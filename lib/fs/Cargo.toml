@@ -1,23 +1,21 @@
 [package]
-name = "ww"
+name = "fs"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[workspace]
-members = ["lib/fs", "lib/net", "lib/proc"]
-
 [dependencies]
 anyhow = "1"
-clap = { version = "4.5.13", features = ["derive"] }
+bytes = "1.7.1"
 futures = "0.3.29"
-ipfs-api-backend-hyper = "0.6"
+ipfs-api-backend-hyper = "0.6.0"
+ipfs-api-prelude = "0.6.0"
 libp2p = { version = "0.54.0", features = ["full"] }
 rand = "0.8"
-tokio = { version = "1.x", features = ["full"] }
+tokio = { version = "1.36", features = ["full"] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-fs = { path = "lib/fs" }
-net = { path = "lib/net" }
-proc = { path = "lib/proc" }
+wasmer = { version = "4.x" }
+wasmer-wasix = { version = "0.27" }
+net = { path = "../../lib/net" }

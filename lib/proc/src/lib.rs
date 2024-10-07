@@ -1,6 +1,10 @@
+use std::marker::{Send, Sync};
+
 use uuid::Uuid;
 use wasmer::{self};
-use wasmer_wasix::{WasiEnv, WasiFunctionEnv};
+use wasmer_wasix::{virtual_fs, WasiEnv, WasiFunctionEnv};
+
+const START_FUNCTION: &str = "_start";
 
 pub struct WasmProcess {
     function: wasmer::Function,
@@ -40,10 +44,15 @@ impl WasmRuntime {
         &mut self.store
     }
 
-    pub fn build(&mut self, bytecode: Vec<u8>) -> Result<WasmProcess, Box<dyn std::error::Error>> {
+    pub fn build(
+        &mut self,
+        bytecode: Vec<u8>,
+        fs: Box<dyn virtual_fs::FileSystem + Send + Sync>,
+    ) -> Result<WasmProcess, Box<dyn std::error::Error>> {
         let module = wasmer::Module::new(&self.store, bytecode).expect("couldn't load WASM module");
         let uuid = Uuid::new_v4();
         let mut wasi_env = WasiEnv::builder(uuid)
+            .fs(fs)
             // .args(&["arg1", "arg2"])
             // .env("KEY", "VALUE")
             .finalize(self.store_mut())?;
@@ -56,7 +65,7 @@ impl WasmRuntime {
 
         wasi_env.initialize(&mut self.store, instance.clone())?;
 
-        let function = instance.exports.get_function("_start")?;
+        let function = instance.exports.get_function(START_FUNCTION)?;
 
         Ok(WasmProcess::new(wasi_env, function.to_owned()))
     }
