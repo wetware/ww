@@ -11,10 +11,6 @@ use std::time::Duration;
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
-use capnp_rpc::rpc_twoparty_capnp::Side;
-use capnp_rpc::twoparty::VatNetwork;
-use capnp_rpc::RpcSystem;
-use futures::io::AsyncReadExt;
 use libp2p::PeerId;
 use membrane::EpochGuard;
 
@@ -22,11 +18,6 @@ use membrane::system_capnp;
 
 /// Timeout for establishing the libp2p stream to a remote peer.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Timeout for the RPC bootstrap handshake after the stream is established.
-/// If the remote peer accepts the libp2p stream but never speaks Cap'n Proto,
-/// this prevents the caller from hanging indefinitely.
-const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct VatClientImpl {
     stream_control: libp2p_stream::Control,
@@ -91,49 +82,46 @@ impl system_capnp::vat_client::Server for VatClientImpl {
                 ))
             })?;
 
-            // Bootstrap Cap'n Proto RPC over the libp2p stream.
-            let (reader, writer) = Box::pin(stream).split();
-            let network = VatNetwork::new(reader, writer, Side::Client, Default::default());
-            let mut rpc_system = RpcSystem::new(Box::new(network), None);
-            let remote_cap: capnp::capability::Client = rpc_system.bootstrap(Side::Server);
+            // Bootstrap Cap'n Proto RPC over the libp2p stream via the
+            // paved-path helper, which spawns the RpcSystem driver before
+            // returning. The driver flushes Bootstrap and receives the
+            // remote Return on its own.
+            //
+            // We don't await an explicit handshake check: `when_resolved()`
+            // on a bootstrap pipeline client doesn't fire reliably in
+            // capnp-rpc-rust 0.25 (see vat_dial docs).  The guest's first
+            // method call through the returned cap observes any remote
+            // failure via that call's own response timeout.
+            let super::vat_dial::VatDial { bootstrap, driver } =
+                super::vat_dial::connect::<_, capnp::capability::Client>(stream);
 
-            // Verify the remote actually speaks Cap'n Proto by waiting for the
-            // bootstrap promise to resolve. Without this, rpc_system.bootstrap()
-            // returns a proxy immediately and method calls hang indefinitely if
-            // the remote never responds.
-            tokio::time::timeout(BOOTSTRAP_TIMEOUT, remote_cap.when_resolved())
-                .await
-                .map_err(|_| {
-                    capnp::Error::failed(format!(
-                        "RPC handshake timeout: {peer_id} on {stream_protocol} did not \
-                         respond within {BOOTSTRAP_TIMEOUT:?} (peer may not speak Cap'n Proto)"
-                    ))
-                })?
-                .map_err(|e| {
-                    capnp::Error::failed(format!(
-                        "RPC handshake failed with {peer_id} on {stream_protocol}: {e}"
-                    ))
-                })?;
-
-            // Drive the RPC system in a background task. Cap'n Proto refcounting
-            // handles shutdown: when the guest drops all capabilities obtained from
-            // this RPC system, the system drains and the task completes.
+            // The driver runs detached. Cap'n Proto refcounting handles
+            // shutdown: when the guest drops all capabilities obtained from
+            // this connection, the RpcSystem drains and the task completes.
+            // We log the eventual RpcSystem outcome for observability.
+            let driver_peer = peer_id;
+            let driver_protocol = stream_protocol.clone();
             tokio::task::spawn_local(async move {
-                match rpc_system.await {
-                    Ok(()) => tracing::debug!(
-                        peer = %peer_id,
-                        protocol = %stream_protocol,
+                match driver.await {
+                    Ok(Ok(())) => tracing::debug!(
+                        peer = %driver_peer,
+                        protocol = %driver_protocol,
                         "Vat dial session ended cleanly"
                     ),
-                    Err(e) => tracing::warn!(
-                        peer = %peer_id,
-                        protocol = %stream_protocol,
+                    Ok(Err(e)) => tracing::warn!(
+                        peer = %driver_peer,
+                        protocol = %driver_protocol,
                         "Vat dial session ended with error: {e}"
+                    ),
+                    Err(e) => tracing::warn!(
+                        peer = %driver_peer,
+                        protocol = %driver_protocol,
+                        "Vat dial driver task aborted: {e}"
                     ),
                 }
             });
 
-            results.get().init_cap().set_as_capability(remote_cap.hook);
+            results.get().init_cap().set_as_capability(bootstrap.hook);
 
             Ok(())
         })

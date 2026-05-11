@@ -14,6 +14,7 @@ pub mod routing;
 pub mod stream_dialer;
 pub mod stream_listener;
 pub mod vat_client;
+pub mod vat_dial;
 pub mod vat_listener;
 pub mod wagi;
 
