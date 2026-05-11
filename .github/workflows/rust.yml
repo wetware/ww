@@ -238,7 +238,6 @@ jobs:
           std/kernel/bin/main.wasm
           std/shell/bin/shell.wasm
           std/shell/bin/shell.capnpc
-          std/shell/etc/init.d/50-shell.glia
           std/mcp/bin/main.wasm
           std/status/bin/status.wasm
           examples/*/bin/
@@ -376,17 +375,18 @@ jobs:
         #   /usr/share/wetware/kernel/  → kernel image (mounted as base)
         #   /usr/share/wetware/shell/   → shell image (overlaid on kernel)
         # The daemon mounts both as separate root layers; the shell layer
-        # provides bin/shell.wasm + bin/shell.capnpc + etc/init.d/.
+        # provides bin/shell.wasm + bin/shell.capnpc (loaded by the
+        # AdminUdsService at startup — shell is a daemon built-in, not
+        # an init.d-registered vat).
         mkdir -p wetware/kernel/bin
-        mkdir -p wetware/shell/bin wetware/shell/etc/init.d
+        mkdir -p wetware/shell/bin
 
         # Kernel layer: bin/main.wasm is required at the merged root.
         cp wasm/std/kernel/bin/main.wasm wetware/kernel/bin/main.wasm
 
-        # Shell layer: WASM, schema, and init script.
+        # Shell layer: WASM + schema.
         cp wasm/std/shell/bin/shell.wasm    wetware/shell/bin/shell.wasm
         cp wasm/std/shell/bin/shell.capnpc  wetware/shell/bin/shell.capnpc
-        cp wasm/std/shell/etc/init.d/50-shell.glia wetware/shell/etc/init.d/
 
         cp ../Containerfile.deploy Containerfile
 
