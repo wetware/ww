@@ -371,7 +371,7 @@ on top of the normal filesystem.
    walk DAG via ipfs.ls() / ipfs.cat()  ──► IPFS UnixFS blocks
               │
               ▼
-   guest path resolution  (e.g. /etc/init.d/50-shell.glia)
+   guest path resolution  (e.g. /etc/init.d/05-status.glia)
               │
               ▼
    WASI fs syscalls  ──►  fs_intercept.rs  ──►  CidTree::resolve_path
