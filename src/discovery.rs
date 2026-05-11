@@ -1,11 +1,14 @@
-//! Local node discovery via lockfiles and LAN Kademlia DHT.
+//! Local node discovery via Unix Domain Sockets and LAN Kademlia DHT.
 //!
-//! Running nodes write a lockfile to `~/.ww/run/<peer_id>` containing
-//! their listen multiaddrs (one per line, transport-only — no `/p2p/`
-//! suffix).  Clients read these files to discover local nodes without
-//! network round-trips.
+//! Running daemons open a UDS at `<run-dir>/<peer-id>.sock` (created by
+//! [`AdminUdsService`](crate::admin_uds::AdminUdsService)) plus a metadata
+//! JSON at `<run-dir>/<peer-id>.json`. Clients enumerate `*.sock` entries
+//! to find live local daemons; the `.json` carries peer_id / multiaddrs /
+//! pid / started_at / version for tooling consumers.
 //!
 //! The DHT discovery CID is also provided for LAN Kademlia advertisement.
+//! That path is orthogonal to local discovery and unaffected by the
+//! UDS migration.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::path::PathBuf;
@@ -27,13 +30,13 @@ pub fn discovery_record_key() -> libp2p::kad::RecordKey {
     libp2p::kad::RecordKey::new(&DISCOVERY_CID.to_bytes())
 }
 
-/// Candidate directories where running nodes may store their lockfiles,
-/// in priority order:
+/// Candidate directories where running daemons may publish their UDS
+/// sockets and metadata, in priority order:
 ///
-/// 1. `/var/run/ww/` — system-wide, discoverable across users (preferred
-///    on bare metal where the daemon can write to `/var/run/`).
-/// 2. `$HOME/.ww/run/` — per-user fallback (used in containers, sandboxes,
-///    or anywhere `/var/run/` is not writable).
+/// 1. `/var/run/ww/` — system-wide on Linux (preferred when writable).
+/// 2. `$HOME/.ww/run/` — per-user fallback (used in containers, on macOS
+///    where `/var/run/` is SIP-protected, and anywhere `/var/run/` is
+///    not writable for the daemon's user).
 ///
 /// The writer picks the first writable directory. The reader scans all
 /// candidates and merges results.
@@ -45,10 +48,10 @@ pub fn run_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Primary directory for *writing* lockfiles. Picks the first candidate
-/// that exists or can be created with write access. Falls back to the
-/// last candidate if none are writable (the writer will then log the
-/// failure and move on).
+/// Primary directory for *writing* the socket and metadata files. Picks
+/// the first candidate from [`run_dirs()`] that can be created and
+/// written to. Falls back to the last candidate if none are writable
+/// (the writer will then surface a bind error and exit).
 fn writable_run_dir() -> PathBuf {
     let candidates = run_dirs();
     for dir in &candidates {
@@ -67,49 +70,39 @@ fn writable_run_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/var/run/ww"))
 }
 
-/// A running wetware node discovered via lockfile.
+/// Path to the admin UDS socket file for the given peer.
+///
+/// Joined under the writable directory from [`run_dirs()`]. The socket
+/// is created by `tokio::net::UnixListener::bind` at daemon startup;
+/// clients connect via `UnixStream::connect(socket_path(...))`.
+pub fn socket_path(peer_id: &str) -> PathBuf {
+    writable_run_dir().join(format!("{peer_id}.sock"))
+}
+
+/// Path to the admin metadata JSON for the given peer.
+///
+/// Lives alongside the `.sock` file and carries peer_id, multiaddrs,
+/// started_at, pid, and version. Consumed by `ww status` and external
+/// tooling. Not load-bearing for shell connection — the `.sock` file
+/// (and a successful `connect()` to it) is the authoritative liveness
+/// signal.
+pub fn metadata_path(peer_id: &str) -> PathBuf {
+    writable_run_dir().join(format!("{peer_id}.json"))
+}
+
+/// A locally running wetware daemon discovered via UDS socket file.
 #[derive(Debug, Clone)]
 pub struct LocalNode {
     pub peer_id: String,
-    pub addrs: Vec<String>,
+    pub socket_path: PathBuf,
 }
 
-/// Write a lockfile for the current node.
+/// List all locally running wetware daemons by scanning every candidate
+/// directory in [`run_dirs()`] for `<peer-id>.sock` entries. Duplicate
+/// peer IDs across directories are deduplicated (first occurrence wins).
 ///
-/// Picks the first writable directory from `run_dirs()` and creates
-/// `<dir>/<peer_id>` with one multiaddr per line. The addrs should be
-/// transport-only (no `/p2p/<peer_id>` suffix).
-///
-/// On a system-wide directory (e.g. `/var/run/ww/`), the sticky bit is
-/// set so users can only remove their own lockfiles.
-pub fn write_lockfile(peer_id: &str, addrs: &[String]) -> std::io::Result<PathBuf> {
-    let dir = writable_run_dir();
-    std::fs::create_dir_all(&dir)?;
-    // If this is a shared system directory, set sticky bit so users can
-    // only delete their own lockfiles. Best-effort; ignore failures.
-    #[cfg(unix)]
-    if dir.starts_with("/var/run") || dir.starts_with("/run") {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777));
-    }
-    let path = dir.join(peer_id);
-    let contents = addrs.join("\n");
-    std::fs::write(&path, contents)?;
-    Ok(path)
-}
-
-/// Remove the lockfile for the given peer from every candidate directory.
-pub fn remove_lockfile(peer_id: &str) {
-    for dir in run_dirs() {
-        let _ = std::fs::remove_file(dir.join(peer_id));
-    }
-}
-
-/// List all locally running wetware nodes by reading lockfiles from
-/// every candidate directory. Duplicate peer IDs across directories are
-/// deduplicated (first occurrence wins).
-///
-/// Does not validate whether the nodes are actually reachable.
+/// Does not validate liveness — the caller should attempt `connect()`
+/// and treat `ECONNREFUSED` as "stale socket, ignore this node".
 pub fn list_local_nodes() -> Vec<LocalNode> {
     use std::collections::HashSet;
 
@@ -123,28 +116,24 @@ pub fn list_local_nodes() -> Vec<LocalNode> {
         };
 
         for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let peer_id = file_name.to_string_lossy().to_string();
-
-            // Skip dotfiles, temp files, etc.
-            if peer_id.starts_with('.') {
-                continue;
-            }
+            let path = entry.path();
+            // Only consider `.sock` files. Skip the `.json` siblings and
+            // any unrelated artifacts in the run dir.
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            let peer_id = match name.strip_suffix(".sock") {
+                Some(p) if !p.is_empty() && !p.starts_with('.') => p.to_string(),
+                _ => continue,
+            };
             if !seen.insert(peer_id.clone()) {
                 continue; // already saw this peer in a higher-priority dir
             }
-
-            if let Ok(contents) = std::fs::read_to_string(entry.path()) {
-                let addrs: Vec<String> = contents
-                    .lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .collect();
-
-                if !addrs.is_empty() {
-                    nodes.push(LocalNode { peer_id, addrs });
-                }
-            }
+            nodes.push(LocalNode {
+                peer_id,
+                socket_path: path,
+            });
         }
     }
 
