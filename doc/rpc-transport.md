@@ -286,6 +286,35 @@ to move data.
    This shows up when the guest stops polling while the host expects a
    follow-up message from the same guest.
 
+6) **Client-side dial: awaiting a derived promise before spawning the
+   RpcSystem.** This is a client-side analog of cause (1), specific to
+   code that *dials* a remote vat (e.g., `ww shell` against a daemon,
+   or `VatClient::dial()` for outgoing guest dials). The buggy shape:
+
+   ```rust
+   // BUG: when_resolved() / .send().promise / etc. registers a waker
+   //      on RpcSystem-internal state that never advances because no
+   //      one is polling the system. Deadlock until the timeout fires.
+   let mut rpc_system = RpcSystem::new(network, None);
+   let client = rpc_system.bootstrap(Side::Server);
+   client.when_resolved().await?;                  // <-- hangs forever
+   tokio::task::spawn_local(rpc_system);           // never reached
+   ```
+
+   A second, capnp-rpc-rust-internal quirk compounds the first:
+   `when_resolved()` on a fresh `PromiseClient` does not reliably
+   fire even with correct ordering in capnp-rpc-rust 0.25
+   (`when_more_resolved` keeps appending waiters to an already-drained
+   queue after `PromiseClient::resolve`). The canonical
+   [capnproto-rust hello-world client] sidesteps this entirely by going
+   straight to method calls — the response promise IS the handshake
+   observable.
+
+   Surfaced as #450, which manifested as a 30s `ww shell` "RPC handshake
+   timeout" on every connect.
+
+   [capnproto-rust hello-world client]: https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/client.rs
+
 ### Mitigations
 
 1) **Ensure both RPC systems are continuously driven.**
@@ -314,6 +343,20 @@ to move data.
 6) **Observability.**
    Keep trace logging enabled during development to detect stalled states
    and verify that the RPC system is being polled.
+
+7) **Use the `vat_dial` paved-path helper for client-side dials.**
+   For any code that dials a remote vat (host-side CLI, the
+   `VatClient::dial()` capability impl, future internal callers), use
+   [`crates/rpc/src/vat_dial.rs::connect`] instead of building the
+   `RpcSystem` + `VatNetwork` + `bootstrap()` chain by hand.  The helper
+   spawns the driver *before* returning the typed bootstrap client, so
+   callers structurally cannot reproduce cause (6).  Returns
+   `VatDial<C>` carrying the typed cap plus a `JoinHandle` for the
+   detached driver; the driver flushes the Bootstrap message and
+   receives the remote Return on its own, with no handshake-check
+   `await` needed.  Regression tests live alongside the helper.
+
+   [`crates/rpc/src/vat_dial.rs::connect`]: ../crates/rpc/src/vat_dial.rs
 
 ## Open questions
 
