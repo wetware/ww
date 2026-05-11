@@ -369,12 +369,18 @@ impl HttpClient {
                 if path.is_dir() {
                     // Queue subdirectories for processing
                     queue.push_back((path, rel_path));
-                } else {
-                    // Read file
+                } else if path.is_file() {
+                    // Read regular files only. Non-regular entries (UDS
+                    // sockets, FIFOs, dangling symlinks, etc.) would fail
+                    // `fs::read` with platform-specific errors and aren't
+                    // meaningful as IPFS-added content. The admin UDS
+                    // endpoint at `~/.ww/run/<peer-id>.sock` is the
+                    // concrete case that motivated this guard.
                     let bytes = fs::read(&path)
                         .with_context(|| format!("Failed to read file: {}", path.display()))?;
                     files_to_add.push((rel_path, bytes));
                 }
+                // (else: silently skip non-regular non-directory entries)
             }
         }
 
