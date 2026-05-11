@@ -23,15 +23,18 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use ed25519_dalek::SigningKey;
 use ::membrane::{Epoch, EpochGuard};
+use ed25519_dalek::SigningKey;
 
 use crate::discovery;
 use crate::host::SwarmCommand;
 use crate::launcher::create_runtime_client;
 use crate::services::Service;
 use crate::system_capnp;
-use rpc::{routing::RoutingImpl, vat_listener::handle_vat_connection_spawn, CachePolicy, HostImpl, NetworkState};
+use rpc::{
+    routing::RoutingImpl, vat_listener::handle_vat_connection_spawn, CachePolicy, HostImpl,
+    NetworkState,
+};
 
 /// Configuration + shared state for the admin UDS endpoint.
 ///
@@ -269,11 +272,7 @@ fn build_full_caps(
     // routing
     let routing_impl = RoutingImpl::new(swarm_cmd_tx.clone(), guard.clone(), ipfs_client.clone());
     let routing: ::membrane::routing_capnp::routing::Client = capnp_rpc::new_client(routing_impl);
-    caps.push((
-        "routing".to_string(),
-        routing.client,
-        schema_for("routing"),
-    ));
+    caps.push(("routing".to_string(), routing.client, schema_for("routing")));
 
     caps
 }
