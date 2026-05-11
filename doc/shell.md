@@ -1,37 +1,50 @@
-# Kernel Shell
+# Shell
 
-The wetware kernel (`pid0`) provides two runtime modes, selected
-automatically based on whether standard input is a terminal.
+The `ww shell` command opens an interactive Glia REPL against a running
+wetware daemon. Today only the local-UDS path is implemented; the
+forward-stable CLI surface for remote shell access (libp2p multiaddr,
+mDNS LAN browse) is documented below but exits with
+`Error: NOT IMPLEMENTED`.
 
-## Interactive mode (TTY)
-
-When `ww run` detects a TTY on stdin it sets `WW_TTY=1` in the guest
-environment. The kernel starts a Clojure-inspired Lisp REPL:
-
-```
-/ > (perform host :id)
-"12D3KooWExample..."
-/ > (perform host :addrs)
-("/ip4/127.0.0.1/tcp/2025" "/ip4/192.168.1.5/tcp/2025")
-/ > (exit)
-```
-
-### Connecting remotely
+## Connecting
 
 ```sh
-ww shell                                    # auto-discover local node
-ww shell /dnsaddr/master.wetware.run        # connect via DNS
-ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...  # direct dial
+ww shell                                          # connect to local daemon via UDS
+ww shell <multiaddr>                              # NOT IMPLEMENTED — future remote dial
+ww shell --discover                               # NOT IMPLEMENTED — future LAN browse
 ```
 
-When no address is given, `ww shell` discovers a local node via
-Kubo's LAN DHT. See [cli.md](cli.md) for details.
+With no arguments, `ww shell` scans the run directories (`/var/run/ww/`
+first on Linux, `$HOME/.ww/run/` fallback on macOS and when `/var/run/`
+isn't writable) for `<peer-id>.sock` files. If exactly one daemon is
+running locally, it connects. If multiple are running, it prompts you
+to choose. If none are running, it errors with a hint to run
+`ww run .` first.
 
-### Syntax
+## Local admin gate (UDS)
+
+The local path is an admin endpoint by design. Whoever can write to
+`~/.ww/run/` (or `/var/run/ww/`) has full administrative control of
+the daemon — by convention with `/var/run/docker.sock`,
+`~/.ipfs/api`, `~/.podman/podman.sock`, and similar local-CLI sockets.
+Filesystem permissions on the run directory ARE the auth boundary;
+there is no Noise handshake, no Terminal challenge, no auth token.
+
+The spawned shell cell receives the daemon's **full membrane** — every
+capability the daemon exposes, without attenuation. Admin scope is
+exempt from epoch-based capability expiry: the shell remains usable for
+the daemon's lifetime regardless of stem activity.
+
+If you need auth-gated remote shell access in the future, that's a
+separate `:listen` registration via init.d, with a `Terminal(Shell)`
+gate per the April-2 design — see the
+[design doc](https://github.com/wetware/ww/issues/452) for context.
+
+## Syntax
 
 Every expression is an S-expression. Effects use the `perform` form:
 the first argument is the capability, the second is a keyword naming
-the method, and the rest are arguments:
+the method, and the rest are method arguments.
 
 ```
 (perform capability :method [args...])
@@ -40,83 +53,63 @@ the method, and the rest are arguments:
 Strings are double-quoted. Symbols are bare words. Comments start with
 `;` and run to end of line.
 
-### Capabilities
+## Capabilities exposed to the shell
 
-After grafting, the shell session holds references to all capabilities
-the membrane provides. See [capabilities.md](capabilities.md) for the
-full list and schemas.
+The shell cell currently grafts these caps from its membrane (see
+`std/shell/src/lib.rs::run_impl`):
 
-#### host
+### host
 
-| Method | Example | Description |
-|--------|---------|-------------|
-| `id` | `(perform host :id)` | Peer ID (hex-encoded) |
-| `addrs` | `(perform host :addrs)` | Listen multiaddrs |
-| `peers` | `(perform host :peers)` | Connected peers with addresses |
-| `connect` | `(perform host :connect "/ip4/1.2.3.4/tcp/2025/p2p/12D3...")` | Dial a peer |
-| `listen` | `(perform host :listen "/ip4/0.0.0.0/tcp/0")` | Listen on additional address |
+| Method     | Example                                                       | Description                            |
+| ---------- | ------------------------------------------------------------- | -------------------------------------- |
+| `id`       | `(perform host :id)`                                          | Peer ID (bs58-encoded string)          |
+| `addrs`    | `(perform host :addrs)`                                       | Listen multiaddrs                      |
+| `peers`    | `(perform host :peers)`                                       | Connected peers with addresses         |
+| `connect`  | `(perform host :connect "/ip4/1.2.3.4/tcp/2025/p2p/12D3...")` | Dial a peer                            |
+| `listen`   | `(perform host :listen "/ip4/0.0.0.0/tcp/0")`                 | Listen on an additional address        |
 
-#### runtime
+### routing
 
-Loading and running WASM binaries is a two-step process:
+| Method          | Example                                       | Description                          |
+| --------------- | --------------------------------------------- | ------------------------------------ |
+| `provide`       | `(perform routing :provide cid)`              | Announce as provider for a CID       |
+| `findProviders` | `(perform routing :findProviders cid)`        | Find providers for a CID over DHT    |
 
-1. `runtime.load(bytes)` compiles the WASM and returns an `Executor`
-2. `executor.spawn()` runs the process and captures stdout
+### Local effect handlers
 
-The PATH lookup mechanism (see below) handles this automatically.
+The shell cell also wires three glia-only effect handlers that do not
+go through a remote capability:
 
-#### identity
-
-| Method | Example | Description |
-|--------|---------|-------------|
-| `sign` | `(perform identity :sign data)` | Sign bytes with the node's Ed25519 key |
-| `verify` | `(perform identity :verify data sig pubkey)` | Verify a signature |
-
-#### routing
-
-| Method | Example | Description |
-|--------|---------|-------------|
-| `provide` | `(perform routing :provide cid)` | Announce as provider for a CID |
-| `findProviders` | `(perform routing :findProviders cid)` | Find providers for a CID |
+- **`fs`** — read paths from the cell's WASI filesystem (reactive to
+  stem updates per [`architecture.md`](architecture.md))
+- **`import`** — load other Glia source files
+- The kernel's built-in expressions: arithmetic, `let`, `if`, `defn`,
+  etc.
 
 ### Built-ins
 
-| Command | Description |
-|---------|-------------|
-| `(cd "<path>")` | Change working directory |
-| `(def name value)` | Bind a value in the session environment |
-| `(help)` | Print available capabilities and methods |
-| `(exit)` | Terminate the kernel |
+| Form               | Description                                              |
+| ------------------ | -------------------------------------------------------- |
+| `(def name value)` | Bind a value in the session environment (persists)       |
+| `(help)`           | Print available capabilities and methods                 |
+| `(exit)`           | Disconnect cleanly                                       |
 
-### PATH lookup
+`def` state and any other env bindings persist for the lifetime of
+the connection. A new `ww shell` session starts with a fresh cell
+and an empty environment.
 
-Any command that is not a known capability or built-in triggers a PATH
-lookup. The kernel scans each directory in `PATH` (default: `/bin`) for
-two candidates in order:
+## Connection model
 
-1. `<dir>/<cmd>.wasm` -- flat single-file binary
-2. `<dir>/<cmd>/main.wasm` -- image-style nested binary
+Each `ww shell` invocation spawns a fresh shell cell on the daemon
+side via `executor.spawn_request()` — sessions are isolated by
+construction. The cell exits cleanly when you `(exit)` or close stdin
+(Ctrl-D).
 
-The first match wins. The bytes are loaded via `runtime.load()` to obtain
-an `Executor`, then `executor.spawn()` runs the process. Standard output
-is captured and printed; the exit code is reported on error.
+The daemon side bridges your `tokio::net::UnixStream` to the cell's
+WASI stdio via the existing `handle_vat_connection_spawn` helper
+(`crates/rpc/src/vat_listener.rs`) — the same one used by the libp2p
+path. The cell itself doesn't know which transport you connected over;
+it sees a generic Cap'n Proto duplex.
 
-```
-/ > (my-tool "arg1" "arg2")
-```
-
-This looks for `/bin/my-tool.wasm` or `/bin/my-tool/main.wasm` in the
-image filesystem. The nested form lets a command be a full FHS image
-directory with its own `boot/`, `etc/`, etc.
-
-## Daemon mode (non-TTY)
-
-When stdin is not a terminal, the kernel enters daemon mode:
-
-1. Grafts onto the host membrane and obtains a session
-2. Logs a JSON readiness message to stderr:
-   ```json
-   {"event":"ready","peer_id":"12D3KooW..."}
-   ```
-3. Blocks on stdin until the host closes it (signaling shutdown)
-4. All stdin data is discarded; no interactive input is processed
+For implementation details of the daemon-side service, see
+[`src/admin_uds.rs`](../src/admin_uds.rs).
