@@ -5,6 +5,8 @@
 
 // Host-only modules (not available for WASM guests)
 #[cfg(not(target_arch = "wasm32"))]
+pub mod admin_uds;
+#[cfg(not(target_arch = "wasm32"))]
 pub use cell;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod daemon_config;

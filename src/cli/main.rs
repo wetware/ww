@@ -256,16 +256,24 @@ enum Commands {
     ///
     /// Example:
     ///   ww shell
-    ///   ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...
-    ///   ww shell /dnsaddr/master.wetware.run
+    ///   ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...   # NOT IMPLEMENTED
+    ///   ww shell --discover                                # NOT IMPLEMENTED
+    ///
+    /// If both ADDR and --discover are given, ADDR takes precedence
+    /// and --discover is ignored with a warning. (When ADDR / --discover
+    /// are implemented, both will use libp2p with Noise; today only the
+    /// local UDS path is built.)
     Shell {
-        /// Multiaddr of the target node (e.g. /ip4/.../p2p/... or /dnsaddr/...).
-        /// If omitted, discovers a local node via lockfiles in ~/.ww/run/.
+        /// Multiaddr of a remote node (NOT YET IMPLEMENTED — forward-stable
+        /// CLI surface for future libp2p remote shell support).
+        /// If omitted, connects to the local daemon via UDS at
+        /// `~/.ww/run/<peer-id>.sock`.
         addr: Option<Multiaddr>,
 
-        /// Path to Ed25519 identity file for auth.
-        #[arg(long, env = "WW_IDENTITY", value_name = "PATH")]
-        identity: Option<PathBuf>,
+        /// Browse the LAN for a wetware daemon via mDNS (NOT YET
+        /// IMPLEMENTED — forward-stable CLI surface).
+        #[arg(long)]
+        discover: bool,
     },
 
     /// Effectful operations that mutate state beyond the current directory.
@@ -578,10 +586,10 @@ impl Commands {
                 private_key,
             } => Self::push(path, ipfs_url, stem, rpc_url, private_key).await,
             Commands::Keygen { output } => Self::keygen(output).await,
-            Commands::Shell { addr, identity } => {
+            Commands::Shell { addr, discover } => {
                 ww::config::init_tracing();
                 let local = tokio::task::LocalSet::new();
-                local.run_until(shell::run_shell(addr, identity)).await
+                local.run_until(shell::run_shell(addr, discover)).await
             }
             Commands::Perform { action } => match action {
                 PerformAction::Install => Self::perform_install().await,
@@ -1716,6 +1724,41 @@ wasip2::cli::command::export!({iface_name}Guest);
         // Save values needed by the MCP cell before moving them into the kernel.
         let signing_key = std::sync::Arc::new(sk);
 
+        // Admin UDS thread: local-only admin gate over Unix Domain Socket.
+        // Lives alongside swarm/epoch/executor pool; clients connect via
+        // ~/.ww/run/<peer-id>.sock for full-membrane unattenuated access.
+        // FS permissions on the run dir ARE the auth boundary, by design —
+        // matching docker.sock / ipfs api / podman.sock conventions.
+        {
+            let snapshot = network_state.snapshot().await;
+            let peer_id_str = libp2p::PeerId::from_bytes(&snapshot.local_peer_id)
+                .context("invalid peer ID in network state")?
+                .to_string();
+            let multiaddrs: Vec<String> = snapshot
+                .listen_addrs
+                .iter()
+                .filter_map(|bytes| libp2p::Multiaddr::try_from(bytes.clone()).ok())
+                .map(|ma| ma.to_string())
+                .collect();
+            supervisor.spawn(
+                "admin-uds",
+                ww::admin_uds::AdminUdsService {
+                    peer_id: peer_id_str,
+                    shell_wasm: EMBEDDED_SHELL.to_vec(),
+                    multiaddrs,
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    network_state: network_state.clone(),
+                    swarm_cmd_tx: swarm_cmd_tx.clone(),
+                    wasm_debug,
+                    signing_key: Some(signing_key.clone()),
+                    stream_control: stream_control.clone(),
+                    ipfs_client: ipfs_client.clone(),
+                    http_dial: http_dial.clone(),
+                    cache_policy,
+                },
+            );
+        }
+
         let mut builder = CellBuilder::new(image_path.clone())
             .with_loader(Box::new(loader))
             .with_network_state(network_state.clone())
@@ -2029,17 +2072,10 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
         }
 
-        // Ensure default init.d script exists. Idempotent — only writes if
-        // missing, so user customizations are preserved.
-        let shell_init = ww_dir.join("etc/init.d/50-shell.glia");
-        if !shell_init.exists() {
-            std::fs::write(
-                &shell_init,
-                include_str!("../../std/shell/etc/init.d/50-shell.glia"),
-            )
-            .context("Failed to write default shell init script")?;
-            done("Default init.d (50-shell.glia)".into());
-        }
+        // Shell is now a daemon built-in served over UDS at
+        // ~/.ww/run/<peer-id>.sock — no init.d registration needed.
+        // (Remote shell over libp2p is a follow-up; when it ships, this
+        // is where its init.d entry would land.)
 
         // ── Status init.d ────────────────────────────────────────────
         let status_init = ww_dir.join("etc/init.d/05-status.glia");
@@ -2328,15 +2364,8 @@ wasip2::cli::command::export!({iface_name}Guest);
         done(format!("Binary symlink ({})", symlink_path.display()));
 
         // ── Default init.d ──────────────────────────────────────────
-        let shell_init = ww_dir.join("etc/init.d/50-shell.glia");
-        if !shell_init.exists() {
-            std::fs::write(
-                &shell_init,
-                include_str!("../../std/shell/etc/init.d/50-shell.glia"),
-            )
-            .context("Failed to write default shell init script")?;
-            done("Default init.d (50-shell.glia)".into());
-        }
+        // Shell is now a daemon built-in served over UDS at
+        // ~/.ww/run/<peer-id>.sock — no init.d registration needed.
 
         // ── Status init.d ────────────────────────────────────────────
         let status_init = ww_dir.join("etc/init.d/05-status.glia");
