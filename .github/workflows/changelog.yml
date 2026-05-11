@@ -13,11 +13,34 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Check CHANGELOG.md was modified
+    - name: Require CHANGELOG entry for code changes
       run: |
-        if git diff --name-only origin/master...HEAD | grep -q '^CHANGELOG.md$'; then
-          echo "CHANGELOG.md was updated."
-        else
-          echo "::error::CHANGELOG.md was not modified. Please add a changelog entry for this PR."
-          exit 1
+        DIFF=$(git diff --name-only origin/master...HEAD)
+
+        if [ -z "$DIFF" ]; then
+          echo "No changes detected -- nothing to check."
+          exit 0
         fi
+
+        if echo "$DIFF" | grep -q '^CHANGELOG.md$'; then
+          echo "CHANGELOG.md was updated."
+          exit 0
+        fi
+
+        # Paths that do not require a CHANGELOG entry on their own:
+        #   - top-level *.md (README.md, TODOS.md, etc.)
+        #   - doc/**, docs/**
+        #   - .github/** (CI tweaks)
+        #   - .agents/** (AI prompt assets)
+        DOCS_PATTERN='^([^/]+\.md|doc/.*|docs/.*|\.github/.*|\.agents/.*)$'
+        CODE_FILES=$(echo "$DIFF" | grep -vE "$DOCS_PATTERN" || true)
+
+        if [ -z "$CODE_FILES" ]; then
+          echo "Docs-only PR -- no CHANGELOG entry required."
+          exit 0
+        fi
+
+        echo "::error::CHANGELOG.md was not modified. Please add a changelog entry for this PR."
+        echo "Non-docs files changed:"
+        echo "$CODE_FILES"
+        exit 1
