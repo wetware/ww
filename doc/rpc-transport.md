@@ -356,6 +356,23 @@ to move data.
    receives the remote Return on its own, with no handshake-check
    `await` needed.  Regression tests live alongside the helper.
 
+   **Trade-off** (accepted, documented in the helper's module docs):
+   `vat_dial::connect` does not synchronously verify the remote
+   responded to Bootstrap before returning the cap.  In the rare case
+   that the peer accepts the libp2p subprotocol stream but doesn't
+   actually speak Cap'n Proto, the failure surfaces on the caller's
+   first method call via that call's own timeout (e.g. `eval timeout
+   (30s)` in `ww shell`) rather than as a distinct "handshake timeout"
+   at connect.  Time-to-failure is unchanged (~30s either way);
+   diagnostic precision is slightly reduced.  Acceptable because libp2p
+   subprotocol negotiation already established the peer claims to speak
+   our exact capnp interface, the canonical capnproto-rust pattern
+   operates the same way, and the alternative (`when_resolved` await)
+   was empirically broken in capnp-rpc-rust 0.25.  In every other
+   scenario the new behaviour is a strict improvement: no 30s connect
+   penalty for dials that never make a method call, no synchronous wait
+   for cold-cache WASM compile on the other side, etc.
+
    [`crates/rpc/src/vat_dial.rs::connect`]: ../crates/rpc/src/vat_dial.rs
 
 ## Open questions

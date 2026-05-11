@@ -62,6 +62,41 @@
 //! Callers that just hold the cap pay no penalty — the connection idles
 //! cleanly until the cap is dropped.
 //!
+//! # Trade-offs
+//!
+//! Without an awaited handshake check, `connect` cannot synchronously
+//! distinguish "bootstrap roundtrip succeeded" from "bootstrap roundtrip
+//! still pending" at return time.  Per-scenario:
+//!
+//! - **Healthy remote.** The bootstrap RTT is paid pipelined under the
+//!   first method call.  Same total latency as the (buggy) `when_resolved`
+//!   path would have given, just shifted from connect-time to
+//!   first-call-time.
+//! - **Healthy remote, cold-cache WASM compile on the other side.** Cost
+//!   shifted from `connect` to the first method call's response timeout;
+//!   the caller sees their `connect` return immediately, then their first
+//!   call wait for compile.
+//! - **Remote up but not speaking Cap'n Proto on the negotiated
+//!   subprotocol.** Surfaces as a first-method-call timeout (e.g.
+//!   `eval timeout (30s)` in `ww shell`) rather than a precise
+//!   `RPC handshake timeout` at connect.  Time-to-failure is unchanged
+//!   (~30s either way); **diagnostic precision is slightly reduced**.
+//! - **Connection drops mid-session.** No change vs. the prior code:
+//!   in-flight promises fail with `Disconnected`.
+//! - **Caller never invokes a method.** No 30s connect penalty for
+//!   dials that don't end up using the cap; connection idles cleanly
+//!   until the cap is dropped.  Pure improvement.
+//! - **libp2p-level dial failure** (host unreachable, no subprotocol
+//!   negotiated).  No change: `vat_dial::connect` is never reached.
+//!
+//! The diagnostic-precision regression in the "wrong protocol" case is
+//! the only qualitative cost.  We accept it because (a) the alternative
+//! mechanism (`when_resolved`) was empirically broken in capnp-rpc-rust
+//! 0.25; (b) libp2p subprotocol negotiation already established that
+//! the peer claims to speak our exact capnp interface, so this case is
+//! rare in practice; (c) the canonical capnproto-rust pattern operates
+//! the same way.
+//!
 //! [capnproto-rust hello-world client]: https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/client.rs
 
 use capnp::capability::FromClientHook;
