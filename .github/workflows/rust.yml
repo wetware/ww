@@ -103,9 +103,13 @@ jobs:
     - name: Install Foundry
       uses: foundry-rs/foundry-toolchain@v1
       with:
-        # Authenticate the foundryup GitHub API call to avoid 403 rate
-        # limits on shared Actions IPs.
-        token: ${{ secrets.GITHUB_TOKEN }}
+        # Pin a specific Foundry version so foundryup skips the
+        # `api.github.com/repos/foundry-rs/foundry/releases/latest` API
+        # call (the `latest`/`stable` channels hit it unconditionally
+        # and get 403 rate-limited on shared Actions IPs). The action
+        # does not accept a `token` input, so this is the canonical
+        # workaround. Bump periodically.
+        version: v1.7.1
 
     - name: Check formatting
       working-directory: contracts/stem
@@ -160,7 +164,9 @@ jobs:
     - name: Install Foundry
       uses: foundry-rs/foundry-toolchain@v1
       with:
-        token: ${{ secrets.GITHUB_TOKEN }}
+        # See note in the `solidity` job above: pin to avoid 403 rate
+        # limits on the unauthenticated `releases/latest` API call.
+        version: v1.7.1
 
     - name: Install IPFS (Kubo)
       run: |
