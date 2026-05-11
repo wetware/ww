@@ -12,11 +12,7 @@ use anyhow::{Context, Result};
 use libp2p::Multiaddr;
 use std::path::PathBuf;
 
-use capnp_rpc::rpc_twoparty_capnp::Side;
-use capnp_rpc::twoparty::VatNetwork;
-use capnp_rpc::RpcSystem;
-use futures::io::AsyncReadExt;
-
+use ww::rpc::vat_dial;
 use ww::shell_capnp;
 
 /// Discover a local node from lockfiles in `~/.ww/run/`.
@@ -155,24 +151,18 @@ pub async fn run_shell(addr: Option<Multiaddr>, identity: Option<PathBuf>) -> Re
     .map_err(|_| anyhow::anyhow!("connection timeout after 30s"))?
     .map_err(|e| anyhow::anyhow!("failed to open stream: {e}"))?;
 
-    // 8. Bootstrap Cap'n Proto RPC.
-    let (reader, writer) = Box::pin(stream).split();
-    let network = VatNetwork::new(reader, writer, Side::Client, Default::default());
-    let mut rpc_system = RpcSystem::new(Box::new(network), None);
-    let shell: shell_capnp::shell::Client = rpc_system.bootstrap(Side::Server);
-
-    // Handshake timeout is generous: the server spawns a fresh cell per
-    // connection, which includes WASM compilation on a cache miss.
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        shell.client.when_resolved(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("RPC handshake timeout (30s)"))?
-    .map_err(|e| anyhow::anyhow!("RPC handshake failed: {e}"))?;
-
+    // 8. Bootstrap Cap'n Proto RPC via the paved-path helper, which spawns
+    //    the RpcSystem driver before returning. The driver flushes the
+    //    Bootstrap message and receives the remote Return on its own; the
+    //    REPL loop's first user-typed `eval` call observes whether the
+    //    handshake succeeded via that call's own 30s timeout.
+    let vat_dial::VatDial {
+        bootstrap: shell,
+        driver,
+    } = vat_dial::connect::<_, shell_capnp::shell::Client>(stream);
+    // Surface the eventual RpcSystem outcome for debugging session drops.
     tokio::task::spawn_local(async move {
-        if let Err(e) = rpc_system.await {
+        if let Ok(Err(e)) = driver.await {
             tracing::debug!("Shell RPC session ended: {e}");
         }
     });
