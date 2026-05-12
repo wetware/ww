@@ -72,6 +72,10 @@ fn discover_socket() -> Result<PathBuf> {
     }
 }
 
+/// Shell prompt: dim `/` then `❯`. Rustyline 15 strips ANSI escapes
+/// natively in `tty::width`, so no `\x01..\x02` zero-width markers needed.
+const PROMPT: &str = "\x1b[2m/\x1b[0m ❯ ";
+
 /// Run the interactive shell client.
 ///
 /// `addr` and `discover` are the forward-stable CLI surface for remote
@@ -138,7 +142,7 @@ pub async fn run_shell(addr: Option<Multiaddr>, discover: bool) -> Result<()> {
             .expect("failed to create external printer");
         let _ = printer_tx.send(printer);
         loop {
-            match rl.readline("/ > ") {
+            match rl.readline(PROMPT) {
                 Ok(line) => {
                     if !line.trim().is_empty() {
                         let _ = rl.add_history_entry(&line);
