@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::num::{NonZeroU8, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -192,6 +193,9 @@ pub struct WetwareBehaviour {
     pub relay_client: libp2p::relay::client::Behaviour,
     /// DCUtR -- upgrades relayed connections to direct via hole-punching.
     pub dcutr: libp2p::dcutr::Behaviour,
+    /// Caps concurrent dials/connections to relieve QUIC TLS handshake load
+    /// on the single-threaded swarm task (Ed25519 verification is the hotspot).
+    pub connection_limits: libp2p::connection_limits::Behaviour,
 }
 
 /// Libp2p host wrapper for Wetware.
@@ -224,10 +228,39 @@ impl Libp2pHost {
         let stream_behaviour = libp2p_stream::Behaviour::new();
         let stream_control = stream_behaviour.new_control();
 
+        // PeerID-derived jitter for the WAN periodic bootstrap interval.
+        //
+        // Why jitter: synchronized starts in fleet deployments (e.g. rolling
+        // restart, mass deploy) cause bootstrap storms on shared upstream peers
+        // (Kubo, public Amino seeds). Spreading the period across [300, 600]s
+        // smears the load.
+        //
+        // Why PeerID-seeded (not RNG): the value is deterministic per host —
+        // easy to debug ("why does node X bootstrap every 437s?") — yet
+        // uncorrelated across hosts, because peer IDs are themselves random.
+        // Same desync benefit as wall-clock jitter, with reproducible behaviour.
+        //
+        // Why startup-only (not re-jittered per cycle): different peer_ids
+        // already produce divergent intervals, so fleet-scale correlation is
+        // unlikely to persist past the first bootstrap. Re-jittering would
+        // require driving bootstrap manually instead of using libp2p's
+        // built-in periodic timer, which is more code for marginal gain.
+        let bootstrap_secs = {
+            let bytes = peer_id.to_bytes();
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[bytes.len() - 8..]);
+            300 + (u64::from_le_bytes(buf) % 301) // uniform in [300, 600]
+        };
+        tracing::info!(
+            bootstrap_secs,
+            "kad wan bootstrap interval (peer-id-jittered)"
+        );
+
         // ---- WAN Kademlia (Amino DHT, client mode) ----
         let kad_store = kad::store::MemoryStore::new(peer_id);
         let mut kad_config = kad::Config::new(kad::PROTOCOL_NAME);
-        kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(300)));
+        kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(bootstrap_secs)));
+        kad_config.set_replication_factor(NonZeroUsize::new(16).unwrap());
         let mut kad_wan = kad::Behaviour::with_config(peer_id, kad_store, kad_config);
         kad_wan.set_mode(Some(kad::Mode::Client));
 
@@ -236,6 +269,7 @@ impl Libp2pHost {
         let lan_proto = libp2p::StreamProtocol::new("/ipfs/lan/kad/1.0.0");
         let mut kad_lan_config = kad::Config::new(lan_proto);
         kad_lan_config.set_periodic_bootstrap_interval(None);
+        kad_lan_config.set_replication_factor(NonZeroUsize::new(16).unwrap());
         let mut kad_lan = kad::Behaviour::with_config(peer_id, kad_lan_store, kad_lan_config);
         kad_lan.set_mode(Some(kad::Mode::Server));
 
@@ -289,6 +323,11 @@ impl Libp2pHost {
             .with_quic()
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
             .with_behaviour(|_keypair, relay_client| {
+                let conn_limits = libp2p::connection_limits::ConnectionLimits::default()
+                    .with_max_pending_incoming(Some(16))
+                    .with_max_pending_outgoing(Some(16))
+                    .with_max_established_incoming(Some(64))
+                    .with_max_established_outgoing(Some(64));
                 Ok(WetwareBehaviour {
                     identify: libp2p::identify::Behaviour::new(identify_config),
                     stream: stream_behaviour,
@@ -301,10 +340,12 @@ impl Libp2pHost {
                     autonat_v2: libp2p::autonat::v2::client::Behaviour::default(),
                     relay_client,
                     dcutr: libp2p::dcutr::Behaviour::new(local_peer_id),
+                    connection_limits: libp2p::connection_limits::Behaviour::new(conn_limits),
                 })
             })?
             .with_swarm_config(|c: libp2p::swarm::Config| {
                 c.with_idle_connection_timeout(Duration::from_secs(60))
+                    .with_dial_concurrency_factor(NonZeroU8::new(1).unwrap())
             })
             .build();
 
