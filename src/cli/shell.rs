@@ -123,10 +123,20 @@ pub async fn run_shell(addr: Option<Multiaddr>, discover: bool) -> Result<()> {
     eprintln!("AI agents:  ipfs cat /ipns/releases.wetware.run/.agents/prompt.md");
 
     // 4. REPL loop. rustyline is blocking, so run it on its own thread
-    //    and bridge to the async eval loop via an mpsc channel.
+    //    and bridge to the async eval loop via an mpsc channel. Eval
+    //    output flows back through an `ExternalPrinter` so it interleaves
+    //    with the live prompt instead of smashing into the next prompt
+    //    line (rustyline draws the next prompt the moment the line is
+    //    sent, before the async side has the eval result in hand).
+    use rustyline::ExternalPrinter as _;
     let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let (printer_tx, printer_rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let mut rl = rustyline::DefaultEditor::new().expect("failed to create editor");
+        let printer = rl
+            .create_external_printer()
+            .expect("failed to create external printer");
+        let _ = printer_tx.send(printer);
         loop {
             match rl.readline("/ > ") {
                 Ok(line) => {
@@ -147,6 +157,10 @@ pub async fn run_shell(addr: Option<Multiaddr>, discover: bool) -> Result<()> {
         }
     });
 
+    let mut printer = printer_rx
+        .await
+        .context("rustyline thread failed to initialize external printer")?;
+
     while let Some(line) = line_rx.recv().await {
         if line.trim().is_empty() {
             continue;
@@ -162,19 +176,20 @@ pub async fn run_shell(addr: Option<Multiaddr>, discover: bool) -> Result<()> {
                     break;
                 }
                 if !text.is_empty() {
-                    if is_error {
-                        eprintln!("error: {text}");
+                    let out = if is_error {
+                        format!("error: {text}\n")
                     } else {
-                        println!("{text}");
-                    }
+                        format!("{text}\n")
+                    };
+                    let _ = printer.print(out);
                 }
             }
             Ok(Err(e)) => {
-                eprintln!("RPC error: {e}");
+                let _ = printer.print(format!("RPC error: {e}\n"));
                 break;
             }
             Err(_) => {
-                eprintln!("eval timeout (30s)");
+                let _ = printer.print("eval timeout (30s)\n".to_string());
             }
         }
     }
