@@ -261,6 +261,15 @@ impl Libp2pHost {
         let mut kad_config = kad::Config::new(kad::PROTOCOL_NAME);
         kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(bootstrap_secs)));
         kad_config.set_replication_factor(NonZeroUsize::new(16).unwrap());
+        // NOTE: we'd like to call `kad_config.set_automatic_bootstrap_throttle`
+        // here to rate-limit identify-triggered bootstrap fan-out (kad
+        // auto-bootstraps whenever a new peer is inserted into the routing
+        // table; without a throttle, identify storms cascade into bootstrap
+        // storms that hammer the swarm task). But in libp2p-kad 0.47 the
+        // setter is `pub(crate) #[cfg(test)]` (see behaviour.rs:443) and not
+        // reachable from downstream crates. The internal default is 500ms;
+        // we rely on that for now and let the random-walk timer in the
+        // event loop do the heavy lifting for ambient refresh.
         let mut kad_wan = kad::Behaviour::with_config(peer_id, kad_store, kad_config);
         kad_wan.set_mode(Some(kad::Mode::Client));
 
@@ -270,6 +279,7 @@ impl Libp2pHost {
         let mut kad_lan_config = kad::Config::new(lan_proto);
         kad_lan_config.set_periodic_bootstrap_interval(None);
         kad_lan_config.set_replication_factor(NonZeroUsize::new(16).unwrap());
+        // Same throttle limitation applies here — see WAN comment above.
         let mut kad_lan = kad::Behaviour::with_config(peer_id, kad_lan_store, kad_lan_config);
         kad_lan.set_mode(Some(kad::Mode::Server));
 
@@ -435,6 +445,20 @@ impl Libp2pHost {
             Ok(_) => tracing::debug!("LAN discovery provide started"),
             Err(e) => tracing::warn!("LAN discovery provide failed: {e:?}"),
         }
+
+        // Ambient kad refresh — Forest-inspired (ChainSafe/forest runs a
+        // similar loop in their discovery service). Periodic random
+        // `get_closest_peers` queries keep buckets warm by exploring fresh
+        // points in keyspace, complementing the forced periodic bootstrap
+        // (a brief synchronized burst against seed peers) with a continuous,
+        // cheap, naturally desynchronized refresh source. Exponential
+        // backoff 1s -> 60s gives fast warm-up after startup, then settles.
+        // Inline in the swarm loop's select! rather than a spawned task:
+        // DHT maintenance is internal to the swarm, not an external command,
+        // so it doesn't belong on the `SwarmCommand` channel.
+        let mut walk_interval = Duration::from_secs(1);
+        let walk_timer = tokio::time::sleep(walk_interval);
+        tokio::pin!(walk_timer);
 
         loop {
             tokio::select! {
@@ -740,6 +764,17 @@ impl Libp2pHost {
                             break;
                         }
                     }
+                }
+                _ = &mut walk_timer => {
+                    let key = PeerId::random();
+                    let beh = self.swarm.behaviour_mut();
+                    beh.kad.get_closest_peers(key);
+                    beh.kad_lan.get_closest_peers(key);
+                    walk_interval = (walk_interval * 2).min(Duration::from_secs(60));
+                    walk_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + walk_interval);
+                    tracing::debug!(%key, ?walk_interval, "kad random walk dispatched");
                 }
             }
         }
