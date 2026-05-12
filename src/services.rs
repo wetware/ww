@@ -1,12 +1,17 @@
 //! Thread-per-subsystem runtime inspired by Cloudflare Pingora.
 //!
 //! Each subsystem (libp2p swarm, epoch pipeline, WASM executor) runs on its
-//! own OS thread with its own single-threaded tokio runtime.  The [`Host`]
-//! supervisor owns all threads and coordinates shutdown.
+//! own OS thread with its own tokio runtime.  The [`Host`] supervisor owns
+//! all threads and coordinates shutdown.
 //!
 //! Executor threads use `current_thread` + `LocalSet` because `wasmtime::Store`
 //! is `!Send`.  M:N cell scheduling comes from the EWMA fuel estimator
 //! (`src/cell/proc.rs`), not tokio work stealing.
+//!
+//! `SwarmService` is the one exception: it uses a `multi_thread` runtime so
+//! the per-connection upgrade tasks that libp2p-swarm spawns (each containing
+//! a synchronous rustls TLS handshake with Ed25519 verification) distribute
+//! across worker threads instead of serializing onto one. See `doc/runtimes.md`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -442,8 +447,17 @@ pub struct SwarmReady {
 
 impl Service for SwarmService {
     fn run(self, mut shutdown: watch::Receiver<()>) -> Result<()> {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        // Multi-thread runtime so libp2p-swarm's per-connection upgrade tasks
+        // (each running a synchronous rustls TLS handshake with Ed25519
+        // verification) distribute across worker threads. With current_thread,
+        // simultaneous QUIC handshakes serialize through one core; profiling
+        // showed ~50% busy time in curve25519_dalek during kad bootstrap
+        // storms (#456). The event loop itself (select_next_some) still runs
+        // on the OS thread Host::spawn created (named "swarm") via block_on;
+        // worker threads only execute spawned tasks. See doc/runtimes.md.
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .thread_name("ww-swarm-worker")
             .build()?;
         let _span = tracing::info_span!("swarm").entered();
 
