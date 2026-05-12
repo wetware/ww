@@ -124,7 +124,6 @@ pub async fn run_shell(addr: Option<Multiaddr>, discover: bool) -> Result<()> {
     });
 
     eprintln!("{}", glia::banner());
-    eprintln!("AI agents:  ipfs cat /ipns/releases.wetware.run/.agents/prompt.md");
 
     // 4. REPL loop. rustyline is blocking, so run it on its own thread
     //    and bridge to the async eval loop via an mpsc channel. Eval
