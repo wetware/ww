@@ -5,9 +5,8 @@
 # Image layout: two cell layers under /usr/share/wetware/, mounted
 # separately by the daemon CMD.
 #   kernel/bin/main.wasm   — pid0 entrypoint
-#   shell/bin/shell.wasm   — REPL cell
-#   shell/bin/shell.capnpc — compiled schema (loaded by init script)
-#   shell/etc/init.d/      — init scripts run on kernel boot
+#   shell/bin/shell.wasm   — REPL cell (loaded by AdminUdsService at startup)
+#   shell/bin/shell.capnpc — compiled schema
 
 FROM gcr.io/distroless/static-debian12
 

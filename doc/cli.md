@@ -92,28 +92,47 @@ ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 
 ## ww shell
 
-Connect to a running node and open a Glia REPL.
+Connect to a running daemon and open a Glia REPL.
 
 ```
-ww shell [MULTIADDR] [--identity PATH]
+ww shell [ADDR] [--discover]
 ```
 
-The address is an optional positional argument:
+Today only the local-UDS path is implemented. The CLI surface for
+remote shell access is forward-stable but currently exits with
+`Error: NOT IMPLEMENTED`.
 
-- `/ip4/.../tcp/.../p2p/...` -- dial directly
-- `/dnsaddr/master.wetware.run` -- resolve via DNS TXT records
-- *(omitted)* -- auto-discover a local node via Kubo's LAN DHT
+- *(no args)* — connect to a local daemon over Unix Domain Socket at
+  `~/.ww/run/<peer-id>.sock`. Scans the run directories and prompts
+  if multiple daemons are running locally.
+- `<multiaddr>` — **NOT IMPLEMENTED.** Future libp2p remote dial.
+- `--discover` — **NOT IMPLEMENTED.** Future mDNS LAN browse.
+
+If both `<multiaddr>` and `--discover` are given, `<multiaddr>` takes
+precedence and `--discover` is ignored (documented for forward
+compatibility; today both exit `NOT IMPLEMENTED`).
 
 ### Examples
 
 ```sh
-ww shell                                    # auto-discover local node
-ww shell /dnsaddr/master.wetware.run        # connect to remote node
-ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...  # direct dial
-ww shell --identity ~/.ww/identity /dnsaddr/master.wetware.run
+ww shell                                    # local UDS, auto-discover
+ww shell /dnsaddr/master.wetware.run        # NOT IMPLEMENTED (clap parse OK)
+ww shell /ip4/127.0.0.1/tcp/2025            # NOT IMPLEMENTED (clap parse OK)
+ww shell garbage                            # clap parse error: invalid multiaddr
 ```
 
-See [shell.md](shell.md) for Glia syntax and capability reference.
+### Auth model
+
+The local UDS path is an admin endpoint. Filesystem permissions on
+`~/.ww/run/` (or `/var/run/ww/`) ARE the auth boundary — matching the
+convention of `/var/run/docker.sock`, `~/.ipfs/api`, and
+`~/.podman/podman.sock`. The spawned shell cell receives the daemon's
+full membrane, unattenuated. There is no Noise handshake, no Terminal
+challenge, no auth token. If you can write to the run dir, you can
+admin the daemon.
+
+See [shell.md](shell.md) for Glia syntax and the capabilities the
+shell cell exposes.
 
 ## ww push
 
