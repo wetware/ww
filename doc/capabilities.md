@@ -42,16 +42,16 @@ no fourth.
 |-------|------------------|------------------|
 | **Membrane graft** | RPC capabilities (`host`, `runtime`, `routing`, `identity`, `http-client`, plus `with`-block grants) | Edit the init.d `with` block; regraft |
 | **Root Atom binding** | The cell's root CID — the initial reachable content subgraph | Bind the cell to a different `stem::Atom`; respawn |
-| **Glia env bindings** | Which Glia functions are callable inside the cell (`fs/ls`, `routing/resolve`, etc.) | Edit init.d to bind/unbind names; re-eval |
+| **Glia env bindings** | Which capabilities are callable inside the cell (`fs`, `routing`, `host`, …) and via what names | Edit init.d to bind/unbind names; re-eval |
 
 The membrane graft is the canonical RPC surface
 (`src/rpc/membrane.rs:HostGraftBuilder`). The root Atom binding flows
 through `stem::Atom` — when the Atom's value changes, `CidTree`'s root
 swaps atomically (`src/vfs.rs:CidTree::swap_root`), and old CIDs the
 cell had cached in memory still resolve to whatever they pointed to,
-but new walks see the new tree. The Glia env layer is where stdlib
-modules like `ww/fs` and `ww/routing` are bound — restricting access
-at this layer is as simple as not importing the module.
+but new walks see the new tree. The Glia env layer is where capabilities
+like `fs`, `routing`, and `host` are bound — restricting access at this
+layer is as simple as not installing the handler.
 
 ## Capabilities exposed to grafted agents
 
@@ -82,13 +82,13 @@ on-chain head advances, forcing a re-graft.
 Cells do not receive an explicit filesystem capability over the
 membrane. Content access flows through the WASI virtual filesystem,
 which the host backs with `CidTree`. Glia code reaches it via the
-`ww/fs` stdlib module (`std/lib/ww/fs.glia`), which exposes:
+`fs` capability bound into the cell's env, invoked through `perform`:
 
-- `(fs/read path)` — bytes
-- `(fs/read-str path)` — UTF-8 string
-- `(fs/ls path)` — list of `{:name :size :type}` maps
-- `(fs/stat path)` — `{:size :type}`
-- `(fs/exists? path)` — bool, never raises on missing paths
+- `(perform fs :read path)` — bytes
+- `(perform fs :read-str path)` — UTF-8 string
+- `(perform fs :ls path)` — list of `{:name :size :type}` maps
+- `(perform fs :stat path)` — `{:size :type}`
+- `(perform fs :exists? path)` — bool, never raises on missing paths
 
 Path resolution (`std/caps/src/lib.rs:resolve_fs_path`): absolute paths
 including `/ipfs/<cid>` and `/ipns/<key>` pass through to the WASI VFS;
