@@ -90,6 +90,8 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
                 Some(epoch_rx.clone()),
                 None,
                 Some(stream_control),
+                None,
+                None,
                 CachePolicy::Shared,
                 ww::ipfs::HttpClient::new("http://localhost:5001".into()),
                 Vec::new(),

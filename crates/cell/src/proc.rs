@@ -212,6 +212,7 @@ struct ProcInit {
     env: Vec<String>,
     args: Vec<String>,
     bytecode: Vec<u8>,
+    component: Option<Arc<Component>>,
     loader: Option<Box<dyn Loader>>,
     engine: Option<Arc<Engine>>,
     stdin: BoxAsyncRead,
@@ -229,6 +230,7 @@ pub struct Builder {
     args: Vec<String>,
     wasm_debug: bool,
     bytecode: Option<Vec<u8>>,
+    component: Option<Arc<Component>>,
     loader: Option<Box<dyn Loader>>,
     engine: Option<Arc<Engine>>,
     stdin: Option<BoxAsyncRead>,
@@ -272,6 +274,7 @@ impl Builder {
             args: Vec::new(),
             wasm_debug: false,
             bytecode: None,
+            component: None,
             loader: None,
             engine: None,
             stdin: None,
@@ -305,6 +308,15 @@ impl Builder {
     /// Provide the component bytecode
     pub fn with_bytecode(mut self, bytecode: Vec<u8>) -> Self {
         self.bytecode = Some(bytecode);
+        self
+    }
+
+    /// Provide a pre-compiled component for this process.
+    ///
+    /// When set, `Proc::new` skips `Component::from_binary` and directly
+    /// instantiates this component on the provided engine.
+    pub fn with_component(mut self, component: Arc<Component>) -> Self {
+        self.component = Some(component);
         self
     }
 
@@ -419,6 +431,7 @@ impl Builder {
             env: self.env,
             args: self.args,
             bytecode,
+            component: self.component,
             loader: self.loader,
             engine: self.engine,
             stdin,
@@ -457,6 +470,7 @@ impl Proc {
             env,
             args,
             bytecode,
+            component,
             loader,
             engine,
             stdin,
@@ -641,18 +655,24 @@ impl Proc {
             Ok(())
         });
 
-        // Instantiate it as a normal component
+        // Instantiate it as a normal component.
         // TODO(perf): cache compiled components at ~/.ww/cache/<cid>.cwasm
-        // using Component::serialize() / Component::deserialize().  The CID
-        // (already known by the caller) is a natural cache key.  First run
+        // using Component::serialize() / Component::deserialize(). The CID
+        // (already known by the caller) is a natural cache key. First run
         // compiles and saves; subsequent runs load native code in milliseconds.
-        let start = std::time::Instant::now();
-        tracing::debug!("Compiling guest component");
-        let component = Component::from_binary(&engine, &bytecode)?;
-        tracing::debug!(
-            elapsed_ms = start.elapsed().as_millis(),
-            "Guest component compiled"
-        );
+        let component = if let Some(component) = component {
+            tracing::debug!("Using precompiled guest component");
+            component
+        } else {
+            let start = std::time::Instant::now();
+            tracing::debug!("Compiling guest component");
+            let compiled = Component::from_binary(&engine, &bytecode)?;
+            tracing::debug!(
+                elapsed_ms = start.elapsed().as_millis(),
+                "Guest component compiled"
+            );
+            Arc::new(compiled)
+        };
         let component_type = component.component_type();
         tracing::trace!(
             imports = component_type.imports(&engine).len(),

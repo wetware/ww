@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::host::SwarmCommand;
+use crate::services::CompileRequest;
 use cell::{proc::DataStreamHandles, Loader, ProcBuilder};
 use rpc::graft::GuestMembrane;
 use rpc::NetworkState;
@@ -71,6 +72,7 @@ pub struct CellBuilder {
     signing_key: Option<Arc<SigningKey>>,
     route_registry: Option<crate::dispatcher::server::RouteRegistry>,
     cache_policy: rpc::CachePolicy,
+    compile_tx: Option<mpsc::Sender<CompileRequest>>,
     /// Shared IPFS pin/content cache for CidTree file materialization.
     /// Every spawn turns this into a `CacheMode::Shared(pinset)` on the
     /// ProcBuilder — the inner cache is the host-wide pinset.
@@ -101,6 +103,7 @@ impl CellBuilder {
             signing_key: None,
             route_registry: None,
             cache_policy: rpc::CachePolicy::default(),
+            compile_tx: None,
             pinset_cache: None,
             suppress_stdin: false,
             ipfs_client: None,
@@ -219,6 +222,12 @@ impl CellBuilder {
         self
     }
 
+    /// Set the compilation service sender for `Runtime.load`.
+    pub fn with_compile_tx(mut self, tx: mpsc::Sender<CompileRequest>) -> Self {
+        self.compile_tx = Some(tx);
+        self
+    }
+
     /// Set the shared IPFS pin/content cache used by CidTree file materialization.
     ///
     /// Required when `with_cid_tree` is set; without it, reads of CID-backed
@@ -270,6 +279,7 @@ impl CellBuilder {
             signing_key: self.signing_key,
             route_registry: self.route_registry,
             cache_policy: self.cache_policy,
+            compile_tx: self.compile_tx,
             pinset_cache: self.pinset_cache,
             suppress_stdin: self.suppress_stdin,
             ipfs_client: self
@@ -303,6 +313,7 @@ pub struct Cell {
     pub signing_key: Option<Arc<SigningKey>>,
     pub route_registry: Option<crate::dispatcher::server::RouteRegistry>,
     pub cache_policy: rpc::CachePolicy,
+    pub compile_tx: Option<mpsc::Sender<CompileRequest>>,
     /// Shared IPFS pin/content cache for CidTree content materialization.
     /// Required when `cid_tree` is set; spawn wraps this in a
     /// `CacheMode::Shared` on the ProcBuilder so fs_intercept can fetch
@@ -368,6 +379,7 @@ impl Cell {
             signing_key: _,
             route_registry: _,
             cache_policy: _,
+            compile_tx: _,
             pinset_cache,
             suppress_stdin,
             ipfs_client: _,
@@ -517,8 +529,10 @@ impl Cell {
         let pre_epoch_rx = self.epoch_rx.take();
         let route_registry = self.route_registry.take();
         let cache_policy = self.cache_policy;
+        let compile_tx = self.compile_tx.clone();
         let ipfs_client = self.ipfs_client.clone();
         let http_dial = self.http_dial.clone();
+        let runtime_engine = self.wasmtime_engine.clone();
         let initial_epoch = self.initial_epoch.clone().unwrap_or(Epoch {
             seq: 0,
             head: vec![],
@@ -559,6 +573,8 @@ impl Cell {
             Some(epoch_rx.clone()),
             signing_key.clone(),
             Some(membrane_stream_control.clone()),
+            runtime_engine,
+            compile_tx,
             cache_policy,
             ipfs_client.clone(),
             http_dial.clone(),

@@ -101,6 +101,8 @@ async fn register_snap_route() -> mpsc::Sender<CgiRequest> {
         Some(epoch_rx.clone()),
         None,
         Some(stream_control),
+        None,
+        None,
         CachePolicy::Shared,
         ww::ipfs::HttpClient::new("http://localhost:5001".into()),
         Vec::new(),

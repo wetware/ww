@@ -64,6 +64,8 @@ async fn spawn_greeter_on_pool(
                     Some(epoch_rx),
                     None, // no signing key
                     Some(stream_control),
+                    None,
+                    None,
                     CachePolicy::Shared,
                     ww::ipfs::HttpClient::new("http://localhost:5001".into()),
                     Vec::new(), // no outbound HTTP access

@@ -42,6 +42,8 @@ fn setup_runtime() -> system_capnp::runtime::Client {
         None,
         None,
         None,
+        None,
+        None,
         CachePolicy::Shared,
         ww::ipfs::HttpClient::new("http://localhost:5001".into()),
         Vec::new(),

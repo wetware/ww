@@ -29,6 +29,7 @@ use ed25519_dalek::SigningKey;
 use crate::discovery;
 use crate::host::SwarmCommand;
 use crate::launcher::create_runtime_client;
+use crate::services::CompileRequest;
 use crate::services::Service;
 use crate::system_capnp;
 use rpc::{
@@ -61,6 +62,7 @@ pub struct AdminUdsService {
     pub ipfs_client: ipfs::HttpClient,
     pub http_dial: Vec<String>,
     pub cache_policy: CachePolicy,
+    pub compile_tx: Option<mpsc::Sender<CompileRequest>>,
 }
 
 impl Service for AdminUdsService {
@@ -121,6 +123,8 @@ impl AdminUdsService {
             Some(epoch_rx.clone()),
             self.signing_key.clone(),
             Some(self.stream_control.clone()),
+            None,
+            self.compile_tx.clone(),
             self.cache_policy,
             self.ipfs_client.clone(),
             self.http_dial.clone(),

@@ -61,6 +61,8 @@ async fn spawn_shell_on_pool(pool: &ExecutorPool) -> Result<shell_capnp::shell::
                     Some(epoch_rx),
                     None,
                     Some(stream_control),
+                    None,
+                    None,
                     CachePolicy::Shared,
                     ww::ipfs::HttpClient::new("http://localhost:5001".into()),
                     Vec::new(),
