@@ -76,6 +76,8 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
                 Some(epoch_rx),
                 None,
                 Some(stream_control),
+                None,
+                None,
                 CachePolicy::Shared,
                 ww::ipfs::HttpClient::new("http://localhost:5001".into()),
                 Vec::new(),

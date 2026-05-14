@@ -15,11 +15,12 @@ use capnp::capability::Promise;
 use capnp_rpc::pry;
 use futures::FutureExt;
 use tokio::io;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use ::membrane::EpochGuard;
 
 use crate::host::SwarmCommand;
+use crate::services::CompileRequest;
 use crate::system_capnp;
 use cell::proc::{Builder as ProcBuilder, FuelEstimator};
 use rpc::{
@@ -68,6 +69,10 @@ pub struct RuntimeImpl {
     /// ExecutorImpl so child cells receive the same Runtime through their
     /// membrane graft.
     self_client: Rc<RefCell<Option<system_capnp::runtime::Client>>>,
+    /// Shared Wasmtime engine for this runtime and all executors it creates.
+    engine: Arc<wasmtime::Engine>,
+    /// Optional compilation service channel.
+    compile_tx: Option<mpsc::Sender<CompileRequest>>,
     /// IPFS HTTP client for Kubo API calls (e.g. IPNS resolution via routing).
     ipfs_client: crate::ipfs::HttpClient,
     /// Allowed outbound HTTP hosts — inherited by child cells.
@@ -83,7 +88,11 @@ impl RuntimeImpl {
     }
 
     /// Create a new ExecutorImpl bound to the given bytecode and wrap it as a client.
-    fn make_executor(&self, bytecode: Arc<Vec<u8>>) -> system_capnp::executor::Client {
+    fn make_executor(
+        &self,
+        bytecode: Arc<Vec<u8>>,
+        component: Option<Arc<wasmtime::component::Component>>,
+    ) -> system_capnp::executor::Client {
         let runtime_client = self
             .self_client
             .borrow()
@@ -91,6 +100,8 @@ impl RuntimeImpl {
             .expect("runtime self-reference must be set (use create_runtime_client)");
         capnp_rpc::new_client(ExecutorImpl {
             bytecode,
+            component,
+            engine: self.engine.clone(),
             wasm_debug: self.wasm_debug,
             network_state: self.network_state.clone(),
             swarm_cmd_tx: self.swarm_cmd_tx.clone(),
@@ -103,6 +114,40 @@ impl RuntimeImpl {
             http_dial: self.http_dial.clone(),
         })
     }
+}
+
+fn build_wasmtime_engine() -> Arc<wasmtime::Engine> {
+    let mut wasm_config = wasmtime::Config::new();
+    wasm_config.async_support(true);
+    wasm_config.consume_fuel(true);
+    wasm_config.epoch_interruption(true);
+    Arc::new(wasmtime::Engine::new(&wasm_config).expect("failed to create wasmtime engine"))
+}
+
+async fn compile_with_service(
+    compile_tx: Option<mpsc::Sender<CompileRequest>>,
+    engine: Arc<wasmtime::Engine>,
+    bytecode: Arc<Vec<u8>>,
+) -> Result<Option<Arc<wasmtime::component::Component>>, capnp::Error> {
+    let Some(tx) = compile_tx else {
+        return Ok(None);
+    };
+
+    let (result_tx, result_rx) = oneshot::channel();
+    tx.send(CompileRequest {
+        bytecode: (*bytecode).clone(),
+        engine,
+        result_tx,
+    })
+    .await
+    .map_err(|_| capnp::Error::failed("compilation service unavailable".into()))?;
+
+    let component = result_rx
+        .await
+        .map_err(|_| capnp::Error::failed("compilation worker dropped request".into()))?
+        .map_err(|err| capnp::Error::failed(err.to_string()))?;
+
+    Ok(Some(Arc::new(component)))
 }
 
 /// Create a RuntimeImpl, wrap it as a client, and inject the self-reference.
@@ -119,6 +164,8 @@ pub fn create_runtime_client(
     epoch_rx: Option<tokio::sync::watch::Receiver<::membrane::Epoch>>,
     signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
     stream_control: Option<libp2p_stream::Control>,
+    engine: Option<Arc<wasmtime::Engine>>,
+    compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
     ipfs_client: crate::ipfs::HttpClient,
     http_dial: Vec<String>,
@@ -135,6 +182,8 @@ pub fn create_runtime_client(
         cache_policy,
         executor_cache: RefCell::new(HashMap::new()),
         self_client: self_client.clone(),
+        engine: engine.unwrap_or_else(build_wasmtime_engine),
+        compile_tx,
         ipfs_client,
         http_dial,
     };
@@ -188,29 +237,45 @@ impl system_capnp::runtime::Server for RuntimeImpl {
         }
 
         let key = *blake3::hash(&wasm).as_bytes();
+        let bytecode = Arc::new(wasm);
+        let compile_tx = self.compile_tx.clone();
+        let engine = self.engine.clone();
+        let server = self.clone();
 
-        let executor = match self.cache_policy {
-            CachePolicy::Shared => {
-                // Check cache with a short-lived borrow to avoid overlap with borrow_mut below.
-                let cached = self.executor_cache.borrow().get(&key).cloned();
-                if let Some(client) = cached {
-                    tracing::debug!(?key, "runtime.load: executor cache hit (shared)");
-                    client
-                } else {
-                    tracing::debug!(?key, "runtime.load: executor cache miss, creating");
-                    let client = self.make_executor(Arc::new(wasm));
-                    self.executor_cache.borrow_mut().insert(key, client.clone());
-                    client
+        Promise::from_future(async move {
+            let executor = match server.cache_policy {
+                CachePolicy::Shared => {
+                    let cached = server.executor_cache.borrow().get(&key).cloned();
+                    if let Some(client) = cached {
+                        tracing::debug!(?key, "runtime.load: executor cache hit (shared)");
+                        client
+                    } else {
+                        tracing::debug!(?key, "runtime.load: executor cache miss, creating");
+                        let component = compile_with_service(
+                            compile_tx.clone(),
+                            engine.clone(),
+                            bytecode.clone(),
+                        )
+                        .await?;
+                        let client = server.make_executor(bytecode.clone(), component);
+                        server
+                            .executor_cache
+                            .borrow_mut()
+                            .insert(key, client.clone());
+                        client
+                    }
                 }
-            }
-            CachePolicy::Isolated => {
-                tracing::debug!(?key, "runtime.load: creating isolated executor");
-                self.make_executor(Arc::new(wasm))
-            }
-        };
+                CachePolicy::Isolated => {
+                    tracing::debug!(?key, "runtime.load: creating isolated executor");
+                    let component =
+                        compile_with_service(compile_tx, engine, bytecode.clone()).await?;
+                    server.make_executor(bytecode, component)
+                }
+            };
 
-        results.get().set_executor(executor);
-        Promise::ok(())
+            results.get().set_executor(executor);
+            Ok(())
+        })
     }
 
     fn shutdown(
@@ -236,6 +301,8 @@ impl system_capnp::runtime::Server for RuntimeImpl {
 /// REQUEST_METHOD, PATH_INFO, etc.).
 pub struct ExecutorImpl {
     bytecode: Arc<Vec<u8>>,
+    component: Option<Arc<wasmtime::component::Component>>,
+    engine: Arc<wasmtime::Engine>,
     wasm_debug: bool,
     network_state: NetworkState,
     swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
@@ -315,6 +382,8 @@ impl system_capnp::executor::Server for ExecutorImpl {
         };
 
         let bytecode = self.bytecode.clone();
+        let component = self.component.clone();
+        let engine = self.engine.clone();
         let wasm_debug = self.wasm_debug;
         let network_state = self.network_state.clone();
         let swarm_cmd_tx = self.swarm_cmd_tx.clone();
@@ -336,11 +405,15 @@ impl system_capnp::executor::Server for ExecutorImpl {
             // stdin/stdout semantics vary by cell type (wire protocol, CGI,
             // or shutdown signal), but the WIT membrane channel is universal.
             let mut proc_builder = ProcBuilder::new()
+                .with_engine(engine)
                 .with_env(env)
                 .with_args(args)
                 .with_wasm_debug(wasm_debug)
                 .with_bytecode((*bytecode).clone())
                 .with_stdio(guest_stdin, guest_stdout, guest_stderr);
+            if let Some(component) = component {
+                proc_builder = proc_builder.with_component(component);
+            }
             if let Some(est) = fuel_estimator {
                 proc_builder = proc_builder.with_fuel_estimator(est);
             }

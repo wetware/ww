@@ -1403,6 +1403,15 @@ wasip2::cli::command::export!({iface_name}Guest);
         let executor_pool =
             ww::services::ExecutorPool::new(executor_threads, supervisor.shutdown_rx());
 
+        // Compilation service: offload component compilation from executor workers.
+        let (compile_tx, compile_rx) = tokio::sync::mpsc::channel(64);
+        supervisor.spawn(
+            "compiler",
+            ww::services::CompilationService {
+                request_rx: compile_rx,
+            },
+        );
+
         // WAGI HTTP server thread (only when --http-listen is provided).
         let route_registry = if let Some(ref addr) = http_listen {
             let listen_addr: std::net::SocketAddr = addr
@@ -1506,6 +1515,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                     ipfs_client: ipfs_client.clone(),
                     http_dial: http_dial.clone(),
                     cache_policy,
+                    compile_tx: Some(compile_tx.clone()),
                 },
             );
         }
@@ -1519,6 +1529,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             .with_pinset_cache(pinset_cache.clone())
             .with_signing_key(signing_key.clone())
             .with_cache_policy(cache_policy)
+            .with_compile_tx(compile_tx.clone())
             .with_wasmtime_engine(executor_pool.engine())
             .with_suppress_stdin(mcp)
             .with_ipfs_client(ipfs_client.clone())
@@ -1584,6 +1595,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                 .with_pinset_cache(pinset_cache.clone())
                 .with_signing_key(signing_key)
                 .with_cache_policy(cache_policy)
+                .with_compile_tx(compile_tx)
                 .with_wasmtime_engine(executor_pool.engine())
                 .with_ipfs_client(ipfs_client)
                 .build();
