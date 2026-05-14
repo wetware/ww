@@ -55,6 +55,18 @@ async fn test_reorg_indexer_false_positive_finalizer_filters() {
 
     let current_block = eth_block_number(&rpc_url).await.expect("eth_block_number");
     let ws_url = rpc_url
+// FIX: 安全检查 — 防止目录穿越
+// FIX: 安全检查 — 防止目录穿越
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
+
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
+
         .replace("http://", "ws://")
         .replace("https://", "wss://");
     let config = IndexerConfig {
