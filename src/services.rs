@@ -13,10 +13,11 @@
 //! a synchronous rustls TLS handshake with Ed25519 verification) distribute
 //! across worker threads instead of serializing onto one. See `doc/runtimes.md`.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -552,18 +553,55 @@ pub struct CompileRequest {
     pub result_tx: tokio::sync::oneshot::Sender<Result<wasmtime::component::Component>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct CompileKey {
+    wasm_hash: [u8; 32],
+    engine_id: usize,
+}
+
+impl CompileKey {
+    fn new(bytecode: &[u8], engine: &Arc<wasmtime::Engine>) -> Self {
+        Self {
+            wasm_hash: *blake3::hash(bytecode).as_bytes(),
+            engine_id: Arc::as_ptr(engine) as usize,
+        }
+    }
+}
+
+struct CompileJob {
+    key: CompileKey,
+    bytecode: Vec<u8>,
+    engine: Arc<wasmtime::Engine>,
+}
+
+struct CompileOutcome {
+    key: CompileKey,
+    result: std::result::Result<wasmtime::component::Component, String>,
+}
+
+fn default_compile_workers() -> usize {
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    (cpu_count / 2).clamp(1, 4)
+}
+
+fn compile_worker_count() -> usize {
+    match std::env::var("WW_COMPILE_WORKERS") {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or_else(default_compile_workers),
+        Err(_) => default_compile_workers(),
+    }
+}
+
 /// Dedicated compilation thread that offloads CPU-heavy `Component::from_binary`
 /// away from executor worker threads.
 ///
-/// Caches compiled components by `(wasm_cid, engine_config)` to avoid
-/// recompilation of the same bytecode. The cache key includes an engine
-/// config fingerprint so different `wasm_debug` settings don't collide.
-///
-/// # Integration (TODO)
-///
-/// ProcBuilder needs a `with_component(Component)` method to accept
-/// pre-compiled components. Until then, compilation still happens inline
-/// on executor threads. This struct is ready to wire in.
+/// Caches compiled components by `(wasm_blake3, engine identity)` and deduplicates
+/// concurrent compiles of the same key.
 pub struct CompilationService {
     pub request_rx: mpsc::Receiver<CompileRequest>,
 }
@@ -577,46 +615,150 @@ impl Service for CompilationService {
 
         rt.block_on(async move {
             let mut rx = self.request_rx;
-            let mut cache: std::collections::HashMap<[u8; 32], wasmtime::component::Component> =
-                std::collections::HashMap::new();
+            let mut cache: HashMap<CompileKey, wasmtime::component::Component> = HashMap::new();
+            let mut inflight: HashMap<
+                CompileKey,
+                Vec<tokio::sync::oneshot::Sender<Result<wasmtime::component::Component>>>,
+            > = HashMap::new();
+
+            let worker_count = compile_worker_count();
+            tracing::info!(workers = worker_count, "starting compile worker pool");
+
+            let (job_tx, job_rx) = std::sync::mpsc::channel::<CompileJob>();
+            let job_rx = Arc::new(Mutex::new(job_rx));
+            let (outcome_tx, mut outcome_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut worker_handles = Vec::with_capacity(worker_count);
+
+            for idx in 0..worker_count {
+                let job_rx = Arc::clone(&job_rx);
+                let outcome_tx = outcome_tx.clone();
+                let handle = std::thread::Builder::new()
+                    .name(format!("compiler-worker-{idx}"))
+                    .spawn(move || {
+                        loop {
+                            let recv_result = {
+                                let lock = job_rx
+                                    .lock()
+                                    .expect("compile worker queue lock poisoned");
+                                lock.recv()
+                            };
+
+                            let job = match recv_result {
+                                Ok(job) => job,
+                                Err(_) => break, // service dropped sender; time to exit
+                            };
+
+                            let start = std::time::Instant::now();
+                            let result = wasmtime::component::Component::from_binary(
+                                &job.engine,
+                                &job.bytecode,
+                            )
+                            .map_err(|e| e.to_string());
+                            if let Ok(ref _component) = result {
+                                tracing::info!(
+                                    ?job.key.wasm_hash,
+                                    engine_id = job.key.engine_id,
+                                    elapsed_ms = start.elapsed().as_millis(),
+                                    "compiled component"
+                                );
+                            }
+
+                            if outcome_tx
+                                .send(CompileOutcome {
+                                    key: job.key,
+                                    result,
+                                })
+                                .is_err()
+                            {
+                                break; // service loop exited
+                            }
+                        }
+                    })
+                    .expect("failed to spawn compile worker thread");
+                worker_handles.push(handle);
+            }
+            drop(outcome_tx);
 
             loop {
                 tokio::select! {
                     req = rx.recv() => match req {
                         Some(req) => {
-                            let cid = blake3::hash(&req.bytecode);
-                            let key = *cid.as_bytes();
-
-                            let result = if let Some(component) = cache.get(&key) {
-                                tracing::debug!(?cid, "compilation cache hit");
-                                Ok(component.clone())
+                            let key = CompileKey::new(&req.bytecode, &req.engine);
+                            if let Some(component) = cache.get(&key) {
+                                tracing::debug!(
+                                    ?key.wasm_hash,
+                                    engine_id = key.engine_id,
+                                    "compilation cache hit"
+                                );
+                                let _ = req.result_tx.send(Ok(component.clone()));
+                            } else if let Some(waiters) = inflight.get_mut(&key) {
+                                tracing::debug!(
+                                    ?key.wasm_hash,
+                                    engine_id = key.engine_id,
+                                    waiters = waiters.len() + 1,
+                                    "compilation inflight dedupe"
+                                );
+                                waiters.push(req.result_tx);
                             } else {
-                                tracing::debug!(?cid, "compilation cache miss, compiling");
-                                let start = std::time::Instant::now();
-                                match wasmtime::component::Component::from_binary(
-                                    &req.engine,
-                                    &req.bytecode,
-                                ) {
-                                    Ok(component) => {
-                                        tracing::info!(
-                                            ?cid,
-                                            elapsed_ms = start.elapsed().as_millis(),
-                                            "compiled component"
-                                        );
-                                        cache.insert(key, component.clone());
-                                        Ok(component)
+                                inflight.insert(key, vec![req.result_tx]);
+                                if job_tx
+                                    .send(CompileJob {
+                                        key,
+                                        bytecode: req.bytecode,
+                                        engine: req.engine,
+                                    })
+                                    .is_err()
+                                {
+                                    if let Some(waiters) = inflight.remove(&key) {
+                                        for waiter in waiters {
+                                            let _ = waiter.send(Err(anyhow::anyhow!(
+                                                "compilation worker pool unavailable"
+                                            )));
+                                        }
                                     }
-                                    Err(e) => Err(e),
                                 }
-                            };
-
-                            let _ = req.result_tx.send(result);
+                            }
                         }
                         None => break,
                     },
+                    maybe_outcome = outcome_rx.recv() => {
+                        match maybe_outcome {
+                            Some(outcome) => {
+                                if let Some(waiters) = inflight.remove(&outcome.key) {
+                                    match outcome.result {
+                                        Ok(component) => {
+                                            cache.insert(outcome.key, component.clone());
+                                            for waiter in waiters {
+                                                let _ = waiter.send(Ok(component.clone()));
+                                            }
+                                        }
+                                        Err(err) => {
+                                            for waiter in waiters {
+                                                let _ = waiter.send(Err(anyhow::anyhow!(err.clone())));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None => break,
+                        }
+                    }
                     _ = shutdown.changed() => break,
                 }
             }
+
+            drop(job_tx);
+            for handle in worker_handles {
+                if let Err(panic) = handle.join() {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("<non-string panic>");
+                    tracing::error!(panic = msg, "compile worker thread panicked");
+                }
+            }
+
             tracing::info!("compilation service shutting down");
             Ok(())
         })
