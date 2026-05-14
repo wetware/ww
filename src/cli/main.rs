@@ -9,6 +9,9 @@ use tokio::sync::watch;
 
 use libp2p::Multiaddr;
 
+mod daemon_cmd;
+mod doctor_cmd;
+mod ns_cmd;
 mod shell;
 
 use ww::cell::image;
@@ -1121,264 +1124,12 @@ wasip2::cli::command::export!({iface_name}Guest);
         images: Vec<String>,
         quiet: bool,
     ) -> Result<()> {
-        let home = dirs::home_dir().context("cannot determine home directory")?;
-        let ww_dir = home.join(".ww");
-
-        // 1. Resolve identity path — default to ~/.ww/identity.
-        let key_path = identity.unwrap_or_else(|| ww_dir.join("identity"));
-
-        // Generate key if it doesn't exist.
-        if !key_path.exists() {
-            let sk = ww::keys::generate()?;
-            ww::keys::save(&sk, &key_path)?;
-
-            if !quiet {
-                let kp = ww::keys::to_libp2p(&sk)?;
-                eprintln!("Generated new identity: {}", key_path.display());
-                eprintln!("  Peer ID:     {}", kp.public().to_peer_id());
-            }
-        } else if !quiet {
-            eprintln!("Using existing identity: {}", key_path.display());
-        }
-
-        // 2. Build config: load existing, override with CLI flags.
-        let config_path = ww::daemon_config::default_config_path();
-        let mut config = ww::daemon_config::load(&config_path)?;
-
-        if !listen.is_empty() {
-            config.listen = listen.iter().map(|a| a.to_string()).collect();
-        }
-        config.identity = Some(key_path.clone());
-        if !images.is_empty() {
-            config.images = images.iter().map(PathBuf::from).collect();
-        }
-        // Default WAGI HTTP listener so the install layer's status init.d
-        // (etc/init.d/05-status.glia) responds to curl on first boot.
-        // Already-configured addresses are preserved.
-        if config.http_listen.is_none() {
-            config.http_listen = Some("127.0.0.1:2080".into());
-        }
-
-        // 3. Write config.
-        config.write(&config_path)?;
-        if !quiet {
-            eprintln!("Wrote config: {}", config_path.display());
-        }
-
-        // 4. Write platform service file.
-        let ww_bin = std::env::current_exe().context("cannot determine ww binary path")?;
-        Self::write_service_file(&ww_bin, &config, &home, quiet)?;
-
-        Ok(())
+        daemon_cmd::daemon_install(identity, listen, images, quiet).await
     }
 
     /// Remove the platform service file.
     async fn daemon_uninstall() -> Result<()> {
-        let home = dirs::home_dir().context("cannot determine home directory")?;
-
-        if cfg!(target_os = "macos") {
-            let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
-            if plist_path.exists() {
-                std::fs::remove_file(&plist_path)
-                    .with_context(|| format!("remove {}", plist_path.display()))?;
-                eprintln!("Removed: {}", plist_path.display());
-                eprintln!();
-                eprintln!("If the service is running, stop it with:");
-                eprintln!("  launchctl unload {}", plist_path.display());
-            } else {
-                eprintln!("No service file found at: {}", plist_path.display());
-            }
-        } else if cfg!(target_os = "linux") {
-            let unit_path = home.join(".config/systemd/user/ww.service");
-            if unit_path.exists() {
-                std::fs::remove_file(&unit_path)
-                    .with_context(|| format!("remove {}", unit_path.display()))?;
-                eprintln!("Removed: {}", unit_path.display());
-                eprintln!();
-                eprintln!("If the service is running, stop it with:");
-                eprintln!("  systemctl --user disable --now ww");
-            } else {
-                eprintln!("No service file found at: {}", unit_path.display());
-            }
-        } else {
-            bail!("unsupported platform; only macOS and Linux are supported");
-        }
-
-        Ok(())
-    }
-
-    /// Write a platform-specific service file and print the activation command.
-    fn write_service_file(
-        ww_bin: &Path,
-        config: &ww::daemon_config::DaemonConfig,
-        home: &Path,
-        quiet: bool,
-    ) -> Result<()> {
-        // Identity as a --identity CLI flag (NOT a :/etc/identity mount).
-        // The host reads it to create the signing key; it never enters
-        // the merged FHS tree visible to guests.
-        let identity_path = config
-            .identity
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| home.join(".ww/identity").display().to_string());
-
-        if cfg!(target_os = "macos") {
-            Self::write_launchd_plist(ww_bin, config, home, &identity_path, quiet)
-        } else if cfg!(target_os = "linux") {
-            Self::write_systemd_unit(ww_bin, config, home, &identity_path, quiet)
-        } else {
-            bail!("unsupported platform; only macOS and Linux are supported")
-        }
-    }
-
-    /// Write a macOS launchd plist.
-    fn write_launchd_plist(
-        ww_bin: &Path,
-        config: &ww::daemon_config::DaemonConfig,
-        home: &Path,
-        identity_path: &str,
-        quiet: bool,
-    ) -> Result<()> {
-        let plist_dir = home.join("Library/LaunchAgents");
-        std::fs::create_dir_all(&plist_dir).context("create ~/Library/LaunchAgents")?;
-
-        let plist_path = plist_dir.join("io.wetware.ww.plist");
-
-        let log_dir = home.join(".ww/logs");
-        std::fs::create_dir_all(&log_dir).context("create ~/.ww/logs")?;
-        let log_path = log_dir.join("ww.log");
-
-        // Build ProgramArguments array entries.
-        let mut args = vec![
-            format!("        <string>{}</string>", ww_bin.display()),
-            "        <string>run</string>".to_string(),
-        ];
-        for addr in &config.listen {
-            args.push("        <string>--listen</string>".to_string());
-            args.push(format!("        <string>{addr}</string>"));
-        }
-        // Identity as a --identity flag (host-side only, not a guest mount).
-        args.push("        <string>--identity</string>".to_string());
-        args.push(format!("        <string>{identity_path}</string>"));
-        // WAGI HTTP listen addr (engagement starter kit: status endpoint on :2080).
-        if let Some(ref addr) = config.http_listen {
-            args.push("        <string>--http-listen</string>".to_string());
-            args.push(format!("        <string>{addr}</string>"));
-        }
-        // Image layers (root mounts).
-        for img in &config.images {
-            args.push(format!("        <string>{}</string>", img.display()));
-        }
-
-        let plist = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>io.wetware.ww</string>
-    <key>ProgramArguments</key>
-    <array>
-{args}
-    </array>
-    <key>StandardOutPath</key>
-    <string>{log}</string>
-    <key>StandardErrorPath</key>
-    <string>{log}</string>
-    <key>KeepAlive</key>
-    <true/>
-    <key>RunAtLoad</key>
-    <false/>
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>NumberOfFiles</key>
-        <integer>4096</integer>
-    </dict>
-</dict>
-</plist>
-"#,
-            args = args.join("\n"),
-            log = log_path.display(),
-        );
-
-        std::fs::write(&plist_path, plist)
-            .with_context(|| format!("write plist: {}", plist_path.display()))?;
-        if !quiet {
-            eprintln!("Wrote service: {}", plist_path.display());
-            eprintln!();
-            eprintln!("Activate with:");
-            eprintln!("  launchctl load {}", plist_path.display());
-        }
-
-        Ok(())
-    }
-
-    /// Write a Linux systemd user unit.
-    fn write_systemd_unit(
-        ww_bin: &Path,
-        config: &ww::daemon_config::DaemonConfig,
-        home: &Path,
-        identity_path: &str,
-        quiet: bool,
-    ) -> Result<()> {
-        let unit_dir = home.join(".config/systemd/user");
-        std::fs::create_dir_all(&unit_dir).context("create ~/.config/systemd/user")?;
-
-        let unit_path = unit_dir.join("ww.service");
-
-        // Build positional args: image layers only (identity is a flag, not a mount).
-        let mut positional = Vec::new();
-        for img in &config.images {
-            positional.push(img.display().to_string());
-        }
-
-        let listen_args: String = config
-            .listen
-            .iter()
-            .map(|a| format!("--listen {a}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let http_listen_arg = match &config.http_listen {
-            Some(addr) => format!(" --http-listen {addr}"),
-            None => String::new(),
-        };
-        let exec_start = format!(
-            "{} run {} --identity {}{} {}",
-            ww_bin.display(),
-            listen_args,
-            identity_path,
-            http_listen_arg,
-            positional.join(" "),
-        );
-
-        let unit = format!(
-            "[Unit]\n\
-             Description=Wetware daemon\n\
-             After=network-online.target\n\
-             Wants=network-online.target\n\
-             \n\
-             [Service]\n\
-             Type=simple\n\
-             ExecStart={exec_start}\n\
-             Restart=on-failure\n\
-             RestartSec=5\n\
-             \n\
-             [Install]\n\
-             WantedBy=default.target\n"
-        );
-
-        std::fs::write(&unit_path, unit)
-            .with_context(|| format!("write unit: {}", unit_path.display()))?;
-        if !quiet {
-            eprintln!("Wrote service: {}", unit_path.display());
-            eprintln!();
-            eprintln!("Activate with:");
-            eprintln!("  systemctl --user enable --now ww");
-        }
-
-        Ok(())
+        daemon_cmd::daemon_uninstall().await
     }
 
     /// Run a wetware environment from parsed mounts.
@@ -2842,353 +2593,30 @@ wasip2::cli::command::export!({iface_name}Guest);
     /// List configured namespaces from ~/.ww/etc/ns/.
     #[allow(clippy::unused_async)]
     async fn ns_list() -> Result<()> {
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let ns_dir = home.join(".ww/etc/ns");
-        let configs = ww::ns::list_configs(&ns_dir)?;
-        if configs.is_empty() {
-            println!("No namespaces configured.");
-            println!("  Add one: ww ns add <name> --ipns <key>");
-            return Ok(());
-        }
-        println!("{:<12} {:<24} {:<24} PATH", "NAME", "IPNS", "BOOTSTRAP");
-        println!("{:<12} {:<24} {:<24} ----", "----", "----", "---------");
-        for config in &configs {
-            let ipns = if config.ipns.is_empty() {
-                "-".to_string()
-            } else {
-                config.ipns.clone()
-            };
-            let bootstrap = if config.bootstrap.is_empty() {
-                "-".to_string()
-            } else {
-                config.bootstrap.clone()
-            };
-            let path = config.ipfs_path().unwrap_or_else(|| "-".to_string());
-            println!("{:<12} {:<24} {:<24} {path}", config.name, ipns, bootstrap);
-        }
-        Ok(())
+        ns_cmd::ns_list().await
     }
 
     /// Add or update a namespace config.
     #[allow(clippy::unused_async)]
     async fn ns_add(name: String, ipns: Option<String>, bootstrap: Option<String>) -> Result<()> {
-        ww::ns::validate_name(&name)?;
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let ns_dir = home.join(".ww/etc/ns");
-        std::fs::create_dir_all(&ns_dir)?;
-        let ns_path = ns_dir.join(&name);
-
-        // Read existing config if present, then overlay provided values.
-        let mut config = if ns_path.exists() {
-            let content = std::fs::read_to_string(&ns_path)?;
-            ww::ns::NamespaceConfig::parse(&name, &content)
-        } else {
-            ww::ns::NamespaceConfig {
-                name: name.clone(),
-                ipns: String::new(),
-                bootstrap: String::new(),
-            }
-        };
-
-        if let Some(key) = ipns {
-            config.ipns = key;
-        }
-        if let Some(cid) = bootstrap {
-            config.bootstrap = cid;
-        }
-
-        if config.ipns.is_empty() && config.bootstrap.is_empty() {
-            bail!("At least one of --ipns or --bootstrap is required");
-        }
-
-        config.write_to(&ns_path)?;
-        println!("Namespace '{name}' configured at {}", ns_path.display());
-        Ok(())
+        ns_cmd::ns_add(name, ipns, bootstrap).await
     }
 
     /// Remove a namespace config.
     #[allow(clippy::unused_async)]
     async fn ns_remove(name: String) -> Result<()> {
-        ww::ns::validate_name(&name)?;
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let ns_path = home.join(".ww/etc/ns").join(&name);
-        if ns_path.exists() {
-            std::fs::remove_file(&ns_path)?;
-            println!("Namespace '{name}' removed.");
-        } else {
-            println!("Namespace '{name}' not found.");
-        }
-        Ok(())
+        ns_cmd::ns_remove(name).await
     }
 
     /// Resolve a namespace to its current IPFS CID.
     async fn ns_resolve(name: String) -> Result<()> {
-        ww::ns::validate_name(&name)?;
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let ns_path = home.join(".ww/etc/ns").join(&name);
-        if !ns_path.exists() {
-            bail!("Namespace '{name}' not configured. Run: ww ns add {name} --ipns <key>");
-        }
-        let content = std::fs::read_to_string(&ns_path)?;
-        let config = ww::ns::NamespaceConfig::parse(&name, &content);
-
-        // Try IPNS resolution
-        if !config.ipns.is_empty() {
-            let ipfs_client = ipfs::HttpClient::new("http://localhost:5001".into());
-            let ipns_path = format!("/ipns/{}", config.ipns);
-            match ipfs_client.name_resolve(&ipns_path).await {
-                Ok(resolved) => {
-                    println!("{resolved}");
-                    return Ok(());
-                }
-                Err(e) => {
-                    eprintln!("IPNS resolution failed: {e}");
-                    eprintln!("Falling back to bootstrap CID...");
-                }
-            }
-        }
-
-        // Fall back to bootstrap
-        if !config.bootstrap.is_empty() {
-            let path = if config.bootstrap.starts_with("/ipfs/") {
-                config.bootstrap.clone()
-            } else {
-                format!("/ipfs/{}", config.bootstrap)
-            };
-            println!("{path}");
-        } else {
-            bail!("Namespace '{name}' has no IPNS name or bootstrap CID");
-        }
-
-        Ok(())
+        ns_cmd::ns_resolve(name).await
     }
 
     /// Check the development environment.
     #[allow(clippy::unused_async)]
     async fn doctor() -> Result<()> {
-        let mut all_required_ok = true;
-
-        // Required: Rust toolchain
-        let rustc = std::process::Command::new("rustc")
-            .arg("--version")
-            .output();
-        match rustc {
-            Ok(out) if out.status.success() => {
-                let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                println!("  Rust toolchain .............. OK ({ver})");
-            }
-            _ => {
-                println!("  Rust toolchain .............. MISSING");
-                println!("    Fix: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh");
-                all_required_ok = false;
-            }
-        }
-
-        // Required: wasm32-wasip2 target
-        let targets = std::process::Command::new("rustup")
-            .args(["target", "list", "--installed"])
-            .output();
-        match targets {
-            Ok(out) if out.status.success() => {
-                let list = String::from_utf8_lossy(&out.stdout);
-                if list.contains("wasm32-wasip2") {
-                    println!("  wasm32-wasip2 target ........ OK");
-                } else {
-                    println!("  wasm32-wasip2 target ........ MISSING");
-                    println!("    Fix: rustup target add wasm32-wasip2");
-                    all_required_ok = false;
-                }
-            }
-            _ => {
-                println!("  wasm32-wasip2 target ........ UNKNOWN (rustup not found)");
-                all_required_ok = false;
-            }
-        }
-
-        // Required: Cargo
-        let cargo = std::process::Command::new("cargo")
-            .arg("--version")
-            .output();
-        match cargo {
-            Ok(out) if out.status.success() => {
-                let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                println!("  Cargo ....................... OK ({ver})");
-            }
-            _ => {
-                println!("  Cargo ....................... MISSING");
-                all_required_ok = false;
-            }
-        }
-
-        // Optional: Kubo
-        let ipfs = std::process::Command::new("ipfs").arg("version").output();
-        match ipfs {
-            Ok(out) if out.status.success() => {
-                let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                println!("  Kubo (IPFS) ................. OK ({ver})");
-            }
-            _ => {
-                println!("  Kubo (IPFS) ................. NOT FOUND (optional)");
-            }
-        }
-
-        // Optional: Ollama
-        let ollama = std::process::Command::new("ollama")
-            .arg("--version")
-            .output();
-        match ollama {
-            Ok(out) if out.status.success() => {
-                let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                println!("  Ollama ...................... OK ({ver})");
-            }
-            _ => {
-                println!("  Ollama ...................... NOT FOUND (optional)");
-            }
-        }
-
-        // --- Install state checks ---
-        println!();
-        println!("Install state:");
-
-        let home = dirs::home_dir();
-        let ww_dir = home.as_ref().map(|h| h.join(".ww"));
-
-        // ~/.ww directory
-        match &ww_dir {
-            Some(d) if d.exists() => {
-                println!("  ~/.ww ....................... OK");
-            }
-            _ => {
-                println!("  ~/.ww ....................... NOT FOUND (run: ww perform install)");
-            }
-        }
-
-        // Identity
-        match &ww_dir {
-            Some(d) if d.join("identity").exists() => {
-                println!("  ~/.ww/identity .............. OK");
-            }
-            _ => {
-                println!("  ~/.ww/identity .............. NOT FOUND");
-            }
-        }
-
-        // Daemon registered
-        if let Some(ref h) = home {
-            let plist = h.join("Library/LaunchAgents/io.wetware.ww.plist");
-            let systemd = h.join(".config/systemd/user/ww.service");
-            if plist.exists() || systemd.exists() {
-                // Check if daemon is actually running.
-                let running = if cfg!(target_os = "macos") {
-                    std::process::Command::new("launchctl")
-                        .args(["list", "io.wetware.ww"])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-                } else {
-                    std::process::Command::new("systemctl")
-                        .args(["--user", "is-active", "--quiet", "ww"])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-                };
-                if running {
-                    println!("  Background daemon ........... RUNNING");
-                } else {
-                    println!("  Background daemon ........... REGISTERED (not running)");
-                    if cfg!(target_os = "macos") {
-                        println!("    Start: launchctl load {}", plist.display());
-                    } else {
-                        println!("    Start: systemctl --user start ww");
-                    }
-                }
-            } else {
-                println!(
-                    "  Background daemon ........... NOT REGISTERED (run: ww perform install)"
-                );
-            }
-        }
-
-        // Claude Code MCP
-        let claude_check = std::process::Command::new("claude")
-            .args(["mcp", "list"])
-            .output();
-        match claude_check {
-            Ok(out) if out.status.success() => {
-                let list = String::from_utf8_lossy(&out.stdout);
-                if list.contains("wetware") {
-                    println!("  Claude Code MCP ............. CONFIGURED");
-                } else {
-                    println!("  Claude Code MCP ............. NOT CONFIGURED");
-                    println!("    Fix: claude mcp add wetware -- ww run --mcp");
-                }
-            }
-            _ => {
-                println!("  Claude Code MCP ............. UNKNOWN (claude CLI not found)");
-            }
-        }
-
-        // --- Namespace checks ---
-        println!();
-        println!("Namespaces:");
-
-        // Check ~/.ww/etc/ns/ exists and has entries
-        let ns_dir = ww_dir.as_ref().map(|d| d.join("etc/ns"));
-        match &ns_dir {
-            Some(d) if d.is_dir() => match ww::ns::list_configs(d) {
-                Ok(configs) if configs.is_empty() => {
-                    println!("  ~/.ww/etc/ns/ ............... EMPTY (no namespaces configured)");
-                    println!("    Fix: ww perform install (or: ww ns add ww --ipns <key>)");
-                }
-                Ok(configs) => {
-                    for config in &configs {
-                        let source = if !config.ipns.is_empty() {
-                            format!("ipns={}", &config.ipns[..config.ipns.len().min(20)])
-                        } else if !config.bootstrap.is_empty() {
-                            format!(
-                                "bootstrap={}",
-                                &config.bootstrap[..config.bootstrap.len().min(20)]
-                            )
-                        } else {
-                            "unconfigured".to_string()
-                        };
-                        println!("  ns/{} {:<22} OK ({})", config.name, ".", source);
-                    }
-                }
-                Err(_) => {
-                    println!("  ~/.ww/etc/ns/ ............... ERROR (cannot read)");
-                }
-            },
-            _ => {
-                println!("  ~/.ww/etc/ns/ ............... NOT FOUND (run: ww perform install)");
-            }
-        }
-
-        // Check if Kubo is reachable (daemon running, not just installed)
-        let kubo_reachable = std::process::Command::new("ipfs")
-            .args(["id", "-f", "<id>"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if kubo_reachable {
-            println!("  Kubo daemon ................. REACHABLE");
-        } else {
-            println!("  Kubo daemon ................. NOT REACHABLE");
-            println!("    Start with: ipfs daemon &");
-            println!("    (Namespace resolution uses embedded fallback without Kubo)");
-        }
-
-        if all_required_ok {
-            println!("\nAll required checks passed.");
-            Ok(())
-        } else {
-            println!("\nSome required checks failed. Fix the issues above and re-run.");
-            std::process::exit(1);
-        }
+        doctor_cmd::doctor().await
     }
 }
 
@@ -3280,7 +2708,7 @@ mod tests {
         let config = config_with_http_listen("127.0.0.1:2080");
         let ww_bin = std::path::Path::new("/usr/local/bin/ww");
 
-        Commands::write_launchd_plist(ww_bin, &config, home.path(), "/tmp/identity", true)
+        daemon_cmd::write_launchd_plist(ww_bin, &config, home.path(), "/tmp/identity", true)
             .expect("write plist should succeed");
 
         let plist =
@@ -3303,7 +2731,7 @@ mod tests {
         let config = config_no_http_listen();
         let ww_bin = std::path::Path::new("/usr/local/bin/ww");
 
-        Commands::write_launchd_plist(ww_bin, &config, home.path(), "/tmp/identity", true)
+        daemon_cmd::write_launchd_plist(ww_bin, &config, home.path(), "/tmp/identity", true)
             .expect("write plist should succeed");
 
         let plist =
@@ -3322,7 +2750,7 @@ mod tests {
         let config = config_with_http_listen("127.0.0.1:2080");
         let ww_bin = std::path::Path::new("/usr/local/bin/ww");
 
-        Commands::write_systemd_unit(ww_bin, &config, home.path(), "/tmp/identity", true)
+        daemon_cmd::write_systemd_unit(ww_bin, &config, home.path(), "/tmp/identity", true)
             .expect("write unit should succeed");
 
         let unit = std::fs::read_to_string(home.path().join(".config/systemd/user/ww.service"))
@@ -3340,7 +2768,7 @@ mod tests {
         let config = config_no_http_listen();
         let ww_bin = std::path::Path::new("/usr/local/bin/ww");
 
-        Commands::write_systemd_unit(ww_bin, &config, home.path(), "/tmp/identity", true)
+        daemon_cmd::write_systemd_unit(ww_bin, &config, home.path(), "/tmp/identity", true)
             .expect("write unit should succeed");
 
         let unit = std::fs::read_to_string(home.path().join(".config/systemd/user/ww.service"))
