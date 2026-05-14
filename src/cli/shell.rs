@@ -22,12 +22,12 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use ww::rpc::vat_dial;
 use ww::shell_capnp;
 
-/// Discover a local daemon by scanning `~/.ww/run/` (and `/var/run/ww/`) for
-/// `<peer-id>.sock` files. Returns the path to the chosen socket.
+/// Discover a local daemon by scanning `~/.ww/run/` for `<peer-id>.sock`
+/// files. Returns the path to the chosen socket.
 ///
 /// - 0 daemons found → error with a hint.
 /// - 1 daemon found → return its socket path.
-/// - >1 daemons found → prompt the user to choose.
+/// - >1 daemons found → fail with a deterministic disambiguation error.
 fn discover_socket() -> Result<PathBuf> {
     let nodes = ww::discovery::list_local_nodes();
     match nodes.len() {
@@ -42,32 +42,18 @@ fn discover_socket() -> Result<PathBuf> {
             Ok(node.socket_path.clone())
         }
         _ => {
-            eprintln!("Multiple wetware daemons found:\n");
-            for (i, node) in nodes.iter().enumerate() {
-                eprintln!(
-                    "  [{}] {} ({})",
-                    i + 1,
+            let mut lines = vec![
+                "multiple local wetware daemons found:".to_string(),
+                "  stop extra daemons or remove stale sockets from ~/.ww/run/".to_string(),
+            ];
+            for node in &nodes {
+                lines.push(format!(
+                    "  - {} ({})",
                     node.peer_id,
                     node.socket_path.display()
-                );
+                ));
             }
-            eprintln!();
-            eprint!("Select daemon [1-{}]: ", nodes.len());
-            let mut input = String::new();
-            std::io::stdin()
-                .read_line(&mut input)
-                .context("failed to read selection")?;
-            let choice: usize = input.trim().parse::<usize>().context("invalid selection")?;
-            if choice == 0 || choice > nodes.len() {
-                anyhow::bail!("selection out of range");
-            }
-            let node = &nodes[choice - 1];
-            eprintln!(
-                "Connecting to {} ({})...",
-                node.peer_id,
-                node.socket_path.display()
-            );
-            Ok(node.socket_path.clone())
+            anyhow::bail!("{}", lines.join("\n"));
         }
     }
 }

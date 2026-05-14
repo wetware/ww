@@ -30,49 +30,29 @@ pub fn discovery_record_key() -> libp2p::kad::RecordKey {
     libp2p::kad::RecordKey::new(&DISCOVERY_CID.to_bytes())
 }
 
-/// Candidate directories where running daemons may publish their UDS
-/// sockets and metadata, in priority order:
+/// Canonical per-user run directory for socket and metadata files.
 ///
-/// 1. `/var/run/ww/` — system-wide on Linux (preferred when writable).
-/// 2. `$HOME/.ww/run/` — per-user fallback (used in containers, on macOS
-///    where `/var/run/` is SIP-protected, and anywhere `/var/run/` is
-///    not writable for the daemon's user).
-///
-/// The writer picks the first writable directory. The reader scans all
-/// candidates and merges results.
-pub fn run_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("/var/run/ww")];
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".ww/run"));
-    }
-    dirs
+/// This is intentionally user-scoped (`~/.ww/run/`) rather than system-scoped.
+/// File ownership and directory permissions are the local auth boundary.
+pub fn run_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ww/run")
 }
 
-/// Primary directory for *writing* the socket and metadata files. Picks
-/// the first candidate from [`run_dirs()`] that can be created and
-/// written to. Falls back to the last candidate if none are writable
-/// (the writer will then surface a bind error and exit).
+/// Primary directory for *writing* the socket and metadata files.
+///
+/// Attempts to create `~/.ww/run/` and returns it regardless of whether
+/// creation succeeds (bind/write calls will surface concrete errors).
 fn writable_run_dir() -> PathBuf {
-    let candidates = run_dirs();
-    for dir in &candidates {
-        if std::fs::create_dir_all(dir).is_ok() {
-            // Probe write access by creating and removing a temp file.
-            let probe = dir.join(".write-probe");
-            if std::fs::write(&probe, b"").is_ok() {
-                let _ = std::fs::remove_file(&probe);
-                return dir.clone();
-            }
-        }
-    }
-    candidates
-        .into_iter()
-        .last()
-        .unwrap_or_else(|| PathBuf::from("/var/run/ww"))
+    let dir = run_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 /// Path to the admin UDS socket file for the given peer.
 ///
-/// Joined under the writable directory from [`run_dirs()`]. The socket
+/// Joined under the writable per-user run directory. The socket
 /// is created by `tokio::net::UnixListener::bind` at daemon startup;
 /// clients connect via `UnixStream::connect(socket_path(...))`.
 pub fn socket_path(peer_id: &str) -> PathBuf {
@@ -97,45 +77,51 @@ pub struct LocalNode {
     pub socket_path: PathBuf,
 }
 
-/// List all locally running wetware daemons by scanning every candidate
-/// directory in [`run_dirs()`] for `<peer-id>.sock` entries. Duplicate
-/// peer IDs across directories are deduplicated (first occurrence wins).
+/// List all locally running wetware daemons by scanning [`run_dir()`]
+/// for `<peer-id>.sock` entries.
 ///
 /// Does not validate liveness — the caller should attempt `connect()`
 /// and treat `ECONNREFUSED` as "stale socket, ignore this node".
 pub fn list_local_nodes() -> Vec<LocalNode> {
-    use std::collections::HashSet;
-
     let mut nodes = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let entries = match std::fs::read_dir(run_dir()) {
+        Ok(entries) => entries,
+        Err(_) => return nodes,
+    };
 
-    for dir in run_dirs() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only consider `.sock` files. Skip the `.json` siblings and
+        // any unrelated artifacts in the run dir.
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
         };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            // Only consider `.sock` files. Skip the `.json` siblings and
-            // any unrelated artifacts in the run dir.
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
-                None => continue,
-            };
-            let peer_id = match name.strip_suffix(".sock") {
-                Some(p) if !p.is_empty() && !p.starts_with('.') => p.to_string(),
-                _ => continue,
-            };
-            if !seen.insert(peer_id.clone()) {
-                continue; // already saw this peer in a higher-priority dir
-            }
-            nodes.push(LocalNode {
-                peer_id,
-                socket_path: path,
-            });
-        }
+        let peer_id = match name.strip_suffix(".sock") {
+            Some(p) if !p.is_empty() && !p.starts_with('.') => p.to_string(),
+            _ => continue,
+        };
+        nodes.push(LocalNode {
+            peer_id,
+            socket_path: path,
+        });
     }
 
+    nodes.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
     nodes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_dir_is_user_scoped() {
+        let dir = run_dir();
+        let s = dir.to_string_lossy();
+        assert!(
+            s.contains(".ww/run"),
+            "run_dir should point at ~/.ww/run, got: {s}"
+        );
+    }
 }

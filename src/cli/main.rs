@@ -254,7 +254,7 @@ enum Commands {
     /// Evaluates Glia expressions on the remote node. State persists
     /// across evals (def sticks). Ctrl-D or (exit) to disconnect.
     ///
-    /// When no address is given, discovers a local node via lockfiles
+    /// When no address is given, discovers a local node via UDS sockets
     /// in `~/.ww/run/`.
     ///
     /// Example:

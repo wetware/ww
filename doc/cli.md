@@ -103,8 +103,8 @@ remote shell access is forward-stable but currently exits with
 `Error: NOT IMPLEMENTED`.
 
 - *(no args)* — connect to a local daemon over Unix Domain Socket at
-  `~/.ww/run/<peer-id>.sock`. Scans the run directories and prompts
-  if multiple daemons are running locally.
+  `~/.ww/run/<peer-id>.sock`. Scans `~/.ww/run/`; if multiple daemons
+  are running locally it fails with a disambiguation error.
 - `<multiaddr>` — **NOT IMPLEMENTED.** Future libp2p remote dial.
 - `--discover` — **NOT IMPLEMENTED.** Future mDNS LAN browse.
 
@@ -124,7 +124,7 @@ ww shell garbage                            # clap parse error: invalid multiadd
 ### Auth model
 
 The local UDS path is an admin endpoint. Filesystem permissions on
-`~/.ww/run/` (or `/var/run/ww/`) ARE the auth boundary — matching the
+`~/.ww/run/` ARE the auth boundary — matching the
 convention of `/var/run/docker.sock`, `~/.ipfs/api`, and
 `~/.podman/podman.sock`. The spawned shell cell receives the daemon's
 full membrane, unattenuated. There is no Noise handshake, no Terminal

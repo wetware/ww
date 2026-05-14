@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Shell local-discovery policy aligned to per-user run dir.** `ww shell` local discovery now scans only `~/.ww/run/` for `<peer-id>.sock` entries (no `/var/run/ww` fallback), and the client fails deterministically with a disambiguation error when multiple local daemons are present instead of prompting interactively. Updated `src/discovery.rs`, `src/cli/shell.rs`, and shell/CLI docs to match this behavior and keep the local admin auth boundary consistently user-scoped.
 - **CLI module boundary cleanup (no behavior change).** Extracted daemon-management helpers, namespace command handlers, and doctor checks from `src/cli/main.rs` into `src/cli/daemon_cmd.rs`, `src/cli/ns_cmd.rs`, and `src/cli/doctor_cmd.rs`, leaving `Commands` as thin delegators. This reduces `main.rs` surface area and improves maintainability while preserving existing command behavior.
 
 ### Removed

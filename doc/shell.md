@@ -14,18 +14,17 @@ ww shell <multiaddr>                              # NOT IMPLEMENTED — future r
 ww shell --discover                               # NOT IMPLEMENTED — future LAN browse
 ```
 
-With no arguments, `ww shell` scans the run directories (`/var/run/ww/`
-first on Linux, `$HOME/.ww/run/` fallback on macOS and when `/var/run/`
-isn't writable) for `<peer-id>.sock` files. If exactly one daemon is
-running locally, it connects. If multiple are running, it prompts you
-to choose. If none are running, it errors with a hint to run
+With no arguments, `ww shell` scans `~/.ww/run/` for `<peer-id>.sock`
+files. If exactly one daemon is running locally, it connects. If
+multiple are running, it fails with a deterministic error listing the
+discovered sockets. If none are running, it errors with a hint to run
 `ww run .` first.
 
 ## Local admin gate (UDS)
 
 The local path is an admin endpoint by design. Whoever can write to
-`~/.ww/run/` (or `/var/run/ww/`) has full administrative control of
-the daemon — by convention with `/var/run/docker.sock`,
+`~/.ww/run/` has full administrative control of the daemon — by
+convention with `/var/run/docker.sock`,
 `~/.ipfs/api`, `~/.podman/podman.sock`, and similar local-CLI sockets.
 Filesystem permissions on the run directory ARE the auth boundary;
 there is no Noise handshake, no Terminal challenge, no auth token.
