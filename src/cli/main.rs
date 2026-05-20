@@ -134,6 +134,12 @@ enum Commands {
         #[arg(long, env = "WW_IDENTITY", value_name = "PATH")]
         identity: Option<String>,
 
+        /// Allow ephemeral identity (insecure). By default, `ww run` requires
+        /// a persistent identity file so auth-dependent shell/network flows can
+        /// rely on stable signing keys across restarts.
+        #[arg(long)]
+        insecure_ephemeral: bool,
+
         /// Atom contract address (hex, 0x-prefixed). Enables the epoch
         /// pipeline: on-chain HEAD tracking, IPFS pinning, session
         /// invalidation on head changes.
@@ -524,6 +530,7 @@ impl Commands {
                 listen,
                 wasm_debug,
                 identity,
+                insecure_ephemeral,
                 stem,
                 rpc_url,
                 ws_url,
@@ -556,6 +563,7 @@ impl Commands {
                 Self::run_with_mounts(
                     mounts,
                     identity_path,
+                    insecure_ephemeral,
                     listen,
                     wasm_debug,
                     stem,
@@ -1065,7 +1073,9 @@ wasip2::cli::command::export!({iface_name}Guest);
     /// Resolve the node's Ed25519 signing key.
     ///
     /// If an explicit `identity_path` is provided, load the key from it.
-    /// Otherwise generate an ephemeral key (will be lost on exit).
+    /// Otherwise load `~/.ww/identity` by default.
+    ///
+    /// Ephemeral identity is only allowed when `allow_ephemeral` is true.
     ///
     /// The identity file is intentionally kept OUT of the merged FHS tree
     /// so that guests cannot read the private key via WASI filesystem access.
@@ -1074,24 +1084,55 @@ wasip2::cli::command::export!({iface_name}Guest);
     /// Returns `(signing_key, verifying_key, source_description)`.
     fn resolve_identity(
         identity_path: Option<&std::path::Path>,
+        allow_ephemeral: bool,
     ) -> Result<(ed25519_dalek::SigningKey, VerifyingKey, &'static str)> {
-        if let Some(path) = identity_path {
+        let default_path = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".ww/identity"));
+
+        let resolved_path = identity_path
+            .map(std::path::Path::to_path_buf)
+            .or(default_path);
+
+        if let Some(path) = resolved_path {
             if path.exists() {
                 let path_str = path.to_str().context("identity path is non-UTF-8")?;
                 let sk = ww::keys::load(path_str)?;
                 let vk = sk.verifying_key();
-                Ok((sk, vk, "file"))
-            } else {
-                tracing::warn!(path = %path.display(), "Identity file not found; using ephemeral key");
+                return Ok((sk, vk, "file"));
+            }
+
+            if allow_ephemeral {
+                tracing::warn!(
+                    path = %path.display(),
+                    "Identity file not found; using insecure ephemeral key (--insecure-ephemeral)"
+                );
                 let sk = ww::keys::generate()?;
                 let vk = sk.verifying_key();
-                Ok((sk, vk, "ephemeral"))
+                return Ok((sk, vk, "ephemeral"));
             }
-        } else {
-            tracing::warn!("No identity configured; using ephemeral key (will be lost on exit)");
+
+            bail!(
+                "Identity file not found: {}\n\
+                 `ww run` requires a persistent identity by default.\n\
+                 Create one with: ww keygen > ~/.ww/identity\n\
+                 Or bypass (insecure, ephemeral) with: --insecure-ephemeral",
+                path.display()
+            );
+        }
+
+        if allow_ephemeral {
+            tracing::warn!(
+                "No HOME directory detected; using insecure ephemeral key (--insecure-ephemeral)"
+            );
             let sk = ww::keys::generate()?;
             let vk = sk.verifying_key();
             Ok((sk, vk, "ephemeral"))
+        } else {
+            bail!(
+                "No identity path provided and HOME is unset.\n\
+                 Pass --identity <path> or use --insecure-ephemeral (insecure)."
+            )
         }
     }
 
@@ -1165,6 +1206,7 @@ wasip2::cli::command::export!({iface_name}Guest);
     async fn run_with_mounts(
         mounts: Vec<ww::cell::mount::Mount>,
         identity: Option<PathBuf>,
+        insecure_ephemeral: bool,
         listen: Vec<Multiaddr>,
         wasm_debug: bool,
         stem: Option<String>,
@@ -1319,7 +1361,8 @@ wasip2::cli::command::export!({iface_name}Guest);
         // Resolve identity from the explicit path (never from the merged FHS tree).
         // The identity file is kept out of the merged tree so guests can't read it.
         tracing::debug!("resolving identity...");
-        let (sk, _verifying_key, identity_source) = Self::resolve_identity(identity.as_deref())?;
+        let (sk, _verifying_key, identity_source) =
+            Self::resolve_identity(identity.as_deref(), insecure_ephemeral)?;
         tracing::info!(source = identity_source, "Node identity resolved");
         tracing::debug!(source = identity_source, "identity resolved");
 
@@ -2686,16 +2729,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolve_identity_ephemeral_when_none() {
-        let (_, _, source) = Commands::resolve_identity(None).unwrap();
-        assert_eq!(source, "ephemeral");
+    fn test_resolve_identity_missing_path_errors_by_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("nonexistent");
+        let err = Commands::resolve_identity(Some(missing.as_path()), false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires a persistent identity by default"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    fn test_resolve_identity_ephemeral_when_missing() {
+    fn test_resolve_identity_ephemeral_when_missing_and_allowed() {
         let dir = tempfile::TempDir::new().unwrap();
         let missing = dir.path().join("nonexistent");
-        let (_, _, source) = Commands::resolve_identity(Some(missing.as_path())).unwrap();
+        let (_, _, source) = Commands::resolve_identity(Some(missing.as_path()), true).unwrap();
         assert_eq!(source, "ephemeral");
     }
 
@@ -2708,7 +2757,8 @@ mod tests {
         let encoded = ww::keys::encode(&sk);
         std::fs::write(&id_path, &encoded).unwrap();
 
-        let (loaded_sk, _, source) = Commands::resolve_identity(Some(id_path.as_path())).unwrap();
+        let (loaded_sk, _, source) =
+            Commands::resolve_identity(Some(id_path.as_path()), false).unwrap();
         assert_eq!(source, "file");
         assert_eq!(ww::keys::encode(&loaded_sk), encoded);
     }
@@ -2747,6 +2797,7 @@ mod tests {
             listen: Vec::new(),
             wasm_debug: false,
             identity: None,
+            insecure_ephemeral: false,
             stem: None,
             rpc_url: "http://127.0.0.1:8545".to_string(),
             ws_url: "ws://127.0.0.1:8545".to_string(),
