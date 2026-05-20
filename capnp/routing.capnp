@@ -38,4 +38,24 @@ interface Routing {
   resolve @3 (name :Text) -> (path :Text);
   # Resolve an IPNS name to an IPFS path via Kubo.
   # Returns e.g. "/ipfs/bafyrei..."
+
+  mkdir @4 (baseCid :Text, path :Text, parents :Bool) -> (rootCid :Text);
+  # Build a new UnixFS directory root by creating `path` relative to
+  # `baseCid`. Returns the new root CID. No global mutable root is used.
+
+  writeFile @5 (baseCid :Text, path :Text, data :Data, createParents :Bool) -> (rootCid :Text);
+  # Build a new UnixFS root by writing file bytes at `path` relative to
+  # `baseCid` (overwrite if present). Returns the new root CID.
+
+  remove @6 (baseCid :Text, path :Text, recursive :Bool) -> (rootCid :Text);
+  # Build a new UnixFS root by removing `path` relative to `baseCid`.
+  # Returns the new root CID.
+
+  publish @7 (name :Text, cid :Text, expectedCurrent :Text) -> (publishedPath :Text);
+  # Publish `/ipfs/<cid>` under IPNS `name`.
+  #
+  # Conflict semantics:
+  # - if `expectedCurrent` is empty, publish unconditionally.
+  # - if set, `name` must currently resolve to `expectedCurrent` (or fail).
+  #   This is a compare-and-set guard to avoid silent last-write-wins.
 }

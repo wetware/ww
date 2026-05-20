@@ -430,6 +430,186 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                             .map_err(|e| Val::from(e.to_string()))?;
                         call_resume(resume, Val::Nil)
                     }
+                    "resolve" => {
+                        let name = match rest.first() {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => return Err(Val::from("routing :resolve — expected name string")),
+                        };
+                        let mut req = routing.resolve_request();
+                        req.get().set_name(&name);
+                        let resp = req
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let path = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_path()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .to_string()
+                            .map_err(|e| Val::from(format!("{e}")))?;
+                        call_resume(resume, Val::Str(path))
+                    }
+                    "mkdir" => {
+                        let base_cid = match rest.first() {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => {
+                                return Err(Val::from(
+                                    "routing :mkdir — expected base CID string",
+                                ));
+                            }
+                        };
+                        let path = match rest.get(1) {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => return Err(Val::from("routing :mkdir — expected path string")),
+                        };
+                        let parents = match rest.get(2) {
+                            Some(Val::Bool(b)) => *b,
+                            _ => true,
+                        };
+                        let mut req = routing.mkdir_request();
+                        let mut r = req.get();
+                        r.set_base_cid(&base_cid);
+                        r.set_path(&path);
+                        r.set_parents(parents);
+                        let resp = req
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let root = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_root_cid()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .to_string()
+                            .map_err(|e| Val::from(format!("{e}")))?;
+                        call_resume(resume, Val::Str(root))
+                    }
+                    "write-file" => {
+                        let base_cid = match rest.first() {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => {
+                                return Err(Val::from(
+                                    "routing :write-file — expected base CID string",
+                                ));
+                            }
+                        };
+                        let path = match rest.get(1) {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => {
+                                return Err(Val::from(
+                                    "routing :write-file — expected path string",
+                                ));
+                            }
+                        };
+                        let data = match rest.get(2) {
+                            Some(Val::Bytes(b)) => b.clone(),
+                            Some(Val::Str(s)) => s.as_bytes().to_vec(),
+                            _ => {
+                                return Err(Val::from(
+                                    "routing :write-file — expected bytes or string data",
+                                ));
+                            }
+                        };
+                        let create_parents = match rest.get(3) {
+                            Some(Val::Bool(b)) => *b,
+                            _ => true,
+                        };
+                        let mut req = routing.write_file_request();
+                        let mut r = req.get();
+                        r.set_base_cid(&base_cid);
+                        r.set_path(&path);
+                        r.set_data(&data);
+                        r.set_create_parents(create_parents);
+                        let resp = req
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let root = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_root_cid()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .to_string()
+                            .map_err(|e| Val::from(format!("{e}")))?;
+                        call_resume(resume, Val::Str(root))
+                    }
+                    "remove" => {
+                        let base_cid = match rest.first() {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => {
+                                return Err(Val::from(
+                                    "routing :remove — expected base CID string",
+                                ));
+                            }
+                        };
+                        let path = match rest.get(1) {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => return Err(Val::from("routing :remove — expected path string")),
+                        };
+                        let recursive = match rest.get(2) {
+                            Some(Val::Bool(b)) => *b,
+                            _ => false,
+                        };
+                        let mut req = routing.remove_request();
+                        let mut r = req.get();
+                        r.set_base_cid(&base_cid);
+                        r.set_path(&path);
+                        r.set_recursive(recursive);
+                        let resp = req
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let root = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_root_cid()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .to_string()
+                            .map_err(|e| Val::from(format!("{e}")))?;
+                        call_resume(resume, Val::Str(root))
+                    }
+                    "publish" => {
+                        let name = match rest.first() {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => return Err(Val::from("routing :publish — expected name string")),
+                        };
+                        let cid = match rest.get(1) {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => return Err(Val::from("routing :publish — expected CID string")),
+                        };
+                        let expected = match rest.get(2) {
+                            Some(Val::Str(s)) => s.clone(),
+                            Some(Val::Nil) | None => String::new(),
+                            _ => {
+                                return Err(Val::from(
+                                    "routing :publish — expected current path string or nil",
+                                ));
+                            }
+                        };
+                        let mut req = routing.publish_request();
+                        let mut r = req.get();
+                        r.set_name(&name);
+                        r.set_cid(&cid);
+                        r.set_expected_current(&expected);
+                        let resp = req
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let published = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_published_path()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .to_string()
+                            .map_err(|e| Val::from(format!("{e}")))?;
+                        call_resume(resume, Val::Str(published))
+                    }
                     "hash" => {
                         let data = match rest.first() {
                             Some(Val::Str(s)) => s.as_bytes().to_vec(),
