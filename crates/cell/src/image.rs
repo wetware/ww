@@ -387,6 +387,14 @@ mod tests {
             msg.contains("targeted mounts are not supported in backend virtual mode"),
             "unexpected error: {msg}"
         );
+        assert!(
+            msg.contains("received 1 targeted mount(s)"),
+            "error should include targeted mount count: {msg}"
+        );
+        assert!(
+            msg.contains("publish content to IPFS/IPNS and mount as a root layer"),
+            "error should include migration guidance: {msg}"
+        );
     }
 
     // ── split_ipns_path: pure parsing, IPNS-to-IPFS subpath split ──

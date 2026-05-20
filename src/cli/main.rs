@@ -2740,6 +2740,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_run_command_rejects_targeted_mounts_preflight() {
+        let cmd = Commands::Run {
+            mounts: vec![".".to_string(), "~/.ww/identity:/etc/identity".to_string()],
+            listen: Vec::new(),
+            wasm_debug: false,
+            identity: None,
+            stem: None,
+            rpc_url: "http://127.0.0.1:8545".to_string(),
+            ws_url: "ws://127.0.0.1:8545".to_string(),
+            confirmation_depth: 6,
+            epoch_drain_secs: 1,
+            executor_threads: 0,
+            mcp: false,
+            http_listen: None,
+            http_dial: Vec::new(),
+            runtime_cache_policy: "shared".to_string(),
+            with_http_admin: None,
+            ipfs_url: "http://localhost:5001".to_string(),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt.block_on(cmd.run()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("targeted mounts are not supported in backend virtual mode"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("/etc/identity"),
+            "error should include offending target path: {msg}"
+        );
+    }
+
     // ── Daemon service-file writer tests ──────────────────────────────
     //
     // These guard the `--http-listen` flag emission, which is the
