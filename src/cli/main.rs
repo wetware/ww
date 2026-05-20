@@ -101,16 +101,15 @@ enum Commands {
 
     /// Run a wetware environment.
     ///
-    /// Every positional argument is a mount: `source[:target]`.
-    /// Without `:target`, the source is mounted at `/` (image layer).
-    /// With `:target`, the source is overlaid at that guest path.
+    /// Every positional argument is a mount source mounted at `/` (image layer).
+    /// Targeted mounts (`source:/guest/path`) are rejected in backend virtual mode.
     ///
     /// Examples:
     ///   ww run .                                    # dev mode
-    ///   ww run images/app ~/.ww/identity:/etc/identity
-    ///   ww run /ipfs/QmHash ~/data:/var/data
+    ///   ww run images/app
+    ///   ww run /ipfs/QmHash /ipns/k51qzi5uqu5...
     Run {
-        /// Mount(s): `source` (image at /) or `source:/guest/path` (targeted).
+        /// Mount source(s) at `/` (image layers).
         #[arg(default_value = ".", value_name = "MOUNT")]
         mounts: Vec<String>,
 
@@ -130,7 +129,7 @@ enum Commands {
         #[arg(long)]
         wasm_debug: bool,
 
-        /// Path to an Ed25519 identity file. Sugar for PATH:/etc/identity mount.
+        /// Path to an Ed25519 identity file (host-side only; not a guest mount).
         /// Works well with direnv: `export WW_IDENTITY=~/.ww/identity` in .envrc.
         #[arg(long, env = "WW_IDENTITY", value_name = "PATH")]
         identity: Option<String>,
@@ -539,6 +538,7 @@ impl Commands {
                 ipfs_url,
             } => {
                 let mounts = ww::cell::mount::parse_args(&mount_args)?;
+                Self::validate_backend_mount_policy(&mounts)?;
                 // Identity is passed separately — NOT as a mount.
                 // The host reads it to create the signing key for the Membrane.
                 // It must never enter the merged FHS tree (which is preopened
@@ -1093,6 +1093,34 @@ wasip2::cli::command::export!({iface_name}Guest);
             let vk = sk.verifying_key();
             Ok((sk, vk, "ephemeral"))
         }
+    }
+
+    /// Backend policy: only root mounts are allowed.
+    ///
+    /// Targeted mounts (`source:/guest/path`) previously fed `LocalOverride`.
+    /// Backend virtual mode removes that path to enforce a single data-plane:
+    /// publish to IPFS/IPNS and mount as root layers.
+    fn validate_backend_mount_policy(mounts: &[ww::cell::mount::Mount]) -> Result<()> {
+        let targeted: Vec<&ww::cell::mount::Mount> =
+            mounts.iter().filter(|m| !m.is_root()).collect();
+        if targeted.is_empty() {
+            return Ok(());
+        }
+
+        let mut details = String::new();
+        for mount in targeted {
+            details.push_str(&format!(
+                "\n  - {}:{}",
+                mount.source,
+                mount.target.display()
+            ));
+        }
+
+        bail!(
+            "targeted mounts are not supported in backend virtual mode.\n\
+             Use root image layers (`/ipfs/...`, `/ipns/...`, or local dirs) and publish data explicitly.\n\
+             Offending mount(s):{details}"
+        );
     }
 
     /// Generate a new Ed25519 identity secret.
@@ -2683,6 +2711,35 @@ mod tests {
         let (loaded_sk, _, source) = Commands::resolve_identity(Some(id_path.as_path())).unwrap();
         assert_eq!(source, "file");
         assert_eq!(ww::keys::encode(&loaded_sk), encoded);
+    }
+
+    #[test]
+    fn test_validate_backend_mount_policy_accepts_root_mounts() {
+        let mounts = ww::cell::mount::parse_args(&[
+            ".".to_string(),
+            "/ipfs/bafybeigdyrzt".to_string(),
+        ])
+        .unwrap();
+        Commands::validate_backend_mount_policy(&mounts).unwrap();
+    }
+
+    #[test]
+    fn test_validate_backend_mount_policy_rejects_targeted_mounts() {
+        let mounts = ww::cell::mount::parse_args(&[
+            ".".to_string(),
+            "~/.ww/identity:/etc/identity".to_string(),
+        ])
+        .unwrap();
+        let err = Commands::validate_backend_mount_policy(&mounts).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("targeted mounts are not supported in backend virtual mode"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("/etc/identity"),
+            "error should include offending target path: {msg}"
+        );
     }
 
     // ── Daemon service-file writer tests ──────────────────────────────

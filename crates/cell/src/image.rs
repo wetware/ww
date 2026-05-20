@@ -2,13 +2,11 @@
 //!
 //! Every positional arg to `ww run` is a mount: `source[:target]`.
 //! Root mounts (target `/`) are traditional image layers. Targeted
-//! mounts overlay a host file or directory at a specific guest path.
+//! mounts are currently rejected in backend virtual mode.
 //!
 //! Mounts are applied left-to-right via `resolve_mounts_virtual`:
 //! root layers are DAG-merged at the IPFS MFS level (file blocks never
-//! touched, only directory nodes get new CIDs), and targeted mounts
-//! become `LocalOverride` entries that the guest's `CidTree` checks
-//! before falling through to the CID walk. No file content is
+//! touched, only directory nodes get new CIDs). No file content is
 //! materialized to disk by this module.
 //!
 //! Pre-#416 this file also exposed an `apply_mounts` API that
@@ -169,10 +167,9 @@ async fn merge_overlay_recursive_inner(
 
 /// Resolve mounts into a root CID and local overrides for the virtual filesystem.
 ///
-/// Performs the DAG merge to produce a merged root CID, and collects
-/// targeted mounts as `LocalOverride` entries. No file content is copied
-/// or fetched — that happens lazily when the guest opens files via
-/// `CidTree` + `fs_intercept`.
+/// Performs the DAG merge to produce a merged root CID.
+/// Targeted mounts are rejected in backend mode to avoid a second,
+/// host-local filesystem path.
 ///
 /// Returns `(root_cid, local_overrides)` suitable for constructing a `CidTree`.
 pub async fn resolve_mounts_virtual(
@@ -182,8 +179,6 @@ pub async fn resolve_mounts_virtual(
     String,
     std::collections::HashMap<std::path::PathBuf, crate::vfs::LocalOverride>,
 )> {
-    use crate::vfs::LocalOverride;
-
     if mounts.is_empty() {
         bail!("No mounts provided");
     }
@@ -193,6 +188,14 @@ pub async fn resolve_mounts_virtual(
 
     if root_mounts.is_empty() {
         bail!("No root mounts provided (at least one required)");
+    }
+
+    if !targeted_mounts.is_empty() {
+        bail!(
+            "targeted mounts are not supported in backend virtual mode (received {} targeted mount(s)); \
+             publish content to IPFS/IPNS and mount as a root layer",
+            targeted_mounts.len()
+        );
     }
 
     // Resolve all root mounts to CIDs.
@@ -226,44 +229,7 @@ pub async fn resolve_mounts_virtual(
     let root_cid = dag_merge(&cids, ipfs_client).await?;
     tracing::info!(cid = %root_cid, layers = cids.len(), "Virtual DAG merge complete");
 
-    // Collect targeted mounts as local overrides.
-    let mut overrides = std::collections::HashMap::new();
-    for mount in &targeted_mounts {
-        let guest_path = mount
-            .target
-            .strip_prefix("/")
-            .unwrap_or(&mount.target)
-            .to_path_buf();
-
-        if guest_path.as_os_str().is_empty() {
-            continue; // skip empty target
-        }
-
-        if ipfs::is_ipfs_path(&mount.source) {
-            // IPFS targeted mounts are not supported in virtual mode.
-            // They would need to be added to the CID tree, which conflicts
-            // with the design goal of keeping private mounts off IPFS.
-            bail!(
-                "IPFS targeted mounts not supported in virtual mode: {} -> {}",
-                mount.source,
-                mount.target.display()
-            );
-        }
-
-        let src = Path::new(&mount.source);
-        if !src.exists() {
-            bail!("Mount source does not exist: {}", mount.source);
-        }
-
-        let ovr = if src.is_dir() {
-            LocalOverride::Dir(src.to_path_buf())
-        } else {
-            LocalOverride::File(src.to_path_buf())
-        };
-        overrides.insert(guest_path, ovr);
-    }
-
-    Ok((root_cid, overrides))
+    Ok((root_cid, std::collections::HashMap::new()))
 }
 
 /// Split `/ipns/<hash>[/<subpath>]` into `(hash, subpath)`. `subpath`
@@ -378,18 +344,12 @@ mod tests {
     //
     // Two pure-validation cases live here (no IPFS roundtrip needed).
     //
-    // Merge correctness (`dag_merge` over multiple layers) and the
-    // targeted-mount → `LocalOverride` translation are NOT unit-tested
-    // here: those paths require Kubo to `add_dir` local layers, and
-    // CI's daemon does not reliably accept ephemeral `tempfile::TempDir`
-    // paths inside the test runner. The previous `apply_mounts` /
-    // `merge_layers` tests only worked because the deleted code had an
-    // all-local `copy_merge` fast path that never hit IPFS — now gone.
-    //
-    // End-to-end coverage of the merge + override translation lives
-    // in `tests/discovery_integration.rs` and `tests/shell_e2e.rs`,
-    // which boot real kernels through `CidTree` against published
-    // images (paths Kubo already accepts).
+    // Merge correctness (`dag_merge` over multiple layers) is NOT unit-tested
+    // here: those paths require Kubo to `add_dir` local layers, and CI's
+    // daemon does not reliably accept ephemeral `tempfile::TempDir` paths
+    // inside the test runner. The previous `apply_mounts` / `merge_layers`
+    // tests only worked because the deleted code had an all-local
+    // `copy_merge` fast path that never hit IPFS — now gone.
 
     #[tokio::test]
     async fn test_virtual_empty_mounts_errors() {
@@ -405,6 +365,28 @@ mod tests {
         let result =
             resolve_mounts_virtual(&[root_mount("/nonexistent/path/abc123")], &client).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_virtual_targeted_mounts_rejected() {
+        let client = stub_ipfs_client();
+        let mounts = vec![
+            Mount {
+                source: "/ipfs/bafybeigdyrzt".to_string(),
+                target: PathBuf::from("/"),
+            },
+            Mount {
+                source: "./local-secret".to_string(),
+                target: PathBuf::from("/etc/identity"),
+            },
+        ];
+        let result = resolve_mounts_virtual(&mounts, &client).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("targeted mounts are not supported in backend virtual mode"),
+            "unexpected error: {msg}"
+        );
     }
 
     // ── split_ipns_path: pure parsing, IPNS-to-IPFS subpath split ──

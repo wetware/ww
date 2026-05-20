@@ -460,169 +460,25 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
     }
 }
 
-/// Resolve a Glia-supplied path against the cell's root.
+/// Legacy `fs` effect handler.
 ///
-/// `/ipfs/<cid>` and `/ipns/<key>` paths pass through unchanged — the
-/// host's CidTree-backed VFS handles content addressing. Absolute paths
-/// also pass through. Relative paths are resolved against `$WW_ROOT`,
-/// falling back to `/` when unset.
-fn resolve_fs_path(path: &str) -> String {
-    if path.starts_with('/') {
-        return path.to_string();
-    }
-    let root = std::env::var("WW_ROOT").unwrap_or_else(|_| "/".to_string());
-    if root.ends_with('/') {
-        format!("{root}{path}")
-    } else {
-        format!("{root}/{path}")
-    }
-}
-
-/// Map a `std::fs::FileType` to a Glia keyword.
-fn file_type_keyword(ft: std::fs::FileType) -> Val {
-    if ft.is_dir() {
-        Val::Keyword("dir".into())
-    } else if ft.is_symlink() {
-        Val::Keyword("symlink".into())
-    } else {
-        Val::Keyword("file".into())
-    }
-}
-
-/// Build a `Val::Map` describing a single filesystem entry.
-fn entry_map(name: String, size: u64, ft: std::fs::FileType) -> Val {
-    Val::Map(glia::ValMap::from_pairs(vec![
-        (Val::Keyword("name".into()), Val::Str(name)),
-        (Val::Keyword("size".into()), Val::Int(size as i64)),
-        (Val::Keyword("type".into()), file_type_keyword(ft)),
-    ]))
-}
-
-/// Glia effect handler for the `fs` capability — content-addressed
-/// filesystem read access via the WASI VFS (CidTree-backed at runtime).
-///
-/// Methods:
-///   - `:read path`     → `Val::Bytes`  (raw file contents)
-///   - `:read-str path` → `Val::Str`    (UTF-8 decoded; structured error on invalid UTF-8)
-///   - `:ls path`       → `Val::List`   (entries `{:name :size :type}` where type ∈ #{:file :dir :symlink})
-///   - `:stat path`     → `Val::Map`    (single-entry map: `{:size :type}`)
-///   - `:exists? path`  → `Val::Bool`   (false on missing path; never errors)
-///
-/// Path resolution (see `resolve_fs_path`):
-///   - Absolute paths (incl. `/ipfs/...`, `/ipns/...`) pass through to
-///     the WASI VFS
-///   - Relative paths are resolved against `$WW_ROOT` (falls back to `/`)
-///
-/// Replaces the prior `make_ipfs_handler` (which exposed `:cat`/`:ls`
-/// under the `ipfs` cap name). Cap-name change `ipfs` → `fs` is part of
-/// the same cleanup: post-#415/#416, content access is uniformly via
-/// the content-addressed VFS, not a separate IPFS surface.
+/// `perform fs` data-plane reads are removed in favor of direct WASI file I/O
+/// (`load`, `import`, and normal guest file reads against `/ipfs` / `/ipns`).
+/// The handler remains only to produce a migration-grade error when older code
+/// attempts `(perform fs ...)`.
 pub fn make_fs_handler() -> Val {
     Val::AsyncNativeFn {
         name: "fs-handler".into(),
         func: Rc::new(move |args: Vec<Val>| {
             Box::pin(async move {
                 let (method, rest) = extract_method(&args[0])?;
-                let resume = &args[1];
-
-                let path_arg = |method_label: &str| -> Result<String, Val> {
-                    match rest.first() {
-                        Some(Val::Str(s)) => Ok(s.clone()),
-                        Some(other) => Err(glia::error::type_mismatch(
-                            &format!("fs :{method_label}"),
-                            "path string",
-                            other,
-                        )),
-                        None => Err(glia::error::arity(
-                            &format!("fs :{method_label}"),
-                            "1",
-                            rest.len(),
-                        )),
-                    }
-                };
-
-                match method {
-                    "read" => {
-                        let path = path_arg("read")?;
-                        let resolved = resolve_fs_path(&path);
-                        match std::fs::read(&resolved) {
-                            Ok(bytes) => call_resume(resume, Val::Bytes(bytes)),
-                            Err(e) => Err(glia::error::cap_call(
-                                "fs",
-                                "read",
-                                format!("{resolved}: {e}"),
-                            )),
-                        }
-                    }
-                    "read-str" => {
-                        let path = path_arg("read-str")?;
-                        let resolved = resolve_fs_path(&path);
-                        let bytes = std::fs::read(&resolved).map_err(|e| {
-                            glia::error::cap_call("fs", "read-str", format!("{resolved}: {e}"))
-                        })?;
-                        match String::from_utf8(bytes) {
-                            Ok(s) => call_resume(resume, Val::Str(s)),
-                            Err(e) => Err(glia::error::cap_call(
-                                "fs",
-                                "read-str",
-                                format!("{resolved}: invalid UTF-8: {e}"),
-                            )),
-                        }
-                    }
-                    "ls" => {
-                        let path = path_arg("ls")?;
-                        let resolved = resolve_fs_path(&path);
-                        match std::fs::read_dir(&resolved) {
-                            Ok(entries) => {
-                                let items: Vec<Val> = entries
-                                    .filter_map(|e| {
-                                        let e = e.ok()?;
-                                        let meta = e.metadata().ok()?;
-                                        let name =
-                                            e.file_name().to_string_lossy().to_string();
-                                        Some(entry_map(name, meta.len(), meta.file_type()))
-                                    })
-                                    .collect();
-                                call_resume(resume, Val::List(items))
-                            }
-                            Err(e) => Err(glia::error::cap_call(
-                                "fs",
-                                "ls",
-                                format!("{resolved}: {e}"),
-                            )),
-                        }
-                    }
-                    "stat" => {
-                        let path = path_arg("stat")?;
-                        let resolved = resolve_fs_path(&path);
-                        match std::fs::metadata(&resolved) {
-                            Ok(meta) => {
-                                let m = Val::Map(glia::ValMap::from_pairs(vec![
-                                    (Val::Keyword("size".into()), Val::Int(meta.len() as i64)),
-                                    (Val::Keyword("type".into()), file_type_keyword(meta.file_type())),
-                                ]));
-                                call_resume(resume, m)
-                            }
-                            Err(e) => Err(glia::error::cap_call(
-                                "fs",
-                                "stat",
-                                format!("{resolved}: {e}"),
-                            )),
-                        }
-                    }
-                    "exists?" => {
-                        let path = path_arg("exists?")?;
-                        let resolved = resolve_fs_path(&path);
-                        // exists? never errors — missing path is just `false`.
-                        let exists = std::fs::metadata(&resolved).is_ok();
-                        call_resume(resume, Val::Bool(exists))
-                    }
-                    other => Err(glia::error::cap_call(
-                        "fs",
-                        other,
-                        format!("unknown method :{other}"),
-                    )),
-                }
+                let _resume = &args[1];
+                let _ = rest;
+                Err(glia::error::cap_call(
+                    "fs",
+                    method,
+                    "deprecated: `(perform fs ...)` is removed; use WASI path I/O (`load`, `import`, or direct file reads under /ipfs|/ipns)".to_string(),
+                ))
             })
         }),
     }
@@ -654,7 +510,7 @@ pub fn wrap_with_handlers(form: &Val, extra_caps: &[&str]) -> Val {
 
     // Wrap in cap handlers (innermost to outermost)
     // Core caps first, then any extras
-    let mut caps: Vec<&str> = vec!["import", "routing", "fs", "host"];
+    let mut caps: Vec<&str> = vec!["import", "routing", "host"];
     for extra in extra_caps {
         caps.insert(0, extra);
     }
@@ -940,7 +796,7 @@ mod tests {
     fn wrap_with_handlers_no_extras() {
         let form = Val::Int(42);
         let wrapped = wrap_with_handlers(&form, &[]);
-        // Should be nested: host(fs(routing(import(:load(42)))))
+        // Should be nested: host(routing(import(:load(42))))
         // Outermost is host
         match &wrapped {
             Val::List(items) => {
@@ -967,13 +823,7 @@ mod tests {
         }
     }
 
-    // -- make_fs_handler --
-    //
-    // Drive the handler against real local files in a tempdir. In a WASM
-    // cell std::fs would be backed by the WASI VFS (CidTree at runtime);
-    // here it's the host's real FS, but the handler logic is identical.
-    // Each test sets WW_ROOT to the tempdir so relative paths resolve
-    // against it without leaking into the host's actual root.
+    // -- make_fs_handler (legacy deprecation behavior) --
 
     /// Drive an `AsyncNativeFn` synchronously by polling its future to
     /// completion on a fresh single-threaded tokio runtime.
@@ -1001,188 +851,29 @@ mod tests {
         }
     }
 
-    /// Cargo runs tests in parallel, but `WW_ROOT` is a process-wide env
-    /// var and `make_fs_handler` reads it at call time. Without
-    /// serialization, two tests setting `WW_ROOT` at the same time race
-    /// and one fixture's path resolves against the other's tempdir.
-    /// All `with_fixture` callers acquire this mutex.
-    static FS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Set up a tempdir, populate it with a known fixture, point WW_ROOT
-    /// at it, run the closure, then restore WW_ROOT. Serialized via
-    /// `FS_TEST_LOCK` so concurrent tests don't clobber each other's
-    /// env-var state.
-    fn with_fixture<F: FnOnce(&std::path::Path)>(f: F) {
-        let _guard = FS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("hello.txt"), b"hi").unwrap();
-        std::fs::write(dir.path().join("data.bin"), [0xff_u8, 0xfe, 0xfd]).unwrap();
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        std::fs::write(dir.path().join("sub").join("nested.txt"), b"nested").unwrap();
-
-        let prev = std::env::var("WW_ROOT").ok();
-        std::env::set_var("WW_ROOT", dir.path());
-        f(dir.path());
-        match prev {
-            Some(v) => std::env::set_var("WW_ROOT", v),
-            None => std::env::remove_var("WW_ROOT"),
-        }
-    }
-
     #[test]
-    fn fs_read_returns_bytes() {
+    fn fs_read_returns_deprecation_error() {
         let handler = make_fs_handler();
-        with_fixture(|_| {
-            let result = drive_handler(&handler, "read", Some("hello.txt")).unwrap();
-            assert_eq!(result, Val::Bytes(b"hi".to_vec()));
-        });
-    }
-
-    #[test]
-    fn fs_read_str_returns_utf8_string() {
-        let handler = make_fs_handler();
-        with_fixture(|_| {
-            let result = drive_handler(&handler, "read-str", Some("hello.txt")).unwrap();
-            assert_eq!(result, Val::Str("hi".into()));
-        });
-    }
-
-    #[test]
-    fn fs_read_str_invalid_utf8_yields_structured_error() {
-        let handler = make_fs_handler();
-        with_fixture(|_| {
-            let err = drive_handler(&handler, "read-str", Some("data.bin")).unwrap_err();
-            assert_eq!(
-                glia::error::type_tag(&err),
-                Some(glia::error::tag::CAP_CALL),
-                "expected cap-call-failed tag, got: {err:?}"
-            );
-        });
-    }
-
-    #[test]
-    fn fs_ls_returns_entries_with_name_size_type() {
-        let handler = make_fs_handler();
-        with_fixture(|_| {
-            let result = drive_handler(&handler, "ls", Some("")).unwrap();
-            let items = match result {
-                Val::List(xs) => xs,
-                other => panic!("expected list, got {other:?}"),
-            };
-            assert_eq!(items.len(), 3, "fixture has 3 entries (2 files, 1 dir)");
-
-            // Each entry should be a map with :name :size :type
-            for entry in &items {
-                let m = match entry {
-                    Val::Map(m) => m,
-                    other => panic!("expected map, got {other:?}"),
-                };
-                assert!(m.contains_key(&Val::Keyword("name".into())));
-                assert!(m.contains_key(&Val::Keyword("size".into())));
-                let ty = m
-                    .get(&Val::Keyword("type".into()))
-                    .expect(":type field present");
-                assert!(matches!(
-                    ty,
-                    Val::Keyword(k) if k == "file" || k == "dir" || k == "symlink"
-                ));
-            }
-        });
-    }
-
-    #[test]
-    fn fs_stat_returns_size_and_type() {
-        let handler = make_fs_handler();
-        with_fixture(|_| {
-            let result = drive_handler(&handler, "stat", Some("hello.txt")).unwrap();
-            let m = match result {
-                Val::Map(m) => m,
-                other => panic!("expected map, got {other:?}"),
-            };
-            assert_eq!(
-                m.get(&Val::Keyword("size".into())),
-                Some(&Val::Int(2)),
-                "hello.txt is 2 bytes"
-            );
-            assert_eq!(
-                m.get(&Val::Keyword("type".into())),
-                Some(&Val::Keyword("file".into()))
-            );
-        });
-    }
-
-    #[test]
-    fn fs_stat_dir_reports_dir_type() {
-        let handler = make_fs_handler();
-        with_fixture(|_| {
-            let result = drive_handler(&handler, "stat", Some("sub")).unwrap();
-            let m = match result {
-                Val::Map(m) => m,
-                other => panic!("expected map, got {other:?}"),
-            };
-            assert_eq!(
-                m.get(&Val::Keyword("type".into())),
-                Some(&Val::Keyword("dir".into()))
-            );
-        });
-    }
-
-    #[test]
-    fn fs_exists_returns_true_for_present_path() {
-        let handler = make_fs_handler();
-        with_fixture(|_| {
-            let result = drive_handler(&handler, "exists?", Some("hello.txt")).unwrap();
-            assert_eq!(result, Val::Bool(true));
-        });
-    }
-
-    #[test]
-    fn fs_exists_returns_false_for_missing_path_without_error() {
-        let handler = make_fs_handler();
-        with_fixture(|_| {
-            // Critical: missing paths must NOT error — the whole point of
-            // exists? is to query without raising.
-            let result = drive_handler(&handler, "exists?", Some("does-not-exist.txt")).unwrap();
-            assert_eq!(result, Val::Bool(false));
-        });
-    }
-
-    #[test]
-    fn fs_read_missing_path_yields_structured_error() {
-        let handler = make_fs_handler();
-        with_fixture(|_| {
-            let err = drive_handler(&handler, "read", Some("nope.txt")).unwrap_err();
-            assert_eq!(
-                glia::error::type_tag(&err),
-                Some(glia::error::tag::CAP_CALL),
-                "expected cap-call-failed tag, got: {err:?}"
-            );
-        });
-    }
-
-    #[test]
-    fn fs_unknown_method_yields_structured_error() {
-        let handler = make_fs_handler();
-        with_fixture(|_| {
-            let err = drive_handler(&handler, "explode", Some("anything")).unwrap_err();
-            assert_eq!(
-                glia::error::type_tag(&err),
-                Some(glia::error::tag::CAP_CALL)
-            );
-            // Message should mention the unknown method name to help debugging.
-            let msg = glia::error::message(&err).unwrap_or("");
-            assert!(msg.contains("explode"), "msg should mention method: {msg}");
-        });
-    }
-
-    #[test]
-    fn fs_missing_path_arg_yields_arity_error() {
-        let handler = make_fs_handler();
-        let err = drive_handler(&handler, "read", None).unwrap_err();
+        let err = drive_handler(&handler, "read", Some("/ipfs/bafy.../foo.txt")).unwrap_err();
         assert_eq!(
             glia::error::type_tag(&err),
-            Some(glia::error::tag::ARITY)
+            Some(glia::error::tag::CAP_CALL),
+            "expected cap-call-failed tag, got: {err:?}"
+        );
+        let msg = glia::error::message(&err).unwrap_or("");
+        assert!(
+            msg.contains("deprecated") && msg.contains("perform fs"),
+            "expected migration error message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn fs_unknown_method_still_returns_deprecation_error() {
+        let handler = make_fs_handler();
+        let err = drive_handler(&handler, "explode", Some("anything")).unwrap_err();
+        assert_eq!(
+            glia::error::type_tag(&err),
+            Some(glia::error::tag::CAP_CALL)
         );
     }
 }

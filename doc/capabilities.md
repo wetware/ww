@@ -77,46 +77,31 @@ appearing in the top-level graft list.
 Every capability is epoch-guarded: it fails with `staleEpoch` once the
 on-chain head advances, forcing a re-graft.
 
-### Content access (no `fs` capability over RPC)
+### Content access (WASI path I/O only)
 
 Cells do not receive an explicit filesystem capability over the
 membrane. Content access flows through the WASI virtual filesystem,
-which the host backs with `CidTree`. Glia code reaches it via the
-`fs` capability bound into the cell's env, invoked through `perform`:
+which the host backs with `CidTree`.
 
-- `(perform fs :read path)` — bytes
-- `(perform fs :read-str path)` — UTF-8 string
-- `(perform fs :ls path)` — list of `{:name :size :type}` maps
-- `(perform fs :stat path)` — `{:size :type}`
-- `(perform fs :exists? path)` — bool, never raises on missing paths
+Use regular guest file I/O against filesystem paths:
+- `(load "path")` for bytes in Glia
+- `(perform import "module")` for module loading
+- direct guest reads via WASI-aware code under `/ipfs/<cid>/...` and
+  `/ipns/<name>/...`
 
-Path resolution (`std/caps/src/lib.rs:resolve_fs_path`): absolute paths
-including `/ipfs/<cid>` and `/ipns/<key>` pass through to the WASI VFS;
-relative paths resolve against `$WW_ROOT` (defaults to `/`).
-
-The `fs` cap is wired by the kernel after graft (`std/kernel/src/lib.rs`);
-the shell and MCP cells wire it the same way (`std/shell/src/lib.rs`,
-`std/mcp/src/lib.rs`). Restricting filesystem access for a particular
-cell means not binding the `fs` handler in its env — the language layer
-is the attenuation point, not a separate cap surface.
+`(perform fs ...)` is legacy and returns a migration error. Keeping a separate
+`perform` filesystem read surface created dual-path semantics and is being
+removed.
 
 ## Local overrides
 
-`LocalOverride` (`src/vfs.rs:59-62`) is the only principled exception
-to "everything resolves through CIDs." It supports per-file or
-per-directory host-local mounts that are checked **before** CID
-resolution, so private content (the operator's identity key,
-per-node secrets) never enters IPFS.
+Backend virtual mode rejects targeted mounts, so host-local overrides are
+currently not part of the backend runtime surface. Publish content to IPFS/IPNS
+and mount it as a root layer instead.
 
-```
-guest opens /etc/identity/key.pem
-  → CidTree::resolve_path
-  → check LocalOverride map first → matches → return ResolvedNode::LocalFile(host_path)
-  → never falls through to the CID walk
-```
-
-Use this exception sparingly. It is meant for genuinely host-private
-files. Anything that should be reachable across nodes belongs in IPFS.
+`LocalOverride` types remain in the codebase as implementation scaffolding for
+future shell-local workflows, but they are not used by `ww run` backend mount
+resolution in this mode.
 
 ## Capability lifecycle
 
