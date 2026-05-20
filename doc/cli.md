@@ -40,7 +40,8 @@ Layers stack with per-file union; later layers win.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port <PORT>` | `2025` | libp2p swarm listen port |
-| `--identity <PATH>` | none | Ed25519 identity file. Sugar for `PATH:/etc/identity` mount. Also reads `WW_IDENTITY` env. |
+| `--identity <PATH>` | `~/.ww/identity` | Ed25519 identity file path. Also reads `WW_IDENTITY` env. |
+| `--insecure-ephemeral` | off | Allow ephemeral identity fallback if identity file is missing (insecure; for quick trial runs). |
 | `--mcp` | off | Run as MCP server (JSON-RPC on stdin/stdout) |
 | `--http-listen <ADDR>` | none | Enable WAGI HTTP server (e.g. `127.0.0.1:2080`) |
 | `--http-dial <HOST>` | none | Allow outbound HTTP to host. Repeatable. Supports exact hosts, `*.example.com`, or `*`. Without this flag, no http-client capability is granted. |
@@ -70,8 +71,8 @@ ww run . --http-listen 0.0.0.0:2080 --http-dial api.example.com
 # Admin metrics + custom port
 ww run . --port 3030 --with-http-admin :2026
 
-# Identity + image layers
-ww run images/app ~/.ww/identity:/etc/identity ~/data:/var/data
+# Explicit identity path + image layers
+ww run --identity ~/.ww/identity images/app /ipfs/QmDataLayer
 
 # Run from IPFS
 ww run /ipfs/QmHash...

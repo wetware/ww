@@ -16,3 +16,7 @@ ww shell --discover
 
 The command shape is intentionally preserved so the remote-shell rollout
 can land without another CLI-breaking change.
+
+## Follow-ups
+
+- Transport cutover work is tracked in issue #470.

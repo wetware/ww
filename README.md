@@ -63,15 +63,12 @@ Requires a Rust toolchain with the `wasm32-wasip2` target. Optional: [Kubo](http
 
 ```bash
 ww run .                                # boot a node from current dir
-ww shell                                # connect to a local node over UDS
+ww shell                                # shell transport currently unavailable
 ```
 
-`ww shell` connects to a local daemon via a Unix Domain Socket at
-`~/.ww/run/<peer-id>.sock`. Filesystem permissions on the run directory
-are the auth boundary — matching `/var/run/docker.sock`, `~/.ipfs/api`,
-`~/.podman/podman.sock`. Remote-shell-over-libp2p (`ww shell <multiaddr>`,
-`ww shell --discover`) is a forward-stable CLI stub today; both exit
-`Error: NOT IMPLEMENTED`.
+`ww shell` is currently a forward-stable CLI stub and exits
+`NOT IMPLEMENTED` while the replacement remote transport/auth path lands.
+See issue #470 for the transport cutover follow-up.
 
 ### Boot a cell
 
