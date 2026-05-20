@@ -640,30 +640,6 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
     }
 }
 
-/// Legacy `fs` effect handler.
-///
-/// `perform fs` data-plane reads are removed in favor of direct WASI file I/O
-/// (`load`, `import`, and normal guest file reads against `/ipfs` / `/ipns`).
-/// The handler remains only to produce a migration-grade error when older code
-/// attempts `(perform fs ...)`.
-pub fn make_fs_handler() -> Val {
-    Val::AsyncNativeFn {
-        name: "fs-handler".into(),
-        func: Rc::new(move |args: Vec<Val>| {
-            Box::pin(async move {
-                let (method, rest) = extract_method(&args[0])?;
-                let _resume = &args[1];
-                let _ = rest;
-                Err(glia::error::cap_call(
-                    "fs",
-                    method,
-                    "deprecated: `(perform fs ...)` is removed; use WASI path I/O (`load`, `import`, or direct file reads under /ipfs|/ipns)".to_string(),
-                ))
-            })
-        }),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Effect handler wrapping — nests with-effect-handler forms around an expr
 // ---------------------------------------------------------------------------
@@ -1003,57 +979,4 @@ mod tests {
         }
     }
 
-    // -- make_fs_handler (legacy deprecation behavior) --
-
-    /// Drive an `AsyncNativeFn` synchronously by polling its future to
-    /// completion on a fresh single-threaded tokio runtime.
-    fn drive_handler(handler: &Val, method: &str, path: Option<&str>) -> Result<Val, Val> {
-        let mut method_list = vec![Val::Keyword(method.into())];
-        if let Some(p) = path {
-            method_list.push(Val::Str(p.into()));
-        }
-        let resume = Val::NativeFn {
-            name: "test-resume".into(),
-            func: std::rc::Rc::new(|args: &[Val]| Ok(args[0].clone())),
-        };
-        let args = vec![Val::List(method_list), resume];
-
-        match handler {
-            Val::AsyncNativeFn { func, .. } => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("runtime");
-                let local = tokio::task::LocalSet::new();
-                local.block_on(&rt, func(args))
-            }
-            other => panic!("expected AsyncNativeFn, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn fs_read_returns_deprecation_error() {
-        let handler = make_fs_handler();
-        let err = drive_handler(&handler, "read", Some("/ipfs/bafy.../foo.txt")).unwrap_err();
-        assert_eq!(
-            glia::error::type_tag(&err),
-            Some(glia::error::tag::CAP_CALL),
-            "expected cap-call-failed tag, got: {err:?}"
-        );
-        let msg = glia::error::message(&err).unwrap_or("");
-        assert!(
-            msg.contains("deprecated") && msg.contains("perform fs"),
-            "expected migration error message, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn fs_unknown_method_still_returns_deprecation_error() {
-        let handler = make_fs_handler();
-        let err = drive_handler(&handler, "explode", Some("anything")).unwrap_err();
-        assert_eq!(
-            glia::error::type_tag(&err),
-            Some(glia::error::tag::CAP_CALL)
-        );
-    }
 }

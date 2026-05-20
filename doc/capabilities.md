@@ -89,9 +89,9 @@ Use regular guest file I/O against filesystem paths:
 - direct guest reads via WASI-aware code under `/ipfs/<cid>/...` and
   `/ipns/<name>/...`
 
-`(perform fs ...)` is legacy and returns a migration error. Keeping a separate
-`perform` filesystem read surface created dual-path semantics and is being
-removed.
+There is no `perform fs` read surface. Keeping a separate `perform`
+filesystem API created dual-path semantics; reads now go only through
+WASI path I/O.
 
 ### Content mutation (explicit capability API)
 
