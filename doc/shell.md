@@ -76,14 +76,17 @@ The shell cell currently grafts these caps from its membrane (see
 
 ### Local effect handlers
 
-The shell cell also wires three glia-only effect handlers that do not
-go through a remote capability:
+The shell cell wires Glia-only local helpers that do not go through a
+remote capability:
 
-- **`fs`** — read paths from the cell's WASI filesystem (reactive to
-  stem updates per [`architecture.md`](architecture.md))
 - **`import`** — load other Glia source files
+- **`load`** dispatch form — read bytes from the WASI filesystem
 - The kernel's built-in expressions: arithmetic, `let`, `if`, `defn`,
   etc.
+
+`(perform fs ...)` is deprecated and returns a migration error. Filesystem
+reads should go through normal WASI file I/O (`load`, `import`, and guest
+file operations on `/ipfs/...` / `/ipns/...` paths).
 
 ### Built-ins
 

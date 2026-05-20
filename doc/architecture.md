@@ -395,21 +395,20 @@ preopen.
 2. **Root Atom binding** — the `stem::Atom` whose value is the cell's
    root CID. Swap the Atom and `CidTree::swap_root` updates the view
    atomically.
-3. **Glia env bindings** — what's callable inside the cell. Restrict
-   filesystem access by not binding the `fs` handler in the cell's
-   env (`std/caps/src/lib.rs:make_fs_handler`).
+3. **Glia env bindings** — what's callable inside the cell. Filesystem
+   data-plane access is via WASI path I/O (`load`, `import`, guest file
+   reads), not a separate `perform fs` surface.
 
-`LocalOverride` (`src/vfs.rs:59-62`) is the only principled exception:
-per-file host-local mounts checked before CID resolution, so private
-content (identity keys, per-node secrets) never enters IPFS. Use
-sparingly and only for genuinely host-private files.
+Backend virtual mode now rejects targeted mounts, so host-local overrides are
+not active in the backend mount path. Data-plane content for backend cells must
+flow through `/ipfs` / `/ipns` root layers.
 
 Revocation = epoch advance + respawn. Classical ocap: you cannot
 un-hand a CID. Advance the epoch (RPC caps fail `staleEpoch`), kill
 and respawn the cell under a different root Atom — the new cell sees
 a different slice of the universe.
 
-For the agent-facing view of all this (`fs/*`, `(schema cap)`,
+For the agent-facing view of all this (WASI path I/O, `(schema cap)`,
 structured errors, attenuation strategies), see
 [capabilities.md](capabilities.md).
 
