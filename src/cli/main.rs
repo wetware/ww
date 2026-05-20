@@ -2715,11 +2715,9 @@ mod tests {
 
     #[test]
     fn test_validate_backend_mount_policy_accepts_root_mounts() {
-        let mounts = ww::cell::mount::parse_args(&[
-            ".".to_string(),
-            "/ipfs/bafybeigdyrzt".to_string(),
-        ])
-        .unwrap();
+        let mounts =
+            ww::cell::mount::parse_args(&[".".to_string(), "/ipfs/bafybeigdyrzt".to_string()])
+                .unwrap();
         Commands::validate_backend_mount_policy(&mounts).unwrap();
     }
 
