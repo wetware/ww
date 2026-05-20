@@ -256,11 +256,8 @@ enum Commands {
 
     /// Connect to a running node and open a Glia REPL.
     ///
-    /// Evaluates Glia expressions on the remote node. State persists
-    /// across evals (def sticks). Ctrl-D or (exit) to disconnect.
-    ///
-    /// When no address is given, discovers a local node via UDS sockets
-    /// in `~/.ww/run/`.
+    /// Remote shell transport/auth is currently being reworked.
+    /// This command exists as a forward-stable CLI surface.
     ///
     /// Example:
     ///   ww shell
@@ -269,13 +266,10 @@ enum Commands {
     ///
     /// If both ADDR and --discover are given, ADDR takes precedence
     /// and --discover is ignored with a warning. (When ADDR / --discover
-    /// are implemented, both will use libp2p with Noise; today only the
-    /// local UDS path is built.)
+    /// are implemented, both will use libp2p with Noise.)
     Shell {
         /// Multiaddr of a remote node (NOT YET IMPLEMENTED — forward-stable
         /// CLI surface for future libp2p remote shell support).
-        /// If omitted, connects to the local daemon via UDS at
-        /// `~/.ww/run/<peer-id>.sock`.
         addr: Option<Multiaddr>,
 
         /// Browse the LAN for a wetware daemon via mDNS (NOT YET
@@ -597,11 +591,7 @@ impl Commands {
                 private_key,
             } => Self::push(path, ipfs_url, stem, rpc_url, private_key).await,
             Commands::Keygen { output } => Self::keygen(output).await,
-            Commands::Shell { addr, discover } => {
-                ww::config::init_tracing();
-                let local = tokio::task::LocalSet::new();
-                local.run_until(shell::run_shell(addr, discover)).await
-            }
+            Commands::Shell { addr, discover } => shell::run_shell(addr, discover).await,
             Commands::Perform { action } => match action {
                 PerformAction::Install => Self::perform_install().await,
                 PerformAction::Uninstall => Self::perform_uninstall().await,
@@ -1555,42 +1545,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         // Save values needed by the MCP cell before moving them into the kernel.
         let signing_key = std::sync::Arc::new(sk);
 
-        // Admin UDS thread: local-only admin gate over Unix Domain Socket.
-        // Lives alongside swarm/epoch/executor pool; clients connect via
-        // ~/.ww/run/<peer-id>.sock for full-membrane unattenuated access.
-        // FS permissions on the run dir ARE the auth boundary, by design —
-        // matching docker.sock / ipfs api / podman.sock conventions.
-        {
-            let snapshot = network_state.snapshot().await;
-            let peer_id_str = libp2p::PeerId::from_bytes(&snapshot.local_peer_id)
-                .context("invalid peer ID in network state")?
-                .to_string();
-            let multiaddrs: Vec<String> = snapshot
-                .listen_addrs
-                .iter()
-                .filter_map(|bytes| libp2p::Multiaddr::try_from(bytes.clone()).ok())
-                .map(|ma| ma.to_string())
-                .collect();
-            supervisor.spawn(
-                "admin-uds",
-                ww::admin_uds::AdminUdsService {
-                    peer_id: peer_id_str,
-                    shell_wasm: EMBEDDED_SHELL.to_vec(),
-                    multiaddrs,
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    network_state: network_state.clone(),
-                    swarm_cmd_tx: swarm_cmd_tx.clone(),
-                    wasm_debug,
-                    signing_key: Some(signing_key.clone()),
-                    stream_control: stream_control.clone(),
-                    ipfs_client: ipfs_client.clone(),
-                    http_dial: http_dial.clone(),
-                    cache_policy,
-                    compile_tx: Some(compile_tx.clone()),
-                },
-            );
-        }
-
         let mut builder = CellBuilder::new(image_path.clone())
             .with_loader(Box::new(loader))
             .with_network_state(network_state.clone())
@@ -1906,10 +1860,8 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
         }
 
-        // Shell is now a daemon built-in served over UDS at
-        // ~/.ww/run/<peer-id>.sock — no init.d registration needed.
-        // (Remote shell over libp2p is a follow-up; when it ships, this
-        // is where its init.d entry would land.)
+        // Shell service registration is intentionally absent while remote
+        // shell transport/auth replacement is in progress.
 
         // ── Status init.d ────────────────────────────────────────────
         let status_init = ww_dir.join("etc/init.d/05-status.glia");
@@ -2198,8 +2150,8 @@ wasip2::cli::command::export!({iface_name}Guest);
         done(format!("Binary symlink ({})", symlink_path.display()));
 
         // ── Default init.d ──────────────────────────────────────────
-        // Shell is now a daemon built-in served over UDS at
-        // ~/.ww/run/<peer-id>.sock — no init.d registration needed.
+        // Shell service registration is intentionally absent while remote
+        // shell transport/auth replacement is in progress.
 
         // ── Status init.d ────────────────────────────────────────────
         let status_init = ww_dir.join("etc/init.d/05-status.glia");

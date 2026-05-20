@@ -18,7 +18,6 @@ shared runtimes.
 |---|---|---|---|
 | Libp2p swarm | `swarm` (+ `ww-swarm-worker-*`) | `multi_thread` | TLS handshake parallelism — see below |
 | Epoch pipeline | `epoch` | `current_thread` | Single linear consumer of L1 events |
-| Admin UDS shell | `admin-uds` | `current_thread` + `LocalSet` | Cap'n Proto RPC drivers are `!Send` |
 | Executor pool worker (×N) | `executor-N` | `current_thread` + `LocalSet` | `wasmtime::Store` is `!Send` |
 
 The default is `current_thread`. We pick it because:
@@ -111,7 +110,7 @@ total thread budget is:
 
 - 1 `swarm` OS thread (the supervisor's child)
 - N `ww-swarm-worker-*` workers (tokio default)
-- 1 `epoch`, 1 `admin-uds`
+- 1 `epoch`
 - M `executor-*` (also `available_parallelism()`)
 
 On an 8-core Mac this lands around 18 threads under load, which is

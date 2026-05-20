@@ -98,13 +98,11 @@ Connect to a running daemon and open a Glia REPL.
 ww shell [ADDR] [--discover]
 ```
 
-Today only the local-UDS path is implemented. The CLI surface for
-remote shell access is forward-stable but currently exits with
-`Error: NOT IMPLEMENTED`.
+The admin UDS path has been removed. The command surface is preserved
+for forward compatibility while remote transport/auth work lands, and
+currently exits with `NOT IMPLEMENTED`.
 
-- *(no args)* — connect to a local daemon over Unix Domain Socket at
-  `~/.ww/run/<peer-id>.sock`. Scans `~/.ww/run/`; if multiple daemons
-  are running locally it fails with a disambiguation error.
+- *(no args)* — **NOT IMPLEMENTED.**
 - `<multiaddr>` — **NOT IMPLEMENTED.** Future libp2p remote dial.
 - `--discover` — **NOT IMPLEMENTED.** Future mDNS LAN browse.
 
@@ -115,7 +113,7 @@ compatibility; today both exit `NOT IMPLEMENTED`).
 ### Examples
 
 ```sh
-ww shell                                    # local UDS, auto-discover
+ww shell                                    # NOT IMPLEMENTED
 ww shell /dnsaddr/master.wetware.run        # NOT IMPLEMENTED (clap parse OK)
 ww shell /ip4/127.0.0.1/tcp/2025            # NOT IMPLEMENTED (clap parse OK)
 ww shell garbage                            # clap parse error: invalid multiaddr
@@ -123,13 +121,8 @@ ww shell garbage                            # clap parse error: invalid multiadd
 
 ### Auth model
 
-The local UDS path is an admin endpoint. Filesystem permissions on
-`~/.ww/run/` ARE the auth boundary — matching the
-convention of `/var/run/docker.sock`, `~/.ipfs/api`, and
-`~/.podman/podman.sock`. The spawned shell cell receives the daemon's
-full membrane, unattenuated. There is no Noise handshake, no Terminal
-challenge, no auth token. If you can write to the run dir, you can
-admin the daemon.
+No shell auth model is active right now because there is no live shell
+transport path. The replacement design will use explicit remote auth.
 
 See [shell.md](shell.md) for Glia syntax and the capabilities the
 shell cell exposes.
