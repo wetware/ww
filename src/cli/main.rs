@@ -2733,10 +2733,18 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let missing = dir.path().join("nonexistent");
         let err = Commands::resolve_identity(Some(missing.as_path()), false).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string()
-                .contains("requires a persistent identity by default"),
-            "unexpected error: {err}"
+            msg.contains("requires a persistent identity by default"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("ww keygen > ~/.ww/identity"),
+            "missing keygen remediation in error: {msg}"
+        );
+        assert!(
+            msg.contains("--insecure-ephemeral"),
+            "missing explicit insecure bypass hint in error: {msg}"
         );
     }
 
@@ -2759,6 +2767,20 @@ mod tests {
 
         let (loaded_sk, _, source) =
             Commands::resolve_identity(Some(id_path.as_path()), false).unwrap();
+        assert_eq!(source, "file");
+        assert_eq!(ww::keys::encode(&loaded_sk), encoded);
+    }
+
+    #[test]
+    fn test_resolve_identity_existing_file_wins_over_ephemeral_flag() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id_path = dir.path().join("identity");
+        let sk = ww::keys::generate().unwrap();
+        let encoded = ww::keys::encode(&sk);
+        std::fs::write(&id_path, &encoded).unwrap();
+
+        let (loaded_sk, _, source) =
+            Commands::resolve_identity(Some(id_path.as_path()), true).unwrap();
         assert_eq!(source, "file");
         assert_eq!(ww::keys::encode(&loaded_sk), encoded);
     }
