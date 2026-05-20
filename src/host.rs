@@ -422,11 +422,8 @@ impl Libp2pHost {
         // Peers already seen as relay candidates (dedup).
         let mut seen_relay_peers: HashSet<PeerId> = HashSet::new();
 
-        // Local discovery moved to UDS — see `src/admin_uds.rs`. The daemon's
-        // listen multiaddrs are written into `~/.ww/run/<peer-id>.json` at
-        // AdminUdsService startup; runtime changes to listen_addrs no longer
-        // get propagated automatically. (Acceptable for now: most consumers
-        // either dial the UDS directly or learn addrs via libp2p discovery.)
+        // Local UDS admin discovery has been removed. Runtime discovery now
+        // relies on libp2p mechanisms and direct multiaddr dialing paths.
 
         // Self-announcement on both DHTs.
         let beh = self.swarm.behaviour_mut();
