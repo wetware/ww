@@ -15,6 +15,11 @@ The `Routing` capability (obtained via `membrane.graft()`) provides:
 | `provide` | `(perform routing :provide "name")` | Hash name to CID, announce this node as a provider |
 | `find` | `(perform routing :find "name" [:count N])` | Discover providers for a name (default 20) |
 | `hash` | `(perform routing :hash "data")` | Compute CID from data (advanced — `provide` hashes internally) |
+| `resolve` | `(perform routing :resolve "k51...")` | Resolve an IPNS name to `/ipfs/<cid>` |
+| `mkdir` | `(perform routing :mkdir "<base-cid>" "path" true)` | Create directory in a derived UnixFS root; returns new root CID |
+| `write-file` | `(perform routing :write-file "<base-cid>" "path" "data" true)` | Write file content in a derived UnixFS root; returns new root CID |
+| `remove` | `(perform routing :remove "<base-cid>" "path" true)` | Remove path from a derived UnixFS root; returns new root CID |
+| `publish` | `(perform routing :publish "ww" "<cid>" "/ipfs/<expected>")` | Publish CID to IPNS with optional CAS guard |
 
 All methods are epoch-guarded: they fail with `staleEpoch` when the on-chain head
 advances, forcing a re-graft.
@@ -55,6 +60,20 @@ Provider keys are CIDv1 hashes (SHA-256, raw codec) of the service name string.
 The shell's `(perform routing :provide "name")` and `(perform routing :find "name")` handle hashing
 internally. The raw `(perform routing :hash "data")` method is exposed for advanced use
 cases (e.g. content-addressed lookups).
+
+## Mutation semantics
+
+Write operations are **CID-transform** operations:
+
+1. Input: base root CID
+2. Apply one mutation (`mkdir`, `write-file`, or `remove`)
+3. Output: new root CID
+
+No hidden mutable global root is kept in the daemon.
+
+For IPNS updates, `publish` supports compare-and-set semantics:
+if `expected-current` is provided and does not match the currently
+resolved head, the call fails instead of silently overwriting.
 
 ## Limitations
 
