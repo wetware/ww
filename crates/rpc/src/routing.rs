@@ -4,13 +4,16 @@
 //! event loop via `SwarmCommand::KadProvide` / `SwarmCommand::KadFindProviders`.
 //! All methods check the epoch guard before proceeding.
 //!
-//! Only content routing (provide/findProviders) lives here.
-//! Data transfer flows through the WASI virtual filesystem, not a capability.
+//! Data-plane reads flow through the WASI virtual filesystem.
+//! This capability provides routing plus explicit write/publish control ops.
 
 use blake3;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use cid::Cid;
+use std::path::{Component, Path};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
 use membrane::EpochGuard;
@@ -26,6 +29,85 @@ fn cid_to_kad_key(cid_str: &str) -> Result<Vec<u8>, capnp::Error> {
         .parse()
         .map_err(|e| capnp::Error::failed(format!("invalid CID '{cid_str}': {e}")))?;
     Ok(cid.hash().to_bytes())
+}
+
+fn parse_cid_text(cid_str: &str, field: &str) -> Result<Cid, capnp::Error> {
+    cid_str
+        .parse()
+        .map_err(|e| capnp::Error::failed(format!("invalid {field} CID '{cid_str}': {e}")))
+}
+
+fn normalize_rel_path(path: &str) -> Result<String, capnp::Error> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(capnp::Error::failed("path must not be empty".into()));
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    for c in Path::new(trimmed).components() {
+        match c {
+            Component::Normal(seg) => {
+                let s = seg
+                    .to_str()
+                    .ok_or_else(|| capnp::Error::failed("path must be valid UTF-8".into()))?;
+                if s.is_empty() {
+                    continue;
+                }
+                parts.push(s.to_string());
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) | Component::ParentDir => {
+                return Err(capnp::Error::failed(format!(
+                    "path must be relative and must not contain '..': {path}"
+                )));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return Err(capnp::Error::failed("path must not be empty".into()));
+    }
+    Ok(parts.join("/"))
+}
+
+fn maybe_normalize_ipfs_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("/ipfs/") {
+        return trimmed.to_string();
+    }
+    format!("/ipfs/{}", trimmed.trim_start_matches('/'))
+}
+
+fn enforce_publish_expected(
+    name: &str,
+    expected_current: &str,
+    current_resolved: &str,
+) -> Result<(), capnp::Error> {
+    let expected = maybe_normalize_ipfs_path(expected_current);
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let current = maybe_normalize_ipfs_path(current_resolved);
+    if current != expected {
+        return Err(capnp::Error::failed(format!(
+            "ipns compare-and-set failed for {name}: expected {expected}, current {current}"
+        )));
+    }
+    Ok(())
+}
+
+static WORKSPACE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_workspace_path() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = WORKSPACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("/ww/stage5/{now}-{seq}")
 }
 
 /// In-memory routing table for deterministic integration tests.
@@ -128,6 +210,56 @@ impl routing_capnp::routing::Server for LocalRouting {
         let c = Cid::new_v1(0x55, mh);
         results.get().set_key(c.to_string());
         Promise::ok(())
+    }
+
+    fn resolve(
+        self: capnp::capability::Rc<Self>,
+        _params: routing_capnp::routing::ResolveParams,
+        _results: routing_capnp::routing::ResolveResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented(
+            "LocalRouting: resolve is not implemented".into(),
+        ))
+    }
+
+    fn mkdir(
+        self: capnp::capability::Rc<Self>,
+        _params: routing_capnp::routing::MkdirParams,
+        _results: routing_capnp::routing::MkdirResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented(
+            "LocalRouting: mkdir is not implemented".into(),
+        ))
+    }
+
+    fn write_file(
+        self: capnp::capability::Rc<Self>,
+        _params: routing_capnp::routing::WriteFileParams,
+        _results: routing_capnp::routing::WriteFileResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented(
+            "LocalRouting: writeFile is not implemented".into(),
+        ))
+    }
+
+    fn remove(
+        self: capnp::capability::Rc<Self>,
+        _params: routing_capnp::routing::RemoveParams,
+        _results: routing_capnp::routing::RemoveResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented(
+            "LocalRouting: remove is not implemented".into(),
+        ))
+    }
+
+    fn publish(
+        self: capnp::capability::Rc<Self>,
+        _params: routing_capnp::routing::PublishParams,
+        _results: routing_capnp::routing::PublishResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented(
+            "LocalRouting: publish is not implemented".into(),
+        ))
     }
 }
 
@@ -258,6 +390,178 @@ impl routing_capnp::routing::Server for RoutingImpl {
             Ok(())
         })
     }
+
+    fn mkdir(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::MkdirParams,
+        mut results: routing_capnp::routing::MkdirResults,
+    ) -> Promise<(), capnp::Error> {
+        pry!(self.guard.check());
+        let reader = pry!(params.get());
+        let base_cid = pry!(reader.get_base_cid()).to_string().unwrap_or_default();
+        let rel_path = pry!(reader.get_path()).to_string().unwrap_or_default();
+        let parents = reader.get_parents();
+        let ipfs_client = self.ipfs_client.clone();
+        Promise::from_future(async move {
+            let rel = normalize_rel_path(&rel_path)?;
+            let _ = parse_cid_text(&base_cid, "base")?;
+            let workspace = next_workspace_path();
+            let root = format!("{workspace}/root");
+            let mfs = ipfs_client.mfs();
+            mfs.files_mkdir(&workspace, true)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("mfs mkdir workspace failed: {e}")))?;
+            mfs.files_cp(&format!("/ipfs/{base_cid}"), &root)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("mfs seed root failed: {e}")))?;
+            let target = format!("{root}/{rel}");
+            let mutate_res = mfs
+                .files_mkdir(&target, parents)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("mkdir failed at {target}: {e}")));
+            let stat_res = ipfs_client.mfs().files_stat(&root, true).await;
+            let _ = ipfs_client.mfs().files_rm(&workspace, true).await;
+            mutate_res?;
+            let stat =
+                stat_res.map_err(|e| capnp::Error::failed(format!("mfs stat root failed: {e}")))?;
+            let root_cid = stat.hash;
+            let _ = parse_cid_text(&root_cid, "result")?;
+            results.get().set_root_cid(&root_cid);
+            Ok(())
+        })
+    }
+
+    fn write_file(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::WriteFileParams,
+        mut results: routing_capnp::routing::WriteFileResults,
+    ) -> Promise<(), capnp::Error> {
+        pry!(self.guard.check());
+        let reader = pry!(params.get());
+        let base_cid = pry!(reader.get_base_cid()).to_string().unwrap_or_default();
+        let rel_path = pry!(reader.get_path()).to_string().unwrap_or_default();
+        let data = pry!(reader.get_data()).to_vec();
+        let create_parents = reader.get_create_parents();
+        let ipfs_client = self.ipfs_client.clone();
+        Promise::from_future(async move {
+            let rel = normalize_rel_path(&rel_path)?;
+            let _ = parse_cid_text(&base_cid, "base")?;
+            let leaf_cid = ipfs_client
+                .add_bytes(&data)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("ipfs add bytes failed: {e}")))?;
+            let workspace = next_workspace_path();
+            let root = format!("{workspace}/root");
+            let mfs = ipfs_client.mfs();
+            mfs.files_mkdir(&workspace, true)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("mfs mkdir workspace failed: {e}")))?;
+            mfs.files_cp(&format!("/ipfs/{base_cid}"), &root)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("mfs seed root failed: {e}")))?;
+            let target = format!("{root}/{rel}");
+            let mutate_res = async {
+                if let Some(parent) = Path::new(&target).parent() {
+                    if create_parents {
+                        let parent_str = parent.to_string_lossy().to_string();
+                        mfs.files_mkdir(&parent_str, true).await.map_err(|e| {
+                            capnp::Error::failed(format!(
+                                "mkdir parents failed at {parent_str}: {e}"
+                            ))
+                        })?;
+                    }
+                }
+                let _ = mfs.files_rm(&target, false).await;
+                mfs.files_cp(&format!("/ipfs/{leaf_cid}"), &target)
+                    .await
+                    .map_err(|e| {
+                        capnp::Error::failed(format!("write file failed at {target}: {e}"))
+                    })
+            }
+            .await;
+            let stat_res = ipfs_client.mfs().files_stat(&root, true).await;
+            let _ = ipfs_client.mfs().files_rm(&workspace, true).await;
+            mutate_res?;
+            let stat =
+                stat_res.map_err(|e| capnp::Error::failed(format!("mfs stat root failed: {e}")))?;
+            let root_cid = stat.hash;
+            let _ = parse_cid_text(&root_cid, "result")?;
+            results.get().set_root_cid(&root_cid);
+            Ok(())
+        })
+    }
+
+    fn remove(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::RemoveParams,
+        mut results: routing_capnp::routing::RemoveResults,
+    ) -> Promise<(), capnp::Error> {
+        pry!(self.guard.check());
+        let reader = pry!(params.get());
+        let base_cid = pry!(reader.get_base_cid()).to_string().unwrap_or_default();
+        let rel_path = pry!(reader.get_path()).to_string().unwrap_or_default();
+        let recursive = reader.get_recursive();
+        let ipfs_client = self.ipfs_client.clone();
+        Promise::from_future(async move {
+            let rel = normalize_rel_path(&rel_path)?;
+            let _ = parse_cid_text(&base_cid, "base")?;
+            let workspace = next_workspace_path();
+            let root = format!("{workspace}/root");
+            let mfs = ipfs_client.mfs();
+            mfs.files_mkdir(&workspace, true)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("mfs mkdir workspace failed: {e}")))?;
+            mfs.files_cp(&format!("/ipfs/{base_cid}"), &root)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("mfs seed root failed: {e}")))?;
+            let target = format!("{root}/{rel}");
+            let mutate_res = mfs
+                .files_rm(&target, recursive)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("remove failed at {target}: {e}")));
+            let stat_res = ipfs_client.mfs().files_stat(&root, true).await;
+            let _ = ipfs_client.mfs().files_rm(&workspace, true).await;
+            mutate_res?;
+            let stat =
+                stat_res.map_err(|e| capnp::Error::failed(format!("mfs stat root failed: {e}")))?;
+            let root_cid = stat.hash;
+            let _ = parse_cid_text(&root_cid, "result")?;
+            results.get().set_root_cid(&root_cid);
+            Ok(())
+        })
+    }
+
+    fn publish(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::PublishParams,
+        mut results: routing_capnp::routing::PublishResults,
+    ) -> Promise<(), capnp::Error> {
+        pry!(self.guard.check());
+        let reader = pry!(params.get());
+        let name = pry!(reader.get_name()).to_string().unwrap_or_default();
+        let cid = pry!(reader.get_cid()).to_string().unwrap_or_default();
+        let expected_current = pry!(reader.get_expected_current())
+            .to_string()
+            .unwrap_or_default();
+        let ipfs_client = self.ipfs_client.clone();
+        Promise::from_future(async move {
+            let parsed = parse_cid_text(&cid, "publish")?;
+            let target = format!("/ipfs/{parsed}");
+            if !expected_current.trim().is_empty() {
+                let current = ipfs_client
+                    .name_resolve(&name)
+                    .await
+                    .map_err(|e| capnp::Error::failed(format!("ipns resolve failed: {e}")))?;
+                enforce_publish_expected(&name, &expected_current, &current)?;
+            }
+            ipfs_client
+                .name_publish(&target, &name)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("ipns publish failed: {e}")))?;
+            results.get().set_published_path(&target);
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +677,31 @@ mod tests {
     fn test_cid_to_kad_key_rejects_invalid() {
         assert!(cid_to_kad_key("not-a-cid").is_err());
         assert!(cid_to_kad_key("").is_err());
+    }
+
+    #[test]
+    fn test_normalize_rel_path_accepts_clean_relative_path() {
+        let p = normalize_rel_path("apps/demo/main.glia").unwrap();
+        assert_eq!(p, "apps/demo/main.glia");
+    }
+
+    #[test]
+    fn test_normalize_rel_path_rejects_absolute_and_parent() {
+        assert!(normalize_rel_path("/etc/passwd").is_err());
+        assert!(normalize_rel_path("../demo").is_err());
+        assert!(normalize_rel_path("apps/../demo").is_err());
+    }
+
+    #[test]
+    fn test_publish_compare_and_set_semantics() {
+        // Empty expected => unconditional publish.
+        assert!(enforce_publish_expected("ww", "", "/ipfs/bafyok").is_ok());
+        // Exact match => ok.
+        assert!(enforce_publish_expected("ww", "/ipfs/bafyok", "/ipfs/bafyok").is_ok());
+        // CID-only expected is normalized to /ipfs/<cid>.
+        assert!(enforce_publish_expected("ww", "bafyok", "/ipfs/bafyok").is_ok());
+        // Mismatch => conflict.
+        assert!(enforce_publish_expected("ww", "/ipfs/bafyold", "/ipfs/bafynew").is_err());
     }
 
     // -------------------------------------------------------------------

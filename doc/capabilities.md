@@ -93,6 +93,20 @@ Use regular guest file I/O against filesystem paths:
 `perform` filesystem read surface created dual-path semantics and is being
 removed.
 
+### Content mutation (explicit capability API)
+
+Writes are effectful and go through `routing`, not plain filesystem reads.
+
+- `routing :mkdir <base-cid> <path> [parents?]` -> `new-root-cid`
+- `routing :write-file <base-cid> <path> <bytes-or-string> [create-parents?]` -> `new-root-cid`
+- `routing :remove <base-cid> <path> [recursive?]` -> `new-root-cid`
+- `routing :publish <ipns-name> <cid> [expected-current]` -> `/ipfs/<cid>`
+
+Semantics:
+- Mutations are **CID-transform operations**: input root CID + operation -> output root CID.
+- No hidden mutable global root is kept in the daemon.
+- IPNS publish supports compare-and-set conflict checks via `expected-current`.
+
 ## Local overrides
 
 Backend virtual mode rejects targeted mounts, so host-local overrides are
