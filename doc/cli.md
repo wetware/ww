@@ -96,34 +96,28 @@ ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 Connect to a running daemon and open a Glia REPL.
 
 ```
-ww shell [ADDR] [--discover]
+ww shell [ADDR]
 ```
 
 The admin UDS path has been removed. The command surface is preserved
-for forward compatibility while remote transport/auth work lands, and
-currently exits with `NOT IMPLEMENTED`.
+with libp2p transport + Terminal(Membrane) auth:
 
-- *(no args)* — **NOT IMPLEMENTED.**
-- `<multiaddr>` — **NOT IMPLEMENTED.** Future libp2p remote dial.
-- `--discover` — **NOT IMPLEMENTED.** Future mDNS LAN browse.
-
-If both `<multiaddr>` and `--discover` are given, `<multiaddr>` takes
-precedence and `--discover` is ignored (documented for forward
-compatibility; today both exit `NOT IMPLEMENTED`).
+- *(no args)* — discover via mDNS, auto-connect only when unambiguous.
+- `<multiaddr>` — explicit remote dial.
 
 ### Examples
 
 ```sh
-ww shell                                    # NOT IMPLEMENTED
-ww shell /dnsaddr/master.wetware.run        # NOT IMPLEMENTED (clap parse OK)
-ww shell /ip4/127.0.0.1/tcp/2025            # NOT IMPLEMENTED (clap parse OK)
+ww shell                                    # mDNS discover + connect
+ww shell /dnsaddr/master.wetware.run        # explicit dial
+ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...
 ww shell garbage                            # clap parse error: invalid multiaddr
 ```
 
 ### Auth model
 
-No shell auth model is active right now because there is no live shell
-transport path. The replacement design will use explicit remote auth.
+Shell uses Terminal(Membrane) challenge-response auth over libp2p.
+The signer key comes from `WW_IDENTITY` or `~/.ww/identity`.
 
 See [shell.md](shell.md) for Glia syntax and the capabilities the
 shell cell exposes.

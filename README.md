@@ -63,12 +63,12 @@ Requires a Rust toolchain with the `wasm32-wasip2` target. Optional: [Kubo](http
 
 ```bash
 ww run .                                # boot a node from current dir
-ww shell                                # shell transport currently unavailable
+ww shell                                # discover a local node via mDNS, then open REPL
 ```
 
-`ww shell` is currently a forward-stable CLI stub and exits
-`NOT IMPLEMENTED` while the replacement remote transport/auth path lands.
-See issue #470 for the transport cutover follow-up.
+`ww shell` uses libp2p transport and Terminal(Membrane) auth. By default it
+discovers local hosts via mDNS and auto-connects only when resolution is
+unambiguous.
 
 ### Boot a cell
 
