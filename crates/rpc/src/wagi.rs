@@ -124,8 +124,8 @@ pub fn parse_cgi_response(stdout: &[u8]) -> Result<WagiResponse, WagiError> {
 
     // Find the header/body separator: \r\n\r\n or \n\n
     let (header_end, body_start) = find_header_boundary(stdout).ok_or_else(|| {
-        // No blank line found. Treat entire output as body with defaults.
-        // This is valid CGI: a response with no headers at all.
+        // No blank line found. This parser currently requires an explicit
+        // header/body separator and treats separator-less output as malformed.
         WagiError::MalformedHeaders("no header/body separator found".into())
     })?;
 
