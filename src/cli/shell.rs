@@ -799,7 +799,9 @@ mod tests {
             }
         ]"#;
 
-        let err = parse_discovery_candidates_json(input).unwrap_err().to_string();
+        let err = parse_discovery_candidates_json(input)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid multiaddr"), "{err}");
     }
 }

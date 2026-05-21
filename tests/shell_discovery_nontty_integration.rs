@@ -59,9 +59,9 @@ fn shell_nontty_ambiguous_discovery_suggests_select_or_addr() {
         stderr.contains("Multiple wetware hosts discovered via mDNS; refusing to guess"),
         "stderr: {stderr}"
     );
-    assert!(stderr.contains("--select <index|peer-id>"), "stderr: {stderr}");
     assert!(
-        stderr.contains("ww shell <multiaddr>"),
+        stderr.contains("--select <index|peer-id>"),
         "stderr: {stderr}"
     );
+    assert!(stderr.contains("ww shell <multiaddr>"), "stderr: {stderr}");
 }
