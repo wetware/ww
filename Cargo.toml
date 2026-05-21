@@ -56,7 +56,7 @@ blake3 = "1.8.3"
 
 # Host-only dependencies (not needed for WASM guests)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-libp2p = { version = "0.55.0", features = ["tokio", "tcp", "noise", "yamux", "macros", "identify", "rsa", "request-response", "ed25519", "kad", "autonat", "relay", "dcutr", "quic", "dns"] }
+libp2p = { version = "0.55.0", features = ["tokio", "tcp", "noise", "yamux", "macros", "identify", "rsa", "request-response", "ed25519", "kad", "autonat", "relay", "dcutr", "quic", "dns", "mdns"] }
 libp2p-core = "0.43"
 ipfs = { path = "crates/ipfs" }
 clap = { version = "4.5.51", features = ["derive", "env"] }

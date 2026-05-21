@@ -256,26 +256,12 @@ enum Commands {
 
     /// Connect to a running node and open a Glia REPL.
     ///
-    /// Remote shell transport/auth is currently being reworked.
-    /// This command exists as a forward-stable CLI surface.
-    ///
     /// Example:
     ///   ww shell
-    ///   ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...   # NOT IMPLEMENTED
-    ///   ww shell --discover                                # NOT IMPLEMENTED
-    ///
-    /// If both ADDR and --discover are given, ADDR takes precedence
-    /// and --discover is ignored with a warning. (When ADDR / --discover
-    /// are implemented, both will use libp2p with Noise.)
+    ///   ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...
     Shell {
-        /// Multiaddr of a remote node (NOT YET IMPLEMENTED — forward-stable
-        /// CLI surface for future libp2p remote shell support).
+        /// Multiaddr of a remote node.
         addr: Option<Multiaddr>,
-
-        /// Browse the LAN for a wetware daemon via mDNS (NOT YET
-        /// IMPLEMENTED — forward-stable CLI surface).
-        #[arg(long)]
-        discover: bool,
     },
 
     /// Effectful operations that mutate state beyond the current directory.
@@ -590,7 +576,7 @@ impl Commands {
                 private_key,
             } => Self::push(path, ipfs_url, stem, rpc_url, private_key).await,
             Commands::Keygen { output } => Self::keygen(output).await,
-            Commands::Shell { addr, discover } => shell::run_shell(addr, discover).await,
+            Commands::Shell { addr } => shell::run_shell(addr).await,
             Commands::Perform { action } => match action {
                 PerformAction::Install => Self::perform_install().await,
                 PerformAction::Uninstall => Self::perform_uninstall().await,
@@ -1356,7 +1342,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         tracing::debug!(source = identity_source, "identity resolved");
 
         let keypair = ww::keys::to_libp2p(&sk)?;
-
         // Attempt to fetch Kubo's identity so we can bootstrap the in-process
         // Kad client against the local node (Amino DHT /ipfs/kad/1.0.0).
         // Non-fatal: if Kubo is unreachable we still start, just without Kad.

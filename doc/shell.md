@@ -1,22 +1,27 @@
 # Shell
 
-The `ww shell` transport is currently unavailable.
+`ww shell` connects to a running node and opens a Glia REPL.
 
-The previous local admin UDS path has been removed, and the replacement
-remote shell transport/auth path has not landed yet. For now, all
-invocations of `ww shell` return `NOT IMPLEMENTED`.
-
-## CLI Surface (Forward-Compatible)
+## Modes
 
 ```sh
 ww shell
 ww shell <multiaddr>
-ww shell --discover
 ```
 
-The command shape is intentionally preserved so the remote-shell rollout
-can land without another CLI-breaking change.
+- `ww shell`: discover hosts via mDNS, then connect only when target
+  selection is unambiguous.
+- `ww shell <multiaddr>`: dial an explicit target.
 
-## Follow-ups
+## Auth
 
-- Transport cutover work is tracked in issue #470.
+Shell transport uses libp2p streams and Terminal(Membrane) challenge-response
+authentication. `ww shell` signs terminal challenges with the local identity
+key (`WW_IDENTITY` or `~/.ww/identity`).
+
+## Multi-Result Discovery
+
+When mDNS returns multiple candidates and no deterministic preferred target
+is found, `ww shell` refuses to guess and asks for an explicit multiaddr.
+
+Interactive multi-select UX is tracked in issue #479.

@@ -177,6 +177,7 @@ pub use rpc::SwarmCommand;
 pub struct WetwareBehaviour {
     pub identify: libp2p::identify::Behaviour,
     pub stream: libp2p_stream::Behaviour,
+    pub mdns: libp2p::mdns::tokio::Behaviour,
     /// WAN Kademlia DHT client (Amino protocol `/ipfs/kad/1.0.0`).
     /// Runs in client mode initially.  Promoted to server when AutoNAT confirms
     /// public reachability.
@@ -333,6 +334,10 @@ impl Libp2pHost {
             .with_quic()
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
             .with_behaviour(|_keypair, relay_client| {
+                let mdns = libp2p::mdns::tokio::Behaviour::new(
+                    libp2p::mdns::Config::default(),
+                    local_peer_id,
+                )?;
                 let conn_limits = libp2p::connection_limits::ConnectionLimits::default()
                     .with_max_pending_incoming(Some(16))
                     .with_max_pending_outgoing(Some(16))
@@ -341,6 +346,7 @@ impl Libp2pHost {
                 Ok(WetwareBehaviour {
                     identify: libp2p::identify::Behaviour::new(identify_config),
                     stream: stream_behaviour,
+                    mdns,
                     kad: kad_wan,
                     kad_lan,
                     autonat: libp2p::autonat::v1::Behaviour::new(
@@ -608,6 +614,21 @@ impl Libp2pHost {
                             );
                         }
                         SwarmEvent::Behaviour(WetwareBehaviourEvent::Identify(_)) => {}
+                        SwarmEvent::Behaviour(WetwareBehaviourEvent::Mdns(
+                            libp2p::mdns::Event::Discovered(discovered),
+                        )) => {
+                            for (peer_id, addr) in discovered {
+                                peer_addr_book.entry(peer_id).or_default().push(addr.clone());
+                                if is_lan_addr(&addr) {
+                                    self.swarm.behaviour_mut().kad_lan.add_address(&peer_id, addr);
+                                } else {
+                                    self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                                }
+                            }
+                        }
+                        SwarmEvent::Behaviour(WetwareBehaviourEvent::Mdns(
+                            libp2p::mdns::Event::Expired(_),
+                        )) => {}
                         // --- AutoNAT v1: authoritative NAT status ---
                         SwarmEvent::Behaviour(WetwareBehaviourEvent::Autonat(
                             libp2p::autonat::v1::Event::StatusChanged { old, new },
@@ -1548,12 +1569,14 @@ mod tests {
 
 /// Minimal network behaviour for client-only operation.
 /// Identify for peer info exchange + libp2p_stream for VatClient dialing.
+/// mDNS for local discovery.
 /// Relay client for connecting to NATted nodes via relayed addresses.
-/// No Kademlia, no mDNS, no listeners.
+/// No Kademlia and no listeners.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct ClientBehaviour {
     identify: libp2p::identify::Behaviour,
     stream: libp2p_stream::Behaviour,
+    mdns: libp2p::mdns::tokio::Behaviour,
     relay_client: libp2p::relay::client::Behaviour,
 }
 
@@ -1589,9 +1612,12 @@ impl ClientSwarm {
             .with_dns()?
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
             .with_behaviour(|_keypair, relay_client| {
+                let mdns =
+                    libp2p::mdns::tokio::Behaviour::new(libp2p::mdns::Config::default(), peer_id)?;
                 Ok(ClientBehaviour {
                     identify: libp2p::identify::Behaviour::new(identify_config),
                     stream: stream_behaviour,
+                    mdns,
                     relay_client,
                 })
             })?
@@ -1640,9 +1666,14 @@ impl ClientSwarm {
     /// If `connected_tx` is provided, the peer ID of the first established
     /// connection is sent through it (useful for dnsaddr dialing where the
     /// peer ID is not known upfront).
-    pub async fn run(mut self, connected_tx: Option<tokio::sync::oneshot::Sender<PeerId>>) {
+    pub async fn run(
+        mut self,
+        connected_tx: Option<tokio::sync::oneshot::Sender<PeerId>>,
+        discovered_tx: Option<tokio::sync::mpsc::UnboundedSender<(PeerId, Multiaddr)>>,
+    ) {
         use libp2p::swarm::SwarmEvent;
         let mut connected_tx = connected_tx;
+        let discovered_tx = discovered_tx;
         loop {
             match self.swarm.next().await {
                 Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {
@@ -1651,6 +1682,18 @@ impl ClientSwarm {
                         let _ = tx.send(peer_id);
                     }
                 }
+                Some(SwarmEvent::Behaviour(ClientBehaviourEvent::Mdns(
+                    libp2p::mdns::Event::Discovered(discovered),
+                ))) => {
+                    if let Some(tx) = &discovered_tx {
+                        for (peer_id, addr) in discovered {
+                            let _ = tx.send((peer_id, addr));
+                        }
+                    }
+                }
+                Some(SwarmEvent::Behaviour(ClientBehaviourEvent::Mdns(
+                    libp2p::mdns::Event::Expired(_),
+                ))) => {}
                 Some(SwarmEvent::ConnectionClosed { peer_id, .. }) => {
                     tracing::debug!(peer = %peer_id, "Client connection closed");
                 }
