@@ -6,7 +6,7 @@ fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let target_dir = manifest_path.join("target");
+    let target_dir = resolve_target_dir(manifest_path);
 
     // Compile example schemas so integration tests get typed access.
     let greeter_schema = manifest_path.join("examples/discovery/greeter.capnp");
@@ -142,6 +142,20 @@ fn main() {
         } else {
             println!("cargo:warning={msg}");
         }
+    }
+}
+
+fn resolve_target_dir(manifest_path: &Path) -> PathBuf {
+    match env::var("CARGO_TARGET_DIR") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let configured = PathBuf::from(raw);
+            if configured.is_absolute() {
+                configured
+            } else {
+                manifest_path.join(configured)
+            }
+        }
+        _ => manifest_path.join("target"),
     }
 }
 

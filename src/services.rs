@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};
 use wasmtime::Engine;
 
@@ -82,14 +82,23 @@ impl Host {
     }
 
     /// Spawn a service on its own OS thread.
-    pub fn spawn<S: Service>(&mut self, name: &str, service: S) {
+    pub fn try_spawn<S: Service>(&mut self, name: &str, service: S) -> Result<()> {
         let shutdown = self.shutdown_rx.clone();
         let thread_name = name.to_string();
         let handle = std::thread::Builder::new()
             .name(thread_name.clone())
             .spawn(move || service.run(shutdown))
-            .unwrap_or_else(|e| panic!("failed to spawn thread {}: {}", thread_name, e));
+            .with_context(|| format!("failed to spawn service thread '{thread_name}'"))?;
         self.threads.push((name.to_string(), handle));
+        Ok(())
+    }
+
+    /// Spawn a service on its own OS thread.
+    ///
+    /// Prefer `try_spawn` in startup paths that should return typed errors.
+    pub fn spawn<S: Service>(&mut self, name: &str, service: S) {
+        self.try_spawn(name, service)
+            .unwrap_or_else(|e| panic!("{e:#}"));
     }
 
     /// Signal all services to shut down and join all threads.
@@ -150,7 +159,7 @@ const SPAWN_CHANNEL_DEPTH: usize = 64;
 
 pub struct ExecutorPool {
     senders: Vec<mpsc::Sender<SpawnRequest>>,
-    threads: Vec<Option<JoinHandle<()>>>,
+    threads: Vec<Option<JoinHandle<Result<()>>>>,
     cell_counts: Arc<Vec<AtomicUsize>>,
     next: AtomicUsize,
     /// Shared engine for all cells. Callers should pass this to CellBuilder
@@ -164,7 +173,7 @@ impl ExecutorPool {
     ///
     /// Each worker thread runs its own `current_thread` tokio runtime.
     /// Pass `0` to use `std::thread::available_parallelism()`.
-    pub fn new(n: usize, shutdown: watch::Receiver<()>) -> Self {
+    pub fn try_new(n: usize, shutdown: watch::Receiver<()>) -> Result<Self> {
         let n = if n == 0 {
             std::thread::available_parallelism()
                 .map(|p| p.get())
@@ -180,7 +189,8 @@ impl ExecutorPool {
         wasm_config.async_support(true);
         wasm_config.consume_fuel(true);
         wasm_config.epoch_interruption(true);
-        let engine = Arc::new(Engine::new(&wasm_config).expect("failed to create wasmtime engine"));
+        let engine =
+            Arc::new(Engine::new(&wasm_config).context("failed to create shared wasmtime engine")?);
 
         let mut senders = Vec::with_capacity(n);
         let mut threads = Vec::with_capacity(n);
@@ -195,20 +205,27 @@ impl ExecutorPool {
             let handle = std::thread::Builder::new()
                 .name(format!("executor-{}", i))
                 .spawn(move || worker_loop(i, rx, shutdown, counts, engine))
-                .unwrap_or_else(|e| panic!("failed to spawn executor-{}: {}", i, e));
+                .with_context(|| format!("failed to spawn executor worker thread {i}"))?;
             senders.push(tx);
             threads.push(Some(handle));
         }
 
         tracing::info!(workers = n, "executor pool started");
 
-        Self {
+        Ok(Self {
             senders,
             threads,
             cell_counts,
             next: AtomicUsize::new(0),
             engine,
-        }
+        })
+    }
+
+    /// Create a new executor pool, panicking on startup errors.
+    ///
+    /// Prefer `try_new` in startup paths that should return typed errors.
+    pub fn new(n: usize, shutdown: watch::Receiver<()>) -> Self {
+        Self::try_new(n, shutdown).unwrap_or_else(|e| panic!("{e:#}"))
     }
 
     /// Submit a cell to the pool using least-loaded assignment.
@@ -270,13 +287,17 @@ impl Drop for ExecutorPool {
         // Join all worker threads.
         for handle in &mut self.threads {
             if let Some(h) = handle.take() {
-                if let Err(panic) = h.join() {
-                    let msg = panic
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                        .unwrap_or("<non-string panic>");
-                    tracing::error!(panic = msg, "executor worker panicked");
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::error!(error = %e, "executor worker failed"),
+                    Err(panic) => {
+                        let msg = panic
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("<non-string panic>");
+                        tracing::error!(panic = msg, "executor worker panicked");
+                    }
                 }
             }
         }
@@ -315,11 +336,11 @@ fn worker_loop(
     shutdown: watch::Receiver<()>,
     cell_counts: Arc<Vec<AtomicUsize>>,
     engine: Arc<Engine>,
-) {
+) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap_or_else(|e| panic!("executor-{}: failed to build runtime: {}", id, e));
+        .with_context(|| format!("executor-{id}: failed to build runtime"))?;
 
     let local = tokio::task::LocalSet::new();
     let _span = tracing::info_span!("executor", worker = id).entered();
@@ -403,6 +424,8 @@ fn worker_loop(
         }
         tracing::info!("executor worker shutting down");
     }));
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -632,15 +655,18 @@ impl Service for CompilationService {
             for idx in 0..worker_count {
                 let job_rx = Arc::clone(&job_rx);
                 let outcome_tx = outcome_tx.clone();
-                let handle = std::thread::Builder::new()
+                match std::thread::Builder::new()
                     .name(format!("compiler-worker-{idx}"))
                     .spawn(move || {
                         loop {
                             let recv_result = {
-                                let lock = job_rx
-                                    .lock()
-                                    .expect("compile worker queue lock poisoned");
-                                lock.recv()
+                                match job_rx.lock() {
+                                    Ok(lock) => lock.recv(),
+                                    Err(e) => {
+                                        tracing::error!(error = %e, worker = idx, "compile worker queue lock poisoned");
+                                        break;
+                                    }
+                                }
                             };
 
                             let job = match recv_result {
@@ -674,8 +700,15 @@ impl Service for CompilationService {
                             }
                         }
                     })
-                    .expect("failed to spawn compile worker thread");
-                worker_handles.push(handle);
+                {
+                    Ok(handle) => worker_handles.push(handle),
+                    Err(e) => {
+                        tracing::error!(error = %e, worker = idx, "failed to spawn compile worker thread");
+                    }
+                }
+            }
+            if worker_handles.is_empty() {
+                anyhow::bail!("failed to start compile worker pool");
             }
             drop(outcome_tx);
 

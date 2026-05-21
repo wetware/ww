@@ -1404,7 +1404,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         // Swarm thread: libp2p event loop.
         // The Libp2pHost is constructed inside the swarm thread so that
         // TCP listeners register with the correct tokio reactor.
-        supervisor.spawn(
+        supervisor.try_spawn(
             "swarm",
             ww::services::SwarmService {
                 params: ww::services::SwarmServiceParams {
@@ -1416,7 +1416,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                 cmd_rx: swarm_cmd_rx,
                 ready_tx: swarm_ready_tx,
             },
-        );
+        )?;
 
         // Wait for the swarm thread to construct the host and send back
         // the stream control + network state.
@@ -1432,7 +1432,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         // Epoch thread: on-chain watcher (only when --stem is provided).
         let epoch_channel_rx = if let Some((epoch_tx, epoch_rx)) = epoch_channel {
             if let Some(config) = stem_config {
-                supervisor.spawn(
+                supervisor.try_spawn(
                     "epoch",
                     ww::services::EpochService {
                         config,
@@ -1442,7 +1442,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                         cid_tree: None, // TODO: pass CidTree when virtual FS is wired
                         drain_duration: std::time::Duration::from_secs(epoch_drain_secs),
                     },
-                );
+                )?;
             }
             Some(epoch_rx)
         } else {
@@ -1451,16 +1451,17 @@ wasip2::cli::command::export!({iface_name}Guest);
 
         // Executor pool: M:N cell scheduling across N worker threads.
         let executor_pool =
-            ww::services::ExecutorPool::new(executor_threads, supervisor.shutdown_rx());
+            ww::services::ExecutorPool::try_new(executor_threads, supervisor.shutdown_rx())
+                .context("failed to start executor pool")?;
 
         // Compilation service: offload component compilation from executor workers.
         let (compile_tx, compile_rx) = tokio::sync::mpsc::channel(64);
-        supervisor.spawn(
+        supervisor.try_spawn(
             "compiler",
             ww::services::CompilationService {
                 request_rx: compile_rx,
             },
-        );
+        )?;
 
         // WAGI HTTP server thread (only when --http-listen is provided).
         let route_registry = if let Some(ref addr) = http_listen {
@@ -1468,13 +1469,13 @@ wasip2::cli::command::export!({iface_name}Guest);
                 .parse()
                 .context("invalid --http-listen address (expected host:port)")?;
             let registry = ww::dispatcher::server::new_registry();
-            supervisor.spawn(
+            supervisor.try_spawn(
                 "wagi-http",
                 ww::services::WagiService {
                     listen_addr,
                     registry: registry.clone(),
                 },
-            );
+            )?;
             Some(registry)
         } else {
             None
@@ -1494,7 +1495,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             let peer_id = libp2p::PeerId::from_bytes(&snapshot.local_peer_id)
                 .context("invalid peer ID in network state")?
                 .to_string();
-            supervisor.spawn(
+            supervisor.try_spawn(
                 "admin",
                 ww::metrics::AdminService {
                     listen_addr,
@@ -1505,7 +1506,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                     cache_metrics: cache_metrics.clone(),
                     stream_metrics: stream_metrics.clone(),
                 },
-            );
+            )?;
         }
 
         let listen_summary = listen
@@ -1534,6 +1535,41 @@ wasip2::cli::command::export!({iface_name}Guest);
         // Save values needed by the MCP cell before moving them into the kernel.
         let signing_key = std::sync::Arc::new(sk);
 
+        // Admin UDS thread: local-only admin gate over Unix Domain Socket.
+        // Lives alongside swarm/epoch/executor pool; clients connect via
+        // ~/.ww/run/<peer-id>.sock for full-membrane unattenuated access.
+        // FS permissions on the run dir ARE the auth boundary, by design —
+        // matching docker.sock / ipfs api / podman.sock conventions.
+        {
+            let snapshot = network_state.snapshot().await;
+            let peer_id_str = libp2p::PeerId::from_bytes(&snapshot.local_peer_id)
+                .context("invalid peer ID in network state")?
+                .to_string();
+            let multiaddrs: Vec<String> = snapshot
+                .listen_addrs
+                .iter()
+                .filter_map(|bytes| libp2p::Multiaddr::try_from(bytes.clone()).ok())
+                .map(|ma| ma.to_string())
+                .collect();
+            supervisor.try_spawn(
+                "admin-uds",
+                ww::admin_uds::AdminUdsService {
+                    peer_id: peer_id_str,
+                    shell_wasm: EMBEDDED_SHELL.to_vec(),
+                    multiaddrs,
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    network_state: network_state.clone(),
+                    swarm_cmd_tx: swarm_cmd_tx.clone(),
+                    wasm_debug,
+                    signing_key: Some(signing_key.clone()),
+                    stream_control: stream_control.clone(),
+                    ipfs_client: ipfs_client.clone(),
+                    http_dial: http_dial.clone(),
+                    cache_policy,
+                    compile_tx: Some(compile_tx.clone()),
+                },
+            )?;
+        }
         let mut builder = CellBuilder::new(image_path.clone())
             .with_loader(Box::new(loader))
             .with_network_state(network_state.clone())
