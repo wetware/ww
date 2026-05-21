@@ -1,7 +1,8 @@
 //! Standard namespace CID
 //!
 //! The IPFS CID for the `ww` standard namespace tree, embedded at build time.
-//! Written by `make publish-std` to `target/std-namespace.cid`; read by build.rs.
+//! Written by `make publish-std` to Cargo's target directory as
+//! `std-namespace.cid`; read by build.rs.
 //!
 //! Empty for local builds (no IPFS needed — HostPathLoader resolves from disk).
 //! In release/CI builds, this points at the published IPFS tree containing

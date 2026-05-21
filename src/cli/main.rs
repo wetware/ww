@@ -1815,6 +1815,80 @@ wasip2::cli::command::export!({iface_name}Guest);
         Ok(())
     }
 
+    fn claude_cli_available() -> bool {
+        std::process::Command::new("claude")
+            .args(["--version"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn restart_user_daemon(home: &std::path::Path) -> Option<bool> {
+        let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
+        let systemd_path = home.join(".config/systemd/user/ww.service");
+
+        if cfg!(target_os = "macos") && plist_path.exists() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist_path.display().to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let ok = std::process::Command::new("launchctl")
+                .args(["load", &plist_path.display().to_string()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            Some(ok)
+        } else if cfg!(target_os = "linux") && systemd_path.exists() {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status();
+            let ok = std::process::Command::new("systemctl")
+                .args(["--user", "restart", "ww"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            Some(ok)
+        } else {
+            None
+        }
+    }
+
+    fn remove_user_daemon(home: &std::path::Path) -> Result<bool> {
+        if cfg!(target_os = "macos") {
+            let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
+            if plist_path.exists() {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["unload", &plist_path.display().to_string()])
+                    .status();
+                std::fs::remove_file(&plist_path)
+                    .with_context(|| format!("remove {}", plist_path.display()))?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        if cfg!(target_os = "linux") {
+            let unit_path = home.join(".config/systemd/user/ww.service");
+            if unit_path.exists() {
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "stop", "ww"])
+                    .status();
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "disable", "ww"])
+                    .status();
+                std::fs::remove_file(&unit_path)
+                    .with_context(|| format!("remove {}", unit_path.display()))?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        bail!("unsupported platform; only macOS and Linux are supported")
+    }
+
     /// Refresh WASM images, daemon service file, and MCP wiring
     /// to match the current binary. Safe to run repeatedly.
     async fn perform_update() -> Result<()> {
@@ -2005,54 +2079,29 @@ wasip2::cli::command::export!({iface_name}Guest);
         done("Background daemon".into());
 
         // ── Restart daemon (only if images changed) ─────────────────
-        let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
-        let systemd_path = home.join(".config/systemd/user/ww.service");
-
         if !any_images_changed {
             skip("Daemon restart (nothing changed)".into());
-        } else if cfg!(target_os = "macos") && plist_path.exists() {
-            // Stop if running, then start.
-            let _ = std::process::Command::new("launchctl")
-                .args(["unload", &plist_path.display().to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            match std::process::Command::new("launchctl")
-                .args(["load", &plist_path.display().to_string()])
-                .status()
-            {
-                Ok(s) if s.success() => done("Daemon restarted".into()),
-                _ => fail(
-                    "Daemon start (try: launchctl load {})"
-                        .replace("{}", &plist_path.display().to_string()),
-                ),
-            }
-        } else if cfg!(target_os = "linux") && systemd_path.exists() {
-            let _ = std::process::Command::new("systemctl")
-                .args(["--user", "daemon-reload"])
-                .status();
-            match std::process::Command::new("systemctl")
-                .args(["--user", "restart", "ww"])
-                .status()
-            {
-                Ok(s) if s.success() => done("Daemon restarted".into()),
-                _ => fail("Daemon restart (try: systemctl --user restart ww)".into()),
-            }
         } else {
-            skip("Daemon start (no service file)".into());
+            match Self::restart_user_daemon(&home) {
+                Some(true) => done("Daemon restarted".into()),
+                Some(false) => {
+                    if cfg!(target_os = "macos") {
+                        let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
+                        fail(format!(
+                            "Daemon start (try: launchctl load {})",
+                            plist_path.display()
+                        ));
+                    } else {
+                        fail("Daemon restart (try: systemctl --user restart ww)".into());
+                    }
+                }
+                None => skip("Daemon start (no service file)".into()),
+            }
         }
 
         // ── Claude Code MCP ──────────────────────────────────────────
         let ww_bin_str = ww_bin.display().to_string();
-        let claude_available = std::process::Command::new("claude")
-            .args(["--version"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-        if claude_available {
+        if Self::claude_cli_available() {
             // Try add first. If it fails with "already exists", remove and retry.
             let output = std::process::Command::new("claude")
                 .args(["mcp", "add", "wetware", "--", &ww_bin_str, "run", "--mcp"])
@@ -2249,45 +2298,13 @@ wasip2::cli::command::export!({iface_name}Guest);
         let ww_dir = home.join(".ww");
 
         // Step 1: Stop and remove daemon.
-        if cfg!(target_os = "macos") {
-            let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
-            if plist_path.exists() {
-                // Try to unload (may fail if not loaded, that's ok).
-                let _ = std::process::Command::new("launchctl")
-                    .args(["unload", &plist_path.display().to_string()])
-                    .status();
-                std::fs::remove_file(&plist_path)
-                    .with_context(|| format!("remove {}", plist_path.display()))?;
-                println!("  Daemon ...................... REMOVED");
-            } else {
-                println!("  Daemon ...................... NOT FOUND (already removed)");
-            }
-        } else if cfg!(target_os = "linux") {
-            let unit_path = home.join(".config/systemd/user/ww.service");
-            if unit_path.exists() {
-                let _ = std::process::Command::new("systemctl")
-                    .args(["--user", "stop", "ww"])
-                    .status();
-                let _ = std::process::Command::new("systemctl")
-                    .args(["--user", "disable", "ww"])
-                    .status();
-                std::fs::remove_file(&unit_path)
-                    .with_context(|| format!("remove {}", unit_path.display()))?;
-                println!("  Daemon ...................... REMOVED");
-            } else {
-                println!("  Daemon ...................... NOT FOUND (already removed)");
-            }
+        match Self::remove_user_daemon(&home)? {
+            true => println!("  Daemon ...................... REMOVED"),
+            false => println!("  Daemon ...................... NOT FOUND (already removed)"),
         }
 
         // Step 2: Remove MCP config from Claude Code.
-        let claude_available = std::process::Command::new("claude")
-            .args(["--version"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok();
-
-        if claude_available {
+        if Self::claude_cli_available() {
             let output = std::process::Command::new("claude")
                 .args(["mcp", "remove", "wetware"])
                 .output();
