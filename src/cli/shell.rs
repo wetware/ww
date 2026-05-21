@@ -18,6 +18,7 @@ const CAPNP_PROTOCOL: StreamProtocol = StreamProtocol::new("/ww/0.1.0");
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const TEST_DISCOVERY_ENV: &str = "WW_TEST_MDNS_CANDIDATES";
 
 #[cfg(has_wasm_std_shell_bin_shell_wasm)]
 const EMBEDDED_SHELL: &[u8] = include_bytes!("../../std/shell/bin/shell.wasm");
@@ -89,7 +90,11 @@ async fn run_shell_local(addr: Option<Multiaddr>, select: Option<String>) -> Res
         let addrs = vec![addr];
         candidate_from_parts(peer, addrs)?
     } else {
-        let candidates = discover_mdns_candidates(&signing_key).await?;
+        let candidates = if let Some(candidates) = discovery_candidates_override()? {
+            candidates
+        } else {
+            discover_mdns_candidates(&signing_key).await?
+        };
         choose_candidate(
             candidates,
             Some(preferred_peer_id),
@@ -353,6 +358,58 @@ async fn discover_mdns_candidates(
             addrs,
         })
         .collect())
+}
+
+fn discovery_candidates_override() -> Result<Option<Vec<Candidate>>> {
+    #[cfg(debug_assertions)]
+    {
+        match std::env::var(TEST_DISCOVERY_ENV) {
+            Ok(raw) => Ok(Some(parse_discovery_candidates_json(&raw)?)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("{TEST_DISCOVERY_ENV} must be valid UTF-8 JSON")
+            }
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        Ok(None)
+    }
+}
+
+fn parse_discovery_candidates_json(raw: &str) -> Result<Vec<Candidate>> {
+    #[derive(serde::Deserialize)]
+    struct RawCandidate {
+        peer_id: String,
+        addrs: Vec<String>,
+    }
+
+    let raw_candidates: Vec<RawCandidate> = serde_json::from_str(raw)
+        .map_err(|e| anyhow::anyhow!("invalid {TEST_DISCOVERY_ENV} JSON: {e}"))?;
+
+    let mut candidates = Vec::with_capacity(raw_candidates.len());
+    for (index, entry) in raw_candidates.into_iter().enumerate() {
+        let peer_id: PeerId = entry.peer_id.parse().map_err(|e| {
+            anyhow::anyhow!("invalid peer_id at {TEST_DISCOVERY_ENV}[{index}]: {e}")
+        })?;
+
+        let mut addrs = Vec::with_capacity(entry.addrs.len());
+        for (addr_index, addr) in entry.addrs.into_iter().enumerate() {
+            let parsed: Multiaddr = addr.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid multiaddr at {TEST_DISCOVERY_ENV}[{index}].addrs[{addr_index}]: {e}"
+                )
+            })?;
+            addrs.push(parsed);
+        }
+
+        candidates.push(Candidate {
+            peer_id: Some(peer_id),
+            addrs,
+        });
+    }
+
+    Ok(candidates)
 }
 
 fn choose_candidate(
@@ -713,5 +770,38 @@ mod tests {
     fn peer_id_from_addr_returns_none_without_p2p() {
         let addr = maddr("/ip4/127.0.0.1/tcp/2025");
         assert_eq!(peer_id_from_addr(&addr), None);
+    }
+
+    #[test]
+    fn parse_discovery_candidates_json_parses_valid_input() {
+        let input = r#"[
+            {
+                "peer_id": "12D3KooWJ3qM19qUUj8JdT9kPEg6VZLoes6eexfUYd6Xn7SPrf8n",
+                "addrs": ["/ip4/127.0.0.1/tcp/2025"]
+            }
+        ]"#;
+
+        let parsed = parse_discovery_candidates_json(input).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].addrs.len(), 1);
+        assert_eq!(
+            parsed[0].addrs[0].to_string(),
+            "/ip4/127.0.0.1/tcp/2025".to_string()
+        );
+    }
+
+    #[test]
+    fn parse_discovery_candidates_json_rejects_invalid_multiaddr() {
+        let input = r#"[
+            {
+                "peer_id": "12D3KooWJ3qM19qUUj8JdT9kPEg6VZLoes6eexfUYd6Xn7SPrf8n",
+                "addrs": ["not-a-multiaddr"]
+            }
+        ]"#;
+
+        let err = parse_discovery_candidates_json(input)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid multiaddr"), "{err}");
     }
 }
