@@ -1535,41 +1535,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         // Save values needed by the MCP cell before moving them into the kernel.
         let signing_key = std::sync::Arc::new(sk);
 
-        // Admin UDS thread: local-only admin gate over Unix Domain Socket.
-        // Lives alongside swarm/epoch/executor pool; clients connect via
-        // ~/.ww/run/<peer-id>.sock for full-membrane unattenuated access.
-        // FS permissions on the run dir ARE the auth boundary, by design —
-        // matching docker.sock / ipfs api / podman.sock conventions.
-        {
-            let snapshot = network_state.snapshot().await;
-            let peer_id_str = libp2p::PeerId::from_bytes(&snapshot.local_peer_id)
-                .context("invalid peer ID in network state")?
-                .to_string();
-            let multiaddrs: Vec<String> = snapshot
-                .listen_addrs
-                .iter()
-                .filter_map(|bytes| libp2p::Multiaddr::try_from(bytes.clone()).ok())
-                .map(|ma| ma.to_string())
-                .collect();
-            supervisor.try_spawn(
-                "admin-uds",
-                ww::admin_uds::AdminUdsService {
-                    peer_id: peer_id_str,
-                    shell_wasm: EMBEDDED_SHELL.to_vec(),
-                    multiaddrs,
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    network_state: network_state.clone(),
-                    swarm_cmd_tx: swarm_cmd_tx.clone(),
-                    wasm_debug,
-                    signing_key: Some(signing_key.clone()),
-                    stream_control: stream_control.clone(),
-                    ipfs_client: ipfs_client.clone(),
-                    http_dial: http_dial.clone(),
-                    cache_policy,
-                    compile_tx: Some(compile_tx.clone()),
-                },
-            )?;
-        }
         let mut builder = CellBuilder::new(image_path.clone())
             .with_loader(Box::new(loader))
             .with_network_state(network_state.clone())
