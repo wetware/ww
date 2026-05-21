@@ -81,11 +81,14 @@ fn daemon_install_writes_service_with_listen_args_and_no_config_glia_dependency(
     );
 
     let identity = home.path().join(".ww/identity");
-    assert!(identity.exists(), "identity not created at {}", identity.display());
+    assert!(
+        identity.exists(),
+        "identity not created at {}",
+        identity.display()
+    );
 
     let service_path = if cfg!(target_os = "macos") {
-        home.path()
-            .join("Library/LaunchAgents/io.wetware.ww.plist")
+        home.path().join("Library/LaunchAgents/io.wetware.ww.plist")
     } else {
         home.path().join(".config/systemd/user/ww.service")
     };
@@ -94,7 +97,10 @@ fn daemon_install_writes_service_with_listen_args_and_no_config_glia_dependency(
         .unwrap_or_else(|e| panic!("failed reading {}: {e}", service_path.display()));
 
     assert!(service.contains("/ip4/127.0.0.1/tcp/23025"), "{service}");
-    assert!(service.contains("/ip4/127.0.0.1/udp/23025/quic-v1"), "{service}");
+    assert!(
+        service.contains("/ip4/127.0.0.1/udp/23025/quic-v1"),
+        "{service}"
+    );
     assert!(service.contains("--identity"), "{service}");
     assert!(
         !service.contains("config.glia"),
