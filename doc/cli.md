@@ -214,7 +214,7 @@ Register wetware as a user-level background service (launchd on
 macOS, systemd on Linux).
 
 ```
-ww daemon install [--identity PATH] [--port PORT] [--images PATH...]
+ww daemon install [--identity PATH] [--listen MULTIADDR ...] [--images PATH...]
 ```
 
 ### ww daemon uninstall

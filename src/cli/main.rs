@@ -314,8 +314,8 @@ enum Commands {
 enum DaemonAction {
     /// Register wetware as a user-level background service.
     ///
-    /// Generates a key if missing, writes the daemon config, creates
-    /// a platform service file (launchd on macOS, systemd on Linux),
+    /// Generates a key if missing, creates a platform service file
+    /// (launchd on macOS, systemd on Linux) from flags/defaults,
     /// and prints the activation command.
     Install {
         /// Path to an Ed25519 identity file. Defaults to ~/.ww/identity;
@@ -341,8 +341,7 @@ enum DaemonAction {
     /// Remove the platform service file.
     ///
     /// Removes the launchd plist (macOS) or systemd unit (Linux) and
-    /// prints the deactivation command. Does not touch ~/.ww/identity or
-    /// ~/.ww/config.glia.
+    /// prints the deactivation command. Does not touch ~/.ww/identity.
     Uninstall,
 }
 
@@ -375,7 +374,7 @@ enum PerformAction {
     /// Steps:
     ///   1. Sync WASM images (CID compare, overwrite if changed)
     ///   2. Republish standard library (if images changed and Kubo running)
-    ///   3. Regenerate daemon config and service file
+    ///   3. Regenerate daemon service file
     ///   4. Restart daemon
     ///   5. Re-wire MCP into Claude Code
     Update,
@@ -546,7 +545,7 @@ impl Commands {
                 // to guests and published to IPFS).
                 let identity_path = identity.map(PathBuf::from);
                 let listen = if listen.is_empty() {
-                    ww::daemon_config::default_listen()
+                    daemon_cmd::default_listen()
                         .iter()
                         .map(|s| s.parse())
                         .collect::<Result<Vec<_>, _>>()
@@ -1825,7 +1824,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         Ok(())
     }
 
-    /// Refresh WASM images, daemon config/service file, and MCP wiring
+    /// Refresh WASM images, daemon service file, and MCP wiring
     /// to match the current binary. Safe to run repeatedly.
     async fn perform_update() -> Result<()> {
         use indicatif::{ProgressBar, ProgressStyle};
@@ -2813,19 +2812,19 @@ mod tests {
     // Runtime/Executor in-process), so a regression in either writer
     // would slip past silently without these unit tests.
 
-    fn config_with_http_listen(addr: &str) -> ww::daemon_config::DaemonConfig {
-        ww::daemon_config::DaemonConfig {
+    fn config_with_http_listen(addr: &str) -> daemon_cmd::DaemonServiceConfig {
+        daemon_cmd::DaemonServiceConfig {
             listen: vec!["/ip4/0.0.0.0/tcp/2025".to_string()],
-            identity: Some(PathBuf::from("/tmp/identity")),
+            identity: PathBuf::from("/tmp/identity"),
             images: Vec::new(),
             http_listen: Some(addr.to_string()),
         }
     }
 
-    fn config_no_http_listen() -> ww::daemon_config::DaemonConfig {
-        ww::daemon_config::DaemonConfig {
+    fn config_no_http_listen() -> daemon_cmd::DaemonServiceConfig {
+        daemon_cmd::DaemonServiceConfig {
             listen: vec!["/ip4/0.0.0.0/tcp/2025".to_string()],
-            identity: Some(PathBuf::from("/tmp/identity")),
+            identity: PathBuf::from("/tmp/identity"),
             images: Vec::new(),
             http_listen: None,
         }

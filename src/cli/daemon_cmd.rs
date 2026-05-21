@@ -2,6 +2,26 @@ use anyhow::{bail, Context, Result};
 use libp2p::Multiaddr;
 use std::path::{Path, PathBuf};
 
+/// Default libp2p listen multiaddrs: TCP and QUIC on both IPv4 and IPv6, port 2025.
+pub(super) fn default_listen() -> Vec<String> {
+    vec![
+        "/ip4/0.0.0.0/tcp/2025".to_string(),
+        "/ip6/::/tcp/2025".to_string(),
+        "/ip4/0.0.0.0/udp/2025/quic-v1".to_string(),
+        "/ip6/::/udp/2025/quic-v1".to_string(),
+    ]
+}
+
+/// Host-side service configuration used to render launchd/systemd units.
+#[derive(Debug, Clone)]
+pub(super) struct DaemonServiceConfig {
+    pub listen: Vec<String>,
+    pub identity: PathBuf,
+    pub images: Vec<PathBuf>,
+    /// Address (`host:port`) for the WAGI HTTP server. `None` disables WAGI.
+    pub http_listen: Option<String>,
+}
+
 /// Register wetware as a user-level background service.
 ///
 /// When `quiet` is true, suppresses status output (used by `perform install`
@@ -32,31 +52,29 @@ pub(super) async fn daemon_install(
         eprintln!("Using existing identity: {}", key_path.display());
     }
 
-    // 2. Build config: load existing, override with CLI flags.
-    let config_path = ww::daemon_config::default_config_path();
-    let mut config = ww::daemon_config::load(&config_path)?;
+    // 2. Build service config directly from CLI/defaults.
+    let listen_addrs = if listen.is_empty() {
+        default_listen()
+    } else {
+        listen.iter().map(|a| a.to_string()).collect()
+    };
 
-    if !listen.is_empty() {
-        config.listen = listen.iter().map(|a| a.to_string()).collect();
-    }
-    config.identity = Some(key_path.clone());
-    if !images.is_empty() {
-        config.images = images.iter().map(PathBuf::from).collect();
-    }
+    let image_layers = if images.is_empty() {
+        vec![ww_dir]
+    } else {
+        images.iter().map(PathBuf::from).collect()
+    };
+
     // Default WAGI HTTP listener so the install layer's status init.d
     // (etc/init.d/05-status.glia) responds to curl on first boot.
-    // Already-configured addresses are preserved.
-    if config.http_listen.is_none() {
-        config.http_listen = Some("127.0.0.1:2080".into());
-    }
+    let config = DaemonServiceConfig {
+        listen: listen_addrs,
+        identity: key_path.clone(),
+        images: image_layers,
+        http_listen: Some("127.0.0.1:2080".to_string()),
+    };
 
-    // 3. Write config.
-    config.write(&config_path)?;
-    if !quiet {
-        eprintln!("Wrote config: {}", config_path.display());
-    }
-
-    // 4. Write platform service file.
+    // 3. Write platform service file.
     let ww_bin = std::env::current_exe().context("cannot determine ww binary path")?;
     write_service_file(&ww_bin, &config, &home, quiet)?;
 
@@ -101,18 +119,14 @@ pub(super) async fn daemon_uninstall() -> Result<()> {
 /// Write a platform-specific service file and print the activation command.
 pub(super) fn write_service_file(
     ww_bin: &Path,
-    config: &ww::daemon_config::DaemonConfig,
+    config: &DaemonServiceConfig,
     home: &Path,
     quiet: bool,
 ) -> Result<()> {
     // Identity as a --identity CLI flag (NOT a :/etc/identity mount).
     // The host reads it to create the signing key; it never enters
     // the merged FHS tree visible to guests.
-    let identity_path = config
-        .identity
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| home.join(".ww/identity").display().to_string());
+    let identity_path = config.identity.display().to_string();
 
     if cfg!(target_os = "macos") {
         write_launchd_plist(ww_bin, config, home, &identity_path, quiet)
@@ -126,7 +140,7 @@ pub(super) fn write_service_file(
 /// Write a macOS launchd plist.
 pub(super) fn write_launchd_plist(
     ww_bin: &Path,
-    config: &ww::daemon_config::DaemonConfig,
+    config: &DaemonServiceConfig,
     home: &Path,
     identity_path: &str,
     quiet: bool,
@@ -209,7 +223,7 @@ pub(super) fn write_launchd_plist(
 /// Write a Linux systemd user unit.
 pub(super) fn write_systemd_unit(
     ww_bin: &Path,
-    config: &ww::daemon_config::DaemonConfig,
+    config: &DaemonServiceConfig,
     home: &Path,
     identity_path: &str,
     quiet: bool,

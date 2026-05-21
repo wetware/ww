@@ -23,8 +23,9 @@ as layers (later mounts override earlier ones):
 |------|---------|
 | Local path | `std/kernel` |
 | IPFS path | `/ipfs/QmAbc123...` |
-| Targeted | `~/.ww/identity:/etc/identity` |
 | Layered | `ww run /ipfs/QmBase my-overlay` |
+
+Targeted mounts (`source:/guest/path`) are not accepted by backend virtual mode.
 
 ## On-chain coordination
 

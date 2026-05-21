@@ -52,8 +52,8 @@ Rationale:
 
 1. `--identity PATH` — explicit path to a key file
 2. `$WW_IDENTITY` — environment variable pointing to a key file
-3. `/etc/identity` present in the merged image layers (baked into the image)
-4. Ephemeral — generated at startup, discarded on exit
+3. `~/.ww/identity` — default path (when `HOME` is set)
+4. Ephemeral — only when `--insecure-ephemeral` is set
 
 Each time the host resolves the identity it logs the source at `INFO` level
 so the active source is always visible in the log output.
@@ -62,12 +62,8 @@ The ephemeral fallback is fine for local development and testing but means
 the node's Peer ID and EVM address change on every restart. Use a persistent
 key for any deployment that other nodes need to remember across restarts.
 
-The Glia config file (`~/.ww/config.glia`) also accepts `:identity` to
-set a default key file for daemon mode:
-
-```glia
-{:port 2025 :identity "~/.ww/key" :images ["images/my-app"]}
-```
+For daemon/service mode, pass identity through the same host flags/env:
+`--identity PATH` or `WW_IDENTITY=PATH`.
 
 ## Usage
 

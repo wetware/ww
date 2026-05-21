@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Daemon install no longer depends on `~/.ww/config.glia`.** `ww daemon install` now renders launchd/systemd service definitions directly from flags/env/defaults, removing the extra host-side Glia config control plane.
 - **Routing capability gains write-path v1 mutation surface (CID-transform API).** Added explicit mutation methods that take a base CID and return a new root CID: `mkdir`, `writeFile`, and `remove`, plus `publish` for IPNS updates with optional compare-and-set (`expectedCurrent`) conflict checks. This keeps reads on WASI paths while making writes explicit, attenuable effects with no hidden mutable daemon root.
 - **Release-facing docs synchronized with shell-migration state.** README/CLI/shell/routing docs now consistently state that `ww shell` is currently a forward-stable stub (`NOT IMPLEMENTED`), reflect persistent-identity defaults and explicit `--insecure-ephemeral`, document routing write-path v1 semantics, and call out shell transport follow-up issue #470.
 - **`ww run` now requires a persistent identity by default.** Identity resolution no longer silently falls back to ephemeral keys when `--identity` is missing or points to a nonexistent file. Default lookup is `~/.ww/identity`; if absent, startup fails with a clear message and remediation. Operators can explicitly bypass with `--insecure-ephemeral` (named insecure on purpose), which restores prior ephemeral behavior for quick trial runs.
