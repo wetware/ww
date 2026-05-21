@@ -96,19 +96,23 @@ ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 Connect to a running daemon and open a Glia REPL.
 
 ```
-ww shell [ADDR]
+ww shell [ADDR] [--select <index|peer-id>]
 ```
 
 The admin UDS path has been removed. The command surface is preserved
 with libp2p transport + Terminal(Membrane) auth:
 
-- *(no args)* — discover via mDNS, auto-connect only when unambiguous.
+- *(no args)* — discover via mDNS. Auto-connect if unambiguous; otherwise
+  prompt for selection in TTY mode.
 - `<multiaddr>` — explicit remote dial.
+- `--select <index|peer-id>` — non-interactive target override when mDNS
+  discovers multiple hosts.
 
 ### Examples
 
 ```sh
 ww shell                                    # mDNS discover + connect
+ww shell --select 2                         # choose 2nd discovered host
 ww shell /dnsaddr/master.wetware.run        # explicit dial
 ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...
 ww shell garbage                            # clap parse error: invalid multiaddr

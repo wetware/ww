@@ -9,6 +9,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use libp2p_core::SignedEnvelope;
 use rustyline::error::ReadlineError;
 use std::collections::HashMap;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -73,14 +74,14 @@ impl ww::stem_capnp::signer::Server for LocalSigner {
 ///
 /// - `ww shell <addr>` dials explicit multiaddr.
 /// - `ww shell` discovers local mDNS candidates and connects when unambiguous.
-pub async fn run_shell(addr: Option<Multiaddr>) -> Result<()> {
+pub async fn run_shell(addr: Option<Multiaddr>, select: Option<String>) -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(async move { run_shell_local(addr).await })
+        .run_until(async move { run_shell_local(addr, select).await })
         .await
 }
 
-async fn run_shell_local(addr: Option<Multiaddr>) -> Result<()> {
+async fn run_shell_local(addr: Option<Multiaddr>, select: Option<String>) -> Result<()> {
     let (signing_key, preferred_peer_id) = load_shell_identity()?;
 
     let target = if let Some(addr) = addr {
@@ -89,7 +90,12 @@ async fn run_shell_local(addr: Option<Multiaddr>) -> Result<()> {
         candidate_from_parts(peer, addrs)?
     } else {
         let candidates = discover_mdns_candidates(&signing_key).await?;
-        choose_candidate(candidates, Some(preferred_peer_id))?
+        choose_candidate(
+            candidates,
+            Some(preferred_peer_id),
+            select.as_deref(),
+            stdin_is_interactive_tty(),
+        )?
     };
 
     let shell = dial_shell(&target, &signing_key).await?;
@@ -349,12 +355,22 @@ async fn discover_mdns_candidates(
         .collect())
 }
 
-fn choose_candidate(candidates: Vec<Candidate>, preferred: Option<PeerId>) -> Result<Candidate> {
+fn choose_candidate(
+    candidates: Vec<Candidate>,
+    preferred: Option<PeerId>,
+    select: Option<&str>,
+    interactive_tty: bool,
+) -> Result<Candidate> {
     if candidates.is_empty() {
         bail!(
             "No wetware hosts discovered via mDNS.\n\
              Try `ww shell <multiaddr>` to connect explicitly."
         );
+    }
+
+    if let Some(selector) = select {
+        let selected = choose_candidate_by_selector(&candidates, selector)?;
+        return ensure_candidate_addr(selected);
     }
 
     if candidates.len() == 1 {
@@ -373,8 +389,28 @@ fn choose_candidate(candidates: Vec<Candidate>, preferred: Option<PeerId>) -> Re
         }
     }
 
+    if interactive_tty {
+        return select_candidate_interactive(&candidates);
+    }
+
+    let listing = format_candidates(&candidates);
+    bail!(
+        "Multiple wetware hosts discovered via mDNS; refusing to guess.\n\
+         If this is a script/non-interactive session, pass one of:\n\
+         - `ww shell --select <index|peer-id>`\n\
+         Use an explicit multiaddr: `ww shell <multiaddr>`\n\
+         Discovered hosts:{listing}\n\
+         TODO tracked in https://github.com/wetware/ww/issues/479"
+    )
+}
+
+fn stdin_is_interactive_tty() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn format_candidates(candidates: &[Candidate]) -> String {
     let mut listing = String::new();
-    for c in &candidates {
+    for (index, c) in candidates.iter().enumerate() {
         let addrs = c
             .addrs
             .iter()
@@ -382,18 +418,80 @@ fn choose_candidate(candidates: Vec<Candidate>, preferred: Option<PeerId>) -> Re
             .collect::<Vec<_>>()
             .join(", ");
         if let Some(peer_id) = c.peer_id {
-            listing.push_str(&format!("\n  - {} [{}]", peer_id, addrs));
+            listing.push_str(&format!("\n  [{}] {} [{}]", index + 1, peer_id, addrs));
         } else {
-            listing.push_str(&format!("\n  - <unknown-peer> [{}]", addrs));
+            listing.push_str(&format!("\n  [{}] <unknown-peer> [{}]", index + 1, addrs));
+        }
+    }
+    listing
+}
+
+fn choose_candidate_by_selector(candidates: &[Candidate], selector: &str) -> Result<Candidate> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("empty selector: expected index (1..N) or peer id");
+    }
+
+    if let Ok(index) = selector.parse::<usize>() {
+        if index == 0 || index > candidates.len() {
+            bail!(
+                "selector index {} out of range; expected 1..{}",
+                index,
+                candidates.len()
+            );
+        }
+        return Ok(candidates[index - 1].clone());
+    }
+
+    let peer_id: PeerId = selector
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid selector '{selector}': expected index or peer id"))?;
+
+    let mut matches = candidates
+        .iter()
+        .filter(|c| c.peer_id == Some(peer_id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if matches.is_empty() {
+        bail!("selector peer id {peer_id} not found in discovered candidates");
+    }
+    if matches.len() > 1 {
+        bail!("selector peer id {peer_id} matched multiple candidates");
+    }
+    Ok(matches.remove(0))
+}
+
+fn select_candidate_interactive(candidates: &[Candidate]) -> Result<Candidate> {
+    println!("Multiple wetware hosts discovered via mDNS.");
+    println!("Select a host by index or peer id:");
+    print!("{}", format_candidates(candidates));
+    println!();
+
+    for _ in 0..5 {
+        eprint!("selection> ");
+        io::stderr().flush().context("failed to flush stderr")?;
+
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .context("failed to read selection from stdin")?;
+        let selector = line.trim();
+
+        if selector.eq_ignore_ascii_case("q")
+            || selector.eq_ignore_ascii_case("quit")
+            || selector.eq_ignore_ascii_case("exit")
+        {
+            bail!("selection canceled");
+        }
+
+        match choose_candidate_by_selector(candidates, selector) {
+            Ok(candidate) => return ensure_candidate_addr(candidate),
+            Err(err) => eprintln!("Invalid selection: {err}"),
         }
     }
 
-    bail!(
-        "Multiple wetware hosts discovered via mDNS; refusing to guess.\n\
-         Use an explicit multiaddr: `ww shell <multiaddr>`\n\
-         Discovered hosts:{listing}\n\
-         TODO tracked in https://github.com/wetware/ww/issues/479"
-    )
+    bail!("too many invalid selections; aborted")
 }
 
 fn ensure_candidate_addr(candidate: Candidate) -> Result<Candidate> {
@@ -454,6 +552,8 @@ mod tests {
                 },
             ],
             Some(p2),
+            None,
+            false,
         )
         .unwrap();
 
@@ -484,11 +584,14 @@ mod tests {
                 },
             ],
             Some(p3),
+            None,
+            false,
         )
         .unwrap_err()
         .to_string();
 
         assert!(err.contains("Multiple wetware hosts discovered"), "{err}");
+        assert!(err.contains("--select <index|peer-id>"), "{err}");
     }
 
     #[test]
@@ -500,11 +603,101 @@ mod tests {
 
     #[test]
     fn choose_candidate_errors_when_empty() {
-        let err = choose_candidate(vec![], None).unwrap_err().to_string();
+        let err = choose_candidate(vec![], None, None, false)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("No wetware hosts discovered via mDNS"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn choose_candidate_respects_numeric_selector() {
+        let p1: PeerId = "12D3KooWJ3qM19qUUj8JdT9kPEg6VZLoes6eexfUYd6Xn7SPrf8n"
+            .parse()
+            .unwrap();
+        let p2: PeerId = "12D3KooWQdQnZYK7hX8Q2Yb8qXWQYvdr4jRWk6TUhSxvVmF5vU3P"
+            .parse()
+            .unwrap();
+
+        let chosen = choose_candidate(
+            vec![
+                Candidate {
+                    peer_id: Some(p1),
+                    addrs: vec![maddr("/ip4/10.0.0.1/tcp/2025")],
+                },
+                Candidate {
+                    peer_id: Some(p2),
+                    addrs: vec![maddr("/ip4/10.0.0.2/tcp/2025")],
+                },
+            ],
+            None,
+            Some("2"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(chosen.peer_id, Some(p2));
+    }
+
+    #[test]
+    fn choose_candidate_respects_peer_id_selector() {
+        let p1: PeerId = "12D3KooWJ3qM19qUUj8JdT9kPEg6VZLoes6eexfUYd6Xn7SPrf8n"
+            .parse()
+            .unwrap();
+        let p2: PeerId = "12D3KooWQdQnZYK7hX8Q2Yb8qXWQYvdr4jRWk6TUhSxvVmF5vU3P"
+            .parse()
+            .unwrap();
+
+        let chosen = choose_candidate(
+            vec![
+                Candidate {
+                    peer_id: Some(p1),
+                    addrs: vec![maddr("/ip4/10.0.0.1/tcp/2025")],
+                },
+                Candidate {
+                    peer_id: Some(p2),
+                    addrs: vec![maddr("/ip4/10.0.0.2/tcp/2025")],
+                },
+            ],
+            None,
+            Some("12D3KooWQdQnZYK7hX8Q2Yb8qXWQYvdr4jRWk6TUhSxvVmF5vU3P"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(chosen.peer_id, Some(p2));
+    }
+
+    #[test]
+    fn choose_candidate_rejects_invalid_selector() {
+        let p1: PeerId = "12D3KooWJ3qM19qUUj8JdT9kPEg6VZLoes6eexfUYd6Xn7SPrf8n"
+            .parse()
+            .unwrap();
+        let p2: PeerId = "12D3KooWQdQnZYK7hX8Q2Yb8qXWQYvdr4jRWk6TUhSxvVmF5vU3P"
+            .parse()
+            .unwrap();
+
+        let err = choose_candidate(
+            vec![
+                Candidate {
+                    peer_id: Some(p1),
+                    addrs: vec![maddr("/ip4/10.0.0.1/tcp/2025")],
+                },
+                Candidate {
+                    peer_id: Some(p2),
+                    addrs: vec![maddr("/ip4/10.0.0.2/tcp/2025")],
+                },
+            ],
+            None,
+            Some("99"),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("out of range"), "{err}");
     }
 
     #[test]
