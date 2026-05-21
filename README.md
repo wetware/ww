@@ -67,8 +67,9 @@ ww shell                                # discover a local node via mDNS, then o
 ```
 
 `ww shell` uses libp2p transport and Terminal(Membrane) auth. By default it
-discovers local hosts via mDNS and auto-connects only when resolution is
-unambiguous.
+discovers local hosts via mDNS and prefers an unambiguous identity match.
+If multiple hosts remain, TTY sessions prompt for selection, and
+non-interactive sessions can pass `--select <index|peer-id>`.
 
 ### Boot a cell
 

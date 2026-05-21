@@ -258,10 +258,15 @@ enum Commands {
     ///
     /// Example:
     ///   ww shell
+    ///   ww shell --select 2
     ///   ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...
     Shell {
         /// Multiaddr of a remote node.
         addr: Option<Multiaddr>,
+
+        /// Selection override for mDNS discovery (`index` or `peer-id`).
+        #[arg(long, value_name = "TARGET", conflicts_with = "addr")]
+        select: Option<String>,
     },
 
     /// Effectful operations that mutate state beyond the current directory.
@@ -576,7 +581,7 @@ impl Commands {
                 private_key,
             } => Self::push(path, ipfs_url, stem, rpc_url, private_key).await,
             Commands::Keygen { output } => Self::keygen(output).await,
-            Commands::Shell { addr } => shell::run_shell(addr).await,
+            Commands::Shell { addr, select } => shell::run_shell(addr, select).await,
             Commands::Perform { action } => match action {
                 PerformAction::Install => Self::perform_install().await,
                 PerformAction::Uninstall => Self::perform_uninstall().await,
