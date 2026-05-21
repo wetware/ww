@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **CLI wiring cleanup and documentation alignment.** Consolidated daemon restart/remove and Claude MCP availability checks into shared helpers, and aligned runtime/CGI documentation comments with current behavior.
 - **Startup resilience and build-target compatibility hardening.** Startup-critical service wiring now returns typed errors instead of panicking (swarm/epoch/executor/compiler boot), compile worker pool startup degrades safely, and build-time CID embedding now resolves from `CARGO_TARGET_DIR` when set.
 - **Daemon install no longer depends on `~/.ww/config.glia`.** `ww daemon install` now renders launchd/systemd service definitions directly from flags/env/defaults, removing the extra host-side Glia config control plane.
 - **Routing capability gains write-path v1 mutation surface (CID-transform API).** Added explicit mutation methods that take a base CID and return a new root CID: `mkdir`, `writeFile`, and `remove`, plus `publish` for IPNS updates with optional compare-and-set (`expectedCurrent`) conflict checks. This keeps reads on WASI paths while making writes explicit, attenuable effects with no hidden mutable daemon root.
