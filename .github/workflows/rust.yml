@@ -521,7 +521,11 @@ jobs:
         echo "${{ secrets.DEPLOY_SSH_HOST_KEY }}" > ~/.ssh/known_hosts
 
         # Get IPFS pod name
-        POD=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl get pod -l app=ipfs-daemon -o jsonpath='{.items[0].metadata.name}'")
+        POD=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl --request-timeout=30s get pod -l app=ipfs-daemon -o jsonpath='{.items[0].metadata.name}'")
+        if [ -z "$POD" ]; then
+          echo "ERROR: failed to discover IPFS daemon pod"
+          exit 1
+        fi
         echo "IPFS pod: $POD"
 
         # Assemble clean release tree (artifacts only, no source code)
@@ -657,18 +661,36 @@ jobs:
         # the `tee` pipe (without it, tee always exits 0 and silent
         # publish failures masquerade as success — see issue uncovered in #421).
         set -o pipefail
-        $SSH_CMD ${{ secrets.VPS_SSH }} "
-          set -e
-          kubectl cp /tmp/ww-release-tree $POD:/tmp/release-tree
-          CID=\$(kubectl exec $POD -- ipfs add -rQ --cid-version=1 /tmp/release-tree/)
-          echo \"CID=\$CID\"
-          kubectl exec $POD -- ipfs pin add \$CID
-          kubectl exec $POD -- ipfs name publish --key=ww-release /ipfs/\$CID
-          kubectl exec $POD -- timeout 60 ipfs routing provide -r \$CID || \
-            echo 'WARNING: provide announce timed out; DHT propagation may lag'
-          kubectl exec $POD -- rm -rf /tmp/release-tree
-          rm -rf /tmp/ww-release-tree
-        " | tee /tmp/ipfs-publish-output.txt
+        published=false
+        for attempt in 1 2 3; do
+          echo "Publish attempt $attempt..."
+          if $SSH_CMD ${{ secrets.VPS_SSH }} "
+            set -e
+            K='kubectl --request-timeout=5m'
+            \$K cp /tmp/ww-release-tree $POD:/tmp/release-tree
+            CID=\$(\$K exec $POD -- ipfs add -rQ --cid-version=1 /tmp/release-tree/)
+            echo \"CID=\$CID\"
+            \$K exec $POD -- ipfs pin add \$CID
+            \$K exec $POD -- ipfs name publish --key=ww-release /ipfs/\$CID
+            \$K exec $POD -- timeout 60 ipfs routing provide -r \$CID || \
+              echo 'WARNING: provide announce timed out; DHT propagation may lag'
+            \$K exec $POD -- rm -rf /tmp/release-tree
+            rm -rf /tmp/ww-release-tree
+          " | tee /tmp/ipfs-publish-output.txt; then
+            published=true
+            break
+          fi
+
+          if [ "$attempt" -lt 3 ]; then
+            backoff=$((attempt * 20))
+            echo "Publish attempt $attempt failed; retrying in ${backoff}s..."
+            sleep "$backoff"
+          fi
+        done
+        if [ "$published" != "true" ]; then
+          echo "ERROR: publish failed after 3 attempts"
+          exit 1
+        fi
 
         # Extract CID from output
         CID=$(grep '^CID=' /tmp/ipfs-publish-output.txt | cut -d= -f2)
