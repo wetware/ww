@@ -17,6 +17,19 @@ pub trait Pinner: Send + Sync {
     /// Fetch the raw bytes for a CID.
     async fn fetch(&self, cid: &Cid) -> Result<Vec<u8>>;
 
+    /// Fetch raw bytes for a subpath under a CID (for example:
+    /// `/ipfs/<cid>/<subpath>`).
+    ///
+    /// Default implementations may only support flat CID fetches.
+    async fn fetch_path(&self, cid: &Cid, subpath: &str) -> Result<Vec<u8>> {
+        if subpath.is_empty() {
+            return self.fetch(cid).await;
+        }
+        Err(anyhow::anyhow!(
+            "subpath fetch not supported: /ipfs/{cid}/{subpath}"
+        ))
+    }
+
     /// Get the size in bytes of the content addressed by a CID,
     /// without fetching the full content.
     async fn size(&self, cid: &Cid) -> Result<u64>;
