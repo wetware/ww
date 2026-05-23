@@ -31,6 +31,33 @@ The second command hit a WebAssembly cell running inside the daemon. The cell ca
 
 That's the whole registration.
 
+Here is the capability surface in action, directly in the Wetware shell (Glia):
+- `defcap` defines a capability server in Glia.
+- `attenuate` derives a restricted capability.
+- `isolate` runs with only explicitly granted capabilities.
+
+```clojure
+;; Define a local capability server with two methods.
+(defcap directory
+  :lookup   (fn [name]
+              (perform routing :find name :count 5))
+  :announce (fn [name]
+              (perform routing :provide name)
+              :ok))
+
+;; Attenuate to a read-only view (lookup only).
+(def directory-ro
+  (attenuate directory [:lookup]))
+
+;; Allowed call inside isolated context.
+(isolate {:caps {:directory directory-ro}}
+  (perform directory :lookup "service:invoices"))
+
+;; Denied call: announce was not granted to this isolate.
+(isolate {:caps {:directory directory-ro}}
+  (perform directory :announce "service:payments"))
+```
+
 ## Features
 
 - **Per-call capability attenuation.** Each cell starts with a typed bundle of capabilities and nothing else. When it spawns a sub-cell, it chooses which capabilities to hand down, narrowed however it likes (with per-method granularity). The runtime enforces the boundary at every call.
