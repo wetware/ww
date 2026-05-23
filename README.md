@@ -50,11 +50,11 @@ Here is the capability surface in action, directly in the Wetware shell (Glia):
   (attenuate directory [:lookup]))
 
 ;; Allowed call inside isolated context.
-(isolate {:caps {:directory directory-ro}}
+(isolate {:env {:directory (cap directory-ro)}}
   (perform directory :lookup "service:invoices"))
 
 ;; Denied call: announce was not granted to this isolate.
-(isolate {:caps {:directory directory-ro}}
+(isolate {:env {:directory (cap directory-ro)}}
   (perform directory :announce "service:payments"))
 ```
 

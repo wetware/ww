@@ -243,6 +243,34 @@ fn parse_allow_methods(value: &Val) -> Result<BTreeSet<String>, Val> {
     Ok(allow)
 }
 
+fn is_isolate_data_value(value: &Val) -> bool {
+    match value {
+        Val::Nil
+        | Val::Bool(_)
+        | Val::Int(_)
+        | Val::Float(_)
+        | Val::Str(_)
+        | Val::Sym(_)
+        | Val::Keyword(_)
+        | Val::Bytes(_) => true,
+        Val::List(items) | Val::Vector(items) | Val::Set(items) => {
+            items.iter().all(is_isolate_data_value)
+        }
+        Val::Map(m) => m
+            .iter()
+            .all(|(k, v)| is_isolate_data_value(k) && is_isolate_data_value(v)),
+        Val::Fn { .. }
+        | Val::Recur(_)
+        | Val::Macro { .. }
+        | Val::Effect { .. }
+        | Val::NativeFn { .. }
+        | Val::AsyncNativeFn { .. }
+        | Val::Resume(_)
+        | Val::Cap { .. }
+        | Val::Cell { .. } => false,
+    }
+}
+
 /// Evaluate a function/macro body, dispatching on `FnBody` variant.
 ///
 /// `Analyzed` bodies are evaluated via `eval_expr` (no re-analysis).
@@ -2085,49 +2113,140 @@ pub fn eval_expr<'a, D: Dispatch>(
                     ));
                 }
 
-                // Special form: (isolate {:caps {:x cap ...}} body...)
+                // Special form: (isolate {:env {:x (cap value) :y (data value)}} body...)
                 if head == "isolate" {
                     if raw_args.is_empty() {
                         return Err(error::arity("isolate", "at least 1", 0));
                     }
-                    let opts_expr = expr::analyze(&raw_args[0])?;
-                    let opts_val = eval_expr(&opts_expr, env, dispatch).await?;
-                    let opts_map = match opts_val {
-                        Val::Map(m) => m,
+                    let opts_map = match &raw_args[0] {
+                        Val::Map(m) => m.clone(),
                         other => {
-                            return Err(error::type_mismatch("isolate options", "map", &other))
+                            return Err(error::type_mismatch(
+                                "isolate options",
+                                "map literal",
+                                other,
+                            ))
                         }
                     };
-                    let caps_val = opts_map
-                        .get(&Val::Keyword("caps".into()))
-                        .cloned()
-                        .unwrap_or_else(|| Val::Map(ValMap::new()));
-                    let caps_map = match caps_val {
+                    if opts_map.get(&Val::Keyword("caps".into())).is_some() {
+                        return Err(error::internal(
+                            "isolate",
+                            ":caps removed; use :env with (cap ...) entries",
+                        ));
+                    }
+                    let env_val = opts_map.get(&Val::Keyword("env".into())).ok_or_else(|| {
+                        error::internal("isolate", "missing required :env option")
+                    })?;
+                    let env_map = match env_val {
                         Val::Map(m) => m,
-                        other => return Err(error::type_mismatch("isolate :caps", "map", &other)),
+                        other => return Err(error::type_mismatch("isolate :env", "map", other)),
                     };
+
+                    for (opt_key, _) in opts_map.iter() {
+                        match opt_key {
+                            Val::Keyword(k) if k == "env" => {}
+                            Val::Keyword(k) => {
+                                return Err(error::internal(
+                                    "isolate",
+                                    format!("unknown option :{k}; expected only :env"),
+                                ))
+                            }
+                            other => {
+                                return Err(error::type_mismatch(
+                                    "isolate option key",
+                                    "keyword",
+                                    other,
+                                ))
+                            }
+                        }
+                    }
 
                     let mut isolate_env = Env::new();
                     let mut handler_targets: Vec<String> = Vec::new();
-                    for (k, v) in caps_map.iter() {
+                    for (k, v) in env_map.iter() {
                         let sym = match k {
                             Val::Keyword(s) | Val::Sym(s) => s.clone(),
                             other => {
                                 return Err(error::type_mismatch(
-                                    "isolate cap name",
+                                    "isolate env name",
                                     "keyword or symbol",
                                     other,
                                 ))
                             }
                         };
-                        if !matches!(v, Val::Cap { .. }) {
-                            return Err(error::type_mismatch("isolate cap value", "cap", v));
+
+                        let wrapped = match v {
+                            Val::List(items) if !items.is_empty() => items,
+                            other => {
+                                return Err(error::internal(
+                                    "isolate env entry",
+                                    format!(
+                                        "{sym}: expected (cap <expr>) or (data <expr>), got {other}"
+                                    ),
+                                ))
+                            }
+                        };
+                        let wrapper = match &wrapped[0] {
+                            Val::Sym(s) => s.as_str(),
+                            other => {
+                                return Err(error::type_mismatch(
+                                    "isolate env wrapper",
+                                    "symbol",
+                                    other,
+                                ))
+                            }
+                        };
+                        if wrapped.len() != 2 {
+                            return match wrapper {
+                                "cap" => {
+                                    Err(error::arity("isolate cap wrapper", "1", wrapped.len() - 1))
+                                }
+                                "data" => Err(error::arity(
+                                    "isolate data wrapper",
+                                    "1",
+                                    wrapped.len() - 1,
+                                )),
+                                _ => Err(error::internal(
+                                    "isolate env entry",
+                                    format!("{sym}: unknown wrapper {wrapper}; use cap or data"),
+                                )),
+                            };
                         }
-                        isolate_env.set(sym.clone(), v.clone());
-                        let handler_name = format!("{sym}-handler");
-                        if let Some(handler) = env.get(&handler_name) {
-                            isolate_env.set(handler_name, handler.clone());
-                            handler_targets.push(sym);
+
+                        let value_expr = expr::analyze(&wrapped[1])?;
+                        let value = eval_expr(&value_expr, env, dispatch).await?;
+                        match wrapper {
+                            "cap" => {
+                                if !matches!(value, Val::Cap { .. }) {
+                                    return Err(error::type_mismatch(
+                                        "isolate cap value",
+                                        "cap",
+                                        &value,
+                                    ));
+                                }
+                                isolate_env.set(sym.clone(), value.clone());
+                                let handler_name = format!("{sym}-handler");
+                                if let Some(handler) = env.get(&handler_name) {
+                                    isolate_env.set(handler_name, handler.clone());
+                                    handler_targets.push(sym);
+                                }
+                            }
+                            "data" => {
+                                if !is_isolate_data_value(&value) {
+                                    return Err(error::type_mismatch(
+                                        "isolate data value",
+                                        "pure data",
+                                        &value,
+                                    ));
+                                }
+                                isolate_env.set(sym, value);
+                            }
+                            _ => {
+                                return Err(error::internal(
+                                    "isolate env entry",
+                                    format!("{sym}: unknown wrapper {wrapper}; use cap or data"),
+                                ))
+                            }
                         }
                     }
 
@@ -6104,7 +6223,7 @@ mod tests {
     fn isolate_blocks_ambient_dispatch() {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
-        let result = eval_str("(isolate {:caps {}} (totally-unknown 1))", &mut env, &d);
+        let result = eval_str("(isolate {:env {}} (totally-unknown 1))", &mut env, &d);
         assert!(result.is_err());
         assert!(err_contains(&result.unwrap_err(), "unavailable in isolate"));
     }
@@ -6114,7 +6233,7 @@ mod tests {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
         let result = eval_str(
-            "(isolate {:caps {}} (perform import \"core\"))",
+            "(isolate {:env {}} (perform import \"core\"))",
             &mut env,
             &d,
         );
@@ -6142,11 +6261,51 @@ mod tests {
             },
         );
         let result = eval_str(
-            "(isolate {:caps {:import import}} (perform import \"core\"))",
+            "(isolate {:env {:import (cap import)}} (perform import \"core\"))",
             &mut env,
             &d,
         );
         assert_eq!(result, Ok(Val::Str("ok".into())));
+    }
+
+    #[test]
+    fn isolate_data_binding_works_when_tagged() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {:n (data 41)}} (+ n 1))", &mut env, &d);
+        assert_eq!(result, Ok(Val::Int(42)));
+    }
+
+    #[test]
+    fn isolate_env_rejects_untagged_entry() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {:n 41}} n)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(
+            &result.unwrap_err(),
+            "expected (cap <expr>) or (data <expr>)"
+        ));
+    }
+
+    #[test]
+    fn isolate_caps_option_is_removed() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:caps {}} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), ":caps removed"));
+    }
+
+    #[test]
+    fn isolate_data_slot_rejects_capability() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let cap = make_test_cap("import", 1);
+        env.set("import".into(), cap);
+        let result = eval_str("(isolate {:env {:x (data import)}} x)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "pure data"));
     }
 
     #[test]
@@ -6190,8 +6349,8 @@ mod tests {
         assert_eq!(setup, Ok(Val::Keyword("ok".into())));
 
         let lookup = eval_str(
-            "(isolate {:caps {:directory directory-ro
-                              :routing routing}}
+            "(isolate {:env {:directory (cap directory-ro)
+                             :routing (cap routing)}}
                (perform directory :lookup \"service:invoices\"))",
             &mut env,
             &d,
@@ -6207,8 +6366,8 @@ mod tests {
         );
 
         let denied = eval_str(
-            "(isolate {:caps {:directory directory-ro
-                              :routing routing}}
+            "(isolate {:env {:directory (cap directory-ro)
+                             :routing (cap routing)}}
                (perform directory :announce \"service:payments\"))",
             &mut env,
             &d,
