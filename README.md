@@ -31,7 +31,7 @@ The second command hit a WebAssembly cell running inside the daemon. The cell ca
 
 That's the whole registration.
 
-Here is the capability surface in action, directly in the Wetware shell:
+Here is the capability surface in action, directly in the Wetware shell (Glia):
 - `defcap` defines a capability server in Glia.
 - `attenuate` derives a restricted capability.
 - `isolate` runs with only explicitly granted capabilities.
