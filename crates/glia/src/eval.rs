@@ -18,12 +18,13 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::Poll;
 use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use crate::effect::{self, HandlerStack};
 use crate::error;
 use crate::expr::FnBody;
-use crate::{oneshot, FnArity, Val, ValMap};
+use crate::{oneshot, AttenuatedCapInner, FnArity, GliaCapInner, Val, ValMap, make_cap};
 
 /// Monotonic counter for `gensym`.
 static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -206,6 +207,40 @@ pub trait Dispatch {
 /// including `0`, empty string, and empty collections.
 fn is_truthy(val: &Val) -> bool {
     !matches!(val, Val::Nil | Val::Bool(false))
+}
+
+fn cap_descriptor_bytes(name: &str, schema_cid: &str, methods: &BTreeSet<String>) -> Vec<u8> {
+    let mut method_vec: Vec<&str> = methods.iter().map(String::as_str).collect();
+    method_vec.sort_unstable();
+    format!(
+        "glia.cap.v1\nname={name}\nschema={schema_cid}\nmethods={}\n",
+        method_vec.join(",")
+    )
+    .into_bytes()
+}
+
+fn parse_allow_methods(value: &Val) -> Result<BTreeSet<String>, Val> {
+    let items = match value {
+        Val::Vector(v) | Val::List(v) => v,
+        other => {
+            return Err(error::type_mismatch(
+                "attenuate allow-methods",
+                "vector or list",
+                other,
+            ))
+        }
+    };
+
+    let mut allow = BTreeSet::new();
+    for item in items {
+        match item {
+            Val::Keyword(k) => {
+                allow.insert(k.clone());
+            }
+            other => return Err(error::type_mismatch("attenuate method", "keyword", other)),
+        }
+    }
+    Ok(allow)
 }
 
 /// Evaluate a function/macro body, dispatching on `FnBody` variant.
@@ -545,6 +580,80 @@ async fn invoke_fn<'a, D: Dispatch>(
                         fn_env.set(rest_name.clone(), rest_val);
                     }
                     // continue — re-evaluate body with new bindings
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+    .await;
+
+    fn_env.pop_frame();
+    result
+}
+
+/// Invoke a closure like [`invoke_fn`] but force the handler stack used inside
+/// the function body. Used by defcap method dispatch so isolated execution uses
+/// the isolate handler stack, not definition-time ambient handlers.
+async fn invoke_fn_with_handler_stack<'a, D: Dispatch>(
+    arities: &'a [FnArity],
+    captured_env: &'a Rc<Env>,
+    args: &[Val],
+    dispatch: &'a D,
+    handler_stack: HandlerStack,
+) -> Result<Val, Val> {
+    let arity = arities
+        .iter()
+        .find(|a| a.variadic.is_none() && args.len() == a.params.len())
+        .or_else(|| {
+            arities
+                .iter()
+                .find(|a| a.variadic.is_some() && args.len() >= a.params.len())
+        })
+        .ok_or_else(|| {
+            let expected: Vec<String> = arities
+                .iter()
+                .map(|a| {
+                    if a.variadic.is_some() {
+                        format!("{}+", a.params.len())
+                    } else {
+                        a.params.len().to_string()
+                    }
+                })
+                .collect();
+            error::arity("fn", &expected.join(" or "), args.len())
+        })?;
+
+    let mut fn_env = Env::for_call(captured_env);
+    fn_env.handler_stack = handler_stack;
+
+    for (name, val) in arity.params.iter().zip(args.iter()) {
+        fn_env.set(name.clone(), val.clone());
+    }
+    if let Some(rest_name) = &arity.variadic {
+        let rest_args: Vec<Val> = args[arity.params.len()..].to_vec();
+        fn_env.set(rest_name.clone(), Val::List(rest_args));
+    }
+
+    let recur_arity = arity.params.len() + usize::from(arity.variadic.is_some());
+    let result = async {
+        loop {
+            let result = eval_fn_body(&arity.body, &mut fn_env, dispatch).await?;
+            match result {
+                Val::Recur(new_vals) => {
+                    if new_vals.len() != recur_arity {
+                        return Err(error::arity(
+                            "recur",
+                            &recur_arity.to_string(),
+                            new_vals.len(),
+                        ));
+                    }
+                    for (name, val) in arity.params.iter().zip(new_vals.iter()) {
+                        fn_env.set(name.clone(), val.clone());
+                    }
+                    if let Some(rest_name) = &arity.variadic {
+                        let rest_val = new_vals[arity.params.len()].clone();
+                        fn_env.set(rest_name.clone(), rest_val);
+                    }
                 }
                 other => return Ok(other),
             }
@@ -1592,19 +1701,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                         )
                     }
                     // (perform cap :method args...) — cap-targeted effect
-                    Val::Cap {
-                        name, schema_cid, ..
-                    } => {
-                        // Pack (:method args...) into a list as the data payload.
-                        let data = Val::List(evaled_args);
-                        (
-                            effect::EffectTarget::Cap {
-                                name: name.clone(),
-                                schema_cid: schema_cid.clone(),
-                            },
-                            data,
-                        )
-                    }
+                    Val::Cap { .. } => return perform_cap_value(&target_val, &evaled_args, env, dispatch).await,
                     other => {
                         return Err(error::type_mismatch(
                             "perform target",
@@ -1655,10 +1752,14 @@ pub fn eval_expr<'a, D: Dispatch>(
                 let effect_target = match &target_val {
                     Val::Keyword(s) => effect::EffectTarget::Keyword(s.clone()),
                     Val::Cap {
-                        name, schema_cid, ..
+                        name,
+                        schema_cid,
+                        cap_id,
+                        ..
                     } => effect::EffectTarget::Cap {
                         name: name.clone(),
                         schema_cid: schema_cid.clone(),
+                        cap_id: *cap_id,
                     },
                     other => {
                         return Err(error::type_mismatch(
@@ -1870,6 +1971,202 @@ pub fn eval_expr<'a, D: Dispatch>(
                 args,
                 raw_args,
             } => {
+                // Special form: (defcap name :method fn ...)
+                if head == "defcap" {
+                    if raw_args.len() < 3 {
+                        return Err(error::arity("defcap", "at least 3", raw_args.len()));
+                    }
+                    let name = match &raw_args[0] {
+                        Val::Sym(s) => s.clone(),
+                        other => return Err(error::type_mismatch("defcap name", "symbol", other)),
+                    };
+                    if (raw_args.len() - 1) % 2 != 0 {
+                        return Err(error::internal(
+                            "defcap",
+                            "method definitions must be keyword/function pairs",
+                        ));
+                    }
+
+                    let mut methods = HashMap::new();
+                    let mut method_names = BTreeSet::new();
+                    for pair in raw_args[1..].chunks(2) {
+                        let method_name = match &pair[0] {
+                            Val::Keyword(k) => k.clone(),
+                            other => {
+                                return Err(error::type_mismatch(
+                                    "defcap method name",
+                                    "keyword",
+                                    other,
+                                ))
+                            }
+                        };
+                        let method_expr = expr::analyze(&pair[1])?;
+                        let method_val = eval_expr(&method_expr, env, dispatch).await?;
+                        if !matches!(
+                            method_val,
+                            Val::Fn { .. } | Val::NativeFn { .. } | Val::AsyncNativeFn { .. }
+                        ) {
+                            return Err(error::type_mismatch(
+                                "defcap method value",
+                                "function",
+                                &method_val,
+                            ));
+                        }
+                        method_names.insert(method_name.clone());
+                        methods.insert(method_name, method_val);
+                    }
+
+                    let schema_cid = "glia:defcap:v1".to_string();
+                    let descriptor = cap_descriptor_bytes(&name, &schema_cid, &method_names);
+                    let cap = make_cap(
+                        name.clone(),
+                        schema_cid,
+                        Rc::new(GliaCapInner { methods, descriptor }),
+                    );
+                    env.set_root(name, cap.clone());
+                    return Ok(cap);
+                }
+
+                // Special form: (attenuate cap [:method ...])
+                if head == "attenuate" {
+                    if args.len() != 2 {
+                        return Err(error::arity("attenuate", "2", args.len()));
+                    }
+                    let cap_val = eval_expr(&args[0], env, dispatch).await?;
+                    let allow_val = eval_expr(&args[1], env, dispatch).await?;
+                    let mut allow_methods = parse_allow_methods(&allow_val)?;
+
+                    let (name, schema_cid, base, nested_allow): (
+                        String,
+                        String,
+                        Val,
+                        Option<BTreeSet<String>>,
+                    ) = match &cap_val {
+                        Val::Cap {
+                            name,
+                            schema_cid,
+                            inner,
+                            ..
+                        } => {
+                            if let Some(inner_att) = inner.downcast_ref::<AttenuatedCapInner>() {
+                                (
+                                    name.clone(),
+                                    schema_cid.clone(),
+                                    inner_att.base.clone(),
+                                    Some(inner_att.allow_methods.clone()),
+                                )
+                            } else {
+                                (name.clone(), schema_cid.clone(), cap_val.clone(), None)
+                            }
+                        }
+                        other => {
+                            return Err(error::type_mismatch(
+                                "attenuate first arg",
+                                "cap",
+                                other,
+                            ))
+                        }
+                    };
+
+                    if let Some(existing) = nested_allow {
+                        allow_methods = allow_methods.intersection(&existing).cloned().collect();
+                    }
+
+                    let descriptor = cap_descriptor_bytes(&name, &schema_cid, &allow_methods);
+                    return Ok(make_cap(
+                        name,
+                        schema_cid,
+                        Rc::new(AttenuatedCapInner {
+                            base,
+                            allow_methods,
+                            descriptor,
+                        }),
+                    ));
+                }
+
+                // Special form: (isolate {:caps {:x cap ...}} body...)
+                if head == "isolate" {
+                    if raw_args.is_empty() {
+                        return Err(error::arity("isolate", "at least 1", 0));
+                    }
+                    let opts_expr = expr::analyze(&raw_args[0])?;
+                    let opts_val = eval_expr(&opts_expr, env, dispatch).await?;
+                    let opts_map = match opts_val {
+                        Val::Map(m) => m,
+                        other => {
+                            return Err(error::type_mismatch(
+                                "isolate options",
+                                "map",
+                                &other,
+                            ))
+                        }
+                    };
+                    let caps_val = opts_map
+                        .get(&Val::Keyword("caps".into()))
+                        .cloned()
+                        .unwrap_or_else(|| Val::Map(ValMap::new()));
+                    let caps_map = match caps_val {
+                        Val::Map(m) => m,
+                        other => {
+                            return Err(error::type_mismatch(
+                                "isolate :caps",
+                                "map",
+                                &other,
+                            ))
+                        }
+                    };
+
+                    let mut isolate_env = Env::new();
+                    let mut handler_targets: Vec<String> = Vec::new();
+                    for (k, v) in caps_map.iter() {
+                        let sym = match k {
+                            Val::Keyword(s) | Val::Sym(s) => s.clone(),
+                            other => {
+                                return Err(error::type_mismatch(
+                                    "isolate cap name",
+                                    "keyword or symbol",
+                                    other,
+                                ))
+                            }
+                        };
+                        if !matches!(v, Val::Cap { .. }) {
+                            return Err(error::type_mismatch("isolate cap value", "cap", v));
+                        }
+                        isolate_env.set(sym.clone(), v.clone());
+                        let handler_name = format!("{sym}-handler");
+                        if let Some(handler) = env.get(&handler_name) {
+                            isolate_env.set(handler_name, handler.clone());
+                            handler_targets.push(sym);
+                        }
+                    }
+
+                    if raw_args.len() == 1 {
+                        return Ok(Val::Nil);
+                    }
+
+                    let mut body_form = if raw_args.len() == 2 {
+                        raw_args[1].clone()
+                    } else {
+                        let mut forms = Vec::with_capacity(raw_args.len());
+                        forms.push(Val::Sym("do".into()));
+                        forms.extend_from_slice(&raw_args[1..]);
+                        Val::List(forms)
+                    };
+
+                    for sym in handler_targets {
+                        body_form = Val::List(vec![
+                            Val::Sym("with-effect-handler".into()),
+                            Val::Sym(sym.clone()),
+                            Val::Sym(format!("{sym}-handler")),
+                            body_form,
+                        ]);
+                    }
+
+                    let body_expr = expr::analyze(&body_form)?;
+                    let restricted = RestrictedDispatch;
+                    return eval_expr(&body_expr, &mut isolate_env, &restricted).await;
+                }
+
                 // 1. Check for macro expansion
                 if let Some(Val::Macro {
                     arities,
@@ -2056,6 +2353,112 @@ async fn eval_expr_args<'a, D: Dispatch>(
         result.push(eval_expr(a, env, dispatch).await?);
     }
     Ok(result)
+}
+
+fn cap_method_and_args(args: &[Val], ctx: &'static str) -> Result<(String, Vec<Val>), Val> {
+    let method = match args.first() {
+        Some(Val::Keyword(k)) => k.clone(),
+        Some(other) => return Err(error::type_mismatch(ctx, "keyword method", other)),
+        None => return Err(error::arity(ctx, "at least 1", 0)),
+    };
+    Ok((method, args[1..].to_vec()))
+}
+
+async fn invoke_cap_method_value<'a, D: Dispatch>(
+    method_val: Val,
+    args: &[Val],
+    env: &'a mut Env,
+    dispatch: &'a D,
+) -> Result<Val, Val> {
+    match method_val {
+        Val::Fn {
+            arities,
+            env: captured_env,
+        } => {
+            invoke_fn_with_handler_stack(
+                &arities,
+                &captured_env,
+                args,
+                dispatch,
+                env.handler_stack.clone(),
+            )
+            .await
+        }
+        Val::NativeFn { func, .. } => func(args),
+        Val::AsyncNativeFn { func, .. } => func(args.to_vec()).await,
+        other => Err(error::type_mismatch("defcap method", "function", &other)),
+    }
+}
+
+async fn perform_cap_value<'a, D: Dispatch>(
+    cap: &Val,
+    args: &[Val],
+    env: &'a mut Env,
+    dispatch: &'a D,
+) -> Result<Val, Val> {
+    let mut current = cap.clone();
+    let payload = args.to_vec();
+
+    loop {
+        let Val::Cap {
+            name,
+            schema_cid,
+            cap_id,
+            inner,
+        } = &current
+        else {
+            return Err(error::type_mismatch("perform target", "cap", &current));
+        };
+
+        if let Some(attenuated) = inner.downcast_ref::<AttenuatedCapInner>() {
+            let (method, _) = cap_method_and_args(&payload, "perform (attenuated cap)")?;
+            if !attenuated.allow_methods.contains(&method) {
+                return Err(error::permission_denied(
+                    &format!("method :{method} denied by attenuation policy on '{name}'"),
+                    None,
+                ));
+            }
+            current = attenuated.base.clone();
+            continue;
+        }
+
+        if let Some(glia_cap) = inner.downcast_ref::<GliaCapInner>() {
+            let (method, method_args) = cap_method_and_args(&payload, "perform (defcap)")?;
+            let method_val = glia_cap
+                .methods
+                .get(&method)
+                .cloned()
+                .ok_or_else(|| {
+                    error::permission_denied(
+                        &format!("method :{method} is not available on capability '{name}'"),
+                        None,
+                    )
+            })?;
+            return invoke_cap_method_value(method_val, &method_args, env, dispatch).await;
+        }
+
+        let effect_target = effect::EffectTarget::Cap {
+            name: name.clone(),
+            schema_cid: schema_cid.clone(),
+            cap_id: *cap_id,
+        };
+        return perform_dispatch(&env.handler_stack, effect_target, Val::List(payload)).await;
+    }
+}
+
+struct RestrictedDispatch;
+
+impl Dispatch for RestrictedDispatch {
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        _args: &'a [Val],
+    ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+        Box::pin(std::future::ready(Err(error::permission_denied(
+            &format!("{name}: unavailable in isolate"),
+            None,
+        ))))
+    }
 }
 
 /// Top-level Expr evaluation with Recur guard.
@@ -5563,13 +5966,9 @@ mod tests {
     // Cap-targeted effect handler tests
     // -----------------------------------------------------------------------
 
-    /// Helper: create a Val::Cap with a given name and CID, wrapping an i32 marker.
+    /// Helper: create a capability with a unique instance identity.
     fn make_test_cap(name: &str, marker: i32) -> Val {
-        Val::Cap {
-            name: name.into(),
-            schema_cid: format!("test-cid-{name}"),
-            inner: Rc::new(marker),
-        }
+        make_cap(name, format!("test-cid-{name}"), Rc::new(marker))
     }
 
     #[test]
@@ -5610,21 +6009,224 @@ mod tests {
     }
 
     #[test]
-    fn perform_cap_same_cid_matches() {
-        // Same schema CID, different Rc — matches (type semantics, not identity).
+    fn perform_cap_same_cid_different_id_no_match() {
+        // Same schema CID, different cap instances — does NOT match.
         let mut env = Env::new();
         let d = RecordingDispatch::new();
         let cap1 = make_test_cap("executor", 1);
         let cap2 = make_test_cap("executor", 2);
         env.set("cap1".into(), cap1);
         env.set("cap2".into(), cap2);
-        // Handler installed for cap1, perform on cap2 — matches because same CID.
+        // Handler installed for cap1, perform on cap2 — no match due to cap_id mismatch.
+        let result = eval_str(
+            "(with-effect-handler cap1 (fn [data] :handled) (perform cap2 :run 0))",
+            &mut env,
+            &d,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn perform_cap_same_instance_matches() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let cap1 = make_test_cap("executor", 1);
+        let cap2 = cap1.clone();
+        env.set("cap1".into(), cap1);
+        env.set("cap2".into(), cap2);
         let result = eval_str(
             "(with-effect-handler cap1 (fn [data] :handled) (perform cap2 :run 0))",
             &mut env,
             &d,
         );
         assert_eq!(result, Ok(Val::Keyword("handled".into())));
+    }
+
+    #[test]
+    fn defcap_define_and_perform() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(do (defcap directory :lookup (fn [name] name))
+                 (perform directory :lookup \"service\"))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Str("service".into())));
+    }
+
+    #[test]
+    fn defcap_unknown_method_denied() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(do (defcap directory :lookup (fn [name] name))
+                 (perform directory :announce \"x\"))",
+            &mut env,
+            &d,
+        );
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "not available"));
+    }
+
+    #[test]
+    fn attenuate_allow_and_deny() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let cap = make_test_cap("svc", 1);
+        env.set("svc".into(), cap.clone());
+        let ok = eval_str(
+            "(with-effect-handler svc (fn [data] :ok)
+               (let [svc-ro (attenuate svc [:run])]
+                 (perform svc-ro :run 1)))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(ok, Ok(Val::Keyword("ok".into())));
+
+        let denied = eval_str(
+            "(with-effect-handler svc (fn [data] :ok)
+               (let [svc-ro (attenuate svc [:run])]
+                 (perform svc-ro :write 1)))",
+            &mut env,
+            &d,
+        );
+        assert!(denied.is_err());
+        assert!(err_contains(&denied.unwrap_err(), "denied"));
+    }
+
+    #[test]
+    fn attenuate_nested_intersection() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let cap = make_test_cap("svc", 1);
+        env.set("svc".into(), cap);
+        let denied = eval_str(
+            "(with-effect-handler svc (fn [data] :ok)
+               (let [a1 (attenuate svc [:run])
+                     a2 (attenuate a1 [:write])]
+                 (perform a2 :run 1)))",
+            &mut env,
+            &d,
+        );
+        assert!(denied.is_err());
+        assert!(err_contains(&denied.unwrap_err(), "denied"));
+    }
+
+    #[test]
+    fn isolate_blocks_ambient_dispatch() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:caps {}} (totally-unknown 1))", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(
+            &result.unwrap_err(),
+            "unavailable in isolate"
+        ));
+    }
+
+    #[test]
+    fn isolate_import_absent_by_default() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:caps {}} (perform import \"core\"))", &mut env, &d);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn isolate_import_works_when_explicitly_granted() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let import_cap = make_test_cap("import", 1);
+        env.set("import".into(), import_cap.clone());
+        env.set(
+            "import-handler".into(),
+            Val::NativeFn {
+                name: "import-handler".into(),
+                func: Rc::new(|args: &[Val]| {
+                    // args: [data, resume]
+                    let resume = &args[1];
+                    if let Val::NativeFn { func, .. } = resume {
+                        return func(&[Val::Str("ok".into())]);
+                    }
+                    Err(Val::from("bad resume"))
+                }),
+            },
+        );
+        let result = eval_str(
+            "(isolate {:caps {:import import}} (perform import \"core\"))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Str("ok".into())));
+    }
+
+    #[test]
+    fn integration_demo_flow_with_custom_routing_handler() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+
+        // Inject a fake routing capability and handler so no external network/DHT path is used.
+        let routing_cap = make_test_cap("routing", 99);
+        env.set("routing".into(), routing_cap);
+        env.set(
+            "routing-handler".into(),
+            Val::NativeFn {
+                name: "routing-handler".into(),
+                func: Rc::new(|args: &[Val]| {
+                    if args.len() != 2 {
+                        return Err(Val::from("routing-handler: expected [data resume]"));
+                    }
+                    let data = args[0].clone();
+                    let resume = &args[1];
+                    if let Val::NativeFn { func, .. } = resume {
+                        return func(&[data]);
+                    }
+                    Err(Val::from("routing-handler: invalid resume"))
+                }),
+            },
+        );
+
+        let setup = eval_str(
+            "(do
+               (defcap directory
+                 :lookup   (fn [name]
+                             (perform routing :find name :count 5))
+                 :announce (fn [name]
+                             (perform routing :provide name)))
+               (def directory-ro (attenuate directory [:lookup]))
+               :ok)",
+            &mut env,
+            &d,
+        );
+        assert_eq!(setup, Ok(Val::Keyword("ok".into())));
+
+        let lookup = eval_str(
+            "(isolate {:caps {:directory directory-ro
+                              :routing routing}}
+               (perform directory :lookup \"service:invoices\"))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(
+            lookup,
+            Ok(Val::List(vec![
+                Val::Keyword("find".into()),
+                Val::Str("service:invoices".into()),
+                Val::Keyword("count".into()),
+                Val::Int(5),
+            ]))
+        );
+
+        let denied = eval_str(
+            "(isolate {:caps {:directory directory-ro
+                              :routing routing}}
+               (perform directory :announce \"service:payments\"))",
+            &mut env,
+            &d,
+        );
+        assert!(denied.is_err());
+        assert!(err_contains(&denied.unwrap_err(), "denied"));
     }
 
     #[test]
@@ -5869,10 +6471,14 @@ mod tests {
         // Pre-fill handler stack to the limit.
         let cap_target = match &cap {
             Val::Cap {
-                name, schema_cid, ..
+                name,
+                schema_cid,
+                cap_id,
+                ..
             } => effect::EffectTarget::Cap {
                 name: name.clone(),
                 schema_cid: schema_cid.clone(),
+                cap_id: *cap_id,
             },
             _ => unreachable!(),
         };

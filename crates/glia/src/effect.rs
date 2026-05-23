@@ -18,20 +18,22 @@ pub enum EffectTarget {
     /// `(perform :keyword data)` — global/environmental effect.
     Keyword(String),
     /// `(perform cap :method args...)` — object-scoped capability effect.
-    /// Matched by schema CID (same capnp interface = same type).
-    Cap { name: String, schema_cid: String },
+    /// Matched by instance identity (`cap_id`).
+    Cap {
+        name: String,
+        schema_cid: String,
+        cap_id: u64,
+    },
 }
 
 impl EffectTarget {
     /// Does this target match the given handler's target?
     ///
-    /// Keywords match by string equality. Caps match by schema CID (same interface type).
+    /// Keywords match by string equality. Caps match by capability instance id.
     pub fn matches(&self, other: &EffectTarget) -> bool {
         match (self, other) {
             (EffectTarget::Keyword(a), EffectTarget::Keyword(b)) => a == b,
-            (EffectTarget::Cap { schema_cid: a, .. }, EffectTarget::Cap { schema_cid: b, .. }) => {
-                a == b
-            }
+            (EffectTarget::Cap { cap_id: a, .. }, EffectTarget::Cap { cap_id: b, .. }) => a == b,
             _ => false,
         }
     }
