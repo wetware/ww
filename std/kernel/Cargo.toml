@@ -15,6 +15,7 @@ wasip2 = "1.0.2"
 hex = "0.4"
 glia = { path = "../../crates/glia" }
 system = { path = "../system" }
+caps = { path = "../caps" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

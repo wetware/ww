@@ -17,7 +17,7 @@ use capnp::capability::Promise;
 use capnp_rpc::pry;
 
 use glia::eval::{self, Dispatch, Env};
-use glia::Val;
+use glia::{Val, make_cap};
 
 use wasip2::exports::cli::run::Guest;
 
@@ -265,11 +265,7 @@ fn run_impl() {
             for (name, handler) in caps {
                 env.set(
                     name.to_string(),
-                    Val::Cap {
-                        name: name.into(),
-                        schema_cid: format!("shell:{name}"),
-                        inner: std::rc::Rc::new(()),
-                    },
+                    make_cap(name, format!("shell:{name}"), std::rc::Rc::new(())),
                 );
                 env.set(format!("{name}-handler"), handler);
             }
