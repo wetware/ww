@@ -31,9 +31,13 @@ The second command hit a WebAssembly cell running inside the daemon. The cell ca
 
 That's the whole registration.
 
-Same model from the Glia REPL:
+Now the same model, but using the new Glia capability features directly in user code:
+- `defcap` defines a capability server in Glia.
+- `attenuate` derives a restricted capability.
+- `isolate` runs with only explicitly granted capabilities.
 
 ```clojure
+;; Define a local capability server with two methods.
 (defcap directory
   :lookup   (fn [name]
               (perform routing :find name :count 5))
@@ -41,13 +45,15 @@ Same model from the Glia REPL:
               (perform routing :provide name)
               :ok))
 
+;; Attenuate to a read-only view (lookup only).
 (def directory-ro
   (attenuate directory [:lookup]))
 
+;; Allowed call inside isolated context.
 (isolate {:caps {:directory directory-ro}}
   (perform directory :lookup "service:invoices"))
 
-;; => permission_denied (announce was not granted)
+;; Denied call: announce was not granted to this isolate.
 (isolate {:caps {:directory directory-ro}}
   (perform directory :announce "service:payments"))
 ```
