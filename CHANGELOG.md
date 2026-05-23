@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - **Glia capability authority and isolation primitives landed (pre-alpha breakage accepted).** Capability authority now matches by per-instance `cap_id` (not `schema_cid`), `defcap` creates Glia-native capability servers with introspectable descriptors, `attenuate` enforces method allowlists with nested-intersection semantics, and `isolate` evaluates in a fresh restricted context with explicit cap grants only.
+- **Kernel now treats `import` as a first-class capability and extends cap introspection for dynamic Glia caps.** pid0 binds `import` via the normal capability mediation path, and `schema`/`doc`/`help` resolve runtime metadata from `defcap`/attenuated capability values before falling back to the core schema registry.
 - **CLI wiring cleanup and documentation alignment.** Consolidated daemon restart/remove and Claude MCP availability checks into shared helpers, and aligned runtime/CGI documentation comments with current behavior.
 - **Startup resilience and build-target compatibility hardening.** Startup-critical service wiring now returns typed errors instead of panicking (swarm/epoch/executor/compiler boot), compile worker pool startup degrades safely, and build-time CID embedding now resolves from `CARGO_TARGET_DIR` when set.
 - **Daemon install no longer depends on `~/.ww/config.glia`.** `ww daemon install` now renders launchd/systemd service definitions directly from flags/env/defaults, removing the extra host-side Glia config control plane.
