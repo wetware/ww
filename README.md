@@ -31,7 +31,7 @@ The second command hit a WebAssembly cell running inside the daemon. The cell ca
 
 That's the whole registration.
 
-Now the same model, but using the new Glia capability features directly in user code:
+Here is the new Glia capability surface in action, directly from user code:
 - `defcap` defines a capability server in Glia.
 - `attenuate` derives a restricted capability.
 - `isolate` runs with only explicitly granted capabilities.
