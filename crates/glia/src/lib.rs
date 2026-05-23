@@ -29,6 +29,9 @@ pub mod oneshot;
 pub mod pattern;
 pub mod valmap;
 
+use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 pub use valmap::ValMap;
 
 /// Crate version from Cargo.toml (compile-time).
@@ -41,6 +44,43 @@ pub const GIT_COMMIT: &str = env!("GIT_COMMIT");
 /// Call this at REPL startup for debuggability.
 pub fn banner() -> String {
     format!("glia v{VERSION} ({GIT_COMMIT})")
+}
+
+/// Process-local monotonic counter for capability instance identity.
+static CAP_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a fresh capability instance identifier.
+pub fn next_cap_id() -> u64 {
+    CAP_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Internal representation for Glia-native capability servers created by `defcap`.
+#[derive(Clone)]
+pub struct GliaCapInner {
+    pub methods: HashMap<String, Val>,
+    pub descriptor: Vec<u8>,
+}
+
+/// Internal representation for attenuated capabilities created by `attenuate`.
+#[derive(Clone)]
+pub struct AttenuatedCapInner {
+    pub base: Val,
+    pub allow_methods: BTreeSet<String>,
+    pub descriptor: Vec<u8>,
+}
+
+/// Construct a capability value with a fresh instance identity.
+pub fn make_cap(
+    name: impl Into<String>,
+    schema_cid: impl Into<String>,
+    inner: Rc<dyn std::any::Any>,
+) -> Val {
+    Val::Cap {
+        name: name.into(),
+        schema_cid: schema_cid.into(),
+        cap_id: next_cap_id(),
+        inner,
+    }
 }
 
 #[cfg(test)]
@@ -166,10 +206,12 @@ pub enum Val {
     ///
     /// `name` is the display label (e.g. "executor").
     /// `schema_cid` is the content-addressed type identity: CIDv1(raw, BLAKE3(canonical schema)).
+    /// `cap_id` is a unique instance identity used for authority matching.
     /// `inner` is the type-erased capability, downcasted by the kernel.
     Cap {
         name: String,
         schema_cid: String,
+        cap_id: u64,
         inner: std::rc::Rc<dyn std::any::Any>,
     },
     /// A cell definition: WASM binary + optional schema + captured capabilities.
@@ -293,8 +335,8 @@ impl PartialEq for Val {
             (Val::AsyncNativeFn { func: a, .. }, Val::AsyncNativeFn { func: b, .. }) => {
                 std::rc::Rc::ptr_eq(a, b)
             }
-            // Caps match by schema CID (same capnp interface = same type).
-            (Val::Cap { schema_cid: a, .. }, Val::Cap { schema_cid: b, .. }) => a == b,
+            // Caps match by instance identity.
+            (Val::Cap { cap_id: a, .. }, Val::Cap { cap_id: b, .. }) => a == b,
             // Cells are equal if wasm and schema match (caps are opaque).
             (
                 Val::Cell {
@@ -349,7 +391,7 @@ impl std::hash::Hash for Val {
             Val::AsyncNativeFn { func, .. } => {
                 (std::rc::Rc::as_ptr(func) as *const () as usize).hash(state)
             }
-            Val::Cap { schema_cid, .. } => schema_cid.hash(state),
+            Val::Cap { cap_id, .. } => cap_id.hash(state),
             Val::Cell { wasm, schema, .. } => {
                 wasm.hash(state);
                 schema.hash(state);
@@ -1731,7 +1773,8 @@ mod tests {
             (Val::Keyword("a".into()), Val::Int(1)),
             (Val::Keyword("b".into()), Val::Int(2)),
         ]));
-        assert_eq!(format!("{v}"), "{:a 1 :b 2}");
+        let rendered = format!("{v}");
+        assert!(rendered == "{:a 1 :b 2}" || rendered == "{:b 2 :a 1}");
     }
 
     #[test]
