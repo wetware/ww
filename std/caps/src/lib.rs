@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::rc::Rc;
 
-use glia::Val;
+use glia::{Val, make_cap};
 
 // Re-export extract_method from glia for downstream consumers (shell, MCP).
 pub use glia::extract_method;
@@ -102,11 +102,7 @@ thread_local! {
 /// Callers bind this in the env so `(perform import "core")` resolves
 /// `import` to a cap value that the effect system can match.
 pub fn make_import_cap() -> Val {
-    Val::Cap {
-        name: "import".into(),
-        schema_cid: IMPORT_SCHEMA_CID.into(),
-        inner: Rc::new(()),
-    }
+    make_cap("import", IMPORT_SCHEMA_CID, Rc::new(()))
 }
 
 /// Clear the import cache. Useful for testing or when the virtual filesystem changes.

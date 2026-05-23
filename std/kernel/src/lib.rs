@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
+use caps::{make_import_cap, make_import_handler};
 use glia::eval::{self, Dispatch, Env};
-use glia::{extract_method, read, read_many, Val};
+use glia::{extract_method, make_cap, read, read_many, AttenuatedCapInner, GliaCapInner, Val};
 
 use std::rc::Rc;
 
@@ -628,11 +629,11 @@ fn make_host_handler(
                         // (perform host :http-client) → Val::Cap wrapping HttpClient
                         // Future: parse :allow and :rate kwargs from rest
                         match &http_client {
-                            Some(c) => Val::Cap {
-                                name: "http".into(),
-                                schema_cid: schema_ids::HTTP_CLIENT_CID.to_string(),
-                                inner: Rc::new(c.clone()),
-                            },
+                            Some(c) => make_cap(
+                                "http",
+                                schema_ids::HTTP_CLIENT_CID.to_string(),
+                                Rc::new(c.clone()),
+                            ),
                             None => return Err(Val::from(
                                 "http-client not available (node started without --http-dial)",
                             )),
@@ -1113,7 +1114,7 @@ fn wrap_with_handlers(form: &Val) -> Val {
     ]);
 
     // Wrap in cap handlers (innermost to outermost).
-    let caps = ["routing", "runtime", "host"];
+    let caps = ["import", "routing", "runtime", "host"];
     let mut wrapped = with_load;
     for cap_name in &caps {
         let handler_name = format!("{cap_name}-handler");
@@ -1385,14 +1386,17 @@ fn schema_bytes_for_cap(name: &str) -> Option<&'static [u8]> {
 fn unwrap_cap_arg<'a>(
     builtin: &'static str,
     args: &'a [Val],
-) -> Result<(&'a str, &'a str), Val> {
+) -> Result<(&'a str, &'a str, &'a Rc<dyn std::any::Any>), Val> {
     if args.len() != 1 {
         return Err(glia::error::arity(builtin, "1", args.len()));
     }
     match &args[0] {
         Val::Cap {
-            name, schema_cid, ..
-        } => Ok((name.as_str(), schema_cid.as_str())),
+            name,
+            schema_cid,
+            inner,
+            ..
+        } => Ok((name.as_str(), schema_cid.as_str(), inner)),
         other => Err(glia::error::type_mismatch(builtin, "cap", other)),
     }
 }
@@ -1401,13 +1405,21 @@ fn make_schema_builtin() -> Val {
     Val::NativeFn {
         name: "schema".into(),
         func: Rc::new(|args: &[Val]| -> Result<Val, Val> {
-            let (cap_name, _) = unwrap_cap_arg("schema", args)?;
+            let (cap_name, _schema_cid, inner) = unwrap_cap_arg("schema", args)?;
             match schema_bytes_for_cap(cap_name) {
                 Some(bytes) => Ok(Val::Bytes(bytes.to_vec())),
-                None => Err(glia::error::permission_denied(
-                    &format!("schema for cap '{cap_name}' not registered"),
-                    Some("schemas registered for: host, runtime, routing, identity, http"),
-                )),
+                None => {
+                    if let Some(glia_cap) = inner.downcast_ref::<GliaCapInner>() {
+                        return Ok(Val::Bytes(glia_cap.descriptor.clone()));
+                    }
+                    if let Some(att) = inner.downcast_ref::<AttenuatedCapInner>() {
+                        return Ok(Val::Bytes(att.descriptor.clone()));
+                    }
+                    Err(glia::error::permission_denied(
+                        &format!("schema for cap '{cap_name}' not registered"),
+                        Some("schemas registered for: host, runtime, routing, identity, http"),
+                    ))
+                }
             }
         }),
     }
@@ -1417,7 +1429,7 @@ fn make_doc_builtin() -> Val {
     Val::NativeFn {
         name: "doc".into(),
         func: Rc::new(|args: &[Val]| -> Result<Val, Val> {
-            let (cap_name, schema_cid) = unwrap_cap_arg("doc", args)?;
+            let (cap_name, schema_cid, inner) = unwrap_cap_arg("doc", args)?;
             // Human-readable summary. `(schema cap)` is the source of
             // truth for machine-readable interface introspection; `doc`
             // is the operator-friendly view.
@@ -1427,10 +1439,24 @@ fn make_doc_builtin() -> Val {
                 "routing" => "routing — DHT content routing (provide / find)",
                 "identity" => "identity — node Ed25519 signing keys",
                 "http" | "http-client" => "http-client — outbound HTTP requests (gated by --http-dial)",
-                _ => return Err(glia::error::permission_denied(
-                    &format!("docs for cap '{cap_name}' not available"),
-                    None,
-                )),
+                _ => {
+                    if let Some(glia_cap) = inner.downcast_ref::<GliaCapInner>() {
+                        return Ok(Val::Str(format!(
+                            "glia capability — local method table\n  cap-name:   {cap_name}\n  schema-cid: {schema_cid}\n  methods:    {}",
+                            glia_cap.methods.len()
+                        )));
+                    }
+                    if let Some(att) = inner.downcast_ref::<AttenuatedCapInner>() {
+                        return Ok(Val::Str(format!(
+                            "attenuated capability — method whitelist\n  cap-name:   {cap_name}\n  schema-cid: {schema_cid}\n  methods:    {}",
+                            att.allow_methods.len()
+                        )));
+                    }
+                    return Err(glia::error::permission_denied(
+                        &format!("docs for cap '{cap_name}' not available"),
+                        None,
+                    ));
+                }
             };
             Ok(Val::Str(format!(
                 "{summary}\n  cap-name:   {cap_name}\n  schema-cid: {schema_cid}"
@@ -1443,7 +1469,7 @@ fn make_help_builtin() -> Val {
     Val::NativeFn {
         name: "help".into(),
         func: Rc::new(|args: &[Val]| -> Result<Val, Val> {
-            let (cap_name, schema_cid) = unwrap_cap_arg("help", args)?;
+            let (cap_name, schema_cid, inner) = unwrap_cap_arg("help", args)?;
             let mut text = String::new();
             text.push_str(&format!("== {cap_name} ==\n"));
             text.push_str(&format!("schema-cid: {schema_cid}\n"));
@@ -1451,6 +1477,16 @@ fn make_help_builtin() -> Val {
                 text.push_str(&format!(
                     "schema-bytes: {} (call (schema {cap_name}) to retrieve)\n",
                     bytes.len()
+                ));
+            } else if let Some(glia_cap) = inner.downcast_ref::<GliaCapInner>() {
+                text.push_str(&format!(
+                    "schema-bytes: {} (derived glia descriptor)\n",
+                    glia_cap.descriptor.len()
+                ));
+            } else if let Some(att) = inner.downcast_ref::<AttenuatedCapInner>() {
+                text.push_str(&format!(
+                    "schema-bytes: {} (attenuation descriptor)\n",
+                    att.descriptor.len()
                 ));
             } else {
                 text.push_str("schema-bytes: not registered\n");
@@ -1573,11 +1609,7 @@ fn run_impl() {
 
                 env.set(
                     cap_name.to_string(),
-                    Val::Cap {
-                        name: cap_name.into(),
-                        schema_cid: schema_cid.to_string(),
-                        inner,
-                    },
+                    make_cap(cap_name, schema_cid.to_string(), inner),
                 );
                 if !matches!(handler, Val::Nil) {
                     env.set(format!("{cap_name}-handler"), handler);
@@ -1591,6 +1623,8 @@ fn run_impl() {
             env.set("schema".to_string(), make_schema_builtin());
             env.set("doc".to_string(), make_doc_builtin());
             env.set("help".to_string(), make_help_builtin());
+            env.set("import".to_string(), make_import_cap());
+            env.set("import-handler".to_string(), make_import_handler());
         }
 
         // Load the prelude (standard macros: when, and, or, defn, cond, not).
@@ -2174,11 +2208,7 @@ mod tests {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let runtime_cap = Val::Cap {
-                name: "runtime".into(),
-                schema_cid: "test-runtime-cid".into(),
-                inner: Rc::new(s.runtime.clone()),
-            };
+            let runtime_cap = make_cap("runtime", "test-runtime-cid", Rc::new(s.runtime.clone()));
             let result = call_handler(
                 &handler,
                 "listen",
@@ -2200,11 +2230,7 @@ mod tests {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let runtime_cap = Val::Cap {
-                name: "runtime".into(),
-                schema_cid: "test-runtime-cid".into(),
-                inner: Rc::new(s.runtime.clone()),
-            };
+            let runtime_cap = make_cap("runtime", "test-runtime-cid", Rc::new(s.runtime.clone()));
             let result = call_handler(
                 &handler,
                 "listen",
@@ -2242,11 +2268,7 @@ mod tests {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let bad_cap = Val::Cap {
-                name: "not-runtime".into(),
-                schema_cid: "test-not-runtime-cid".into(),
-                inner: Rc::new(42i32),
-            };
+            let bad_cap = make_cap("not-runtime", "test-not-runtime-cid", Rc::new(42i32));
             let err =
                 call_handler(&handler, "listen", &[bad_cap, Val::Bytes(b"wasm".to_vec())]).await;
             assert!(err.is_err(), "should reject wrong capability type");
@@ -2265,11 +2287,7 @@ mod tests {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let forged_cap = Val::Cap {
-                name: "runtime".into(),
-                schema_cid: "test-runtime-cid".into(),
-                inner: Rc::new(42i32),
-            };
+            let forged_cap = make_cap("runtime", "test-runtime-cid", Rc::new(42i32));
             let err = call_handler(
                 &handler,
                 "listen",
@@ -2325,11 +2343,7 @@ mod tests {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let bad_cap = Val::Cap {
-                name: "imposter".into(),
-                schema_cid: "test-imposter-cid".into(),
-                inner: Rc::new(42i32),
-            };
+            let bad_cap = make_cap("imposter", "test-imposter-cid", Rc::new(42i32));
             let err = call_handler(
                 &handler,
                 "listen",
@@ -2376,11 +2390,7 @@ mod tests {
             // 0 args after :listen — should error
             assert!(call_handler(&handler, "listen", &[]).await.is_err());
             // 4 args after :listen — should error
-            let runtime_cap = Val::Cap {
-                name: "runtime".into(),
-                schema_cid: "test-runtime-cid".into(),
-                inner: Rc::new(s.runtime.clone()),
-            };
+            let runtime_cap = make_cap("runtime", "test-runtime-cid", Rc::new(s.runtime.clone()));
             assert!(call_handler(
                 &handler,
                 "listen",
@@ -2610,24 +2620,18 @@ mod tests {
         for (name, cid, inner, handler) in caps {
             env.set(
                 name.to_string(),
-                Val::Cap {
-                    name: name.into(),
-                    schema_cid: cid.into(),
-                    inner,
-                },
+                make_cap(name, cid, inner),
             );
             env.set(format!("{name}-handler"), handler);
         }
+        env.set("import".to_string(), make_import_cap());
+        env.set("import-handler".to_string(), make_import_handler());
 
         // http-client with real capnp client (tests always provide one).
         if let Some(ref c) = session.http_client {
             env.set(
                 "http-client".to_string(),
-                Val::Cap {
-                    name: "http-client".into(),
-                    schema_cid: "test-http-cid".into(),
-                    inner: Rc::new(c.clone()),
-                },
+                make_cap("http-client", "test-http-cid", Rc::new(c.clone())),
             );
         }
     }
@@ -2834,11 +2838,11 @@ mod tests {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let http_cap = Val::Cap {
-                name: "http".into(),
-                schema_cid: "test-http-cid".into(),
-                inner: Rc::new(s.http_client.clone().unwrap()),
-            };
+            let http_cap = make_cap(
+                "http",
+                "test-http-cid",
+                Rc::new(s.http_client.clone().unwrap()),
+            );
             let cell = Val::Cell {
                 wasm: b"fake-wasm".to_vec(),
                 schema: Some(b"fake-schema".to_vec()),
@@ -2880,11 +2884,7 @@ mod tests {
     /// Construct a cap-shaped Val for tests. The `inner` is a placeholder
     /// since the introspection builtins only read `name` and `schema_cid`.
     fn test_cap(name: &str, schema_cid: &str) -> Val {
-        Val::Cap {
-            name: name.into(),
-            schema_cid: schema_cid.into(),
-            inner: Rc::new(()),
-        }
+        make_cap(name, schema_cid, Rc::new(()))
     }
 
     /// Invoke a builtin (NativeFn) with the given args. Panics if the
@@ -3010,6 +3010,50 @@ mod tests {
             text.contains("not registered"),
             "help should note unregistered schema: {text}"
         );
+    }
+
+    #[test]
+    fn schema_dynamic_glia_cap_returns_descriptor_bytes() {
+        let builtin = make_schema_builtin();
+        let mut methods = std::collections::HashMap::new();
+        methods.insert(
+            "lookup".to_string(),
+            Val::NativeFn {
+                name: "lookup".into(),
+                func: Rc::new(|_args: &[Val]| Ok(Val::Nil)),
+            },
+        );
+        let descriptor = b"glia-cap-descriptor".to_vec();
+        let cap = make_cap(
+            "directory",
+            "glia:defcap:v1",
+            Rc::new(GliaCapInner {
+                methods,
+                descriptor: descriptor.clone(),
+            }),
+        );
+        let out = call_builtin(&builtin, &[cap]).unwrap();
+        assert_eq!(out, Val::Bytes(descriptor));
+    }
+
+    #[test]
+    fn schema_dynamic_attenuated_cap_returns_descriptor_bytes() {
+        let builtin = make_schema_builtin();
+        let base = test_cap("runtime", "test-runtime");
+        let mut allow = std::collections::BTreeSet::new();
+        allow.insert("run".to_string());
+        let descriptor = b"attenuated-cap-descriptor".to_vec();
+        let cap = make_cap(
+            "runtime-ro",
+            "glia:defcap:v1",
+            Rc::new(AttenuatedCapInner {
+                base,
+                allow_methods: allow,
+                descriptor: descriptor.clone(),
+            }),
+        );
+        let out = call_builtin(&builtin, &[cap]).unwrap();
+        assert_eq!(out, Val::Bytes(descriptor));
     }
 
     #[test]

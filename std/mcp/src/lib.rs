@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use glia::eval::{self, Dispatch, Env};
-use glia::Val;
+use glia::{Val, make_cap};
 
 use wasip2::exports::cli::run::Guest;
 
@@ -744,11 +744,7 @@ fn run_impl() {
                 for (name, handler) in cap_handlers {
                     e.set(
                         name.to_string(),
-                        Val::Cap {
-                            name: name.into(),
-                            schema_cid: format!("mcp:{name}"),
-                            inner: std::rc::Rc::new(()),
-                        },
+                        make_cap(name, format!("mcp:{name}"), std::rc::Rc::new(())),
                     );
                     e.set(format!("{name}-handler"), handler);
                 }
