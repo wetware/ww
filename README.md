@@ -31,6 +31,27 @@ The second command hit a WebAssembly cell running inside the daemon. The cell ca
 
 That's the whole registration.
 
+Same model from the Glia REPL:
+
+```clojure
+(defcap directory
+  :lookup   (fn [name]
+              (perform routing :find name :count 5))
+  :announce (fn [name]
+              (perform routing :provide name)
+              :ok))
+
+(def directory-ro
+  (attenuate directory [:lookup]))
+
+(isolate {:caps {:directory directory-ro}}
+  (perform directory :lookup "service:invoices"))
+
+;; => permission_denied (announce was not granted)
+(isolate {:caps {:directory directory-ro}}
+  (perform directory :announce "service:payments"))
+```
+
 ## Features
 
 - **Per-call capability attenuation.** Each cell starts with a typed bundle of capabilities and nothing else. When it spawns a sub-cell, it chooses which capabilities to hand down, narrowed however it likes (with per-method granularity). The runtime enforces the boundary at every call.
