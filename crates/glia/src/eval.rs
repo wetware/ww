@@ -24,7 +24,7 @@ use std::rc::Rc;
 use crate::effect::{self, HandlerStack};
 use crate::error;
 use crate::expr::FnBody;
-use crate::{oneshot, AttenuatedCapInner, FnArity, GliaCapInner, Val, ValMap, make_cap};
+use crate::{make_cap, oneshot, AttenuatedCapInner, FnArity, GliaCapInner, Val, ValMap};
 
 /// Monotonic counter for `gensym`.
 static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1701,7 +1701,9 @@ pub fn eval_expr<'a, D: Dispatch>(
                         )
                     }
                     // (perform cap :method args...) — cap-targeted effect
-                    Val::Cap { .. } => return perform_cap_value(&target_val, &evaled_args, env, dispatch).await,
+                    Val::Cap { .. } => {
+                        return perform_cap_value(&target_val, &evaled_args, env, dispatch).await
+                    }
                     other => {
                         return Err(error::type_mismatch(
                             "perform target",
@@ -2021,7 +2023,10 @@ pub fn eval_expr<'a, D: Dispatch>(
                     let cap = make_cap(
                         name.clone(),
                         schema_cid,
-                        Rc::new(GliaCapInner { methods, descriptor }),
+                        Rc::new(GliaCapInner {
+                            methods,
+                            descriptor,
+                        }),
                     );
                     env.set_root(name, cap.clone());
                     return Ok(cap);
@@ -2060,11 +2065,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                             }
                         }
                         other => {
-                            return Err(error::type_mismatch(
-                                "attenuate first arg",
-                                "cap",
-                                other,
-                            ))
+                            return Err(error::type_mismatch("attenuate first arg", "cap", other))
                         }
                     };
 
@@ -2094,11 +2095,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                     let opts_map = match opts_val {
                         Val::Map(m) => m,
                         other => {
-                            return Err(error::type_mismatch(
-                                "isolate options",
-                                "map",
-                                &other,
-                            ))
+                            return Err(error::type_mismatch("isolate options", "map", &other))
                         }
                     };
                     let caps_val = opts_map
@@ -2107,13 +2104,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                         .unwrap_or_else(|| Val::Map(ValMap::new()));
                     let caps_map = match caps_val {
                         Val::Map(m) => m,
-                        other => {
-                            return Err(error::type_mismatch(
-                                "isolate :caps",
-                                "map",
-                                &other,
-                            ))
-                        }
+                        other => return Err(error::type_mismatch("isolate :caps", "map", &other)),
                     };
 
                     let mut isolate_env = Env::new();
@@ -2424,15 +2415,11 @@ async fn perform_cap_value<'a, D: Dispatch>(
 
         if let Some(glia_cap) = inner.downcast_ref::<GliaCapInner>() {
             let (method, method_args) = cap_method_and_args(&payload, "perform (defcap)")?;
-            let method_val = glia_cap
-                .methods
-                .get(&method)
-                .cloned()
-                .ok_or_else(|| {
-                    error::permission_denied(
-                        &format!("method :{method} is not available on capability '{name}'"),
-                        None,
-                    )
+            let method_val = glia_cap.methods.get(&method).cloned().ok_or_else(|| {
+                error::permission_denied(
+                    &format!("method :{method} is not available on capability '{name}'"),
+                    None,
+                )
             })?;
             return invoke_cap_method_value(method_val, &method_args, env, dispatch).await;
         }
@@ -6119,17 +6106,18 @@ mod tests {
         let d = RecordingDispatch::new();
         let result = eval_str("(isolate {:caps {}} (totally-unknown 1))", &mut env, &d);
         assert!(result.is_err());
-        assert!(err_contains(
-            &result.unwrap_err(),
-            "unavailable in isolate"
-        ));
+        assert!(err_contains(&result.unwrap_err(), "unavailable in isolate"));
     }
 
     #[test]
     fn isolate_import_absent_by_default() {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
-        let result = eval_str("(isolate {:caps {}} (perform import \"core\"))", &mut env, &d);
+        let result = eval_str(
+            "(isolate {:caps {}} (perform import \"core\"))",
+            &mut env,
+            &d,
+        );
         assert!(result.is_err());
     }
 

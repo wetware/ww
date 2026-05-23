@@ -29,10 +29,10 @@ pub mod oneshot;
 pub mod pattern;
 pub mod valmap;
 
-pub use valmap::ValMap;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+pub use valmap::ValMap;
 
 /// Crate version from Cargo.toml (compile-time).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
