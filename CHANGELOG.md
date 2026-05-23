@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Routine cruft cleanup in membrane and shell code paths (no functional behavior change).** Simplified two synchronous membrane tests by dropping unnecessary async wrappers, strengthened membrane construction coverage with an explicit "builder not invoked on construction" assertion, and removed one `unwrap()` plus an internal TODO tail from `ww shell` candidate-selection error handling.
 - **Glia capability authority and isolation primitives landed (pre-alpha breakage accepted).** Capability authority now matches by per-instance `cap_id` (not `schema_cid`), `defcap` creates Glia-native capability servers with introspectable descriptors, `attenuate` enforces method allowlists with nested-intersection semantics, and `isolate` evaluates in a fresh restricted context with explicit cap grants only.
 - **Kernel now treats `import` as a first-class capability and extends cap introspection for dynamic Glia caps.** pid0 binds `import` via the normal capability mediation path, and `schema`/`doc`/`help` resolve runtime metadata from `defcap`/attenuated capability values before falling back to the core schema registry.
 - **CLI wiring cleanup and documentation alignment.** Consolidated daemon restart/remove and Claude MCP availability checks into shared helpers, and aligned runtime/CGI documentation comments with current behavior.
