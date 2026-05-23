@@ -100,6 +100,7 @@ pub fn membrane_client(receiver: watch::Receiver<Epoch>) -> stem_capnp::membrane
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
 
     fn test_epoch(seq: u64) -> Epoch {
         Epoch {
@@ -134,7 +135,7 @@ mod tests {
 
     /// Custom GraftBuilder that records whether build() was called.
     struct RecordingBuilder {
-        called: std::cell::Cell<bool>,
+        called: Rc<std::cell::Cell<bool>>,
     }
 
     impl GraftBuilder for RecordingBuilder {
@@ -151,11 +152,15 @@ mod tests {
     #[test]
     fn membrane_server_constructs_with_custom_graft_builder() {
         let (_tx, rx) = watch::channel(test_epoch(1));
+        let called = Rc::new(std::cell::Cell::new(false));
         let builder = RecordingBuilder {
-            called: std::cell::Cell::new(false),
+            called: Rc::clone(&called),
         };
         let _server = MembraneServer::new(rx, builder);
-        // Construction succeeds — GraftBuilder is stored, not yet invoked.
+        assert!(
+            !called.get(),
+            "graft builder should not run during server construction"
+        );
     }
 
     /// GraftBuilder that always fails.

@@ -431,7 +431,8 @@ fn choose_candidate(
     }
 
     if candidates.len() == 1 {
-        return ensure_candidate_addr(candidates.into_iter().next().unwrap());
+        let mut candidates = candidates;
+        return ensure_candidate_addr(candidates.remove(0));
     }
 
     if let Some(preferred_peer) = preferred {
@@ -456,8 +457,7 @@ fn choose_candidate(
          If this is a script/non-interactive session, pass one of:\n\
          - `ww shell --select <index|peer-id>`\n\
          Use an explicit multiaddr: `ww shell <multiaddr>`\n\
-         Discovered hosts:{listing}\n\
-         TODO tracked in https://github.com/wetware/ww/issues/479"
+         Discovered hosts:{listing}"
     )
 }
 

@@ -59,8 +59,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn epoch_guard_ok_when_seq_matches() {
+    #[test]
+    fn epoch_guard_ok_when_seq_matches() {
         let (_tx, rx) = watch::channel(epoch(1, b"head1", 100));
         let guard = EpochGuard {
             issued_seq: 1,
@@ -69,8 +69,8 @@ mod tests {
         assert!(guard.check().is_ok());
     }
 
-    #[tokio::test]
-    async fn epoch_guard_fails_when_seq_differs() {
+    #[test]
+    fn epoch_guard_fails_when_seq_differs() {
         let (tx, rx) = watch::channel(epoch(1, b"head1", 100));
         let guard = EpochGuard {
             issued_seq: 1,
