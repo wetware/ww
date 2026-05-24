@@ -35,6 +35,7 @@ Here is the capability surface in action, directly in the Wetware shell (Glia):
 - `defcap` defines a capability server in Glia.
 - `attenuate` derives a restricted capability.
 - `isolate` runs with only explicitly granted capabilities.
+- For a deeper explainer on `isolate`, free-variable analysis, and closure capture safety, see [doc/isolate.md](doc/isolate.md).
 
 ```clojure
 ;; Define a local capability server with two methods.
