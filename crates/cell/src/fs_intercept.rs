@@ -285,32 +285,36 @@ impl IpfsFilesystemView<'_> {
         // Materialize to staging directory (local filesystem is our cache).
         // Staging dir is owned by the CacheMode: shared for Shared, per-proc for Isolated.
         let staging_path = cache.staging_dir().join(ipfs_path.cid.to_string());
-        let file_path = if ipfs_path.subpath.is_empty() {
+        let target_path = if ipfs_path.subpath.is_empty() {
             staging_path.clone()
         } else {
             staging_path.join(&ipfs_path.subpath)
         };
 
         // Skip fetch if already staged (disk cache hit)
-        if !file_path.exists() {
-            let bytes = cache.fetch(&ipfs_path.cid).await.map_err(|e| {
-                tracing::warn!(cid = %ipfs_path.cid, err = %e, "IPFS fetch failed");
+        if !target_path.exists() {
+            let fetch_result = if ipfs_path.subpath.is_empty() {
+                cache.fetch(&ipfs_path.cid).await
+            } else {
+                cache.fetch_path(&ipfs_path.cid, &ipfs_path.subpath).await
+            };
+            let bytes = fetch_result.map_err(|e| {
+                tracing::warn!(
+                    cid = %ipfs_path.cid,
+                    subpath = %ipfs_path.subpath,
+                    err = %e,
+                    "IPFS fetch failed"
+                );
                 FsError::from(types::ErrorCode::Io)
             })?;
 
-            if let Some(parent) = file_path.parent() {
+            if let Some(parent) = target_path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
             }
-            std::fs::write(&file_path, &bytes)
+            std::fs::write(&target_path, &bytes)
                 .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
         }
-
-        let target_path = if ipfs_path.subpath.is_empty() {
-            staging_path
-        } else {
-            staging_path.join(&ipfs_path.subpath)
-        };
 
         if !target_path.exists() {
             return Err(types::ErrorCode::NoEntry.into());
@@ -740,6 +744,7 @@ mod tests {
 
     struct MockPinner {
         data: HashMap<cid::Cid, Vec<u8>>,
+        path_data: HashMap<String, Vec<u8>>,
     }
 
     #[async_trait::async_trait]
@@ -756,6 +761,16 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("CID not found in mock"))
         }
+        async fn fetch_path(&self, cid: &cid::Cid, subpath: &str) -> anyhow::Result<Vec<u8>> {
+            if subpath.is_empty() {
+                return self.fetch(cid).await;
+            }
+            let key = format!("{cid}/{subpath}");
+            self.path_data
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("CID subpath not found in mock: {key}"))
+        }
         async fn size(&self, cid: &cid::Cid) -> anyhow::Result<u64> {
             self.data
                 .get(cid)
@@ -770,7 +785,28 @@ mod tests {
         let cid: cid::Cid = cid_str.parse().unwrap();
         let mut data = HashMap::new();
         data.insert(cid, content.to_vec());
-        (cid, Arc::new(MockPinner { data }))
+        (
+            cid,
+            Arc::new(MockPinner {
+                data,
+                path_data: HashMap::new(),
+            }),
+        )
+    }
+
+    /// Helper: construct a test CID + mock pinner where subpath bytes differ
+    /// from the root CID bytes.
+    fn test_cid_and_pinner_with_subpath(
+        root_content: &[u8],
+        subpath: &str,
+        subpath_content: &[u8],
+    ) -> (cid::Cid, Arc<MockPinner>) {
+        let (cid, _) = test_cid_and_pinner(root_content);
+        let mut data = HashMap::new();
+        data.insert(cid, root_content.to_vec());
+        let mut path_data = HashMap::new();
+        path_data.insert(format!("{cid}/{subpath}"), subpath_content.to_vec());
+        (cid, Arc::new(MockPinner { data, path_data }))
     }
 
     /// Helper: build the view for testing open_ipfs.
@@ -894,6 +930,7 @@ mod tests {
         // Pinner has no data for the CID we'll request
         let pinner = Arc::new(MockPinner {
             data: HashMap::new(),
+            path_data: HashMap::new(),
         });
         let isolated = cache::IsolatedPinset::new(pinner).unwrap();
         let mut harness = TestHarness::new(Some(cache::CacheMode::Isolated(isolated)));
@@ -952,8 +989,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_ipfs_with_subpath() {
-        let content = b"nested file content";
-        let (cid, pinner) = test_cid_and_pinner(content);
+        // Root CID bytes and subpath bytes intentionally differ.
+        // Regression: open_ipfs must fetch /ipfs/<cid>/<subpath>, not /ipfs/<cid>.
+        let root_bytes = b"root cid blob bytes";
+        let nested_bytes = b"nested file content";
+        let (cid, pinner) =
+            test_cid_and_pinner_with_subpath(root_bytes, "sub/dir/file.txt", nested_bytes);
 
         let isolated = cache::IsolatedPinset::new(pinner).unwrap();
         let mut harness = TestHarness::new(Some(cache::CacheMode::Isolated(isolated)));
@@ -983,7 +1024,7 @@ mod tests {
             .join(cid.to_string())
             .join("sub/dir/file.txt");
         assert!(nested_file.exists(), "nested staging file should exist");
-        assert_eq!(std::fs::read(&nested_file).unwrap(), content);
+        assert_eq!(std::fs::read(&nested_file).unwrap(), nested_bytes);
     }
 
     #[tokio::test]
