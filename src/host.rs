@@ -1185,7 +1185,6 @@ impl WasmtimeHost {
         // No epoch_interruption here — WasmtimeHost is used by integration
         // tests, not by the ExecutorPool which has its own Engine + tick task.
         let mut config = WasmConfig::new();
-        config.async_support(true);
         config.consume_fuel(true);
         let engine = Engine::new(&config)?;
         Ok(Self {

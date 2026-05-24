@@ -486,10 +486,7 @@ impl Proc {
         let stdout_stream = AsyncStdoutStream::new(BUFFER_SIZE, stdout);
         let stderr_stream = AsyncStdoutStream::new(BUFFER_SIZE, stderr);
 
-        // Build a Wasmtime engine with three settings for cooperative scheduling:
-        //   async_support      — fuel exhaustion yields (Poll::Pending) instead
-        //                        of trapping, so the Tokio LocalSet can run
-        //                        other cells.
+        // Build a Wasmtime engine with two settings for cooperative scheduling:
         //   consume_fuel       — enables instruction counting; without this,
         //                        fuel methods are no-ops and the estimator is
         //                        inert.
@@ -501,7 +498,6 @@ impl Proc {
             engine
         } else {
             let mut wasm_config = WasmConfig::new();
-            wasm_config.async_support(true);
             wasm_config.consume_fuel(true);
             wasm_config.epoch_interruption(true);
             Arc::new(Engine::new(&wasm_config)?)

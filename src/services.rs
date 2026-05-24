@@ -186,7 +186,6 @@ impl ExecutorPool {
         // all workers share this Engine so Engine::increment_epoch() reaches
         // every Store's epoch_deadline_callback.
         let mut wasm_config = wasmtime::Config::new();
-        wasm_config.async_support(true);
         wasm_config.consume_fuel(true);
         wasm_config.epoch_interruption(true);
         let engine = Arc::new(
