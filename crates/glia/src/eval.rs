@@ -39,11 +39,9 @@ static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// `pop_frame` create and destroy child scopes (used by future `let` / `fn`
 /// special forms).
 ///
-/// The `handler_stack` is dynamic scope for the effect system. It is stored
-/// as `Rc<RefCell<...>>` so that clones (including closures via `snapshot()`)
-/// share the SAME handler stack. This means `perform` always sees the live
-/// handler stack of the current eval session, regardless of where the calling
-/// closure was defined.
+/// The `handler_stack` is dynamic scope for the effect system.
+/// Closures and macros use the caller's handler stack at invocation time,
+/// not the handler stack captured at definition time.
 #[derive(Debug, Clone)]
 pub struct Env {
     frames: Vec<Frame>,
@@ -134,7 +132,9 @@ impl Env {
                 merged.insert(k.clone(), v.clone());
             }
         }
-        merged.into_iter().collect()
+        let mut bindings: Vec<(String, Val)> = merged.into_iter().collect();
+        bindings.sort_by(|(left, _), (right, _)| left.cmp(right));
+        bindings
     }
 
     /// Returns a new Env with one frame containing all visible bindings.
@@ -148,8 +148,24 @@ impl Env {
         }
         Self {
             frames: vec![merged],
-            // Share the same handler stack — dynamic scope, not lexical.
-            // Closures see the handler stack of their call site.
+            // Keep the current stack on snapshots; invocation still routes through
+            // the caller's handler stack via `Env::for_call`.
+            handler_stack: self.handler_stack.clone(),
+        }
+    }
+
+    /// Return a snapshot filtered to a set of binding names.
+    ///
+    /// Names not present in this env are ignored.
+    pub fn filter_to(&self, names: BTreeSet<&String>) -> Self {
+        let mut filtered = Frame::new();
+        for name in names {
+            if let Some(value) = self.get(name) {
+                filtered.insert(name.clone(), value.clone());
+            }
+        }
+        Self {
+            frames: vec![filtered],
             handler_stack: self.handler_stack.clone(),
         }
     }
@@ -160,7 +176,7 @@ impl Env {
     /// closures capture their own scope), this creates a new Env that COPIES
     /// only the captured snapshot's single frame (no deep clone of Val::Fn envs).
     /// The captured frame's Val::Fn values keep their Rc<Env> references shared.
-    pub fn for_call(captured: &Rc<Env>) -> Self {
+    pub fn for_call(captured: &Rc<Env>, caller_hs: &HandlerStack) -> Self {
         // The captured env is a snapshot (single frame).
         // Copy its bindings into a new env's root frame.
         // Val::Fn values inside are Rc-wrapped, so cloning them is O(1).
@@ -172,7 +188,7 @@ impl Env {
         }
         Self {
             frames: vec![root, Frame::new()], // root + param frame
-            handler_stack: captured.handler_stack.clone(),
+            handler_stack: caller_hs.clone(),
         }
     }
 }
@@ -241,6 +257,39 @@ fn parse_allow_methods(value: &Val) -> Result<BTreeSet<String>, Val> {
         }
     }
     Ok(allow)
+}
+
+fn is_authority_free(value: &Val) -> bool {
+    match value {
+        Val::Nil
+        | Val::Bool(_)
+        | Val::Int(_)
+        | Val::Float(_)
+        | Val::Str(_)
+        | Val::Sym(_)
+        | Val::Keyword(_)
+        | Val::Bytes(_) => true,
+        Val::List(items) | Val::Vector(items) | Val::Set(items) => {
+            items.iter().all(is_authority_free)
+        }
+        Val::Map(m) => m
+            .iter()
+            .all(|(k, v)| is_authority_free(k) && is_authority_free(v)),
+        Val::Fn { is_cap_free, .. } | Val::Macro { is_cap_free, .. } => *is_cap_free,
+        Val::Cell { .. } | Val::NativeFn { .. } | Val::AsyncNativeFn { .. } | Val::Cap { .. } => {
+            false
+        }
+        Val::Recur(_) | Val::Effect { .. } | Val::Resume(_) => false,
+    }
+}
+
+fn compute_cap_status(env: &Env) -> (bool, Option<String>) {
+    for (name, value) in env.bindings() {
+        if !is_authority_free(&value) {
+            return (false, Some(name));
+        }
+    }
+    (true, None)
 }
 
 /// Evaluate a function/macro body, dispatching on `FnBody` variant.
@@ -495,9 +544,16 @@ fn eval_fn(args: &[Val], env: &Env) -> Result<Val, Val> {
         }
     };
 
+    // Raw fn path: no FnArityExpr, no free-vars data. Keep full snapshot;
+    // is_cap_free check below still works correctly because it walks all bindings.
+    // Slim closures only apply to the analyzed pipeline (expr::Expr::Fn).
+    let captured_env = Rc::new(env.snapshot());
+    let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
     Ok(Val::Fn {
         arities,
-        env: Rc::new(env.snapshot()),
+        env: captured_env,
+        is_cap_free,
+        cap_violation,
     })
 }
 
@@ -507,6 +563,7 @@ async fn invoke_fn<'a, D: Dispatch>(
     captured_env: &'a Rc<Env>,
     args: &[Val],
     dispatch: &'a D,
+    caller_hs: HandlerStack,
 ) -> Result<Val, Val> {
     // Find matching arity: prefer exact fixed-arity match over variadic.
     // This ensures (fn ([x y] ...) ([x & rest] ...)) called with 2 args
@@ -536,7 +593,7 @@ async fn invoke_fn<'a, D: Dispatch>(
     // Build fn environment: captured env + new frame with param bindings.
     // Uses Env::for_call to avoid infinite recursion from Env::clone when
     // closures capture their own scope.
-    let mut fn_env = Env::for_call(captured_env);
+    let mut fn_env = Env::for_call(captured_env, &caller_hs);
 
     // Bind positional params
     for (name, val) in arity.params.iter().zip(args.iter()) {
@@ -601,68 +658,7 @@ async fn invoke_fn_with_handler_stack<'a, D: Dispatch>(
     dispatch: &'a D,
     handler_stack: HandlerStack,
 ) -> Result<Val, Val> {
-    let arity = arities
-        .iter()
-        .find(|a| a.variadic.is_none() && args.len() == a.params.len())
-        .or_else(|| {
-            arities
-                .iter()
-                .find(|a| a.variadic.is_some() && args.len() >= a.params.len())
-        })
-        .ok_or_else(|| {
-            let expected: Vec<String> = arities
-                .iter()
-                .map(|a| {
-                    if a.variadic.is_some() {
-                        format!("{}+", a.params.len())
-                    } else {
-                        a.params.len().to_string()
-                    }
-                })
-                .collect();
-            error::arity("fn", &expected.join(" or "), args.len())
-        })?;
-
-    let mut fn_env = Env::for_call(captured_env);
-    fn_env.handler_stack = handler_stack;
-
-    for (name, val) in arity.params.iter().zip(args.iter()) {
-        fn_env.set(name.clone(), val.clone());
-    }
-    if let Some(rest_name) = &arity.variadic {
-        let rest_args: Vec<Val> = args[arity.params.len()..].to_vec();
-        fn_env.set(rest_name.clone(), Val::List(rest_args));
-    }
-
-    let recur_arity = arity.params.len() + usize::from(arity.variadic.is_some());
-    let result = async {
-        loop {
-            let result = eval_fn_body(&arity.body, &mut fn_env, dispatch).await?;
-            match result {
-                Val::Recur(new_vals) => {
-                    if new_vals.len() != recur_arity {
-                        return Err(error::arity(
-                            "recur",
-                            &recur_arity.to_string(),
-                            new_vals.len(),
-                        ));
-                    }
-                    for (name, val) in arity.params.iter().zip(new_vals.iter()) {
-                        fn_env.set(name.clone(), val.clone());
-                    }
-                    if let Some(rest_name) = &arity.variadic {
-                        let rest_val = new_vals[arity.params.len()].clone();
-                        fn_env.set(rest_name.clone(), rest_val);
-                    }
-                }
-                other => return Ok(other),
-            }
-        }
-    }
-    .await;
-
-    fn_env.pop_frame();
-    result
+    invoke_fn(arities, captured_env, args, dispatch, handler_stack).await
 }
 
 /// Parse macro/fn arity definitions from raw Val args.
@@ -748,9 +744,16 @@ async fn eval_defmacro(args: &[Val], env: &mut Env) -> Result<Val, Val> {
         return Err(error::arity("defmacro", "at least 2", 1));
     }
     let arities = parse_macro_arities(fn_args)?;
+    // Raw macro path: no FnArityExpr, no free-vars data. Keep full snapshot;
+    // is_cap_free check below still works correctly because it walks all bindings.
+    // Slim closures only apply to the analyzed pipeline (expr::Expr::Fn).
+    let captured_env = Rc::new(env.snapshot());
+    let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
     let val = Val::Macro {
         arities,
-        env: Rc::new(env.snapshot()),
+        env: captured_env,
+        is_cap_free,
+        cap_violation,
     };
     env.set_root(name, val.clone());
     Ok(val)
@@ -761,9 +764,10 @@ async fn eval_defmacro(args: &[Val], env: &mut Env) -> Result<Val, Val> {
 /// that the caller will re-evaluate in their own env.
 async fn invoke_macro<'a, D: Dispatch>(
     arities: &'a [FnArity],
-    captured_env: &'a Env,
+    captured_env: &'a Rc<Env>,
     raw_args: &[Val],
     dispatch: &'a D,
+    caller_hs: HandlerStack,
 ) -> Result<Val, Val> {
     // Find matching arity (same logic as invoke_fn)
     let arity = arities
@@ -789,8 +793,7 @@ async fn invoke_macro<'a, D: Dispatch>(
         })?;
 
     // Build macro environment: captured env + new frame with raw arg bindings
-    let mut macro_env = captured_env.clone();
-    macro_env.push_frame();
+    let mut macro_env = Env::for_call(captured_env, &caller_hs);
 
     // Bind positional params to RAW (unevaluated) args
     for (name, val) in arity.params.iter().zip(raw_args.iter()) {
@@ -908,7 +911,7 @@ async fn eval_recur<'a, D: Dispatch>(
 async fn eval_hof<'a, D: Dispatch>(
     name: &str,
     args: &[Val],
-    _env: &'a mut Env,
+    env: &'a mut Env,
     dispatch: &'a D,
 ) -> Result<Val, Val> {
     match name {
@@ -925,6 +928,7 @@ async fn eval_hof<'a, D: Dispatch>(
                     &captured_env,
                     std::slice::from_ref(item),
                     dispatch,
+                    env.handler_stack.clone(),
                 )
                 .await?;
                 result.push(val);
@@ -944,6 +948,7 @@ async fn eval_hof<'a, D: Dispatch>(
                     &captured_env,
                     std::slice::from_ref(item),
                     dispatch,
+                    env.handler_stack.clone(),
                 )
                 .await?;
                 let keep = !matches!(val, Val::Nil | Val::Bool(false));
@@ -972,7 +977,14 @@ async fn eval_hof<'a, D: Dispatch>(
                 (items[0].clone(), &items[1..])
             };
             for item in items {
-                acc = invoke_fn(&arities, &captured_env, &[acc, item.clone()], dispatch).await?;
+                acc = invoke_fn(
+                    &arities,
+                    &captured_env,
+                    &[acc, item.clone()],
+                    dispatch,
+                    env.handler_stack.clone(),
+                )
+                .await?;
             }
             Ok(acc)
         }
@@ -986,6 +998,7 @@ fn extract_fn(caller: &str, val: &Val) -> Result<(Vec<FnArity>, Rc<Env>), Val> {
         Val::Fn {
             arities,
             env: captured_env,
+            ..
         } => Ok((arities.clone(), captured_env.clone())),
         other => Err(error::type_mismatch(caller, "function", other)),
     }
@@ -1589,6 +1602,12 @@ pub fn eval_expr<'a, D: Dispatch>(
 
             Expr::Fn { arities } => {
                 // Convert FnArityExpr → FnArity with FnBody::Analyzed
+                let free_vars: BTreeSet<&String> = arities
+                    .iter()
+                    .flat_map(|arity| arity.free_vars.iter())
+                    .collect();
+                let captured_env = env.filter_to(free_vars);
+                let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
                 let fn_arities: Vec<FnArity> = arities
                     .iter()
                     .map(|a| FnArity {
@@ -1599,7 +1618,9 @@ pub fn eval_expr<'a, D: Dispatch>(
                     .collect();
                 Ok(Val::Fn {
                     arities: fn_arities,
-                    env: Rc::new(env.snapshot()),
+                    env: Rc::new(captured_env),
+                    is_cap_free,
+                    cap_violation,
                 })
             }
 
@@ -1774,6 +1795,7 @@ pub fn eval_expr<'a, D: Dispatch>(
 
                 // Depth check.
                 let hs = env.handler_stack.clone();
+                let caller_hs = hs.clone();
                 if hs.borrow().len() >= effect::MAX_HANDLER_DEPTH {
                     return Err(error::internal(
                         "with-effect-handler",
@@ -1825,6 +1847,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                                                     Val::Fn {
                                                         arities,
                                                         env: captured_env,
+                                                        ..
                                                     } => {
                                                         // Pop before handle (handler's performs go to outer handlers).
                                                         hs.borrow_mut().pop();
@@ -1848,24 +1871,28 @@ pub fn eval_expr<'a, D: Dispatch>(
                                                             let resume_fn =
                                                                 effect::make_resume_fn(resume_tx);
                                                             let args = vec![data, resume_fn];
+                                                            let handler_hs = caller_hs.clone();
                                                             Box::pin(async move {
                                                                 invoke_fn(
                                                                     &owned_arities,
                                                                     &owned_env,
                                                                     &args,
                                                                     dispatch,
+                                                                    handler_hs,
                                                                 )
                                                                 .await
                                                             })
                                                         } else {
                                                             drop(resume_tx);
                                                             let args = vec![data];
+                                                            let handler_hs = caller_hs.clone();
                                                             Box::pin(async move {
                                                                 invoke_fn(
                                                                     &owned_arities,
                                                                     &owned_env,
                                                                     &args,
                                                                     dispatch,
+                                                                    handler_hs,
                                                                 )
                                                                 .await
                                                             })
@@ -1960,9 +1987,13 @@ pub fn eval_expr<'a, D: Dispatch>(
             Expr::DefMacro { name, raw_args } => {
                 // raw_args contains [params, body...] — no name (already extracted).
                 let arities = parse_macro_arities(raw_args)?;
+                let captured_env = Rc::new(env.snapshot());
+                let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
                 let val = Val::Macro {
                     arities,
-                    env: Rc::new(env.snapshot()),
+                    env: captured_env,
+                    is_cap_free,
+                    cap_violation,
                 };
                 env.set_root(name.clone(), val.clone());
                 Ok(val)
@@ -2085,49 +2116,167 @@ pub fn eval_expr<'a, D: Dispatch>(
                     ));
                 }
 
-                // Special form: (isolate {:caps {:x cap ...}} body...)
+                // Special form: (isolate {:env {:x (cap value) :y (data value)}} body...)
                 if head == "isolate" {
                     if raw_args.is_empty() {
                         return Err(error::arity("isolate", "at least 1", 0));
                     }
-                    let opts_expr = expr::analyze(&raw_args[0])?;
-                    let opts_val = eval_expr(&opts_expr, env, dispatch).await?;
-                    let opts_map = match opts_val {
-                        Val::Map(m) => m,
+                    let opts_map = match &raw_args[0] {
+                        Val::Map(m) => m.clone(),
                         other => {
-                            return Err(error::type_mismatch("isolate options", "map", &other))
+                            return Err(error::type_mismatch(
+                                "isolate options",
+                                "map literal",
+                                other,
+                            ))
                         }
                     };
-                    let caps_val = opts_map
-                        .get(&Val::Keyword("caps".into()))
-                        .cloned()
-                        .unwrap_or_else(|| Val::Map(ValMap::new()));
-                    let caps_map = match caps_val {
+                    if opts_map.get(&Val::Keyword("caps".into())).is_some() {
+                        return Err(error::internal(
+                            "isolate",
+                            ":caps removed; use :env with (cap ...) entries",
+                        ));
+                    }
+                    let env_val = opts_map.get(&Val::Keyword("env".into())).ok_or_else(|| {
+                        error::internal("isolate", "missing required :env option")
+                    })?;
+                    let env_map = match env_val {
                         Val::Map(m) => m,
-                        other => return Err(error::type_mismatch("isolate :caps", "map", &other)),
+                        other => return Err(error::type_mismatch("isolate :env", "map", other)),
                     };
+
+                    for (opt_key, _) in opts_map.iter() {
+                        match opt_key {
+                            Val::Keyword(k) if k == "env" => {}
+                            Val::Keyword(k) => {
+                                return Err(error::internal(
+                                    "isolate",
+                                    format!("unknown option :{k}; expected only :env"),
+                                ))
+                            }
+                            other => {
+                                return Err(error::type_mismatch(
+                                    "isolate option key",
+                                    "keyword",
+                                    other,
+                                ))
+                            }
+                        }
+                    }
 
                     let mut isolate_env = Env::new();
                     let mut handler_targets: Vec<String> = Vec::new();
-                    for (k, v) in caps_map.iter() {
+                    for (k, v) in env_map.iter() {
                         let sym = match k {
                             Val::Keyword(s) | Val::Sym(s) => s.clone(),
                             other => {
                                 return Err(error::type_mismatch(
-                                    "isolate cap name",
+                                    "isolate env name",
                                     "keyword or symbol",
                                     other,
                                 ))
                             }
                         };
-                        if !matches!(v, Val::Cap { .. }) {
-                            return Err(error::type_mismatch("isolate cap value", "cap", v));
+
+                        let wrapped = match v {
+                            Val::List(items) if !items.is_empty() => items,
+                            other => {
+                                return Err(error::internal(
+                                    "isolate env entry",
+                                    format!(
+                                        "{sym}: expected (cap <expr>) or (data <expr>), got {other}"
+                                    ),
+                                ))
+                            }
+                        };
+                        let wrapper = match &wrapped[0] {
+                            Val::Sym(s) => s.as_str(),
+                            other => {
+                                return Err(error::type_mismatch(
+                                    "isolate env wrapper",
+                                    "symbol",
+                                    other,
+                                ))
+                            }
+                        };
+                        if wrapped.len() != 2 {
+                            return match wrapper {
+                                "cap" => {
+                                    Err(error::arity("isolate cap wrapper", "1", wrapped.len() - 1))
+                                }
+                                "data" => Err(error::arity(
+                                    "isolate data wrapper",
+                                    "1",
+                                    wrapped.len() - 1,
+                                )),
+                                _ => Err(error::internal(
+                                    "isolate env entry",
+                                    format!("{sym}: unknown wrapper {wrapper}; use cap or data"),
+                                )),
+                            };
                         }
-                        isolate_env.set(sym.clone(), v.clone());
-                        let handler_name = format!("{sym}-handler");
-                        if let Some(handler) = env.get(&handler_name) {
-                            isolate_env.set(handler_name, handler.clone());
-                            handler_targets.push(sym);
+
+                        let value_expr = expr::analyze(&wrapped[1])?;
+                        let value = eval_expr(&value_expr, env, dispatch).await?;
+                        match wrapper {
+                            "cap" => {
+                                if !matches!(value, Val::Cap { .. }) {
+                                    return Err(error::type_mismatch(
+                                        "isolate cap value",
+                                        "cap",
+                                        &value,
+                                    ));
+                                }
+                                isolate_env.set(sym.clone(), value.clone());
+                                let handler_name = format!("{sym}-handler");
+                                if let Some(handler) = env.get(&handler_name) {
+                                    isolate_env.set(handler_name, handler.clone());
+                                    handler_targets.push(sym);
+                                }
+                            }
+                            "data" => {
+                                match &value {
+                                    Val::Fn {
+                                        is_cap_free: false,
+                                        cap_violation: Some(name),
+                                        ..
+                                    } => {
+                                        return Err(error::internal(
+                                            "isolate data value",
+                                            format!(
+                                                "function carries capability authority via captured '{name}'"
+                                            ),
+                                        ));
+                                    }
+                                    Val::Macro {
+                                        is_cap_free: false,
+                                        cap_violation: Some(name),
+                                        ..
+                                    } => {
+                                        return Err(error::internal(
+                                            "isolate data value",
+                                            format!(
+                                                "macro carries capability authority via captured '{name}'"
+                                            ),
+                                        ));
+                                    }
+                                    other if !is_authority_free(other) => {
+                                        return Err(error::type_mismatch(
+                                            "isolate data value",
+                                            "pure data",
+                                            other,
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                                isolate_env.set(sym, value);
+                            }
+                            _ => {
+                                return Err(error::internal(
+                                    "isolate env entry",
+                                    format!("{sym}: unknown wrapper {wrapper}; use cap or data"),
+                                ))
+                            }
                         }
                     }
 
@@ -2162,12 +2311,19 @@ pub fn eval_expr<'a, D: Dispatch>(
                 if let Some(Val::Macro {
                     arities,
                     env: captured_env,
+                    ..
                 }) = env.get(head)
                 {
                     let arities = arities.clone();
                     let captured_env = captured_env.clone();
-                    let expanded =
-                        invoke_macro(&arities, &captured_env, raw_args, dispatch).await?;
+                    let expanded = invoke_macro(
+                        &arities,
+                        &captured_env,
+                        raw_args,
+                        dispatch,
+                        env.handler_stack.clone(),
+                    )
+                    .await?;
                     // Re-analyze and eval the expanded form
                     let analyzed = expr::analyze(&expanded)?;
                     return eval_expr(&analyzed, env, dispatch).await;
@@ -2177,12 +2333,20 @@ pub fn eval_expr<'a, D: Dispatch>(
                 if let Some(Val::Fn {
                     arities,
                     env: captured_env,
+                    ..
                 }) = env.get(head)
                 {
                     let arities = arities.clone();
                     let captured_env = captured_env.clone();
                     let evaled_args = eval_expr_args(args, env, dispatch).await?;
-                    return invoke_fn(&arities, &captured_env, &evaled_args, dispatch).await;
+                    return invoke_fn(
+                        &arities,
+                        &captured_env,
+                        &evaled_args,
+                        dispatch,
+                        env.handler_stack.clone(),
+                    )
+                    .await;
                 }
                 if let Some(Val::NativeFn { func, .. }) = env.get(head) {
                     let func = func.clone();
@@ -2268,11 +2432,19 @@ pub fn eval_expr<'a, D: Dispatch>(
                         if let Some(Val::Fn {
                             arities,
                             env: captured_env,
+                            ..
                         }) = env.get(fname)
                         {
                             let arities = arities.clone();
                             let captured_env = captured_env.clone();
-                            return invoke_fn(&arities, &captured_env, &spread, dispatch).await;
+                            return invoke_fn(
+                                &arities,
+                                &captured_env,
+                                &spread,
+                                dispatch,
+                                env.handler_stack.clone(),
+                            )
+                            .await;
                         }
                         if let Some(Val::NativeFn { func, .. }) = env.get(fname) {
                             return func.clone()(&spread);
@@ -2288,10 +2460,18 @@ pub fn eval_expr<'a, D: Dispatch>(
                     Val::Fn {
                         arities,
                         env: captured_env,
+                        ..
                     } => {
                         let arities = arities.clone();
                         let captured_env = captured_env.clone();
-                        invoke_fn(&arities, &captured_env, &spread, dispatch).await
+                        invoke_fn(
+                            &arities,
+                            &captured_env,
+                            &spread,
+                            dispatch,
+                            env.handler_stack.clone(),
+                        )
+                        .await
                     }
                     Val::NativeFn { func, .. } => func(&spread),
                     Val::AsyncNativeFn { func, .. } => func(spread).await,
@@ -2365,6 +2545,7 @@ async fn invoke_cap_method_value<'a, D: Dispatch>(
         Val::Fn {
             arities,
             env: captured_env,
+            ..
         } => {
             invoke_fn_with_handler_stack(
                 &arities,
@@ -2549,13 +2730,20 @@ pub fn eval<'a, D: Dispatch>(
                 if let Some(Val::Macro {
                     arities,
                     env: captured_env,
+                    ..
                 }) = env.get(head)
                 {
                     let arities = arities.clone();
                     let captured_env = captured_env.clone();
                     // Macro receives RAW (unevaluated) args, body runs in captured env
-                    let expanded =
-                        invoke_macro(&arities, &captured_env, raw_args, dispatch).await?;
+                    let expanded = invoke_macro(
+                        &arities,
+                        &captured_env,
+                        raw_args,
+                        dispatch,
+                        env.handler_stack.clone(),
+                    )
+                    .await?;
                     // Re-evaluate the expanded form in the CALLER's env
                     return eval(&expanded, env, dispatch).await;
                 }
@@ -2564,12 +2752,20 @@ pub fn eval<'a, D: Dispatch>(
                 if let Some(Val::Fn {
                     arities,
                     env: captured_env,
+                    ..
                 }) = env.get(head)
                 {
                     let arities = arities.clone();
                     let captured_env = captured_env.clone();
                     let args = eval_args(raw_args, env, dispatch).await?;
-                    return invoke_fn(&arities, &captured_env, &args, dispatch).await;
+                    return invoke_fn(
+                        &arities,
+                        &captured_env,
+                        &args,
+                        dispatch,
+                        env.handler_stack.clone(),
+                    )
+                    .await;
                 }
 
                 // --- Built-in: apply (needs re-dispatch, so handled here) ---
@@ -2602,11 +2798,19 @@ pub fn eval<'a, D: Dispatch>(
                             if let Some(Val::Fn {
                                 arities,
                                 env: captured_env,
+                                ..
                             }) = env.get(fname)
                             {
                                 let arities = arities.clone();
                                 let captured_env = captured_env.clone();
-                                return invoke_fn(&arities, &captured_env, &spread, dispatch).await;
+                                return invoke_fn(
+                                    &arities,
+                                    &captured_env,
+                                    &spread,
+                                    dispatch,
+                                    env.handler_stack.clone(),
+                                )
+                                .await;
                             }
                             if let Some(result) = eval_builtin(fname, &spread) {
                                 return result;
@@ -2616,10 +2820,18 @@ pub fn eval<'a, D: Dispatch>(
                         Val::Fn {
                             arities,
                             env: captured_env,
+                            ..
                         } => {
                             let arities = arities.clone();
                             let captured_env = captured_env.clone();
-                            return invoke_fn(&arities, &captured_env, &spread, dispatch).await;
+                            return invoke_fn(
+                                &arities,
+                                &captured_env,
+                                &spread,
+                                dispatch,
+                                env.handler_stack.clone(),
+                            )
+                            .await;
                         }
                         other => {
                             return Err(error::type_mismatch(
@@ -3454,6 +3666,389 @@ mod tests {
         // (f) → 10, not 20 (captured at definition time)
         let call = Val::List(vec![Val::Sym("f".into())]);
         assert_eq!(eval_blocking(&call, &mut env, &d), Ok(Val::Int(10)));
+    }
+
+    #[test]
+    fn fn_closure_empty_free_vars_captures_nothing() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+
+        let closure = eval_str("(fn [] 1)", &mut env, &d).unwrap();
+        let Val::Fn {
+            env: captured_env, ..
+        } = closure
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(captured_env.bindings().len(), 0);
+    }
+
+    #[test]
+    fn fn_closure_single_capture_is_slim() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("x".into(), Val::Int(7));
+        env.set("y".into(), Val::Int(9));
+
+        let closure = eval_str("(fn [] x)", &mut env, &d).unwrap();
+        let Val::Fn {
+            env: captured_env, ..
+        } = closure
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(captured_env.bindings().len(), 1);
+        assert_eq!(captured_env.get("x"), Some(&Val::Int(7)));
+        assert!(captured_env.get("y").is_none());
+    }
+
+    #[test]
+    fn fn_closure_multi_arity_union_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("x".into(), Val::Int(1));
+        env.set("y".into(), Val::Int(2));
+        env.set("z".into(), Val::Int(3));
+
+        let closure = eval_str("(fn ([a] x) ([a b] y))", &mut env, &d).unwrap();
+        let Val::Fn {
+            env: captured_env, ..
+        } = closure
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(captured_env.bindings().len(), 2);
+        assert_eq!(captured_env.get("x"), Some(&Val::Int(1)));
+        assert_eq!(captured_env.get("y"), Some(&Val::Int(2)));
+        assert!(captured_env.get("z").is_none());
+    }
+
+    #[test]
+    fn fn_closure_over_closure_still_works_with_slim_env() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let inner = eval_str("(let [x 42 outer (fn [] (fn [] x))] (outer))", &mut env, &d).unwrap();
+        let Val::Fn {
+            env: captured_env, ..
+        } = &inner
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(captured_env.bindings().len(), 1);
+        assert_eq!(captured_env.get("x"), Some(&Val::Int(42)));
+        env.set("inner".into(), inner);
+        assert_eq!(
+            eval_str("(inner)", &mut env, &d),
+            Ok(Val::Int(42)),
+            "nested closure should remain functional"
+        );
+    }
+
+    #[test]
+    fn fn_closure_identity_preservation_with_slim_envs() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+
+        let f = eval_str("(fn [] 1)", &mut env, &d).unwrap();
+        let f_clone = f.clone();
+        let g = eval_str("(fn [] 1)", &mut env, &d).unwrap();
+
+        assert_eq!(f, f_clone, "cloned closure should preserve Rc identity");
+        assert_ne!(f, g, "separate evaluations should produce distinct Rc envs");
+    }
+
+    #[test]
+    fn raw_fn_path_keeps_full_snapshot() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("x".into(), Val::Int(1));
+        env.set("y".into(), Val::Int(2));
+
+        let raw = Val::List(vec![
+            Val::Sym("fn".into()),
+            Val::Vector(vec![]),
+            Val::Sym("x".into()),
+        ]);
+        let closure = pollster_eval(eval(&raw, &mut env, &d)).unwrap();
+        let Val::Fn {
+            env: captured_env, ..
+        } = closure
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(captured_env.get("x"), Some(&Val::Int(1)));
+        assert_eq!(captured_env.get("y"), Some(&Val::Int(2)));
+    }
+
+    fn fn_cap_status(value: Val) -> (bool, Option<String>) {
+        let Val::Fn {
+            is_cap_free,
+            cap_violation,
+            ..
+        } = value
+        else {
+            panic!("expected fn value");
+        };
+        (is_cap_free, cap_violation)
+    }
+
+    fn macro_cap_status(value: Val) -> (bool, Option<String>) {
+        let Val::Macro {
+            is_cap_free,
+            cap_violation,
+            ..
+        } = value
+        else {
+            panic!("expected macro value");
+        };
+        (is_cap_free, cap_violation)
+    }
+
+    #[test]
+    fn fn_cap_status_no_captures() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let status = fn_cap_status(eval_str("(fn [] 1)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn fn_cap_status_int_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("x".into(), Val::Int(1));
+        let status = fn_cap_status(eval_str("(fn [] x)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn fn_cap_status_cap_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        let status = fn_cap_status(eval_str("(fn [] db)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("db".into())));
+    }
+
+    #[test]
+    fn fn_cap_status_cell_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set(
+            "c".into(),
+            Val::Cell {
+                wasm: vec![],
+                schema: None,
+                caps: vec![],
+            },
+        );
+        let status = fn_cap_status(eval_str("(fn [] c)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("c".into())));
+    }
+
+    #[test]
+    fn fn_cap_status_native_fn_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set(
+            "n".into(),
+            Val::NativeFn {
+                name: "n".into(),
+                func: Rc::new(|_| Ok(Val::Nil)),
+            },
+        );
+        let status = fn_cap_status(eval_str("(fn [] n)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("n".into())));
+    }
+
+    #[test]
+    fn fn_cap_status_capture_cap_free_fn() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let helper = eval_str("(fn [] 1)", &mut env, &d).unwrap();
+        env.set("helper".into(), helper);
+        let status = fn_cap_status(eval_str("(fn [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn fn_cap_status_capture_cap_bearing_fn() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        let helper = eval_str("(fn [] db)", &mut env, &d).unwrap();
+        env.set("helper".into(), helper);
+        let status = fn_cap_status(eval_str("(fn [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("helper".into())));
+    }
+
+    #[test]
+    fn fn_cap_status_capture_cap_free_macro() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(defmacro m [] 42)", &mut env, &d).unwrap();
+        let status = fn_cap_status(eval_str("(fn [] m)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn fn_cap_status_capture_cap_bearing_macro() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        eval_str("(defmacro m [] db)", &mut env, &d).unwrap();
+        let status = fn_cap_status(eval_str("(fn [] m)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("m".into())));
+    }
+
+    #[test]
+    fn fn_cap_violation_is_deterministic_by_binding_name() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("z_cap".into(), make_cap("z", "cid:z", Rc::new(())));
+        env.set("a_cap".into(), make_cap("a", "cid:a", Rc::new(())));
+        let status = fn_cap_status(eval_str("(fn [] (list z_cap a_cap))", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("a_cap".into())));
+    }
+
+    #[test]
+    fn macro_cap_status_no_captures() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let status = macro_cap_status(eval_str("(defmacro m [] 1)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn macro_cap_status_int_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("x".into(), Val::Int(1));
+        let status = macro_cap_status(eval_str("(defmacro m [] x)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn macro_cap_status_cap_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        let status = macro_cap_status(eval_str("(defmacro m [] db)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("db".into())));
+    }
+
+    #[test]
+    fn macro_cap_status_cell_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set(
+            "c".into(),
+            Val::Cell {
+                wasm: vec![],
+                schema: None,
+                caps: vec![],
+            },
+        );
+        let status = macro_cap_status(eval_str("(defmacro m [] c)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("c".into())));
+    }
+
+    #[test]
+    fn macro_cap_status_native_fn_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set(
+            "n".into(),
+            Val::NativeFn {
+                name: "n".into(),
+                func: Rc::new(|_| Ok(Val::Nil)),
+            },
+        );
+        let status = macro_cap_status(eval_str("(defmacro m [] n)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("n".into())));
+    }
+
+    #[test]
+    fn macro_cap_status_capture_cap_free_fn() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let helper = eval_str("(fn [] 1)", &mut env, &d).unwrap();
+        env.set("helper".into(), helper);
+        let status = macro_cap_status(eval_str("(defmacro m [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn macro_cap_status_capture_cap_bearing_fn() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        let helper = eval_str("(fn [] db)", &mut env, &d).unwrap();
+        env.set("helper".into(), helper);
+        let status = macro_cap_status(eval_str("(defmacro m [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("db".into())));
+    }
+
+    #[test]
+    fn macro_cap_status_capture_cap_free_macro() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(defmacro helper [] 42)", &mut env, &d).unwrap();
+        let status = macro_cap_status(eval_str("(defmacro m [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn macro_cap_status_capture_cap_bearing_macro() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        eval_str("(defmacro helper [] db)", &mut env, &d).unwrap();
+        let status = macro_cap_status(eval_str("(defmacro m [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("db".into())));
+    }
+
+    #[test]
+    fn closure_hash_and_eq_ignore_cap_status_fields() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let shared = Rc::new(Env::new());
+        let left = Val::Fn {
+            arities: vec![],
+            env: shared.clone(),
+            is_cap_free: true,
+            cap_violation: None,
+        };
+        let right = Val::Fn {
+            arities: vec![],
+            env: shared,
+            is_cap_free: false,
+            cap_violation: Some("db".into()),
+        };
+
+        assert_eq!(left, right);
+        let mut lh = DefaultHasher::new();
+        left.hash(&mut lh);
+        let mut rh = DefaultHasher::new();
+        right.hash(&mut rh);
+        assert_eq!(lh.finish(), rh.finish());
+    }
+
+    #[test]
+    fn raw_fn_path_cap_status_scans_full_snapshot() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        env.set("x".into(), Val::Int(1));
+
+        let raw = Val::List(vec![
+            Val::Sym("fn".into()),
+            Val::Vector(vec![]),
+            Val::Sym("x".into()),
+        ]);
+        let status = fn_cap_status(pollster_eval(eval(&raw, &mut env, &d)).unwrap());
+        assert_eq!(status, (false, Some("db".into())));
     }
 
     #[test]
@@ -6104,9 +6699,39 @@ mod tests {
     fn isolate_blocks_ambient_dispatch() {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
-        let result = eval_str("(isolate {:caps {}} (totally-unknown 1))", &mut env, &d);
+        let result = eval_str("(isolate {:env {}} (totally-unknown 1))", &mut env, &d);
         assert!(result.is_err());
         assert!(err_contains(&result.unwrap_err(), "unavailable in isolate"));
+    }
+
+    #[test]
+    fn isolate_missing_env_option_errors() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(
+            &result.unwrap_err(),
+            "missing required :env option"
+        ));
+    }
+
+    #[test]
+    fn isolate_env_must_be_map() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env 1} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "isolate :env"));
+    }
+
+    #[test]
+    fn isolate_unknown_option_rejected() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {} :foo 1} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "unknown option :foo"));
     }
 
     #[test]
@@ -6114,7 +6739,7 @@ mod tests {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
         let result = eval_str(
-            "(isolate {:caps {}} (perform import \"core\"))",
+            "(isolate {:env {}} (perform import \"core\"))",
             &mut env,
             &d,
         );
@@ -6142,11 +6767,276 @@ mod tests {
             },
         );
         let result = eval_str(
-            "(isolate {:caps {:import import}} (perform import \"core\"))",
+            "(isolate {:env {:import (cap import)}} (perform import \"core\"))",
             &mut env,
             &d,
         );
         assert_eq!(result, Ok(Val::Str("ok".into())));
+    }
+
+    #[test]
+    fn isolate_data_binding_works_when_tagged() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {:n (data 41)}} (+ n 1))", &mut env, &d);
+        assert_eq!(result, Ok(Val::Int(42)));
+    }
+
+    #[test]
+    fn isolate_data_allows_cap_free_fn() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def add (fn [a b] (+ a b)))", &mut env, &d).unwrap();
+        let result = eval_str("(isolate {:env {:add (data add)}} (add 1 2))", &mut env, &d);
+        assert_eq!(result, Ok(Val::Int(3)));
+    }
+
+    #[test]
+    fn isolate_data_rejects_cap_bearing_fn_with_offender_name() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_test_cap("db", 1));
+        eval_str("(def ro (fn [k] (perform db :read k)))", &mut env, &d).unwrap();
+        let result = eval_str("(isolate {:env {:ro (data ro)}} (ro \"x\"))", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(
+            &result.unwrap_err(),
+            "function carries capability authority via captured 'db'"
+        ));
+    }
+
+    #[test]
+    fn isolate_data_allows_cap_free_macro() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(defmacro m [x] (list (quote +) x 1))", &mut env, &d).unwrap();
+        let result = eval_str("(isolate {:env {:m (data m)}} (m 41))", &mut env, &d);
+        assert_eq!(result, Ok(Val::Int(42)));
+    }
+
+    #[test]
+    fn isolate_data_rejects_cap_bearing_macro_with_offender_name() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_test_cap("db", 1));
+        eval_str(
+            "(defmacro m [k] (list (quote perform) db :read k))",
+            &mut env,
+            &d,
+        )
+        .unwrap();
+        let result = eval_str("(isolate {:env {:m (data m)}} (m \"x\"))", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(
+            &result.unwrap_err(),
+            "macro carries capability authority via captured 'db'"
+        ));
+    }
+
+    #[test]
+    fn isolate_cap_wrapper_rejects_fn_value() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def add (fn [a b] (+ a b)))", &mut env, &d).unwrap();
+        let result = eval_str("(isolate {:env {:add (cap add)}} (add 1 2))", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "isolate cap value"));
+    }
+
+    #[test]
+    fn isolate_closure_effect_unhandled_without_isolate_handler() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def logger (fn [msg] (perform :log msg)))", &mut env, &d).unwrap();
+        let result = eval_str(
+            "(isolate {:env {:logger (data logger)}} (logger \"x\"))",
+            &mut env,
+            &d,
+        );
+        assert!(matches!(
+            result,
+            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+        ));
+    }
+
+    #[test]
+    fn isolate_closure_effect_handled_by_isolate_handler() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def logger (fn [msg] (perform :log msg)))", &mut env, &d).unwrap();
+        eval_str("(def logh (fn [msg] (str \"handled:\" msg)))", &mut env, &d).unwrap();
+        let result = eval_str(
+            "(isolate {:env {:logger (data logger) :logh (data logh)}}
+               (with-effect-handler :log logh (logger \"x\")))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Str("handled:x".into())));
+    }
+
+    #[test]
+    fn isolate_blocks_handler_stack_smuggling_from_outer_scope() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def logger (fn [msg] (perform :log msg)))", &mut env, &d).unwrap();
+        let result = eval_str(
+            "(with-effect-handler :log (fn [msg] :outer)
+               (isolate {:env {:logger (data logger)}} (logger \"x\")))",
+            &mut env,
+            &d,
+        );
+        assert!(matches!(
+            result,
+            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+        ));
+    }
+
+    #[test]
+    fn isolate_macro_expansion_uses_isolate_handler_stack() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str(
+            "(defmacro m [x] (list (quote perform) :log x))",
+            &mut env,
+            &d,
+        )
+        .unwrap();
+        let result = eval_str(
+            "(with-effect-handler :log (fn [msg] :outer)
+               (isolate {:env {:m (data m)}} (m \"x\")))",
+            &mut env,
+            &d,
+        );
+        assert!(matches!(
+            result,
+            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+        ));
+    }
+
+    #[test]
+    fn isolate_transitive_closure_calls_use_isolate_handler_stack() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def g (fn [msg] (perform :log msg)))", &mut env, &d).unwrap();
+        eval_str("(def f (fn [msg] (g msg)))", &mut env, &d).unwrap();
+        eval_str("(def logh (fn [msg] (str \"iso:\" msg)))", &mut env, &d).unwrap();
+        let result = eval_str(
+            "(isolate {:env {:f (data f) :g (data g) :logh (data logh)}}
+               (with-effect-handler :log logh (f \"x\")))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Str("iso:x".into())));
+    }
+
+    #[test]
+    fn isolate_env_rejects_untagged_entry() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {:n 41}} n)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(
+            &result.unwrap_err(),
+            "expected (cap <expr>) or (data <expr>)"
+        ));
+    }
+
+    #[test]
+    fn isolate_env_rejects_unknown_wrapper() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {:n (foo 41)}} n)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(
+            &result.unwrap_err(),
+            "unknown wrapper foo; use cap or data"
+        ));
+    }
+
+    #[test]
+    fn isolate_cap_wrapper_arity_enforced() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {:x (cap 1 2)}} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "isolate cap wrapper"));
+    }
+
+    #[test]
+    fn isolate_data_wrapper_arity_enforced() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {:x (data 1 2)}} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "isolate data wrapper"));
+    }
+
+    #[test]
+    fn isolate_caps_option_is_removed() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:caps {}} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), ":caps removed"));
+    }
+
+    #[test]
+    fn isolate_data_slot_rejects_capability() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let cap = make_test_cap("import", 1);
+        env.set("import".into(), cap);
+        let result = eval_str("(isolate {:env {:x (data import)}} x)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "pure data"));
+    }
+
+    #[test]
+    fn isolate_data_slot_rejects_nested_authority() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let cap = make_test_cap("import", 1);
+        env.set("import".into(), cap);
+        let result = eval_str("(isolate {:env {:x (data {:k import})}} x)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "pure data"));
+    }
+
+    #[test]
+    fn fn_invocation_uses_caller_handler_stack_not_definition_stack() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(do
+               (def f
+                 (with-effect-handler :log (fn [msg] :inner)
+                   (fn [msg] (perform :log msg))))
+               (f \"x\"))",
+            &mut env,
+            &d,
+        );
+        assert!(matches!(
+            result,
+            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+        ));
+    }
+
+    #[test]
+    fn macro_invocation_uses_caller_handler_stack_not_definition_stack() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(do
+               (with-effect-handler :log (fn [msg] :inner)
+                 (defmacro m [x] (list (quote perform) :log x)))
+               (m \"x\"))",
+            &mut env,
+            &d,
+        );
+        assert!(matches!(
+            result,
+            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+        ));
     }
 
     #[test]
@@ -6190,8 +7080,8 @@ mod tests {
         assert_eq!(setup, Ok(Val::Keyword("ok".into())));
 
         let lookup = eval_str(
-            "(isolate {:caps {:directory directory-ro
-                              :routing routing}}
+            "(isolate {:env {:directory (cap directory-ro)
+                             :routing (cap routing)}}
                (perform directory :lookup \"service:invoices\"))",
             &mut env,
             &d,
@@ -6207,8 +7097,8 @@ mod tests {
         );
 
         let denied = eval_str(
-            "(isolate {:caps {:directory directory-ro
-                              :routing routing}}
+            "(isolate {:env {:directory (cap directory-ro)
+                             :routing (cap routing)}}
                (perform directory :announce \"service:payments\"))",
             &mut env,
             &d,
