@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 const CAPNP_PROTOCOL: StreamProtocol = StreamProtocol::new("/ww/0.1.0");
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_DISCOVERY_ENV: &str = "WW_TEST_MDNS_CANDIDATES";
@@ -93,7 +93,7 @@ async fn run_shell_local(addr: Option<Multiaddr>, select: Option<String>) -> Res
         let candidates = if let Some(candidates) = discovery_candidates_override()? {
             candidates
         } else {
-            discover_mdns_candidates(&signing_key).await?
+            discover_mdns_candidates().await?
         };
         choose_candidate(
             candidates,
@@ -111,11 +111,15 @@ async fn dial_shell(
     target: &Candidate,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<ww::shell_capnp::shell::Client> {
-    let keypair = ww::keys::to_libp2p(signing_key)?;
+    // Use a fresh transport identity for the shell client swarm.
+    // The user's persistent key from ~/.ww/identity is still used for
+    // Terminal login signing below (LocalSigner). Reusing the same libp2p
+    // peer ID as the daemon causes self-dial rejection.
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
     let mut client = ww::host::ClientSwarm::new(keypair)?;
     let mut stream_control = client.stream_control();
 
-    let (connected_tx, connected_rx) = oneshot::channel();
+    let (connected_tx, connected_rx) = oneshot::channel::<Result<PeerId, String>>();
 
     if let Some(peer_id) = target.peer_id {
         // Seed known addresses and initiate dial.
@@ -132,10 +136,7 @@ async fn dial_shell(
 
     tokio::task::spawn_local(client.run(Some(connected_tx), None));
 
-    let connected_peer = tokio::time::timeout(CONNECT_TIMEOUT, connected_rx)
-        .await
-        .context("timed out waiting for libp2p connection")?
-        .context("connection notification channel dropped")?;
+    let connected_peer = await_connected_peer(connected_rx).await?;
 
     let remote_peer = target.peer_id.unwrap_or(connected_peer);
 
@@ -198,6 +199,16 @@ async fn dial_shell(
 
     wait_shell_ready(&shell).await?;
     Ok(shell)
+}
+
+async fn await_connected_peer(
+    connected_rx: oneshot::Receiver<Result<PeerId, String>>,
+) -> Result<PeerId> {
+    tokio::time::timeout(CONNECT_TIMEOUT, connected_rx)
+        .await
+        .context("timed out waiting for libp2p connection")?
+        .context("connection notification channel dropped")?
+        .map_err(|e| anyhow::anyhow!("libp2p connection failed before establish: {e}"))
 }
 
 async fn run_repl(shell: &ww::shell_capnp::shell::Client) -> Result<()> {
@@ -320,19 +331,17 @@ fn load_shell_identity() -> Result<(ed25519_dalek::SigningKey, PeerId)> {
     Ok((sk, peer_id))
 }
 
-async fn discover_mdns_candidates(
-    signing_key: &ed25519_dalek::SigningKey,
-) -> Result<Vec<Candidate>> {
+async fn discover_mdns_candidates() -> Result<Vec<Candidate>> {
     if std::env::var_os(TEST_DISCOVERY_ENV).is_none() {
         // mDNS discovery is disabled in the hardened transport profile.
         // Require an explicit address for shell connection.
         return Ok(Vec::new());
     }
 
-    let keypair = ww::keys::to_libp2p(signing_key)?;
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
     let client = ww::host::ClientSwarm::new(keypair)?;
 
-    let (_connected_tx, _connected_rx) = oneshot::channel::<PeerId>();
+    let (_connected_tx, _connected_rx) = oneshot::channel::<Result<PeerId, String>>();
     let (discovered_tx, mut discovered_rx) = mpsc::unbounded_channel::<(PeerId, Multiaddr)>();
 
     tokio::task::spawn_local(client.run(None, Some(discovered_tx)));
@@ -809,5 +818,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid multiaddr"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn await_connected_peer_returns_peer_on_success() {
+        let expected: PeerId = "12D3KooWJ3qM19qUUj8JdT9kPEg6VZLoes6eexfUYd6Xn7SPrf8n"
+            .parse()
+            .unwrap();
+        let (tx, rx) = oneshot::channel::<Result<PeerId, String>>();
+        tx.send(Ok(expected)).unwrap();
+
+        let got = await_connected_peer(rx).await.unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn await_connected_peer_surfaces_dial_failure() {
+        let (tx, rx) = oneshot::channel::<Result<PeerId, String>>();
+        tx.send(Err("dial failed".to_string())).unwrap();
+
+        let err = await_connected_peer(rx).await.unwrap_err().to_string();
+        assert!(err.contains("dial failed"), "{err}");
     }
 }
