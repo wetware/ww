@@ -134,7 +134,9 @@ impl Env {
                 merged.insert(k.clone(), v.clone());
             }
         }
-        merged.into_iter().collect()
+        let mut bindings: Vec<(String, Val)> = merged.into_iter().collect();
+        bindings.sort_by(|(left, _), (right, _)| left.cmp(right));
+        bindings
     }
 
     /// Returns a new Env with one frame containing all visible bindings.
@@ -257,6 +259,39 @@ fn parse_allow_methods(value: &Val) -> Result<BTreeSet<String>, Val> {
         }
     }
     Ok(allow)
+}
+
+fn is_cap_authority_free(value: &Val) -> bool {
+    match value {
+        Val::Nil
+        | Val::Bool(_)
+        | Val::Int(_)
+        | Val::Float(_)
+        | Val::Str(_)
+        | Val::Sym(_)
+        | Val::Keyword(_)
+        | Val::Bytes(_) => true,
+        Val::List(items) | Val::Vector(items) | Val::Set(items) => {
+            items.iter().all(is_cap_authority_free)
+        }
+        Val::Map(m) => m
+            .iter()
+            .all(|(k, v)| is_cap_authority_free(k) && is_cap_authority_free(v)),
+        Val::Fn { is_cap_free, .. } | Val::Macro { is_cap_free, .. } => *is_cap_free,
+        Val::Cell { .. } | Val::NativeFn { .. } | Val::AsyncNativeFn { .. } | Val::Cap { .. } => {
+            false
+        }
+        Val::Recur(_) | Val::Effect { .. } | Val::Resume(_) => false,
+    }
+}
+
+fn compute_cap_status(env: &Env) -> (bool, Option<String>) {
+    for (name, value) in env.bindings() {
+        if !is_cap_authority_free(&value) {
+            return (false, Some(name));
+        }
+    }
+    (true, None)
 }
 
 fn is_isolate_data_value(value: &Val) -> bool {
@@ -542,9 +577,13 @@ fn eval_fn(args: &[Val], env: &Env) -> Result<Val, Val> {
     // Raw fn path: no FnArityExpr, no free-vars data. Keep full snapshot;
     // is_cap_free check below still works correctly because it walks all bindings.
     // Slim closures only apply to the analyzed pipeline (expr::Expr::Fn).
+    let captured_env = Rc::new(env.snapshot());
+    let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
     Ok(Val::Fn {
         arities,
-        env: Rc::new(env.snapshot()),
+        env: captured_env,
+        is_cap_free,
+        cap_violation,
     })
 }
 
@@ -798,9 +837,13 @@ async fn eval_defmacro(args: &[Val], env: &mut Env) -> Result<Val, Val> {
     // Raw macro path: no FnArityExpr, no free-vars data. Keep full snapshot;
     // is_cap_free check below still works correctly because it walks all bindings.
     // Slim closures only apply to the analyzed pipeline (expr::Expr::Fn).
+    let captured_env = Rc::new(env.snapshot());
+    let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
     let val = Val::Macro {
         arities,
-        env: Rc::new(env.snapshot()),
+        env: captured_env,
+        is_cap_free,
+        cap_violation,
     };
     env.set_root(name, val.clone());
     Ok(val)
@@ -1036,6 +1079,7 @@ fn extract_fn(caller: &str, val: &Val) -> Result<(Vec<FnArity>, Rc<Env>), Val> {
         Val::Fn {
             arities,
             env: captured_env,
+            ..
         } => Ok((arities.clone(), captured_env.clone())),
         other => Err(error::type_mismatch(caller, "function", other)),
     }
@@ -1645,6 +1689,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                     .flat_map(|arity| arity.free_vars.iter())
                     .collect();
                 let captured_env = snapshot.filter_to(free_vars);
+                let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
                 let fn_arities: Vec<FnArity> = arities
                     .iter()
                     .map(|a| FnArity {
@@ -1656,6 +1701,8 @@ pub fn eval_expr<'a, D: Dispatch>(
                 Ok(Val::Fn {
                     arities: fn_arities,
                     env: Rc::new(captured_env),
+                    is_cap_free,
+                    cap_violation,
                 })
             }
 
@@ -1881,6 +1928,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                                                     Val::Fn {
                                                         arities,
                                                         env: captured_env,
+                                                        ..
                                                     } => {
                                                         // Pop before handle (handler's performs go to outer handlers).
                                                         hs.borrow_mut().pop();
@@ -2016,9 +2064,13 @@ pub fn eval_expr<'a, D: Dispatch>(
             Expr::DefMacro { name, raw_args } => {
                 // raw_args contains [params, body...] — no name (already extracted).
                 let arities = parse_macro_arities(raw_args)?;
+                let captured_env = Rc::new(env.snapshot());
+                let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
                 let val = Val::Macro {
                     arities,
-                    env: Rc::new(env.snapshot()),
+                    env: captured_env,
+                    is_cap_free,
+                    cap_violation,
                 };
                 env.set_root(name.clone(), val.clone());
                 Ok(val)
@@ -2309,6 +2361,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                 if let Some(Val::Macro {
                     arities,
                     env: captured_env,
+                    ..
                 }) = env.get(head)
                 {
                     let arities = arities.clone();
@@ -2324,6 +2377,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                 if let Some(Val::Fn {
                     arities,
                     env: captured_env,
+                    ..
                 }) = env.get(head)
                 {
                     let arities = arities.clone();
@@ -2415,6 +2469,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                         if let Some(Val::Fn {
                             arities,
                             env: captured_env,
+                            ..
                         }) = env.get(fname)
                         {
                             let arities = arities.clone();
@@ -2435,6 +2490,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                     Val::Fn {
                         arities,
                         env: captured_env,
+                        ..
                     } => {
                         let arities = arities.clone();
                         let captured_env = captured_env.clone();
@@ -2512,6 +2568,7 @@ async fn invoke_cap_method_value<'a, D: Dispatch>(
         Val::Fn {
             arities,
             env: captured_env,
+            ..
         } => {
             invoke_fn_with_handler_stack(
                 &arities,
@@ -2696,6 +2753,7 @@ pub fn eval<'a, D: Dispatch>(
                 if let Some(Val::Macro {
                     arities,
                     env: captured_env,
+                    ..
                 }) = env.get(head)
                 {
                     let arities = arities.clone();
@@ -2711,6 +2769,7 @@ pub fn eval<'a, D: Dispatch>(
                 if let Some(Val::Fn {
                     arities,
                     env: captured_env,
+                    ..
                 }) = env.get(head)
                 {
                     let arities = arities.clone();
@@ -2749,6 +2808,7 @@ pub fn eval<'a, D: Dispatch>(
                             if let Some(Val::Fn {
                                 arities,
                                 env: captured_env,
+                                ..
                             }) = env.get(fname)
                             {
                                 let arities = arities.clone();
@@ -2763,6 +2823,7 @@ pub fn eval<'a, D: Dispatch>(
                         Val::Fn {
                             arities,
                             env: captured_env,
+                            ..
                         } => {
                             let arities = arities.clone();
                             let captured_env = captured_env.clone();
@@ -3713,6 +3774,277 @@ mod tests {
         };
         assert_eq!(captured_env.get("x"), Some(&Val::Int(1)));
         assert_eq!(captured_env.get("y"), Some(&Val::Int(2)));
+    }
+
+    fn fn_cap_status(value: Val) -> (bool, Option<String>) {
+        let Val::Fn {
+            is_cap_free,
+            cap_violation,
+            ..
+        } = value
+        else {
+            panic!("expected fn value");
+        };
+        (is_cap_free, cap_violation)
+    }
+
+    fn macro_cap_status(value: Val) -> (bool, Option<String>) {
+        let Val::Macro {
+            is_cap_free,
+            cap_violation,
+            ..
+        } = value
+        else {
+            panic!("expected macro value");
+        };
+        (is_cap_free, cap_violation)
+    }
+
+    #[test]
+    fn fn_cap_status_no_captures() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let status = fn_cap_status(eval_str("(fn [] 1)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn fn_cap_status_int_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("x".into(), Val::Int(1));
+        let status = fn_cap_status(eval_str("(fn [] x)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn fn_cap_status_cap_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        let status = fn_cap_status(eval_str("(fn [] db)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("db".into())));
+    }
+
+    #[test]
+    fn fn_cap_status_cell_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set(
+            "c".into(),
+            Val::Cell {
+                wasm: vec![],
+                schema: None,
+                caps: vec![],
+            },
+        );
+        let status = fn_cap_status(eval_str("(fn [] c)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("c".into())));
+    }
+
+    #[test]
+    fn fn_cap_status_native_fn_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set(
+            "n".into(),
+            Val::NativeFn {
+                name: "n".into(),
+                func: Rc::new(|_| Ok(Val::Nil)),
+            },
+        );
+        let status = fn_cap_status(eval_str("(fn [] n)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("n".into())));
+    }
+
+    #[test]
+    fn fn_cap_status_capture_cap_free_fn() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let helper = eval_str("(fn [] 1)", &mut env, &d).unwrap();
+        env.set("helper".into(), helper);
+        let status = fn_cap_status(eval_str("(fn [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn fn_cap_status_capture_cap_bearing_fn() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        let helper = eval_str("(fn [] db)", &mut env, &d).unwrap();
+        env.set("helper".into(), helper);
+        let status = fn_cap_status(eval_str("(fn [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("helper".into())));
+    }
+
+    #[test]
+    fn fn_cap_status_capture_cap_free_macro() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(defmacro m [] 42)", &mut env, &d).unwrap();
+        let status = fn_cap_status(eval_str("(fn [] m)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn fn_cap_status_capture_cap_bearing_macro() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        eval_str("(defmacro m [] db)", &mut env, &d).unwrap();
+        let status = fn_cap_status(eval_str("(fn [] m)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("m".into())));
+    }
+
+    #[test]
+    fn fn_cap_violation_is_deterministic_by_binding_name() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("z_cap".into(), make_cap("z", "cid:z", Rc::new(())));
+        env.set("a_cap".into(), make_cap("a", "cid:a", Rc::new(())));
+        let status = fn_cap_status(eval_str("(fn [] (list z_cap a_cap))", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("a_cap".into())));
+    }
+
+    #[test]
+    fn macro_cap_status_no_captures() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let status = macro_cap_status(eval_str("(defmacro m [] 1)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn macro_cap_status_int_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("x".into(), Val::Int(1));
+        let status = macro_cap_status(eval_str("(defmacro m [] x)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn macro_cap_status_cap_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        let status = macro_cap_status(eval_str("(defmacro m [] db)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("db".into())));
+    }
+
+    #[test]
+    fn macro_cap_status_cell_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set(
+            "c".into(),
+            Val::Cell {
+                wasm: vec![],
+                schema: None,
+                caps: vec![],
+            },
+        );
+        let status = macro_cap_status(eval_str("(defmacro m [] c)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("c".into())));
+    }
+
+    #[test]
+    fn macro_cap_status_native_fn_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set(
+            "n".into(),
+            Val::NativeFn {
+                name: "n".into(),
+                func: Rc::new(|_| Ok(Val::Nil)),
+            },
+        );
+        let status = macro_cap_status(eval_str("(defmacro m [] n)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("n".into())));
+    }
+
+    #[test]
+    fn macro_cap_status_capture_cap_free_fn() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let helper = eval_str("(fn [] 1)", &mut env, &d).unwrap();
+        env.set("helper".into(), helper);
+        let status = macro_cap_status(eval_str("(defmacro m [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn macro_cap_status_capture_cap_bearing_fn() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        let helper = eval_str("(fn [] db)", &mut env, &d).unwrap();
+        env.set("helper".into(), helper);
+        let status = macro_cap_status(eval_str("(defmacro m [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("db".into())));
+    }
+
+    #[test]
+    fn macro_cap_status_capture_cap_free_macro() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(defmacro helper [] 42)", &mut env, &d).unwrap();
+        let status = macro_cap_status(eval_str("(defmacro m [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn macro_cap_status_capture_cap_bearing_macro() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        eval_str("(defmacro helper [] db)", &mut env, &d).unwrap();
+        let status = macro_cap_status(eval_str("(defmacro m [] helper)", &mut env, &d).unwrap());
+        assert_eq!(status, (false, Some("db".into())));
+    }
+
+    #[test]
+    fn closure_hash_and_eq_ignore_cap_status_fields() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let shared = Rc::new(Env::new());
+        let left = Val::Fn {
+            arities: vec![],
+            env: shared.clone(),
+            is_cap_free: true,
+            cap_violation: None,
+        };
+        let right = Val::Fn {
+            arities: vec![],
+            env: shared,
+            is_cap_free: false,
+            cap_violation: Some("db".into()),
+        };
+
+        assert_eq!(left, right);
+        let mut lh = DefaultHasher::new();
+        left.hash(&mut lh);
+        let mut rh = DefaultHasher::new();
+        right.hash(&mut rh);
+        assert_eq!(lh.finish(), rh.finish());
+    }
+
+    #[test]
+    fn raw_fn_path_cap_status_scans_full_snapshot() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
+        env.set("x".into(), Val::Int(1));
+
+        let raw = Val::List(vec![
+            Val::Sym("fn".into()),
+            Val::Vector(vec![]),
+            Val::Sym("x".into()),
+        ]);
+        let status = fn_cap_status(pollster_eval(eval(&raw, &mut env, &d)).unwrap());
+        assert_eq!(status, (false, Some("db".into())));
     }
 
     #[test]

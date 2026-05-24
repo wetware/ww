@@ -168,6 +168,8 @@ pub enum Val {
     Fn {
         arities: Vec<FnArity>,
         env: std::rc::Rc<eval::Env>,
+        is_cap_free: bool,
+        cap_violation: Option<String>,
     },
     /// Internal sentinel returned by `recur` — never escapes `loop`.
     Recur(Vec<Val>),
@@ -175,6 +177,8 @@ pub enum Val {
     Macro {
         arities: Vec<FnArity>,
         env: std::rc::Rc<eval::Env>,
+        is_cap_free: bool,
+        cap_violation: Option<String>,
     },
     /// Internal sentinel returned by `perform` — caught by `with-handler`.
     /// Propagates up the eval stack until a matching handler is found.
