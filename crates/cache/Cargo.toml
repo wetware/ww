@@ -1,5 +1,5 @@
 [package]
-name = "cache"
+name = "ww-cache"
 version = "0.1.0"
 edition = "2021"
 description = "CID-keyed, weight-aware ARC cache managing IPFS pins"

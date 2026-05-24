@@ -16,9 +16,9 @@ cid = "0.11"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures = "0.3"
 hex = "0.4"
-libp2p = { version = "0.55.0", features = ["tokio", "tcp", "noise", "yamux", "macros", "identify", "rsa", "request-response", "ed25519", "kad", "autonat", "relay", "dcutr", "quic", "dns"] }
+libp2p = { version = "0.56.0", default-features = false, features = ["tokio", "tcp", "noise", "yamux", "macros", "identify", "rsa", "request-response", "ed25519", "kad", "autonat", "relay", "dcutr", "quic"] }
 libp2p-core = "0.43"
-libp2p-stream = "0.3.0-alpha"
+libp2p-stream = "0.4.0-alpha"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,7 +31,7 @@ wasmparser = "0.243"
 # Workspace crates
 atom = { path = "../atom" }
 auth = { path = "../guest/auth" }
-cache = { path = "../cache" }
+cache = { package = "ww-cache", path = "../cache" }
 ipfs = { path = "../ipfs" }
 membrane = { path = "../membrane" }
 schema-id = { path = "../schema-id" }

@@ -56,20 +56,20 @@ blake3 = "1.8.3"
 
 # Host-only dependencies (not needed for WASM guests)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-libp2p = { version = "0.55.0", features = ["tokio", "tcp", "noise", "yamux", "macros", "identify", "rsa", "request-response", "ed25519", "kad", "autonat", "relay", "dcutr", "quic", "dns", "mdns"] }
+libp2p = { version = "0.56.0", default-features = false, features = ["tokio", "tcp", "noise", "yamux", "macros", "identify", "rsa", "request-response", "ed25519", "kad", "autonat", "relay", "dcutr", "quic"] }
 libp2p-core = "0.43"
 ipfs = { path = "crates/ipfs" }
 clap = { version = "4.5.51", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 nix = { version = "0.30.1", features = ["socket"] }
-wasmtime = { version = "40.0.0", features = ["call-hook"] }
+wasmtime = { version = "45.0.0", features = ["call-hook"] }
 capnp = "0.25.3"
 capnp-rpc = "0.25.0"
-libp2p-stream = "0.3.0-alpha"
+libp2p-stream = "0.4.0-alpha"
 membrane = { path = "crates/membrane" }
 atom = { path = "crates/atom" }
 stem = { path = "crates/stem" }
-cache = { path = "crates/cache" }
+cache = { package = "ww-cache", path = "crates/cache" }
 cell = { path = "crates/cell" }
 rpc = { path = "crates/rpc" }
 blake3 = "1"
