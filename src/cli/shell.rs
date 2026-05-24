@@ -391,7 +391,6 @@ fn check_multicast_send_health() -> Result<()> {
     Ok(())
 }
 
-
 fn discovery_candidates_override() -> Result<Option<Vec<Candidate>>> {
     #[cfg(debug_assertions)]
     {
