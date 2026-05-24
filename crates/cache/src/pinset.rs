@@ -169,6 +169,16 @@ impl PinsetCache {
         self.pinner.fetch(cid).await.context("failed to fetch CID")
     }
 
+    /// Fetch raw bytes for a subpath under a CID from the IPFS node.
+    ///
+    /// The CID should already be pinned via a prior `ensure()` call.
+    pub async fn fetch_path(&self, cid: &Cid, subpath: &str) -> Result<Vec<u8>> {
+        self.pinner
+            .fetch_path(cid, subpath)
+            .await
+            .with_context(|| format!("failed to fetch CID subpath /ipfs/{cid}/{subpath}"))
+    }
+
     /// Spawn background tasks to unpin evicted entries with retry.
     fn spawn_unpins(&self, evicted: Vec<(Cid, PinEntry)>) {
         for (cid, _entry) in evicted {
@@ -247,6 +257,14 @@ impl CacheMode {
             CacheMode::Isolated(pinset) => pinset.fetch(cid).await,
         }
     }
+
+    /// Fetch raw bytes for a subpath under a CID.
+    pub async fn fetch_path(&self, cid: &Cid, subpath: &str) -> Result<Vec<u8>> {
+        match self {
+            CacheMode::Shared(cache) => cache.fetch_path(cid, subpath).await,
+            CacheMode::Isolated(pinset) => pinset.fetch_path(cid, subpath).await,
+        }
+    }
 }
 
 /// A per-process isolated pinset. Does not use ARC; simply tracks
@@ -297,6 +315,16 @@ impl IsolatedPinset {
     /// The CID should already be pinned via a prior `ensure()` call.
     pub async fn fetch(&self, cid: &Cid) -> Result<Vec<u8>> {
         self.pinner.fetch(cid).await.context("failed to fetch CID")
+    }
+
+    /// Fetch raw bytes for a subpath under a CID from the IPFS node.
+    ///
+    /// The CID should already be pinned via a prior `ensure()` call.
+    pub async fn fetch_path(&self, cid: &Cid, subpath: &str) -> Result<Vec<u8>> {
+        self.pinner
+            .fetch_path(cid, subpath)
+            .await
+            .with_context(|| format!("failed to fetch CID subpath /ipfs/{cid}/{subpath}"))
     }
 }
 

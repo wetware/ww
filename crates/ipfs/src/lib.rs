@@ -620,6 +620,15 @@ impl cache::Pinner for HttpClient {
         self.cat(&format!("/ipfs/{cid}")).await
     }
 
+    async fn fetch_path(&self, cid: &cid::Cid, subpath: &str) -> Result<Vec<u8>> {
+        let path = if subpath.is_empty() {
+            format!("/ipfs/{cid}")
+        } else {
+            format!("/ipfs/{cid}/{subpath}")
+        };
+        self.cat(&path).await
+    }
+
     async fn size(&self, cid: &cid::Cid) -> Result<u64> {
         let entries = self.ls(&format!("/ipfs/{cid}")).await?;
         Ok(entries.iter().map(|e| e.size).sum())
