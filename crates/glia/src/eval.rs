@@ -6706,6 +6706,36 @@ mod tests {
     }
 
     #[test]
+    fn isolate_missing_env_option_errors() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(
+            &result.unwrap_err(),
+            "missing required :env option"
+        ));
+    }
+
+    #[test]
+    fn isolate_env_must_be_map() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env 1} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "isolate :env"));
+    }
+
+    #[test]
+    fn isolate_unknown_option_rejected() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {} :foo 1} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "unknown option :foo"));
+    }
+
+    #[test]
     fn isolate_import_absent_by_default() {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
@@ -6913,6 +6943,36 @@ mod tests {
     }
 
     #[test]
+    fn isolate_env_rejects_unknown_wrapper() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {:n (foo 41)}} n)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(
+            &result.unwrap_err(),
+            "unknown wrapper foo; use cap or data"
+        ));
+    }
+
+    #[test]
+    fn isolate_cap_wrapper_arity_enforced() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {:x (cap 1 2)}} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "isolate cap wrapper"));
+    }
+
+    #[test]
+    fn isolate_data_wrapper_arity_enforced() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(isolate {:env {:x (data 1 2)}} nil)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "isolate data wrapper"));
+    }
+
+    #[test]
     fn isolate_caps_option_is_removed() {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
@@ -6930,6 +6990,54 @@ mod tests {
         let result = eval_str("(isolate {:env {:x (data import)}} x)", &mut env, &d);
         assert!(result.is_err());
         assert!(err_contains(&result.unwrap_err(), "pure data"));
+    }
+
+    #[test]
+    fn isolate_data_slot_rejects_nested_authority() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let cap = make_test_cap("import", 1);
+        env.set("import".into(), cap);
+        let result = eval_str("(isolate {:env {:x (data {:k import})}} x)", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "pure data"));
+    }
+
+    #[test]
+    fn fn_invocation_uses_caller_handler_stack_not_definition_stack() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(do
+               (def f
+                 (with-effect-handler :log (fn [msg] :inner)
+                   (fn [msg] (perform :log msg))))
+               (f \"x\"))",
+            &mut env,
+            &d,
+        );
+        assert!(matches!(
+            result,
+            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+        ));
+    }
+
+    #[test]
+    fn macro_invocation_uses_caller_handler_stack_not_definition_stack() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(do
+               (with-effect-handler :log (fn [msg] :inner)
+                 (defmacro m [x] (list (quote perform) :log x)))
+               (m \"x\"))",
+            &mut env,
+            &d,
+        );
+        assert!(matches!(
+            result,
+            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+        ));
     }
 
     #[test]
