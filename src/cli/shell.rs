@@ -323,6 +323,12 @@ fn load_shell_identity() -> Result<(ed25519_dalek::SigningKey, PeerId)> {
 async fn discover_mdns_candidates(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<Vec<Candidate>> {
+    if std::env::var_os(TEST_DISCOVERY_ENV).is_none() {
+        // mDNS discovery is disabled in the hardened transport profile.
+        // Require an explicit address for shell connection.
+        return Ok(Vec::new());
+    }
+
     let keypair = ww::keys::to_libp2p(signing_key)?;
     let client = ww::host::ClientSwarm::new(keypair)?;
 

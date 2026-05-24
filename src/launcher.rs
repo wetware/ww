@@ -118,7 +118,6 @@ impl RuntimeImpl {
 
 fn build_wasmtime_engine() -> Arc<wasmtime::Engine> {
     let mut wasm_config = wasmtime::Config::new();
-    wasm_config.async_support(true);
     wasm_config.consume_fuel(true);
     wasm_config.epoch_interruption(true);
     Arc::new(wasmtime::Engine::new(&wasm_config).expect("failed to create wasmtime engine"))

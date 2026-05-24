@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use wasmtime::component::bindgen;
@@ -486,10 +486,7 @@ impl Proc {
         let stdout_stream = AsyncStdoutStream::new(BUFFER_SIZE, stdout);
         let stderr_stream = AsyncStdoutStream::new(BUFFER_SIZE, stderr);
 
-        // Build a Wasmtime engine with three settings for cooperative scheduling:
-        //   async_support      — fuel exhaustion yields (Poll::Pending) instead
-        //                        of trapping, so the Tokio LocalSet can run
-        //                        other cells.
+        // Build a Wasmtime engine with two settings for cooperative scheduling:
         //   consume_fuel       — enables instruction counting; without this,
         //                        fuel methods are no-ops and the estimator is
         //                        inert.
@@ -501,7 +498,6 @@ impl Proc {
             engine
         } else {
             let mut wasm_config = WasmConfig::new();
-            wasm_config.async_support(true);
             wasm_config.consume_fuel(true);
             wasm_config.epoch_interruption(true);
             Arc::new(Engine::new(&wasm_config)?)
@@ -544,7 +540,7 @@ impl Proc {
         if let Some(ref tree) = cid_tree {
             wasi_builder
                 .preopened_dir(tree.staging_dir(), "/", DirPerms::READ, FilePerms::READ)
-                .context("failed to preopen CidTree staging dir at /")?;
+                .map_err(|e| anyhow!("failed to preopen CidTree staging dir at /: {e}"))?;
             tracing::debug!(
                 staging = %tree.staging_dir().display(),
                 "Mounted CidTree staging at / (fs_intercept routes via virtual FS)"
@@ -733,7 +729,7 @@ impl Proc {
             .wasi_cli_run()
             .call_run(&mut self.store)
             .await
-            .context("failed to call `wasi:cli/run`")?
+            .map_err(|e| anyhow!("failed to call `wasi:cli/run`: {e}"))?
             .map_err(|()| anyhow!("guest returned non-zero exit status"))
     }
 }
@@ -760,7 +756,7 @@ fn add_streams_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> 
                 let guest_stream = state
                     .data_stream
                     .take()
-                    .ok_or_else(|| anyhow!("data streams not enabled"))?;
+                    .ok_or_else(|| wasmtime::Error::msg("data streams not enabled"))?;
 
                 let (guest_read, guest_write) = tokio::io::split(guest_stream);
                 let input_stream: DynInputStream = Box::new(AsyncReadStream::new(guest_read));
@@ -791,7 +787,7 @@ fn add_streams_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> 
                     conn_state
                         .input_stream
                         .take()
-                        .ok_or_else(|| anyhow!("input stream already taken"))?
+                        .ok_or_else(|| wasmtime::Error::msg("input stream already taken"))?
                 };
 
                 let state = store.data_mut();
@@ -813,7 +809,7 @@ fn add_streams_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> 
                     conn_state
                         .output_stream
                         .take()
-                        .ok_or_else(|| anyhow!("output stream already taken"))?
+                        .ok_or_else(|| wasmtime::Error::msg("output stream already taken"))?
                 };
 
                 let state = store.data_mut();

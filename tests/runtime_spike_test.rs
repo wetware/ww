@@ -224,7 +224,6 @@ async fn spike3_wasm_compilation_off_thread() {
 
     // Measure inline compilation time (current approach).
     let mut config = wasmtime::Config::new();
-    config.async_support(true);
     config.consume_fuel(true);
     let engine = Arc::new(wasmtime::Engine::new(&config).unwrap());
 

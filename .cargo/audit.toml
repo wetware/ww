@@ -1,0 +1,9 @@
+[advisories]
+# RUSTSEC-2026-0118 / RUSTSEC-2026-0119 are on `hickory-proto`.
+# In this workspace they are lockfile-only entries (Cargo resolver weak-feature
+# behavior) and not part of the reachable dependency graph after disabling
+# libp2p dns/mdns features.
+ignore = [
+  "RUSTSEC-2026-0118",
+  "RUSTSEC-2026-0119",
+]

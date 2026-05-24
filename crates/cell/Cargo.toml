@@ -19,13 +19,16 @@ futures = "0.3"
 rand = "0.9"
 dirs = "5"
 cap-std = "3.4"
-wasmtime = { version = "40.0.0", features = ["call-hook"] }
-wasmtime-wasi = "40.0.0"
-wasmtime-wasi-io = "40.0.0"
+wasmtime = { version = "45.0.0", features = ["call-hook"] }
+wasmtime-wasi = "45.0.0"
+wasmtime-wasi-io = "45.0.0"
 
 # Workspace crates
 atom = { path = "../atom" }
 stem = { path = "../stem" }
 membrane = { path = "../membrane" }
-cache = { path = "../cache" }
+cache = { package = "ww-cache", path = "../cache" }
 ipfs = { path = "../ipfs" }
+
+[dev-dependencies]
+tempfile = "3"
