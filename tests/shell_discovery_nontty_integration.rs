@@ -18,7 +18,7 @@ fn run_ww(home: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     cmd.args(args)
         .env("HOME", home)
         .env_remove("WW_IDENTITY")
-        .env_remove("WW_TEST_MDNS_CANDIDATES");
+        .env_remove("WW_TEST_SHELL_CANDIDATES");
 
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -50,13 +50,13 @@ fn shell_nontty_ambiguous_discovery_suggests_select_or_addr() {
     let output = run_ww(
         home.path(),
         &["shell"],
-        &[("WW_TEST_MDNS_CANDIDATES", discovery_json)],
+        &[("WW_TEST_SHELL_CANDIDATES", discovery_json)],
     );
 
     assert!(!output.status.success(), "unexpected success");
     let stderr = stderr_text(&output);
     assert!(
-        stderr.contains("Multiple wetware hosts discovered via mDNS; refusing to guess"),
+        stderr.contains("Multiple wetware hosts discovered; refusing to guess"),
         "stderr: {stderr}"
     );
     assert!(
