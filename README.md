@@ -51,16 +51,16 @@ Here is the capability surface in action, directly in the Wetware shell (Glia):
   (attenuate directory [:lookup]))
 
 ;; Allowed call inside isolated context.
-(isolate {:env {:directory (cap directory-ro)}}
+(isolate {:env {:directory directory-ro}}
   (perform directory :lookup "service:invoices"))
 
 ;; Denied call: announce was not granted to this isolate.
-(isolate {:env {:directory (cap directory-ro)}}
+(isolate {:env {:directory directory-ro}}
   (perform directory :announce "service:payments"))
 
 ;; Authority-free helpers can cross isolate boundaries as data.
 (let [add (fn [a b] (+ a b))]
-  (isolate {:env {:add (data add)}}
+  (isolate {:env {:add add}}
     (add 1 2)))
 ```
 

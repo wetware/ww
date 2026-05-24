@@ -9,14 +9,14 @@ It is written for technical readers who may be new to Lisp and new to free-varia
 `isolate` creates a fresh execution context with only explicitly imported bindings.
 
 ```clojure
-(isolate {:env {:directory (cap directory-ro)
-                :add       (data add)}}
+(isolate {:env {:directory directory-ro
+                :add       add}}
   ...)
 ```
 
 The goal is strict authority control:
-- `(cap x)` imports a capability value.
-- `(data x)` imports pure data.
+- Capability values are imported as capabilities.
+- Authority-free values are imported as data.
 
 Before this work, closures made the boundary fuzzy: a value that *looked* like data could carry hidden authority through captured environment bindings.
 
@@ -25,7 +25,7 @@ Example risk:
 (def db ...capability...)
 (def helper (fn [k] (perform db :read k)))
 
-(isolate {:env {:helper (data helper)}}
+(isolate {:env {:helper helper}}
   (helper "x"))
 ```
 
@@ -95,11 +95,11 @@ Those paths intentionally keep full snapshots because they do not have the analy
 
 This is an intentional asymmetry in the current design.
 
-## Authority checks for `(data ...)`
+## Authority checks at `:env` import time
 
-When importing into `isolate` with `(data ...)`, Glia now enforces:
+When importing into `isolate`, Glia now enforces:
 - Plain data is allowed.
-- Capability values are rejected.
+- Capability values are imported as capabilities.
 - Closures/macros are allowed only if they are authority-free.
 
 Function and macro values cache:
@@ -120,9 +120,9 @@ This blocks handler smuggling patterns where an outer handler could be reached i
 
 Use this mental model:
 - `isolate` boundary = exactly what `:env` imports, plus whatever those imports can reach.
-- `(cap ...)` for explicit authority.
-- `(data ...)` only for authority-free values.
-- If you pass closures/macros as data, expect the runtime to inspect captured authority.
+- If a value is a capability, it is imported as capability authority.
+- If a value is not a capability, it must be authority-free.
+- If you pass closures/macros, expect the runtime to inspect captured authority.
 
 If an import fails, inspect the reported captured binding name first; that is usually the shortest path to a safe refactor.
 
