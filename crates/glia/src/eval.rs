@@ -261,7 +261,7 @@ fn parse_allow_methods(value: &Val) -> Result<BTreeSet<String>, Val> {
     Ok(allow)
 }
 
-fn is_cap_authority_free(value: &Val) -> bool {
+fn is_authority_free(value: &Val) -> bool {
     match value {
         Val::Nil
         | Val::Bool(_)
@@ -272,11 +272,11 @@ fn is_cap_authority_free(value: &Val) -> bool {
         | Val::Keyword(_)
         | Val::Bytes(_) => true,
         Val::List(items) | Val::Vector(items) | Val::Set(items) => {
-            items.iter().all(is_cap_authority_free)
+            items.iter().all(is_authority_free)
         }
         Val::Map(m) => m
             .iter()
-            .all(|(k, v)| is_cap_authority_free(k) && is_cap_authority_free(v)),
+            .all(|(k, v)| is_authority_free(k) && is_authority_free(v)),
         Val::Fn { is_cap_free, .. } | Val::Macro { is_cap_free, .. } => *is_cap_free,
         Val::Cell { .. } | Val::NativeFn { .. } | Val::AsyncNativeFn { .. } | Val::Cap { .. } => {
             false
@@ -287,39 +287,11 @@ fn is_cap_authority_free(value: &Val) -> bool {
 
 fn compute_cap_status(env: &Env) -> (bool, Option<String>) {
     for (name, value) in env.bindings() {
-        if !is_cap_authority_free(&value) {
+        if !is_authority_free(&value) {
             return (false, Some(name));
         }
     }
     (true, None)
-}
-
-fn is_isolate_data_value(value: &Val) -> bool {
-    match value {
-        Val::Nil
-        | Val::Bool(_)
-        | Val::Int(_)
-        | Val::Float(_)
-        | Val::Str(_)
-        | Val::Sym(_)
-        | Val::Keyword(_)
-        | Val::Bytes(_) => true,
-        Val::List(items) | Val::Vector(items) | Val::Set(items) => {
-            items.iter().all(is_isolate_data_value)
-        }
-        Val::Map(m) => m
-            .iter()
-            .all(|(k, v)| is_isolate_data_value(k) && is_isolate_data_value(v)),
-        Val::Fn { .. }
-        | Val::Recur(_)
-        | Val::Macro { .. }
-        | Val::Effect { .. }
-        | Val::NativeFn { .. }
-        | Val::AsyncNativeFn { .. }
-        | Val::Resume(_)
-        | Val::Cap { .. }
-        | Val::Cell { .. } => false,
-    }
 }
 
 /// Evaluate a function/macro body, dispatching on `FnBody` variant.
@@ -2312,12 +2284,39 @@ pub fn eval_expr<'a, D: Dispatch>(
                                 }
                             }
                             "data" => {
-                                if !is_isolate_data_value(&value) {
-                                    return Err(error::type_mismatch(
-                                        "isolate data value",
-                                        "pure data",
-                                        &value,
-                                    ));
+                                match &value {
+                                    Val::Fn {
+                                        is_cap_free: false,
+                                        cap_violation: Some(name),
+                                        ..
+                                    } => {
+                                        return Err(error::internal(
+                                            "isolate data value",
+                                            format!(
+                                                "function carries capability authority via captured '{name}'"
+                                            ),
+                                        ));
+                                    }
+                                    Val::Macro {
+                                        is_cap_free: false,
+                                        cap_violation: Some(name),
+                                        ..
+                                    } => {
+                                        return Err(error::internal(
+                                            "isolate data value",
+                                            format!(
+                                                "macro carries capability authority via captured '{name}'"
+                                            ),
+                                        ));
+                                    }
+                                    other if !is_authority_free(other) => {
+                                        return Err(error::type_mismatch(
+                                            "isolate data value",
+                                            "pure data",
+                                            other,
+                                        ));
+                                    }
+                                    _ => {}
                                 }
                                 isolate_env.set(sym, value);
                             }
@@ -6746,6 +6745,67 @@ mod tests {
         let d = RecordingDispatch::new();
         let result = eval_str("(isolate {:env {:n (data 41)}} (+ n 1))", &mut env, &d);
         assert_eq!(result, Ok(Val::Int(42)));
+    }
+
+    #[test]
+    fn isolate_data_allows_cap_free_fn() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def add (fn [a b] (+ a b)))", &mut env, &d).unwrap();
+        let result = eval_str("(isolate {:env {:add (data add)}} (add 1 2))", &mut env, &d);
+        assert_eq!(result, Ok(Val::Int(3)));
+    }
+
+    #[test]
+    fn isolate_data_rejects_cap_bearing_fn_with_offender_name() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_test_cap("db", 1));
+        eval_str("(def ro (fn [k] (perform db :read k)))", &mut env, &d).unwrap();
+        let result = eval_str("(isolate {:env {:ro (data ro)}} (ro \"x\"))", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(
+            &result.unwrap_err(),
+            "function carries capability authority via captured 'db'"
+        ));
+    }
+
+    #[test]
+    fn isolate_data_allows_cap_free_macro() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(defmacro m [x] (list (quote +) x 1))", &mut env, &d).unwrap();
+        let result = eval_str("(isolate {:env {:m (data m)}} (m 41))", &mut env, &d);
+        assert_eq!(result, Ok(Val::Int(42)));
+    }
+
+    #[test]
+    fn isolate_data_rejects_cap_bearing_macro_with_offender_name() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("db".into(), make_test_cap("db", 1));
+        eval_str(
+            "(defmacro m [k] (list (quote perform) db :read k))",
+            &mut env,
+            &d,
+        )
+        .unwrap();
+        let result = eval_str("(isolate {:env {:m (data m)}} (m \"x\"))", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(
+            &result.unwrap_err(),
+            "macro carries capability authority via captured 'db'"
+        ));
+    }
+
+    #[test]
+    fn isolate_cap_wrapper_rejects_fn_value() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def add (fn [a b] (+ a b)))", &mut env, &d).unwrap();
+        let result = eval_str("(isolate {:env {:add (cap add)}} (add 1 2))", &mut env, &d);
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "isolate cap value"));
     }
 
     #[test]
