@@ -332,12 +332,6 @@ fn load_shell_identity() -> Result<(ed25519_dalek::SigningKey, PeerId)> {
 }
 
 async fn discover_mdns_candidates() -> Result<Vec<Candidate>> {
-    if std::env::var_os(TEST_DISCOVERY_ENV).is_none() {
-        // mDNS discovery is disabled in the hardened transport profile.
-        // Require an explicit address for shell connection.
-        return Ok(Vec::new());
-    }
-
     let keypair = libp2p::identity::Keypair::generate_ed25519();
     let client = ww::host::ClientSwarm::new(keypair)?;
 
@@ -366,6 +360,10 @@ async fn discover_mdns_candidates() -> Result<Vec<Candidate>> {
         }
     }
 
+    if candidates.is_empty() {
+        check_multicast_send_health()?;
+    }
+
     Ok(candidates
         .into_iter()
         .map(|(peer_id, addrs)| Candidate {
@@ -373,6 +371,24 @@ async fn discover_mdns_candidates() -> Result<Vec<Candidate>> {
             addrs,
         })
         .collect())
+}
+
+fn check_multicast_send_health() -> Result<()> {
+    use std::net::{Ipv4Addr, UdpSocket};
+
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .context("failed to create UDP socket for multicast health check")?;
+    let probe = socket.send_to(b"ww-mdns-probe", (Ipv4Addr::new(224, 0, 0, 251), 5353));
+    if let Err(err) = probe {
+        if err.kind() == std::io::ErrorKind::HostUnreachable {
+            bail!(
+                "mDNS probe send failed: {err}\n\
+                 This host is currently rejecting raw multicast sends.\n\
+                 On macOS, check Local Network permission for the app running this shell (e.g. Conductor/iTerm/Terminal), then retry."
+            );
+        }
+    }
+    Ok(())
 }
 
 fn discovery_candidates_override() -> Result<Option<Vec<Candidate>>> {
@@ -460,6 +476,10 @@ fn choose_candidate(
         if matches.len() == 1 {
             return ensure_candidate_addr(matches.remove(0));
         }
+    }
+
+    if let Some(candidate) = choose_by_locality(&candidates) {
+        return ensure_candidate_addr(candidate);
     }
 
     if interactive_tty {
@@ -574,6 +594,82 @@ fn ensure_candidate_addr(candidate: Candidate) -> Result<Candidate> {
         bail!("candidate has no dialable addresses");
     }
     Ok(candidate)
+}
+
+// Candidate locality preference for no-selector/no-identity shell discovery:
+// loopback > private LAN > direct public IP > unknown/direct name > relay.
+// Returns Some only when there is a unique best candidate.
+fn choose_by_locality(candidates: &[Candidate]) -> Option<Candidate> {
+    let mut best: Option<(usize, i8)> = None;
+    let mut tie = false;
+    for (idx, c) in candidates.iter().enumerate() {
+        let score = candidate_locality_score(c);
+        match best {
+            None => {
+                best = Some((idx, score));
+                tie = false;
+            }
+            Some((_, best_score)) if score > best_score => {
+                best = Some((idx, score));
+                tie = false;
+            }
+            Some((_, best_score)) if score == best_score => {
+                tie = true;
+            }
+            _ => {}
+        }
+    }
+    if tie {
+        None
+    } else {
+        best.map(|(idx, _)| candidates[idx].clone())
+    }
+}
+
+fn candidate_locality_score(candidate: &Candidate) -> i8 {
+    candidate
+        .addrs
+        .iter()
+        .map(addr_locality_score)
+        .max()
+        .unwrap_or(-100)
+}
+
+fn addr_locality_score(addr: &Multiaddr) -> i8 {
+    use std::net::IpAddr;
+
+    let mut ip: Option<IpAddr> = None;
+    let mut relay = false;
+
+    for p in addr.iter() {
+        match p {
+            Protocol::Ip4(v4) => ip = Some(IpAddr::V4(v4)),
+            Protocol::Ip6(v6) => ip = Some(IpAddr::V6(v6)),
+            Protocol::P2pCircuit => relay = true,
+            _ => {}
+        }
+    }
+
+    if relay {
+        return 0;
+    }
+
+    match ip {
+        Some(IpAddr::V4(v4)) if v4.is_loopback() => 5,
+        Some(IpAddr::V6(v6)) if v6.is_loopback() => 5,
+        Some(IpAddr::V4(v4))
+            if v4.is_private() || (v4.octets()[0] == 169 && v4.octets()[1] == 254) =>
+        {
+            4
+        }
+        Some(IpAddr::V6(v6))
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 || (v6.segments()[0] & 0xfe00) == 0xfc00 =>
+        {
+            4
+        }
+        Some(_) => 3,
+        None => 2,
+    }
 }
 
 fn peer_id_from_addr(addr: &Multiaddr) -> Option<PeerId> {
@@ -818,6 +914,66 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid multiaddr"), "{err}");
+    }
+
+    #[test]
+    fn choose_prefers_local_candidate_over_relay() {
+        let local_peer: PeerId = "12D3KooWJ3qM19qUUj8JdT9kPEg6VZLoes6eexfUYd6Xn7SPrf8n"
+            .parse()
+            .unwrap();
+        let relay_peer: PeerId = "12D3KooWQdQnZYK7hX8Q2Yb8qXWQYvdr4jRWk6TUhSxvVmF5vU3P"
+            .parse()
+            .unwrap();
+
+        let chosen = choose_candidate(
+            vec![
+                Candidate {
+                    peer_id: Some(relay_peer),
+                    addrs: vec![maddr(
+                        "/ip4/23.92.30.240/tcp/4001/p2p/12D3KooWQ9jBCBSvw13vETKe8sUVUx1y878qNrneNGTrHdKxenp1/p2p-circuit",
+                    )],
+                },
+                Candidate {
+                    peer_id: Some(local_peer),
+                    addrs: vec![maddr("/ip4/192.168.1.44/tcp/2025")],
+                },
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(chosen.peer_id, Some(local_peer));
+    }
+
+    #[test]
+    fn choose_prefers_loopback_over_lan() {
+        let lan_peer: PeerId = "12D3KooWJ3qM19qUUj8JdT9kPEg6VZLoes6eexfUYd6Xn7SPrf8n"
+            .parse()
+            .unwrap();
+        let loopback_peer: PeerId = "12D3KooWQdQnZYK7hX8Q2Yb8qXWQYvdr4jRWk6TUhSxvVmF5vU3P"
+            .parse()
+            .unwrap();
+
+        let chosen = choose_candidate(
+            vec![
+                Candidate {
+                    peer_id: Some(lan_peer),
+                    addrs: vec![maddr("/ip4/10.0.0.1/tcp/2025")],
+                },
+                Candidate {
+                    peer_id: Some(loopback_peer),
+                    addrs: vec![maddr("/ip4/127.0.0.1/tcp/2025")],
+                },
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(chosen.peer_id, Some(loopback_peer));
     }
 
     #[tokio::test]
