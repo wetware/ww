@@ -1,5 +1,13 @@
 # TODOs
 
+## AutoNAT v2: expose per-address reachability (follow-up after node-level parity)
+**What:** Extend runtime network state to expose per-address reachability outcomes from AutoNAT v2 probes, instead of only the node-level `NatReachability` enum.
+**Why:** Node-level state is enough for current relay/Kad policy, but operators and future policy layers may need richer diagnostics (which address was tested, by which server, and why it failed).
+**Context:** Current milestone intentionally keeps external API stable and projects v2 signals into node-level transitions with hysteresis. This follow-up should evaluate adding a structured address-level surface without destabilizing existing consumers.
+**Effort:** M
+**Priority:** P3
+**Depends on:** AutoNAT v2 node-level parity wiring
+
 ## Status cell: host.peers() blocks for ~20s on first request
 **What:** The std/status cell's first GET response takes ~20 seconds before returning. After that, subsequent responses are presumably fast (didn't measure). The latency is from `host_peer_count()` (`std/status/src/lib.rs:110-114`) calling `host.peers_request().send().promise.await` which blocks until the libp2p swarm has populated peer counts. On a freshly-deployed pod the swarm needs time to bootstrap to 300+ peers, so the first `host.peers()` call sits there.
 **Why:** Discovered while verifying the snap-hello-rs deploy on master.wetware.run (lthibault/ipns-mount-fix branch, 2026-05-04). curl to `/status` timed out at 15s; bumping curl timeout to 30s revealed the response did eventually return (200, peer_count=317, time_total=20.4s). The snap cell next door responds instantly because it doesn't make host calls. The 20s latency is invisible during normal operation but pathological at cold-start: any monitoring or readiness check that hits /status with a sub-15s timeout will flap.

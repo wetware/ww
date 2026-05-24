@@ -28,6 +28,13 @@ const MAX_RELAY_RESERVATIONS: usize = 2;
 /// The relay v2 hop protocol advertised by peers that can serve as relays.
 const RELAY_HOP_PROTOCOL: &str = "/libp2p/circuit/relay/0.2.0/hop";
 
+/// AutoNAT v2 hysteresis thresholds for node-level reachability decisions.
+///
+/// We intentionally require multiple consecutive outcomes to avoid flapping on
+/// transient network blips.
+const NAT_SUCCESS_THRESHOLD: u8 = 2;
+const NAT_FAILURE_THRESHOLD: u8 = 2;
+
 // ---------------------------------------------------------------------------
 // Dual DHT types
 // ---------------------------------------------------------------------------
@@ -42,6 +49,93 @@ enum DhtSource {
 /// Compound key for pending query maps.  Prevents collision between QueryId
 /// values from the two independent `kad::Behaviour` instances.
 type DhtQueryKey = (DhtSource, kad::QueryId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NatTransition {
+    from: NatReachability,
+    to: NatReachability,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NatPolicyState {
+    status: NatReachability,
+    consecutive_successes: u8,
+    consecutive_failures: u8,
+}
+
+impl NatPolicyState {
+    fn new() -> Self {
+        Self {
+            status: NatReachability::Unknown,
+            consecutive_successes: 0,
+            consecutive_failures: 0,
+        }
+    }
+
+    fn status(&self) -> NatReachability {
+        self.status
+    }
+
+    fn record_probe_result(&mut self, success: bool) -> Option<NatTransition> {
+        let from = self.status;
+        if success {
+            self.consecutive_successes = self.consecutive_successes.saturating_add(1);
+            self.consecutive_failures = 0;
+            if self.status != NatReachability::Public
+                && self.consecutive_successes >= NAT_SUCCESS_THRESHOLD
+            {
+                self.status = NatReachability::Public;
+            }
+        } else {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            self.consecutive_successes = 0;
+            if self.status != NatReachability::Private
+                && self.consecutive_failures >= NAT_FAILURE_THRESHOLD
+            {
+                self.status = NatReachability::Private;
+            }
+        }
+        if from != self.status {
+            Some(NatTransition {
+                from,
+                to: self.status,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NatTransitionActions {
+    set_status: NatReachability,
+    kad_mode: kad::Mode,
+    try_reserve_relay: bool,
+}
+
+fn actions_for_nat_transition(transition: NatTransition) -> NatTransitionActions {
+    match transition.to {
+        NatReachability::Public => NatTransitionActions {
+            set_status: NatReachability::Public,
+            kad_mode: kad::Mode::Server,
+            try_reserve_relay: false,
+        },
+        NatReachability::Private => NatTransitionActions {
+            set_status: NatReachability::Private,
+            kad_mode: kad::Mode::Client,
+            try_reserve_relay: true,
+        },
+        NatReachability::Unknown => NatTransitionActions {
+            set_status: NatReachability::Unknown,
+            kad_mode: if transition.from == NatReachability::Public {
+                kad::Mode::Client
+            } else {
+                kad::Mode::Server
+            },
+            try_reserve_relay: false,
+        },
+    }
+}
 
 /// Shared state for a logical `find_providers` request dispatched to both DHTs.
 ///
@@ -184,9 +278,6 @@ pub struct WetwareBehaviour {
     /// LAN Kademlia DHT server (`/ipfs/lan/kad/1.0.0`).
     /// Runs in server mode.  Bootstrapped against Kubo's private/loopback peers.
     pub kad_lan: kad::Behaviour<kad::store::MemoryStore>,
-    /// AutoNAT v1 client -- probes peers to determine NAT reachability.
-    /// Authoritative source for NAT status (has built-in threshold logic).
-    pub autonat: libp2p::autonat::v1::Behaviour,
     /// AutoNAT v2 client -- supplementary NAT probes for newer peers.
     pub autonat_v2: libp2p::autonat::v2::client::Behaviour,
     /// Relay client -- enables relayed connections and circuit addresses.
@@ -343,10 +434,6 @@ impl Libp2pHost {
                     stream: stream_behaviour,
                     kad: kad_wan,
                     kad_lan,
-                    autonat: libp2p::autonat::v1::Behaviour::new(
-                        local_peer_id,
-                        libp2p::autonat::v1::Config::default(),
-                    ),
                     autonat_v2: libp2p::autonat::v2::client::Behaviour::default(),
                     relay_client,
                     dcutr: libp2p::dcutr::Behaviour::new(local_peer_id),
@@ -414,9 +501,13 @@ impl Libp2pHost {
         let mut routed_peers: HashMap<u64, HashSet<PeerId>> = HashMap::new();
 
         // --- NAT traversal state ---
-        let mut nat_status = NatReachability::Unknown;
+        let mut nat_policy = NatPolicyState::new();
         let mut active_relay_reservations: usize = 0;
         let mut inflight_relay_requests: usize = 0;
+        // Relay reservation attempts not yet confirmed by ReservationReqAccepted.
+        // Keyed by relay peer id so we can unwind inflight counters on terminal
+        // failures (e.g. outgoing dial error / connection close before accept).
+        let mut pending_relay_attempts: HashMap<PeerId, usize> = HashMap::new();
         // Relay-capable peers discovered via Identify but not yet reserved.
         let mut relay_candidates: Vec<(PeerId, Multiaddr)> = Vec::new();
         // Peers already seen as relay candidates (dedup).
@@ -487,6 +578,7 @@ impl Libp2pHost {
                                     &mut relay_candidates,
                                     &mut active_relay_reservations,
                                     &mut inflight_relay_requests,
+                                    &mut pending_relay_attempts,
                                     &mut self.swarm,
                                 );
                             }
@@ -524,6 +616,11 @@ impl Libp2pHost {
                             network_state
                                 .set_known_peers(known_peers.values().cloned().collect())
                                 .await;
+                            clear_pending_relay_attempts(
+                                peer_id,
+                                &mut inflight_relay_requests,
+                                &mut pending_relay_attempts,
+                            );
                         }
                         SwarmEvent::OutgoingConnectionError {
                             peer_id: Some(peer_id),
@@ -535,6 +632,11 @@ impl Libp2pHost {
                                     let _ = sender.send(Err(error.to_string()));
                                 }
                             }
+                            clear_pending_relay_attempts(
+                                peer_id,
+                                &mut inflight_relay_requests,
+                                &mut pending_relay_attempts,
+                            );
                         }
                         // Classify new peer addresses into the correct DHT.
                         SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
@@ -599,33 +701,44 @@ impl Libp2pHost {
                         )) => {
                             handle_identify_received(
                                 peer_id, &info,
-                                nat_status,
+                                nat_policy.status(),
                                 &mut active_relay_reservations,
                                 &mut inflight_relay_requests,
+                                &mut pending_relay_attempts,
                                 &mut relay_candidates,
                                 &mut seen_relay_peers,
                                 &mut self.swarm,
                             );
                         }
                         SwarmEvent::Behaviour(WetwareBehaviourEvent::Identify(_)) => {}
-                        // --- AutoNAT v1: authoritative NAT status ---
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::Autonat(
-                            libp2p::autonat::v1::Event::StatusChanged { old, new },
-                        )) => {
-                            handle_autonat_v1_status(
-                                &old, &new,
-                                &mut nat_status,
-                                &mut self.swarm,
-                                &network_state,
-                                &mut active_relay_reservations,
-                                &mut inflight_relay_requests,
-                                &mut relay_candidates,
-                            ).await;
-                        }
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::Autonat(_)) => {}
                         // --- AutoNAT v2: supplementary probes ---
                         SwarmEvent::Behaviour(WetwareBehaviourEvent::AutonatV2(ev)) => {
-                            tracing::debug!("AutoNAT v2 probe: {ev:?}");
+                            let success = ev.result.is_ok();
+                            tracing::debug!(
+                                addr = %ev.tested_addr,
+                                server = %ev.server,
+                                success,
+                                "AutoNAT v2 probe"
+                            );
+                            if let Some(transition) = nat_policy.record_probe_result(success) {
+                                let actions = actions_for_nat_transition(transition);
+                                tracing::info!(
+                                    from = ?transition.from,
+                                    to = ?transition.to,
+                                    "AutoNAT v2 node reachability transition"
+                                );
+                                network_state.set_nat_status(actions.set_status).await;
+                                self.swarm.behaviour_mut().kad.set_mode(Some(actions.kad_mode));
+                                if actions.try_reserve_relay {
+                                    try_reserve_relay(
+                                        &mut relay_candidates,
+                                        &mut active_relay_reservations,
+                                        &mut inflight_relay_requests,
+                                        &mut pending_relay_attempts,
+                                        &mut self.swarm,
+                                    );
+                                }
+                            }
                         }
                         // --- Relay client ---
                         SwarmEvent::Behaviour(WetwareBehaviourEvent::RelayClient(
@@ -635,8 +748,11 @@ impl Libp2pHost {
                                 ..
                             },
                         )) => {
-                            inflight_relay_requests =
-                                inflight_relay_requests.saturating_sub(1);
+                            clear_pending_relay_attempts(
+                                relay_peer_id,
+                                &mut inflight_relay_requests,
+                                &mut pending_relay_attempts,
+                            );
                             if !renewal {
                                 active_relay_reservations =
                                     active_relay_reservations.saturating_add(1);
@@ -1035,6 +1151,7 @@ fn handle_identify_received(
     nat_status: NatReachability,
     active_relay_reservations: &mut usize,
     inflight_relay_requests: &mut usize,
+    pending_relay_attempts: &mut HashMap<PeerId, usize>,
     relay_candidates: &mut Vec<(PeerId, Multiaddr)>,
     seen_relay_peers: &mut HashSet<PeerId>,
     swarm: &mut libp2p::swarm::Swarm<WetwareBehaviour>,
@@ -1078,72 +1195,16 @@ fn handle_identify_received(
     // Try to reserve if we're NATted or status is unknown.
     // Count both active and in-flight to avoid overshooting the cap.
     if *active_relay_reservations + *inflight_relay_requests < MAX_RELAY_RESERVATIONS {
-        tracing::info!(
-            relay = %peer_id,
-            addr = %circuit_addr,
-            "Requesting relay reservation"
+        request_relay_reservation(
+            peer_id,
+            circuit_addr.clone(),
+            inflight_relay_requests,
+            pending_relay_attempts,
+            swarm,
         );
-        if let Err(e) = swarm.listen_on(circuit_addr.clone()) {
-            tracing::warn!(
-                relay = %peer_id,
-                error = %e,
-                "Failed to request relay reservation"
-            );
-        } else {
-            *inflight_relay_requests += 1;
-        }
     } else {
         // Save for later in case a reservation expires.
         relay_candidates.push((peer_id, circuit_addr));
-    }
-}
-
-/// Handle AutoNAT v1 status change.
-#[allow(clippy::too_many_arguments)]
-async fn handle_autonat_v1_status(
-    _old: &libp2p::autonat::v1::NatStatus,
-    new: &libp2p::autonat::v1::NatStatus,
-    nat_status: &mut NatReachability,
-    swarm: &mut libp2p::swarm::Swarm<WetwareBehaviour>,
-    network_state: &NetworkState,
-    active_relay_reservations: &mut usize,
-    inflight_relay_requests: &mut usize,
-    relay_candidates: &mut Vec<(PeerId, Multiaddr)>,
-) {
-    match new {
-        libp2p::autonat::v1::NatStatus::Public(addr) => {
-            if *nat_status != NatReachability::Public {
-                tracing::info!(%addr, "AutoNAT: confirmed public reachability");
-                *nat_status = NatReachability::Public;
-                network_state.set_nat_status(NatReachability::Public).await;
-                // Promote WAN Kad to server mode — we can serve DHT queries.
-                swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Server));
-                tracing::info!("WAN Kad promoted to server mode");
-            }
-        }
-        libp2p::autonat::v1::NatStatus::Private => {
-            if *nat_status != NatReachability::Private {
-                let was_public = *nat_status == NatReachability::Public;
-                tracing::info!(was_public, "AutoNAT: node is behind NAT, seeking relay");
-                *nat_status = NatReachability::Private;
-                network_state.set_nat_status(NatReachability::Private).await;
-                // Demote Kad back to client mode if we were previously public.
-                if was_public {
-                    swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Client));
-                    tracing::info!("WAN Kad demoted to client mode");
-                }
-                // Try to reserve from any candidates we've already seen.
-                try_reserve_relay(
-                    relay_candidates,
-                    active_relay_reservations,
-                    inflight_relay_requests,
-                    swarm,
-                );
-            }
-        }
-        libp2p::autonat::v1::NatStatus::Unknown => {
-            tracing::debug!("AutoNAT: status reset to Unknown");
-        }
     }
 }
 
@@ -1152,26 +1213,60 @@ fn try_reserve_relay(
     relay_candidates: &mut Vec<(PeerId, Multiaddr)>,
     active_relay_reservations: &mut usize,
     inflight_relay_requests: &mut usize,
+    pending_relay_attempts: &mut HashMap<PeerId, usize>,
     swarm: &mut libp2p::swarm::Swarm<WetwareBehaviour>,
 ) {
     while *active_relay_reservations + *inflight_relay_requests < MAX_RELAY_RESERVATIONS {
         let Some((peer_id, circuit_addr)) = relay_candidates.pop() else {
             break;
         };
+        request_relay_reservation(
+            peer_id,
+            circuit_addr,
+            inflight_relay_requests,
+            pending_relay_attempts,
+            swarm,
+        );
+    }
+}
+
+fn request_relay_reservation(
+    peer_id: PeerId,
+    circuit_addr: Multiaddr,
+    inflight_relay_requests: &mut usize,
+    pending_relay_attempts: &mut HashMap<PeerId, usize>,
+    swarm: &mut libp2p::swarm::Swarm<WetwareBehaviour>,
+) {
+    tracing::info!(
+        relay = %peer_id,
+        addr = %circuit_addr,
+        "Requesting relay reservation"
+    );
+    if let Err(e) = swarm.listen_on(circuit_addr) {
+        tracing::warn!(
+            relay = %peer_id,
+            error = %e,
+            "Failed to request relay reservation"
+        );
+    } else {
+        *inflight_relay_requests += 1;
+        *pending_relay_attempts.entry(peer_id).or_insert(0) += 1;
+    }
+}
+
+fn clear_pending_relay_attempts(
+    peer_id: PeerId,
+    inflight_relay_requests: &mut usize,
+    pending_relay_attempts: &mut HashMap<PeerId, usize>,
+) {
+    if let Some(count) = pending_relay_attempts.remove(&peer_id) {
+        *inflight_relay_requests = inflight_relay_requests.saturating_sub(count);
         tracing::info!(
             relay = %peer_id,
-            addr = %circuit_addr,
-            "Requesting relay reservation (from candidate pool)"
+            cleared = count,
+            inflight = *inflight_relay_requests,
+            "Cleared pending relay attempts"
         );
-        if let Err(e) = swarm.listen_on(circuit_addr) {
-            tracing::warn!(
-                relay = %peer_id,
-                error = %e,
-                "Failed to request relay reservation"
-            );
-        } else {
-            *inflight_relay_requests += 1;
-        }
     }
 }
 
@@ -1538,6 +1633,110 @@ mod tests {
         assert!(!is_relay_capable(&without_relay));
 
         assert!(!is_relay_capable(&[]));
+    }
+
+    #[test]
+    fn test_nat_policy_starts_unknown() {
+        let policy = NatPolicyState::new();
+        assert_eq!(policy.status(), NatReachability::Unknown);
+    }
+
+    #[test]
+    fn test_nat_policy_promotes_after_success_threshold() {
+        let mut policy = NatPolicyState::new();
+        assert_eq!(policy.record_probe_result(true), None);
+        let transition = policy.record_probe_result(true).expect("must transition");
+        assert_eq!(
+            transition,
+            NatTransition {
+                from: NatReachability::Unknown,
+                to: NatReachability::Public
+            }
+        );
+        assert_eq!(policy.status(), NatReachability::Public);
+    }
+
+    #[test]
+    fn test_nat_policy_demotes_after_failure_threshold() {
+        let mut policy = NatPolicyState::new();
+        policy.record_probe_result(true);
+        policy.record_probe_result(true);
+        assert_eq!(policy.status(), NatReachability::Public);
+
+        assert_eq!(policy.record_probe_result(false), None);
+        let transition = policy
+            .record_probe_result(false)
+            .expect("must transition after threshold");
+        assert_eq!(
+            transition,
+            NatTransition {
+                from: NatReachability::Public,
+                to: NatReachability::Private
+            }
+        );
+        assert_eq!(policy.status(), NatReachability::Private);
+    }
+
+    #[test]
+    fn test_nat_policy_hysteresis_prevents_flapping() {
+        let mut policy = NatPolicyState::new();
+        policy.record_probe_result(true);
+        policy.record_probe_result(true);
+        assert_eq!(policy.status(), NatReachability::Public);
+
+        // Single failure should not demote.
+        assert_eq!(policy.record_probe_result(false), None);
+        assert_eq!(policy.status(), NatReachability::Public);
+
+        // A success after one failure resets failure streak.
+        assert_eq!(policy.record_probe_result(true), None);
+        assert_eq!(policy.status(), NatReachability::Public);
+    }
+
+    #[test]
+    fn test_actions_for_public_transition() {
+        let actions = actions_for_nat_transition(NatTransition {
+            from: NatReachability::Unknown,
+            to: NatReachability::Public,
+        });
+        assert_eq!(
+            actions,
+            NatTransitionActions {
+                set_status: NatReachability::Public,
+                kad_mode: kad::Mode::Server,
+                try_reserve_relay: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_actions_for_private_transition() {
+        let actions = actions_for_nat_transition(NatTransition {
+            from: NatReachability::Public,
+            to: NatReachability::Private,
+        });
+        assert_eq!(
+            actions,
+            NatTransitionActions {
+                set_status: NatReachability::Private,
+                kad_mode: kad::Mode::Client,
+                try_reserve_relay: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_clear_pending_relay_attempts_unwinds_inflight() {
+        let peer: PeerId = "12D3KooWJ3qM19qUUj8JdT9kPEg6VZLoes6eexfUYd6Xn7SPrf8n"
+            .parse()
+            .unwrap();
+        let mut inflight = 3usize;
+        let mut pending = HashMap::new();
+        pending.insert(peer, 2usize);
+
+        clear_pending_relay_attempts(peer, &mut inflight, &mut pending);
+        assert_eq!(inflight, 1);
+        assert!(!pending.contains_key(&peer));
     }
 }
 
