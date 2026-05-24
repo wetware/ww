@@ -39,11 +39,9 @@ static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// `pop_frame` create and destroy child scopes (used by future `let` / `fn`
 /// special forms).
 ///
-/// The `handler_stack` is dynamic scope for the effect system. It is stored
-/// as `Rc<RefCell<...>>` so that clones (including closures via `snapshot()`)
-/// share the SAME handler stack. This means `perform` always sees the live
-/// handler stack of the current eval session, regardless of where the calling
-/// closure was defined.
+/// The `handler_stack` is dynamic scope for the effect system.
+/// Closures and macros use the caller's handler stack at invocation time,
+/// not the handler stack captured at definition time.
 #[derive(Debug, Clone)]
 pub struct Env {
     frames: Vec<Frame>,
@@ -150,8 +148,8 @@ impl Env {
         }
         Self {
             frames: vec![merged],
-            // Share the same handler stack — dynamic scope, not lexical.
-            // Closures see the handler stack of their call site.
+            // Keep the current stack on snapshots; invocation still routes through
+            // the caller's handler stack via `Env::for_call`.
             handler_stack: self.handler_stack.clone(),
         }
     }
@@ -178,7 +176,7 @@ impl Env {
     /// closures capture their own scope), this creates a new Env that COPIES
     /// only the captured snapshot's single frame (no deep clone of Val::Fn envs).
     /// The captured frame's Val::Fn values keep their Rc<Env> references shared.
-    pub fn for_call(captured: &Rc<Env>) -> Self {
+    pub fn for_call(captured: &Rc<Env>, caller_hs: &HandlerStack) -> Self {
         // The captured env is a snapshot (single frame).
         // Copy its bindings into a new env's root frame.
         // Val::Fn values inside are Rc-wrapped, so cloning them is O(1).
@@ -190,7 +188,7 @@ impl Env {
         }
         Self {
             frames: vec![root, Frame::new()], // root + param frame
-            handler_stack: captured.handler_stack.clone(),
+            handler_stack: caller_hs.clone(),
         }
     }
 }
@@ -565,6 +563,7 @@ async fn invoke_fn<'a, D: Dispatch>(
     captured_env: &'a Rc<Env>,
     args: &[Val],
     dispatch: &'a D,
+    caller_hs: HandlerStack,
 ) -> Result<Val, Val> {
     // Find matching arity: prefer exact fixed-arity match over variadic.
     // This ensures (fn ([x y] ...) ([x & rest] ...)) called with 2 args
@@ -594,7 +593,7 @@ async fn invoke_fn<'a, D: Dispatch>(
     // Build fn environment: captured env + new frame with param bindings.
     // Uses Env::for_call to avoid infinite recursion from Env::clone when
     // closures capture their own scope.
-    let mut fn_env = Env::for_call(captured_env);
+    let mut fn_env = Env::for_call(captured_env, &caller_hs);
 
     // Bind positional params
     for (name, val) in arity.params.iter().zip(args.iter()) {
@@ -659,68 +658,7 @@ async fn invoke_fn_with_handler_stack<'a, D: Dispatch>(
     dispatch: &'a D,
     handler_stack: HandlerStack,
 ) -> Result<Val, Val> {
-    let arity = arities
-        .iter()
-        .find(|a| a.variadic.is_none() && args.len() == a.params.len())
-        .or_else(|| {
-            arities
-                .iter()
-                .find(|a| a.variadic.is_some() && args.len() >= a.params.len())
-        })
-        .ok_or_else(|| {
-            let expected: Vec<String> = arities
-                .iter()
-                .map(|a| {
-                    if a.variadic.is_some() {
-                        format!("{}+", a.params.len())
-                    } else {
-                        a.params.len().to_string()
-                    }
-                })
-                .collect();
-            error::arity("fn", &expected.join(" or "), args.len())
-        })?;
-
-    let mut fn_env = Env::for_call(captured_env);
-    fn_env.handler_stack = handler_stack;
-
-    for (name, val) in arity.params.iter().zip(args.iter()) {
-        fn_env.set(name.clone(), val.clone());
-    }
-    if let Some(rest_name) = &arity.variadic {
-        let rest_args: Vec<Val> = args[arity.params.len()..].to_vec();
-        fn_env.set(rest_name.clone(), Val::List(rest_args));
-    }
-
-    let recur_arity = arity.params.len() + usize::from(arity.variadic.is_some());
-    let result = async {
-        loop {
-            let result = eval_fn_body(&arity.body, &mut fn_env, dispatch).await?;
-            match result {
-                Val::Recur(new_vals) => {
-                    if new_vals.len() != recur_arity {
-                        return Err(error::arity(
-                            "recur",
-                            &recur_arity.to_string(),
-                            new_vals.len(),
-                        ));
-                    }
-                    for (name, val) in arity.params.iter().zip(new_vals.iter()) {
-                        fn_env.set(name.clone(), val.clone());
-                    }
-                    if let Some(rest_name) = &arity.variadic {
-                        let rest_val = new_vals[arity.params.len()].clone();
-                        fn_env.set(rest_name.clone(), rest_val);
-                    }
-                }
-                other => return Ok(other),
-            }
-        }
-    }
-    .await;
-
-    fn_env.pop_frame();
-    result
+    invoke_fn(arities, captured_env, args, dispatch, handler_stack).await
 }
 
 /// Parse macro/fn arity definitions from raw Val args.
@@ -826,9 +764,10 @@ async fn eval_defmacro(args: &[Val], env: &mut Env) -> Result<Val, Val> {
 /// that the caller will re-evaluate in their own env.
 async fn invoke_macro<'a, D: Dispatch>(
     arities: &'a [FnArity],
-    captured_env: &'a Env,
+    captured_env: &'a Rc<Env>,
     raw_args: &[Val],
     dispatch: &'a D,
+    caller_hs: HandlerStack,
 ) -> Result<Val, Val> {
     // Find matching arity (same logic as invoke_fn)
     let arity = arities
@@ -854,8 +793,7 @@ async fn invoke_macro<'a, D: Dispatch>(
         })?;
 
     // Build macro environment: captured env + new frame with raw arg bindings
-    let mut macro_env = captured_env.clone();
-    macro_env.push_frame();
+    let mut macro_env = Env::for_call(captured_env, &caller_hs);
 
     // Bind positional params to RAW (unevaluated) args
     for (name, val) in arity.params.iter().zip(raw_args.iter()) {
@@ -973,7 +911,7 @@ async fn eval_recur<'a, D: Dispatch>(
 async fn eval_hof<'a, D: Dispatch>(
     name: &str,
     args: &[Val],
-    _env: &'a mut Env,
+    env: &'a mut Env,
     dispatch: &'a D,
 ) -> Result<Val, Val> {
     match name {
@@ -990,6 +928,7 @@ async fn eval_hof<'a, D: Dispatch>(
                     &captured_env,
                     std::slice::from_ref(item),
                     dispatch,
+                    env.handler_stack.clone(),
                 )
                 .await?;
                 result.push(val);
@@ -1009,6 +948,7 @@ async fn eval_hof<'a, D: Dispatch>(
                     &captured_env,
                     std::slice::from_ref(item),
                     dispatch,
+                    env.handler_stack.clone(),
                 )
                 .await?;
                 let keep = !matches!(val, Val::Nil | Val::Bool(false));
@@ -1037,7 +977,14 @@ async fn eval_hof<'a, D: Dispatch>(
                 (items[0].clone(), &items[1..])
             };
             for item in items {
-                acc = invoke_fn(&arities, &captured_env, &[acc, item.clone()], dispatch).await?;
+                acc = invoke_fn(
+                    &arities,
+                    &captured_env,
+                    &[acc, item.clone()],
+                    dispatch,
+                    env.handler_stack.clone(),
+                )
+                .await?;
             }
             Ok(acc)
         }
@@ -1849,6 +1796,7 @@ pub fn eval_expr<'a, D: Dispatch>(
 
                 // Depth check.
                 let hs = env.handler_stack.clone();
+                let caller_hs = hs.clone();
                 if hs.borrow().len() >= effect::MAX_HANDLER_DEPTH {
                     return Err(error::internal(
                         "with-effect-handler",
@@ -1924,24 +1872,28 @@ pub fn eval_expr<'a, D: Dispatch>(
                                                             let resume_fn =
                                                                 effect::make_resume_fn(resume_tx);
                                                             let args = vec![data, resume_fn];
+                                                            let handler_hs = caller_hs.clone();
                                                             Box::pin(async move {
                                                                 invoke_fn(
                                                                     &owned_arities,
                                                                     &owned_env,
                                                                     &args,
                                                                     dispatch,
+                                                                    handler_hs,
                                                                 )
                                                                 .await
                                                             })
                                                         } else {
                                                             drop(resume_tx);
                                                             let args = vec![data];
+                                                            let handler_hs = caller_hs.clone();
                                                             Box::pin(async move {
                                                                 invoke_fn(
                                                                     &owned_arities,
                                                                     &owned_env,
                                                                     &args,
                                                                     dispatch,
+                                                                    handler_hs,
                                                                 )
                                                                 .await
                                                             })
@@ -2365,8 +2317,14 @@ pub fn eval_expr<'a, D: Dispatch>(
                 {
                     let arities = arities.clone();
                     let captured_env = captured_env.clone();
-                    let expanded =
-                        invoke_macro(&arities, &captured_env, raw_args, dispatch).await?;
+                    let expanded = invoke_macro(
+                        &arities,
+                        &captured_env,
+                        raw_args,
+                        dispatch,
+                        env.handler_stack.clone(),
+                    )
+                    .await?;
                     // Re-analyze and eval the expanded form
                     let analyzed = expr::analyze(&expanded)?;
                     return eval_expr(&analyzed, env, dispatch).await;
@@ -2382,7 +2340,14 @@ pub fn eval_expr<'a, D: Dispatch>(
                     let arities = arities.clone();
                     let captured_env = captured_env.clone();
                     let evaled_args = eval_expr_args(args, env, dispatch).await?;
-                    return invoke_fn(&arities, &captured_env, &evaled_args, dispatch).await;
+                    return invoke_fn(
+                        &arities,
+                        &captured_env,
+                        &evaled_args,
+                        dispatch,
+                        env.handler_stack.clone(),
+                    )
+                    .await;
                 }
                 if let Some(Val::NativeFn { func, .. }) = env.get(head) {
                     let func = func.clone();
@@ -2473,7 +2438,14 @@ pub fn eval_expr<'a, D: Dispatch>(
                         {
                             let arities = arities.clone();
                             let captured_env = captured_env.clone();
-                            return invoke_fn(&arities, &captured_env, &spread, dispatch).await;
+                            return invoke_fn(
+                                &arities,
+                                &captured_env,
+                                &spread,
+                                dispatch,
+                                env.handler_stack.clone(),
+                            )
+                            .await;
                         }
                         if let Some(Val::NativeFn { func, .. }) = env.get(fname) {
                             return func.clone()(&spread);
@@ -2493,7 +2465,14 @@ pub fn eval_expr<'a, D: Dispatch>(
                     } => {
                         let arities = arities.clone();
                         let captured_env = captured_env.clone();
-                        invoke_fn(&arities, &captured_env, &spread, dispatch).await
+                        invoke_fn(
+                            &arities,
+                            &captured_env,
+                            &spread,
+                            dispatch,
+                            env.handler_stack.clone(),
+                        )
+                        .await
                     }
                     Val::NativeFn { func, .. } => func(&spread),
                     Val::AsyncNativeFn { func, .. } => func(spread).await,
@@ -2758,8 +2737,14 @@ pub fn eval<'a, D: Dispatch>(
                     let arities = arities.clone();
                     let captured_env = captured_env.clone();
                     // Macro receives RAW (unevaluated) args, body runs in captured env
-                    let expanded =
-                        invoke_macro(&arities, &captured_env, raw_args, dispatch).await?;
+                    let expanded = invoke_macro(
+                        &arities,
+                        &captured_env,
+                        raw_args,
+                        dispatch,
+                        env.handler_stack.clone(),
+                    )
+                    .await?;
                     // Re-evaluate the expanded form in the CALLER's env
                     return eval(&expanded, env, dispatch).await;
                 }
@@ -2774,7 +2759,14 @@ pub fn eval<'a, D: Dispatch>(
                     let arities = arities.clone();
                     let captured_env = captured_env.clone();
                     let args = eval_args(raw_args, env, dispatch).await?;
-                    return invoke_fn(&arities, &captured_env, &args, dispatch).await;
+                    return invoke_fn(
+                        &arities,
+                        &captured_env,
+                        &args,
+                        dispatch,
+                        env.handler_stack.clone(),
+                    )
+                    .await;
                 }
 
                 // --- Built-in: apply (needs re-dispatch, so handled here) ---
@@ -2812,7 +2804,14 @@ pub fn eval<'a, D: Dispatch>(
                             {
                                 let arities = arities.clone();
                                 let captured_env = captured_env.clone();
-                                return invoke_fn(&arities, &captured_env, &spread, dispatch).await;
+                                return invoke_fn(
+                                    &arities,
+                                    &captured_env,
+                                    &spread,
+                                    dispatch,
+                                    env.handler_stack.clone(),
+                                )
+                                .await;
                             }
                             if let Some(result) = eval_builtin(fname, &spread) {
                                 return result;
@@ -2826,7 +2825,14 @@ pub fn eval<'a, D: Dispatch>(
                         } => {
                             let arities = arities.clone();
                             let captured_env = captured_env.clone();
-                            return invoke_fn(&arities, &captured_env, &spread, dispatch).await;
+                            return invoke_fn(
+                                &arities,
+                                &captured_env,
+                                &spread,
+                                dispatch,
+                                env.handler_stack.clone(),
+                            )
+                            .await;
                         }
                         other => {
                             return Err(error::type_mismatch(
@@ -6806,6 +6812,92 @@ mod tests {
         let result = eval_str("(isolate {:env {:add (cap add)}} (add 1 2))", &mut env, &d);
         assert!(result.is_err());
         assert!(err_contains(&result.unwrap_err(), "isolate cap value"));
+    }
+
+    #[test]
+    fn isolate_closure_effect_unhandled_without_isolate_handler() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def logger (fn [msg] (perform :log msg)))", &mut env, &d).unwrap();
+        let result = eval_str(
+            "(isolate {:env {:logger (data logger)}} (logger \"x\"))",
+            &mut env,
+            &d,
+        );
+        assert!(matches!(
+            result,
+            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+        ));
+    }
+
+    #[test]
+    fn isolate_closure_effect_handled_by_isolate_handler() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def logger (fn [msg] (perform :log msg)))", &mut env, &d).unwrap();
+        eval_str("(def logh (fn [msg] (str \"handled:\" msg)))", &mut env, &d).unwrap();
+        let result = eval_str(
+            "(isolate {:env {:logger (data logger) :logh (data logh)}}
+               (with-effect-handler :log logh (logger \"x\")))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Str("handled:x".into())));
+    }
+
+    #[test]
+    fn isolate_blocks_handler_stack_smuggling_from_outer_scope() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def logger (fn [msg] (perform :log msg)))", &mut env, &d).unwrap();
+        let result = eval_str(
+            "(with-effect-handler :log (fn [msg] :outer)
+               (isolate {:env {:logger (data logger)}} (logger \"x\")))",
+            &mut env,
+            &d,
+        );
+        assert!(matches!(
+            result,
+            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+        ));
+    }
+
+    #[test]
+    fn isolate_macro_expansion_uses_isolate_handler_stack() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str(
+            "(defmacro m [x] (list (quote perform) :log x))",
+            &mut env,
+            &d,
+        )
+        .unwrap();
+        let result = eval_str(
+            "(with-effect-handler :log (fn [msg] :outer)
+               (isolate {:env {:m (data m)}} (m \"x\")))",
+            &mut env,
+            &d,
+        );
+        assert!(matches!(
+            result,
+            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+        ));
+    }
+
+    #[test]
+    fn isolate_transitive_closure_calls_use_isolate_handler_stack() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        eval_str("(def g (fn [msg] (perform :log msg)))", &mut env, &d).unwrap();
+        eval_str("(def f (fn [msg] (g msg)))", &mut env, &d).unwrap();
+        eval_str("(def logh (fn [msg] (str \"iso:\" msg)))", &mut env, &d).unwrap();
+        let result = eval_str(
+            "(isolate {:env {:f (data f) :g (data g) :logh (data logh)}}
+               (with-effect-handler :log logh (f \"x\")))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Str("iso:x".into())));
     }
 
     #[test]

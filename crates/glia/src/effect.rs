@@ -1,7 +1,8 @@
 //! Effect system infrastructure — types and helpers for `perform`/`with-handler`/`resume`.
 //!
-//! The handler stack is dynamic scope (NOT stored in Env). It's a shared
-//! `Rc<RefCell<Vec<...>>>` passed alongside env through all eval calls.
+//! The handler stack is dynamic scope and flows through the caller's eval env.
+//! Closures/macros invoked across lexical boundaries still use the caller's
+//! current handler stack at invocation/expansion time.
 
 use crate::oneshot;
 use crate::Val;
