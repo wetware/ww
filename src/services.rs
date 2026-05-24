@@ -189,8 +189,10 @@ impl ExecutorPool {
         wasm_config.async_support(true);
         wasm_config.consume_fuel(true);
         wasm_config.epoch_interruption(true);
-        let engine =
-            Arc::new(Engine::new(&wasm_config).context("failed to create shared wasmtime engine")?);
+        let engine = Arc::new(
+            Engine::new(&wasm_config)
+                .map_err(|e| anyhow::anyhow!("failed to create shared wasmtime engine: {e}"))?,
+        );
 
         let mut senders = Vec::with_capacity(n);
         let mut threads = Vec::with_capacity(n);

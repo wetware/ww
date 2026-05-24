@@ -525,7 +525,7 @@ impl types::HostDescriptor for IpfsFilesystemView<'_> {
             .await
     }
 
-    fn drop(&mut self, fd: Resource<types::Descriptor>) -> anyhow::Result<()> {
+    fn drop(&mut self, fd: Resource<types::Descriptor>) -> wasmtime::Result<()> {
         self.as_wasi_view().drop(fd)
     }
 
@@ -603,7 +603,7 @@ impl types::HostDescriptor for IpfsFilesystemView<'_> {
         &mut self,
         a: Resource<types::Descriptor>,
         b: Resource<types::Descriptor>,
-    ) -> anyhow::Result<bool> {
+    ) -> wasmtime::Result<bool> {
         self.as_wasi_view().is_same_object(a, b).await
     }
 
@@ -629,14 +629,14 @@ impl types::HostDescriptor for IpfsFilesystemView<'_> {
 // ── Host trait (error code conversion) ─────────────────────────────
 
 impl types::Host for IpfsFilesystemView<'_> {
-    fn convert_error_code(&mut self, err: FsError) -> anyhow::Result<types::ErrorCode> {
+    fn convert_error_code(&mut self, err: FsError) -> wasmtime::Result<types::ErrorCode> {
         self.as_wasi_view().convert_error_code(err)
     }
 
     fn filesystem_error_code(
         &mut self,
-        err: Resource<anyhow::Error>,
-    ) -> anyhow::Result<Option<types::ErrorCode>> {
+        err: Resource<wasmtime::Error>,
+    ) -> wasmtime::Result<Option<types::ErrorCode>> {
         self.as_wasi_view().filesystem_error_code(err)
     }
 }
@@ -651,7 +651,7 @@ impl types::HostDirectoryEntryStream for IpfsFilesystemView<'_> {
         self.as_wasi_view().read_directory_entry(stream).await
     }
 
-    fn drop(&mut self, stream: Resource<types::DirectoryEntryStream>) -> anyhow::Result<()> {
+    fn drop(&mut self, stream: Resource<types::DirectoryEntryStream>) -> wasmtime::Result<()> {
         types::HostDirectoryEntryStream::drop(&mut self.as_wasi_view(), stream)
     }
 }
