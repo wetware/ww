@@ -1639,7 +1639,7 @@ impl ClientSwarm {
     /// peer ID is not known upfront).
     pub async fn run(
         mut self,
-        connected_tx: Option<tokio::sync::oneshot::Sender<PeerId>>,
+        connected_tx: Option<tokio::sync::oneshot::Sender<Result<PeerId, String>>>,
         discovered_tx: Option<tokio::sync::mpsc::UnboundedSender<(PeerId, Multiaddr)>>,
     ) {
         use libp2p::swarm::SwarmEvent;
@@ -1650,7 +1650,7 @@ impl ClientSwarm {
                 Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {
                     tracing::debug!(peer = %peer_id, "Client connection established");
                     if let Some(tx) = connected_tx.take() {
-                        let _ = tx.send(peer_id);
+                        let _ = tx.send(Ok(peer_id));
                     }
                 }
                 Some(SwarmEvent::ConnectionClosed { peer_id, .. }) => {
@@ -1661,6 +1661,9 @@ impl ClientSwarm {
                         peer = ?peer_id,
                         "Client outgoing connection error: {error}"
                     );
+                    if let Some(tx) = connected_tx.take() {
+                        let _ = tx.send(Err(format!("{error}")));
+                    }
                 }
                 Some(_) => {} // Ignore other events
                 None => break,
