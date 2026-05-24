@@ -18,6 +18,7 @@
 //! ```
 
 use crate::Val;
+use std::collections::BTreeSet;
 
 #[cfg(test)]
 use crate::ValMap;
@@ -54,6 +55,37 @@ pub enum Pattern {
     /// Extra keys are ignored (asymmetric with Vector's exact-length matching
     /// because maps are unordered key-value stores, not positional).
     Map(Vec<(Val, Pattern)>),
+}
+
+impl Pattern {
+    /// Return all names this pattern binds.
+    pub fn bound_names(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        self.collect_bound_names(&mut out);
+        out
+    }
+
+    fn collect_bound_names(&self, out: &mut BTreeSet<String>) {
+        match self {
+            Pattern::Wildcard | Pattern::Literal(_) => {}
+            Pattern::Bind(name) => {
+                out.insert(name.clone());
+            }
+            Pattern::Vector { elements, rest } => {
+                for element in elements {
+                    element.collect_bound_names(out);
+                }
+                if let Some(rest_pattern) = rest {
+                    rest_pattern.collect_bound_names(out);
+                }
+            }
+            Pattern::Map(pairs) => {
+                for (_key, pattern) in pairs {
+                    pattern.collect_bound_names(out);
+                }
+            }
+        }
+    }
 }
 
 /// A parameter in fn/loop — either a simple name or a destructuring pattern.
@@ -395,6 +427,33 @@ mod tests {
             Val::Sym("extra".into()),
         ]));
         assert!(result.is_err());
+    }
+
+    // --- bound_names tests ---
+
+    #[test]
+    fn bound_names_simple_bind() {
+        let pattern = Pattern::Bind("x".into());
+        assert_eq!(pattern.bound_names(), BTreeSet::from(["x".to_string()]));
+    }
+
+    #[test]
+    fn bound_names_nested_vector_map() {
+        let pattern = Pattern::Vector {
+            elements: vec![
+                Pattern::Bind("a".into()),
+                Pattern::Map(vec![
+                    (Val::Keyword("k".into()), Pattern::Bind("b".into())),
+                    (Val::Keyword("skip".into()), Pattern::Wildcard),
+                ]),
+            ],
+            rest: Some(Box::new(Pattern::Bind("rest".into()))),
+        };
+
+        assert_eq!(
+            pattern.bound_names(),
+            BTreeSet::from(["a".to_string(), "b".to_string(), "rest".to_string()])
+        );
     }
 
     // --- match_pattern tests ---

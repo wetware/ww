@@ -9,6 +9,7 @@
 //! definition time (stored as `FnBody::Analyzed`), not re-analyzed on every call.
 
 use crate::Val;
+use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -111,12 +112,163 @@ pub enum Expr {
     Set(Vec<Expr>),
 }
 
+impl Expr {
+    /// Return the set of free lexical variables referenced by this expression.
+    pub fn free_vars(&self) -> BTreeSet<String> {
+        fn union_exprs(exprs: &[Expr]) -> BTreeSet<String> {
+            let mut out = BTreeSet::new();
+            for expr in exprs {
+                out.extend(expr.free_vars());
+            }
+            out
+        }
+
+        fn free_vars_in_raw_val(value: &Val) -> BTreeSet<String> {
+            match value {
+                Val::Sym(name) => BTreeSet::from([name.clone()]),
+                Val::List(items) | Val::Vector(items) | Val::Set(items) => {
+                    let mut out = BTreeSet::new();
+                    for item in items {
+                        out.extend(free_vars_in_raw_val(item));
+                    }
+                    out
+                }
+                Val::Map(map) => {
+                    let mut out = BTreeSet::new();
+                    for (key, value) in map.iter() {
+                        out.extend(free_vars_in_raw_val(key));
+                        out.extend(free_vars_in_raw_val(value));
+                    }
+                    out
+                }
+                Val::Nil
+                | Val::Bool(_)
+                | Val::Int(_)
+                | Val::Float(_)
+                | Val::Str(_)
+                | Val::Keyword(_)
+                | Val::Bytes(_)
+                | Val::Fn { .. }
+                | Val::Recur(_)
+                | Val::Macro { .. }
+                | Val::Effect { .. }
+                | Val::NativeFn { .. }
+                | Val::AsyncNativeFn { .. }
+                | Val::Resume(_)
+                | Val::Cap { .. }
+                | Val::Cell { .. } => BTreeSet::new(),
+            }
+        }
+
+        fn bound_names(binding: &crate::pattern::LetBinding) -> BTreeSet<String> {
+            match binding {
+                crate::pattern::LetBinding::Simple(name) => BTreeSet::from([name.clone()]),
+                crate::pattern::LetBinding::Destructure(pattern) => pattern.bound_names(),
+            }
+        }
+
+        match self {
+            Expr::Const(_) | Expr::Quote(_) => BTreeSet::new(),
+            Expr::Sym(name) => BTreeSet::from([name.clone()]),
+            Expr::Def { name: _, value } => value.free_vars(),
+            Expr::If { test, then, else_ } => {
+                let mut out = test.free_vars();
+                out.extend(then.free_vars());
+                out.extend(else_.free_vars());
+                out
+            }
+            Expr::Do { body } => union_exprs(body),
+            Expr::Let { bindings, body } | Expr::Loop { bindings, body } => {
+                let mut bound = BTreeSet::new();
+                let mut free = BTreeSet::new();
+
+                for (binding, init_expr) in bindings {
+                    for name in init_expr.free_vars() {
+                        if !bound.contains(&name) {
+                            free.insert(name);
+                        }
+                    }
+                    bound.extend(bound_names(binding));
+                }
+
+                for expr in body {
+                    for name in expr.free_vars() {
+                        if !bound.contains(&name) {
+                            free.insert(name);
+                        }
+                    }
+                }
+
+                free
+            }
+            Expr::Fn { arities } => {
+                let mut out = BTreeSet::new();
+                for arity in arities {
+                    out.extend(arity.free_vars.clone());
+                }
+                out
+            }
+            Expr::Recur { args } => union_exprs(args),
+            Expr::DefMacro { name: _, raw_args } => {
+                let mut out = BTreeSet::new();
+                for arg in raw_args {
+                    out.extend(free_vars_in_raw_val(arg));
+                }
+                out
+            }
+            Expr::Perform { target, args } => {
+                let mut out = target.free_vars();
+                out.extend(union_exprs(args));
+                out
+            }
+            Expr::WithEffectHandler {
+                target,
+                handler,
+                body,
+            } => {
+                let mut out = target.free_vars();
+                out.extend(handler.free_vars());
+                out.extend(union_exprs(body));
+                out
+            }
+            Expr::Match { expr, clauses } => {
+                let mut out = expr.free_vars();
+                for (pattern, body) in clauses {
+                    let clause_bound = pattern.bound_names();
+                    for name in body.free_vars() {
+                        if !clause_bound.contains(&name) {
+                            out.insert(name);
+                        }
+                    }
+                }
+                out
+            }
+            Expr::Call { head, args, .. } => {
+                let mut out = BTreeSet::from([head.clone()]);
+                out.extend(union_exprs(args));
+                out
+            }
+            Expr::Apply { args } => union_exprs(args),
+            Expr::Vector(items) | Expr::Set(items) => union_exprs(items),
+            Expr::Map(pairs) => {
+                let mut out = BTreeSet::new();
+                for (key, value) in pairs {
+                    out.extend(key.free_vars());
+                    out.extend(value.free_vars());
+                }
+                out
+            }
+        }
+    }
+}
+
 /// An analyzed function arity — body forms are pre-analyzed Expr.
 #[derive(Debug, Clone)]
 pub struct FnArityExpr {
     pub params: Vec<String>,
     pub variadic: Option<String>,
     pub body: Vec<Expr>,
+    pub free_vars: BTreeSet<String>,
 }
 
 /// Fn body storage: raw Val (macro-produced) or pre-analyzed Expr.
@@ -395,10 +547,21 @@ fn analyze_fn_arity(param_vec: &[Val], body: &[Val]) -> Result<FnArityExpr, Stri
         i += 1;
     }
     let analyzed_body = body.iter().map(analyze).collect::<Result<Vec<_>, _>>()?;
+    let mut free_vars = BTreeSet::new();
+    for expr in &analyzed_body {
+        free_vars.extend(expr.free_vars());
+    }
+    for param in &params {
+        free_vars.remove(param);
+    }
+    if let Some(rest_name) = &variadic {
+        free_vars.remove(rest_name);
+    }
     Ok(FnArityExpr {
         params,
         variadic,
         body: analyzed_body,
+        free_vars,
     })
 }
 
@@ -639,10 +802,19 @@ fn analyze_match(args: &[Val]) -> Result<Expr, String> {
 mod tests {
     use super::*;
     use crate::read;
+    use std::collections::BTreeSet;
 
     fn analyze_str(input: &str) -> Result<Expr, String> {
         let val = read(input).map_err(|e| format!("parse: {e}"))?;
         analyze(&val)
+    }
+
+    fn free_vars_str(input: &str) -> BTreeSet<String> {
+        analyze_str(input).unwrap().free_vars()
+    }
+
+    fn fv(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
     }
 
     #[test]
@@ -944,5 +1116,94 @@ mod tests {
             }
             other => panic!("expected WithEffectHandler, got {other:?}"),
         }
+    }
+
+    // --- free_vars tests ---
+
+    #[test]
+    fn free_vars_quote_is_empty() {
+        assert_eq!(free_vars_str("(quote x)"), BTreeSet::new());
+    }
+
+    #[test]
+    fn free_vars_symbol_is_self() {
+        assert_eq!(free_vars_str("x"), fv(&["x"]));
+    }
+
+    #[test]
+    fn free_vars_def_ignores_name_binding() {
+        assert_eq!(free_vars_str("(def x y)"), fv(&["y"]));
+    }
+
+    #[test]
+    fn free_vars_let_is_sequential_shadowing() {
+        assert_eq!(free_vars_str("(let [x x] x)"), fv(&["x"]));
+    }
+
+    #[test]
+    fn free_vars_let_is_sequential_prior_binding_visible() {
+        assert_eq!(free_vars_str("(let [x 1 y x] y)"), BTreeSet::new());
+    }
+
+    #[test]
+    fn free_vars_loop_is_sequential() {
+        assert_eq!(free_vars_str("(loop [x 1 y x] y)"), BTreeSet::new());
+    }
+
+    #[test]
+    fn free_vars_nested_fn_shadowing() {
+        assert_eq!(free_vars_str("(fn [x] (fn [x] x))"), BTreeSet::new());
+    }
+
+    #[test]
+    fn free_vars_fn_multi_arity_union() {
+        assert_eq!(free_vars_str("(fn ([x] y) ([x y] z))"), fv(&["y", "z"]));
+    }
+
+    #[test]
+    fn free_vars_fn_variadic_subtracts_rest() {
+        assert_eq!(free_vars_str("(fn [a & rest] (foo a rest))"), fv(&["foo"]));
+    }
+
+    #[test]
+    fn free_vars_match_clause_pattern_shadowing() {
+        assert_eq!(free_vars_str("(match v [x] x _ y)"), fv(&["v", "y"]));
+    }
+
+    #[test]
+    fn free_vars_let_destructure_binds_pattern_names() {
+        assert_eq!(free_vars_str("(let [[a b] xs] a)"), fv(&["xs"]));
+    }
+
+    #[test]
+    fn free_vars_call_includes_head_lookup() {
+        assert_eq!(free_vars_str("(f x y)"), fv(&["f", "x", "y"]));
+    }
+
+    #[test]
+    fn free_vars_apply_unions_args() {
+        assert_eq!(free_vars_str("(apply f xs ys)"), fv(&["f", "xs", "ys"]));
+    }
+
+    #[test]
+    fn free_vars_perform_unions_target_and_args() {
+        assert_eq!(
+            free_vars_str("(perform target x y)"),
+            fv(&["target", "x", "y"])
+        );
+    }
+
+    #[test]
+    fn free_vars_with_effect_handler_unions_parts() {
+        assert_eq!(
+            free_vars_str("(with-effect-handler target handler body)"),
+            fv(&["target", "handler", "body"])
+        );
+    }
+
+    #[test]
+    fn free_vars_defmacro_name_not_treated_as_lexically_bound() {
+        let vars = free_vars_str("(defmacro m [x] m)");
+        assert!(vars.contains("m"));
     }
 }
