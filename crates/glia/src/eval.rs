@@ -154,6 +154,22 @@ impl Env {
         }
     }
 
+    /// Return a snapshot filtered to a set of binding names.
+    ///
+    /// Names not present in this env are ignored.
+    pub fn filter_to(&self, names: BTreeSet<&String>) -> Self {
+        let mut filtered = Frame::new();
+        for name in names {
+            if let Some(value) = self.get(name) {
+                filtered.insert(name.clone(), value.clone());
+            }
+        }
+        Self {
+            frames: vec![filtered],
+            handler_stack: self.handler_stack.clone(),
+        }
+    }
+
     /// Create a new Env for function invocation.
     ///
     /// Instead of cloning the captured env (which recurses infinitely when
@@ -523,6 +539,9 @@ fn eval_fn(args: &[Val], env: &Env) -> Result<Val, Val> {
         }
     };
 
+    // Raw fn path: no FnArityExpr, no free-vars data. Keep full snapshot;
+    // is_cap_free check below still works correctly because it walks all bindings.
+    // Slim closures only apply to the analyzed pipeline (expr::Expr::Fn).
     Ok(Val::Fn {
         arities,
         env: Rc::new(env.snapshot()),
@@ -776,6 +795,9 @@ async fn eval_defmacro(args: &[Val], env: &mut Env) -> Result<Val, Val> {
         return Err(error::arity("defmacro", "at least 2", 1));
     }
     let arities = parse_macro_arities(fn_args)?;
+    // Raw macro path: no FnArityExpr, no free-vars data. Keep full snapshot;
+    // is_cap_free check below still works correctly because it walks all bindings.
+    // Slim closures only apply to the analyzed pipeline (expr::Expr::Fn).
     let val = Val::Macro {
         arities,
         env: Rc::new(env.snapshot()),
@@ -1617,6 +1639,12 @@ pub fn eval_expr<'a, D: Dispatch>(
 
             Expr::Fn { arities } => {
                 // Convert FnArityExpr → FnArity with FnBody::Analyzed
+                let snapshot = env.snapshot();
+                let free_vars: BTreeSet<&String> = arities
+                    .iter()
+                    .flat_map(|arity| arity.free_vars.iter())
+                    .collect();
+                let captured_env = snapshot.filter_to(free_vars);
                 let fn_arities: Vec<FnArity> = arities
                     .iter()
                     .map(|a| FnArity {
@@ -1627,7 +1655,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                     .collect();
                 Ok(Val::Fn {
                     arities: fn_arities,
-                    env: Rc::new(env.snapshot()),
+                    env: Rc::new(captured_env),
                 })
             }
 
@@ -3573,6 +3601,118 @@ mod tests {
         // (f) → 10, not 20 (captured at definition time)
         let call = Val::List(vec![Val::Sym("f".into())]);
         assert_eq!(eval_blocking(&call, &mut env, &d), Ok(Val::Int(10)));
+    }
+
+    #[test]
+    fn fn_closure_empty_free_vars_captures_nothing() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+
+        let closure = eval_str("(fn [] 1)", &mut env, &d).unwrap();
+        let Val::Fn {
+            env: captured_env, ..
+        } = closure
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(captured_env.bindings().len(), 0);
+    }
+
+    #[test]
+    fn fn_closure_single_capture_is_slim() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("x".into(), Val::Int(7));
+        env.set("y".into(), Val::Int(9));
+
+        let closure = eval_str("(fn [] x)", &mut env, &d).unwrap();
+        let Val::Fn {
+            env: captured_env, ..
+        } = closure
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(captured_env.bindings().len(), 1);
+        assert_eq!(captured_env.get("x"), Some(&Val::Int(7)));
+        assert!(captured_env.get("y").is_none());
+    }
+
+    #[test]
+    fn fn_closure_multi_arity_union_capture() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("x".into(), Val::Int(1));
+        env.set("y".into(), Val::Int(2));
+        env.set("z".into(), Val::Int(3));
+
+        let closure = eval_str("(fn ([a] x) ([a b] y))", &mut env, &d).unwrap();
+        let Val::Fn {
+            env: captured_env, ..
+        } = closure
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(captured_env.bindings().len(), 2);
+        assert_eq!(captured_env.get("x"), Some(&Val::Int(1)));
+        assert_eq!(captured_env.get("y"), Some(&Val::Int(2)));
+        assert!(captured_env.get("z").is_none());
+    }
+
+    #[test]
+    fn fn_closure_over_closure_still_works_with_slim_env() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let inner = eval_str("(let [x 42 outer (fn [] (fn [] x))] (outer))", &mut env, &d).unwrap();
+        let Val::Fn {
+            env: captured_env, ..
+        } = &inner
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(captured_env.bindings().len(), 1);
+        assert_eq!(captured_env.get("x"), Some(&Val::Int(42)));
+        env.set("inner".into(), inner);
+        assert_eq!(
+            eval_str("(inner)", &mut env, &d),
+            Ok(Val::Int(42)),
+            "nested closure should remain functional"
+        );
+    }
+
+    #[test]
+    fn fn_closure_identity_preservation_with_slim_envs() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+
+        let f = eval_str("(fn [] 1)", &mut env, &d).unwrap();
+        let f_clone = f.clone();
+        let g = eval_str("(fn [] 1)", &mut env, &d).unwrap();
+
+        assert_eq!(f, f_clone, "cloned closure should preserve Rc identity");
+        assert_ne!(f, g, "separate evaluations should produce distinct Rc envs");
+    }
+
+    #[test]
+    fn raw_fn_path_keeps_full_snapshot() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("x".into(), Val::Int(1));
+        env.set("y".into(), Val::Int(2));
+
+        let raw = Val::List(vec![
+            Val::Sym("fn".into()),
+            Val::Vector(vec![]),
+            Val::Sym("x".into()),
+        ]);
+        let closure = pollster_eval(eval(&raw, &mut env, &d)).unwrap();
+        let Val::Fn {
+            env: captured_env, ..
+        } = closure
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(captured_env.get("x"), Some(&Val::Int(1)));
+        assert_eq!(captured_env.get("y"), Some(&Val::Int(2)));
     }
 
     #[test]
