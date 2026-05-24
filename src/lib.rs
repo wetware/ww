@@ -19,6 +19,8 @@ pub use ipfs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod launcher;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod local_host;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod metrics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ns;

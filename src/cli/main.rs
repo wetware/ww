@@ -264,7 +264,7 @@ enum Commands {
         /// Multiaddr of a remote node.
         addr: Option<Multiaddr>,
 
-        /// Selection override for mDNS discovery (`index` or `peer-id`).
+        /// Selection override for host discovery (`index` or `peer-id`).
         #[arg(long, value_name = "TARGET", conflicts_with = "addr")]
         select: Option<String>,
     },
@@ -1428,6 +1428,19 @@ wasip2::cli::command::export!({iface_name}Guest);
         tracing::debug!("swarm ready");
         let network_state = swarm_ready.network_state;
         let stream_control = swarm_ready.stream_control;
+        let runtime_hostfile_task = {
+            let network_state = network_state.clone();
+            tokio::spawn(async move {
+                loop {
+                    match ww::local_host::write_from_snapshot(&network_state.snapshot().await) {
+                        Ok(true) => {}
+                        Ok(false) => {}
+                        Err(e) => tracing::debug!("failed to update local host state file: {e}"),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            })
+        };
 
         // Epoch thread: on-chain watcher (only when --stem is provided).
         let epoch_channel_rx = if let Some((epoch_tx, epoch_rx)) = epoch_channel {
@@ -1688,6 +1701,11 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
         };
         tracing::info!(code = exit_code, "Kernel exited");
+
+        runtime_hostfile_task.abort();
+        if let Err(e) = ww::local_host::remove_state_file() {
+            tracing::debug!("failed to remove local host state file: {e}");
+        }
 
         supervisor.shutdown();
 

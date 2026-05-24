@@ -8,17 +8,16 @@ use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use libp2p_core::SignedEnvelope;
 use rustyline::error::ReadlineError;
-use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 const CAPNP_PROTOCOL: StreamProtocol = StreamProtocol::new("/ww/0.1.0");
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
-const TEST_DISCOVERY_ENV: &str = "WW_TEST_MDNS_CANDIDATES";
+const TEST_DISCOVERY_ENV: &str = "WW_TEST_SHELL_CANDIDATES";
 
 #[cfg(has_wasm_std_shell_bin_shell_wasm)]
 const EMBEDDED_SHELL: &[u8] = include_bytes!("../../std/shell/bin/shell.wasm");
@@ -74,7 +73,7 @@ impl ww::stem_capnp::signer::Server for LocalSigner {
 /// Run the interactive shell client.
 ///
 /// - `ww shell <addr>` dials explicit multiaddr.
-/// - `ww shell` discovers local mDNS candidates and connects when unambiguous.
+/// - `ww shell` discovers local host candidates and connects when unambiguous.
 pub async fn run_shell(addr: Option<Multiaddr>, select: Option<String>) -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
@@ -93,7 +92,7 @@ async fn run_shell_local(addr: Option<Multiaddr>, select: Option<String>) -> Res
         let candidates = if let Some(candidates) = discovery_candidates_override()? {
             candidates
         } else {
-            discover_mdns_candidates().await?
+            discover_local_candidates().await?
         };
         choose_candidate(
             candidates,
@@ -134,7 +133,7 @@ async fn dial_shell(
         bail!("no dial addresses provided");
     }
 
-    tokio::task::spawn_local(client.run(Some(connected_tx), None));
+    tokio::task::spawn_local(client.run(Some(connected_tx)));
 
     let connected_peer = await_connected_peer(connected_rx).await?;
 
@@ -331,64 +330,28 @@ fn load_shell_identity() -> Result<(ed25519_dalek::SigningKey, PeerId)> {
     Ok((sk, peer_id))
 }
 
-async fn discover_mdns_candidates() -> Result<Vec<Candidate>> {
-    let keypair = libp2p::identity::Keypair::generate_ed25519();
-    let client = ww::host::ClientSwarm::new(keypair)?;
-
-    let (_connected_tx, _connected_rx) = oneshot::channel::<Result<PeerId, String>>();
-    let (discovered_tx, mut discovered_rx) = mpsc::unbounded_channel::<(PeerId, Multiaddr)>();
-
-    tokio::task::spawn_local(client.run(None, Some(discovered_tx)));
+async fn discover_local_candidates() -> Result<Vec<Candidate>> {
+    let path = ww::local_host::state_path()?;
 
     let deadline = tokio::time::Instant::now() + DISCOVERY_TIMEOUT;
-    let mut candidates: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
-
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => break,
-            maybe = discovered_rx.recv() => {
-                match maybe {
-                    Some((peer_id, addr)) => {
-                        let entry = candidates.entry(peer_id).or_default();
-                        if !entry.iter().any(|a| a == &addr) {
-                            entry.push(addr);
-                        }
-                    }
-                    None => break,
-                }
-            }
+        if let Some(host) = ww::local_host::read_live_host_state()? {
+            return Ok(vec![Candidate {
+                peer_id: Some(host.peer_id),
+                addrs: host.addrs,
+            }]);
         }
-    }
 
-    if candidates.is_empty() {
-        check_multicast_send_health()?;
-    }
-
-    Ok(candidates
-        .into_iter()
-        .map(|(peer_id, addrs)| Candidate {
-            peer_id: Some(peer_id),
-            addrs,
-        })
-        .collect())
-}
-
-fn check_multicast_send_health() -> Result<()> {
-    use std::net::{Ipv4Addr, UdpSocket};
-
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .context("failed to create UDP socket for multicast health check")?;
-    let probe = socket.send_to(b"ww-mdns-probe", (Ipv4Addr::new(224, 0, 0, 251), 5353));
-    if let Err(err) = probe {
-        if err.kind() == std::io::ErrorKind::HostUnreachable {
+        if tokio::time::Instant::now() >= deadline {
             bail!(
-                "mDNS probe send failed: {err}\n\
-                 This host is currently rejecting raw multicast sends.\n\
-                 On macOS, check Local Network permission for the app running this shell (e.g. Conductor/iTerm/Terminal), then retry."
+                "No local wetware host discovered.\n\
+                 Expected live host state at: {}\n\
+                 Start a host first: `ww run .`",
+                path.display()
             );
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Ok(())
 }
 
 fn discovery_candidates_override() -> Result<Option<Vec<Candidate>>> {
@@ -451,7 +414,7 @@ fn choose_candidate(
 ) -> Result<Candidate> {
     if candidates.is_empty() {
         bail!(
-            "No wetware hosts discovered via mDNS.\n\
+            "No wetware hosts discovered.\n\
              Try `ww shell <multiaddr>` to connect explicitly."
         );
     }
@@ -488,7 +451,7 @@ fn choose_candidate(
 
     let listing = format_candidates(&candidates);
     bail!(
-        "Multiple wetware hosts discovered via mDNS; refusing to guess.\n\
+        "Multiple wetware hosts discovered; refusing to guess.\n\
          If this is a script/non-interactive session, pass one of:\n\
          - `ww shell --select <index|peer-id>`\n\
          Use an explicit multiaddr: `ww shell <multiaddr>`\n\
@@ -555,7 +518,7 @@ fn choose_candidate_by_selector(candidates: &[Candidate], selector: &str) -> Res
 }
 
 fn select_candidate_interactive(candidates: &[Candidate]) -> Result<Candidate> {
-    println!("Multiple wetware hosts discovered via mDNS.");
+    println!("Multiple wetware hosts discovered.");
     println!("Select a host by index or peer id:");
     print!("{}", format_candidates(candidates));
     println!();
@@ -774,10 +737,7 @@ mod tests {
         let err = choose_candidate(vec![], None, None, false)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("No wetware hosts discovered via mDNS"),
-            "{err}"
-        );
+        assert!(err.contains("No wetware hosts discovered"), "{err}");
     }
 
     #[test]
