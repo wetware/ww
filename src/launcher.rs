@@ -31,9 +31,9 @@ use rpc::{
 /// Maximum WASM binary size accepted by the Executor.
 ///
 /// Rejects oversized binaries before compilation to bound memory and
-/// CPU spent on untrusted guest code.  2 MiB is generous for current
-/// guests (chess ≈ 1.1 MiB) while preventing abuse.
-const MAX_WASM_BYTES: usize = 2 * 1024 * 1024;
+/// CPU spent on untrusted guest code while still accommodating larger
+/// practical WASM guests.
+const MAX_WASM_BYTES: usize = 8 * 1024 * 1024;
 
 // =========================================================================
 // RuntimeImpl — system-wide WASM compilation + execution runtime
