@@ -1,6 +1,14 @@
 # Isolate, Free Variables, and Closure Safety in Glia
 
-This document explains how `isolate` works in Glia, why free-variable analysis was added, and how closure snapshot slimming makes `isolate` safer and cheaper.
+This document explains the main `isolate` problem in Glia:
+
+- We want to import useful helpers (functions/macros) into `:env`.
+- Those values close over lexical scope.
+- Closed-over scope can covertly carry capability authority.
+
+Free-variable analysis is what makes this safe and usable: it narrows closure capture to only what the function/macro actually references, which lets `isolate` accurately decide whether that import is authority-free.
+
+This document also covers closure snapshot slimming, which falls out of the same analysis and reduces capture cost.
 
 It is written for technical readers who may be new to Lisp and new to free-variable analysis.
 
@@ -14,9 +22,9 @@ It is written for technical readers who may be new to Lisp and new to free-varia
   ...)
 ```
 
-The goal is strict authority control:
-- Capability values are imported as capabilities.
-- Authority-free values are imported as data.
+The goal is strict authority control with ergonomic imports:
+- Capability values import as capabilities.
+- Non-capability values must be authority-free.
 
 Before this work, closures made the boundary fuzzy: a value that *looked* like data could carry hidden authority through captured environment bindings.
 
@@ -30,6 +38,11 @@ Example risk:
 ```
 
 If `helper` carries `db` in its closure environment, `isolate` can be bypassed. The runtime now prevents this.
+
+This is the key motivation for free-variable analysis in this area:
+- We need helper functions/macros to be usable in `:env`.
+- We need their closure capture to be explicit and inspectable.
+- We must reject helpers that still carry capability authority.
 
 ## Lisp background: evaluation and lexical scope
 
@@ -65,7 +78,9 @@ Why this matters: if we know free vars, we can capture only those bindings when 
 For analyzed `Expr::Fn` forms, each arity stores a computed `free_vars` set.
 At function construction time, Glia unions those sets and captures only those names from the current environment.
 
-That means closure capture is now proportional to what the function actually references, not to all visible bindings.
+That gives two properties we need for `isolate`:
+- Closure capture is proportional to what the function actually references, not all visible bindings.
+- Authority checks can operate on a tight captured env, so closures/macros that are actually authority-free are admitted instead of being over-rejected.
 
 ## Sequential `let`/`loop` semantics
 
