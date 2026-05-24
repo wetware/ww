@@ -1602,12 +1602,11 @@ pub fn eval_expr<'a, D: Dispatch>(
 
             Expr::Fn { arities } => {
                 // Convert FnArityExpr → FnArity with FnBody::Analyzed
-                let snapshot = env.snapshot();
                 let free_vars: BTreeSet<&String> = arities
                     .iter()
                     .flat_map(|arity| arity.free_vars.iter())
                     .collect();
-                let captured_env = snapshot.filter_to(free_vars);
+                let captured_env = env.filter_to(free_vars);
                 let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
                 let fn_arities: Vec<FnArity> = arities
                     .iter()
