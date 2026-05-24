@@ -96,11 +96,11 @@ Requires a Rust toolchain with the `wasm32-wasip2` target. Optional: [Kubo](http
 
 ```bash
 ww run .                                # boot a node from current dir
-ww shell                                # discover a local node via mDNS, then open REPL
+ww shell                                # discover a local node, then open REPL
 ```
 
 `ww shell` uses libp2p transport and Terminal(Membrane) auth. By default it
-discovers local hosts via mDNS and prefers an unambiguous identity match.
+discovers local hosts from runtime state and prefers an unambiguous identity match.
 If multiple hosts remain, TTY sessions prompt for selection, and
 non-interactive sessions can pass `--select <index|peer-id>`.
 
