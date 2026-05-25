@@ -464,19 +464,45 @@ impl system_capnp::executor::Server for ExecutorImpl {
             });
 
             tokio::task::spawn_local(async move {
-                let exit_code = tokio::select! {
-                    result = proc.run() => {
-                        match result {
+                let mut proc_run = Box::pin(proc.run());
+                let mut watch_kill = true;
+                let exit_code = loop {
+                    if watch_kill {
+                        tokio::select! {
+                            result = &mut proc_run => {
+                                break match result {
+                                    Ok(()) => 0,
+                                    Err(e) => {
+                                        tracing::error!("executor: child process failed: {}", e);
+                                        1
+                                    }
+                                };
+                            }
+                            changed = kill_rx.changed() => {
+                                match changed {
+                                    Ok(()) => {
+                                        if *kill_rx.borrow() {
+                                            tracing::info!("executor: child process killed");
+                                            break 137; // SIGKILL convention
+                                        }
+                                        // Spurious wakeup/value refresh with `false`: keep waiting.
+                                    }
+                                    Err(_) => {
+                                        // All kill handles were dropped. Stop polling kill_rx and
+                                        // await natural process exit to avoid a tight ready-loop.
+                                        watch_kill = false;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        break match proc_run.await {
                             Ok(()) => 0,
                             Err(e) => {
                                 tracing::error!("executor: child process failed: {}", e);
                                 1
                             }
-                        }
-                    }
-                    _ = kill_rx.changed() => {
-                        tracing::info!("executor: child process killed");
-                        137 // SIGKILL convention
+                        };
                     }
                 };
                 tracing::info!("executor: child process exited with code {}", exit_code);
