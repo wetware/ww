@@ -16,8 +16,8 @@ use tokio::sync::oneshot;
 const CAPNP_PROTOCOL: StreamProtocol = StreamProtocol::new("/ww/0.1.0");
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(60);
-const RPC_TIMEOUT: Duration = Duration::from_secs(90);
+const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_DISCOVERY_ENV: &str = "WW_TEST_SHELL_CANDIDATES";
 
 #[cfg(has_wasm_std_shell_bin_shell_wasm)]
