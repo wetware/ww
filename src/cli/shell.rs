@@ -16,7 +16,8 @@ use tokio::sync::oneshot;
 const CAPNP_PROTOCOL: StreamProtocol = StreamProtocol::new("/ww/0.1.0");
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const RPC_TIMEOUT: Duration = Duration::from_secs(90);
 const TEST_DISCOVERY_ENV: &str = "WW_TEST_SHELL_CANDIDATES";
 
 #[cfg(has_wasm_std_shell_bin_shell_wasm)]
@@ -139,13 +140,29 @@ async fn dial_shell(
 
     let remote_peer = target.peer_id.unwrap_or(connected_peer);
 
-    let stream = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        stream_control.open_stream(remote_peer, CAPNP_PROTOCOL),
-    )
-    .await
-    .context("timed out opening shell stream")?
-    .map_err(|e| anyhow::anyhow!("failed to open shell stream: {e}"))?;
+    let stream_open_deadline = tokio::time::Instant::now() + STREAM_READY_TIMEOUT;
+    let stream = loop {
+        match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            stream_control.open_stream(remote_peer, CAPNP_PROTOCOL),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => break stream,
+            Ok(Err(e)) => {
+                if tokio::time::Instant::now() >= stream_open_deadline {
+                    return Err(anyhow::anyhow!("failed to open shell stream: {e}"));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(_) => {
+                if tokio::time::Instant::now() >= stream_open_deadline {
+                    return Err(anyhow::anyhow!("timed out opening shell stream"));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    };
 
     let ww::rpc::vat_dial::VatDial {
         bootstrap: terminal,

@@ -43,6 +43,59 @@ mod schema_ids {
 /// Bootstrap capability: the concrete Membrane defined in stem.capnp.
 type Membrane = stem_capnp::membrane::Client;
 
+/// Exported kernel bootstrap capability.
+///
+/// The kernel boots with host-provided `Membrane` access, and the shell client
+/// expects the kernel process to export a `Membrane` bootstrap cap in return.
+/// This proxy forwards `graft()` to the active host membrane once initialization
+/// has stored it.
+struct KernelBootstrap {
+    membrane: Rc<RefCell<Option<Membrane>>>,
+}
+
+#[allow(refining_impl_trait)]
+impl stem_capnp::membrane::Server for KernelBootstrap {
+    fn graft(
+        self: capnp::capability::Rc<Self>,
+        _params: stem_capnp::membrane::GraftParams,
+        mut results: stem_capnp::membrane::GraftResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        let membrane = match self.membrane.borrow().clone() {
+            Some(m) => m,
+            None => {
+                return capnp::capability::Promise::err(capnp::Error::failed(
+                    "kernel bootstrap membrane not ready".into(),
+                ))
+            }
+        };
+
+        capnp::capability::Promise::from_future(async move {
+            let resp = membrane.graft_request().send().promise.await?;
+            let src_caps = resp.get()?.get_caps()?;
+            let mut dst_caps = results.get().init_caps(src_caps.len());
+
+            for i in 0..src_caps.len() {
+                let src = src_caps.get(i);
+                let mut dst = dst_caps.reborrow().get(i);
+                dst.set_name(src.get_name()?);
+                dst.reborrow()
+                    .init_cap()
+                    .set_as_capability(
+                        src.get_cap()
+                            .get_as_capability::<capnp::capability::Client>()?
+                            .hook
+                            .clone(),
+                    );
+                if src.has_schema() {
+                    dst.set_schema(src.get_schema()?)?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+}
+
 struct StderrLogger;
 
 impl log::Log for StderrLogger {
@@ -1520,7 +1573,15 @@ impl Guest for Kernel {
 fn run_impl() {
     init_logging();
 
-    system::run(|membrane: Membrane| async move {
+    let exported_membrane: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(None));
+    let bootstrap: stem_capnp::membrane::Client = capnp_rpc::new_client(KernelBootstrap {
+        membrane: Rc::clone(&exported_membrane),
+    });
+
+    system::serve(bootstrap.client, move |membrane: Membrane| {
+        let exported_membrane = Rc::clone(&exported_membrane);
+        async move {
+        *exported_membrane.borrow_mut() = Some(membrane.clone());
         let graft_resp = membrane.graft_request().send().promise.await?;
         let results = graft_resp.get()?;
 
@@ -1658,7 +1719,8 @@ fn run_impl() {
             }
         }
 
-        Ok(())
+            Ok(())
+        }
     });
 }
 
@@ -2058,6 +2120,30 @@ mod tests {
         }
     }
 
+    // --- Stub Membrane: returns fixed graft caps ---
+
+    struct TestMembrane {
+        runtime: system_capnp::runtime::Client,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl stem_capnp::membrane::Server for TestMembrane {
+        fn graft(
+            self: capnp::capability::Rc<Self>,
+            _params: stem_capnp::membrane::GraftParams,
+            mut results: stem_capnp::membrane::GraftResults,
+        ) -> Promise<(), capnp::Error> {
+            let mut caps = results.get().init_caps(1);
+            let mut entry = caps.reborrow().get(0);
+            entry.set_name("runtime");
+            entry
+                .reborrow()
+                .init_cap()
+                .set_as_capability(self.runtime.client.hook.clone());
+            Promise::ok(())
+        }
+    }
+
     // --- Helper: construct a Session with test stubs ---
 
     struct TestHttpClient;
@@ -2123,6 +2209,58 @@ mod tests {
             Err(e) => Err(e),
             Ok(v) => Ok(v), // Handler returned directly without resume.
         }
+    }
+
+    // --- kernel bootstrap tests ---
+
+    #[tokio::test]
+    async fn test_kernel_bootstrap_forwards_membrane_graft() {
+        run_local(async {
+            let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(TestRuntime);
+            let upstream: Membrane = capnp_rpc::new_client(TestMembrane {
+                runtime: runtime.clone(),
+            });
+            let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(Some(upstream)));
+
+            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap { membrane: state });
+            let resp = bootstrap
+                .graft_request()
+                .send()
+                .promise
+                .await
+                .expect("bootstrap graft should succeed");
+            let caps = resp.get().unwrap().get_caps().unwrap();
+
+            let forwarded_runtime: system_capnp::runtime::Client =
+                get_graft_cap(&caps, "runtime").expect("runtime cap should be forwarded");
+            let load_resp = forwarded_runtime
+                .load_request()
+                .send()
+                .promise
+                .await
+                .expect("forwarded runtime should be callable");
+            assert!(load_resp.get().unwrap().has_executor());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_kernel_bootstrap_errors_when_membrane_not_ready() {
+        run_local(async {
+            let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(None));
+            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap { membrane: state });
+
+            match bootstrap.graft_request().send().promise.await {
+                Ok(_) => panic!("bootstrap graft should fail before membrane is ready"),
+                Err(err) => {
+                    assert!(
+                        format!("{err}").contains("not ready"),
+                        "unexpected error: {err}"
+                    );
+                }
+            }
+        })
+        .await;
     }
 
     // --- host tests ---
