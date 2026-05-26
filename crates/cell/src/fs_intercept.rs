@@ -168,17 +168,18 @@ impl IpfsFilesystemView<'_> {
 
                 let staging_path = cache.staging_dir().join(&cid);
                 if !staging_path.exists() {
-                    let bytes = cache.fetch(&cid_parsed).await.map_err(|e| {
-                        tracing::warn!(cid = %cid, err = %e, "CidTree fetch failed");
-                        FsError::from(types::ErrorCode::Io)
-                    })?;
+                    cache
+                        .fetch_to_path(&cid_parsed, &staging_path)
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(cid = %cid, err = %e, "CidTree stream fetch failed");
+                            FsError::from(types::ErrorCode::Io)
+                        })?;
 
-                    if let Some(parent) = staging_path.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
+                    if !staging_path.exists() {
+                        tracing::warn!(cid = %cid, "CidTree stream fetch did not materialize file");
+                        return Err(FsError::from(types::ErrorCode::Io));
                     }
-                    std::fs::write(&staging_path, &bytes)
-                        .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
                 }
 
                 let file = cap_std::fs::Dir::open_ambient_dir(
@@ -294,26 +295,21 @@ impl IpfsFilesystemView<'_> {
         // Skip fetch if already staged (disk cache hit)
         if !target_path.exists() {
             let fetch_result = if ipfs_path.subpath.is_empty() {
-                cache.fetch(&ipfs_path.cid).await
+                cache.fetch_to_path(&ipfs_path.cid, &target_path).await
             } else {
-                cache.fetch_path(&ipfs_path.cid, &ipfs_path.subpath).await
+                cache
+                    .fetch_path_to_path(&ipfs_path.cid, &ipfs_path.subpath, &target_path)
+                    .await
             };
-            let bytes = fetch_result.map_err(|e| {
+            fetch_result.map_err(|e| {
                 tracing::warn!(
                     cid = %ipfs_path.cid,
                     subpath = %ipfs_path.subpath,
                     err = %e,
-                    "IPFS fetch failed"
+                    "IPFS stream fetch failed"
                 );
                 FsError::from(types::ErrorCode::Io)
             })?;
-
-            if let Some(parent) = target_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-            }
-            std::fs::write(&target_path, &bytes)
-                .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
         }
 
         if !target_path.exists() {
