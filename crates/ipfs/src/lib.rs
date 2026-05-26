@@ -8,6 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use tokio::io::AsyncWriteExt;
 
 /// HTTP client for talking to a Kubo node's `/api/v0/*` endpoints.
 #[derive(Clone)]
@@ -50,6 +51,52 @@ impl HttpClient {
             .await
             .with_context(|| format!("Failed to read IPFS content from {path}"))
             .map(|b| b.to_vec())
+    }
+
+    /// Stream file content from an IPFS path directly to `dst`.
+    ///
+    /// Accepts IPFS-family paths: `/ipfs/<cid>`, `/ipns/...`, `/ipld/...`.
+    pub async fn cat_to_path(&self, path: &str, dst: &Path) -> Result<()> {
+        let url = format!("{}/api/v0/cat?arg={}", self.base_url, path);
+        let mut response = self
+            .http_client
+            .post(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to connect to IPFS node at {}", self.base_url))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Failed to retrieve file from IPFS: {} (path: {})",
+                response.status(),
+                path
+            ));
+        }
+
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("Failed to create parent dir {}", parent.display()))?;
+        }
+
+        let mut out = tokio::fs::File::create(dst)
+            .await
+            .with_context(|| format!("Failed to create destination file {}", dst.display()))?;
+
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .with_context(|| format!("Failed to read streaming chunk from {path}"))?
+        {
+            out.write_all(&chunk)
+                .await
+                .with_context(|| format!("Failed writing chunk to {}", dst.display()))?;
+        }
+
+        out.flush()
+            .await
+            .with_context(|| format!("Failed to flush destination file {}", dst.display()))?;
+        Ok(())
     }
 
     /// Fetch an IPFS directory and extract it to a local path.
@@ -627,6 +674,19 @@ impl cache::Pinner for HttpClient {
             format!("/ipfs/{cid}/{subpath}")
         };
         self.cat(&path).await
+    }
+
+    async fn fetch_to_path(&self, cid: &cid::Cid, dst: &Path) -> Result<()> {
+        self.cat_to_path(&format!("/ipfs/{cid}"), dst).await
+    }
+
+    async fn fetch_path_to_path(&self, cid: &cid::Cid, subpath: &str, dst: &Path) -> Result<()> {
+        let path = if subpath.is_empty() {
+            format!("/ipfs/{cid}")
+        } else {
+            format!("/ipfs/{cid}/{subpath}")
+        };
+        self.cat_to_path(&path, dst).await
     }
 
     async fn size(&self, cid: &cid::Cid) -> Result<u64> {

@@ -3431,6 +3431,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "tokio",
  "ww-cache",
 ]
 

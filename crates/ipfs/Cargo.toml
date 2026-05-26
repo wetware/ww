@@ -12,3 +12,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 cid = "0.11"
 cache = { package = "ww-cache", path = "../cache" }
+tokio = { version = "1", features = ["fs", "io-util"] }

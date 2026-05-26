@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use cid::Cid;
+use std::path::Path;
 
 /// Abstraction over IPFS pin/unpin/fetch operations.
 ///
@@ -28,6 +29,33 @@ pub trait Pinner: Send + Sync {
         Err(anyhow::anyhow!(
             "subpath fetch not supported: /ipfs/{cid}/{subpath}"
         ))
+    }
+
+    /// Stream CID content directly into `dst` without materializing a full
+    /// in-memory buffer.
+    ///
+    /// Default implementation falls back to `fetch()` and writes bytes
+    /// synchronously.
+    async fn fetch_to_path(&self, cid: &Cid, dst: &Path) -> Result<()> {
+        let bytes = self.fetch(cid).await?;
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(dst, &bytes)?;
+        Ok(())
+    }
+
+    /// Stream CID subpath content directly into `dst`.
+    ///
+    /// Default implementation falls back to `fetch_path()` and writes bytes
+    /// synchronously.
+    async fn fetch_path_to_path(&self, cid: &Cid, subpath: &str, dst: &Path) -> Result<()> {
+        let bytes = self.fetch_path(cid, subpath).await?;
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(dst, &bytes)?;
+        Ok(())
     }
 
     /// Get the size in bytes of the content addressed by a CID,
