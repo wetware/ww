@@ -37,6 +37,16 @@ mod stem_capnp {
 }
 
 #[allow(dead_code)]
+mod auth_capnp {
+    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
+}
+
+#[allow(dead_code)]
+mod membrane_capnp {
+    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
+}
+
+#[allow(dead_code)]
 mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
 }
@@ -54,11 +64,11 @@ mod oracle_capnp {
 // Build-time schema constants: PRICE_ORACLE_SCHEMA (&[u8]) and PRICE_ORACLE_CID (&str).
 include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
-type Membrane = stem_capnp::membrane::Client;
+type Membrane = membrane_capnp::membrane::Client;
 
 /// Look up a typed capability by name from the graft caps list.
 fn get_graft_cap<T: capnp::capability::FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, stem_capnp::export::Owned>,
+    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Result<T, capnp::Error> {
     for i in 0..caps.len() {

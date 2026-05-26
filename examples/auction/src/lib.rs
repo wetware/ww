@@ -39,6 +39,16 @@ mod stem_capnp {
 }
 
 #[allow(dead_code)]
+mod auth_capnp {
+    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
+}
+
+#[allow(dead_code)]
+mod membrane_capnp {
+    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
+}
+
+#[allow(dead_code)]
 mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
 }
@@ -56,11 +66,11 @@ mod auction_capnp {
 // Build-time schema constants: COMPUTE_PROVIDER_SCHEMA (&[u8]) and COMPUTE_PROVIDER_CID (&str).
 include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
-type Membrane = stem_capnp::membrane::Client;
+type Membrane = membrane_capnp::membrane::Client;
 
 /// Look up a typed capability by name from the graft caps list.
 fn get_graft_cap<T: capnp::capability::FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, stem_capnp::export::Owned>,
+    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Result<T, capnp::Error> {
     for i in 0..caps.len() {
@@ -242,11 +252,11 @@ struct ComputeProviderImpl {
     /// The host's peer ID, used as the provider field in quotes.
     self_id: Vec<u8>,
     /// Domain-scoped signer for quote signing.
-    signer: stem_capnp::signer::Client,
+    signer: auth_capnp::signer::Client,
     /// Identity capability for signature verification on accept().
     /// Retained for future cross-node verification with external pubkeys.
     #[allow(dead_code)]
-    identity: stem_capnp::identity::Client,
+    identity: auth_capnp::identity::Client,
     /// Runtime capability for loading WASM binaries.
     runtime: system_capnp::runtime::Client,
 }
@@ -509,7 +519,7 @@ fn run_cell() {
             let graft_resp = membrane.graft_request().send().promise.await?;
             let results = graft_resp.get()?;
             let caps = results.get_caps()?;
-            let identity: stem_capnp::identity::Client =
+            let identity: auth_capnp::identity::Client =
                 get_graft_cap(&caps, "identity")?;
             let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
             let runtime: system_capnp::runtime::Client =

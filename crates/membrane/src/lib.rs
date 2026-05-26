@@ -24,6 +24,24 @@ pub mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/capnp/stem_capnp.rs"));
 }
 
+#[allow(
+    unused_parens,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
+pub mod auth_capnp {
+    include!(concat!(env!("OUT_DIR"), "/capnp/auth_capnp.rs"));
+}
+
+#[allow(
+    unused_parens,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
+pub mod membrane_capnp {
+    include!(concat!(env!("OUT_DIR"), "/capnp/membrane_capnp.rs"));
+}
+
 // cell_capnp is still needed by the host for Raw/Http cell type decoding.
 // TODO: remove once Raw/Http cells migrate to envvars.
 #[allow(unused_parens, clippy::match_single_binding)]
@@ -60,6 +78,7 @@ pub mod schema_registry {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use capnp::traits::HasTypeId;
 
         #[test]
         fn each_core_cap_has_non_empty_bytes() {
@@ -114,6 +133,57 @@ pub mod schema_registry {
                     "schema for '{name}' is not an interface node"
                 );
             }
+        }
+
+        #[test]
+        fn split_schema_type_ids_are_pinned_for_wire_compat() {
+            // These IDs were historically defined in stem.capnp and are now
+            // split across auth.capnp and membrane.capnp. Keep them pinned.
+            assert_eq!(
+                <crate::auth_capnp::signer::Client as HasTypeId>::TYPE_ID,
+                0xafaf_af94_68b6_a274
+            );
+            assert_eq!(
+                <crate::auth_capnp::identity::Client as HasTypeId>::TYPE_ID,
+                0xa7c2_00e5_b472_6d89
+            );
+            assert_eq!(
+                <crate::auth_capnp::terminal::Client<capnp::any_pointer::Owned> as HasTypeId>::TYPE_ID,
+                0xeae8_840b_2a89_8ba9
+            );
+            assert_eq!(
+                <crate::membrane_capnp::export::Reader<'static> as HasTypeId>::TYPE_ID,
+                0xbb8d_5590_cb2f_3d2e
+            );
+            assert_eq!(
+                <crate::membrane_capnp::membrane::Client as HasTypeId>::TYPE_ID,
+                0xdb52_c251_06bc_2c5e
+            );
+        }
+
+        #[test]
+        fn core_cap_schema_cids_are_stable() {
+            // CID snapshots guard against accidental protocol drift.
+            assert_eq!(
+                HOST_CID,
+                "bafkr4ic7cpeyps4vztynjvnyygid47przo5aqtkgjswb5ns4yoqiox4pnu"
+            );
+            assert_eq!(
+                RUNTIME_CID,
+                "bafkr4idvcyjadh3aefmdcis7ejmbi7jevfyutk7ifj7o3pi2tmfyrgcglm"
+            );
+            assert_eq!(
+                ROUTING_CID,
+                "bafkr4ids5ycfp6wd4ta5nf6e7deg625pyiur6ee53u63t47dsfoiwv5zsy"
+            );
+            assert_eq!(
+                IDENTITY_CID,
+                "bafkr4iggkvmx4tlhgge76adnmde65og2kjvnwz5h43k5pzuresvzsaduaq"
+            );
+            assert_eq!(
+                HTTP_CLIENT_CID,
+                "bafkr4ibch3gln5hzay6uivfxkwb5gsqphlkxn75rh3gb6fj2viznd33ari"
+            );
         }
     }
 }

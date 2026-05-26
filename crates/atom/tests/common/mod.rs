@@ -10,11 +10,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::time::sleep;
 
+use atom::auth_capnp;
 use atom::system_capnp;
 use atom::{EpochGuard, GraftBuilder};
 use membrane::http_capnp;
 use membrane::routing_capnp;
-use membrane::stem_capnp;
 
 // ---------------------------------------------------------------------------
 // Stub runtime + executor + session builder for epoch-guarded capability tests
@@ -71,7 +71,7 @@ impl GraftBuilder for StubSessionBuilder {
     fn build(
         &self,
         guard: &EpochGuard,
-        mut builder: atom::stem_capnp::membrane::graft_results::Builder<'_>,
+        mut builder: atom::membrane_capnp::membrane::graft_results::Builder<'_>,
     ) -> std::result::Result<(), capnp::Error> {
         let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(StubRuntime {
             guard: guard.clone(),
@@ -94,19 +94,19 @@ impl GraftBuilder for StubSessionBuilder {
 pub struct StubIdentity;
 
 #[allow(refining_impl_trait)]
-impl stem_capnp::identity::Server for StubIdentity {
+impl auth_capnp::identity::Server for StubIdentity {
     fn signer(
         self: capnp::capability::Rc<Self>,
-        _params: stem_capnp::identity::SignerParams,
-        _results: stem_capnp::identity::SignerResults,
+        _params: auth_capnp::identity::SignerParams,
+        _results: auth_capnp::identity::SignerResults,
     ) -> Promise<(), capnp::Error> {
         Promise::err(capnp::Error::unimplemented("stub identity".into()))
     }
 
     fn verify(
         self: capnp::capability::Rc<Self>,
-        _params: stem_capnp::identity::VerifyParams,
-        _results: stem_capnp::identity::VerifyResults,
+        _params: auth_capnp::identity::VerifyParams,
+        _results: auth_capnp::identity::VerifyResults,
     ) -> Promise<(), capnp::Error> {
         Promise::err(capnp::Error::unimplemented("stub identity".into()))
     }
@@ -202,9 +202,9 @@ impl GraftBuilder for FullStubSessionBuilder {
     fn build(
         &self,
         guard: &EpochGuard,
-        mut builder: atom::stem_capnp::membrane::graft_results::Builder<'_>,
+        mut builder: atom::membrane_capnp::membrane::graft_results::Builder<'_>,
     ) -> std::result::Result<(), capnp::Error> {
-        let identity: stem_capnp::identity::Client = capnp_rpc::new_client(StubIdentity);
+        let identity: auth_capnp::identity::Client = capnp_rpc::new_client(StubIdentity);
         let host: system_capnp::host::Client = capnp_rpc::new_client(StubHost);
         let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(StubRuntime {
             guard: guard.clone(),

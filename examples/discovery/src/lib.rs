@@ -35,6 +35,16 @@ mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
 
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
+mod auth_capnp {
+    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
+}
+
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
+mod membrane_capnp {
+    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
+}
+
 #[allow(dead_code)]
 mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
@@ -53,12 +63,12 @@ mod greeter_capnp {
 // Build-time schema constants: GREETER_SCHEMA (&[u8]) and GREETER_CID (&str).
 include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
-/// Bootstrap capability: the concrete Membrane defined in stem.capnp.
-type Membrane = stem_capnp::membrane::Client;
+/// Bootstrap capability: the concrete Membrane defined in membrane.capnp.
+type Membrane = membrane_capnp::membrane::Client;
 
 /// Look up a typed capability by name from the graft caps list.
 fn get_graft_cap<T: capnp::capability::FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, stem_capnp::export::Owned>,
+    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Result<T, capnp::Error> {
     for i in 0..caps.len() {

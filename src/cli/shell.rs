@@ -90,11 +90,11 @@ impl LocalSigner {
 }
 
 #[allow(refining_impl_trait)]
-impl ww::stem_capnp::signer::Server for LocalSigner {
+impl ww::auth_capnp::signer::Server for LocalSigner {
     fn sign(
         self: capnp::capability::Rc<Self>,
-        params: ww::stem_capnp::signer::SignParams,
-        mut results: ww::stem_capnp::signer::SignResults,
+        params: ww::auth_capnp::signer::SignParams,
+        mut results: ww::auth_capnp::signer::SignResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
         let p = pry!(params.get());
         let nonce = p.get_nonce();
@@ -217,10 +217,10 @@ async fn dial_shell(
         driver: _driver,
     } = ww::rpc::vat_dial::connect::<
         _,
-        ww::stem_capnp::terminal::Client<ww::stem_capnp::membrane::Owned>,
+        ww::auth_capnp::terminal::Client<ww::membrane_capnp::membrane::Owned>,
     >(stream);
 
-    let signer_client: ww::stem_capnp::signer::Client =
+    let signer_client: ww::auth_capnp::signer::Client =
         new_client(LocalSigner::from_signing_key(signing_key)?);
 
     let mut login_req = terminal.login_request();
@@ -776,7 +776,7 @@ async fn shell_eval_value(
 }
 
 fn get_graft_cap<T: FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, ww::stem_capnp::export::Owned>,
+    caps: &capnp::struct_list::Reader<'_, ww::membrane_capnp::export::Owned>,
     name: &str,
 ) -> Result<T, capnp::Error> {
     for i in 0..caps.len() {
@@ -1319,11 +1319,11 @@ mod tests {
     }
 
     #[allow(refining_impl_trait)]
-    impl ww::stem_capnp::membrane::Server for TestMembrane {
+    impl ww::membrane_capnp::membrane::Server for TestMembrane {
         fn graft(
             self: capnp::capability::Rc<Self>,
-            _params: ww::stem_capnp::membrane::GraftParams,
-            mut results: ww::stem_capnp::membrane::GraftResults,
+            _params: ww::membrane_capnp::membrane::GraftParams,
+            mut results: ww::membrane_capnp::membrane::GraftResults,
         ) -> Promise<(), capnp::Error> {
             let count = if self.ipfs.is_some() { 3 } else { 2 };
             let mut caps = results.get().init_caps(count);
@@ -1354,7 +1354,7 @@ mod tests {
 
     async fn serve_terminal_streams(
         mut control: libp2p_stream::Control,
-        terminal: ww::stem_capnp::terminal::Client<ww::stem_capnp::membrane::Owned>,
+        terminal: ww::auth_capnp::terminal::Client<ww::membrane_capnp::membrane::Owned>,
     ) {
         let mut incoming = match control.accept(CAPNP_PROTOCOL) {
             Ok(s) => s,
@@ -1731,7 +1731,7 @@ mod tests {
                 });
 
                 let (grafted, _seen_paths) = test_grafted_caps();
-                let membrane: ww::stem_capnp::membrane::Client =
+                let membrane: ww::membrane_capnp::membrane::Client =
                     capnp_rpc::new_client(TestMembrane {
                         host: grafted.host,
                         routing: grafted.routing,
@@ -1744,7 +1744,7 @@ mod tests {
                     provenance: membrane::Provenance::Block(0),
                 };
                 let (_epoch_tx, epoch_rx) = watch::channel(epoch);
-                let terminal_server = TerminalServer::<ww::stem_capnp::membrane::Owned>::new(
+                let terminal_server = TerminalServer::<ww::membrane_capnp::membrane::Owned>::new(
                     server_signing_key.verifying_key(),
                     membrane,
                     auth::SigningDomain::terminal_membrane(),

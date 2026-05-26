@@ -7,6 +7,8 @@
 
 @0xbf5147b78c0e6a2f;
 
+using MembraneSchema = import "membrane.capnp";
+
 struct PeerInfo {
   peerId @0 :Data;       # libp2p peer ID, serialized.
   addrs @1 :List(Data);  # Multiaddrs for this peer, each serialized.
@@ -75,7 +77,7 @@ struct OneshotFuel {
 
 interface Executor {
   spawn @0 (args :List(Text), env :List(Text),
-            caps :List(import "stem.capnp".Export),
+            caps :List(MembraneSchema.Export),
             fuelPolicy :FuelPolicy) -> (process :Process);
   # Spawn a new instance of the bound WASM binary with the given
   # args and env.  Late-binding args/env is required for WAGI, which
@@ -95,7 +97,7 @@ interface StreamListener {
 
 interface HttpListener {
   listen @0 (executor :Executor, prefix :Text,
-             caps :List(import "stem.capnp".Export)) -> ();
+             caps :List(MembraneSchema.Export)) -> ();
   # Accept HTTP requests matching the path prefix.
   # For each request, spawn a cell process via Executor.
   # CGI env vars are passed as environment, request body to stdin,
@@ -146,7 +148,7 @@ struct VatHandler {
 
 interface VatListener {
   listen @0 (handler :VatHandler, schema :Data,
-             caps :List(import "stem.capnp".Export)) -> ();
+             caps :List(MembraneSchema.Export)) -> ();
   # Accept incoming Cap'n Proto RPC connections on /ww/0.1.0/vat/{cid}
   # where cid = CIDv1(raw, BLAKE3(schema)).
   #

@@ -33,6 +33,16 @@ mod stem_capnp {
 }
 
 #[allow(dead_code)]
+mod auth_capnp {
+    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
+}
+
+#[allow(dead_code)]
+mod membrane_capnp {
+    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
+}
+
+#[allow(dead_code)]
 mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
 }
@@ -42,12 +52,12 @@ mod http_capnp {
     include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
 }
 
-type Membrane = stem_capnp::membrane::Client;
+type Membrane = membrane_capnp::membrane::Client;
 
 /// Look up a typed capability by name in the graft caps list.
 /// Returns `None` if the cap is missing — used for graceful degradation.
 fn graft_cap_opt<T: FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, stem_capnp::export::Owned>,
+    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Option<T> {
     for i in 0..caps.len() {

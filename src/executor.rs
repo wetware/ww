@@ -15,6 +15,7 @@ use tracing::info;
 
 use crate::host::SwarmCommand;
 use crate::services::CompileRequest;
+use crate::{auth_capnp, membrane_capnp};
 use cell::{proc::DataStreamHandles, Loader, ProcBuilder};
 use rpc::graft::GuestMembrane;
 use rpc::NetworkState;
@@ -714,16 +715,15 @@ async fn serve_one_terminal_stream(
     epoch_rx: watch::Receiver<Epoch>,
 ) {
     use futures::AsyncReadExt;
-    use membrane::stem_capnp;
     use membrane::TerminalServer;
 
-    let terminal = TerminalServer::<stem_capnp::membrane::Owned>::new(
+    let terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
         vk,
         membrane,
         auth::SigningDomain::terminal_membrane(),
         epoch_rx,
     );
-    let terminal_client: stem_capnp::terminal::Client<stem_capnp::membrane::Owned> =
+    let terminal_client: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
         capnp_rpc::new_client(terminal);
 
     let (reader, writer) = Box::pin(stream).split();

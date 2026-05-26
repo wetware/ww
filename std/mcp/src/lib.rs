@@ -27,10 +27,10 @@ use wasip2::exports::cli::run::Guest;
 // Shared effect handler factories from the caps crate.
 use caps::{
     eval_load_async, get_graft_cap, make_host_handler, make_import_handler,
-    make_routing_handler, routing_capnp, stem_capnp, system_capnp, wrap_with_handlers,
+    make_routing_handler, membrane_capnp, routing_capnp, system_capnp, wrap_with_handlers,
 };
 
-type Membrane = stem_capnp::membrane::Client;
+type Membrane = membrane_capnp::membrane::Client;
 
 // ---------------------------------------------------------------------------
 // JSON-RPC types (minimal, hand-rolled to avoid pulling in jsonrpc crate)

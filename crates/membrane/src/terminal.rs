@@ -8,8 +8,8 @@
 //! (Membrane). Having a Membrane reference IS authorization (ocap); Terminal
 //! is the gate that decides who gets that reference.
 
+use crate::auth_capnp;
 use crate::epoch::Epoch;
-use crate::stem_capnp;
 use auth::SigningDomain;
 use capnp::capability::Promise;
 use capnp::Error;
@@ -146,17 +146,17 @@ where
 }
 
 #[allow(refining_impl_trait)]
-impl<Session> stem_capnp::terminal::Server<Session> for TerminalServer<Session>
+impl<Session> auth_capnp::terminal::Server<Session> for TerminalServer<Session>
 where
     Session: capnp::traits::Owned + 'static,
     <Session as capnp::traits::Owned>::Reader<'static>: capnp::traits::SetterInput<Session> + Clone,
 {
     fn login(
         self: capnp::capability::Rc<Self>,
-        params: stem_capnp::terminal::LoginParams<Session>,
-        mut results: stem_capnp::terminal::LoginResults<Session>,
+        params: auth_capnp::terminal::LoginParams<Session>,
+        mut results: auth_capnp::terminal::LoginResults<Session>,
     ) -> Promise<(), Error> {
-        let signer: stem_capnp::signer::Client = match pry!(params.get()).get_signer() {
+        let signer: auth_capnp::signer::Client = match pry!(params.get()).get_signer() {
             Ok(s) => s,
             Err(_) => return Promise::err(Error::failed("missing signer".into())),
         };
@@ -225,6 +225,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::membrane_capnp;
     use ed25519_dalek::SigningKey;
 
     fn test_epoch(seq: u64) -> Epoch {
@@ -252,11 +253,11 @@ mod tests {
     }
 
     #[allow(refining_impl_trait)]
-    impl stem_capnp::signer::Server for TestSigner {
+    impl auth_capnp::signer::Server for TestSigner {
         fn sign(
             self: capnp::capability::Rc<Self>,
-            params: stem_capnp::signer::SignParams,
-            mut results: stem_capnp::signer::SignResults,
+            params: auth_capnp::signer::SignParams,
+            mut results: auth_capnp::signer::SignResults,
         ) -> Promise<(), Error> {
             let p = pry!(params.get());
             let nonce = p.get_nonce();
@@ -287,11 +288,11 @@ mod tests {
     }
 
     #[allow(refining_impl_trait)]
-    impl stem_capnp::signer::Server for WrongEpochSigner {
+    impl auth_capnp::signer::Server for WrongEpochSigner {
         fn sign(
             self: capnp::capability::Rc<Self>,
-            params: stem_capnp::signer::SignParams,
-            mut results: stem_capnp::signer::SignResults,
+            params: auth_capnp::signer::SignParams,
+            mut results: auth_capnp::signer::SignResults,
         ) -> Promise<(), Error> {
             let p = pry!(params.get());
             let nonce = p.get_nonce();
@@ -318,12 +319,13 @@ mod tests {
         vk: VerifyingKey,
         epoch: Epoch,
     ) -> (
-        stem_capnp::terminal::Client<stem_capnp::membrane::Owned>,
+        auth_capnp::terminal::Client<membrane_capnp::membrane::Owned>,
         watch::Sender<Epoch>,
     ) {
         let (tx, rx) = watch::channel(epoch);
-        let membrane: stem_capnp::membrane::Client = crate::membrane::membrane_client(rx.clone());
-        let terminal = TerminalServer::<stem_capnp::membrane::Owned>::new(
+        let membrane: membrane_capnp::membrane::Client =
+            crate::membrane::membrane_client(rx.clone());
+        let terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
             vk,
             membrane,
             SigningDomain::terminal_membrane(),
@@ -338,9 +340,10 @@ mod tests {
         let vk = sk.verifying_key();
 
         let (_tx, rx) = watch::channel(test_epoch(1));
-        let membrane: stem_capnp::membrane::Client = crate::membrane::membrane_client(rx.clone());
+        let membrane: membrane_capnp::membrane::Client =
+            crate::membrane::membrane_client(rx.clone());
 
-        let _terminal = TerminalServer::<stem_capnp::membrane::Owned>::new(
+        let _terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
             vk,
             membrane,
             SigningDomain::terminal_membrane(),
@@ -351,9 +354,10 @@ mod tests {
     #[test]
     fn terminal_server_constructs_with_custom_policy() {
         let (_tx, rx) = watch::channel(test_epoch(1));
-        let membrane: stem_capnp::membrane::Client = crate::membrane::membrane_client(rx.clone());
+        let membrane: membrane_capnp::membrane::Client =
+            crate::membrane::membrane_client(rx.clone());
 
-        let _terminal = TerminalServer::<stem_capnp::membrane::Owned>::with_policy(
+        let _terminal = TerminalServer::<membrane_capnp::membrane::Owned>::with_policy(
             Box::new(AllowAllPolicy),
             membrane,
             SigningDomain::terminal_membrane(),
@@ -371,7 +375,7 @@ mod tests {
                 let vk = sk.verifying_key();
                 let (terminal, _tx) = terminal_with_epoch(vk, test_epoch(1));
 
-                let signer: stem_capnp::signer::Client =
+                let signer: auth_capnp::signer::Client =
                     capnp_rpc::new_client(TestSigner::from_ed25519(&sk));
                 let mut req = terminal.login_request();
                 req.get().set_signer(signer);
@@ -397,7 +401,7 @@ mod tests {
                 let ed_kp =
                     libp2p_identity::ed25519::Keypair::try_from_bytes(&mut sk.to_keypair_bytes())
                         .expect("valid key");
-                let signer: stem_capnp::signer::Client = capnp_rpc::new_client(WrongEpochSigner {
+                let signer: auth_capnp::signer::Client = capnp_rpc::new_client(WrongEpochSigner {
                     keypair: ed_kp.into(),
                     forced_epoch_seq: 999, // wrong epoch
                 });
@@ -431,11 +435,11 @@ mod tests {
     }
 
     #[allow(refining_impl_trait)]
-    impl stem_capnp::signer::Server for EpochAdvancingSigner {
+    impl auth_capnp::signer::Server for EpochAdvancingSigner {
         fn sign(
             self: capnp::capability::Rc<Self>,
-            params: stem_capnp::signer::SignParams,
-            mut results: stem_capnp::signer::SignResults,
+            params: auth_capnp::signer::SignParams,
+            mut results: auth_capnp::signer::SignResults,
         ) -> Promise<(), Error> {
             let p = pry!(params.get());
             let nonce = p.get_nonce();
@@ -478,7 +482,7 @@ mod tests {
                 let ed_kp =
                     libp2p_identity::ed25519::Keypair::try_from_bytes(&mut sk.to_keypair_bytes())
                         .expect("valid key");
-                let signer: stem_capnp::signer::Client =
+                let signer: auth_capnp::signer::Client =
                     capnp_rpc::new_client(EpochAdvancingSigner {
                         keypair: ed_kp.into(),
                         epoch_tx: tx,
