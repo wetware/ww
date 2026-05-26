@@ -13,6 +13,8 @@ fn main() {
         .crate_provides("capnp", [0xa93fc509624c72d9])
         .file(capnp_dir.join("system.capnp"))
         .file(capnp_dir.join("routing.capnp"))
+        .file(capnp_dir.join("auth.capnp"))
+        .file(capnp_dir.join("membrane.capnp"))
         .file(capnp_dir.join("stem.capnp"))
         .file(capnp_dir.join("cell.capnp"))
         .file(capnp_dir.join("http.capnp"))
@@ -41,7 +43,9 @@ fn main() {
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
-    for schema in &["system", "routing", "stem", "cell", "http"] {
+    for schema in &[
+        "system", "routing", "auth", "membrane", "stem", "cell", "http",
+    ] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()

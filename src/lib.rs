@@ -32,11 +32,15 @@ pub use rpc::keys;
 pub mod services;
 
 // Re-export capnp schema modules from the membrane crate so host code can
-// use `crate::system_capnp`, `crate::routing_capnp`, `crate::stem_capnp`, etc.
+// use `crate::system_capnp`, `crate::routing_capnp`, `crate::auth_capnp`, etc.
+#[cfg(not(target_arch = "wasm32"))]
+pub use membrane::auth_capnp;
 #[cfg(not(target_arch = "wasm32"))]
 pub use membrane::cell_capnp;
 #[cfg(not(target_arch = "wasm32"))]
 pub use membrane::http_capnp;
+#[cfg(not(target_arch = "wasm32"))]
+pub use membrane::membrane_capnp;
 #[cfg(not(target_arch = "wasm32"))]
 pub use membrane::routing_capnp;
 #[cfg(not(target_arch = "wasm32"))]

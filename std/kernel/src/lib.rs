@@ -24,6 +24,16 @@ mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
 
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
+mod auth_capnp {
+    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
+}
+
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
+mod membrane_capnp {
+    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
+}
+
 #[allow(dead_code)]
 mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
@@ -40,8 +50,8 @@ mod schema_ids {
     include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 }
 
-/// Bootstrap capability: the concrete Membrane defined in stem.capnp.
-type Membrane = stem_capnp::membrane::Client;
+/// Bootstrap capability: the concrete Membrane defined in membrane.capnp.
+type Membrane = membrane_capnp::membrane::Client;
 
 /// Exported kernel bootstrap capability.
 ///
@@ -54,11 +64,11 @@ struct KernelBootstrap {
 }
 
 #[allow(refining_impl_trait)]
-impl stem_capnp::membrane::Server for KernelBootstrap {
+impl membrane_capnp::membrane::Server for KernelBootstrap {
     fn graft(
         self: capnp::capability::Rc<Self>,
-        _params: stem_capnp::membrane::GraftParams,
-        mut results: stem_capnp::membrane::GraftResults,
+        _params: membrane_capnp::membrane::GraftParams,
+        mut results: membrane_capnp::membrane::GraftResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
         let membrane = match self.membrane.borrow().clone() {
             Some(m) => m,
@@ -141,10 +151,10 @@ struct Session {
     /// Host-side node identity hub for this session.
     ///
     /// Call `identity.signer("ww-membrane-graft")` (or another known domain) to
-    /// obtain a domain-scoped [`stem_capnp::signer::Client`].  The identity secret
+    /// obtain a domain-scoped [`auth_capnp::signer::Client`].  The identity secret
     /// never crosses the host–guest boundary; only this capability reference is passed.
     #[allow(dead_code)]
-    identity: stem_capnp::identity::Client,
+    identity: auth_capnp::identity::Client,
     /// Outbound HTTP capability for WASM guests.
     ///
     /// Domain-scoped proxy — the host checks URL host against an allowlist.
@@ -176,7 +186,7 @@ fn extract_capnp_client(
     try_downcast!(system_capnp::host::Client);
     try_downcast!(system_capnp::runtime::Client);
     try_downcast!(routing_capnp::routing::Client);
-    try_downcast!(stem_capnp::identity::Client);
+    try_downcast!(auth_capnp::identity::Client);
     try_downcast!(http_capnp::http_client::Client);
     try_downcast!(system_capnp::executor::Client);
     None
@@ -1385,7 +1395,7 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Look up a typed capability by name from the graft caps list.
 fn get_graft_cap<T: capnp::capability::FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, stem_capnp::export::Owned>,
+    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Result<T, capnp::Error> {
     for i in 0..caps.len() {
@@ -1574,7 +1584,7 @@ fn run_impl() {
     init_logging();
 
     let exported_membrane: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(None));
-    let bootstrap: stem_capnp::membrane::Client = capnp_rpc::new_client(KernelBootstrap {
+    let bootstrap: membrane_capnp::membrane::Client = capnp_rpc::new_client(KernelBootstrap {
         membrane: Rc::clone(&exported_membrane),
     });
 
@@ -1591,7 +1601,7 @@ fn run_impl() {
         let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
         let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
         let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
-        let identity: stem_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
+        let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
         let http_client: Option<http_capnp::http_client::Client> =
             get_graft_cap(&caps, "http-client").ok();
 
@@ -2102,19 +2112,19 @@ mod tests {
     struct TestIdentity;
 
     #[allow(refining_impl_trait)]
-    impl stem_capnp::identity::Server for TestIdentity {
+    impl auth_capnp::identity::Server for TestIdentity {
         fn signer(
             self: capnp::capability::Rc<Self>,
-            _p: stem_capnp::identity::SignerParams,
-            _r: stem_capnp::identity::SignerResults,
+            _p: auth_capnp::identity::SignerParams,
+            _r: auth_capnp::identity::SignerResults,
         ) -> Promise<(), capnp::Error> {
             Promise::err(capnp::Error::unimplemented("stub".into()))
         }
 
         fn verify(
             self: capnp::capability::Rc<Self>,
-            _p: stem_capnp::identity::VerifyParams,
-            _r: stem_capnp::identity::VerifyResults,
+            _p: auth_capnp::identity::VerifyParams,
+            _r: auth_capnp::identity::VerifyResults,
         ) -> Promise<(), capnp::Error> {
             Promise::err(capnp::Error::unimplemented("stub".into()))
         }
@@ -2127,11 +2137,11 @@ mod tests {
     }
 
     #[allow(refining_impl_trait)]
-    impl stem_capnp::membrane::Server for TestMembrane {
+    impl membrane_capnp::membrane::Server for TestMembrane {
         fn graft(
             self: capnp::capability::Rc<Self>,
-            _params: stem_capnp::membrane::GraftParams,
-            mut results: stem_capnp::membrane::GraftResults,
+            _params: membrane_capnp::membrane::GraftParams,
+            mut results: membrane_capnp::membrane::GraftResults,
         ) -> Promise<(), capnp::Error> {
             let mut caps = results.get().init_caps(1);
             let mut entry = caps.reborrow().get(0);
@@ -3211,4 +3221,5 @@ mod tests {
             Some(glia::error::tag::ARITY)
         );
     }
+
 }

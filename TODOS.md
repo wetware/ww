@@ -216,6 +216,14 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 **Priority:** P2
 **Depends on:** MCP dynamic tools (done)
 
+## Cap'n Proto schema-boundary refactor (stem/auth/membrane/system) (#509)
+**What:** Refactor schema ownership so epoch/provenance types stay in `stem.capnp`, auth/session types move to `auth.capnp`, membrane transport types (`Membrane`, `Export`) move to `membrane.capnp`, and core host/runtime/listener contracts remain in `system.capnp`.
+**Why:** `stem.capnp` currently mixes unrelated concerns and `system.capnp` imports `stem.Export` for core spawn/listener surfaces, which obscures ownership boundaries and complicates protocol evolution.
+**Context:** This is a staged-compat migration, not a redesign. Keep authority semantics unchanged (`Terminal(Membrane)` and no new ambient privileges), preserve runtime behavior, and plan explicit compatibility for schema bytes/type IDs/CID-derived vat addresses. Must audit all capnp build scripts and generated-module consumers (`crates/membrane`, `std/kernel`, `std/caps`, `std/status`, examples, CLI template scaffolding) plus schema-introspection paths (`schema_registry`, `Export.schema` propagation). Include a rollback path and a temporary shim period where old and new schema surfaces coexist long enough to land cross-crate updates atomically.
+**Effort:** L
+**Priority:** P2
+**Depends on:** issue #509 design approval, cross-crate capnp migration plan, compatibility decision for schema/type IDs
+
 ## MCP resources (Filesystem capability)
 **What:** Expose the merged FHS filesystem as MCP resources via a `Filesystem` capability in the membrane. The MCP cell would serve `resources/list` and `resources/read` requests by delegating to the host-provided Filesystem cap.
 **Why:** Claude Code needs to browse files (init.d scripts, WASM binaries, Glia modules) without writing Glia expressions. MCP resources is the standard mechanism for this.

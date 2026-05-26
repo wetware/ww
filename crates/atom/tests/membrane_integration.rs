@@ -6,7 +6,8 @@
 
 mod common;
 
-use atom::stem_capnp;
+use atom::auth_capnp;
+use atom::membrane_capnp;
 use atom::system_capnp;
 use atom::{AtomIndexer, Epoch, IndexerConfig, MembraneServer, TerminalServer};
 use auth::SigningDomain;
@@ -24,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 /// Look up a typed capability by name from the graft caps list.
 fn get_graft_cap<T: capnp::capability::FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, stem_capnp::export::Owned>,
+    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Result<T, capnp::Error> {
     for i in 0..caps.len() {
@@ -58,11 +59,11 @@ impl TestSigner {
 }
 
 #[allow(refining_impl_trait)]
-impl stem_capnp::signer::Server for TestSigner {
+impl auth_capnp::signer::Server for TestSigner {
     fn sign(
         self: capnp::capability::Rc<Self>,
-        params: stem_capnp::signer::SignParams,
-        mut results: stem_capnp::signer::SignResults,
+        params: auth_capnp::signer::SignParams,
+        mut results: auth_capnp::signer::SignResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
         let p = capnp_rpc::pry!(params.get());
         let nonce = p.get_nonce();
@@ -95,7 +96,7 @@ fn observed_to_epoch(ev: &atom::HeadUpdatedObserved) -> Epoch {
 }
 
 /// Helper: create a Membrane client (no auth — pure ocap).
-fn stub_membrane(rx: watch::Receiver<Epoch>) -> stem_capnp::membrane::Client {
+fn stub_membrane(rx: watch::Receiver<Epoch>) -> membrane_capnp::membrane::Client {
     new_client(MembraneServer::new(rx, StubSessionBuilder))
 }
 
@@ -103,9 +104,9 @@ fn stub_membrane(rx: watch::Receiver<Epoch>) -> stem_capnp::membrane::Client {
 fn terminal_membrane(
     rx: watch::Receiver<Epoch>,
     vk: ed25519_dalek::VerifyingKey,
-) -> stem_capnp::terminal::Client<stem_capnp::membrane::Owned> {
+) -> auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> {
     let membrane = stub_membrane(rx.clone());
-    new_client(TerminalServer::<stem_capnp::membrane::Owned>::new(
+    new_client(TerminalServer::<membrane_capnp::membrane::Owned>::new(
         vk,
         membrane,
         SigningDomain::terminal_membrane(),
@@ -190,7 +191,7 @@ async fn test_membrane_graft_runtime_against_anvil() {
 
     let (tx, rx) = watch::channel(epoch1.clone());
     let terminal = terminal_membrane(rx, vk);
-    let signer_client: stem_capnp::signer::Client = new_client(TestSigner::from_ed25519(&sk));
+    let signer_client: auth_capnp::signer::Client = new_client(TestSigner::from_ed25519(&sk));
 
     // Login via Terminal → get Membrane → graft → runtime.shutdown → Ok
     let mut login_req = terminal.login_request();
@@ -347,7 +348,7 @@ async fn test_terminal_wrong_key_rejected() {
 
     let (_tx, rx) = watch::channel(epoch);
     let terminal = terminal_membrane(rx, vk_a);
-    let signer_client: stem_capnp::signer::Client = new_client(TestSigner::from_ed25519(&sk_b));
+    let signer_client: auth_capnp::signer::Client = new_client(TestSigner::from_ed25519(&sk_b));
 
     let mut login_req = terminal.login_request();
     login_req.get().set_signer(signer_client);
@@ -400,7 +401,7 @@ async fn test_terminal_missing_signer_rejected() {
 }
 
 /// Helper: create a Membrane client with all 5 capabilities populated.
-fn full_stub_membrane(rx: watch::Receiver<Epoch>) -> stem_capnp::membrane::Client {
+fn full_stub_membrane(rx: watch::Receiver<Epoch>) -> membrane_capnp::membrane::Client {
     new_client(MembraneServer::new(rx, FullStubSessionBuilder))
 }
 
@@ -427,7 +428,7 @@ async fn test_graft_returns_all_five_capabilities() {
 
     // All 5 capabilities must be present by name.
     assert_eq!(caps.len(), 5, "expected 5 capabilities");
-    let _identity: stem_capnp::identity::Client =
+    let _identity: auth_capnp::identity::Client =
         get_graft_cap(&caps, "identity").expect("identity capability should be present");
     let _host: system_capnp::host::Client =
         get_graft_cap(&caps, "host").expect("host capability should be present");
@@ -469,13 +470,13 @@ async fn test_terminal_over_stream_pair() {
     let (_tx, rx) = watch::channel(epoch);
     let membrane = full_stub_membrane(rx.clone());
 
-    let terminal = TerminalServer::<stem_capnp::membrane::Owned>::new(
+    let terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
         vk,
         membrane,
         SigningDomain::terminal_membrane(),
         rx,
     );
-    let terminal_client: stem_capnp::terminal::Client<stem_capnp::membrane::Owned> =
+    let terminal_client: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
         new_client(terminal);
 
     let (client_stream, server_stream) = tokio::io::duplex(4096);
@@ -494,7 +495,7 @@ async fn test_terminal_over_stream_pair() {
             let client_network = VatNetwork::new(cr, cw, Side::Client, Default::default());
             let mut client_rpc =
                 RpcSystem::new(Box::new(client_network), None::<capnp::capability::Client>);
-            let remote_terminal: stem_capnp::terminal::Client<stem_capnp::membrane::Owned> =
+            let remote_terminal: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
                 client_rpc.bootstrap(Side::Server);
 
             tokio::task::spawn_local(async move {
@@ -505,7 +506,7 @@ async fn test_terminal_over_stream_pair() {
             });
 
             // Login with correct signer → get Membrane → graft → runtime.shutdown.
-            let signer_client: stem_capnp::signer::Client =
+            let signer_client: auth_capnp::signer::Client =
                 new_client(TestSigner::from_ed25519(&sk));
             let mut login_req = remote_terminal.login_request();
             login_req.get().set_signer(signer_client);
@@ -515,7 +516,7 @@ async fn test_terminal_over_stream_pair() {
                 .expect("login timed out")
                 .expect("login RPC");
 
-            let remote_membrane: stem_capnp::membrane::Client = login_resp
+            let remote_membrane: membrane_capnp::membrane::Client = login_resp
                 .get()
                 .expect("login results")
                 .get_session()
@@ -564,13 +565,13 @@ async fn test_terminal_over_stream_wrong_key_rejected() {
     let (_tx, rx) = watch::channel(epoch);
     let membrane = full_stub_membrane(rx.clone());
 
-    let terminal = TerminalServer::<stem_capnp::membrane::Owned>::new(
+    let terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
         host_vk,
         membrane,
         SigningDomain::terminal_membrane(),
         rx,
     );
-    let terminal_client: stem_capnp::terminal::Client<stem_capnp::membrane::Owned> =
+    let terminal_client: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
         new_client(terminal);
 
     let (client_stream, server_stream) = tokio::io::duplex(4096);
@@ -588,7 +589,7 @@ async fn test_terminal_over_stream_wrong_key_rejected() {
             let client_network = VatNetwork::new(cr, cw, Side::Client, Default::default());
             let mut client_rpc =
                 RpcSystem::new(Box::new(client_network), None::<capnp::capability::Client>);
-            let remote_terminal: stem_capnp::terminal::Client<stem_capnp::membrane::Owned> =
+            let remote_terminal: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
                 client_rpc.bootstrap(Side::Server);
 
             tokio::task::spawn_local(async move {
@@ -599,7 +600,7 @@ async fn test_terminal_over_stream_wrong_key_rejected() {
             });
 
             // Login with wrong key — should fail.
-            let signer_client: stem_capnp::signer::Client =
+            let signer_client: auth_capnp::signer::Client =
                 new_client(TestSigner::from_ed25519(&wrong_sk));
             let mut login_req = remote_terminal.login_request();
             login_req.get().set_signer(signer_client);
@@ -627,11 +628,11 @@ async fn test_terminal_over_stream_wrong_key_rejected() {
 struct MalformedSigner;
 
 #[allow(refining_impl_trait)]
-impl stem_capnp::signer::Server for MalformedSigner {
+impl auth_capnp::signer::Server for MalformedSigner {
     fn sign(
         self: capnp::capability::Rc<Self>,
-        _params: stem_capnp::signer::SignParams,
-        mut results: stem_capnp::signer::SignResults,
+        _params: auth_capnp::signer::SignParams,
+        mut results: auth_capnp::signer::SignResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
         // 64 bytes of 0xFF is not a valid signed envelope.
         results.get().set_sig(&[0xFF; 64]);
@@ -653,7 +654,7 @@ async fn test_terminal_malformed_signature_rejected() {
 
     let (_tx, rx) = watch::channel(epoch);
     let terminal = terminal_membrane(rx, vk);
-    let signer_client: stem_capnp::signer::Client = new_client(MalformedSigner);
+    let signer_client: auth_capnp::signer::Client = new_client(MalformedSigner);
 
     let mut login_req = terminal.login_request();
     login_req.get().set_signer(signer_client);
@@ -689,7 +690,7 @@ async fn test_terminal_login_fails_after_epoch_advance() {
     let terminal = terminal_membrane(rx, vk);
 
     // Login succeeds under epoch 1.
-    let signer1: stem_capnp::signer::Client = new_client(TestSigner::from_ed25519(&sk));
+    let signer1: auth_capnp::signer::Client = new_client(TestSigner::from_ed25519(&sk));
     let mut req1 = terminal.login_request();
     req1.get().set_signer(signer1);
     req1.send()
@@ -707,7 +708,7 @@ async fn test_terminal_login_fails_after_epoch_advance() {
 
     // Login again — the Terminal issues a challenge bound to epoch 2,
     // and the signer signs it correctly, so this should succeed too.
-    let signer2: stem_capnp::signer::Client = new_client(TestSigner::from_ed25519(&sk));
+    let signer2: auth_capnp::signer::Client = new_client(TestSigner::from_ed25519(&sk));
     let mut req2 = terminal.login_request();
     req2.get().set_signer(signer2);
     req2.send()

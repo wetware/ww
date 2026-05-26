@@ -30,6 +30,22 @@ pub mod system_capnp {
 pub mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
+#[allow(
+    unused_parens,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
+pub mod auth_capnp {
+    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
+}
+#[allow(
+    unused_parens,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
+pub mod membrane_capnp {
+    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
+}
 #[allow(unused_parens, clippy::match_single_binding)]
 pub mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
@@ -742,7 +758,7 @@ pub fn wrap_with_handlers(form: &Val, extra_caps: &[&str]) -> Val {
 
 /// Look up a typed capability by name from the graft caps list.
 pub fn get_graft_cap<T: capnp::capability::FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, stem_capnp::export::Owned>,
+    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Result<T, capnp::Error> {
     for i in 0..caps.len() {

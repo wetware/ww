@@ -6,6 +6,8 @@
 //!   configurable [Strategy] (e.g. [ConfirmationDepth]) and pass the canonical cross-check
 //!   (`Atom.head()`), giving reorg-safe finalized output.
 
+pub use membrane::auth_capnp;
+pub use membrane::membrane_capnp;
 pub use membrane::stem_capnp;
 pub use membrane::system_capnp;
 pub use membrane::{

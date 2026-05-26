@@ -24,7 +24,7 @@ use wasip2::exports::cli::run::Guest;
 // Shared effect handler factories.
 use caps::{
     eval_load_async, get_graft_cap, make_host_handler, make_import_handler,
-    make_routing_handler, routing_capnp, stem_capnp, system_capnp, wrap_with_handlers,
+    make_routing_handler, membrane_capnp, routing_capnp, system_capnp, wrap_with_handlers,
 };
 
 // Shell-specific generated Cap'n Proto modules.
@@ -39,7 +39,7 @@ mod schema_ids {
     include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 }
 
-type Membrane = stem_capnp::membrane::Client;
+type Membrane = membrane_capnp::membrane::Client;
 
 // ---------------------------------------------------------------------------
 // Session — capability context for the shell cell

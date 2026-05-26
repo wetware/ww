@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Cap'n Proto schema boundary split for `stem`/`auth`/`membrane`/`system` (#509).** Moved signer/identity/terminal/membrane/export types out of `stem.capnp` into dedicated `auth.capnp` and `membrane.capnp`, rewired `system.capnp` exports to the new membrane schema, updated build/codegen wiring across host/std/examples, and pinned key type IDs/schema CIDs in tests to guard wire/introspection compatibility during the migration.
 - **Runtime WASM load size limit raised to 8 MiB.** Increased `MAX_WASM_BYTES` in the runtime load path from 2 MiB to 8 MiB so practical guest binaries (including current standard-library shells) load without tripping size validation, while retaining a global upper bound for untrusted code.
 - **`ww shell` no-arg discovery is now runtime-state based (mDNS removed).** `ww run` now publishes live local dial targets to a host-state file (`$WW_HOST_STATE_PATH` override, else runtime-dir fallback) and `ww shell` resolves candidates from that file instead of multicast mDNS. This makes local attach deterministic on hosts where multicast is unavailable/restricted and keeps discovery independent of LAN policy quirks.
 - **Removed deprecated Wasmtime async config calls.** Dropped no-op `Config::async_support(true)` calls across runtime/host/test engine setup to keep `clippy -D warnings` clean on current Wasmtime.

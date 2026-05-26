@@ -5,7 +5,7 @@
 //! [`TerminalServer`].
 
 use crate::epoch::{Epoch, EpochGuard};
-use crate::stem_capnp;
+use crate::membrane_capnp;
 use capnp::capability::Promise;
 use capnp::Error;
 use capnp_rpc::new_client;
@@ -20,7 +20,7 @@ pub trait GraftBuilder: 'static {
     fn build(
         &self,
         guard: &EpochGuard,
-        builder: stem_capnp::membrane::graft_results::Builder<'_>,
+        builder: membrane_capnp::membrane::graft_results::Builder<'_>,
     ) -> Result<(), Error>;
 }
 
@@ -33,7 +33,7 @@ impl GraftBuilder for NoExtension {
     fn build(
         &self,
         _guard: &EpochGuard,
-        _builder: stem_capnp::membrane::graft_results::Builder<'_>,
+        _builder: membrane_capnp::membrane::graft_results::Builder<'_>,
     ) -> Result<(), Error> {
         Ok(())
     }
@@ -62,7 +62,10 @@ impl<F: GraftBuilder> MembraneServer<F> {
     }
 
     /// Build epoch-guarded capabilities into the graft results.
-    fn build_graft(&self, results: &mut stem_capnp::membrane::GraftResults) -> Result<(), Error> {
+    fn build_graft(
+        &self,
+        results: &mut membrane_capnp::membrane::GraftResults,
+    ) -> Result<(), Error> {
         let epoch = self.get_current_epoch();
         let guard = EpochGuard {
             issued_seq: epoch.seq,
@@ -73,11 +76,11 @@ impl<F: GraftBuilder> MembraneServer<F> {
 }
 
 #[allow(refining_impl_trait)]
-impl<F: GraftBuilder> stem_capnp::membrane::Server for MembraneServer<F> {
+impl<F: GraftBuilder> membrane_capnp::membrane::Server for MembraneServer<F> {
     fn graft(
         self: capnp::capability::Rc<Self>,
-        _params: stem_capnp::membrane::GraftParams,
-        mut results: stem_capnp::membrane::GraftResults,
+        _params: membrane_capnp::membrane::GraftParams,
+        mut results: membrane_capnp::membrane::GraftResults,
     ) -> Promise<(), Error> {
         tracing::debug!("Membrane graft() called");
         if let Err(e) = self.build_graft(&mut results) {
@@ -93,7 +96,7 @@ impl<F: GraftBuilder> stem_capnp::membrane::Server for MembraneServer<F> {
 /// Uses `NoExtension` — all result fields are left empty (null capabilities).
 /// For platform-specific graft responses, construct
 /// `MembraneServer::new(receiver, your_graft_builder)` directly.
-pub fn membrane_client(receiver: watch::Receiver<Epoch>) -> stem_capnp::membrane::Client {
+pub fn membrane_client(receiver: watch::Receiver<Epoch>) -> membrane_capnp::membrane::Client {
     new_client(MembraneServer::new(receiver, NoExtension))
 }
 
@@ -142,7 +145,7 @@ mod tests {
         fn build(
             &self,
             _guard: &EpochGuard,
-            _builder: stem_capnp::membrane::graft_results::Builder<'_>,
+            _builder: membrane_capnp::membrane::graft_results::Builder<'_>,
         ) -> Result<(), capnp::Error> {
             self.called.set(true);
             Ok(())
@@ -170,7 +173,7 @@ mod tests {
         fn build(
             &self,
             _guard: &EpochGuard,
-            _builder: stem_capnp::membrane::graft_results::Builder<'_>,
+            _builder: membrane_capnp::membrane::graft_results::Builder<'_>,
         ) -> Result<(), capnp::Error> {
             Err(capnp::Error::failed("intentional failure".into()))
         }
@@ -196,7 +199,7 @@ mod tests {
             receiver: rx,
         };
         let mut message = capnp::message::Builder::new_default();
-        let builder = message.init_root::<stem_capnp::membrane::graft_results::Builder<'_>>();
+        let builder = message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
         let result = NoExtension.build(&guard, builder);
         assert!(result.is_ok());
     }

@@ -19,7 +19,7 @@ use capnp_rpc::RpcSystem;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use libp2p::identity::Keypair;
 use libp2p_core::SignedEnvelope;
-use membrane::{stem_capnp, Epoch, EpochGuard, GraftBuilder, MembraneServer};
+use membrane::{auth_capnp, membrane_capnp, Epoch, EpochGuard, GraftBuilder, MembraneServer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -61,11 +61,11 @@ impl EpochGuardedIdentity {
 }
 
 #[allow(refining_impl_trait)]
-impl stem_capnp::identity::Server for EpochGuardedIdentity {
+impl auth_capnp::identity::Server for EpochGuardedIdentity {
     fn signer(
         self: capnp::capability::Rc<Self>,
-        params: stem_capnp::identity::SignerParams,
-        mut results: stem_capnp::identity::SignerResults,
+        params: auth_capnp::identity::SignerParams,
+        mut results: auth_capnp::identity::SignerResults,
     ) -> Promise<(), capnp::Error> {
         pry!(self.guard.check());
         let domain_reader = pry!(pry!(params.get()).get_domain());
@@ -81,7 +81,7 @@ impl stem_capnp::identity::Server for EpochGuardedIdentity {
         // The domain string is opaque to the host; it just constructs the
         // domain-separated signing buffer using whatever the guest requested.
         let domain = SigningDomain::new(domain_str);
-        let signer: stem_capnp::signer::Client = capnp_rpc::new_client(EpochGuardedDomainSigner {
+        let signer: auth_capnp::signer::Client = capnp_rpc::new_client(EpochGuardedDomainSigner {
             domain,
             keypair: self.keypair.clone(),
             guard: self.guard.clone(),
@@ -92,8 +92,8 @@ impl stem_capnp::identity::Server for EpochGuardedIdentity {
 
     fn verify(
         self: capnp::capability::Rc<Self>,
-        params: stem_capnp::identity::VerifyParams,
-        mut results: stem_capnp::identity::VerifyResults,
+        params: auth_capnp::identity::VerifyParams,
+        mut results: auth_capnp::identity::VerifyResults,
     ) -> Promise<(), capnp::Error> {
         pry!(self.guard.check());
         let params = pry!(params.get());
@@ -200,11 +200,11 @@ impl system_capnp::ipfs::Server for EpochGuardedIpfs {
 }
 
 #[allow(refining_impl_trait)]
-impl stem_capnp::signer::Server for EpochGuardedDomainSigner {
+impl auth_capnp::signer::Server for EpochGuardedDomainSigner {
     fn sign(
         self: capnp::capability::Rc<Self>,
-        params: stem_capnp::signer::SignParams,
-        mut results: stem_capnp::signer::SignResults,
+        params: auth_capnp::signer::SignParams,
+        mut results: auth_capnp::signer::SignResults,
     ) -> Promise<(), capnp::Error> {
         pry!(self.guard.check());
         let p = pry!(params.get());
@@ -290,7 +290,7 @@ impl HostGraftBuilder {
     /// Set named capabilities from init.d `with` block to inject into graft.
     ///
     /// The third tuple element is the canonical `Schema.Node` bytes for the
-    /// cap. The wire format already carries these (see `stem.capnp:Export`);
+    /// cap. The wire format already carries these (see `membrane.capnp:Export`);
     /// callers that received the cap over `Executor.spawn` /
     /// `VatListener.listen` should preserve `entry.get_schema()` and pass
     /// it through. Pass an empty Vec only when the schema is genuinely
@@ -308,7 +308,7 @@ impl GraftBuilder for HostGraftBuilder {
     fn build(
         &self,
         guard: &EpochGuard,
-        mut builder: stem_capnp::membrane::graft_results::Builder<'_>,
+        mut builder: membrane_capnp::membrane::graft_results::Builder<'_>,
     ) -> Result<(), capnp::Error> {
         // Build the core capabilities.
         let mut host_impl = super::HostImpl::new(
@@ -336,7 +336,7 @@ impl GraftBuilder for HostGraftBuilder {
         if let Some(sk) = &self.signing_key {
             let keypair =
                 crate::keys::to_libp2p(sk).map_err(|e| capnp::Error::failed(e.to_string()))?;
-            let identity: stem_capnp::identity::Client =
+            let identity: auth_capnp::identity::Client =
                 capnp_rpc::new_client(EpochGuardedIdentity::new(keypair, guard.clone()));
             entries.push(("identity", identity.client));
         }
@@ -403,7 +403,7 @@ impl GraftBuilder for HostGraftBuilder {
 /// `crates/membrane/build.rs`. Unknown names get an empty Schema.Node —
 /// callers then fall back to string-name lookup.
 fn write_schema_for_core_cap(
-    mut entry: stem_capnp::export::Builder<'_>,
+    mut entry: membrane_capnp::export::Builder<'_>,
     name: &str,
 ) -> Result<(), capnp::Error> {
     let Some(bytes) = membrane::schema_registry::schema_by_name(name) else {
@@ -424,7 +424,7 @@ fn write_schema_for_core_cap(
 /// header). Capnp segments must be 8-byte aligned, but byte slices may
 /// only be byte-aligned, so copy into a Word-aligned buffer first.
 fn write_schema_bytes(
-    mut entry: stem_capnp::export::Builder<'_>,
+    mut entry: membrane_capnp::export::Builder<'_>,
     bytes: &[u8],
 ) -> Result<(), capnp::Error> {
     let aligned = bytes_to_aligned_words(bytes);
@@ -458,7 +458,7 @@ pub(super) fn bytes_to_aligned_words(bytes: &[u8]) -> Vec<capnp::Word> {
 /// When a guest calls `runtime::serve(my_membrane, ...)`, the host
 /// captures it here. The host can then re-serve it to external peers,
 /// allowing the guest to attenuate or enrich the capability surface it exposes.
-pub type GuestMembrane = membrane::stem_capnp::membrane::Client;
+pub type GuestMembrane = membrane::membrane_capnp::membrane::Client;
 
 /// Build an RPC system that bootstraps a `Membrane` instead of a bare `Host`.
 ///
@@ -541,7 +541,7 @@ mod tests {
 
     /// Helper: create an EpochGuardedIdentity client for testing.
     fn test_identity() -> (
-        stem_capnp::identity::Client,
+        auth_capnp::identity::Client,
         tokio::sync::watch::Sender<Epoch>,
     ) {
         let sk = gen_signing_key();
@@ -556,7 +556,7 @@ mod tests {
             issued_seq: 1,
             receiver: rx,
         };
-        let client: stem_capnp::identity::Client =
+        let client: auth_capnp::identity::Client =
             capnp_rpc::new_client(EpochGuardedIdentity::new(keypair, guard));
         (client, tx)
     }
@@ -789,7 +789,7 @@ mod tests {
     /// the Schema.Node id along with whether the node is an Interface.
     fn write_then_read_schema(name: &str) -> (u64, bool) {
         let mut message = capnp::message::Builder::new_default();
-        let entry: stem_capnp::export::Builder<'_> = message.init_root();
+        let entry: membrane_capnp::export::Builder<'_> = message.init_root();
         write_schema_for_core_cap(entry, name).expect("write_schema_for_core_cap");
 
         // Round-trip via capnp serialization, mimicking what a guest sees
@@ -801,7 +801,7 @@ mod tests {
             capnp::message::ReaderOptions::new(),
         )
         .expect("deserialize export");
-        let entry: stem_capnp::export::Reader<'_> = reader.get_root().expect("export root");
+        let entry: membrane_capnp::export::Reader<'_> = reader.get_root().expect("export root");
         let schema_node: capnp::schema_capnp::node::Reader =
             entry.get_schema().expect("schema field present");
         let id = schema_node.get_id();
@@ -853,7 +853,7 @@ mod tests {
     #[test]
     fn item1a_unknown_cap_yields_empty_schema() {
         let mut message = capnp::message::Builder::new_default();
-        let entry: stem_capnp::export::Builder<'_> = message.init_root();
+        let entry: membrane_capnp::export::Builder<'_> = message.init_root();
         write_schema_for_core_cap(entry, "not-a-real-cap").expect("returns Ok with empty");
 
         let mut buf = Vec::new();
@@ -863,7 +863,7 @@ mod tests {
             capnp::message::ReaderOptions::new(),
         )
         .expect("deserialize");
-        let entry: stem_capnp::export::Reader<'_> = reader.get_root().expect("export root");
+        let entry: membrane_capnp::export::Reader<'_> = reader.get_root().expect("export root");
         let schema_node: capnp::schema_capnp::node::Reader =
             entry.get_schema().expect("schema field present");
         // Empty Schema.Node has id=0 and a default (uninterpreted) Which.
@@ -876,7 +876,7 @@ mod tests {
         // (MCP tool description generator, future (schema cap) builtin) can
         // walk methods. Verify host's methods are non-empty and have names.
         let mut message = capnp::message::Builder::new_default();
-        let entry: stem_capnp::export::Builder<'_> = message.init_root();
+        let entry: membrane_capnp::export::Builder<'_> = message.init_root();
         write_schema_for_core_cap(entry, "host").expect("write host schema");
 
         let mut buf = Vec::new();
@@ -886,7 +886,7 @@ mod tests {
             capnp::message::ReaderOptions::new(),
         )
         .expect("deserialize");
-        let entry: stem_capnp::export::Reader<'_> = reader.get_root().expect("export root");
+        let entry: membrane_capnp::export::Reader<'_> = reader.get_root().expect("export root");
         let schema_node: capnp::schema_capnp::node::Reader =
             entry.get_schema().expect("schema field present");
 
@@ -926,7 +926,7 @@ mod tests {
     /// `Schema.Node` id and whether it parses as an interface.
     fn write_then_read_extras_schema(bytes: &[u8]) -> (u64, bool) {
         let mut message = capnp::message::Builder::new_default();
-        let entry: stem_capnp::export::Builder<'_> = message.init_root();
+        let entry: membrane_capnp::export::Builder<'_> = message.init_root();
         write_schema_bytes(entry, bytes).expect("write_schema_bytes");
 
         let mut buf = Vec::new();
@@ -936,7 +936,7 @@ mod tests {
             capnp::message::ReaderOptions::new(),
         )
         .expect("deserialize");
-        let entry: stem_capnp::export::Reader<'_> = reader.get_root().expect("export root");
+        let entry: membrane_capnp::export::Reader<'_> = reader.get_root().expect("export root");
         let schema_node: capnp::schema_capnp::node::Reader =
             entry.get_schema().expect("schema field present");
         let id = schema_node.get_id();
@@ -989,7 +989,7 @@ mod tests {
         // `init_schema()` produces a Schema.Node with id=0, which is the
         // shape consumers see for "extra cap registered without schema".
         let mut message = capnp::message::Builder::new_default();
-        let entry: stem_capnp::export::Builder<'_> = message.init_root();
+        let entry: membrane_capnp::export::Builder<'_> = message.init_root();
         entry.init_schema();
 
         let mut buf = Vec::new();
@@ -999,7 +999,7 @@ mod tests {
             capnp::message::ReaderOptions::new(),
         )
         .expect("deserialize");
-        let entry: stem_capnp::export::Reader<'_> = reader.get_root().expect("export root");
+        let entry: membrane_capnp::export::Reader<'_> = reader.get_root().expect("export root");
         let schema_node: capnp::schema_capnp::node::Reader =
             entry.get_schema().expect("schema field present");
         assert_eq!(
