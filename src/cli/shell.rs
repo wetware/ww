@@ -4,12 +4,22 @@ use anyhow::{bail, Context, Result};
 use auth::SigningDomain;
 use capnp::capability::FromClientHook;
 use capnp_rpc::{new_client, pry};
+use caps::{
+    clear_import_cache, clear_load_backend, clear_load_cache, eval_load_async, extract_method,
+    make_import_cap, make_import_handler, set_load_backend, wrap_with_handlers, LoadBackend,
+};
+use glia::eval::{self, Dispatch, Env};
+use glia::{make_cap, Val};
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use libp2p_core::SignedEnvelope;
 use rustyline::error::ReadlineError;
+use std::collections::HashMap;
+use std::future::Future;
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::rc::Rc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -20,10 +30,14 @@ const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_DISCOVERY_ENV: &str = "WW_TEST_SHELL_CANDIDATES";
 
-#[cfg(has_wasm_std_shell_bin_shell_wasm)]
-const EMBEDDED_SHELL: &[u8] = include_bytes!("../../std/shell/bin/shell.wasm");
-#[cfg(not(has_wasm_std_shell_bin_shell_wasm))]
-const EMBEDDED_SHELL: &[u8] = &[];
+const HELP_TEXT: &str = "\
+Remote Glia shell. Available commands:
+  (perform host :id)       — peer identity
+  (perform host :addrs)    — listen addresses
+  (perform host :peers)    — connected peers
+  (perform routing :resolve \"/ipns/<name>\") — IPNS resolve
+  (help)                   — this message
+  (exit)                   — disconnect";
 
 #[derive(Clone, Debug)]
 struct Candidate {
@@ -33,6 +47,39 @@ struct Candidate {
 
 struct LocalSigner {
     keypair: libp2p::identity::Keypair,
+}
+
+struct GraftedShellCaps {
+    host: ww::system_capnp::host::Client,
+    routing: ww::routing_capnp::routing::Client,
+    ipfs: Option<ww::system_capnp::ipfs::Client>,
+}
+
+type HandlerFn =
+    for<'a> fn(&'a [Val]) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + 'a>>;
+
+struct LocalShellDispatch<'a> {
+    table: &'a HashMap<&'static str, HandlerFn>,
+}
+
+impl<'a> Dispatch for LocalShellDispatch<'a> {
+    fn call<'b>(
+        &'b self,
+        name: &'b str,
+        args: &'b [Val],
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + 'b>> {
+        Box::pin(async move {
+            match self.table.get(name) {
+                Some(handler) => handler(args).await,
+                None => Err(Val::from(format!("{name}: command not found"))),
+            }
+        })
+    }
+}
+
+struct LocalShellRuntime {
+    env: Env,
+    dispatch: HashMap<&'static str, HandlerFn>,
 }
 
 impl LocalSigner {
@@ -103,14 +150,15 @@ async fn run_shell_local(addr: Option<Multiaddr>, select: Option<String>) -> Res
         )?
     };
 
-    let shell = dial_shell(&target, &signing_key).await?;
-    run_repl(&shell).await
+    let grafted_caps = dial_shell(&target, &signing_key).await?;
+    let mut runtime = build_local_shell_runtime(grafted_caps).await;
+    run_repl(&mut runtime).await
 }
 
 async fn dial_shell(
     target: &Candidate,
     signing_key: &ed25519_dalek::SigningKey,
-) -> Result<ww::shell_capnp::shell::Client> {
+) -> Result<GraftedShellCaps> {
     // Use a fresh transport identity for the shell client swarm.
     // The user's persistent key from ~/.ww/identity is still used for
     // Terminal login signing below (LocalSigner). Reusing the same libp2p
@@ -190,31 +238,14 @@ async fn dial_shell(
         .await
         .context("graft request timed out")??;
     let caps = graft_resp.get()?.get_caps()?;
-    let runtime: ww::system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
-
-    let shell_wasm = load_shell_wasm()?;
-
-    let mut load_req = runtime.load_request();
-    load_req.get().set_wasm(&shell_wasm);
-    let load_resp = tokio::time::timeout(RPC_TIMEOUT, load_req.send().promise)
-        .await
-        .context("runtime.load timed out")??;
-    let executor = load_resp.get()?.get_executor()?;
-
-    let spawn_resp = tokio::time::timeout(RPC_TIMEOUT, executor.spawn_request().send().promise)
-        .await
-        .context("executor.spawn timed out")??;
-    let process = spawn_resp.get()?.get_process()?;
-
-    let bootstrap_resp =
-        tokio::time::timeout(RPC_TIMEOUT, process.bootstrap_request().send().promise)
-            .await
-            .context("process.bootstrap timed out")??;
-    let bootstrap = bootstrap_resp.get()?;
-    let shell: ww::shell_capnp::shell::Client = bootstrap.get_cap().get_as_capability()?;
-
-    wait_shell_ready(&shell).await?;
-    Ok(shell)
+    let host = get_graft_cap(&caps, "host")?;
+    let routing = get_graft_cap(&caps, "routing")?;
+    let ipfs = get_graft_cap(&caps, "ipfs").ok();
+    Ok(GraftedShellCaps {
+        host,
+        routing,
+        ipfs,
+    })
 }
 
 async fn await_connected_peer(
@@ -227,7 +258,7 @@ async fn await_connected_peer(
         .map_err(|e| anyhow::anyhow!("libp2p connection failed before establish: {e}"))
 }
 
-async fn run_repl(shell: &ww::shell_capnp::shell::Client) -> Result<()> {
+async fn run_repl(runtime: &mut LocalShellRuntime) -> Result<()> {
     let mut rl = rustyline::DefaultEditor::new().context("failed to initialize line editor")?;
 
     loop {
@@ -242,7 +273,7 @@ async fn run_repl(shell: &ww::shell_capnp::shell::Client) -> Result<()> {
                 }
                 let _ = rl.add_history_entry(input);
 
-                let (result, is_error) = shell_eval(shell, input).await?;
+                let (result, is_error) = shell_eval(runtime, input).await?;
                 if is_error {
                     eprintln!("{result}");
                 } else {
@@ -261,30 +292,487 @@ async fn run_repl(shell: &ww::shell_capnp::shell::Client) -> Result<()> {
     Ok(())
 }
 
-async fn shell_eval(shell: &ww::shell_capnp::shell::Client, text: &str) -> Result<(String, bool)> {
-    let mut req = shell.eval_request();
-    req.get().set_text(text);
-    let resp = tokio::time::timeout(RPC_TIMEOUT, req.send().promise)
-        .await
-        .context("shell eval timed out")??;
-    let result = resp.get()?;
-    let text = result
-        .get_result()?
-        .to_str()
-        .unwrap_or("(invalid UTF-8)")
-        .to_string();
-    Ok((text, result.get_is_error()))
+async fn build_local_shell_runtime(caps: GraftedShellCaps) -> LocalShellRuntime {
+    let GraftedShellCaps {
+        host,
+        routing,
+        ipfs,
+    } = caps;
+
+    clear_load_backend();
+    clear_load_cache();
+    clear_import_cache();
+    set_load_backend(Rc::new(ShellLoadBackend { ipfs }));
+
+    let mut env = Env::new();
+
+    env.set(
+        "host".to_string(),
+        make_cap("host", "shell:host", Rc::new(host.clone())),
+    );
+    env.set(
+        "routing".to_string(),
+        make_cap("routing", "shell:routing", Rc::new(routing.clone())),
+    );
+    env.set("import".to_string(), make_import_cap());
+
+    env.set("host-handler".to_string(), make_host_handler_local(host));
+    env.set(
+        "routing-handler".to_string(),
+        make_routing_handler_local(routing),
+    );
+    env.set("import-handler".to_string(), make_import_handler());
+
+    let dispatch = build_dispatch();
+    {
+        let mut prelude_dispatch = LocalShellDispatch { table: &dispatch };
+        glia::load_prelude(&mut env, &mut prelude_dispatch).await;
+    }
+
+    LocalShellRuntime { env, dispatch }
 }
 
-async fn wait_shell_ready(shell: &ww::shell_capnp::shell::Client) -> Result<()> {
-    for _ in 0..60 {
-        let (result, is_error) = shell_eval(shell, "nil").await?;
-        if !is_error || !result.contains("not ready") {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
+    fn load_handler(
+        args: &[Val],
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + '_>> {
+        Box::pin(eval_load_async(args))
     }
-    bail!("shell did not become ready")
+
+    fn help_handler(
+        _args: &[Val],
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + '_>> {
+        Box::pin(std::future::ready(Ok(Val::Str(HELP_TEXT.to_string()))))
+    }
+
+    fn exit_handler(
+        _args: &[Val],
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + '_>> {
+        Box::pin(std::future::ready(Ok(Val::Keyword("exit".into()))))
+    }
+
+    let mut table: HashMap<&'static str, HandlerFn> = HashMap::new();
+    table.insert("load", load_handler);
+    table.insert("help", help_handler);
+    table.insert("exit", exit_handler);
+    table
+}
+
+struct ShellLoadBackend {
+    ipfs: Option<ww::system_capnp::ipfs::Client>,
+}
+
+impl LoadBackend for ShellLoadBackend {
+    fn load<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<Vec<u8>, Val>> + 'a>> {
+        Box::pin(async move {
+            if ww::ipfs::is_ipfs_path(path) {
+                let ipfs = self.ipfs.clone().ok_or_else(|| {
+                    Val::from("load: /ipfs and /ipns paths require grafted 'ipfs' capability")
+                })?;
+                let mut req = ipfs.read_request();
+                req.get().set_path(path);
+                let resp = req
+                    .send()
+                    .promise
+                    .await
+                    .map_err(|e| Val::from(format!("load: {path}: {e}")))?;
+                let bytes = resp
+                    .get()
+                    .map_err(|e| Val::from(format!("load: {path}: {e}")))?
+                    .get_data()
+                    .map_err(|e| Val::from(format!("load: {path}: {e}")))?;
+                Ok(bytes.to_vec())
+            } else {
+                std::fs::read(path).map_err(|e| Val::from(format!("load: {path}: {e}")))
+            }
+        })
+    }
+}
+
+fn call_resume_local(resume: &Val, val: Val) -> Result<Val, Val> {
+    match resume {
+        Val::NativeFn { func, .. } => func(&[val]),
+        _ => Err(Val::from("cap handler: invalid resume function")),
+    }
+}
+
+fn make_host_handler_local(host: ww::system_capnp::host::Client) -> Val {
+    use base58::ToBase58;
+
+    Val::AsyncNativeFn {
+        name: "host-handler".into(),
+        func: Rc::new(move |args: Vec<Val>| {
+            let host = host.clone();
+            Box::pin(async move {
+                let (method, _rest) = extract_method(&args[0])?;
+                let resume = &args[1];
+
+                match method {
+                    "id" => {
+                        let resp = host
+                            .id_request()
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let peer_id_bytes = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_peer_id()
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let encoded = peer_id_bytes.to_base58();
+                        call_resume_local(resume, Val::Str(encoded))
+                    }
+                    "addrs" => {
+                        let resp = host
+                            .addrs_request()
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let addrs = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_addrs()
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let items: Vec<Val> = addrs
+                            .iter()
+                            .filter_map(|a| {
+                                a.ok().and_then(|bytes| {
+                                    multiaddr::Multiaddr::try_from(bytes.to_vec())
+                                        .ok()
+                                        .map(|ma| Val::Str(ma.to_string()))
+                                })
+                            })
+                            .collect();
+                        call_resume_local(resume, Val::List(items))
+                    }
+                    "peers" => {
+                        let resp = host
+                            .peers_request()
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let peers = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_peers()
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let items: Vec<Val> = peers
+                            .iter()
+                            .filter_map(|p| {
+                                let peer_id = p.get_peer_id().ok()?;
+                                let encoded = peer_id.to_base58();
+                                let addrs: Vec<Val> = p
+                                    .get_addrs()
+                                    .ok()?
+                                    .iter()
+                                    .filter_map(|a| {
+                                        a.ok().and_then(|bytes| {
+                                            multiaddr::Multiaddr::try_from(bytes.to_vec())
+                                                .ok()
+                                                .map(|ma| Val::Str(ma.to_string()))
+                                        })
+                                    })
+                                    .collect();
+                                Some(Val::Map(glia::ValMap::from_pairs(vec![
+                                    (Val::Keyword("peer-id".into()), Val::Str(encoded)),
+                                    (Val::Keyword("addrs".into()), Val::List(addrs)),
+                                ])))
+                            })
+                            .collect();
+                        call_resume_local(resume, Val::List(items))
+                    }
+                    other => Err(Val::from(format!("host: unknown method :{other}"))),
+                }
+            })
+        }),
+    }
+}
+
+fn make_routing_handler_local(routing: ww::routing_capnp::routing::Client) -> Val {
+    Val::AsyncNativeFn {
+        name: "routing-handler".into(),
+        func: Rc::new(move |args: Vec<Val>| {
+            let routing = routing.clone();
+            Box::pin(async move {
+                let (method, rest) = extract_method(&args[0])?;
+                let resume = &args[1];
+
+                match method {
+                    "provide" => {
+                        let key = match rest.first() {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => return Err(Val::from("routing :provide — expected key string")),
+                        };
+                        let mut req = routing.provide_request();
+                        req.get().set_key(&key);
+                        req.send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        call_resume_local(resume, Val::Nil)
+                    }
+                    "resolve" => {
+                        let name = match rest.first() {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => return Err(Val::from("routing :resolve — expected name string")),
+                        };
+                        let mut req = routing.resolve_request();
+                        req.get().set_name(&name);
+                        let resp = req
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let path = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_path()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .to_string()
+                            .map_err(|e| Val::from(format!("{e}")))?;
+                        call_resume_local(resume, Val::Str(path))
+                    }
+                    "mkdir" => {
+                        let base_cid = match rest.first() {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => {
+                                return Err(Val::from("routing :mkdir — expected base CID string"));
+                            }
+                        };
+                        let path = match rest.get(1) {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => return Err(Val::from("routing :mkdir — expected path string")),
+                        };
+                        let parents = match rest.get(2) {
+                            Some(Val::Bool(b)) => *b,
+                            _ => true,
+                        };
+                        let mut req = routing.mkdir_request();
+                        let mut r = req.get();
+                        r.set_base_cid(&base_cid);
+                        r.set_path(&path);
+                        r.set_parents(parents);
+                        let resp = req
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let root = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_root_cid()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .to_string()
+                            .map_err(|e| Val::from(format!("{e}")))?;
+                        call_resume_local(resume, Val::Str(root))
+                    }
+                    "write-file" => {
+                        let base_cid = match rest.first() {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => {
+                                return Err(Val::from(
+                                    "routing :write-file — expected base CID string",
+                                ));
+                            }
+                        };
+                        let path = match rest.get(1) {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => {
+                                return Err(Val::from(
+                                    "routing :write-file — expected path string",
+                                ));
+                            }
+                        };
+                        let data = match rest.get(2) {
+                            Some(Val::Bytes(b)) => b.clone(),
+                            Some(Val::Str(s)) => s.as_bytes().to_vec(),
+                            _ => {
+                                return Err(Val::from(
+                                    "routing :write-file — expected bytes or string data",
+                                ));
+                            }
+                        };
+                        let create_parents = match rest.get(3) {
+                            Some(Val::Bool(b)) => *b,
+                            _ => true,
+                        };
+                        let mut req = routing.write_file_request();
+                        let mut r = req.get();
+                        r.set_base_cid(&base_cid);
+                        r.set_path(&path);
+                        r.set_data(&data);
+                        r.set_create_parents(create_parents);
+                        let resp = req
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let root = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_root_cid()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .to_string()
+                            .map_err(|e| Val::from(format!("{e}")))?;
+                        call_resume_local(resume, Val::Str(root))
+                    }
+                    "remove" => {
+                        let base_cid = match rest.first() {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => {
+                                return Err(Val::from(
+                                    "routing :remove — expected base CID string",
+                                ));
+                            }
+                        };
+                        let path = match rest.get(1) {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => return Err(Val::from("routing :remove — expected path string")),
+                        };
+                        let recursive = match rest.get(2) {
+                            Some(Val::Bool(b)) => *b,
+                            _ => false,
+                        };
+                        let mut req = routing.remove_request();
+                        let mut r = req.get();
+                        r.set_base_cid(&base_cid);
+                        r.set_path(&path);
+                        r.set_recursive(recursive);
+                        let resp = req
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let root = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_root_cid()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .to_string()
+                            .map_err(|e| Val::from(format!("{e}")))?;
+                        call_resume_local(resume, Val::Str(root))
+                    }
+                    "publish" => {
+                        let name = match rest.first() {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => return Err(Val::from("routing :publish — expected name string")),
+                        };
+                        let cid = match rest.get(1) {
+                            Some(Val::Str(s)) => s.clone(),
+                            _ => return Err(Val::from("routing :publish — expected CID string")),
+                        };
+                        let expected = match rest.get(2) {
+                            Some(Val::Str(s)) => s.clone(),
+                            Some(Val::Nil) | None => String::new(),
+                            _ => {
+                                return Err(Val::from(
+                                    "routing :publish — expected current path string or nil",
+                                ));
+                            }
+                        };
+                        let mut req = routing.publish_request();
+                        let mut r = req.get();
+                        r.set_name(&name);
+                        r.set_cid(&cid);
+                        r.set_expected_current(&expected);
+                        let resp = req
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let published = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_published_path()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .to_string()
+                            .map_err(|e| Val::from(format!("{e}")))?;
+                        call_resume_local(resume, Val::Str(published))
+                    }
+                    "hash" => {
+                        let data = match rest.first() {
+                            Some(Val::Str(s)) => s.as_bytes().to_vec(),
+                            Some(Val::Bytes(b)) => b.clone(),
+                            _ => return Err(Val::from("routing :hash — expected string or bytes")),
+                        };
+                        let mut req = routing.hash_request();
+                        req.get().set_data(&data);
+                        let resp = req
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let key = resp
+                            .get()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .get_key()
+                            .map_err(|e| Val::from(e.to_string()))?
+                            .to_string()
+                            .map_err(|e| Val::from(format!("{e}")))?;
+                        call_resume_local(resume, Val::Str(key))
+                    }
+                    other => Err(Val::from(format!("routing: unknown method :{other}"))),
+                }
+            })
+        }),
+    }
+}
+
+async fn shell_eval(runtime: &mut LocalShellRuntime, text: &str) -> Result<(String, bool)> {
+    let eval_result = shell_eval_value(runtime, text).await?;
+
+    match eval_result {
+        Ok(value) => Ok((value, false)),
+        Err(value) => Ok((value, true)),
+    }
+}
+
+async fn shell_eval_value(
+    runtime: &mut LocalShellRuntime,
+    text: &str,
+) -> Result<std::result::Result<String, String>> {
+    if text.trim().is_empty() {
+        return Ok(Ok(String::new()));
+    }
+
+    let expr = match glia::read(text) {
+        Ok(expr) => expr,
+        Err(e) => return Ok(Err(format!("parse error: {e}"))),
+    };
+
+    let wrapped = wrap_with_handlers(&expr, &[]);
+    let dispatch = LocalShellDispatch {
+        table: &runtime.dispatch,
+    };
+    let eval_result = tokio::time::timeout(
+        RPC_TIMEOUT,
+        eval::eval_toplevel(&wrapped, &mut runtime.env, &dispatch),
+    )
+    .await
+    .context("shell eval timed out")?;
+
+    match eval_result {
+        Ok(Val::Nil) => Ok(Ok(String::new())),
+        Ok(Val::Keyword(ref k)) if k == "exit" => Ok(Ok("exit".to_string())),
+        Ok(result) => Ok(Ok(format!("{result}"))),
+        Err(err) => {
+            let inner = glia::error::unwrap_thrown(&err).unwrap_or(&err);
+            let msg = glia::error::message(inner)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{inner}"));
+            let formatted = match glia::error::type_tag(inner) {
+                Some(tag) => format!("[{tag}] {msg}"),
+                None => msg,
+            };
+            Ok(Err(formatted))
+        }
+    }
 }
 
 fn get_graft_cap<T: FromClientHook>(
@@ -305,21 +793,6 @@ fn get_graft_cap<T: FromClientHook>(
     Err(capnp::Error::failed(format!(
         "capability '{name}' not found in graft response"
     )))
-}
-
-fn load_shell_wasm() -> Result<Vec<u8>> {
-    if !EMBEDDED_SHELL.is_empty() {
-        return Ok(EMBEDDED_SHELL.to_vec());
-    }
-
-    let path = Path::new("std/shell/bin/shell.wasm");
-    if path.exists() {
-        return std::fs::read(path).context("failed to read std/shell/bin/shell.wasm");
-    }
-
-    bail!(
-        "shell WASM not found (embedded shell unavailable). Build it with `make shell` or install a release with embedded shell."
-    )
 }
 
 fn shell_identity_path() -> Result<PathBuf> {
@@ -674,9 +1147,229 @@ fn candidate_from_parts(peer: Option<PeerId>, addrs: Vec<Multiaddr>) -> Result<C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capnp::capability::Promise;
+    use capnp_rpc::rpc_twoparty_capnp::Side;
+    use capnp_rpc::twoparty::VatNetwork;
+    use capnp_rpc::RpcSystem;
+    use futures::AsyncReadExt;
+    use futures::StreamExt;
+    use membrane::TerminalServer;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use tokio::sync::{mpsc, watch};
+
+    const TEST_PEER_ID_BYTES: &[u8] = b"shell-local-eval-peer-id";
 
     fn maddr(s: &str) -> Multiaddr {
         s.parse().unwrap()
+    }
+
+    struct TestHost;
+
+    #[allow(refining_impl_trait)]
+    impl ww::system_capnp::host::Server for TestHost {
+        fn id(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::system_capnp::host::IdParams,
+            mut results: ww::system_capnp::host::IdResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_peer_id(TEST_PEER_ID_BYTES);
+            Promise::ok(())
+        }
+
+        fn addrs(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::system_capnp::host::AddrsParams,
+            mut results: ww::system_capnp::host::AddrsResults,
+        ) -> Promise<(), capnp::Error> {
+            let mut list = results.get().init_addrs(1);
+            list.set(0, maddr("/ip4/127.0.0.1/tcp/2025").to_vec().as_slice());
+            Promise::ok(())
+        }
+
+        fn peers(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::system_capnp::host::PeersParams,
+            mut results: ww::system_capnp::host::PeersResults,
+        ) -> Promise<(), capnp::Error> {
+            let mut list = results.get().init_peers(0);
+            list.reborrow();
+            Promise::ok(())
+        }
+
+        fn network(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::system_capnp::host::NetworkParams,
+            _results: ww::system_capnp::host::NetworkResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented(
+                "network not implemented".into(),
+            ))
+        }
+    }
+
+    struct TestRouting;
+
+    #[allow(refining_impl_trait)]
+    impl ww::routing_capnp::routing::Server for TestRouting {
+        fn provide(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::routing_capnp::routing::ProvideParams,
+            _results: ww::routing_capnp::routing::ProvideResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("test routing".into()))
+        }
+
+        fn find_providers(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::routing_capnp::routing::FindProvidersParams,
+            _results: ww::routing_capnp::routing::FindProvidersResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("test routing".into()))
+        }
+
+        fn resolve(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::routing_capnp::routing::ResolveParams,
+            _results: ww::routing_capnp::routing::ResolveResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("test routing".into()))
+        }
+
+        fn mkdir(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::routing_capnp::routing::MkdirParams,
+            _results: ww::routing_capnp::routing::MkdirResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("test routing".into()))
+        }
+
+        fn write_file(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::routing_capnp::routing::WriteFileParams,
+            _results: ww::routing_capnp::routing::WriteFileResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("test routing".into()))
+        }
+
+        fn remove(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::routing_capnp::routing::RemoveParams,
+            _results: ww::routing_capnp::routing::RemoveResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("test routing".into()))
+        }
+
+        fn publish(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::routing_capnp::routing::PublishParams,
+            _results: ww::routing_capnp::routing::PublishResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("test routing".into()))
+        }
+
+        fn hash(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::routing_capnp::routing::HashParams,
+            _results: ww::routing_capnp::routing::HashResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("test routing".into()))
+        }
+    }
+
+    struct TestIpfs {
+        seen_paths: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl ww::system_capnp::ipfs::Server for TestIpfs {
+        fn read(
+            self: capnp::capability::Rc<Self>,
+            params: ww::system_capnp::ipfs::ReadParams,
+            mut results: ww::system_capnp::ipfs::ReadResults,
+        ) -> Promise<(), capnp::Error> {
+            if let Ok(p) = params.get() {
+                if let Ok(path) = p.get_path() {
+                    if let Ok(path_str) = path.to_str() {
+                        self.seen_paths.borrow_mut().push(path_str.to_string());
+                    }
+                }
+            }
+            results.get().set_data(b"abc");
+            Promise::ok(())
+        }
+    }
+
+    fn test_grafted_caps() -> (GraftedShellCaps, Rc<RefCell<Vec<String>>>) {
+        let seen_paths = Rc::new(RefCell::new(Vec::new()));
+        let caps = GraftedShellCaps {
+            host: capnp_rpc::new_client(TestHost),
+            routing: capnp_rpc::new_client(TestRouting),
+            ipfs: Some(capnp_rpc::new_client(TestIpfs {
+                seen_paths: seen_paths.clone(),
+            })),
+        };
+        (caps, seen_paths)
+    }
+
+    struct TestMembrane {
+        host: ww::system_capnp::host::Client,
+        routing: ww::routing_capnp::routing::Client,
+        ipfs: Option<ww::system_capnp::ipfs::Client>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl ww::stem_capnp::membrane::Server for TestMembrane {
+        fn graft(
+            self: capnp::capability::Rc<Self>,
+            _params: ww::stem_capnp::membrane::GraftParams,
+            mut results: ww::stem_capnp::membrane::GraftResults,
+        ) -> Promise<(), capnp::Error> {
+            let count = if self.ipfs.is_some() { 3 } else { 2 };
+            let mut caps = results.get().init_caps(count);
+
+            {
+                let mut entry = caps.reborrow().get(0);
+                entry.set_name("host");
+                entry
+                    .init_cap()
+                    .set_as_capability(self.host.client.hook.clone());
+            }
+            {
+                let mut entry = caps.reborrow().get(1);
+                entry.set_name("routing");
+                entry
+                    .init_cap()
+                    .set_as_capability(self.routing.client.hook.clone());
+            }
+            if let Some(ipfs) = &self.ipfs {
+                let mut entry = caps.reborrow().get(2);
+                entry.set_name("ipfs");
+                entry.init_cap().set_as_capability(ipfs.client.hook.clone());
+            }
+
+            Promise::ok(())
+        }
+    }
+
+    async fn serve_terminal_streams(
+        mut control: libp2p_stream::Control,
+        terminal: ww::stem_capnp::terminal::Client<ww::stem_capnp::membrane::Owned>,
+    ) {
+        let mut incoming = match control.accept(CAPNP_PROTOCOL) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        while let Some((_peer_id, stream)) = incoming.next().await {
+            let terminal = terminal.clone();
+            tokio::task::spawn_local(async move {
+                let (reader, writer) = Box::pin(stream).split();
+                let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
+                let rpc = RpcSystem::new(Box::new(network), Some(terminal.client));
+                let _ = rpc.await;
+            });
+        }
     }
 
     #[test]
@@ -972,5 +1665,152 @@ mod tests {
 
         let err = await_connected_peer(rx).await.unwrap_err().to_string();
         assert!(err.contains("dial failed"), "{err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_runtime_initializes_without_runtime_cap_and_evals_arithmetic() {
+        let (caps, _seen_paths) = test_grafted_caps();
+        let mut runtime = build_local_shell_runtime(caps).await;
+        let (result, is_error) = shell_eval(&mut runtime, "(+ 1 2)").await.unwrap();
+        assert!(!is_error, "unexpected eval error: {result}");
+        assert_eq!(result, "3");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_runtime_dispatches_host_calls_through_grafted_cap() {
+        use base58::ToBase58;
+        let (caps, _seen_paths) = test_grafted_caps();
+        let mut runtime = build_local_shell_runtime(caps).await;
+        let (result, is_error) = shell_eval(&mut runtime, "(perform host :id)")
+            .await
+            .unwrap();
+        assert!(!is_error, "unexpected eval error: {result}");
+        assert_eq!(result, format!("\"{}\"", TEST_PEER_ID_BYTES.to_base58()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_runtime_routes_ipfs_loads_through_grafted_ipfs_cap() {
+        let (caps, seen_paths) = test_grafted_caps();
+        let mut runtime = build_local_shell_runtime(caps).await;
+        let (result, is_error) = shell_eval(&mut runtime, "(load \"/ipfs/bafy-test/path\")")
+            .await
+            .unwrap();
+        assert!(!is_error, "unexpected eval error: {result}");
+        assert_eq!(result, "<3 bytes>");
+        assert_eq!(
+            seen_paths.borrow().as_slice(),
+            &["/ipfs/bafy-test/path".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_dial_login_graft_and_local_eval_smoke() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let server_signing_key = ww::keys::generate().expect("generate signing key");
+                let server_libp2p_key =
+                    ww::keys::to_libp2p(&server_signing_key).expect("convert key");
+
+                let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+                let host = ww::host::Libp2pHost::new(
+                    vec![listen_addr],
+                    server_libp2p_key,
+                    None,
+                    Vec::new(),
+                )
+                .expect("start host");
+                let peer_id = host.local_peer_id();
+                let stream_control = host.stream_control();
+
+                let network_state = ww::rpc::NetworkState::from_peer_id(peer_id.to_bytes());
+                let host_network_state = network_state.clone();
+                let (_swarm_tx, swarm_rx) = mpsc::channel(4);
+                let host_task = tokio::task::spawn_local(async move {
+                    host.run(host_network_state, swarm_rx).await
+                });
+
+                let (grafted, _seen_paths) = test_grafted_caps();
+                let membrane: ww::stem_capnp::membrane::Client =
+                    capnp_rpc::new_client(TestMembrane {
+                        host: grafted.host,
+                        routing: grafted.routing,
+                        ipfs: grafted.ipfs,
+                    });
+
+                let epoch = membrane::Epoch {
+                    seq: 1,
+                    head: b"head".to_vec(),
+                    provenance: membrane::Provenance::Block(0),
+                };
+                let (_epoch_tx, epoch_rx) = watch::channel(epoch);
+                let terminal_server = TerminalServer::<ww::stem_capnp::membrane::Owned>::new(
+                    server_signing_key.verifying_key(),
+                    membrane,
+                    auth::SigningDomain::terminal_membrane(),
+                    epoch_rx,
+                );
+                let terminal_client = capnp_rpc::new_client(terminal_server);
+                let terminal_task = tokio::task::spawn_local(serve_terminal_streams(
+                    stream_control,
+                    terminal_client,
+                ));
+
+                let dial_addr = {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let snapshot = network_state.snapshot().await;
+                        if let Some(raw_addr) = snapshot.listen_addrs.first() {
+                            let addr =
+                                Multiaddr::try_from(raw_addr.clone()).expect("decode listen addr");
+                            break addr;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            panic!("host did not publish listen address");
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                };
+
+                let target = Candidate {
+                    peer_id: Some(peer_id),
+                    addrs: vec![dial_addr],
+                };
+                let caps = dial_shell(&target, &server_signing_key)
+                    .await
+                    .expect("dial/login/graft");
+                let mut runtime = build_local_shell_runtime(caps).await;
+                let (result, is_error) = shell_eval(&mut runtime, "(+ 1 2)").await.unwrap();
+                assert!(!is_error, "unexpected eval error: {result}");
+                assert_eq!(result, "3");
+
+                host_task.abort();
+                terminal_task.abort();
+            })
+            .await;
+    }
+
+    #[test]
+    fn shell_connect_path_does_not_include_remote_shell_bootstrap_calls() {
+        let src = include_str!("shell.rs");
+        let start = src
+            .find("async fn dial_shell")
+            .expect("dial_shell function should exist");
+        let end = src
+            .find("async fn await_connected_peer")
+            .expect("await_connected_peer should exist");
+        let dial_body = &src[start..end];
+        assert!(
+            !dial_body.contains("load_request("),
+            "runtime.load path detected"
+        );
+        assert!(
+            !dial_body.contains("spawn_request("),
+            "executor.spawn path detected"
+        );
+        assert!(
+            !dial_body.contains("bootstrap_request("),
+            "process.bootstrap path detected"
+        );
     }
 }

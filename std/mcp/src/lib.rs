@@ -26,7 +26,7 @@ use wasip2::exports::cli::run::Guest;
 
 // Shared effect handler factories from the caps crate.
 use caps::{
-    eval_load, get_graft_cap, make_host_handler, make_import_handler,
+    eval_load_async, get_graft_cap, make_host_handler, make_import_handler,
     make_routing_handler, routing_capnp, stem_capnp, system_capnp, wrap_with_handlers,
 };
 
@@ -392,7 +392,7 @@ impl<'s> Dispatch for McpDispatch<'s> {
 
 fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
     let mut t: HashMap<&'static str, HandlerFn> = HashMap::new();
-    t.insert("load", |a, _| Box::pin(std::future::ready(eval_load(a))));
+    t.insert("load", |a, _| Box::pin(eval_load_async(a)));
     t.insert("help", |_, _| {
         Box::pin(std::future::ready(Ok(Val::Str(HELP_TEXT.to_string()))))
     });

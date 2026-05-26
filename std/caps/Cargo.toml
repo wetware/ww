@@ -3,8 +3,6 @@ name = "caps"
 version = "0.1.0"
 edition = "2021"
 
-[workspace]  # standalone — not part of the host workspace
-
 [dependencies]
 capnp = "0.25.3"
 capnp-rpc = "0.25.0"

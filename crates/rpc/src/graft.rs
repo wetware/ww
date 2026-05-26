@@ -146,6 +146,59 @@ struct EpochGuardedDomainSigner {
     guard: EpochGuard,
 }
 
+// ---------------------------------------------------------------------------
+// EpochGuardedIpfs — daemon-side IPFS read proxy for non-WASI clients
+// ---------------------------------------------------------------------------
+
+struct EpochGuardedIpfs {
+    guard: EpochGuard,
+    ipfs_client: ipfs::HttpClient,
+}
+
+// Keep a conservative ceiling well below common Cap'n Proto default traversal
+// limits (~64 MiB) so oversize reads fail with a clear contract error rather
+// than an opaque decode failure on the client side.
+const MAX_IPFS_READ_BYTES: usize = 32 * 1024 * 1024;
+
+#[allow(refining_impl_trait)]
+impl system_capnp::ipfs::Server for EpochGuardedIpfs {
+    fn read(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::ipfs::ReadParams,
+        mut results: system_capnp::ipfs::ReadResults,
+    ) -> Promise<(), capnp::Error> {
+        pry!(self.guard.check());
+        let p = pry!(params.get());
+        let path = pry!(p
+            .get_path()
+            .and_then(|t| t.to_str().map_err(|e| capnp::Error::failed(e.to_string()))))
+        .to_string();
+
+        if !ipfs::is_ipfs_path(&path) {
+            return Promise::err(capnp::Error::failed(format!(
+                "ipfs.read: expected /ipfs/, /ipns/, or /ipld/ path; got {path}"
+            )));
+        }
+
+        let client = self.ipfs_client.clone();
+        Promise::from_future(async move {
+            let bytes = client
+                .cat(&path)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("ipfs.read failed: {e}")))?;
+            if bytes.len() > MAX_IPFS_READ_BYTES {
+                return Err(capnp::Error::failed(format!(
+                    "ipfs.read: payload too large ({} bytes > {} bytes max); use smaller objects or a streaming API",
+                    bytes.len(),
+                    MAX_IPFS_READ_BYTES
+                )));
+            }
+            results.get().set_data(&bytes);
+            Ok(())
+        })
+    }
+}
+
 #[allow(refining_impl_trait)]
 impl stem_capnp::signer::Server for EpochGuardedDomainSigner {
     fn sign(
@@ -291,6 +344,11 @@ impl GraftBuilder for HostGraftBuilder {
         entries.push(("host", host.client));
         entries.push(("runtime", self.runtime_client.clone().client));
         entries.push(("routing", routing.client));
+        let ipfs_cap: system_capnp::ipfs::Client = capnp_rpc::new_client(EpochGuardedIpfs {
+            guard: guard.clone(),
+            ipfs_client: self.ipfs_client.clone(),
+        });
+        entries.push(("ipfs", ipfs_cap.client));
 
         // Only grant http-client if the operator explicitly opted in via --http-dial.
         if !self.allowed_hosts.is_empty() {
