@@ -722,27 +722,8 @@ struct ShellLoadBackend {
 async fn load_ipfs_read(
     ipfs: &ww::system_capnp::ipfs::Client,
     path: &str,
-) -> std::result::Result<Vec<u8>, Val> {
-    let mut req = ipfs.read_request();
-    req.get().set_path(path);
-    let resp = req
-        .send()
-        .promise
-        .await
-        .map_err(|e| Val::from(format!("load: {path}: {e}")))?;
-    let bytes = resp
-        .get()
-        .map_err(|e| Val::from(format!("load: {path}: {e}")))?
-        .get_data()
-        .map_err(|e| Val::from(format!("load: {path}: {e}")))?;
-    Ok(bytes.to_vec())
-}
-
-async fn load_ipfs_read_stream(
-    ipfs: &ww::system_capnp::ipfs::Client,
-    path: &str,
 ) -> std::result::Result<Vec<u8>, capnp::Error> {
-    let mut req = ipfs.read_stream_request();
+    let mut req = ipfs.read_request();
     req.get().set_path(path);
     let resp = req.send().promise.await?;
     let stream = resp.get()?.get_stream()?;
@@ -762,11 +743,6 @@ async fn load_ipfs_read_stream(
     Ok(out)
 }
 
-fn is_unimplemented_error(err: &capnp::Error) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    msg.contains("unimplemented") || msg.contains("unknown method") || msg.contains("no method")
-}
-
 impl LoadBackend for ShellLoadBackend {
     fn load<'a>(
         &'a self,
@@ -777,9 +753,8 @@ impl LoadBackend for ShellLoadBackend {
                 let ipfs = self.ipfs.clone().ok_or_else(|| {
                     Val::from("load: /ipfs and /ipns paths require grafted 'ipfs' capability")
                 })?;
-                match load_ipfs_read_stream(&ipfs, path).await {
+                match load_ipfs_read(&ipfs, path).await {
                     Ok(bytes) => Ok(bytes),
-                    Err(err) if is_unimplemented_error(&err) => load_ipfs_read(&ipfs, path).await,
                     Err(err) => Err(Val::from(format!("load: {path}: {err}"))),
                 }
             } else {
@@ -1694,22 +1669,6 @@ mod tests {
             self: capnp::capability::Rc<Self>,
             params: ww::system_capnp::ipfs::ReadParams,
             mut results: ww::system_capnp::ipfs::ReadResults,
-        ) -> Promise<(), capnp::Error> {
-            if let Ok(p) = params.get() {
-                if let Ok(path) = p.get_path() {
-                    if let Ok(path_str) = path.to_str() {
-                        self.seen_paths.borrow_mut().push(path_str.to_string());
-                    }
-                }
-            }
-            results.get().set_data(b"legacy");
-            Promise::ok(())
-        }
-
-        fn read_stream(
-            self: capnp::capability::Rc<Self>,
-            params: ww::system_capnp::ipfs::ReadStreamParams,
-            mut results: ww::system_capnp::ipfs::ReadStreamResults,
         ) -> Promise<(), capnp::Error> {
             if let Ok(p) = params.get() {
                 if let Ok(path) = p.get_path() {
