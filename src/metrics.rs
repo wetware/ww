@@ -1,7 +1,7 @@
 //! Admin HTTP server for node introspection.
 //!
-//! Serves Prometheus metrics at `GET /metrics` and host identity/address
-//! information at `GET /host/id` and `GET /host/addrs`.
+//! Serves Prometheus metrics at `GET /metrics` and host identity/address/NAT
+//! information at `GET /host/id`, `GET /host/addrs`, and `GET /host/nat`.
 //!
 //! Fuel metrics (`ww_cell_fuel_remaining`, `ww_cell_fuel_consumed_total`)
 //! are live from host-side [`FuelEstimator`] state.  Auction-specific
@@ -358,6 +358,23 @@ async fn host_addrs_handler(State(state): State<AdminState>) -> impl IntoRespons
     )
 }
 
+/// `GET /host/nat` — returns node-level reachability and recent AutoNAT probe outcomes.
+async fn host_nat_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    let snapshot = state.network_state.snapshot().await;
+    let body = serde_json::json!({
+        "nat_status": snapshot.nat_status,
+        "recent_probes": snapshot.nat_probe_events,
+    });
+    let payload = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        payload,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // AdminService (runtime::Service implementation)
 // ---------------------------------------------------------------------------
@@ -395,6 +412,7 @@ impl crate::services::Service for AdminService {
                 .route("/metrics", get(metrics_handler))
                 .route("/host/id", get(host_id_handler))
                 .route("/host/addrs", get(host_addrs_handler))
+                .route("/host/nat", get(host_nat_handler))
                 .with_state(state);
 
             let listener = tokio::net::TcpListener::bind(self.listen_addr).await?;
@@ -566,5 +584,36 @@ mod tests {
         let state = test_state();
         let snapshot = state.network_state.snapshot().await;
         assert!(snapshot.listen_addrs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn host_nat_returns_status_and_recent_probe_events() {
+        let state = test_state();
+        state
+            .network_state
+            .set_nat_status(rpc::NatReachability::Public)
+            .await;
+        state
+            .network_state
+            .record_nat_probe_event(rpc::NatProbeEvent {
+                tested_addr: "/ip4/127.0.0.1/tcp/2025".to_string(),
+                server_peer_id: "12D3KooWTest".to_string(),
+                success: true,
+                timestamp_unix_ms: 42,
+            })
+            .await;
+
+        let response = host_nat_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("parse JSON");
+        assert_eq!(value["nat_status"], "Public");
+        assert_eq!(
+            value["recent_probes"].as_array().map(|a| a.len()),
+            Some(1),
+            "expected exactly one recent probe event"
+        );
     }
 }

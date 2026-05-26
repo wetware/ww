@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::num::{NonZeroU8, NonZeroUsize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -720,6 +720,17 @@ impl Libp2pHost {
                                 success,
                                 "AutoNAT v2 probe"
                             );
+                            network_state
+                                .record_nat_probe_event(rpc::NatProbeEvent {
+                                    tested_addr: ev.tested_addr.to_string(),
+                                    server_peer_id: ev.server.to_string(),
+                                    success,
+                                    timestamp_unix_ms: SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u64,
+                                })
+                                .await;
                             if let Some(transition) = nat_policy.record_probe_result(success) {
                                 let actions = actions_for_nat_transition(transition);
                                 tracing::info!(
