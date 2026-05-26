@@ -212,16 +212,28 @@ pub struct PeerInfo {
     pub addrs: Vec<Vec<u8>>,
 }
 
+/// Maximum number of recent AutoNAT v2 probe outcomes retained in memory.
+pub const MAX_NAT_PROBE_EVENTS: usize = 64;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct NatProbeEvent {
+    pub tested_addr: String,
+    pub server_peer_id: String,
+    pub success: bool,
+    pub timestamp_unix_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct NetworkSnapshot {
     pub local_peer_id: Vec<u8>,
     pub listen_addrs: Vec<Vec<u8>>,
     pub known_peers: Vec<PeerInfo>,
     pub nat_status: NatReachability,
+    pub nat_probe_events: Vec<NatProbeEvent>,
 }
 
 /// NAT reachability status as determined by AutoNAT.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NatReachability {
     Unknown,
     Public,
@@ -255,6 +267,7 @@ impl NetworkState {
             listen_addrs: Vec::new(),
             known_peers: Vec::new(),
             nat_status: NatReachability::Unknown,
+            nat_probe_events: Vec::new(),
         };
         Self {
             inner: Arc::new(RwLock::new(snapshot)),
@@ -294,6 +307,15 @@ impl NetworkState {
 
     pub async fn nat_status(&self) -> NatReachability {
         self.inner.read().await.nat_status
+    }
+
+    pub async fn record_nat_probe_event(&self, event: NatProbeEvent) {
+        let mut guard = self.inner.write().await;
+        guard.nat_probe_events.push(event);
+        if guard.nat_probe_events.len() > MAX_NAT_PROBE_EVENTS {
+            let overflow = guard.nat_probe_events.len() - MAX_NAT_PROBE_EVENTS;
+            guard.nat_probe_events.drain(0..overflow);
+        }
     }
 }
 
@@ -868,6 +890,50 @@ mod tests {
 
         let snap = state2.snapshot().await;
         assert_eq!(snap.listen_addrs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_network_state_records_nat_probe_events() {
+        let state = NetworkState::from_peer_id(vec![1]);
+        state
+            .record_nat_probe_event(NatProbeEvent {
+                tested_addr: "/ip4/127.0.0.1/tcp/2025".to_string(),
+                server_peer_id: "12D3KooWTest".to_string(),
+                success: true,
+                timestamp_unix_ms: 123,
+            })
+            .await;
+
+        let snap = state.snapshot().await;
+        assert_eq!(snap.nat_probe_events.len(), 1);
+        assert_eq!(
+            snap.nat_probe_events[0].tested_addr,
+            "/ip4/127.0.0.1/tcp/2025"
+        );
+        assert!(snap.nat_probe_events[0].success);
+    }
+
+    #[tokio::test]
+    async fn test_network_state_nat_probe_ring_buffer_bounded() {
+        let state = NetworkState::from_peer_id(vec![1]);
+        for i in 0..(MAX_NAT_PROBE_EVENTS + 5) {
+            state
+                .record_nat_probe_event(NatProbeEvent {
+                    tested_addr: format!("/ip4/127.0.0.1/tcp/{}", 2000 + i),
+                    server_peer_id: format!("12D3KooW{i}"),
+                    success: i % 2 == 0,
+                    timestamp_unix_ms: i as u64,
+                })
+                .await;
+        }
+
+        let snap = state.snapshot().await;
+        assert_eq!(snap.nat_probe_events.len(), MAX_NAT_PROBE_EVENTS);
+        assert_eq!(snap.nat_probe_events[0].timestamp_unix_ms, 5);
+        assert_eq!(
+            snap.nat_probe_events[MAX_NAT_PROBE_EVENTS - 1].timestamp_unix_ms,
+            (MAX_NAT_PROBE_EVENTS + 4) as u64
+        );
     }
 
     // =========================================================================
