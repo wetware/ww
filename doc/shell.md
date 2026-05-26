@@ -51,3 +51,12 @@ is found, `ww shell` uses this order:
 2. If in TTY mode, show an interactive selector.
 3. Otherwise, return an error and suggest `--select` or an explicit
    `<multiaddr>`.
+
+## Troubleshooting
+
+- `No local wetware host discovered`: confirm daemon is running and host state
+  exists at `~/.ww/run/host.json` (or your `$WW_HOST_STATE_PATH` override).
+- `login auth failed: signing key does not match expected identity`: use the
+  same identity for daemon and shell (`WW_IDENTITY` / `~/.ww/identity`).
+- If discovery is ambiguous, use `ww shell --select <index|peer-id>` or pass an
+  explicit multiaddr.
