@@ -292,7 +292,7 @@ STD_OK=true
 fetch_to "bin/main.wasm"     "std/kernel/bin/main.wasm"   || STD_OK=false
 fetch_to "bin/shell.wasm"    "std/shell/bin/shell.wasm"   || STD_OK=false
 fetch_to "bin/shell.capnpc"  "std/shell/bin/shell.capnpc" || STD_OK=false
-fetch_to "bin/mcp.wasm"      "std/mcp/bin/main.wasm"      || STD_OK=false
+fetch_to "bin/status.wasm"   "std/status/bin/status.wasm" || STD_OK=false
 
 # Glia stdlib (enumerate directory, fetch each file)
 mkdir -p "${WW_HOME}/std/lib/ww"

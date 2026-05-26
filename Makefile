@@ -5,7 +5,7 @@
 
 WASM_TARGET := wasm32-wasip2
 
-.PHONY: all host std kernel shell mcp status examples chess echo counter discovery oracle auction mindshare snap-hello-rs clean run-kernel
+.PHONY: all host std kernel shell status examples chess echo counter discovery oracle auction mindshare snap-hello-rs clean run-kernel
 .PHONY: publish-std try-publish-std publish test-wasm
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
@@ -19,7 +19,7 @@ host:
 
 # --- Std components ----------------------------------------------------------
 
-std: kernel shell mcp status
+std: kernel shell status
 
 kernel:
 	cargo build -p kernel --target $(WASM_TARGET) --release --manifest-path std/kernel/Cargo.toml
@@ -34,12 +34,6 @@ shell:
 		if [ -n "$$SCHEMA_OUT" ]; then \
 			cp "$$SCHEMA_OUT" std/shell/bin/shell.capnpc; \
 		fi
-
-mcp:
-	cargo build -p mcp --target $(WASM_TARGET) --release --manifest-path std/mcp/Cargo.toml
-	@mkdir -p std/mcp/bin
-	cp std/mcp/target/$(WASM_TARGET)/release/mcp.wasm std/mcp/bin/mcp.wasm
-	cp std/mcp/target/$(WASM_TARGET)/release/mcp.wasm std/mcp/bin/main.wasm
 
 status:
 	cargo build -p status --target $(WASM_TARGET) --release --manifest-path std/status/Cargo.toml
@@ -105,11 +99,9 @@ publish-std: std
 	@mkdir -p $(STD_TREE)/lib/ww
 	@mkdir -p $(STD_TREE)/kernel/bin
 	@mkdir -p $(STD_TREE)/shell/bin
-	@mkdir -p $(STD_TREE)/mcp/bin
 	@cp std/lib/ww/*.glia $(STD_TREE)/lib/ww/
 	@cp std/kernel/bin/main.wasm $(STD_TREE)/kernel/bin/main.wasm
 	@cp std/shell/bin/shell.wasm $(STD_TREE)/shell/bin/shell.wasm
-	@cp std/mcp/bin/main.wasm $(STD_TREE)/mcp/bin/main.wasm
 	@echo "Publishing to IPFS..."
 	@CID=$$(ipfs add -r --cid-version=1 -Q $(STD_TREE)) && \
 		echo "$$CID" > target/std-namespace.cid && \
@@ -162,7 +154,7 @@ publish: host
 
 # --- Test WASM components ----------------------------------------------------
 # Scaffolding for WASM component tests. Today this is a no-op because the
-# WASM crates (kernel, shell, mcp) have no test suite yet. When tests are
+# WASM crates (kernel, shell, status) have no test suite yet. When tests are
 # added, this target will run them. CI calls this after building WASM.
 #
 # WASM crates can't run cargo test on the host (they depend on wasip2).
@@ -175,7 +167,7 @@ test-wasm: std
 	@echo "Verifying WASM artifacts..."
 	@test -f std/kernel/bin/main.wasm  || { echo "FAIL: kernel WASM missing"; exit 1; }
 	@test -f std/shell/bin/shell.wasm  || { echo "FAIL: shell WASM missing"; exit 1; }
-	@test -f std/mcp/bin/main.wasm     || { echo "FAIL: mcp WASM missing"; exit 1; }
+	@test -f std/status/bin/status.wasm || { echo "FAIL: status WASM missing"; exit 1; }
 	@echo "WASM artifacts OK (no test suite yet — see Makefile for guidance)"
 
 # --- Run ---------------------------------------------------------------------
@@ -189,7 +181,7 @@ clean:
 	cargo clean
 	rm -f std/kernel/bin/main.wasm
 	rm -f std/shell/bin/shell.wasm std/shell/bin/shell.capnpc
-	rm -f std/mcp/bin/mcp.wasm std/mcp/bin/main.wasm
+	rm -f std/status/bin/status.wasm
 	$(MAKE) -C examples/chess clean
 	$(MAKE) -C examples/echo clean
 	$(MAKE) -C examples/counter clean

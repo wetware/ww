@@ -516,11 +516,11 @@ IPNS provides mutable pointers for release channels:
 Wetware is the drivetrain, not the engine. An LLM connects to a
 node and gets a capability-secured shell:
 
-- **MCP mode** (`ww run . --mcp`): the cell becomes an MCP server on
-  stdin/stdout. `eval` is the universal primitive; per-cap sugar tools
-  (`host`, `routing`, `runtime`, ...) translate to internal Glia
-  expressions. The membrane provides the safety boundary — AI agents
-  can only do what their capabilities allow.
+- **MCP mode** (`ww shell --mcp`): the shell process serves MCP on
+  stdin/stdout over the standard shell dial/login/graft path. `eval` is
+  the universal primitive; per-cap sugar tools (`host`, `routing`, ...)
+  translate to internal Glia expressions. The membrane provides the
+  safety boundary — AI agents can only do what their capabilities allow.
 
 - **Structured errors and introspection.** Errors are values
   (`Result<Val, Val>`) with namespaced `:glia.error/*` keys

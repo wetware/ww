@@ -20,7 +20,7 @@ use ww::executor::CellBuilder;
 use ww::host;
 use ww::ipfs;
 
-// Embedded WASM blobs — compiled into the binary so `ww run --mcp` works
+// Embedded WASM blobs — compiled into the binary so standard cells work
 // without requiring `make std` on the user's machine.
 // build.rs sets cfg flags (has_wasm_*) when each file exists and is non-empty.
 // In debug/test builds without `make std`, these are empty slices and the
@@ -34,11 +34,6 @@ const EMBEDDED_KERNEL: &[u8] = b"";
 const EMBEDDED_SHELL: &[u8] = include_bytes!("../../std/shell/bin/shell.wasm");
 #[cfg(not(has_wasm_std_shell_bin_shell_wasm))]
 const EMBEDDED_SHELL: &[u8] = b"";
-
-#[cfg(has_wasm_std_mcp_bin_main_wasm)]
-const EMBEDDED_MCP: &[u8] = include_bytes!("../../std/mcp/bin/main.wasm");
-#[cfg(not(has_wasm_std_mcp_bin_main_wasm))]
-const EMBEDDED_MCP: &[u8] = b"";
 
 #[cfg(has_wasm_examples_echo_bin_echo_wasm)]
 const EMBEDDED_ECHO: &[u8] = include_bytes!("../../examples/echo/bin/echo.wasm");
@@ -68,9 +63,6 @@ fn embedded_loader() -> EmbeddedLoader {
         loader = loader.insert("bin/shell.wasm", EMBEDDED_SHELL);
     }
     loader = loader.insert("bin/shell.capnpc", EMBEDDED_SHELL_CAPNPC);
-    if !EMBEDDED_MCP.is_empty() {
-        loader = loader.insert("bin/mcp.wasm", EMBEDDED_MCP);
-    }
     if !EMBEDDED_ECHO.is_empty() {
         loader = loader.insert("bin/echo.wasm", EMBEDDED_ECHO);
     }
@@ -183,14 +175,6 @@ enum Commands {
         #[arg(long, default_value = "0")]
         executor_threads: usize,
 
-        /// Run as an MCP server. Reads MCP JSON-RPC from stdin, routes
-        /// tools/call requests to a cell WASM process, writes responses
-        /// to stdout. The cell binary is specified by the MOUNT arg
-        /// (must contain boot/main.wasm). MCP lifecycle methods (initialize,
-        /// tools/list) are handled by the adapter, not the cell.
-        #[arg(long)]
-        mcp: bool,
-
         /// Enable the WAGI HTTP server on the given address.
         /// Example: --http-listen 127.0.0.1:8080
         #[arg(long, value_name = "ADDR")]
@@ -272,6 +256,7 @@ enum Commands {
     ///
     /// Example:
     ///   ww shell
+    ///   ww shell --mcp
     ///   ww shell --select 2
     ///   ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...
     Shell {
@@ -281,6 +266,11 @@ enum Commands {
         /// Selection override for host discovery (`index` or `peer-id`).
         #[arg(long, value_name = "TARGET", conflicts_with = "addr")]
         select: Option<String>,
+
+        /// Run shell in MCP stdio mode (JSON-RPC on stdin/stdout).
+        /// In this mode the shell never prompts interactively.
+        #[arg(long)]
+        mcp: bool,
     },
 
     /// Effectful operations that mutate state beyond the current directory.
@@ -535,7 +525,6 @@ impl Commands {
                 confirmation_depth,
                 epoch_drain_secs,
                 executor_threads,
-                mcp,
                 http_listen,
                 http_dial,
                 runtime_cache_policy,
@@ -570,7 +559,6 @@ impl Commands {
                     confirmation_depth,
                     epoch_drain_secs,
                     executor_threads,
-                    mcp,
                     http_listen,
                     http_dial,
                     runtime_cache_policy,
@@ -595,7 +583,13 @@ impl Commands {
                 private_key,
             } => Self::push(path, ipfs_url, stem, rpc_url, private_key).await,
             Commands::Keygen { output } => Self::keygen(output).await,
-            Commands::Shell { addr, select } => shell::run_shell(addr, select).await,
+            Commands::Shell { addr, select, mcp } => {
+                if mcp {
+                    shell::run_mcp(addr, select).await
+                } else {
+                    shell::run_shell(addr, select).await
+                }
+            }
             Commands::Perform { action } => match action {
                 PerformAction::Install => Self::perform_install().await,
                 PerformAction::Uninstall => Self::perform_uninstall().await,
@@ -1221,7 +1215,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         confirmation_depth: u64,
         epoch_drain_secs: u64,
         executor_threads: usize,
-        mcp: bool,
         http_listen: Option<String>,
         http_dial: Vec<String>,
         runtime_cache_policy: String,
@@ -1244,7 +1237,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
         }
 
-        ww::config::init_tracing_to_stderr(mcp);
+        ww::config::init_tracing_to_stderr(false);
 
         // Build a chain loader: HostPath > Embedded > IPFS.
         // HostPath first so local files can override embedded WASM (enables hot-patches).
@@ -1571,8 +1564,6 @@ wasip2::cli::command::export!({iface_name}Guest);
             ),
         };
 
-        // Save values needed by optional process-local MCP mode before moving
-        // them into the kernel.
         let signing_key = std::sync::Arc::new(sk);
 
         let mut builder = CellBuilder::new(image_path.clone())
@@ -1582,11 +1573,11 @@ wasip2::cli::command::export!({iface_name}Guest);
             .with_wasm_debug(wasm_debug)
             .with_cid_tree(cid_tree.clone())
             .with_pinset_cache(pinset_cache.clone())
-            .with_signing_key(signing_key.clone())
+            .with_signing_key(signing_key)
             .with_cache_policy(cache_policy)
             .with_compile_tx(compile_tx.clone())
             .with_wasmtime_engine(executor_pool.engine())
-            .with_suppress_stdin(mcp)
+            .with_suppress_stdin(false)
             .with_ipfs_client(ipfs_client.clone())
             .with_http_dial(http_dial);
 
@@ -1624,69 +1615,15 @@ wasip2::cli::command::export!({iface_name}Guest);
             })
             .map_err(|_| anyhow::anyhow!("executor pool rejected kernel spawn"))?;
 
-        // MCP mode: run MCP in the ww shell process (CLI side), while the
-        // daemon/kernel remain backend providers for transport/auth/caps.
-        // The kernel runs headless because its stdin is suppressed above.
-        let mcp_result_rx = if mcp {
-            let mcp_signing_key = (*signing_key).clone();
-            let (mcp_tx, mcp_rx) = tokio::sync::oneshot::channel();
-            tokio::task::spawn_local(async move {
-                let result = shell::run_mcp_with_signing_key(mcp_signing_key).await;
-                let _ = match result {
-                    Ok(()) => mcp_tx.send(Ok(0)),
-                    Err(e) => mcp_tx.send(Err(e)),
-                };
-            });
-
-            tracing::info!("MCP server running process-local in ww shell");
-            Some(mcp_rx)
-        } else {
-            None
-        };
-
-        // Wait for the kernel (or process-local MCP task, whichever exits first) to exit.
-        let exit_code = if let Some(mcp_rx) = mcp_result_rx {
-            // In MCP mode, wait for the MCP task to exit (it owns stdin/stdout).
-            // When MCP exits (stdin EOF), shut everything down.
-            tokio::select! {
-                result = mcp_rx => {
-                    match result {
-                        Ok(Ok(code)) => code,
-                        Ok(Err(e)) => {
-                            tracing::error!("MCP server error: {}", e);
-                            1
-                        }
-                        Err(_) => {
-                            tracing::error!("MCP server result channel dropped");
-                            1
-                        }
-                    }
-                }
-                result = result_rx => {
-                    match result {
-                        Ok(Ok(code)) => code,
-                        Ok(Err(e)) => {
-                            tracing::error!("Kernel error: {}", e);
-                            1
-                        }
-                        Err(_) => {
-                            tracing::error!("Kernel result channel dropped");
-                            1
-                        }
-                    }
-                }
+        let exit_code = match result_rx.await {
+            Ok(Ok(code)) => code,
+            Ok(Err(e)) => {
+                tracing::error!("Kernel error: {}", e);
+                1
             }
-        } else {
-            match result_rx.await {
-                Ok(Ok(code)) => code,
-                Ok(Err(e)) => {
-                    tracing::error!("Kernel error: {}", e);
-                    1
-                }
-                Err(_) => {
-                    tracing::error!("Kernel result channel dropped");
-                    1
-                }
+            Err(_) => {
+                tracing::error!("Kernel result channel dropped");
+                1
             }
         };
         tracing::info!(code = exit_code, "Kernel exited");
@@ -1904,7 +1841,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         let embedded_cells: &[(&str, &[u8])] = &[
             ("main.wasm", EMBEDDED_KERNEL),
             ("shell.wasm", EMBEDDED_SHELL),
-            ("mcp.wasm", EMBEDDED_MCP),
             ("status.wasm", EMBEDDED_STATUS),
         ];
         let images_ok = embedded_cells.iter().all(|(_, bytes)| !bytes.is_empty());
@@ -2060,7 +1996,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         if Self::claude_cli_available() {
             // Try add first. If it fails with "already exists", remove and retry.
             let output = std::process::Command::new("claude")
-                .args(["mcp", "add", "wetware", "--", &ww_bin_str, "run", "--mcp"])
+                .args(["mcp", "add", "wetware", "--", &ww_bin_str, "shell", "--mcp"])
                 .output();
             match output {
                 Ok(o) if o.status.success() => done("Claude Code MCP".into()),
@@ -2075,23 +2011,26 @@ wasip2::cli::command::export!({iface_name}Guest);
                             .stderr(std::process::Stdio::null())
                             .status();
                         let retry = std::process::Command::new("claude")
-                            .args(["mcp", "add", "wetware", "--", &ww_bin_str, "run", "--mcp"])
+                            .args(["mcp", "add", "wetware", "--", &ww_bin_str, "shell", "--mcp"])
                             .output();
                         match retry {
                             Ok(r) if r.status.success() => done("Claude Code MCP (updated)".into()),
                             _ => {
                                 fail("Claude Code MCP".into());
-                                println!("    claude mcp add wetware -- {} run --mcp", ww_bin_str);
+                                println!(
+                                    "    claude mcp add wetware -- {} shell --mcp",
+                                    ww_bin_str
+                                );
                             }
                         }
                     } else {
                         fail("Claude Code MCP".into());
-                        println!("    claude mcp add wetware -- {} run --mcp", ww_bin_str);
+                        println!("    claude mcp add wetware -- {} shell --mcp", ww_bin_str);
                     }
                 }
                 Err(_) => {
                     fail("Claude Code MCP".into());
-                    println!("    claude mcp add wetware -- {} run --mcp", ww_bin_str);
+                    println!("    claude mcp add wetware -- {} shell --mcp", ww_bin_str);
                 }
             }
         } else {
@@ -2741,7 +2680,6 @@ mod tests {
             confirmation_depth: 6,
             epoch_drain_secs: 1,
             executor_threads: 0,
-            mcp: false,
             http_listen: None,
             http_dial: Vec::new(),
             runtime_cache_policy: "shared".to_string(),
