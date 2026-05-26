@@ -30,6 +30,9 @@ const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_DISCOVERY_ENV: &str = "WW_TEST_SHELL_CANDIDATES";
 const IPFS_STREAM_READ_CHUNK_BYTES: u32 = 64 * 1024;
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MCP_SERVER_NAME: &str = "wetware";
+const MCP_SERVER_VERSION: &str = "0.1.0";
 
 const HELP_TEXT: &str = "\
 Remote Glia shell. Available commands:
@@ -130,6 +133,13 @@ pub async fn run_shell(addr: Option<Multiaddr>, select: Option<String>) -> Resul
         .await
 }
 
+pub async fn run_mcp_with_signing_key(signing_key: ed25519_dalek::SigningKey) -> Result<()> {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move { run_mcp_local(signing_key).await })
+        .await
+}
+
 async fn run_shell_local(addr: Option<Multiaddr>, select: Option<String>) -> Result<()> {
     let (signing_key, preferred_peer_id) = load_shell_identity()?;
 
@@ -154,6 +164,348 @@ async fn run_shell_local(addr: Option<Multiaddr>, select: Option<String>) -> Res
     let grafted_caps = dial_shell(&target, &signing_key).await?;
     let mut runtime = build_local_shell_runtime(grafted_caps).await;
     run_repl(&mut runtime).await
+}
+
+async fn run_mcp_local(signing_key: ed25519_dalek::SigningKey) -> Result<()> {
+    let preferred_peer_id = ww::keys::to_libp2p(&signing_key)?.public().to_peer_id();
+    let candidates = if let Some(candidates) = discovery_candidates_override()? {
+        candidates
+    } else {
+        discover_local_candidates().await?
+    };
+    // MCP mode is stdio protocol mode; never prompt interactively on stdin.
+    let target = choose_candidate(candidates, Some(preferred_peer_id), None, false)?;
+    let grafted_caps = dial_shell(&target, &signing_key).await?;
+    let mut runtime = build_local_shell_runtime(grafted_caps).await;
+    run_mcp_stdio(&mut runtime).await
+}
+
+#[derive(serde::Deserialize)]
+struct JsonRpcRequest {
+    #[allow(dead_code)]
+    jsonrpc: Option<String>,
+    method: String,
+    params: Option<serde_json::Value>,
+    id: Option<serde_json::Value>,
+}
+
+fn write_jsonrpc_result(id: &serde_json::Value, result: serde_json::Value) {
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "result": result,
+        "id": id,
+    });
+    let mut out = std::io::stdout();
+    let _ = serde_json::to_writer(&mut out, &response);
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
+}
+
+fn write_jsonrpc_error(id: &serde_json::Value, code: i64, message: &str) {
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": code,
+            "message": message,
+        },
+        "id": id,
+    });
+    let mut out = std::io::stdout();
+    let _ = serde_json::to_writer(&mut out, &response);
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
+}
+
+fn write_mcp_tool_result(id: &serde_json::Value, text: &str) {
+    write_jsonrpc_result(
+        id,
+        serde_json::json!({
+            "content": [{ "type": "text", "text": text }],
+        }),
+    );
+}
+
+fn write_mcp_tool_error(id: &serde_json::Value, message: &str, data: &serde_json::Value) {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "content".into(),
+        serde_json::json!([{"type": "text", "text": message}]),
+    );
+    payload.insert("isError".into(), serde_json::Value::Bool(true));
+    if !data.is_null() {
+        payload.insert("structuredContent".into(), data.clone());
+    }
+    write_jsonrpc_result(id, serde_json::Value::Object(payload));
+}
+
+fn mcp_initialize_result() -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "serverInfo": {
+            "name": MCP_SERVER_NAME,
+            "version": MCP_SERVER_VERSION,
+        },
+        "capabilities": {
+            "tools": {},
+        },
+    })
+}
+
+fn mcp_tools_list() -> serde_json::Value {
+    serde_json::json!({
+        "tools": [
+            {
+                "name": "host",
+                "description": "Node identity and peer management. Actions: id, peers, addrs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["id", "peers", "addrs"]
+                        }
+                    },
+                    "required": ["action"]
+                }
+            },
+            {
+                "name": "routing",
+                "description": "DHT routing operations. Actions: provide, resolve, hash.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["provide", "resolve", "hash"]
+                        },
+                        "key": { "type": "string" },
+                        "name": { "type": "string" },
+                        "data": { "type": "string" }
+                    },
+                    "required": ["action"]
+                }
+            },
+            {
+                "name": "import",
+                "description": "Load a Glia module by path.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "eval",
+                "description": "Evaluate a Glia s-expression.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "expression": { "type": "string" }
+                    },
+                    "required": ["expression"]
+                }
+            }
+        ]
+    })
+}
+
+fn glia_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn is_safe_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn mcp_tool_to_glia(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    match tool_name {
+        "host" => {
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            if !is_safe_identifier(action) {
+                return None;
+            }
+            match action {
+                "id" | "peers" | "addrs" => Some(format!("(perform host :{action})")),
+                _ => None,
+            }
+        }
+        "routing" => {
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            if !is_safe_identifier(action) {
+                return None;
+            }
+            match action {
+                "provide" => {
+                    let key = glia_escape(args.get("key").and_then(|v| v.as_str()).unwrap_or(""));
+                    Some(format!("(perform routing :provide \"{key}\")"))
+                }
+                "resolve" => {
+                    let name = glia_escape(args.get("name").and_then(|v| v.as_str()).unwrap_or(""));
+                    Some(format!("(perform routing :resolve \"{name}\")"))
+                }
+                "hash" => {
+                    let data = glia_escape(args.get("data").and_then(|v| v.as_str()).unwrap_or(""));
+                    Some(format!("(perform routing :hash \"{data}\")"))
+                }
+                _ => None,
+            }
+        }
+        "import" => {
+            let path = glia_escape(args.get("path").and_then(|v| v.as_str()).unwrap_or(""));
+            Some(format!("(perform import \"{path}\")"))
+        }
+        _ => None,
+    }
+}
+
+fn val_to_mcp_error_text(err: &Val) -> String {
+    let inner = glia::error::unwrap_thrown(err).unwrap_or(err);
+
+    let msg = glia::error::message(inner)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{inner}"));
+
+    let Some(tag) = glia::error::type_tag(inner) else {
+        return msg;
+    };
+
+    let mut text = format!("[{tag}] {msg}");
+    if let Some(hint) = glia::error::hint(inner) {
+        text.push_str("\n\nhint: ");
+        text.push_str(hint);
+    }
+    text
+}
+
+fn val_to_json(v: &Val) -> serde_json::Value {
+    match v {
+        Val::Nil => serde_json::Value::Null,
+        Val::Bool(b) => serde_json::Value::Bool(*b),
+        Val::Int(i) => serde_json::Value::from(*i),
+        Val::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Val::Str(s) | Val::Sym(s) | Val::Keyword(s) => serde_json::Value::String(s.clone()),
+        Val::List(items) | Val::Vector(items) | Val::Set(items) => {
+            serde_json::Value::Array(items.iter().map(val_to_json).collect())
+        }
+        Val::Map(map) => {
+            let mut object = serde_json::Map::new();
+            for (k, v) in map {
+                let key = match k {
+                    Val::Keyword(s) | Val::Str(s) | Val::Sym(s) => s.clone(),
+                    other => format!("{other}"),
+                };
+                object.insert(key, val_to_json(v));
+            }
+            serde_json::Value::Object(object)
+        }
+        Val::Bytes(bytes) => serde_json::Value::String(format!("<{} bytes>", bytes.len())),
+        other => serde_json::Value::String(format!("{other}")),
+    }
+}
+
+fn val_to_mcp_error_data(err: &Val) -> serde_json::Value {
+    let inner = glia::error::unwrap_thrown(err).unwrap_or(err);
+    let Some(data) = glia::error::data(inner) else {
+        return serde_json::Value::Null;
+    };
+
+    let mut object = serde_json::Map::new();
+    for (k, v) in data {
+        let key = match k {
+            Val::Keyword(s) | Val::Str(s) | Val::Sym(s) => s.clone(),
+            other => format!("{other}"),
+        };
+        object.insert(key, val_to_json(v));
+    }
+    serde_json::Value::Object(object)
+}
+
+async fn run_mcp_stdio(runtime: &mut LocalShellRuntime) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let tools = mcp_tools_list();
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).await?;
+        if read == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
+            Ok(req) => req,
+            Err(err) => {
+                let null_id = serde_json::Value::Null;
+                write_jsonrpc_error(&null_id, -32700, &format!("Parse error: {err}"));
+                continue;
+            }
+        };
+
+        let Some(id) = request.id else {
+            continue;
+        };
+
+        match request.method.as_str() {
+            "initialize" => write_jsonrpc_result(&id, mcp_initialize_result()),
+            "ping" => write_jsonrpc_result(&id, serde_json::json!({})),
+            "tools/list" => write_jsonrpc_result(&id, tools.clone()),
+            "tools/call" => {
+                let params = request.params.unwrap_or(serde_json::Value::Null);
+                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let expression = if tool_name == "eval" {
+                    let expression = arguments
+                        .get("expression")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if expression.is_empty() {
+                        write_mcp_tool_error(&id, "empty expression", &serde_json::Value::Null);
+                        continue;
+                    }
+                    expression.to_string()
+                } else if let Some(expr) = mcp_tool_to_glia(tool_name, &arguments) {
+                    expr
+                } else {
+                    write_jsonrpc_error(&id, -32602, &format!("Unknown tool: {tool_name}"));
+                    continue;
+                };
+
+                match shell_eval_raw(runtime, &expression).await? {
+                    Ok(Val::Nil) => write_mcp_tool_result(&id, "nil"),
+                    Ok(value) => write_mcp_tool_result(&id, &format!("{value}")),
+                    Err(err) => {
+                        let text = val_to_mcp_error_text(&err);
+                        let data = val_to_mcp_error_data(&err);
+                        write_mcp_tool_error(&id, &text, &data);
+                    }
+                }
+            }
+            _ => write_jsonrpc_error(
+                &id,
+                -32601,
+                &format!("Method not found: {}", request.method),
+            ),
+        }
+    }
+
+    Ok(())
 }
 
 async fn dial_shell(
@@ -778,25 +1130,7 @@ async fn shell_eval_value(
     runtime: &mut LocalShellRuntime,
     text: &str,
 ) -> Result<std::result::Result<String, String>> {
-    if text.trim().is_empty() {
-        return Ok(Ok(String::new()));
-    }
-
-    let expr = match glia::read(text) {
-        Ok(expr) => expr,
-        Err(e) => return Ok(Err(format!("parse error: {e}"))),
-    };
-
-    let wrapped = wrap_with_handlers(&expr, &[]);
-    let dispatch = LocalShellDispatch {
-        table: &runtime.dispatch,
-    };
-    let eval_result = tokio::time::timeout(
-        RPC_TIMEOUT,
-        eval::eval_toplevel(&wrapped, &mut runtime.env, &dispatch),
-    )
-    .await
-    .context("shell eval timed out")?;
+    let eval_result = shell_eval_raw(runtime, text).await?;
 
     match eval_result {
         Ok(Val::Nil) => Ok(Ok(String::new())),
@@ -814,6 +1148,33 @@ async fn shell_eval_value(
             Ok(Err(formatted))
         }
     }
+}
+
+async fn shell_eval_raw(
+    runtime: &mut LocalShellRuntime,
+    text: &str,
+) -> Result<std::result::Result<Val, Val>> {
+    if text.trim().is_empty() {
+        return Ok(Ok(Val::Nil));
+    }
+
+    let expr = match glia::read(text) {
+        Ok(expr) => expr,
+        Err(e) => return Ok(Err(glia::error::parse(None, e))),
+    };
+
+    let wrapped = wrap_with_handlers(&expr, &[]);
+    let dispatch = LocalShellDispatch {
+        table: &runtime.dispatch,
+    };
+    let eval_result = tokio::time::timeout(
+        RPC_TIMEOUT,
+        eval::eval_toplevel(&wrapped, &mut runtime.env, &dispatch),
+    )
+    .await
+    .context("shell eval timed out")?;
+
+    Ok(eval_result)
 }
 
 fn get_graft_cap<T: FromClientHook>(
@@ -1879,5 +2240,19 @@ mod tests {
             !dial_body.contains("bootstrap_request("),
             "process.bootstrap path detected"
         );
+    }
+
+    #[test]
+    fn mcp_tool_host_id_maps_to_glia_expression() {
+        let args = serde_json::json!({ "action": "id" });
+        let expr = mcp_tool_to_glia("host", &args);
+        assert_eq!(expr, Some("(perform host :id)".to_string()));
+    }
+
+    #[test]
+    fn mcp_tool_rejects_unsafe_action_identifier() {
+        let args = serde_json::json!({ "action": "id) (evil" });
+        let expr = mcp_tool_to_glia("host", &args);
+        assert_eq!(expr, None);
     }
 }

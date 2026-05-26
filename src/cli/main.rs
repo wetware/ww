@@ -1571,7 +1571,8 @@ wasip2::cli::command::export!({iface_name}Guest);
             ),
         };
 
-        // Save values needed by the MCP cell before moving them into the kernel.
+        // Save values needed by optional process-local MCP mode before moving
+        // them into the kernel.
         let signing_key = std::sync::Arc::new(sk);
 
         let mut builder = CellBuilder::new(image_path.clone())
@@ -1623,78 +1624,40 @@ wasip2::cli::command::export!({iface_name}Guest);
             })
             .map_err(|_| anyhow::anyhow!("executor pool rejected kernel spawn"))?;
 
-        // MCP mode: spawn the MCP cell alongside the kernel.
-        // The MCP cell reads JSON-RPC from host stdin and evaluates Glia
-        // expressions via the membrane. The kernel runs headless (daemon mode)
-        // because its stdin has been suppressed.
+        // MCP mode: run MCP in the ww shell process (CLI side), while the
+        // daemon/kernel remain backend providers for transport/auth/caps.
+        // The kernel runs headless because its stdin is suppressed above.
         let mcp_result_rx = if mcp {
-            // Resolve the MCP cell image path. The MCP cell's FHS root
-            // is std/mcp/ which contains bin/main.wasm after `make mcp`.
-            let mcp_image = Self::find_mcp_image()?;
-            tracing::info!(image = %mcp_image, "Resolved MCP cell image");
-
-            // Build a loader for the MCP cell.
-            // Same priority as main loader: HostPath > Embedded > IPFS.
-            let mcp_loader = ChainLoader::new(vec![
-                Box::new(HostPathLoader),
-                Box::new(embedded_loader()),
-                Box::new(IpfsLoader::new(ipfs_client.clone())),
-            ]);
-            let mcp_cell = CellBuilder::new(mcp_image)
-                .with_loader(Box::new(mcp_loader))
-                .with_network_state(network_state)
-                .with_swarm_cmd_tx(swarm_cmd_tx)
-                .with_wasm_debug(wasm_debug)
-                .with_cid_tree(cid_tree.clone())
-                .with_pinset_cache(pinset_cache.clone())
-                .with_signing_key(signing_key)
-                .with_cache_policy(cache_policy)
-                .with_compile_tx(compile_tx)
-                .with_wasmtime_engine(executor_pool.engine())
-                .with_ipfs_client(ipfs_client)
-                .build();
-
+            let mcp_signing_key = (*signing_key).clone();
             let (mcp_tx, mcp_rx) = tokio::sync::oneshot::channel();
-            executor_pool
-                .spawn(ww::services::SpawnRequest {
-                    name: "mcp".into(),
-                    factory: Box::new(move |_shutdown| {
-                        Box::pin(async move {
-                            match mcp_cell.spawn().await {
-                                Ok(result) => {
-                                    let _ = mcp_tx.send(Ok(result.exit_code));
-                                }
-                                Err(e) => {
-                                    tracing::error!("MCP cell failed: {}", e);
-                                    let _ = mcp_tx.send(Err(e));
-                                }
-                            }
-                        })
-                    }),
-                    result_tx: None,
-                })
-                .map_err(|_| anyhow::anyhow!("executor pool rejected MCP cell spawn"))?;
+            tokio::task::spawn_local(async move {
+                let result = shell::run_mcp_with_signing_key(mcp_signing_key).await;
+                let _ = match result {
+                    Ok(()) => mcp_tx.send(Ok(0)),
+                    Err(e) => mcp_tx.send(Err(e)),
+                };
+            });
 
-            tracing::info!("MCP server cell spawned on stdin/stdout");
+            tracing::info!("MCP server running process-local in ww shell");
             Some(mcp_rx)
         } else {
             None
         };
 
-        // Wait for the kernel (or MCP cell, whichever exits first) to exit.
+        // Wait for the kernel (or process-local MCP task, whichever exits first) to exit.
         let exit_code = if let Some(mcp_rx) = mcp_result_rx {
-            // In MCP mode, wait for the MCP cell to exit (it owns stdin/stdout).
-            // When the MCP cell exits (stdin EOF), shut everything down.
+            // In MCP mode, wait for the MCP task to exit (it owns stdin/stdout).
+            // When MCP exits (stdin EOF), shut everything down.
             tokio::select! {
                 result = mcp_rx => {
                     match result {
                         Ok(Ok(code)) => code,
                         Ok(Err(e)) => {
-                            tracing::error!("MCP cell error: {}", e);
+                            tracing::error!("MCP server error: {}", e);
                             1
                         }
                         Err(_) => {
-                            tracing::error!("MCP cell result channel dropped");
+                            tracing::error!("MCP server result channel dropped");
                             1
                         }
                     }
@@ -1742,57 +1705,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         drop(executor_pool);
         drop(cid_tree);
         std::process::exit(exit_code);
-    }
-
-    /// Locate the MCP cell image directory.
-    ///
-    /// Searches for `bin/main.wasm` in:
-    /// 1. `std/mcp/` relative to CWD (dev mode)
-    /// 2. `../std/mcp/` relative to the host binary (installed mode)
-    /// 3. `~/.ww/images/mcp/` (user install layer)
-    /// 4. Falls back to `mcp` (sentinel for EmbeddedLoader, if WASM is embedded)
-    ///
-    /// Returns the image path as a string suitable for `CellBuilder::new()`.
-    fn find_mcp_image() -> Result<String> {
-        let mut candidates = vec![
-            PathBuf::from("std/mcp"),
-            std::env::current_exe()
-                .unwrap_or_default()
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join("../std/mcp"),
-        ];
-
-        // Check the user install layer (~/.ww/images/mcp)
-        if let Some(home) = dirs::home_dir() {
-            candidates.push(home.join(".ww/images/mcp"));
-        }
-
-        for candidate in &candidates {
-            if candidate.join("bin/main.wasm").exists() {
-                return Ok(candidate.display().to_string());
-            }
-        }
-
-        // Fall back to the sentinel path that EmbeddedLoader can resolve.
-        // The embedded loader matches by suffix, so "mcp/bin/main.wasm"
-        // will match the registered "mcp/bin/main.wasm" entry.
-        if !EMBEDDED_MCP.is_empty() {
-            tracing::info!("Using embedded MCP cell image");
-            return Ok("mcp".to_string());
-        }
-
-        bail!(
-            "MCP cell WASM not found. Run `make mcp` to build the MCP cell.\n\
-             \n\
-             Searched:\n\
-             {}",
-            candidates
-                .iter()
-                .map(|p| format!("  {}/bin/main.wasm", p.display()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
     }
 
     /// Publish a wetware environment to IPFS

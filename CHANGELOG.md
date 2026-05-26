@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **`ww run --mcp` now runs MCP process-local in the shell path (#508).** Replaced daemon-spawned `std/mcp` WASM execution with a process-local MCP JSON-RPC loop in the CLI that reuses shell dial/login/graft auth flow and local Glia evaluation, while keeping daemon-backed transport/auth/capability dispatch unchanged.
 - **`system.Ipfs` now supports chunked reads for large payloads (#511).** Added `Ipfs.readStream(path)->(stream :ByteStream)` to `system.capnp`, implemented daemon-side streaming bridge over the existing grafted capability (no shell→Kubo direct coupling), and switched process-local `ww shell` IPFS-family `load` paths to consume chunked bytes with compatibility fallback to legacy `Ipfs.read`.
 - **Cap'n Proto schema boundary split for `stem`/`auth`/`membrane`/`system` (#509).** Moved signer/identity/terminal/membrane/export types out of `stem.capnp` into dedicated `auth.capnp` and `membrane.capnp`, rewired `system.capnp` exports to the new membrane schema, updated build/codegen wiring across host/std/examples, and pinned key type IDs/schema CIDs in tests to guard wire/introspection compatibility during the migration.
 - **Runtime WASM load size limit raised to 8 MiB.** Increased `MAX_WASM_BYTES` in the runtime load path from 2 MiB to 8 MiB so practical guest binaries (including current standard-library shells) load without tripping size validation, while retaining a global upper bound for untrusted code.
