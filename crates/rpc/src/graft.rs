@@ -20,11 +20,11 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use libp2p::identity::Keypair;
 use libp2p_core::SignedEnvelope;
 use membrane::{auth_capnp, membrane_capnp, Epoch, EpochGuard, GraftBuilder, MembraneServer};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::SwarmCommand;
+use crate::{ByteStreamImpl, StreamMode, SwarmCommand};
 use auth::SigningDomain;
 use membrane::http_capnp;
 use membrane::routing_capnp;
@@ -159,6 +159,16 @@ struct EpochGuardedIpfs {
 // limits (~64 MiB) so oversize reads fail with a clear contract error rather
 // than an opaque decode failure on the client side.
 const MAX_IPFS_READ_BYTES: usize = 32 * 1024 * 1024;
+const IPFS_STREAM_BRIDGE_BUFFER_BYTES: usize = 64 * 1024;
+
+fn validate_ipfs_path(path: &str) -> Result<(), capnp::Error> {
+    if ipfs::is_ipfs_path(path) {
+        return Ok(());
+    }
+    Err(capnp::Error::failed(format!(
+        "ipfs.read: expected /ipfs/, /ipns/, or /ipld/ path; got {path}"
+    )))
+}
 
 #[allow(refining_impl_trait)]
 impl system_capnp::ipfs::Server for EpochGuardedIpfs {
@@ -174,10 +184,8 @@ impl system_capnp::ipfs::Server for EpochGuardedIpfs {
             .and_then(|t| t.to_str().map_err(|e| capnp::Error::failed(e.to_string()))))
         .to_string();
 
-        if !ipfs::is_ipfs_path(&path) {
-            return Promise::err(capnp::Error::failed(format!(
-                "ipfs.read: expected /ipfs/, /ipns/, or /ipld/ path; got {path}"
-            )));
+        if let Err(err) = validate_ipfs_path(&path) {
+            return Promise::err(err);
         }
 
         let client = self.ipfs_client.clone();
@@ -188,7 +196,7 @@ impl system_capnp::ipfs::Server for EpochGuardedIpfs {
                 .map_err(|e| capnp::Error::failed(format!("ipfs.read failed: {e}")))?;
             if bytes.len() > MAX_IPFS_READ_BYTES {
                 return Err(capnp::Error::failed(format!(
-                    "ipfs.read: payload too large ({} bytes > {} bytes max); use smaller objects or a streaming API",
+                    "ipfs.read: payload too large ({} bytes > {} bytes max); use ipfs.readStream",
                     bytes.len(),
                     MAX_IPFS_READ_BYTES
                 )));
@@ -196,6 +204,38 @@ impl system_capnp::ipfs::Server for EpochGuardedIpfs {
             results.get().set_data(&bytes);
             Ok(())
         })
+    }
+
+    fn read_stream(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::ipfs::ReadStreamParams,
+        mut results: system_capnp::ipfs::ReadStreamResults,
+    ) -> Promise<(), capnp::Error> {
+        pry!(self.guard.check());
+        let p = pry!(params.get());
+        let path = pry!(p
+            .get_path()
+            .and_then(|t| t.to_str().map_err(|e| capnp::Error::failed(e.to_string()))))
+        .to_string();
+
+        if let Err(err) = validate_ipfs_path(&path) {
+            return Promise::err(err);
+        }
+
+        let (mut writer, reader) = io::duplex(IPFS_STREAM_BRIDGE_BUFFER_BYTES);
+        let stream_client: system_capnp::byte_stream::Client =
+            capnp_rpc::new_client(ByteStreamImpl::new(reader, StreamMode::ReadOnly));
+        results.get().set_stream(stream_client);
+
+        let client = self.ipfs_client.clone();
+        tokio::spawn(async move {
+            if let Err(err) = client.cat_to_writer(&path, &mut writer).await {
+                tracing::warn!(path = %path, error = %err, "ipfs.read_stream bridge failed");
+            }
+            let _ = writer.shutdown().await;
+        });
+
+        Promise::ok(())
     }
 }
 

@@ -29,6 +29,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_DISCOVERY_ENV: &str = "WW_TEST_SHELL_CANDIDATES";
+const IPFS_STREAM_READ_CHUNK_BYTES: u32 = 64 * 1024;
 
 const HELP_TEXT: &str = "\
 Remote Glia shell. Available commands:
@@ -362,6 +363,54 @@ struct ShellLoadBackend {
     ipfs: Option<ww::system_capnp::ipfs::Client>,
 }
 
+async fn load_ipfs_read(
+    ipfs: &ww::system_capnp::ipfs::Client,
+    path: &str,
+) -> std::result::Result<Vec<u8>, Val> {
+    let mut req = ipfs.read_request();
+    req.get().set_path(path);
+    let resp = req
+        .send()
+        .promise
+        .await
+        .map_err(|e| Val::from(format!("load: {path}: {e}")))?;
+    let bytes = resp
+        .get()
+        .map_err(|e| Val::from(format!("load: {path}: {e}")))?
+        .get_data()
+        .map_err(|e| Val::from(format!("load: {path}: {e}")))?;
+    Ok(bytes.to_vec())
+}
+
+async fn load_ipfs_read_stream(
+    ipfs: &ww::system_capnp::ipfs::Client,
+    path: &str,
+) -> std::result::Result<Vec<u8>, capnp::Error> {
+    let mut req = ipfs.read_stream_request();
+    req.get().set_path(path);
+    let resp = req.send().promise.await?;
+    let stream = resp.get()?.get_stream()?;
+    let mut out = Vec::new();
+
+    loop {
+        let mut read_req = stream.read_request();
+        read_req.get().set_max_bytes(IPFS_STREAM_READ_CHUNK_BYTES);
+        let read_resp = read_req.send().promise.await?;
+        let chunk = read_resp.get()?.get_data()?;
+        if chunk.is_empty() {
+            break;
+        }
+        out.extend_from_slice(chunk);
+    }
+
+    Ok(out)
+}
+
+fn is_unimplemented_error(err: &capnp::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("unimplemented") || msg.contains("unknown method") || msg.contains("no method")
+}
+
 impl LoadBackend for ShellLoadBackend {
     fn load<'a>(
         &'a self,
@@ -372,19 +421,11 @@ impl LoadBackend for ShellLoadBackend {
                 let ipfs = self.ipfs.clone().ok_or_else(|| {
                     Val::from("load: /ipfs and /ipns paths require grafted 'ipfs' capability")
                 })?;
-                let mut req = ipfs.read_request();
-                req.get().set_path(path);
-                let resp = req
-                    .send()
-                    .promise
-                    .await
-                    .map_err(|e| Val::from(format!("load: {path}: {e}")))?;
-                let bytes = resp
-                    .get()
-                    .map_err(|e| Val::from(format!("load: {path}: {e}")))?
-                    .get_data()
-                    .map_err(|e| Val::from(format!("load: {path}: {e}")))?;
-                Ok(bytes.to_vec())
+                match load_ipfs_read_stream(&ipfs, path).await {
+                    Ok(bytes) => Ok(bytes),
+                    Err(err) if is_unimplemented_error(&err) => load_ipfs_read(&ipfs, path).await,
+                    Err(err) => Err(Val::from(format!("load: {path}: {err}"))),
+                }
             } else {
                 std::fs::read(path).map_err(|e| Val::from(format!("load: {path}: {e}")))
             }
@@ -1156,6 +1197,7 @@ mod tests {
     use membrane::TerminalServer;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::{mpsc, watch};
 
     const TEST_PEER_ID_BYTES: &[u8] = b"shell-local-eval-peer-id";
@@ -1295,7 +1337,32 @@ mod tests {
                     }
                 }
             }
-            results.get().set_data(b"abc");
+            results.get().set_data(b"legacy");
+            Promise::ok(())
+        }
+
+        fn read_stream(
+            self: capnp::capability::Rc<Self>,
+            params: ww::system_capnp::ipfs::ReadStreamParams,
+            mut results: ww::system_capnp::ipfs::ReadStreamResults,
+        ) -> Promise<(), capnp::Error> {
+            if let Ok(p) = params.get() {
+                if let Ok(path) = p.get_path() {
+                    if let Ok(path_str) = path.to_str() {
+                        self.seen_paths.borrow_mut().push(path_str.to_string());
+                    }
+                }
+            }
+
+            let (mut writer, reader) = tokio::io::duplex(1024);
+            let stream_client: ww::system_capnp::byte_stream::Client = capnp_rpc::new_client(
+                ww::rpc::ByteStreamImpl::new(reader, ww::rpc::StreamMode::ReadOnly),
+            );
+            results.get().set_stream(stream_client);
+            tokio::spawn(async move {
+                let _ = writer.write_all(b"abc").await;
+                let _ = writer.shutdown().await;
+            });
             Promise::ok(())
         }
     }
