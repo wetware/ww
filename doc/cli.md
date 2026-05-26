@@ -42,7 +42,6 @@ Layers stack with per-file union; later layers win.
 | `--port <PORT>` | `2025` | libp2p swarm listen port |
 | `--identity <PATH>` | `~/.ww/identity` | Ed25519 identity file path. Also reads `WW_IDENTITY` env. |
 | `--insecure-ephemeral` | off | Allow ephemeral identity fallback if identity file is missing (insecure; for quick trial runs). |
-| `--mcp` | off | Run as MCP server (JSON-RPC on stdin/stdout) |
 | `--http-listen <ADDR>` | none | Enable WAGI HTTP server (e.g. `127.0.0.1:2080`) |
 | `--http-dial <HOST>` | none | Allow outbound HTTP to host. Repeatable. Supports exact hosts, `*.example.com`, or `*`. Without this flag, no http-client capability is granted. |
 | `--with-http-admin <ADDR>` | none | Enable HTTP admin endpoint (metrics, `/host/id`, `/host/addrs`) |
@@ -61,9 +60,6 @@ Layers stack with per-file union; later layers win.
 ```sh
 # Dev mode (current directory)
 ww run .
-
-# Run as MCP server
-ww run . --mcp
 
 # HTTP endpoint with outbound access
 ww run . --http-listen 0.0.0.0:2080 --http-dial api.example.com
@@ -96,7 +92,7 @@ ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 Connect to a running daemon and open a Glia REPL.
 
 ```
-ww shell [ADDR] [--select <index|peer-id>]
+ww shell [ADDR] [--select <index|peer-id>] [--mcp]
 ```
 
 Shell transport/auth is remote, but evaluation is local:
@@ -111,11 +107,12 @@ Shell transport/auth is remote, but evaluation is local:
 - `<multiaddr>` — explicit remote dial.
 - `--select <index|peer-id>` — non-interactive target override when discovery
   returns multiple hosts.
+- `--mcp` — run shell in MCP stdio mode (JSON-RPC over stdin/stdout).
 
 `ww shell` does not call daemon-side `runtime.load(shell.wasm)`,
 `executor.spawn`, or `process.bootstrap` on connect.
 For `load`/`import`, `/ipfs|/ipns|/ipld` paths route through grafted
-`system.Ipfs.read`; non-IPFS paths use local process filesystem reads.
+`system.Ipfs` reads; non-IPFS paths use local process filesystem reads.
 
 ### Examples
 

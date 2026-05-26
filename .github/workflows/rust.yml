@@ -238,7 +238,6 @@ jobs:
           std/kernel/bin/main.wasm
           std/shell/bin/shell.wasm
           std/shell/bin/shell.capnpc
-          std/mcp/bin/main.wasm
           std/status/bin/status.wasm
           examples/*/bin/
         retention-days: 1
@@ -547,7 +546,6 @@ jobs:
         # canonical names (loaded by name via embedded loader / VFS).
         cp artifacts/wasm-artifacts/std/kernel/bin/main.wasm   "$STAGE/bin/main.wasm"
         cp artifacts/wasm-artifacts/std/shell/bin/shell.wasm   "$STAGE/bin/shell.wasm"
-        cp artifacts/wasm-artifacts/std/mcp/bin/main.wasm      "$STAGE/bin/mcp.wasm"
         cp artifacts/wasm-artifacts/std/status/bin/status.wasm "$STAGE/bin/status.wasm"
 
         # Example WASM cells (flat, for reference / convenience).

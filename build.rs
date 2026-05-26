@@ -96,7 +96,6 @@ fn main() {
     // In release mode, fail with a clear error message.
     let embedded_wasm = [
         "std/kernel/bin/main.wasm",
-        "std/mcp/bin/main.wasm",
         "std/shell/bin/shell.wasm",
         "std/status/bin/status.wasm",
         "examples/echo/bin/echo.wasm",

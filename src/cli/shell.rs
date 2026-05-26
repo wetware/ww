@@ -133,51 +133,55 @@ pub async fn run_shell(addr: Option<Multiaddr>, select: Option<String>) -> Resul
         .await
 }
 
-pub async fn run_mcp_with_signing_key(signing_key: ed25519_dalek::SigningKey) -> Result<()> {
+pub async fn run_mcp(addr: Option<Multiaddr>, select: Option<String>) -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(async move { run_mcp_local(signing_key).await })
+        .run_until(async move { run_mcp_local(addr, select).await })
         .await
 }
 
 async fn run_shell_local(addr: Option<Multiaddr>, select: Option<String>) -> Result<()> {
     let (signing_key, preferred_peer_id) = load_shell_identity()?;
-
-    let target = if let Some(addr) = addr {
-        let peer = peer_id_from_addr(&addr);
-        let addrs = vec![addr];
-        candidate_from_parts(peer, addrs)?
-    } else {
-        let candidates = if let Some(candidates) = discovery_candidates_override()? {
-            candidates
-        } else {
-            discover_local_candidates().await?
-        };
-        choose_candidate(
-            candidates,
-            Some(preferred_peer_id),
-            select.as_deref(),
-            stdin_is_interactive_tty(),
-        )?
-    };
+    let target = resolve_target(
+        addr,
+        select.as_deref(),
+        Some(preferred_peer_id),
+        stdin_is_interactive_tty(),
+    )
+    .await?;
 
     let grafted_caps = dial_shell(&target, &signing_key).await?;
     let mut runtime = build_local_shell_runtime(grafted_caps).await;
     run_repl(&mut runtime).await
 }
 
-async fn run_mcp_local(signing_key: ed25519_dalek::SigningKey) -> Result<()> {
-    let preferred_peer_id = ww::keys::to_libp2p(&signing_key)?.public().to_peer_id();
+async fn run_mcp_local(addr: Option<Multiaddr>, select: Option<String>) -> Result<()> {
+    let (signing_key, preferred_peer_id) = load_shell_identity()?;
+    let target = resolve_target(addr, select.as_deref(), Some(preferred_peer_id), false).await?;
+    // MCP mode is stdio protocol mode; never prompt interactively on stdin.
+    let grafted_caps = dial_shell(&target, &signing_key).await?;
+    let mut runtime = build_local_shell_runtime(grafted_caps).await;
+    run_mcp_stdio(&mut runtime).await
+}
+
+async fn resolve_target(
+    addr: Option<Multiaddr>,
+    select: Option<&str>,
+    preferred_peer_id: Option<libp2p::PeerId>,
+    interactive: bool,
+) -> Result<Candidate> {
+    if let Some(addr) = addr {
+        let peer = peer_id_from_addr(&addr);
+        let addrs = vec![addr];
+        return candidate_from_parts(peer, addrs);
+    }
+
     let candidates = if let Some(candidates) = discovery_candidates_override()? {
         candidates
     } else {
         discover_local_candidates().await?
     };
-    // MCP mode is stdio protocol mode; never prompt interactively on stdin.
-    let target = choose_candidate(candidates, Some(preferred_peer_id), None, false)?;
-    let grafted_caps = dial_shell(&target, &signing_key).await?;
-    let mut runtime = build_local_shell_runtime(grafted_caps).await;
-    run_mcp_stdio(&mut runtime).await
+    choose_candidate(candidates, preferred_peer_id, select, interactive)
 }
 
 #[derive(serde::Deserialize)]

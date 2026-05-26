@@ -157,7 +157,7 @@ pub(super) async fn doctor() -> Result<()> {
                 println!("  Claude Code MCP ............. CONFIGURED");
             } else {
                 println!("  Claude Code MCP ............. NOT CONFIGURED");
-                println!("    Fix: claude mcp add wetware -- ww run --mcp");
+                println!("    Fix: claude mcp add wetware -- ww shell --mcp");
             }
         }
         _ => {
