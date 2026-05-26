@@ -72,6 +72,7 @@ stem = { path = "crates/stem" }
 cache = { package = "ww-cache", path = "crates/cache" }
 cell = { path = "crates/cell" }
 rpc = { path = "crates/rpc" }
+caps = { path = "std/caps" }
 blake3 = "1"
 cid = "0.11"
 hex = "0.4"

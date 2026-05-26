@@ -47,6 +47,14 @@ interface Runtime {
   # Terminate all tasks spawned through this Runtime.
 }
 
+interface Ipfs {
+  read @0 (path :Text) -> (data :Data);
+  # Read bytes from an IPFS-family path via the daemon backend.
+  # Accepts `/ipfs/<cid>`, `/ipns/...`, `/ipld/...`.
+  # Used by non-WASI clients (e.g. process-local `ww shell` eval) to
+  # preserve content-path semantics without direct shell→Kubo coupling.
+}
+
 struct FuelPolicy {
   union {
     scheduled @0 :Void;

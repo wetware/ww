@@ -57,13 +57,27 @@ const EMBEDDED_SHELL_CAPNPC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/s
 
 /// Build the standard embedded loader with all bundled WASM images.
 fn embedded_loader() -> EmbeddedLoader {
-    EmbeddedLoader::new()
-        .insert("bin/main.wasm", EMBEDDED_KERNEL)
-        .insert("bin/shell.wasm", EMBEDDED_SHELL)
-        .insert("bin/shell.capnpc", EMBEDDED_SHELL_CAPNPC)
-        .insert("bin/mcp.wasm", EMBEDDED_MCP)
-        .insert("bin/echo.wasm", EMBEDDED_ECHO)
-        .insert("bin/status.wasm", EMBEDDED_STATUS)
+    let mut loader = EmbeddedLoader::new();
+    // Important: do NOT register empty placeholders. If an empty blob is
+    // inserted, EmbeddedLoader "wins" path resolution and masks downstream
+    // loaders (HostPath/IPFS), causing zero-byte WASM loads.
+    if !EMBEDDED_KERNEL.is_empty() {
+        loader = loader.insert("bin/main.wasm", EMBEDDED_KERNEL);
+    }
+    if !EMBEDDED_SHELL.is_empty() {
+        loader = loader.insert("bin/shell.wasm", EMBEDDED_SHELL);
+    }
+    loader = loader.insert("bin/shell.capnpc", EMBEDDED_SHELL_CAPNPC);
+    if !EMBEDDED_MCP.is_empty() {
+        loader = loader.insert("bin/mcp.wasm", EMBEDDED_MCP);
+    }
+    if !EMBEDDED_ECHO.is_empty() {
+        loader = loader.insert("bin/echo.wasm", EMBEDDED_ECHO);
+    }
+    if !EMBEDDED_STATUS.is_empty() {
+        loader = loader.insert("bin/status.wasm", EMBEDDED_STATUS);
+    }
+    loader
 }
 
 #[derive(Parser)]
@@ -2825,6 +2839,31 @@ mod tests {
             msg.contains("/etc/identity"),
             "error should include offending target path: {msg}"
         );
+    }
+
+    #[test]
+    fn test_embedded_loader_does_not_shadow_with_empty_kernel_blob() {
+        use ww::cell::Loader;
+
+        let loader = embedded_loader();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(loader.load("/ipfs/example/bin/main.wasm"));
+
+        if EMBEDDED_KERNEL.is_empty() {
+            assert!(
+                result.is_err(),
+                "embedded loader should not resolve bin/main.wasm when kernel blob is absent"
+            );
+        } else {
+            let bytes = result.expect("expected embedded kernel bytes");
+            assert!(
+                !bytes.is_empty(),
+                "embedded kernel resolution returned empty bytes"
+            );
+        }
     }
 
     // ── Daemon service-file writer tests ──────────────────────────────

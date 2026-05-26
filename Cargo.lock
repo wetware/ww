@@ -1353,6 +1353,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "caps"
+version = "0.1.0"
+dependencies = [
+ "bs58",
+ "capnp",
+ "capnp-rpc",
+ "capnpc",
+ "glia",
+ "multiaddr",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8138,6 +8152,7 @@ dependencies = [
  "capnp",
  "capnp-rpc",
  "capnpc",
+ "caps",
  "cell",
  "chrono",
  "cid",

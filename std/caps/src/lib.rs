@@ -6,9 +6,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 
-use glia::{Val, make_cap};
+use glia::{make_cap, Val};
 
 // Re-export extract_method from glia for downstream consumers (shell, MCP).
 pub use glia::extract_method;
@@ -17,19 +18,23 @@ pub use glia::extract_method;
 pub use capnp::schema_capnp;
 
 // Generated Cap'n Proto modules.
-#[allow(dead_code)]
+#[allow(unused_parens, clippy::match_single_binding)]
 pub mod system_capnp {
     include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
 }
-#[allow(dead_code)]
+#[allow(
+    unused_parens,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
 pub mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
-#[allow(dead_code)]
+#[allow(unused_parens, clippy::match_single_binding)]
 pub mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
 }
-#[allow(dead_code)]
+#[allow(unused_parens, clippy::match_single_binding)]
 pub mod http_capnp {
     include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
 }
@@ -40,9 +45,33 @@ pub mod http_capnp {
 
 thread_local! {
     static LOAD_CACHE: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
+    static LOAD_BACKEND: RefCell<Option<Rc<dyn LoadBackend>>> = RefCell::new(None);
 }
 
-pub fn eval_load(args: &[Val]) -> Result<Val, Val> {
+pub trait LoadBackend {
+    fn load<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Val>> + 'a>>;
+}
+
+pub fn set_load_backend(backend: Rc<dyn LoadBackend>) {
+    LOAD_BACKEND.with(|slot| {
+        *slot.borrow_mut() = Some(backend);
+    });
+}
+
+pub fn clear_load_backend() {
+    LOAD_BACKEND.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+pub fn clear_load_cache() {
+    LOAD_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+fn resolve_load_path(args: &[Val]) -> Result<String, Val> {
     let path = match args.first() {
         Some(Val::Str(s)) => s.clone(),
         Some(Val::Sym(s)) => s.clone(),
@@ -57,17 +86,48 @@ pub fn eval_load(args: &[Val]) -> Result<Val, Val> {
         format!("{root}/{path}")
     };
 
+    Ok(resolved)
+}
+
+fn read_default_path(path: &str) -> Result<Vec<u8>, Val> {
+    std::fs::read(path).map_err(|e| Val::from(format!("load: {path}: {e}")))
+}
+
+pub async fn eval_load_async(args: &[Val]) -> Result<Val, Val> {
+    let resolved = resolve_load_path(args)?;
+
+    if let Some(bytes) = LOAD_CACHE.with(|cache| cache.borrow().get(&resolved).cloned()) {
+        return Ok(Val::Bytes(bytes));
+    }
+
+    let maybe_backend = LOAD_BACKEND.with(|slot| slot.borrow().clone());
+    let bytes = if let Some(backend) = maybe_backend {
+        backend.load(&resolved).await?
+    } else {
+        read_default_path(&resolved)?
+    };
+
+    LOAD_CACHE.with(|cache| {
+        cache.borrow_mut().insert(resolved.clone(), bytes.clone());
+    });
+
+    Ok(Val::Bytes(bytes))
+}
+
+pub fn eval_load(args: &[Val]) -> Result<Val, Val> {
+    let resolved = resolve_load_path(args)?;
+
     LOAD_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(bytes) = cache.get(&resolved) {
             return Ok(Val::Bytes(bytes.clone()));
         }
-        match std::fs::read(&resolved) {
+        match read_default_path(&resolved) {
             Ok(bytes) => {
                 cache.insert(resolved, bytes.clone());
                 Ok(Val::Bytes(bytes))
             }
-            Err(e) => Err(Val::from(format!("load: {resolved}: {e}"))),
+            Err(e) => Err(e),
         }
     })
 }
@@ -82,7 +142,6 @@ pub fn call_resume(resume: &Val, val: Val) -> Result<Val, Val> {
         _ => Err(Val::from("cap handler: invalid resume function")),
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Import handler — module loading as a membrane capability
@@ -175,14 +234,13 @@ pub fn make_import_handler() -> Val {
                 let resolved = resolve_import_path(&path);
 
                 // Check cache
-                let cached =
-                    IMPORT_CACHE.with(|cache| cache.borrow().get(&resolved).cloned());
+                let cached = IMPORT_CACHE.with(|cache| cache.borrow().get(&resolved).cloned());
                 if let Some(map) = cached {
                     return call_resume(resume, map);
                 }
 
                 // Load the file via eval_load
-                let bytes_val = eval_load(&[Val::Str(resolved.clone())])?;
+                let bytes_val = eval_load_async(&[Val::Str(resolved.clone())]).await?;
                 let content = match &bytes_val {
                     Val::Bytes(b) => std::str::from_utf8(b)
                         .map_err(|e| {
@@ -215,8 +273,7 @@ pub fn make_import_handler() -> Val {
                             _args: &'a [glia::Val],
                         ) -> std::pin::Pin<
                             Box<
-                                dyn std::future::Future<Output = Result<glia::Val, glia::Val>>
-                                    + 'a,
+                                dyn std::future::Future<Output = Result<glia::Val, glia::Val>> + 'a,
                             >,
                         > {
                             Box::pin(std::future::ready(Err(glia::Val::from(format!(
@@ -230,7 +287,7 @@ pub fn make_import_handler() -> Val {
                         let mut fut =
                             Box::pin(glia::eval::eval_toplevel(form, &mut import_env, &noop));
                         let waker = std::task::Waker::noop();
-                        let mut cx = std::task::Context::from_waker(&waker);
+                        let mut cx = std::task::Context::from_waker(waker);
                         match fut.as_mut().poll(&mut cx) {
                             std::task::Poll::Ready(Ok(_)) => {}
                             std::task::Poll::Ready(Err(e)) => {
@@ -253,8 +310,7 @@ pub fn make_import_handler() -> Val {
                             _args: &'a [glia::Val],
                         ) -> std::pin::Pin<
                             Box<
-                                dyn std::future::Future<Output = Result<glia::Val, glia::Val>>
-                                    + 'a,
+                                dyn std::future::Future<Output = Result<glia::Val, glia::Val>> + 'a,
                             >,
                         > {
                             Box::pin(std::future::ready(Err(glia::Val::from(format!(
@@ -264,19 +320,22 @@ pub fn make_import_handler() -> Val {
                     }
                     let noop = NoopDispatch;
                     for form in &forms {
-                        let analyzed = glia::expr::analyze(form)
-                            .map_err(|e| Val::from(format!("import: analyze error in {resolved}: {e}")))?;
+                        let analyzed = glia::expr::analyze(form).map_err(|e| {
+                            Val::from(format!("import: analyze error in {resolved}: {e}"))
+                        })?;
                         let mut fut = Box::pin(glia::eval::eval_toplevel_expr(
                             &analyzed,
                             &mut import_env,
                             &noop,
                         ));
                         let waker = std::task::Waker::noop();
-                        let mut cx = std::task::Context::from_waker(&waker);
+                        let mut cx = std::task::Context::from_waker(waker);
                         match fut.as_mut().poll(&mut cx) {
                             std::task::Poll::Ready(Ok(_)) => {}
                             std::task::Poll::Ready(Err(e)) => {
-                                return Err(Val::from(format!("import: eval error in {resolved}: {e}")));
+                                return Err(Val::from(format!(
+                                    "import: eval error in {resolved}: {e}"
+                                )));
                             }
                             std::task::Poll::Pending => {
                                 return Err(Val::from(format!(
@@ -451,9 +510,7 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                         let base_cid = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
                             _ => {
-                                return Err(Val::from(
-                                    "routing :mkdir — expected base CID string",
-                                ));
+                                return Err(Val::from("routing :mkdir — expected base CID string"));
                             }
                         };
                         let path = match rest.get(1) {
@@ -690,7 +747,10 @@ pub fn get_graft_cap<T: capnp::capability::FromClientHook>(
 ) -> Result<T, capnp::Error> {
     for i in 0..caps.len() {
         let entry = caps.get(i);
-        let n = entry.get_name()?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let n = entry
+            .get_name()?
+            .to_str()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
         if n == name {
             return entry.get_cap().get_as_capability();
         }
@@ -809,7 +869,10 @@ mod tests {
     fn import_cached_returns_same_map() {
         clear_import_cache();
 
-        let test_map = Val::Map(glia::ValMap::from_pairs(vec![(Val::Keyword("a".into()), Val::Int(1))]));
+        let test_map = Val::Map(glia::ValMap::from_pairs(vec![(
+            Val::Keyword("a".into()),
+            Val::Int(1),
+        )]));
         IMPORT_CACHE.with(|cache| {
             cache
                 .borrow_mut()
@@ -974,5 +1037,4 @@ mod tests {
             other => panic!("expected list, got {other:?}"),
         }
     }
-
 }

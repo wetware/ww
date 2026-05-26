@@ -1,6 +1,8 @@
 # Shell
 
 `ww shell` connects to a running node and opens a Glia REPL.
+Transport/auth stays remote (`/ww/0.1.0` + `Terminal(Membrane)`), while
+Glia evaluation runs locally in the `ww shell` process.
 
 ## Modes
 
@@ -10,9 +12,10 @@ ww shell --select <index|peer-id>
 ww shell <multiaddr>
 ```
 
-- `ww shell`: discover hosts via mDNS. If multiple hosts are found:
-  interactive TTY sessions prompt for a selection; non-TTY sessions fail
-  with explicit next steps.
+- `ww shell`: discover hosts via local host-state (`~/.ww/run/host.json`,
+  or `$WW_HOST_STATE_PATH` override). If multiple hosts are found, interactive
+  TTY sessions prompt for a selection; non-TTY sessions fail with explicit next
+  steps.
 - `ww shell --select <index|peer-id>`: choose a discovered host
   non-interactively.
 - `ww shell <multiaddr>`: dial an explicit target.
@@ -23,9 +26,25 @@ Shell transport uses libp2p streams and Terminal(Membrane) challenge-response
 authentication. `ww shell` signs terminal challenges with the local identity
 key (`WW_IDENTITY` or `~/.ww/identity`).
 
+## Execution model
+
+- Connect path performs `dial -> login -> graft`.
+- `ww shell` does **not** start a daemon-side shell process
+  (`runtime.load`/`executor.spawn`/`process.bootstrap` are not used by shell
+  connect).
+- A process-local Glia environment is created in the CLI process and populated
+  with grafted capabilities.
+
+## Path semantics
+
+- `/ipfs/...`, `/ipns/...`, `/ipld/...` loads/imports route through the grafted
+  `ipfs` capability (`system.Ipfs.read`).
+- Non-IPFS paths use the shell process local filesystem.
+- `ww shell` never talks directly to Kubo.
+
 ## Multi-Result Discovery
 
-When mDNS returns multiple candidates and no deterministic preferred target
+When discovery returns multiple candidates and no deterministic preferred target
 is found, `ww shell` uses this order:
 
 1. Prefer the local identity peer id if exactly one discovered host matches.

@@ -99,19 +99,28 @@ Connect to a running daemon and open a Glia REPL.
 ww shell [ADDR] [--select <index|peer-id>]
 ```
 
-The admin UDS path has been removed. The command surface is preserved
-with libp2p transport + Terminal(Membrane) auth:
+Shell transport/auth is remote, but evaluation is local:
+- Connect over libp2p `/ww/0.1.0`.
+- Authenticate via `Terminal(Membrane)` challenge-response.
+- Graft capabilities from the daemon membrane.
+- Evaluate Glia inside the local `ww shell` process.
 
-- *(no args)* — discover via mDNS. Auto-connect if unambiguous; otherwise
-  prompt for selection in TTY mode.
+- *(no args)* — discover via local host-state (`~/.ww/run/host.json`,
+  or `$WW_HOST_STATE_PATH`). Auto-connect if unambiguous; otherwise prompt
+  for selection in TTY mode.
 - `<multiaddr>` — explicit remote dial.
-- `--select <index|peer-id>` — non-interactive target override when mDNS
-  discovers multiple hosts.
+- `--select <index|peer-id>` — non-interactive target override when discovery
+  returns multiple hosts.
+
+`ww shell` does not call daemon-side `runtime.load(shell.wasm)`,
+`executor.spawn`, or `process.bootstrap` on connect.
+For `load`/`import`, `/ipfs|/ipns|/ipld` paths route through grafted
+`system.Ipfs.read`; non-IPFS paths use local process filesystem reads.
 
 ### Examples
 
 ```sh
-ww shell                                    # mDNS discover + connect
+ww shell                                    # local host-state discover + connect
 ww shell --select 2                         # choose 2nd discovered host
 ww shell /dnsaddr/master.wetware.run        # explicit dial
 ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...
