@@ -26,8 +26,8 @@ struct CacheState {
 /// CID-keyed cache backed by IPFS pins, with a weight-aware ARC eviction policy.
 ///
 /// Manages which CIDs stay pinned in the IPFS node. Does not hold file
-/// content in memory — callers use `fetch()` to retrieve bytes on demand
-/// and write them to a local staging directory.
+/// content in memory — callers either fetch bytes on demand or stream content
+/// directly to local staging files.
 ///
 /// Thread-safe: the inner ARC is wrapped in a `Mutex`. The expensive I/O
 /// operations (pin, unpin) happen outside the lock.
@@ -179,6 +179,31 @@ impl PinsetCache {
             .with_context(|| format!("failed to fetch CID subpath /ipfs/{cid}/{subpath}"))
     }
 
+    /// Stream CID content directly to `dst`.
+    ///
+    /// The CID should already be pinned via a prior `ensure()` call.
+    pub async fn fetch_to_path(&self, cid: &Cid, dst: &Path) -> Result<()> {
+        self.pinner
+            .fetch_to_path(cid, dst)
+            .await
+            .with_context(|| format!("failed to stream CID /ipfs/{cid} to {}", dst.display()))
+    }
+
+    /// Stream CID subpath content directly to `dst`.
+    ///
+    /// The CID should already be pinned via a prior `ensure()` call.
+    pub async fn fetch_path_to_path(&self, cid: &Cid, subpath: &str, dst: &Path) -> Result<()> {
+        self.pinner
+            .fetch_path_to_path(cid, subpath, dst)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to stream CID subpath /ipfs/{cid}/{subpath} to {}",
+                    dst.display()
+                )
+            })
+    }
+
     /// Spawn background tasks to unpin evicted entries with retry.
     fn spawn_unpins(&self, evicted: Vec<(Cid, PinEntry)>) {
         for (cid, _entry) in evicted {
@@ -265,6 +290,22 @@ impl CacheMode {
             CacheMode::Isolated(pinset) => pinset.fetch_path(cid, subpath).await,
         }
     }
+
+    /// Stream CID content directly to `dst`.
+    pub async fn fetch_to_path(&self, cid: &Cid, dst: &Path) -> Result<()> {
+        match self {
+            CacheMode::Shared(cache) => cache.fetch_to_path(cid, dst).await,
+            CacheMode::Isolated(pinset) => pinset.fetch_to_path(cid, dst).await,
+        }
+    }
+
+    /// Stream CID subpath content directly to `dst`.
+    pub async fn fetch_path_to_path(&self, cid: &Cid, subpath: &str, dst: &Path) -> Result<()> {
+        match self {
+            CacheMode::Shared(cache) => cache.fetch_path_to_path(cid, subpath, dst).await,
+            CacheMode::Isolated(pinset) => pinset.fetch_path_to_path(cid, subpath, dst).await,
+        }
+    }
 }
 
 /// A per-process isolated pinset. Does not use ARC; simply tracks
@@ -325,6 +366,31 @@ impl IsolatedPinset {
             .fetch_path(cid, subpath)
             .await
             .with_context(|| format!("failed to fetch CID subpath /ipfs/{cid}/{subpath}"))
+    }
+
+    /// Stream CID content directly to `dst`.
+    ///
+    /// The CID should already be pinned via a prior `ensure()` call.
+    pub async fn fetch_to_path(&self, cid: &Cid, dst: &Path) -> Result<()> {
+        self.pinner
+            .fetch_to_path(cid, dst)
+            .await
+            .with_context(|| format!("failed to stream CID /ipfs/{cid} to {}", dst.display()))
+    }
+
+    /// Stream CID subpath content directly to `dst`.
+    ///
+    /// The CID should already be pinned via a prior `ensure()` call.
+    pub async fn fetch_path_to_path(&self, cid: &Cid, subpath: &str, dst: &Path) -> Result<()> {
+        self.pinner
+            .fetch_path_to_path(cid, subpath, dst)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to stream CID subpath /ipfs/{cid}/{subpath} to {}",
+                    dst.display()
+                )
+            })
     }
 }
 
