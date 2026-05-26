@@ -17,9 +17,16 @@ interface Identity @0xa7c200e5b4726d89 {
 
   verify @1 (data :Data, signature :Data, pubkey :Data) -> (valid :Bool);
   # Verify an Ed25519 signature against an arbitrary public key.
+  # Stateless -- does not use the node's private key.
+  # The pubkey is the 32-byte Ed25519 verifying key.
+  # The signature is the 64-byte Ed25519 signature.
 }
 
 interface Terminal @0xeae8840b2a898ba9 (Session) {
   login @0 (signer :Signer) -> (session :Session);
-  # Authenticate via epoch-bound challenge-response.
+  # Authenticate via epoch-bound challenge-response. The Terminal generates
+  # a random nonce + current epoch seq, the Signer signs both, and the
+  # Terminal verifies the signature, nonce, epoch freshness, and auth policy.
+  # Having a Terminal reference does NOT grant access -- the caller must prove
+  # identity by signing the challenge with the expected key.
 }
