@@ -8,7 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// HTTP client for talking to a Kubo node's `/api/v0/*` endpoints.
 #[derive(Clone)]
@@ -26,10 +26,7 @@ impl HttpClient {
         }
     }
 
-    /// Fetch file content from an IPFS path (calls `/api/v0/cat`).
-    ///
-    /// Accepts IPFS-family paths: `/ipfs/<cid>`, `/ipns/...`, `/ipld/...`.
-    pub async fn cat(&self, path: &str) -> Result<Vec<u8>> {
+    async fn cat_response(&self, path: &str) -> Result<reqwest::Response> {
         let url = format!("{}/api/v0/cat?arg={}", self.base_url, path);
         let response = self
             .http_client
@@ -46,6 +43,15 @@ impl HttpClient {
             ));
         }
 
+        Ok(response)
+    }
+
+    /// Fetch file content from an IPFS path (calls `/api/v0/cat`).
+    ///
+    /// Accepts IPFS-family paths: `/ipfs/<cid>`, `/ipns/...`, `/ipld/...`.
+    pub async fn cat(&self, path: &str) -> Result<Vec<u8>> {
+        let response = self.cat_response(path).await?;
+
         response
             .bytes()
             .await
@@ -53,26 +59,37 @@ impl HttpClient {
             .map(|b| b.to_vec())
     }
 
+    /// Stream file content from an IPFS path into an [`AsyncWrite`] sink.
+    ///
+    /// Returns the total number of bytes written.
+    pub async fn cat_to_writer<W>(&self, path: &str, dst: &mut W) -> Result<u64>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut response = self.cat_response(path).await?;
+        let mut total = 0u64;
+
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .with_context(|| format!("Failed to read streaming chunk from {path}"))?
+        {
+            dst.write_all(&chunk)
+                .await
+                .with_context(|| format!("Failed writing streaming chunk from {path}"))?;
+            total += chunk.len() as u64;
+        }
+
+        dst.flush()
+            .await
+            .with_context(|| format!("Failed to flush streaming sink for {path}"))?;
+        Ok(total)
+    }
+
     /// Stream file content from an IPFS path directly to `dst`.
     ///
     /// Accepts IPFS-family paths: `/ipfs/<cid>`, `/ipns/...`, `/ipld/...`.
     pub async fn cat_to_path(&self, path: &str, dst: &Path) -> Result<()> {
-        let url = format!("{}/api/v0/cat?arg={}", self.base_url, path);
-        let mut response = self
-            .http_client
-            .post(&url)
-            .send()
-            .await
-            .with_context(|| format!("Failed to connect to IPFS node at {}", self.base_url))?;
-
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to retrieve file from IPFS: {} (path: {})",
-                response.status(),
-                path
-            ));
-        }
-
         if let Some(parent) = dst.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -82,20 +99,7 @@ impl HttpClient {
         let mut out = tokio::fs::File::create(dst)
             .await
             .with_context(|| format!("Failed to create destination file {}", dst.display()))?;
-
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .with_context(|| format!("Failed to read streaming chunk from {path}"))?
-        {
-            out.write_all(&chunk)
-                .await
-                .with_context(|| format!("Failed writing chunk to {}", dst.display()))?;
-        }
-
-        out.flush()
-            .await
-            .with_context(|| format!("Failed to flush destination file {}", dst.display()))?;
+        self.cat_to_writer(path, &mut out).await?;
         Ok(())
     }
 

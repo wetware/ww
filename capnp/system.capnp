@@ -55,6 +55,11 @@ interface Ipfs {
   # Accepts `/ipfs/<cid>`, `/ipns/...`, `/ipld/...`.
   # Used by non-WASI clients (e.g. process-local `ww shell` eval) to
   # preserve content-path semantics without direct shell→Kubo coupling.
+
+  readStream @1 (path :Text) -> (stream :ByteStream);
+  # Read bytes from an IPFS-family path as a stream.
+  # Supports large payloads without requiring a single capnp `Data` frame.
+  # Returns a read-only `ByteStream` that yields EOF on completion.
 }
 
 struct FuelPolicy {
