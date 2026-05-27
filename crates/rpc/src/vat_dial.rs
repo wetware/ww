@@ -228,10 +228,7 @@ where
         .write_all(schema_bytes)
         .await
         .map_err(|e| map_io_error("write payload", e))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| map_io_error("flush", e))?;
+    stream.flush().await.map_err(|e| map_io_error("flush", e))?;
 
     Ok(())
 }
@@ -461,7 +458,9 @@ mod tests {
 
                 tokio::task::spawn_local(async move {
                     let mut writer = writer.compat_write();
-                    write_schema_attestation(&mut writer, &schema).await.unwrap();
+                    write_schema_attestation(&mut writer, &schema)
+                        .await
+                        .unwrap();
                 });
 
                 let mut reader = reader.compat();
@@ -484,7 +483,9 @@ mod tests {
 
                 tokio::task::spawn_local(async move {
                     let mut writer = writer.compat_write();
-                    write_schema_attestation(&mut writer, &schema).await.unwrap();
+                    write_schema_attestation(&mut writer, &schema)
+                        .await
+                        .unwrap();
                 });
 
                 let mut reader = reader.compat();

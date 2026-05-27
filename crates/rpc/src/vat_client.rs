@@ -85,14 +85,12 @@ impl system_capnp::vat_client::Server for VatClientImpl {
 
             // Verify producer-sourced schema attestation first, then start
             // Cap'n Proto RPC on the same stream.
-            let (
-                super::vat_dial::VatDial { bootstrap, driver },
-                attested_schema,
-            ) = super::vat_dial::connect_with_schema_attestation::<_, capnp::capability::Client>(
-                stream,
-                &protocol_cid,
-            )
-            .await?;
+            let (super::vat_dial::VatDial { bootstrap, driver }, attested_schema) =
+                super::vat_dial::connect_with_schema_attestation::<_, capnp::capability::Client>(
+                    stream,
+                    &protocol_cid,
+                )
+                .await?;
 
             // The driver runs detached. Cap'n Proto refcounting handles
             // shutdown: when the guest drops all capabilities obtained from
@@ -121,7 +119,10 @@ impl system_capnp::vat_client::Server for VatClientImpl {
             });
 
             let mut typed = results.get().init_typed();
-            typed.reborrow().init_cap().set_as_capability(bootstrap.hook);
+            typed
+                .reborrow()
+                .init_cap()
+                .set_as_capability(bootstrap.hook);
             let aligned = crate::graft::bytes_to_aligned_words(&attested_schema);
             let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
             let segment_array = capnp::message::SegmentArray::new(segments);
