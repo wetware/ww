@@ -2244,6 +2244,14 @@ pub fn eval_expr<'a, D: Dispatch>(
                             ..
                         } => {
                             if let Some(inner_att) = inner.downcast_ref::<AttenuatedCapInner>() {
+                                if matches!(&inner_att.base, Val::Keyword(k) if k == "self")
+                                    && !env.allows_attenuate_self()
+                                {
+                                    return Err(error::internal(
+                                        "attenuate",
+                                        ":self is only valid inside attenuate :returns",
+                                    ));
+                                }
                                 (
                                     name.clone(),
                                     schema_cid.clone(),
@@ -3200,6 +3208,7 @@ async fn perform_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    static WW_ROOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A trivial dispatcher that records calls and returns nil.
     /// Uses RefCell for interior mutability (Dispatch takes &self).
@@ -3271,6 +3280,7 @@ mod tests {
 
     #[test]
     fn resolve_guest_fs_path_honors_ww_root() {
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
         let ww_root = std::env::temp_dir().join(format!(
             "glia-ww-root-{}-{}",
             std::process::id(),
@@ -3287,6 +3297,7 @@ mod tests {
 
     #[test]
     fn resolve_guest_fs_path_defaults_to_rooted_path_without_ww_root() {
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
         std::env::remove_var("WW_ROOT");
         assert_eq!(
             resolve_guest_fs_path("lib/init/default.glia"),
@@ -6999,6 +7010,28 @@ mod tests {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
         let err = eval_str("(attenuate :self [:dial])", &mut env, &d).unwrap_err();
+        assert!(err_contains(
+            &err,
+            ":self is only valid inside attenuate :returns"
+        ));
+    }
+
+    #[test]
+    fn attenuate_self_cannot_escape_returns_scope_via_binding() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("svc".into(), make_test_cap("svc", 1));
+        eval_str(
+            "(attenuate svc
+               :allow [:network]
+               :returns (do
+                          (def leaked-self (attenuate :self [:dial]))
+                          {:network {:streamDialer leaked-self}}))",
+            &mut env,
+            &d,
+        )
+        .expect("setup attenuate should succeed");
+        let err = eval_str("(attenuate leaked-self [:dial])", &mut env, &d).unwrap_err();
         assert!(err_contains(
             &err,
             ":self is only valid inside attenuate :returns"
