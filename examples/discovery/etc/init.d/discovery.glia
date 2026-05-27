@@ -1,13 +1,6 @@
-; Discovery init.d script — evaluated by the kernel at boot.
+; Deployment-only hook.
 ;
-; Registers the Greeter vat cell. VatListener spawns a cell per
-; connection (no args = cell mode); each cell exports Greeter
-; via system::serve().
-;
-; To start the discovery service from the shell:
-;   (perform runtime :run (load "bin/discovery.wasm") "serve")
-
-(def discovery-wasm (load "bin/discovery.wasm"))
-(def discovery-schema (load "bin/discovery.capnpc"))
-
-(perform host :listen runtime discovery-wasm discovery-schema)
+; Demos are shell-forward by default.
+; Load snippets from examples/discovery/glia/ in ww shell:
+;   (load "glia/register.glia")
+;   (load "glia/serve.glia")

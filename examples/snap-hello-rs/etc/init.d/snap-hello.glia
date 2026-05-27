@@ -1,14 +1,5 @@
-;; snap-hello.glia — Farcaster Snap POC over WAGI.
+;; Deployment-only hook.
 ;;
-;; Mounts a static "Hello, @stranger" snap at /snaps/hello.
-;; Content negotiation:
-;;   GET with Accept: application/vnd.farcaster.snap+json -> snap JSON
-;;   GET with anything else                               -> HTML + Link
-;;
-;; Stateless. Fresh cell per request. No graft caps used.
-;;
-;; Spec: https://docs.farcaster.xyz/snap/spec-overview
-
-(def snap-hello (cell (load "bin/snap-hello-rs.wasm")))
-
-(perform host :listen snap-hello "/snaps/hello")
+;; Demos are shell-forward by default.
+;; Load snippets from examples/snap-hello-rs/glia/ in ww shell:
+;;   (load "glia/register.glia")

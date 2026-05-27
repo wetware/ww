@@ -26,30 +26,40 @@ make counter
 
 ## Running
 
-### Step 1: Boot the node
+### Step 1: Run a node (daemon terminal)
 
-Stack the counter layer on top of the kernel. The init.d script
-registers the counter cell with the host's `HttpListener`.
+Start a host with HTTP enabled:
 
 ```sh
-ww run std/kernel examples/counter
+ww run --port=2025 --http-listen 127.0.0.1:2080 std/kernel
 ```
 
-This drops you into the Glia shell.
+Leave this process running.
 
-### Step 2: Start the service
+### Step 2: Connect with `ww shell` (shell terminal)
 
-From the Glia shell, run the counter cell interactively:
+In a second terminal:
+
+```sh
+cd examples/counter
+ww shell
+```
+
+If multiple local nodes are running, use `ww shell --select <index|peer-id>`.
+
+### Step 3: Load the demo snippet to register the route
+
+From the Glia prompt:
 
 ```clojure
-/ > (perform runtime :run (load "bin/counter.wasm") "serve")
+/ > (load "glia/register.glia")
 ```
 
-Then test with curl:
+### Step 4: Test with curl
 
 ```sh
-curl http://localhost:8080/counter        # GET  -> "0"
-curl -X POST http://localhost:8080/counter # POST -> "1"
+curl http://127.0.0.1:2080/counter         # GET  -> "0"
+curl -X POST http://127.0.0.1:2080/counter # POST -> "1"
 ```
 
 ## How it works
@@ -129,9 +139,9 @@ than capnp cells. They target developers who want to expose a REST
 endpoint without learning Cap'n Proto. FastCGI is the simplest
 well-specified binary protocol for this job.
 
-## Init.d script
+## Demo snippet
 
-`etc/init.d/counter.glia`:
+`glia/register.glia`:
 
 ```clojure
 ; Register the counter cell as an HTTP handler at /counter.
@@ -141,10 +151,12 @@ well-specified binary protocol for this job.
 (perform host :listen counter "/counter")
 ```
 
-The script defines the counter cell, then registers it with the
-host's `HttpListener` under the path prefix `"/counter"`. Each
-incoming HTTP request spawns a fresh counter cell. The capability
-is passed explicitly -- no ambient authority.
+This snippet defines the counter cell, then registers it with the
+host's `HttpListener` under the path prefix `"/counter"`.
+
+`etc/init.d/counter.glia` is now a deployment-only hook. Keep
+init-based boot scripts for packaged images, but use snippets as the
+default demo flow.
 
 ## Tests
 
@@ -183,9 +195,11 @@ examples/counter/
 ├── README.md           # this file
 ├── bin/                # build output (gitignored)
 │   └── counter.wasm
+├── glia/
+│   └── register.glia   # shell-loaded demo registration
 ├── etc/
 │   └── init.d/
-│       └── counter.glia # cell registration
+│       └── counter.glia # deployment-only hook
 └── src/
     └── lib.rs          # guest implementation
 ```

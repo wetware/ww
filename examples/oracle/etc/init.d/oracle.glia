@@ -1,20 +1,7 @@
-;; oracle.glia — gas price feed over RPC + HTTP
+;; Deployment-only hook.
 ;;
-;; Demonstrates one binary on two transports. The cell exports
-;; PriceOracle over schema-keyed RPC (libp2p) and returns JSON
-;; over HTTP (curl-friendly).
-;;
-;; Both transports share the same binary and the same grants.
-;; All graft caps (including http-client) are auto-injected by
-;; the membrane.
-;;
-;; Shell commands (after boot):
-;;   (perform runtime :run (load "bin/oracle.wasm") "serve")   ;; DHT provide
-;;   (perform runtime :run (load "bin/oracle.wasm") "consume") ;; discover + query
-
-(def oracle
-  (cell (load "bin/oracle.wasm")
-        (load "bin/oracle.capnpc")))
-
-(perform host :listen oracle)              ;; vat RPC (schema-keyed, libp2p)
-(perform host :listen oracle "/oracle")    ;; HTTP/WAGI at /oracle
+;; Demos are shell-forward by default.
+;; Load snippets from examples/oracle/glia/ in ww shell:
+;;   (load "glia/register.glia")
+;;   (load "glia/serve.glia")
+;;   (load "glia/consume.glia")

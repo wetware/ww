@@ -32,28 +32,37 @@ cp target/wasm32-wasip2/release/echo.wasm examples/echo/bin/echo.wasm
 
 ## Running
 
-### Step 1: Boot the node
+### Step 1: Run a node (daemon terminal)
 
-Stack the echo layer on top of the kernel. The init.d script
-registers the echo cell with the host's `StreamListener`.
+Start a host:
 
 ```sh
-ww run std/kernel examples/echo
+ww run --port=2025 std/kernel
 ```
 
-This drops you into the Glia shell.
+Leave this process running.
 
-### Step 2: Start the service
+### Step 2: Connect with `ww shell` (shell terminal)
 
-From the Glia shell, run the echo cell interactively:
+In a second terminal:
+
+```sh
+cd examples/echo
+ww shell
+```
+
+If multiple local nodes are running, use `ww shell --select <index|peer-id>`.
+
+### Step 3: Load the demo snippet to register the handler
+
+From the Glia prompt:
 
 ```clojure
-/ > (perform runtime :run (load "bin/echo.wasm"))
+/ > (load "glia/register.glia")
 ```
 
-The cell reads all of stdin, writes it to stdout unchanged, then
-exits. It validates the full spawn-pipe-collect pipeline without
-any protocol-specific logic.
+This registers protocol `"echo"` with `StreamListener`. Each incoming
+stream spawns a fresh echo cell.
 
 ## How it works
 
@@ -78,9 +87,9 @@ negotiation, no RPC. It exists to validate that the host can
 spawn a WASM process, pipe bytes through it, and collect the
 output.
 
-## Init.d script
+## Demo snippet
 
-`etc/init.d/echo.glia`:
+`glia/register.glia`:
 
 ```clojure
 ; Register the echo cell as a raw stream handler.
@@ -88,12 +97,9 @@ output.
 (perform host :listen runtime "echo" (load "bin/echo.wasm"))
 ```
 
-The script uses `runtime.load()` to compile the binary, then
-registers the resulting `Executor` with the host's
-`StreamListener` under the protocol name `"echo"`. Each
-incoming stream connection spawns a fresh echo cell via
-`executor.spawn()`. The capability is passed explicitly -- no
-ambient authority.
+`etc/init.d/echo.glia` is now a deployment-only hook. Keep
+init-based boot scripts for packaged images, but use snippets as the
+default demo flow.
 
 ## Tests
 
@@ -115,9 +121,11 @@ examples/echo/
 ├── README.md           # this file
 ├── bin/                # build output (gitignored)
 │   └── echo.wasm
+├── glia/
+│   └── register.glia   # shell-loaded demo registration
 ├── etc/
 │   └── init.d/
-│       └── echo.glia   # cell registration
+│       └── echo.glia   # deployment-only hook
 └── src/
     └── lib.rs          # guest implementation
 ```

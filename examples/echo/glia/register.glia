@@ -1,0 +1,2 @@
+; Demo snippet: register raw stream echo handler.
+(perform host :listen runtime "echo" (load "bin/echo.wasm"))

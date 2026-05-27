@@ -1,12 +1,5 @@
-; counter.glia — WAGI HTTP counter cell
+; Deployment-only hook.
 ;
-; Registers the counter cell as an HTTP handler at /counter.
-; HttpListener spawns a cell per request and pipes FastCGI.
-;
-; Routes:
-;   GET  /counter -> "0"
-;   POST /counter -> "1"
-
-(def counter (cell (load "bin/counter.wasm")))
-
-(perform host :listen counter "/counter")
+; Demos are shell-forward by default.
+; Load snippets from examples/counter/glia/ in ww shell:
+;   (load "glia/register.glia")

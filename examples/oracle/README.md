@@ -38,28 +38,44 @@ explicitly via RPC at runtime -- no custom sections.
 
 ## Running
 
-### Step 1: Boot the oracle node
+### Step 1: Run the oracle node (daemon terminal)
 
-Stack the oracle layer on top of the kernel. The init.d script
-registers the oracle cell on both transports.
+Start a host with HTTP enabled:
 
 ```sh
-# Terminal 1 -- oracle provider
-ww run --http-listen 127.0.0.1:2080 --port=2025 std/kernel examples/oracle
+ww run --http-listen 127.0.0.1:2080 --port=2025 std/kernel
 ```
 
-This drops you into a Glia shell. The oracle is now serving on:
-- **RPC** (libp2p, schema-keyed) -- for peer-to-peer typed queries
-- **HTTP** at `http://localhost:2080/oracle` -- for curl/browser
+Leave this process running.
 
-### Step 2: Query via curl
+### Step 2: Connect with `ww shell` (provider shell)
+
+In a second terminal:
+
+```sh
+cd examples/oracle
+ww shell
+```
+
+If multiple local nodes are running, use `ww shell --select <index|peer-id>`.
+
+### Step 3: Load snippets to register and serve
+
+From the Glia prompt:
+
+```clojure
+/ > (load "glia/register.glia")
+/ > (load "glia/serve.glia")
+```
+
+### Step 4: Query via curl
 
 ```sh
 # All pairs
-curl http://localhost:2080/oracle
+curl http://127.0.0.1:2080/oracle
 
 # Single pair
-curl 'http://localhost:2080/oracle?pair=ETH%2Fgas'
+curl 'http://127.0.0.1:2080/oracle?pair=ETH%2Fgas'
 ```
 
 Example response:
@@ -79,28 +95,30 @@ Example response:
 }
 ```
 
-### Step 3: Start the DHT service (optional)
-
-From the Glia shell, run the oracle in service mode. This provides
-the schema CID on the DHT and re-provides periodically:
-
-```clojure
-/ > (perform runtime :run (load "bin/oracle.wasm") "serve")
-```
-
-### Step 4: Query from a consumer (optional)
+### Step 5: Query from a consumer (optional)
 
 Open a second terminal and boot a consumer node:
 
 ```sh
-# Terminal 2 -- price consumer
-WW_CONSUMER=1 ww run --port=2026 std/kernel examples/oracle
+# Terminal 3 -- consumer daemon
+ww run --port=2026 std/kernel
 ```
 
-From the consumer's Glia shell:
+From another terminal, connect to that node and run consume mode:
+
+```sh
+# Terminal 4 -- consumer shell
+cd examples/oracle
+ww shell
+```
+
+If prompted, select the host for the `--port=2026` node.
+
+Then in Glia:
 
 ```clojure
-/ > (perform runtime :run (load "bin/oracle.wasm") "consume")
+/ > (load "glia/register.glia")
+/ > (load "glia/consume.glia")
 ```
 
 The consumer discovers the oracle provider via DHT, dials it with
@@ -119,7 +137,7 @@ The consumer discovers the oracle provider via DHT, dials it with
 
 ```
 ORACLE NODE:                            CURL CLIENT:
-  init.d registers cell on              curl http://localhost:2080/oracle
+  glia/register.glia mounts cell on     curl http://localhost:2080/oracle
   two transports (vat + http)              |
                                            v
   HttpListener accepts     <---HTTP---  axum server
@@ -184,33 +202,43 @@ The cell uses the `HttpClient` capability (obtained via
 the cell can reach. Prices are cached in-process and served via
 RPC. Confidence decays toward 0.0 if data goes stale.
 
-## Init.d script
+## Demo snippets
 
-`etc/init.d/oracle.glia`:
+`glia/register.glia`:
 
 ```clojure
-;; Grant an HttpClient capability and define the cell.
+;; Define the oracle cell (HttpClient arrives via membrane graft in-cell).
 (def oracle
-  (with [(http (perform host :http-client))]
-    (cell (load "bin/oracle.wasm")
-          (load "bin/oracle.capnpc"))))
+  (cell (load "bin/oracle.wasm")
+        (load "bin/oracle.capnpc")))
 
 ;; Mount on both transports.
 (perform host :listen oracle)              ;; vat RPC
 (perform host :listen oracle "/oracle")    ;; HTTP/WAGI
 ```
 
-**`with`** creates local capability bindings (sugar over `let`).
-**`cell`** bundles wasm + schema + all capabilities from scope.
-**`(perform host :listen ...)`** registers the cell with the host:
+`glia/serve.glia`:
+
+```clojure
+(perform runtime :run (load "bin/oracle.wasm") "serve")
+```
+
+`glia/consume.glia`:
+
+```clojure
+(perform runtime :run (load "bin/oracle.wasm") "consume")
+```
+
+`(perform host :listen ...)` registers the cell with the host:
 - Cell alone → VatListener (schema-keyed RPC over libp2p)
 - Cell + path → HttpListener (WAGI at the given prefix)
 
 The same binary handles both transports. It detects HTTP mode via
 the `REQUEST_METHOD` CGI env var (injected by HttpListener).
 
-The service and consumer modes are started interactively from the
-Glia shell -- not from the init.d script.
+`etc/init.d/oracle.glia` is now a deployment-only hook. Keep
+init-based boot scripts for packaged images, but use snippets as the
+default demo flow.
 
 ## Tests
 
@@ -233,9 +261,13 @@ examples/oracle/
 ├── bin/                  # build output (gitignored)
 │   ├── oracle.wasm
 │   └── oracle.capnpc     # compiled schema bytes
+├── glia/
+│   ├── register.glia     # shell-loaded registration
+│   ├── serve.glia        # DHT provide loop
+│   └── consume.glia      # discover + query loop
 ├── etc/
 │   └── init.d/
-│       └── oracle.glia   # cell registration (dual transport)
+│       └── oracle.glia   # deployment-only hook
 └── src/
     └── lib.rs            # guest implementation
 ```

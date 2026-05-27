@@ -1,20 +1,6 @@
-;; auction.glia — fuel auction over RPC + HTTP
+;; Deployment-only hook.
 ;;
-;; Demonstrates one binary on two transports. The cell exports
-;; ComputeProvider over schema-keyed RPC (libp2p) and returns JSON
-;; over HTTP (curl-friendly).
-;;
-;; The cell needs Identity (for quote signing) and Runtime (for
-;; spawning metered child cells), which it obtains via membrane.graft()
-;; inside the cell. No extra `with` grants needed here — the membrane
-;; provides them.
-;;
-;; Shell commands (after boot):
-;;   (perform runtime :run (load "bin/auction.wasm") "serve")   ;; DHT provide loop
-
-(def auction
-  (cell (load "bin/auction.wasm")
-        (load "bin/auction.capnpc")))
-
-(perform host :listen auction)              ;; vat RPC (schema-keyed, libp2p)
-(perform host :listen auction "/auction")   ;; HTTP/WAGI at /auction
+;; Demos are shell-forward by default.
+;; Load snippets from examples/auction/glia/ in ww shell:
+;;   (load "glia/register.glia")
+;;   (load "glia/serve.glia")
