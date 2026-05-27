@@ -1,0 +1,8 @@
+(load-file "/lib/init/default.glia")
+
+{:identity identity
+ :host host
+ :runtime runtime
+ :routing routing
+ :ipfs ipfs
+ :http-client http-client}
