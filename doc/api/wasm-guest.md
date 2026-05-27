@@ -196,7 +196,7 @@ Full interface reference for the capabilities available to guests.
 | `stdout` | `() -> (stream: ByteStream)` | Readable stream from guest's stdout. |
 | `stderr` | `() -> (stream: ByteStream)` | Readable stream from guest's stderr. |
 | `wait` | `() -> (exitCode: Int32)` | Block until process exits. |
-| `bootstrap` | `(schema: Data) -> (cap: AnyPointer)` | Get the capability exported by the guest via `system::serve()`. Type-erased. `schema` is required for method-level attenuation on returned caps. |
+| `bootstrap` | `(schema: Data) -> (typed: TypedCap)` | Get the capability exported by the guest via `system::serve()` with producer-attached schema metadata. |
 
 ### ByteStream
 
@@ -222,13 +222,13 @@ Full interface reference for the capabilities available to guests.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `listen` | `(handler: VatHandler, schema: Data) -> ()` | Accept connections on `/ww/0.1.0/vat/{cid}` where cid = CIDv1(raw, BLAKE3(schema)). VatHandler is a union: `spawn` (Executor) for stateless per-connection cells, or `serve` (AnyPointer) for a persistent bootstrap capability. |
+| `listen` | `(handler: VatHandler, schema: Data) -> ()` | Accept connections on `/ww/0.1.0/vat/{cid}` where cid = CIDv1(raw, BLAKE3(schema)). VatHandler is a union: `spawn` (Executor) for stateless per-connection cells, or `serve` (TypedCap) for a persistent bootstrap capability. |
 
 ### VatClient (capability mode)
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `dial` | `(peer: Data, schema: Data) -> (cap: AnyPointer)` | Open connection to peer on `/ww/0.1.0/vat/{cid}`. Bootstrap RPC, return remote's capability. Type-erased. |
+| `dial` | `(peer: Data, schema: Data) -> (typed: TypedCap)` | Open connection to peer on `/ww/0.1.0/vat/{cid}`. Bootstrap RPC and return remote capability plus schema metadata. |
 
 ## WASM Custom Sections
 

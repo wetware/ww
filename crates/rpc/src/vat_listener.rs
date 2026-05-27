@@ -59,6 +59,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                 "schema bytes must not be empty".into(),
             ));
         }
+        let schema_bytes = pry!(super::canonicalize_schema_bytes(&schema_bytes));
 
         let protocol_cid = super::schema_cid(&schema_bytes);
         let stream_protocol = pry!(super::schema_protocol(&protocol_cid));
@@ -85,16 +86,33 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
             let mut caps_vec = Vec::new();
             if let Ok(caps_reader) = params.get_caps() {
                 for entry in caps_reader.iter() {
-                    if let (Ok(name), Ok(cap)) = (
-                        entry.get_name().map(|n| n.to_string().unwrap_or_default()),
-                        entry.get_cap().get_as_capability(),
-                    ) {
-                        let schema_bytes = match entry.get_schema() {
-                            Ok(node) => super::canonicalize_schema_node(node).unwrap_or_default(),
-                            Err(_) => Vec::new(),
-                        };
-                        caps_vec.push((name, cap, schema_bytes));
-                    }
+                    let name = match entry.get_name() {
+                        Ok(n) => match n.to_str() {
+                            Ok(s) => s.to_string(),
+                            Err(e) => {
+                                return Promise::err(capnp::Error::failed(format!(
+                                    "invalid utf8 cap name: {e}"
+                                )))
+                            }
+                        },
+                        Err(e) => return Promise::err(capnp::Error::from(e)),
+                    };
+                    let cap = match entry.get_cap().get_as_capability() {
+                        Ok(v) => v,
+                        Err(e) => return Promise::err(e),
+                    };
+                    let schema_bytes = match entry.get_schema() {
+                        Ok(node) => match super::canonicalize_schema_node(node) {
+                            Some(bytes) => bytes,
+                            None => {
+                                return Promise::err(capnp::Error::failed(
+                                    "invalid cap schema: canonicalization failed".into(),
+                                ))
+                            }
+                        },
+                        Err(_) => Vec::new(),
+                    };
+                    caps_vec.push((name, cap, schema_bytes));
                 }
             }
             caps_vec
@@ -159,7 +177,33 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                 });
             }
             system_capnp::vat_handler::Which::Serve(cap_ptr) => {
-                let bootstrap_cap: capnp::capability::Client = pry!(cap_ptr.get_as_capability());
+                let typed = pry!(cap_ptr);
+                let bootstrap_cap: capnp::capability::Client =
+                    match typed.get_cap().get_as_capability() {
+                        Ok(v) => v,
+                        Err(e) => return Promise::err(e),
+                    };
+                let served_schema = match typed.get_schema() {
+                    Ok(schema) => schema,
+                    Err(e) => return Promise::err(capnp::Error::from(e)),
+                };
+                let served_root = match served_schema.get_root() {
+                    Ok(root) => root,
+                    Err(e) => return Promise::err(capnp::Error::from(e)),
+                };
+                let served_schema_bytes = match super::canonicalize_schema_node(served_root) {
+                    Some(bytes) => bytes,
+                    None => {
+                        return Promise::err(capnp::Error::failed(
+                            "invalid serve schema: canonicalization failed".into(),
+                        ))
+                    }
+                };
+                if served_schema_bytes != schema_bytes {
+                    return Promise::err(capnp::Error::failed(
+                        "vat-listener.listen schema must match handler.serve typed schema".into(),
+                    ));
+                }
 
                 // Accept loop: for each incoming connection, bootstrap with the persistent cap.
                 let mut epoch_rx = self.guard.receiver.clone();
@@ -290,10 +334,10 @@ pub async fn handle_vat_connection_spawn(
             ));
         }
     };
-    let bootstrap_cap: capnp::capability::Client = match bootstrap_resp
-        .get()
-        .and_then(|r| r.get_cap().get_as_capability())
-    {
+    let bootstrap_cap: capnp::capability::Client = match bootstrap_resp.get().and_then(|r| {
+        let typed = r.get_typed()?;
+        typed.get_cap().get_as_capability()
+    }) {
         Ok(cap) => cap,
         Err(e) => {
             let _ = stdin.close_request().send().promise.await;

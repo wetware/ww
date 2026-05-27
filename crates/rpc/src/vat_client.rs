@@ -49,6 +49,7 @@ impl system_capnp::vat_client::Server for VatClientImpl {
         if schema_bytes.is_empty() {
             return Promise::err(capnp::Error::failed("schema must not be empty".into()));
         }
+        let schema_bytes = pry!(super::canonicalize_schema_bytes(&schema_bytes));
 
         let peer_id = pry!(PeerId::from_bytes(&peer_bytes)
             .map_err(|e| capnp::Error::failed(format!("invalid peer ID: {e}"))));
@@ -121,7 +122,17 @@ impl system_capnp::vat_client::Server for VatClientImpl {
                 }
             });
 
-            results.get().init_cap().set_as_capability(bootstrap.hook);
+            let mut typed = results.get().init_typed();
+            typed.reborrow().init_cap().set_as_capability(bootstrap.hook);
+            let aligned = crate::graft::bytes_to_aligned_words(&schema_bytes);
+            let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
+            let segment_array = capnp::message::SegmentArray::new(segments);
+            let reader =
+                capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
+            let schema_node: capnp::schema_capnp::node::Reader<'_> = reader.get_root()?;
+            let mut out_schema = typed.reborrow().init_schema();
+            out_schema.set_root(schema_node)?;
+            out_schema.init_deps(0);
 
             Ok(())
         })

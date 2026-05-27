@@ -96,6 +96,33 @@ pub fn canonicalize_schema_node(node: capnp::schema_capnp::node::Reader<'_>) -> 
     Some(segments[0].to_vec())
 }
 
+/// Canonicalize raw schema bytes expected to encode a `schema.Node`.
+///
+/// This normalizes non-canonical but equivalent encodings so downstream CID
+/// derivation and policy enforcement operate on deterministic bytes.
+pub fn canonicalize_schema_bytes(schema_bytes: &[u8]) -> Result<Vec<u8>, capnp::Error> {
+    if schema_bytes.is_empty() {
+        return Err(capnp::Error::failed(
+            "schema bytes must not be empty".into(),
+        ));
+    }
+
+    let word_count = schema_bytes.len().div_ceil(8);
+    let mut words = vec![capnp::word(0, 0, 0, 0, 0, 0, 0, 0); word_count];
+    capnp::Word::words_to_bytes_mut(&mut words)[..schema_bytes.len()].copy_from_slice(schema_bytes);
+    let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&words)];
+    let segment_array = capnp::message::SegmentArray::new(segments);
+    let reader = capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
+    let node: capnp::schema_capnp::node::Reader<'_> = reader
+        .get_root()
+        .map_err(|e| capnp::Error::failed(format!("invalid schema bytes: {e}")))?;
+    canonicalize_schema_node(node).ok_or_else(|| {
+        capnp::Error::failed(
+            "invalid schema bytes: canonicalization produced unexpected segment layout".into(),
+        )
+    })
+}
+
 /// Extract a custom section from a WASM binary (component or module).
 ///
 /// Returns the section data if found, or `None` if the section doesn't exist.
@@ -518,14 +545,14 @@ impl system_capnp::process::Server for ProcessImpl {
         params: system_capnp::process::BootstrapParams,
         mut results: system_capnp::process::BootstrapResults,
     ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
-        let schema_len = match params.get() {
+        let schema_bytes = match params.get() {
             Ok(p) => match p.get_schema() {
-                Ok(schema) => schema.len(),
+                Ok(schema) => schema.to_vec(),
                 Err(e) => return Promise::err(capnp::Error::from(e)),
             },
             Err(e) => return Promise::err(capnp::Error::from(e)),
         };
-        if schema_len == 0 {
+        if schema_bytes.is_empty() {
             return Promise::err(capnp::Error::failed(
                 "process.bootstrap schema must not be empty".into(),
             ));
@@ -538,7 +565,18 @@ impl system_capnp::process::Server for ProcessImpl {
                     "process did not export a bootstrap capability via system::serve()".into(),
                 )
             })?;
-            results.get().init_cap().set_as_capability(cap.hook);
+            let canonical_schema = canonicalize_schema_bytes(&schema_bytes)?;
+            let aligned = crate::graft::bytes_to_aligned_words(&canonical_schema);
+            let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
+            let segment_array = capnp::message::SegmentArray::new(segments);
+            let reader =
+                capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
+            let schema_node: capnp::schema_capnp::node::Reader<'_> = reader.get_root()?;
+            let mut typed = results.get().init_typed();
+            typed.reborrow().init_cap().set_as_capability(cap.hook);
+            let mut out_schema = typed.reborrow().init_schema();
+            out_schema.set_root(schema_node)?;
+            out_schema.init_deps(0);
             Ok(())
         })
     }
@@ -1075,12 +1113,12 @@ mod tests {
                 // Call bootstrap() — should return the stored cap.
                 let resp = {
                     let mut req = process.bootstrap_request();
-                    req.get().set_schema(b"test-schema");
+                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
                     req.send().promise
                 }
                 .await
                 .unwrap();
-                let cap = resp.get().unwrap().get_cap();
+                let cap = resp.get().unwrap().get_typed().unwrap().get_cap();
 
                 // Cast it back to a Host and verify it works.
                 let host2: system_capnp::host::Client = cap.get_as_capability().unwrap();
@@ -1103,14 +1141,14 @@ mod tests {
                 // Call bootstrap() without a stored cap — should error.
                 let result = {
                     let mut req = process.bootstrap_request();
-                    req.get().set_schema(b"test-schema");
+                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
                     req.send().promise
                 }
                 .await;
                 assert!(
                     result.is_err() || {
                         let resp = result.unwrap();
-                        // The error may come from get_cap() trying to read a missing cap,
+                        // The error may come from get_typed() trying to read a missing cap,
                         // or from the server returning an error in the response.
                         resp.get().is_err()
                     }
@@ -1141,12 +1179,12 @@ mod tests {
                 for _ in 0..2 {
                     let resp = {
                         let mut req = process.bootstrap_request();
-                        req.get().set_schema(b"test-schema");
+                        req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
                         req.send().promise
                     }
                     .await
                     .unwrap();
-                    let cap = resp.get().unwrap().get_cap();
+                    let cap = resp.get().unwrap().get_typed().unwrap().get_cap();
                     let host2: system_capnp::host::Client = cap.get_as_capability().unwrap();
                     let id_resp = host2.id_request().send().promise.await.unwrap();
                     let peer_id = id_resp.get().unwrap().get_peer_id().unwrap();
@@ -1191,12 +1229,12 @@ mod tests {
                 // Call bootstrap() immediately — the cap hasn't resolved yet.
                 let resp = {
                     let mut req = process.bootstrap_request();
-                    req.get().set_schema(b"test-schema");
+                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
                     req.send().promise
                 }
                 .await
                 .unwrap();
-                let cap = resp.get().unwrap().get_cap();
+                let cap = resp.get().unwrap().get_typed().unwrap().get_cap();
                 let host2: system_capnp::host::Client = cap.get_as_capability().unwrap();
 
                 // Use the cap — should block until the delayed future resolves.
@@ -1355,13 +1393,19 @@ mod tests {
                 // 3. Call Process.bootstrap() to get the cap (what handle_rpc_connection does).
                 let resp = {
                     let mut req = process.bootstrap_request();
-                    req.get().set_schema(b"test-schema");
+                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
                     req.send().promise
                 }
                 .await
                 .unwrap();
-                let bootstrap_cap: capnp::capability::Client =
-                    resp.get().unwrap().get_cap().get_as_capability().unwrap();
+                let bootstrap_cap: capnp::capability::Client = resp
+                    .get()
+                    .unwrap()
+                    .get_typed()
+                    .unwrap()
+                    .get_cap()
+                    .get_as_capability()
+                    .unwrap();
 
                 // 4. Bridge: serve it over a duplex (simulates the libp2p stream bridge).
                 let (remote_host, _bridge): (system_capnp::host::Client, _) =
@@ -1396,13 +1440,19 @@ mod tests {
 
                 let resp = {
                     let mut req = process.bootstrap_request();
-                    req.get().set_schema(b"test-schema");
+                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
                     req.send().promise
                 }
                 .await
                 .unwrap();
-                let bootstrap_cap: capnp::capability::Client =
-                    resp.get().unwrap().get_cap().get_as_capability().unwrap();
+                let bootstrap_cap: capnp::capability::Client = resp
+                    .get()
+                    .unwrap()
+                    .get_typed()
+                    .unwrap()
+                    .get_cap()
+                    .get_as_capability()
+                    .unwrap();
 
                 let (remote_host, _bridge): (system_capnp::host::Client, _) =
                     setup_bridge(bootstrap_cap);
@@ -1438,13 +1488,19 @@ mod tests {
 
                 let resp = {
                     let mut req = process.bootstrap_request();
-                    req.get().set_schema(b"test-schema");
+                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
                     req.send().promise
                 }
                 .await
                 .unwrap();
-                let bootstrap_cap: capnp::capability::Client =
-                    resp.get().unwrap().get_cap().get_as_capability().unwrap();
+                let bootstrap_cap: capnp::capability::Client = resp
+                    .get()
+                    .unwrap()
+                    .get_typed()
+                    .unwrap()
+                    .get_cap()
+                    .get_as_capability()
+                    .unwrap();
 
                 let (remote_host, _bridge): (system_capnp::host::Client, _) =
                     setup_bridge(bootstrap_cap);
@@ -1489,13 +1545,19 @@ mod tests {
 
                     let resp = {
                         let mut req = process.bootstrap_request();
-                        req.get().set_schema(b"test-schema");
+                        req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
                         req.send().promise
                     }
                     .await
                     .unwrap();
-                    let cap: capnp::capability::Client =
-                        resp.get().unwrap().get_cap().get_as_capability().unwrap();
+                    let cap: capnp::capability::Client = resp
+                        .get()
+                        .unwrap()
+                        .get_typed()
+                        .unwrap()
+                        .get_cap()
+                        .get_as_capability()
+                        .unwrap();
 
                     let (remote, _bridge): (system_capnp::host::Client, _) = setup_bridge(cap);
                     remote_hosts.push(remote);
@@ -1642,7 +1704,7 @@ mod tests {
 
                 let mut req = dialer.dial_request();
                 req.get().set_peer(&[0xFF, 0xFF, 0xFF]); // garbage peer ID
-                req.get().set_schema(b"valid schema bytes");
+                req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
 
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "invalid peer ID should error");
@@ -1676,7 +1738,7 @@ mod tests {
                     let mut handler = req.get().init_handler();
                     handler.set_spawn(executor);
                 }
-                req.get().set_schema(b"some schema");
+                req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
 
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "stale epoch should error");
@@ -1706,7 +1768,7 @@ mod tests {
 
                 let mut req = dialer.dial_request();
                 req.get().set_peer(&peer_id.to_bytes());
-                req.get().set_schema(b"some schema");
+                req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
 
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "stale epoch should error");
@@ -1734,7 +1796,7 @@ mod tests {
                 let executor = stub_executor();
 
                 // Both registrations use the same schema → same protocol CID.
-                let schema = b"some schema bytes";
+                let schema = membrane::schema_registry::HOST_SCHEMA;
 
                 // First registration should succeed.
                 let mut req1 = client1.listen_request();
@@ -1829,7 +1891,7 @@ mod tests {
                     let mut handler = req.get().init_handler();
                     handler.set_spawn(executor);
                 }
-                req.get().set_schema(b"valid schema bytes");
+                req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
 
                 let result = req.send().promise.await;
                 assert!(

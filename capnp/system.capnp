@@ -8,6 +8,17 @@
 @0xbf5147b78c0e6a2f;
 
 using MembraneSchema = import "membrane.capnp";
+using Schema = import "/capnp/schema.capnp";
+
+struct SchemaBundle {
+  root @0 :Schema.Node;
+  deps @1 :List(Schema.Node);
+}
+
+struct TypedCap {
+  cap @0 :Capability;
+  schema @1 :SchemaBundle;
+}
 
 struct PeerInfo {
   peerId @0 :Data;       # libp2p peer ID, serialized.
@@ -128,9 +139,9 @@ interface Process {
   wait @3 () -> (exitCode :Int32);
   # Block until the process exits and return its exit code.
 
-  bootstrap @4 (schema :Data) -> (cap :AnyPointer);
-  # Return the capability exported by the guest via system::serve().
-  # The cap is type-erased — cast to the expected interface on the guest side.
+  bootstrap @4 (schema :Data) -> (typed :TypedCap);
+  # Return the capability exported by the guest via system::serve() with
+  # producer-attached schema metadata required for recursive attenuation.
   # Errors if the guest didn't export a capability.
 
   kill @5 () -> ();
@@ -141,7 +152,7 @@ struct VatHandler {
   union {
     spawn @0 :Executor;
     # Stateless: spawn a fresh cell per connection.
-    serve @1 :AnyPointer;
+    serve @1 :TypedCap;
     # Stateful: bootstrap all connections with this persistent capability.
   }
 }
@@ -166,15 +177,14 @@ interface VatListener {
 }
 
 interface VatClient {
-  dial @0 (peer :Data, schema :Data) -> (cap :AnyPointer);
+  dial @0 (peer :Data, schema :Data) -> (typed :TypedCap);
   # Open a Cap'n Proto RPC connection to peer on /ww/0.1.0/vat/{cid}
   # where cid = CIDv1(raw, BLAKE3(schema)).
   # The schema is the canonical Cap'n Proto encoding of a schema.Node.
   # Bootstraps a Cap'n Proto vat over the stream and returns the remote
   # cell's bootstrap capability.
   #
-  # The returned cap is type-erased (AnyPointer) — cast it to the expected
-  # interface type on the guest side.
+  # Returns a capability plus schema metadata for recursive attenuation.
 }
 
 interface ByteStream {
