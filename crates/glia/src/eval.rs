@@ -18,13 +18,15 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::Poll;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use crate::effect::{self, HandlerStack};
 use crate::error;
 use crate::expr::FnBody;
-use crate::{make_cap, oneshot, AttenuatedCapInner, FnArity, GliaCapInner, Val, ValMap};
+use crate::{
+    make_cap, oneshot, AttenuatedCapInner, AttenuationPolicy, FnArity, GliaCapInner, Val, ValMap,
+};
 
 /// Monotonic counter for `gensym`.
 static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -46,6 +48,7 @@ static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct Env {
     frames: Vec<Frame>,
     handler_stack: HandlerStack,
+    attenuate_self_scope_depth: usize,
 }
 
 impl Default for Env {
@@ -57,12 +60,25 @@ impl Default for Env {
 
 type Frame = std::collections::HashMap<String, Val>;
 
+fn resolve_guest_fs_path(path: &str) -> String {
+    if let Ok(root) = std::env::var("WW_ROOT") {
+        let root = root.trim_end_matches('/');
+        let rel = path.strip_prefix('/').unwrap_or(path);
+        return format!("{root}/{rel}");
+    }
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    format!("/{path}")
+}
+
 impl Env {
     /// Create a new, empty environment with a single root frame.
     pub fn new() -> Self {
         Self {
             frames: vec![Frame::new()],
             handler_stack: effect::new_handler_stack(),
+            attenuate_self_scope_depth: 0,
         }
     }
 
@@ -151,6 +167,7 @@ impl Env {
             // Keep the current stack on snapshots; invocation still routes through
             // the caller's handler stack via `Env::for_call`.
             handler_stack: self.handler_stack.clone(),
+            attenuate_self_scope_depth: self.attenuate_self_scope_depth,
         }
     }
 
@@ -167,6 +184,7 @@ impl Env {
         Self {
             frames: vec![filtered],
             handler_stack: self.handler_stack.clone(),
+            attenuate_self_scope_depth: self.attenuate_self_scope_depth,
         }
     }
 
@@ -189,7 +207,22 @@ impl Env {
         Self {
             frames: vec![root, Frame::new()], // root + param frame
             handler_stack: caller_hs.clone(),
+            attenuate_self_scope_depth: 0,
         }
+    }
+
+    fn enter_attenuate_self_scope(&mut self) {
+        self.attenuate_self_scope_depth += 1;
+    }
+
+    fn exit_attenuate_self_scope(&mut self) {
+        if self.attenuate_self_scope_depth > 0 {
+            self.attenuate_self_scope_depth -= 1;
+        }
+    }
+
+    fn allows_attenuate_self(&self) -> bool {
+        self.attenuate_self_scope_depth > 0
     }
 }
 
@@ -235,6 +268,35 @@ fn cap_descriptor_bytes(name: &str, schema_cid: &str, methods: &BTreeSet<String>
     .into_bytes()
 }
 
+fn parse_policy_name(value: &Val, context: &'static str) -> Result<String, Val> {
+    match value {
+        Val::Keyword(name) | Val::Sym(name) | Val::Str(name) => Ok(name.clone()),
+        other => Err(error::type_mismatch(
+            context,
+            "keyword/symbol/string",
+            other,
+        )),
+    }
+}
+
+fn canonical_member_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut upper_next = false;
+    for ch in name.chars() {
+        if ch == '-' || ch == '_' {
+            upper_next = true;
+            continue;
+        }
+        if upper_next {
+            out.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn parse_allow_methods(value: &Val) -> Result<BTreeSet<String>, Val> {
     let items = match value {
         Val::Vector(v) | Val::List(v) => v,
@@ -249,14 +311,111 @@ fn parse_allow_methods(value: &Val) -> Result<BTreeSet<String>, Val> {
 
     let mut allow = BTreeSet::new();
     for item in items {
-        match item {
-            Val::Keyword(k) => {
-                allow.insert(k.clone());
-            }
-            other => return Err(error::type_mismatch("attenuate method", "keyword", other)),
-        }
+        let parsed = parse_policy_name(item, "attenuate method")?;
+        allow.insert(canonical_member_name(&parsed));
     }
     Ok(allow)
+}
+
+fn parse_self_return_policy(value: &Val) -> Result<AttenuationPolicy, Val> {
+    let Val::Cap { inner, .. } = value else {
+        return Err(error::type_mismatch(
+            "attenuate :returns field policy",
+            "attenuated :self capability",
+            value,
+        ));
+    };
+    let Some(att) = inner.downcast_ref::<AttenuatedCapInner>() else {
+        return Err(error::type_mismatch(
+            "attenuate :returns field policy",
+            "attenuated :self capability",
+            value,
+        ));
+    };
+    match &att.base {
+        Val::Keyword(k) if k == "self" => Ok(att.policy.clone()),
+        other => Err(error::type_mismatch(
+            "attenuate :returns field policy base",
+            ":self",
+            other,
+        )),
+    }
+}
+
+fn parse_returns_policy(
+    value: &Val,
+) -> Result<BTreeMap<String, BTreeMap<String, AttenuationPolicy>>, Val> {
+    let methods = match value {
+        Val::Map(m) => m,
+        other => return Err(error::type_mismatch("attenuate :returns", "map", other)),
+    };
+
+    let mut out = BTreeMap::new();
+    for (method_key, fields_val) in methods.iter() {
+        let method_name = canonical_member_name(&parse_policy_name(
+            method_key,
+            "attenuate :returns method key",
+        )?);
+        let fields = match fields_val {
+            Val::Map(m) => m,
+            other => {
+                return Err(error::type_mismatch(
+                    "attenuate :returns method value",
+                    "map",
+                    other,
+                ))
+            }
+        };
+        let mut parsed_fields = BTreeMap::new();
+        for (field_key, field_policy_val) in fields.iter() {
+            let field_name = canonical_member_name(&parse_policy_name(
+                field_key,
+                "attenuate :returns field key",
+            )?);
+            let field_policy = parse_self_return_policy(field_policy_val)?;
+            parsed_fields.insert(field_name, field_policy);
+        }
+        out.insert(method_name, parsed_fields);
+    }
+    Ok(out)
+}
+
+fn intersect_return_policies(
+    existing: &BTreeMap<String, BTreeMap<String, AttenuationPolicy>>,
+    incoming: &BTreeMap<String, BTreeMap<String, AttenuationPolicy>>,
+) -> BTreeMap<String, BTreeMap<String, AttenuationPolicy>> {
+    let mut out = existing.clone();
+    for (method, incoming_fields) in incoming {
+        if let Some(existing_fields) = out.get_mut(method) {
+            for (field, incoming_policy) in incoming_fields {
+                if let Some(existing_policy) = existing_fields.get_mut(field) {
+                    *existing_policy =
+                        intersect_attenuation_policy(existing_policy, incoming_policy);
+                } else {
+                    existing_fields.insert(field.clone(), incoming_policy.clone());
+                }
+            }
+        } else {
+            out.insert(method.clone(), incoming_fields.clone());
+        }
+    }
+    out
+}
+
+fn intersect_attenuation_policy(
+    existing: &AttenuationPolicy,
+    incoming: &AttenuationPolicy,
+) -> AttenuationPolicy {
+    let allow_methods = existing
+        .allow_methods
+        .intersection(&incoming.allow_methods)
+        .cloned()
+        .collect();
+    let returns = intersect_return_policies(&existing.returns, &incoming.returns);
+    AttenuationPolicy {
+        allow_methods,
+        returns,
+    }
 }
 
 fn is_authority_free(value: &Val) -> bool {
@@ -2063,20 +2222,20 @@ pub fn eval_expr<'a, D: Dispatch>(
                     return Ok(cap);
                 }
 
-                // Special form: (attenuate cap [:method ...])
+                // Special form:
+                //   (attenuate cap [:method ...])
+                //   (attenuate cap :allow [:method ...] :returns {...})
                 if head == "attenuate" {
-                    if args.len() != 2 {
-                        return Err(error::arity("attenuate", "2", args.len()));
+                    if args.len() < 2 {
+                        return Err(error::arity("attenuate", "at least 2", args.len()));
                     }
                     let cap_val = eval_expr(&args[0], env, dispatch).await?;
-                    let allow_val = eval_expr(&args[1], env, dispatch).await?;
-                    let mut allow_methods = parse_allow_methods(&allow_val)?;
 
-                    let (name, schema_cid, base, nested_allow): (
+                    let (name, schema_cid, base, existing_policy): (
                         String,
                         String,
                         Val,
-                        Option<BTreeSet<String>>,
+                        Option<AttenuationPolicy>,
                     ) = match &cap_val {
                         Val::Cap {
                             name,
@@ -2089,28 +2248,118 @@ pub fn eval_expr<'a, D: Dispatch>(
                                     name.clone(),
                                     schema_cid.clone(),
                                     inner_att.base.clone(),
-                                    Some(inner_att.allow_methods.clone()),
+                                    Some(inner_att.policy.clone()),
                                 )
                             } else {
                                 (name.clone(), schema_cid.clone(), cap_val.clone(), None)
                             }
+                        }
+                        Val::Keyword(k) if k == "self" => {
+                            if !env.allows_attenuate_self() {
+                                return Err(error::internal(
+                                    "attenuate",
+                                    ":self is only valid inside attenuate :returns",
+                                ));
+                            }
+                            (
+                                "self".into(),
+                                "glia:self:v1".into(),
+                                Val::Keyword("self".into()),
+                                None,
+                            )
                         }
                         other => {
                             return Err(error::type_mismatch("attenuate first arg", "cap", other))
                         }
                     };
 
-                    if let Some(existing) = nested_allow {
-                        allow_methods = allow_methods.intersection(&existing).cloned().collect();
-                    }
+                    let incoming_policy = if args.len() == 2 {
+                        let allow_val = eval_expr(&args[1], env, dispatch).await?;
+                        AttenuationPolicy {
+                            allow_methods: parse_allow_methods(&allow_val)?,
+                            returns: BTreeMap::new(),
+                        }
+                    } else {
+                        if (args.len() - 1) % 2 != 0 {
+                            return Err(error::internal(
+                                "attenuate",
+                                "keyword form expects :allow/:returns key-value pairs",
+                            ));
+                        }
+                        let mut allow_methods: Option<BTreeSet<String>> = None;
+                        let mut saw_returns = false;
+                        let mut returns =
+                            BTreeMap::<String, BTreeMap<String, AttenuationPolicy>>::new();
+                        for pair in args[1..].chunks(2) {
+                            let key = eval_expr(&pair[0], env, dispatch).await?;
+                            let key = match key {
+                                Val::Keyword(k) => k,
+                                other => {
+                                    return Err(error::type_mismatch(
+                                        "attenuate option key",
+                                        "keyword",
+                                        &other,
+                                    ))
+                                }
+                            };
+                            match key.as_str() {
+                                "allow" => {
+                                    if allow_methods.is_some() {
+                                        return Err(error::internal(
+                                            "attenuate",
+                                            "duplicate :allow option",
+                                        ));
+                                    }
+                                    let allow_val = eval_expr(&pair[1], env, dispatch).await?;
+                                    allow_methods = Some(parse_allow_methods(&allow_val)?);
+                                }
+                                "returns" => {
+                                    if saw_returns {
+                                        return Err(error::internal(
+                                            "attenuate",
+                                            "duplicate :returns option",
+                                        ));
+                                    }
+                                    saw_returns = true;
+                                    env.enter_attenuate_self_scope();
+                                    let returns_result = eval_expr(&pair[1], env, dispatch).await;
+                                    env.exit_attenuate_self_scope();
+                                    let returns_val = returns_result?;
+                                    returns = parse_returns_policy(&returns_val)?;
+                                }
+                                other => {
+                                    return Err(error::internal(
+                                        "attenuate",
+                                        format!(
+                                            "unknown option :{other}; expected :allow and optional :returns"
+                                        ),
+                                    ))
+                                }
+                            }
+                        }
+                        let allow_methods = allow_methods.ok_or_else(|| {
+                            error::internal("attenuate", "keyword form requires :allow option")
+                        })?;
+                        AttenuationPolicy {
+                            allow_methods,
+                            returns,
+                        }
+                    };
 
-                    let descriptor = cap_descriptor_bytes(&name, &schema_cid, &allow_methods);
+                    let policy = if let Some(existing) = existing_policy {
+                        intersect_attenuation_policy(&existing, &incoming_policy)
+                    } else {
+                        incoming_policy
+                    };
+
+                    let descriptor =
+                        cap_descriptor_bytes(&name, &schema_cid, &policy.allow_methods);
                     return Ok(make_cap(
                         name,
                         schema_cid,
                         Rc::new(AttenuatedCapInner {
                             base,
-                            allow_methods,
+                            policy,
                             descriptor,
                         }),
                     ));
@@ -2250,6 +2499,59 @@ pub fn eval_expr<'a, D: Dispatch>(
                     let body_expr = expr::analyze(&body_form)?;
                     let restricted = RestrictedDispatch;
                     return eval_expr(&body_expr, &mut isolate_env, &restricted).await;
+                }
+
+                // Special form: (eval "<form>" | "<form1> <form2> ...")
+                //
+                // Parses one or more forms from a string and evaluates them
+                // in the current environment. Returns the last result.
+                if head == "eval" {
+                    if args.len() != 1 {
+                        return Err(error::arity("eval", "1", args.len()));
+                    }
+                    let code_val = eval_expr(&args[0], env, dispatch).await?;
+                    let code = match code_val {
+                        Val::Str(s) => s,
+                        other => return Err(error::type_mismatch("eval", "string", &other)),
+                    };
+                    let forms =
+                        crate::read_many(&code).map_err(|e| error::parse(None, e.to_string()))?;
+                    let mut last = Val::Nil;
+                    for form in forms {
+                        let analyzed = expr::analyze(&form)?;
+                        last = eval_expr(&analyzed, env, dispatch).await?;
+                    }
+                    return Ok(last);
+                }
+
+                // Special form: (load-file "<path>")
+                //
+                // Reads a glia source file, parses all forms, and evaluates
+                // them in the current environment. Returns the last result.
+                if head == "load-file" {
+                    if args.len() != 1 {
+                        return Err(error::arity("load-file", "1", args.len()));
+                    }
+                    let path_val = eval_expr(&args[0], env, dispatch).await?;
+                    let path = match path_val {
+                        Val::Str(s) => s,
+                        other => {
+                            return Err(error::type_mismatch("load-file path", "string", &other))
+                        }
+                    };
+                    let resolved = resolve_guest_fs_path(&path);
+                    let bytes = std::fs::read(&resolved)
+                        .map_err(|e| error::internal("load-file", format!("{resolved}: {e}")))?;
+                    let source = std::str::from_utf8(&bytes)
+                        .map_err(|e| error::internal("load-file", format!("{resolved}: {e}")))?;
+                    let forms = crate::read_many(source)
+                        .map_err(|e| error::parse(None, format!("{resolved}: {e}")))?;
+                    let mut last = Val::Nil;
+                    for form in forms {
+                        let analyzed = expr::analyze(&form)?;
+                        last = eval_expr(&analyzed, env, dispatch).await?;
+                    }
+                    return Ok(last);
                 }
 
                 // 1. Check for macro expansion
@@ -2529,7 +2831,7 @@ async fn perform_cap_value<'a, D: Dispatch>(
 
         if let Some(attenuated) = inner.downcast_ref::<AttenuatedCapInner>() {
             let (method, _) = cap_method_and_args(&payload, "perform (attenuated cap)")?;
-            if !attenuated.allow_methods.contains(&method) {
+            if !attenuated.policy.allow_methods.contains(&method) {
                 return Err(error::permission_denied(
                     &format!("method :{method} denied by attenuation policy on '{name}'"),
                     None,
@@ -2965,6 +3267,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn resolve_guest_fs_path_honors_ww_root() {
+        let ww_root = std::env::temp_dir().join(format!(
+            "glia-ww-root-{}-{}",
+            std::process::id(),
+            GENSYM_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&ww_root).unwrap();
+        std::env::set_var("WW_ROOT", &ww_root);
+        let resolved = resolve_guest_fs_path("/lib/init/default.glia");
+        std::env::remove_var("WW_ROOT");
+        let expected = ww_root.join("lib/init/default.glia");
+        assert_eq!(resolved, expected.to_string_lossy().to_string());
+        let _ = std::fs::remove_dir_all(&ww_root);
+    }
+
+    #[test]
+    fn resolve_guest_fs_path_defaults_to_rooted_path_without_ww_root() {
+        std::env::remove_var("WW_ROOT");
+        assert_eq!(
+            resolve_guest_fs_path("lib/init/default.glia"),
+            "/lib/init/default.glia".to_string()
+        );
     }
 
     // --- Env tests ---
@@ -6638,6 +6965,101 @@ mod tests {
         );
         assert!(denied.is_err());
         assert!(err_contains(&denied.unwrap_err(), "denied"));
+    }
+
+    #[test]
+    fn attenuate_keyword_form_parses_recursive_returns() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("svc".into(), make_test_cap("svc", 1));
+        let result = eval_str(
+            "(attenuate svc
+               :allow [:network]
+               :returns {:network {:streamDialer (attenuate :self [:dial])}})",
+            &mut env,
+            &d,
+        )
+        .expect("attenuate keyword form should evaluate");
+        let Val::Cap { inner, .. } = result else {
+            panic!("expected cap");
+        };
+        let att = inner
+            .downcast_ref::<AttenuatedCapInner>()
+            .expect("expected attenuated cap");
+        assert!(att.policy.allow_methods.contains("network"));
+        let network_fields = att.policy.returns.get("network").expect("network policy");
+        let stream_dialer = network_fields
+            .get("streamDialer")
+            .expect("streamDialer return policy");
+        assert!(stream_dialer.allow_methods.contains("dial"));
+    }
+
+    #[test]
+    fn attenuate_self_rejected_outside_returns_scope() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let err = eval_str("(attenuate :self [:dial])", &mut env, &d).unwrap_err();
+        assert!(err_contains(
+            &err,
+            ":self is only valid inside attenuate :returns"
+        ));
+    }
+
+    #[test]
+    fn attenuate_recursive_intersection_does_not_widen() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("svc".into(), make_test_cap("svc", 1));
+        let result = eval_str(
+            "(let [a1 (attenuate svc
+                        :allow [:network]
+                        :returns {:network {:streamDialer (attenuate :self [:dial :close])}})
+                   a2 (attenuate a1
+                        :allow [:network :id]
+                        :returns {:network {:streamDialer (attenuate :self [:dial])
+                                            :vatClient (attenuate :self [:dial])}})]
+               a2)",
+            &mut env,
+            &d,
+        )
+        .expect("nested attenuate should evaluate");
+        let Val::Cap { inner, .. } = result else {
+            panic!("expected cap");
+        };
+        let att = inner
+            .downcast_ref::<AttenuatedCapInner>()
+            .expect("expected attenuated cap");
+        assert!(att.policy.allow_methods.contains("network"));
+        assert!(!att.policy.allow_methods.contains("id"));
+        let network_fields = att.policy.returns.get("network").expect("network policy");
+        assert!(network_fields.contains_key("streamDialer"));
+        assert!(network_fields.contains_key("vatClient"));
+        let stream_dialer = network_fields
+            .get("streamDialer")
+            .expect("streamDialer return policy");
+        assert!(stream_dialer.allow_methods.contains("dial"));
+        assert!(!stream_dialer.allow_methods.contains("close"));
+        let vat_client = network_fields
+            .get("vatClient")
+            .expect("vatClient return policy");
+        assert!(vat_client.allow_methods.contains("dial"));
+    }
+
+    #[test]
+    fn attenuate_rejects_duplicate_returns_even_when_first_empty() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("svc".into(), make_test_cap("svc", 1));
+        let err = eval_str(
+            "(attenuate svc
+               :allow [:network]
+               :returns {}
+               :returns {:network {:streamDialer (attenuate :self [:dial])}})",
+            &mut env,
+            &d,
+        )
+        .unwrap_err();
+        assert!(err_contains(&err, "duplicate :returns option"));
     }
 
     #[test]
