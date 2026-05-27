@@ -1,11 +1,14 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 
 use caps::{make_import_cap, make_import_handler};
 use glia::eval::{self, Dispatch, Env};
-use glia::{extract_method, make_cap, read, read_many, AttenuatedCapInner, GliaCapInner, Val};
+use glia::{
+    extract_method, make_cap, read, read_many, AttenuatedCapInner, AttenuationPolicy, GliaCapInner,
+    Val,
+};
 
 use std::rc::Rc;
 
@@ -61,6 +64,2003 @@ type Membrane = membrane_capnp::membrane::Client;
 /// has stored it.
 struct KernelBootstrap {
     membrane: Rc<RefCell<Option<Membrane>>>,
+    policy: Rc<RefCell<Option<ExportPolicy>>>,
+}
+
+const INIT_MEMBRANE_NOT_READY: &str = "INIT_MEMBRANE_NOT_READY";
+const INIT_POLICY_NOT_READY: &str = "INIT_POLICY_NOT_READY";
+
+#[derive(Debug, Clone, Default)]
+struct ExportPolicy {
+    caps: BTreeMap<String, ExportCapPolicy>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExportCapPolicy {
+    allow_methods: Option<BTreeSet<String>>,
+    returns: BTreeMap<String, BTreeMap<String, ExportCapPolicy>>,
+}
+
+#[derive(Copy, Clone)]
+enum MethodFilterCap {
+    Host,
+    Runtime,
+    Routing,
+    Identity,
+    Ipfs,
+    HttpClient,
+    StreamListener,
+    StreamDialer,
+    VatListener,
+    VatClient,
+    HttpListener,
+    Executor,
+    Process,
+    Signer,
+    ByteStream,
+}
+
+fn method_filter_cap(cap_name: &str) -> Option<MethodFilterCap> {
+    match cap_name {
+        "host" => Some(MethodFilterCap::Host),
+        "runtime" => Some(MethodFilterCap::Runtime),
+        "routing" => Some(MethodFilterCap::Routing),
+        "identity" => Some(MethodFilterCap::Identity),
+        "ipfs" => Some(MethodFilterCap::Ipfs),
+        "http-client" => Some(MethodFilterCap::HttpClient),
+        _ => None,
+    }
+}
+
+fn deny_method(interface: &str, method: &str) -> capnp::Error {
+    capnp::Error::failed(format!(
+        "permission denied: {interface}.{method} blocked by export policy"
+    ))
+}
+
+fn allow_method(
+    policy: &ExportCapPolicy,
+    interface: &str,
+    method: &str,
+) -> Result<(), capnp::Error> {
+    let Some(allow) = &policy.allow_methods else {
+        return Ok(());
+    };
+    if allow.contains(method) {
+        return Ok(());
+    }
+    Err(deny_method(interface, method))
+}
+
+fn return_policy<'a>(
+    policy: &'a ExportCapPolicy,
+    method: &str,
+    field: &str,
+) -> Option<&'a ExportCapPolicy> {
+    policy
+        .returns
+        .get(method)
+        .and_then(|fields| fields.get(field))
+}
+
+#[derive(Clone)]
+struct MethodFilteredHost {
+    inner: system_capnp::host::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::host::Server for MethodFilteredHost {
+    fn id(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::host::IdParams,
+        mut results: system_capnp::host::IdResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "host", "id") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        capnp::capability::Promise::from_future(async move {
+            let resp = inner.id_request().send().promise.await?;
+            results.get().set_peer_id(resp.get()?.get_peer_id()?);
+            Ok(())
+        })
+    }
+
+    fn addrs(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::host::AddrsParams,
+        mut results: system_capnp::host::AddrsResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "host", "addrs") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        capnp::capability::Promise::from_future(async move {
+            let resp = inner.addrs_request().send().promise.await?;
+            let addrs = resp.get()?.get_addrs()?;
+            let mut out = results.get().init_addrs(addrs.len());
+            for i in 0..addrs.len() {
+                out.set(i, addrs.get(i)?);
+            }
+            Ok(())
+        })
+    }
+
+    fn peers(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::host::PeersParams,
+        mut results: system_capnp::host::PeersResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "host", "peers") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        capnp::capability::Promise::from_future(async move {
+            let resp = inner.peers_request().send().promise.await?;
+            let peers = resp.get()?.get_peers()?;
+            let mut out = results.get().init_peers(peers.len());
+            for i in 0..peers.len() {
+                let src = peers.get(i);
+                let mut dst = out.reborrow().get(i);
+                dst.set_peer_id(src.get_peer_id()?);
+                let src_addrs = src.get_addrs()?;
+                let mut dst_addrs = dst.init_addrs(src_addrs.len());
+                for j in 0..src_addrs.len() {
+                    dst_addrs.set(j, src_addrs.get(j)?);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn network(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::host::NetworkParams,
+        mut results: system_capnp::host::NetworkResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "host", "network") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let policy = self.policy.clone();
+        capnp::capability::Promise::from_future(async move {
+            let resp = inner.network_request().send().promise.await?;
+            let src = resp.get()?;
+            let mut dst = results.get();
+
+            let stream_listener = src.get_stream_listener()?;
+            let stream_listener = maybe_wrap_returned_cap(
+                MethodFilterCap::StreamListener,
+                "network",
+                "streamListener",
+                stream_listener.client,
+                &policy,
+            )?;
+            let stream_listener: system_capnp::stream_listener::Client =
+                capnp::capability::FromClientHook::new(stream_listener.hook.clone());
+            dst.set_stream_listener(stream_listener);
+
+            let stream_dialer = src.get_stream_dialer()?;
+            let stream_dialer = maybe_wrap_returned_cap(
+                MethodFilterCap::StreamDialer,
+                "network",
+                "streamDialer",
+                stream_dialer.client,
+                &policy,
+            )?;
+            let stream_dialer: system_capnp::stream_dialer::Client =
+                capnp::capability::FromClientHook::new(stream_dialer.hook.clone());
+            dst.set_stream_dialer(stream_dialer);
+
+            let vat_listener = src.get_vat_listener()?;
+            let vat_listener = maybe_wrap_returned_cap(
+                MethodFilterCap::VatListener,
+                "network",
+                "vatListener",
+                vat_listener.client,
+                &policy,
+            )?;
+            let vat_listener: system_capnp::vat_listener::Client =
+                capnp::capability::FromClientHook::new(vat_listener.hook.clone());
+            dst.set_vat_listener(vat_listener);
+
+            let vat_client = src.get_vat_client()?;
+            let vat_client = maybe_wrap_returned_cap(
+                MethodFilterCap::VatClient,
+                "network",
+                "vatClient",
+                vat_client.client,
+                &policy,
+            )?;
+            let vat_client: system_capnp::vat_client::Client =
+                capnp::capability::FromClientHook::new(vat_client.hook.clone());
+            dst.set_vat_client(vat_client);
+
+            let http_listener = src.get_http_listener()?;
+            let http_listener = maybe_wrap_returned_cap(
+                MethodFilterCap::HttpListener,
+                "network",
+                "httpListener",
+                http_listener.client,
+                &policy,
+            )?;
+            let http_listener: system_capnp::http_listener::Client =
+                capnp::capability::FromClientHook::new(http_listener.hook.clone());
+            dst.set_http_listener(http_listener);
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredRuntime {
+    inner: system_capnp::runtime::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::runtime::Server for MethodFilteredRuntime {
+    fn load(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::runtime::LoadParams,
+        mut results: system_capnp::runtime::LoadResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "runtime", "load") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let policy = self.policy.clone();
+        let wasm = match params.get() {
+            Ok(p) => match p.get_wasm() {
+                Ok(w) => w.to_vec(),
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            },
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.load_request();
+            req.get().set_wasm(&wasm);
+            let resp = req.send().promise.await?;
+            let executor = resp.get()?.get_executor()?;
+            let executor = maybe_wrap_returned_cap(
+                MethodFilterCap::Executor,
+                "load",
+                "executor",
+                executor.client,
+                &policy,
+            )?;
+            let executor: system_capnp::executor::Client =
+                capnp::capability::FromClientHook::new(executor.hook.clone());
+            results.get().set_executor(executor);
+            Ok(())
+        })
+    }
+
+    fn shutdown(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::runtime::ShutdownParams,
+        _results: system_capnp::runtime::ShutdownResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "runtime", "shutdown") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        capnp::capability::Promise::from_future(async move {
+            inner.shutdown_request().send().promise.await?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredRouting {
+    inner: routing_capnp::routing::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl routing_capnp::routing::Server for MethodFilteredRouting {
+    fn provide(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::ProvideParams,
+        _results: routing_capnp::routing::ProvideResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "routing", "provide") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let key = match params.get() {
+            Ok(p) => match p.get_key() {
+                Ok(k) => match k.to_string() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return capnp::capability::Promise::err(capnp::Error::failed(e.to_string()))
+                    }
+                },
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            },
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.provide_request();
+            req.get().set_key(&key);
+            req.send().promise.await?;
+            Ok(())
+        })
+    }
+
+    fn find_providers(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::FindProvidersParams,
+        _results: routing_capnp::routing::FindProvidersResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "routing", "findProviders") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (key, count, sink) = match params.get() {
+            Ok(p) => {
+                let key = match p.get_key() {
+                    Ok(k) => match k.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let count = p.get_count();
+                let sink = match p.get_sink() {
+                    Ok(s) => s,
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                (key, count, sink)
+            }
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.find_providers_request();
+            req.get().set_key(&key);
+            req.get().set_count(count);
+            req.get().set_sink(sink);
+            req.send().promise.await?;
+            Ok(())
+        })
+    }
+
+    fn hash(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::HashParams,
+        mut results: routing_capnp::routing::HashResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "routing", "hash") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let data = match params.get() {
+            Ok(p) => match p.get_data() {
+                Ok(d) => d.to_vec(),
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            },
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.hash_request();
+            req.get().set_data(&data);
+            let resp = req.send().promise.await?;
+            let key = resp
+                .get()?
+                .get_key()?
+                .to_string()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            results.get().set_key(&key);
+            Ok(())
+        })
+    }
+
+    fn resolve(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::ResolveParams,
+        mut results: routing_capnp::routing::ResolveResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "routing", "resolve") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let name = match params.get() {
+            Ok(p) => match p.get_name() {
+                Ok(n) => match n.to_string() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return capnp::capability::Promise::err(capnp::Error::failed(e.to_string()))
+                    }
+                },
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            },
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.resolve_request();
+            req.get().set_name(&name);
+            let resp = req.send().promise.await?;
+            let path = resp
+                .get()?
+                .get_path()?
+                .to_string()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            results.get().set_path(&path);
+            Ok(())
+        })
+    }
+
+    fn mkdir(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::MkdirParams,
+        mut results: routing_capnp::routing::MkdirResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "routing", "mkdir") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (base, path, parents) = match params.get() {
+            Ok(p) => {
+                let base = match p.get_base_cid() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let path = match p.get_path() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                (base, path, p.get_parents())
+            }
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.mkdir_request();
+            req.get().set_base_cid(&base);
+            req.get().set_path(&path);
+            req.get().set_parents(parents);
+            let resp = req.send().promise.await?;
+            let root_cid = resp
+                .get()?
+                .get_root_cid()?
+                .to_string()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            results.get().set_root_cid(&root_cid);
+            Ok(())
+        })
+    }
+
+    fn write_file(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::WriteFileParams,
+        mut results: routing_capnp::routing::WriteFileResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "routing", "writeFile") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (base, path, data, create_parents) = match params.get() {
+            Ok(p) => {
+                let base = match p.get_base_cid() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let path = match p.get_path() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let data = match p.get_data() {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                (base, path, data, p.get_create_parents())
+            }
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.write_file_request();
+            req.get().set_base_cid(&base);
+            req.get().set_path(&path);
+            req.get().set_data(&data);
+            req.get().set_create_parents(create_parents);
+            let resp = req.send().promise.await?;
+            let root_cid = resp
+                .get()?
+                .get_root_cid()?
+                .to_string()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            results.get().set_root_cid(&root_cid);
+            Ok(())
+        })
+    }
+
+    fn remove(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::RemoveParams,
+        mut results: routing_capnp::routing::RemoveResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "routing", "remove") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (base, path, recursive) = match params.get() {
+            Ok(p) => {
+                let base = match p.get_base_cid() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let path = match p.get_path() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                (base, path, p.get_recursive())
+            }
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.remove_request();
+            req.get().set_base_cid(&base);
+            req.get().set_path(&path);
+            req.get().set_recursive(recursive);
+            let resp = req.send().promise.await?;
+            let root_cid = resp
+                .get()?
+                .get_root_cid()?
+                .to_string()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            results.get().set_root_cid(&root_cid);
+            Ok(())
+        })
+    }
+
+    fn publish(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::routing::PublishParams,
+        mut results: routing_capnp::routing::PublishResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "routing", "publish") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (name, cid, expected_current) = match params.get() {
+            Ok(p) => {
+                let name = match p.get_name() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let cid = match p.get_cid() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let expected_current = match p.get_expected_current() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                (name, cid, expected_current)
+            }
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.publish_request();
+            req.get().set_name(&name);
+            req.get().set_cid(&cid);
+            req.get().set_expected_current(&expected_current);
+            let resp = req.send().promise.await?;
+            let published_path = resp
+                .get()?
+                .get_published_path()?
+                .to_string()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            results.get().set_published_path(&published_path);
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredIpfs {
+    inner: system_capnp::ipfs::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::ipfs::Server for MethodFilteredIpfs {
+    fn read(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::ipfs::ReadParams,
+        mut results: system_capnp::ipfs::ReadResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "ipfs", "read") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let policy = self.policy.clone();
+        let path = match params.get() {
+            Ok(p) => match p.get_path() {
+                Ok(v) => match v.to_string() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return capnp::capability::Promise::err(capnp::Error::failed(e.to_string()))
+                    }
+                },
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            },
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.read_request();
+            req.get().set_path(&path);
+            let resp = req.send().promise.await?;
+            let stream = resp.get()?.get_stream()?;
+            let stream = maybe_wrap_returned_cap(
+                MethodFilterCap::ByteStream,
+                "read",
+                "stream",
+                stream.client,
+                &policy,
+            )?;
+            let stream: system_capnp::byte_stream::Client =
+                capnp::capability::FromClientHook::new(stream.hook.clone());
+            results.get().set_stream(stream);
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredHttpClient {
+    inner: http_capnp::http_client::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl http_capnp::http_client::Server for MethodFilteredHttpClient {
+    fn get(
+        self: capnp::capability::Rc<Self>,
+        params: http_capnp::http_client::GetParams,
+        mut results: http_capnp::http_client::GetResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "http-client", "get") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (url, headers) = match params.get() {
+            Ok(p) => {
+                let url = match p.get_url() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let headers = match p.get_headers() {
+                    Ok(v) => v,
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let mut pairs = Vec::new();
+                for i in 0..headers.len() {
+                    let h = headers.get(i);
+                    let name = match h.get_name() {
+                        Ok(v) => match v.to_string() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                return capnp::capability::Promise::err(capnp::Error::failed(
+                                    e.to_string(),
+                                ))
+                            }
+                        },
+                        Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                    };
+                    let value = match h.get_value() {
+                        Ok(v) => match v.to_string() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                return capnp::capability::Promise::err(capnp::Error::failed(
+                                    e.to_string(),
+                                ))
+                            }
+                        },
+                        Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                    };
+                    pairs.push((name, value));
+                }
+                (url, pairs)
+            }
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.get_request();
+            req.get().set_url(&url);
+            let mut out_headers = req.get().init_headers(headers.len() as u32);
+            for (i, (name, value)) in headers.iter().enumerate() {
+                let mut h = out_headers.reborrow().get(i as u32);
+                h.set_name(name);
+                h.set_value(value);
+            }
+            let resp = req.send().promise.await?;
+            let src = resp.get()?;
+            let mut dst = results.get();
+            dst.set_status(src.get_status());
+            dst.set_body(src.get_body()?);
+            let src_headers = src.get_headers()?;
+            let mut dst_headers = dst.init_headers(src_headers.len());
+            for i in 0..src_headers.len() {
+                let h = src_headers.get(i);
+                let mut o = dst_headers.reborrow().get(i);
+                o.set_name(h.get_name()?);
+                o.set_value(h.get_value()?);
+            }
+            Ok(())
+        })
+    }
+
+    fn post(
+        self: capnp::capability::Rc<Self>,
+        params: http_capnp::http_client::PostParams,
+        mut results: http_capnp::http_client::PostResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "http-client", "post") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (url, headers, body) = match params.get() {
+            Ok(p) => {
+                let url = match p.get_url() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let mut pairs = Vec::new();
+                let headers = match p.get_headers() {
+                    Ok(v) => v,
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                for i in 0..headers.len() {
+                    let h = headers.get(i);
+                    let name = match h.get_name() {
+                        Ok(v) => match v.to_string() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                return capnp::capability::Promise::err(capnp::Error::failed(
+                                    e.to_string(),
+                                ))
+                            }
+                        },
+                        Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                    };
+                    let value = match h.get_value() {
+                        Ok(v) => match v.to_string() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                return capnp::capability::Promise::err(capnp::Error::failed(
+                                    e.to_string(),
+                                ))
+                            }
+                        },
+                        Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                    };
+                    pairs.push((name, value));
+                }
+                let body = match p.get_body() {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                (url, pairs, body)
+            }
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.post_request();
+            req.get().set_url(&url);
+            req.get().set_body(&body);
+            let mut out_headers = req.get().init_headers(headers.len() as u32);
+            for (i, (name, value)) in headers.iter().enumerate() {
+                let mut h = out_headers.reborrow().get(i as u32);
+                h.set_name(name);
+                h.set_value(value);
+            }
+            let resp = req.send().promise.await?;
+            let src = resp.get()?;
+            let mut dst = results.get();
+            dst.set_status(src.get_status());
+            dst.set_body(src.get_body()?);
+            let src_headers = src.get_headers()?;
+            let mut dst_headers = dst.init_headers(src_headers.len());
+            for i in 0..src_headers.len() {
+                let h = src_headers.get(i);
+                let mut o = dst_headers.reborrow().get(i);
+                o.set_name(h.get_name()?);
+                o.set_value(h.get_value()?);
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredIdentity {
+    inner: auth_capnp::identity::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl auth_capnp::identity::Server for MethodFilteredIdentity {
+    fn signer(
+        self: capnp::capability::Rc<Self>,
+        params: auth_capnp::identity::SignerParams,
+        mut results: auth_capnp::identity::SignerResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "identity", "signer") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let policy = self.policy.clone();
+        let domain = match params.get() {
+            Ok(p) => match p.get_domain() {
+                Ok(v) => match v.to_string() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return capnp::capability::Promise::err(capnp::Error::failed(e.to_string()))
+                    }
+                },
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            },
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.signer_request();
+            req.get().set_domain(&domain);
+            let resp = req.send().promise.await?;
+            let signer = resp.get()?.get_signer()?;
+            let signer = maybe_wrap_returned_cap(
+                MethodFilterCap::Signer,
+                "signer",
+                "signer",
+                signer.client,
+                &policy,
+            )?;
+            let signer: auth_capnp::signer::Client =
+                capnp::capability::FromClientHook::new(signer.hook.clone());
+            results.get().set_signer(signer);
+            Ok(())
+        })
+    }
+
+    fn verify(
+        self: capnp::capability::Rc<Self>,
+        params: auth_capnp::identity::VerifyParams,
+        mut results: auth_capnp::identity::VerifyResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "identity", "verify") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (data, sig, pubkey) = match params.get() {
+            Ok(p) => {
+                let data = match p.get_data() {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let sig = match p.get_signature() {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let pubkey = match p.get_pubkey() {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                (data, sig, pubkey)
+            }
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.verify_request();
+            req.get().set_data(&data);
+            req.get().set_signature(&sig);
+            req.get().set_pubkey(&pubkey);
+            let resp = req.send().promise.await?;
+            results.get().set_valid(resp.get()?.get_valid());
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredStreamListener {
+    inner: system_capnp::stream_listener::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::stream_listener::Server for MethodFilteredStreamListener {
+    fn listen(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::stream_listener::ListenParams,
+        _results: system_capnp::stream_listener::ListenResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "stream-listener", "listen") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (executor, protocol) = match params.get() {
+            Ok(p) => {
+                let executor = match p.get_executor() {
+                    Ok(v) => v,
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let protocol = match p.get_protocol() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                (executor, protocol)
+            }
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.listen_request();
+            req.get().set_executor(executor);
+            req.get().set_protocol(&protocol);
+            req.send().promise.await?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredStreamDialer {
+    inner: system_capnp::stream_dialer::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::stream_dialer::Server for MethodFilteredStreamDialer {
+    fn dial(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::stream_dialer::DialParams,
+        mut results: system_capnp::stream_dialer::DialResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "stream-dialer", "dial") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (peer, protocol) = match params.get() {
+            Ok(p) => {
+                let peer = match p.get_peer() {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let protocol = match p.get_protocol() {
+                    Ok(v) => match v.to_string() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                e.to_string(),
+                            ))
+                        }
+                    },
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                (peer, protocol)
+            }
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        let policy = self.policy.clone();
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.dial_request();
+            req.get().set_peer(&peer);
+            req.get().set_protocol(&protocol);
+            let resp = req.send().promise.await?;
+            let stream = resp.get()?.get_stream()?;
+            let stream = maybe_wrap_returned_cap(
+                MethodFilterCap::ByteStream,
+                "dial",
+                "stream",
+                stream.client,
+                &policy,
+            )?;
+            let stream: system_capnp::byte_stream::Client =
+                capnp::capability::FromClientHook::new(stream.hook.clone());
+            results.get().set_stream(stream);
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredVatListener {
+    inner: system_capnp::vat_listener::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::vat_listener::Server for MethodFilteredVatListener {
+    fn listen(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::vat_listener::ListenParams,
+        _results: system_capnp::vat_listener::ListenResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "vat-listener", "listen") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let mut req = inner.listen_request();
+        {
+            let p = match params.get() {
+                Ok(v) => v,
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            };
+            let handler = match p.get_handler() {
+                Ok(v) => v,
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            };
+            let schema = match p.get_schema() {
+                Ok(v) => v,
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            };
+            let caps = match p.get_caps() {
+                Ok(v) => v,
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            };
+
+            let mut out = req.get();
+            {
+                let mut out_handler = out.reborrow().init_handler();
+                match handler.which() {
+                    Ok(system_capnp::vat_handler::WhichReader::Spawn(executor)) => {
+                        let executor = match executor {
+                            Ok(v) => v,
+                            Err(e) => return capnp::capability::Promise::err(e),
+                        };
+                        out_handler.set_spawn(executor);
+                    }
+                    Ok(system_capnp::vat_handler::WhichReader::Serve(cap)) => {
+                        let cap = match cap.get_as_capability::<capnp::capability::Client>() {
+                            Ok(v) => v,
+                            Err(e) => return capnp::capability::Promise::err(e),
+                        };
+                        out_handler.init_serve().set_as_capability(cap.hook.clone());
+                    }
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                }
+            }
+            out.reborrow().set_schema(schema);
+            let mut out_caps = out.init_caps(caps.len());
+            for i in 0..caps.len() {
+                let src = caps.get(i);
+                let mut dst = out_caps.reborrow().get(i);
+                let name = match src.get_name() {
+                    Ok(v) => v,
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                dst.set_name(name);
+                if src.has_schema() {
+                    let schema = match src.get_schema() {
+                        Ok(v) => v,
+                        Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                    };
+                    if let Err(e) = dst.set_schema(schema) {
+                        return capnp::capability::Promise::err(capnp::Error::from(e));
+                    }
+                }
+                let cap = match src
+                    .get_cap()
+                    .get_as_capability::<capnp::capability::Client>()
+                {
+                    Ok(v) => v,
+                    Err(e) => return capnp::capability::Promise::err(e),
+                };
+                dst.reborrow()
+                    .init_cap()
+                    .set_as_capability(cap.hook.clone());
+            }
+        }
+        let promise = req.send().promise;
+        capnp::capability::Promise::from_future(async move {
+            promise.await?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredVatClient {
+    inner: system_capnp::vat_client::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::vat_client::Server for MethodFilteredVatClient {
+    fn dial(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::vat_client::DialParams,
+        mut results: system_capnp::vat_client::DialResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "vat-client", "dial") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (peer, schema) = match params.get() {
+            Ok(p) => {
+                let peer = match p.get_peer() {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let schema = match p.get_schema() {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                (peer, schema)
+            }
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.dial_request();
+            req.get().set_peer(&peer);
+            req.get().set_schema(&schema);
+            let resp = req.send().promise.await?;
+            let cap = resp
+                .get()?
+                .get_cap()
+                .get_as_capability::<capnp::capability::Client>()?;
+            results.get().get_cap().set_as_capability(cap.hook.clone());
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredHttpListener {
+    inner: system_capnp::http_listener::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::http_listener::Server for MethodFilteredHttpListener {
+    fn listen(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::http_listener::ListenParams,
+        _results: system_capnp::http_listener::ListenResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "http-listener", "listen") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let mut req = inner.listen_request();
+        {
+            let p = match params.get() {
+                Ok(v) => v,
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            };
+            let executor = match p.get_executor() {
+                Ok(v) => v,
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            };
+            let prefix = match p.get_prefix() {
+                Ok(v) => v,
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            };
+            let caps = match p.get_caps() {
+                Ok(v) => v,
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            };
+
+            let mut out = req.get();
+            out.reborrow().set_executor(executor);
+            out.reborrow().set_prefix(prefix);
+            let mut out_caps = out.init_caps(caps.len());
+            for i in 0..caps.len() {
+                let src = caps.get(i);
+                let mut dst = out_caps.reborrow().get(i);
+                let name = match src.get_name() {
+                    Ok(v) => v,
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                dst.set_name(name);
+                if src.has_schema() {
+                    let schema = match src.get_schema() {
+                        Ok(v) => v,
+                        Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                    };
+                    if let Err(e) = dst.set_schema(schema) {
+                        return capnp::capability::Promise::err(capnp::Error::from(e));
+                    }
+                }
+                let cap = match src
+                    .get_cap()
+                    .get_as_capability::<capnp::capability::Client>()
+                {
+                    Ok(v) => v,
+                    Err(e) => return capnp::capability::Promise::err(e),
+                };
+                dst.reborrow()
+                    .init_cap()
+                    .set_as_capability(cap.hook.clone());
+            }
+        }
+        let promise = req.send().promise;
+        capnp::capability::Promise::from_future(async move {
+            promise.await?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredExecutor {
+    inner: system_capnp::executor::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::executor::Server for MethodFilteredExecutor {
+    fn spawn(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::executor::SpawnParams,
+        mut results: system_capnp::executor::SpawnResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "executor", "spawn") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let policy = self.policy.clone();
+        capnp::capability::Promise::from_future(async move {
+            let p = params.get()?;
+            let args = p.get_args()?;
+            let env = p.get_env()?;
+            let caps = p.get_caps()?;
+            let fuel = p.get_fuel_policy()?;
+
+            let mut req = inner.spawn_request();
+            {
+                let mut out = req.get();
+                let mut out_args = out.reborrow().init_args(args.len());
+                for i in 0..args.len() {
+                    out_args.set(i, args.get(i)?);
+                }
+                let mut out_env = out.reborrow().init_env(env.len());
+                for i in 0..env.len() {
+                    out_env.set(i, env.get(i)?);
+                }
+                let mut out_caps = out.reborrow().init_caps(caps.len());
+                for i in 0..caps.len() {
+                    let src = caps.get(i);
+                    let mut dst = out_caps.reborrow().get(i);
+                    dst.set_name(src.get_name()?);
+                    if src.has_schema() {
+                        dst.set_schema(src.get_schema()?)?;
+                    }
+                    let cap = src
+                        .get_cap()
+                        .get_as_capability::<capnp::capability::Client>()?;
+                    dst.reborrow()
+                        .init_cap()
+                        .set_as_capability(cap.hook.clone());
+                }
+                let mut out_fuel = out.init_fuel_policy();
+                match fuel.which()? {
+                    system_capnp::fuel_policy::Which::Scheduled(()) => out_fuel.set_scheduled(()),
+                    system_capnp::fuel_policy::Which::Oneshot(src) => {
+                        let src = src?;
+                        let mut dst = out_fuel.init_oneshot();
+                        dst.set_total_budget(src.get_total_budget());
+                        dst.set_max_per_epoch(src.get_max_per_epoch());
+                        dst.set_min_per_epoch(src.get_min_per_epoch());
+                    }
+                }
+            }
+            let resp = req.send().promise.await?;
+            let process = resp.get()?.get_process()?;
+            let process = maybe_wrap_returned_cap(
+                MethodFilterCap::Process,
+                "spawn",
+                "process",
+                process.client,
+                &policy,
+            )?;
+            let process: system_capnp::process::Client =
+                capnp::capability::FromClientHook::new(process.hook.clone());
+            results.get().set_process(process);
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredProcess {
+    inner: system_capnp::process::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::process::Server for MethodFilteredProcess {
+    fn stdin(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::process::StdinParams,
+        mut results: system_capnp::process::StdinResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "process", "stdin") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let policy = self.policy.clone();
+        capnp::capability::Promise::from_future(async move {
+            let resp = inner.stdin_request().send().promise.await?;
+            let stream = resp.get()?.get_stream()?;
+            let stream = maybe_wrap_returned_cap(
+                MethodFilterCap::ByteStream,
+                "stdin",
+                "stream",
+                stream.client,
+                &policy,
+            )?;
+            let stream: system_capnp::byte_stream::Client =
+                capnp::capability::FromClientHook::new(stream.hook.clone());
+            results.get().set_stream(stream);
+            Ok(())
+        })
+    }
+
+    fn stdout(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::process::StdoutParams,
+        mut results: system_capnp::process::StdoutResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "process", "stdout") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let policy = self.policy.clone();
+        capnp::capability::Promise::from_future(async move {
+            let resp = inner.stdout_request().send().promise.await?;
+            let stream = resp.get()?.get_stream()?;
+            let stream = maybe_wrap_returned_cap(
+                MethodFilterCap::ByteStream,
+                "stdout",
+                "stream",
+                stream.client,
+                &policy,
+            )?;
+            let stream: system_capnp::byte_stream::Client =
+                capnp::capability::FromClientHook::new(stream.hook.clone());
+            results.get().set_stream(stream);
+            Ok(())
+        })
+    }
+
+    fn stderr(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::process::StderrParams,
+        mut results: system_capnp::process::StderrResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "process", "stderr") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let policy = self.policy.clone();
+        capnp::capability::Promise::from_future(async move {
+            let resp = inner.stderr_request().send().promise.await?;
+            let stream = resp.get()?.get_stream()?;
+            let stream = maybe_wrap_returned_cap(
+                MethodFilterCap::ByteStream,
+                "stderr",
+                "stream",
+                stream.client,
+                &policy,
+            )?;
+            let stream: system_capnp::byte_stream::Client =
+                capnp::capability::FromClientHook::new(stream.hook.clone());
+            results.get().set_stream(stream);
+            Ok(())
+        })
+    }
+
+    fn wait(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::process::WaitParams,
+        mut results: system_capnp::process::WaitResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "process", "wait") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        capnp::capability::Promise::from_future(async move {
+            let resp = inner.wait_request().send().promise.await?;
+            results.get().set_exit_code(resp.get()?.get_exit_code());
+            Ok(())
+        })
+    }
+
+    fn bootstrap(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::process::BootstrapParams,
+        mut results: system_capnp::process::BootstrapResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "process", "bootstrap") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        capnp::capability::Promise::from_future(async move {
+            let resp = inner.bootstrap_request().send().promise.await?;
+            let cap = resp
+                .get()?
+                .get_cap()
+                .get_as_capability::<capnp::capability::Client>()?;
+            results.get().get_cap().set_as_capability(cap.hook.clone());
+            Ok(())
+        })
+    }
+
+    fn kill(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::process::KillParams,
+        _results: system_capnp::process::KillResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "process", "kill") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        capnp::capability::Promise::from_future(async move {
+            inner.kill_request().send().promise.await?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredSigner {
+    inner: auth_capnp::signer::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl auth_capnp::signer::Server for MethodFilteredSigner {
+    fn sign(
+        self: capnp::capability::Rc<Self>,
+        params: auth_capnp::signer::SignParams,
+        mut results: auth_capnp::signer::SignResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "signer", "sign") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let (nonce, epoch_seq) = match params.get() {
+            Ok(p) => (p.get_nonce(), p.get_epoch_seq()),
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.sign_request();
+            req.get().set_nonce(nonce);
+            req.get().set_epoch_seq(epoch_seq);
+            let resp = req.send().promise.await?;
+            results.get().set_sig(resp.get()?.get_sig()?);
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MethodFilteredByteStream {
+    inner: system_capnp::byte_stream::Client,
+    policy: ExportCapPolicy,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::byte_stream::Server for MethodFilteredByteStream {
+    fn read(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::byte_stream::ReadParams,
+        mut results: system_capnp::byte_stream::ReadResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "byte-stream", "read") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let max_bytes = match params.get() {
+            Ok(p) => p.get_max_bytes(),
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.read_request();
+            req.get().set_max_bytes(max_bytes);
+            let resp = req.send().promise.await?;
+            results.get().set_data(resp.get()?.get_data()?);
+            Ok(())
+        })
+    }
+
+    fn write(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::byte_stream::WriteParams,
+        _results: system_capnp::byte_stream::WriteResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "byte-stream", "write") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        let data = match params.get() {
+            Ok(p) => match p.get_data() {
+                Ok(v) => v.to_vec(),
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            },
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
+        capnp::capability::Promise::from_future(async move {
+            let mut req = inner.write_request();
+            req.get().set_data(&data);
+            req.send().promise.await?;
+            Ok(())
+        })
+    }
+
+    fn close(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::byte_stream::CloseParams,
+        _results: system_capnp::byte_stream::CloseResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Err(e) = allow_method(&self.policy, "byte-stream", "close") {
+            return capnp::capability::Promise::err(e);
+        }
+        let inner = self.inner.clone();
+        capnp::capability::Promise::from_future(async move {
+            inner.close_request().send().promise.await?;
+            Ok(())
+        })
+    }
+}
+
+fn parse_policy_cap_name(v: &Val) -> Result<String, capnp::Error> {
+    match v {
+        Val::Str(s) | Val::Sym(s) | Val::Keyword(s) => Ok(s.clone()),
+        other => Err(capnp::Error::failed(format!(
+            "export policy: expected cap name string/symbol/keyword, got {other}"
+        ))),
+    }
+}
+
+fn convert_att_policy(policy: &AttenuationPolicy) -> ExportCapPolicy {
+    let mut returns = BTreeMap::new();
+    for (method, fields) in &policy.returns {
+        let mut mapped_fields = BTreeMap::new();
+        for (field, nested) in fields {
+            mapped_fields.insert(field.clone(), convert_att_policy(nested));
+        }
+        returns.insert(method.clone(), mapped_fields);
+    }
+    ExportCapPolicy {
+        allow_methods: Some(policy.allow_methods.clone()),
+        returns,
+    }
+}
+
+fn parse_export_cap_value(cap_name: &str, value: &Val) -> Result<ExportCapPolicy, capnp::Error> {
+    let Val::Cap { name, inner, .. } = value else {
+        return Err(capnp::Error::failed(format!(
+            "init.glia export '{cap_name}' must map to a capability value, got {value}"
+        )));
+    };
+
+    if let Some(att) = inner.downcast_ref::<AttenuatedCapInner>() {
+        let base_name = match &att.base {
+            Val::Cap { name, .. } => name.as_str(),
+            Val::Keyword(k) if k == "self" => {
+                return Err(capnp::Error::failed(format!(
+                    "init.glia export '{cap_name}' cannot use :self as top-level base"
+                )))
+            }
+            other => {
+                return Err(capnp::Error::failed(format!(
+                    "init.glia export '{cap_name}' attenuation base must be a cap, got {other}"
+                )))
+            }
+        };
+        if base_name != cap_name {
+            return Err(capnp::Error::failed(format!(
+                "init.glia export key '{cap_name}' must attenuate the '{cap_name}' cap, got base '{base_name}'"
+            )));
+        }
+        return Ok(convert_att_policy(&att.policy));
+    }
+
+    if name != cap_name {
+        return Err(capnp::Error::failed(format!(
+            "init.glia export key '{cap_name}' must map to cap '{cap_name}', got '{name}'"
+        )));
+    }
+
+    Ok(ExportCapPolicy::default())
+}
+
+fn is_supported_method(kind: MethodFilterCap, method: &str) -> bool {
+    match kind {
+        MethodFilterCap::Host => matches!(method, "id" | "addrs" | "peers" | "network"),
+        MethodFilterCap::Runtime => matches!(method, "load" | "shutdown"),
+        MethodFilterCap::Routing => matches!(
+            method,
+            "provide"
+                | "findProviders"
+                | "hash"
+                | "resolve"
+                | "mkdir"
+                | "writeFile"
+                | "remove"
+                | "publish"
+        ),
+        MethodFilterCap::Identity => matches!(method, "signer" | "verify"),
+        MethodFilterCap::Ipfs => method == "read",
+        MethodFilterCap::HttpClient => matches!(method, "get" | "post"),
+        MethodFilterCap::StreamListener => method == "listen",
+        MethodFilterCap::StreamDialer => method == "dial",
+        MethodFilterCap::VatListener => method == "listen",
+        MethodFilterCap::VatClient => method == "dial",
+        MethodFilterCap::HttpListener => method == "listen",
+        MethodFilterCap::Executor => method == "spawn",
+        MethodFilterCap::Process => {
+            matches!(
+                method,
+                "stdin" | "stdout" | "stderr" | "wait" | "bootstrap" | "kill"
+            )
+        }
+        MethodFilterCap::Signer => method == "sign",
+        MethodFilterCap::ByteStream => matches!(method, "read" | "write" | "close"),
+    }
+}
+
+fn return_field_cap_kind(
+    kind: MethodFilterCap,
+    method: &str,
+    field: &str,
+) -> Option<MethodFilterCap> {
+    match (kind, method, field) {
+        (MethodFilterCap::Host, "network", "streamListener") => {
+            Some(MethodFilterCap::StreamListener)
+        }
+        (MethodFilterCap::Host, "network", "streamDialer") => Some(MethodFilterCap::StreamDialer),
+        (MethodFilterCap::Host, "network", "vatListener") => Some(MethodFilterCap::VatListener),
+        (MethodFilterCap::Host, "network", "vatClient") => Some(MethodFilterCap::VatClient),
+        (MethodFilterCap::Host, "network", "httpListener") => Some(MethodFilterCap::HttpListener),
+        (MethodFilterCap::Runtime, "load", "executor") => Some(MethodFilterCap::Executor),
+        (MethodFilterCap::Identity, "signer", "signer") => Some(MethodFilterCap::Signer),
+        (MethodFilterCap::Ipfs, "read", "stream") => Some(MethodFilterCap::ByteStream),
+        (MethodFilterCap::StreamDialer, "dial", "stream") => Some(MethodFilterCap::ByteStream),
+        (MethodFilterCap::Executor, "spawn", "process") => Some(MethodFilterCap::Process),
+        (MethodFilterCap::Process, "stdin", "stream") => Some(MethodFilterCap::ByteStream),
+        (MethodFilterCap::Process, "stdout", "stream") => Some(MethodFilterCap::ByteStream),
+        (MethodFilterCap::Process, "stderr", "stream") => Some(MethodFilterCap::ByteStream),
+        _ => None,
+    }
+}
+
+fn method_supports_cap_returns(kind: MethodFilterCap, method: &str) -> bool {
+    matches!(
+        (kind, method),
+        (MethodFilterCap::Host, "network")
+            | (MethodFilterCap::Runtime, "load")
+            | (MethodFilterCap::Identity, "signer")
+            | (MethodFilterCap::Ipfs, "read")
+            | (MethodFilterCap::StreamDialer, "dial")
+            | (MethodFilterCap::Executor, "spawn")
+            | (MethodFilterCap::Process, "stdin" | "stdout" | "stderr")
+    )
+}
+
+fn validate_cap_policy(
+    cap_name: &str,
+    kind: MethodFilterCap,
+    policy: &ExportCapPolicy,
+) -> Result<(), capnp::Error> {
+    if let Some(allow) = &policy.allow_methods {
+        for method in allow {
+            if !is_supported_method(kind, method) {
+                return Err(capnp::Error::failed(format!(
+                    "init.glia export '{cap_name}' references unknown method '{method}'"
+                )));
+            }
+        }
+    }
+
+    for (method, fields) in &policy.returns {
+        if !is_supported_method(kind, method) {
+            return Err(capnp::Error::failed(format!(
+                "init.glia export '{cap_name}' :returns references unknown method '{method}'"
+            )));
+        }
+        if let Some(allow) = &policy.allow_methods {
+            if !allow.contains(method) {
+                return Err(capnp::Error::failed(format!(
+                    "init.glia export '{cap_name}' :returns method '{method}' must also be allowed by :allow"
+                )));
+            }
+        }
+        if !method_supports_cap_returns(kind, method) {
+            return Err(capnp::Error::failed(format!(
+                "init.glia export '{cap_name}' method '{method}' does not return capability fields"
+            )));
+        }
+        for (field, nested) in fields {
+            let Some(child_kind) = return_field_cap_kind(kind, method, field) else {
+                return Err(capnp::Error::failed(format!(
+                    "init.glia export '{cap_name}' method '{method}' references unknown return field '{field}'"
+                )));
+            };
+            validate_cap_policy(&format!("{cap_name}.{method}.{field}"), child_kind, nested)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_export_policy(v: &Val) -> Result<ExportPolicy, capnp::Error> {
+    let root = match v {
+        Val::Map(m) => m,
+        other => {
+            return Err(capnp::Error::failed(format!(
+                "init.glia must return a map, got {other}"
+            )))
+        }
+    };
+
+    if root.get(&Val::Keyword("export".into())).is_some() {
+        return Err(capnp::Error::failed(
+            "init.glia legacy {:export {:caps ... :methods ...}} policy is no longer supported; return a bare export map {:host host-cap ...}".into(),
+        ));
+    }
+
+    let mut caps = BTreeMap::new();
+    for (k, v) in root.iter() {
+        let cap_name = parse_policy_cap_name(k)?;
+        let Some(kind) = method_filter_cap(&cap_name) else {
+            return Err(capnp::Error::failed(format!(
+                "init.glia export references unknown cap '{cap_name}'"
+            )));
+        };
+        let cap_policy = parse_export_cap_value(&cap_name, v)?;
+        validate_cap_policy(&cap_name, kind, &cap_policy)?;
+        caps.insert(cap_name, cap_policy);
+    }
+
+    Ok(ExportPolicy { caps })
+}
+
+fn maybe_wrap_export_cap(
+    kind: MethodFilterCap,
+    base: capnp::capability::Client,
+    policy: &ExportCapPolicy,
+) -> Result<capnp::capability::Client, capnp::Error> {
+    if policy.allow_methods.is_none() && policy.returns.is_empty() {
+        return Ok(base);
+    }
+
+    match kind {
+        MethodFilterCap::Host => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: system_capnp::host::Client = capnp_rpc::new_client(MethodFilteredHost {
+                inner: typed,
+                policy: policy.clone(),
+            });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::Runtime => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: system_capnp::runtime::Client =
+                capnp_rpc::new_client(MethodFilteredRuntime {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::Routing => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: routing_capnp::routing::Client =
+                capnp_rpc::new_client(MethodFilteredRouting {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::Identity => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: auth_capnp::identity::Client =
+                capnp_rpc::new_client(MethodFilteredIdentity {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::Ipfs => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: system_capnp::ipfs::Client = capnp_rpc::new_client(MethodFilteredIpfs {
+                inner: typed,
+                policy: policy.clone(),
+            });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::HttpClient => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: http_capnp::http_client::Client =
+                capnp_rpc::new_client(MethodFilteredHttpClient {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::StreamListener => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: system_capnp::stream_listener::Client =
+                capnp_rpc::new_client(MethodFilteredStreamListener {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::StreamDialer => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: system_capnp::stream_dialer::Client =
+                capnp_rpc::new_client(MethodFilteredStreamDialer {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::VatListener => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: system_capnp::vat_listener::Client =
+                capnp_rpc::new_client(MethodFilteredVatListener {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::VatClient => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: system_capnp::vat_client::Client =
+                capnp_rpc::new_client(MethodFilteredVatClient {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::HttpListener => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: system_capnp::http_listener::Client =
+                capnp_rpc::new_client(MethodFilteredHttpListener {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::Executor => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: system_capnp::executor::Client =
+                capnp_rpc::new_client(MethodFilteredExecutor {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::Process => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: system_capnp::process::Client =
+                capnp_rpc::new_client(MethodFilteredProcess {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::Signer => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: auth_capnp::signer::Client = capnp_rpc::new_client(MethodFilteredSigner {
+                inner: typed,
+                policy: policy.clone(),
+            });
+            Ok(wrapped.client)
+        }
+        MethodFilterCap::ByteStream => {
+            let typed = capnp::capability::FromClientHook::new(base.hook.clone());
+            let wrapped: system_capnp::byte_stream::Client =
+                capnp_rpc::new_client(MethodFilteredByteStream {
+                    inner: typed,
+                    policy: policy.clone(),
+                });
+            Ok(wrapped.client)
+        }
+    }
+}
+
+fn maybe_wrap_returned_cap(
+    kind: MethodFilterCap,
+    method: &str,
+    field: &str,
+    base: capnp::capability::Client,
+    policy: &ExportCapPolicy,
+) -> Result<capnp::capability::Client, capnp::Error> {
+    let Some(child_policy) = return_policy(policy, method, field) else {
+        return Ok(base);
+    };
+    maybe_wrap_export_cap(kind, base, child_policy)
 }
 
 #[allow(refining_impl_trait)]
@@ -73,32 +2073,84 @@ impl membrane_capnp::membrane::Server for KernelBootstrap {
         let membrane = match self.membrane.borrow().clone() {
             Some(m) => m,
             None => {
-                return capnp::capability::Promise::err(capnp::Error::failed(
-                    "kernel bootstrap membrane not ready".into(),
-                ))
+                return capnp::capability::Promise::err(capnp::Error::failed(format!(
+                    "{INIT_MEMBRANE_NOT_READY}: kernel bootstrap membrane not ready"
+                )))
+            }
+        };
+        let policy = match self.policy.borrow().clone() {
+            Some(p) => p,
+            None => {
+                return capnp::capability::Promise::err(capnp::Error::failed(format!(
+                    "{INIT_POLICY_NOT_READY}: kernel export policy not ready"
+                )))
             }
         };
 
         capnp::capability::Promise::from_future(async move {
             let resp = membrane.graft_request().send().promise.await?;
             let src_caps = resp.get()?.get_caps()?;
-            let mut dst_caps = results.get().init_caps(src_caps.len());
+            let mut export_count = 0u32;
+            let mut available_caps = BTreeSet::new();
 
             for i in 0..src_caps.len() {
                 let src = src_caps.get(i);
-                let mut dst = dst_caps.reborrow().get(i);
-                dst.set_name(src.get_name()?);
+                let cap_name = src
+                    .get_name()?
+                    .to_str()
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?
+                    .to_string();
+                available_caps.insert(cap_name.clone());
+                if !policy.caps.contains_key(&cap_name) {
+                    continue;
+                }
+                export_count += 1;
+            }
+
+            let unknown_caps: Vec<String> = policy
+                .caps
+                .keys()
+                .filter(|name| !available_caps.contains(*name))
+                .cloned()
+                .collect();
+            if !unknown_caps.is_empty() {
+                return Err(capnp::Error::failed(format!(
+                    "export policy references unknown cap(s): {}",
+                    unknown_caps.join(", ")
+                )));
+            }
+
+            let mut dst_caps = results.get().init_caps(export_count);
+            let mut dst_i = 0u32;
+            for i in 0..src_caps.len() {
+                let src = src_caps.get(i);
+                let cap_name = src
+                    .get_name()?
+                    .to_str()
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?
+                    .to_string();
+                let Some(cap_policy) = policy.caps.get(&cap_name) else {
+                    continue;
+                };
+                let base = src
+                    .get_cap()
+                    .get_as_capability::<capnp::capability::Client>()?;
+                let kind = method_filter_cap(&cap_name).ok_or_else(|| {
+                    capnp::Error::failed(format!(
+                        "export policy method filter unsupported at runtime for cap '{cap_name}'"
+                    ))
+                })?;
+                let client = maybe_wrap_export_cap(kind, base, cap_policy)?;
+
+                let mut dst = dst_caps.reborrow().get(dst_i);
+                dst.set_name(&cap_name);
                 dst.reborrow()
                     .init_cap()
-                    .set_as_capability(
-                        src.get_cap()
-                            .get_as_capability::<capnp::capability::Client>()?
-                            .hook
-                            .clone(),
-                    );
+                    .set_as_capability(client.hook.clone());
                 if src.has_schema() {
                     dst.set_schema(src.get_schema()?)?;
                 }
+                dst_i += 1;
             }
 
             Ok(())
@@ -164,7 +2216,6 @@ struct Session {
     cwd: String,
 }
 
-
 // ---------------------------------------------------------------------------
 // Cap extraction — get type-erased capnp Client from Val::Cap.inner
 // ---------------------------------------------------------------------------
@@ -207,6 +2258,15 @@ type HandlerFn = for<'a> fn(
 fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
     let mut t: HashMap<&'static str, HandlerFn> = HashMap::new();
     t.insert("load", |a, _| Box::pin(std::future::ready(eval_load(a))));
+    t.insert("list-dir", |a, _| {
+        Box::pin(std::future::ready(eval_list_dir(a)))
+    });
+    t.insert("path-is-dir", |a, _| {
+        Box::pin(std::future::ready(eval_path_is_dir(a)))
+    });
+    t.insert("sort-strings", |a, _| {
+        Box::pin(std::future::ready(eval_sort_strings(a)))
+    });
     t.insert("cd", |a, c| Box::pin(std::future::ready(eval_cd(a, c))));
     t.insert("help", |_, _| {
         Box::pin(std::future::ready(Ok(Val::Str(HELP_TEXT.to_string()))))
@@ -269,6 +2329,63 @@ fn eval_cd(args: &[Val], ctx: &RefCell<Session>) -> Result<Val, Val> {
     };
     ctx.borrow_mut().cwd = path;
     Ok(Val::Nil)
+}
+
+fn eval_list_dir(args: &[Val]) -> Result<Val, Val> {
+    let path = match args.first() {
+        Some(Val::Str(s)) => s.clone(),
+        _ => return Err("(list-dir \"<path>\")".into()),
+    };
+    let resolved = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+    let entries = std::fs::read_dir(&resolved)
+        .map_err(|e| Val::from(format!("list-dir: {resolved}: {e}")))?;
+
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| Val::from(format!("list-dir: {resolved}: {e}")))?;
+        let metadata = std::fs::metadata(entry.path())
+            .map_err(|e| Val::from(format!("list-dir: {resolved}: {e}")))?;
+        if metadata.is_file() {
+            if let Some(name) = entry.file_name().to_str() {
+                out.push(Val::Str(name.to_string()));
+            }
+        }
+    }
+    Ok(Val::List(out))
+}
+
+fn eval_path_is_dir(args: &[Val]) -> Result<Val, Val> {
+    let path = match args.first() {
+        Some(Val::Str(s)) => s.clone(),
+        _ => return Err("(path-is-dir \"<path>\")".into()),
+    };
+    let resolved = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+    Ok(Val::Bool(std::path::Path::new(&resolved).is_dir()))
+}
+
+fn eval_sort_strings(args: &[Val]) -> Result<Val, Val> {
+    let items: &[Val] = match args.first() {
+        Some(Val::List(v)) | Some(Val::Vector(v)) => v.as_slice(),
+        _ => return Err("(sort-strings <list-or-vector-of-strings>)".into()),
+    };
+
+    let mut strings: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Val::Str(s) => strings.push(s.clone()),
+            _ => return Err(Val::from("sort-strings: all elements must be strings")),
+        }
+    }
+    strings.sort();
+    Ok(Val::List(strings.into_iter().map(Val::Str).collect()))
 }
 
 // ---------------------------------------------------------------------------
@@ -697,9 +2814,11 @@ fn make_host_handler(
                                 schema_ids::HTTP_CLIENT_CID.to_string(),
                                 Rc::new(c.clone()),
                             ),
-                            None => return Err(Val::from(
-                                "http-client not available (node started without --http-dial)",
-                            )),
+                            None => {
+                                return Err(Val::from(
+                                    "http-client not available (node started without --http-dial)",
+                                ))
+                            }
                         }
                     }
                     _ => return Err(Val::from(format!("host: unknown method :{method}"))),
@@ -1111,41 +3230,20 @@ Capabilities (via perform):
 
 Effects:
   (perform :load \"<path>\")                   Load bytes from virtual filesystem
+  (perform :list-dir \"<path>\")               List directory entries
+  (perform :path-is-dir \"<path>\")            True if path exists and is a directory
+  (perform :sort-strings <list>)               Sort strings lexicographically
 
 Built-ins:
   (load \"<path>\")                Load bytes (dispatch form)
+  (list-dir \"<path>\")            List directory entries
+  (path-is-dir \"<path>\")         True if path exists and is a directory
+  (sort-strings <list>)            Sort strings lexicographically
   (cd \"<path>\")                  Change working directory
   (help)                         This message
   (exit)                         Quit
 
 Unrecognized commands are looked up in PATH (default /bin).";
-
-// ---------------------------------------------------------------------------
-// Init.d — evaluate scripts from $WW_ROOT/etc/init.d/*.glia
-// ---------------------------------------------------------------------------
-
-/// Parse an init.d script from raw bytes. Returns `None` on error (logs details).
-/// Extracted from `run_initd` for testability — the caller uses `None` to skip
-/// the failed script and continue (SysV best-effort model).
-fn parse_initd_script(name: &str, data: &[u8]) -> Option<Vec<Val>> {
-    let content = match std::str::from_utf8(data) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("init.d: {name}: not valid UTF-8: {e}");
-            return None;
-        }
-    };
-    match read_many(content) {
-        Ok(forms) => {
-            log::info!("init.d: parsed {name} ({} form(s))", forms.len());
-            Some(forms)
-        }
-        Err(e) => {
-            log::error!("init.d: {name}: parse error: {e}");
-            None
-        }
-    }
-}
 
 /// Wrap a form in cap handlers + keyword effect handlers.
 ///
@@ -1176,9 +3274,57 @@ fn wrap_with_handlers(form: &Val) -> Val {
         form.clone(),
     ]);
 
+    let with_list_dir = Val::List(vec![
+        Val::Sym("with-effect-handler".into()),
+        Val::Keyword("list-dir".into()),
+        Val::List(vec![
+            Val::Sym("fn".into()),
+            Val::Vector(vec![Val::Sym("path".into()), Val::Sym("resume".into())]),
+            Val::List(vec![
+                Val::Sym("resume".into()),
+                Val::List(vec![Val::Sym("list-dir".into()), Val::Sym("path".into())]),
+            ]),
+        ]),
+        with_load,
+    ]);
+
+    let with_path_is_dir = Val::List(vec![
+        Val::Sym("with-effect-handler".into()),
+        Val::Keyword("path-is-dir".into()),
+        Val::List(vec![
+            Val::Sym("fn".into()),
+            Val::Vector(vec![Val::Sym("path".into()), Val::Sym("resume".into())]),
+            Val::List(vec![
+                Val::Sym("resume".into()),
+                Val::List(vec![
+                    Val::Sym("path-is-dir".into()),
+                    Val::Sym("path".into()),
+                ]),
+            ]),
+        ]),
+        with_list_dir,
+    ]);
+
+    let with_sort_strings = Val::List(vec![
+        Val::Sym("with-effect-handler".into()),
+        Val::Keyword("sort-strings".into()),
+        Val::List(vec![
+            Val::Sym("fn".into()),
+            Val::Vector(vec![Val::Sym("items".into()), Val::Sym("resume".into())]),
+            Val::List(vec![
+                Val::Sym("resume".into()),
+                Val::List(vec![
+                    Val::Sym("sort-strings".into()),
+                    Val::Sym("items".into()),
+                ]),
+            ]),
+        ]),
+        with_path_is_dir,
+    ]);
+
     // Wrap in cap handlers (innermost to outermost).
     let caps = ["import", "routing", "runtime", "host"];
-    let mut wrapped = with_load;
+    let mut wrapped = with_sort_strings;
     for cap_name in &caps {
         let handler_name = format!("{cap_name}-handler");
         wrapped = Val::List(vec![
@@ -1191,109 +3337,56 @@ fn wrap_with_handlers(form: &Val) -> Val {
     wrapped
 }
 
-/// Scan `$WW_ROOT/etc/init.d/*.glia` via the WASI virtual filesystem,
-/// parse and evaluate each file as a glia script. Returns true if any
-/// expression blocked
-/// (i.e. a foreground process ran to completion via `(runtime run ...)`).
-async fn run_initd(
+fn resolve_boot_file_path(rel_path: &str) -> Option<String> {
+    if let Ok(ww_root) = std::env::var("WW_ROOT") {
+        let root = ww_root.trim_end_matches('/');
+        let rooted = format!("{root}/{rel_path}");
+        return std::path::Path::new(&rooted).exists().then_some(rooted);
+    }
+
+    let host = format!("/{rel_path}");
+    std::path::Path::new(&host).exists().then_some(host)
+}
+
+async fn run_init_glia(
     env: &mut Env,
     ctx: &RefCell<Session>,
     dispatch: &HashMap<&'static str, HandlerFn>,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let ww_root = std::env::var("WW_ROOT").unwrap_or_default();
-    if ww_root.is_empty() {
-        log::debug!("init.d: WW_ROOT not set, skipping");
-        return Ok(false);
-    }
-    let root = ww_root.trim_end_matches('/');
-
-    // Read init.d scripts via WASI virtual filesystem.
-    // Try $WW_ROOT/etc/init.d first (IPFS CidTree path), then fall back to
-    // /etc/init.d (direct WASI preopen for local images).
-    let initd_paths = [format!("{root}/etc/init.d"), "/etc/init.d".to_string()];
-    let (initd_path, entries) = {
-        let mut found = None;
-        for path in &initd_paths {
-            if let Ok(dir) = std::fs::read_dir(path) {
-                let mut names: Vec<String> = dir
-                    .filter_map(|entry| {
-                        let entry = entry.ok()?;
-                        let name = entry.file_name().to_str()?.to_string();
-                        if name.ends_with(".glia") {
-                            Some(name)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                names.sort();
-                found = Some((path.clone(), names));
-                break;
+) -> Result<ExportPolicy, capnp::Error> {
+    let init_path =
+        resolve_boot_file_path("etc/init.glia").ok_or_else(|| match std::env::var("WW_ROOT") {
+            Ok(root) => {
+                let root = root.trim_end_matches('/');
+                capnp::Error::failed(format!(
+                    "boot failed: missing required {root}/etc/init.glia"
+                ))
             }
-        }
-        match found {
-            Some(f) => f,
-            None => {
-                log::warn!(
-                    "init.d: not found (tried {} paths), skipping",
-                    initd_paths.len()
-                );
-                return Ok(false);
-            }
-        }
-    };
+            Err(_) => capnp::Error::failed("boot failed: missing required /etc/init.glia".into()),
+        })?;
+    log::info!("boot: evaluating init script at {init_path}");
 
-    if entries.is_empty() {
-        log::info!("init.d: no scripts found");
-        return Ok(false);
+    let data = std::fs::read(&init_path)
+        .map_err(|e| capnp::Error::failed(format!("boot failed: read {init_path}: {e}")))?;
+    let content = std::str::from_utf8(&data).map_err(|e| {
+        capnp::Error::failed(format!("boot failed: init.glia is not valid UTF-8: {e}"))
+    })?;
+    let forms = read_many(content)
+        .map_err(|e| capnp::Error::failed(format!("boot failed: init.glia parse error: {e}")))?;
+    if forms.is_empty() {
+        return Err(capnp::Error::failed(
+            "boot failed: init.glia must return an export policy map".into(),
+        ));
     }
 
-    log::info!("init.d: found {} script(s)", entries.len());
-    let mut blocked = false;
-
-    // SysV init: execute each script in lexicographic order, best-effort.
-    // On failure: log with full context, continue to next script.
-    for name in &entries {
-        let script_path = format!("{initd_path}/{name}");
-
-        // Read the glia script via WASI FS — failure skips this script.
-        let data = match std::fs::read(&script_path) {
-            Ok(d) => d,
-            Err(e) => {
-                log::error!("init.d: {name}: read failed: {e}");
-                continue;
-            }
-        };
-
-        let forms = match parse_initd_script(name, &data) {
-            Some(f) => f,
-            None => continue, // SysV: skip failed script
-        };
-
-        for (i, form) in forms.iter().enumerate() {
-            log::info!("init.d: {name}: evaluating form {}/{}", i + 1, forms.len());
-            // Wrap each form in default effect handlers so init.d
-            // scripts can use (perform :load ...) etc.
-            let wrapped = wrap_with_handlers(form);
-            match eval(&wrapped, env, ctx, dispatch).await {
-                Ok(Val::Nil) => {}
-                Ok(Val::Int(code)) => {
-                    // A (runtime run ...) that returned an exit code means
-                    // a foreground process ran to completion.
-                    log::info!("init.d: {name}: foreground process exited ({code})");
-                    blocked = true;
-                }
-                Ok(result) => {
-                    log::debug!("init.d: {name}: {result}");
-                }
-                Err(e) => {
-                    log::error!("init.d: {name}: form {}: {e}", i + 1);
-                }
-            }
-        }
+    let mut result = Val::Nil;
+    for (i, form) in forms.iter().enumerate() {
+        let wrapped = wrap_with_handlers(form);
+        result = eval(&wrapped, env, ctx, dispatch).await.map_err(|e| {
+            capnp::Error::failed(format!("boot failed: init.glia form {}: {e}", i + 1))
+        })?;
     }
 
-    Ok(blocked)
+    parse_export_policy(&result)
 }
 
 // ---------------------------------------------------------------------------
@@ -1501,7 +3594,9 @@ fn make_doc_builtin() -> Val {
                 "runtime" => "runtime — cell spawn + execution",
                 "routing" => "routing — DHT content routing (provide / find)",
                 "identity" => "identity — node Ed25519 signing keys",
-                "http" | "http-client" => "http-client — outbound HTTP requests (gated by --http-dial)",
+                "http" | "http-client" => {
+                    "http-client — outbound HTTP requests (gated by --http-dial)"
+                }
                 _ => {
                     if let Some(glia_cap) = inner.downcast_ref::<GliaCapInner>() {
                         return Ok(Val::Str(format!(
@@ -1512,7 +3607,7 @@ fn make_doc_builtin() -> Val {
                     if let Some(att) = inner.downcast_ref::<AttenuatedCapInner>() {
                         return Ok(Val::Str(format!(
                             "attenuated capability — method whitelist\n  cap-name:   {cap_name}\n  schema-cid: {schema_cid}\n  methods:    {}",
-                            att.allow_methods.len()
+                            att.policy.allow_methods.len()
                         )));
                     }
                     return Err(glia::error::permission_denied(
@@ -1584,139 +3679,143 @@ fn run_impl() {
     init_logging();
 
     let exported_membrane: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(None));
+    let exported_policy: Rc<RefCell<Option<ExportPolicy>>> = Rc::new(RefCell::new(None));
     let bootstrap: membrane_capnp::membrane::Client = capnp_rpc::new_client(KernelBootstrap {
         membrane: Rc::clone(&exported_membrane),
+        policy: Rc::clone(&exported_policy),
     });
 
     system::serve(bootstrap.client, move |membrane: Membrane| {
         let exported_membrane = Rc::clone(&exported_membrane);
+        let exported_policy = Rc::clone(&exported_policy);
         async move {
-        *exported_membrane.borrow_mut() = Some(membrane.clone());
-        let graft_resp = membrane.graft_request().send().promise.await?;
-        let results = graft_resp.get()?;
+            let graft_resp = membrane.graft_request().send().promise.await?;
+            let results = graft_resp.get()?;
 
-        // Iterate the caps list to find capabilities by name.
-        let caps = results.get_caps()?;
+            // Iterate the caps list to find capabilities by name.
+            let caps = results.get_caps()?;
 
-        let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
-        let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
-        let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
-        let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
-        let http_client: Option<http_capnp::http_client::Client> =
-            get_graft_cap(&caps, "http-client").ok();
+            let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
+            let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
+            let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
+            let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
+            let http_client: Option<http_capnp::http_client::Client> =
+                get_graft_cap(&caps, "http-client").ok();
 
-        let ctx = RefCell::new(Session {
-            host: host.clone(),
-            runtime: runtime.clone(),
-            routing: routing.clone(),
-            identity,
-            http_client: http_client.clone(),
-            cwd: "/".to_string(),
-        });
-
-        let dispatch = build_dispatch();
-        let mut env = Env::new();
-
-        // Bind graft caps + effect handlers from the membrane response.
-        // The membrane exports a flat list of named capabilities; we iterate
-        // it, downcast each to its typed client, and bind both a Val::Cap
-        // (for collect_caps / :listen forwarding) and an effect handler
-        // (for `(perform cap :method ...)` in Glia).
-        {
-            let s = ctx.borrow();
-            for i in 0..caps.len() {
-                let entry = caps.get(i);
-                let cap_name = entry
-                    .get_name()?
-                    .to_str()
-                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-                let (schema_cid, inner, handler): (&str, Rc<dyn std::any::Any>, Val) =
-                    match cap_name {
-                        "host" => (
-                            schema_ids::HOST_CID,
-                            Rc::new(s.host.clone()),
-                            make_host_handler(
-                                s.host.clone(),
-                                s.runtime.clone(),
-                                s.http_client.clone(),
-                            ),
-                        ),
-                        "runtime" => (
-                            schema_ids::RUNTIME_CID,
-                            Rc::new(s.runtime.clone()),
-                            make_runtime_handler(s.runtime.clone()),
-                        ),
-                        "routing" => (
-                            schema_ids::ROUTING_CID,
-                            Rc::new(s.routing.clone()),
-                            make_routing_handler(s.routing.clone()),
-                        ),
-                        "identity" => {
-                            // Identity is stored in the Session but has no
-                            // Glia effect handler — skip env binding.
-                            continue;
-                        }
-                        "http-client" => {
-                            match s.http_client.clone() {
-                                Some(c) => (
-                                    schema_ids::HTTP_CLIENT_CID,
-                                    Rc::new(c),
-                                    // No standalone handler — http-client is accessed
-                                    // via (perform host :http-client).
-                                    Val::Nil,
-                                ),
-                                None => {
-                                    log::warn!("graft: host sent 'http-client' but Session has None, skipping");
-                                    continue;
-                                }
-                            }
-                        }
-                        other => {
-                            log::warn!("graft: unknown cap '{other}', skipping");
-                            continue;
-                        }
-                    };
-
-                env.set(
-                    cap_name.to_string(),
-                    make_cap(cap_name, schema_cid.to_string(), inner),
-                );
-                if !matches!(handler, Val::Nil) {
-                    env.set(format!("{cap_name}-handler"), handler);
-                }
-            }
-
-            // Introspection builtins. `(schema cap)` returns the cap's
-            // canonical Schema.Node bytes; `(doc cap)` returns a human-
-            // readable summary. Bytes come from the build-time schema
-            // registry baked into the kernel (see std/kernel/build.rs).
-            env.set("schema".to_string(), make_schema_builtin());
-            env.set("doc".to_string(), make_doc_builtin());
-            env.set("help".to_string(), make_help_builtin());
-            env.set("import".to_string(), make_import_cap());
-            env.set("import-handler".to_string(), make_import_handler());
-        }
-
-        // Load the prelude (standard macros: when, and, or, defn, cond, not).
-        {
-            let mut kd = KernelDispatch {
-                ctx: &ctx,
-                table: &dispatch,
-            };
-            glia::load_prelude(&mut env, &mut kd).await;
-        }
-
-        // Run init.d scripts first. If a foreground process blocked
-        // (e.g. `(runtime run ...)` in the script), we're done.
-        let blocked = run_initd(&mut env, &ctx, &dispatch)
-            .await
-            .unwrap_or_else(|e| {
-                log::error!("init.d: {e}");
-                false
+            let ctx = RefCell::new(Session {
+                host: host.clone(),
+                runtime: runtime.clone(),
+                routing: routing.clone(),
+                identity,
+                http_client: http_client.clone(),
+                cwd: "/".to_string(),
             });
 
-        if !blocked {
+            let dispatch = build_dispatch();
+            let mut env = Env::new();
+
+            // Bind graft caps + effect handlers from the membrane response.
+            // The membrane exports a flat list of named capabilities; we iterate
+            // it, downcast each to its typed client, and bind both a Val::Cap
+            // (for collect_caps / :listen forwarding) and an effect handler
+            // (for `(perform cap :method ...)` in Glia).
+            {
+                let s = ctx.borrow();
+                for i in 0..caps.len() {
+                    let entry = caps.get(i);
+                    let cap_name = entry
+                        .get_name()?
+                        .to_str()
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+                    let (schema_cid, inner, handler): (&str, Rc<dyn std::any::Any>, Val) =
+                        match cap_name {
+                            "host" => (
+                                schema_ids::HOST_CID,
+                                Rc::new(s.host.clone()),
+                                make_host_handler(
+                                    s.host.clone(),
+                                    s.runtime.clone(),
+                                    s.http_client.clone(),
+                                ),
+                            ),
+                            "runtime" => (
+                                schema_ids::RUNTIME_CID,
+                                Rc::new(s.runtime.clone()),
+                                make_runtime_handler(s.runtime.clone()),
+                            ),
+                            "routing" => (
+                                schema_ids::ROUTING_CID,
+                                Rc::new(s.routing.clone()),
+                                make_routing_handler(s.routing.clone()),
+                            ),
+                            "identity" => {
+                                // Identity is stored in the Session but has no
+                                // Glia effect handler — skip env binding.
+                                continue;
+                            }
+                            "http-client" => {
+                                match s.http_client.clone() {
+                                    Some(c) => (
+                                        schema_ids::HTTP_CLIENT_CID,
+                                        Rc::new(c),
+                                        // No standalone handler — http-client is accessed
+                                        // via (perform host :http-client).
+                                        Val::Nil,
+                                    ),
+                                    None => {
+                                        log::warn!("graft: host sent 'http-client' but Session has None, skipping");
+                                        continue;
+                                    }
+                                }
+                            }
+                            other => {
+                                log::warn!("graft: unknown cap '{other}', skipping");
+                                continue;
+                            }
+                        };
+
+                    env.set(
+                        cap_name.to_string(),
+                        make_cap(cap_name, schema_cid.to_string(), inner),
+                    );
+                    if !matches!(handler, Val::Nil) {
+                        env.set(format!("{cap_name}-handler"), handler);
+                    }
+                }
+
+                // Introspection builtins. `(schema cap)` returns the cap's
+                // canonical Schema.Node bytes; `(doc cap)` returns a human-
+                // readable summary. Bytes come from the build-time schema
+                // registry baked into the kernel (see std/kernel/build.rs).
+                env.set("schema".to_string(), make_schema_builtin());
+                env.set("doc".to_string(), make_doc_builtin());
+                env.set("help".to_string(), make_help_builtin());
+                env.set("import".to_string(), make_import_cap());
+                env.set("import-handler".to_string(), make_import_handler());
+            }
+
+            // Load the prelude (standard macros: when, and, or, defn, cond, not).
+            {
+                let mut kd = KernelDispatch {
+                    ctx: &ctx,
+                    table: &dispatch,
+                };
+                glia::load_prelude(&mut env, &mut kd).await;
+            }
+
+            // Boot policy gate: init.glia must succeed and return a valid policy map.
+            // Until this is set, KernelBootstrap::graft is fail-closed.
+            let policy = match run_init_glia(&mut env, &ctx, &dispatch).await {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!("{e}");
+                    std::process::exit(1);
+                }
+            };
+            *exported_policy.borrow_mut() = Some(policy);
+            *exported_membrane.borrow_mut() = Some(membrane.clone());
+
             let is_tty = std::env::var("WW_TTY").is_ok();
             let result = if is_tty {
                 run_shell(&mut env, ctx, &dispatch).await
@@ -1727,7 +3826,6 @@ fn run_impl() {
             if let Err(e) = result {
                 log::error!("kernel error: {e}");
             }
-        }
 
             Ok(())
         }
@@ -1739,72 +3837,6 @@ wasip2::cli::command::export!(Kernel);
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- init.d parse + SysV error recovery ---
-
-    #[test]
-    fn parse_initd_script_valid() {
-        let data = b"(cd \"/foo\") (cd \"/bar\")";
-        let forms = parse_initd_script("test.glia", data).unwrap();
-        assert_eq!(forms.len(), 2);
-    }
-
-    #[test]
-    fn parse_initd_script_malformed() {
-        let data = b"(cd \"/foo\") (broken";
-        assert!(parse_initd_script("bad.glia", data).is_none());
-    }
-
-    #[test]
-    fn parse_initd_script_invalid_utf8() {
-        assert!(parse_initd_script("binary.glia", &[0xFF, 0xFE]).is_none());
-    }
-
-    #[test]
-    fn parse_initd_script_empty() {
-        let forms = parse_initd_script("empty.glia", b"").unwrap();
-        assert!(forms.is_empty());
-    }
-
-    #[test]
-    fn parse_initd_script_comments_only() {
-        let data = b"; just a comment\n; another one\n";
-        let forms = parse_initd_script("comments.glia", data).unwrap();
-        assert!(forms.is_empty());
-    }
-
-    #[test]
-    fn sysv_continues_past_failed_scripts() {
-        // SysV contract: each script is processed independently.
-        // parse_initd_script returns None on failure, enabling the caller
-        // to `continue` to the next script.
-        let scripts: Vec<(&str, &[u8])> = vec![
-            ("01-bad.glia", &[0xFF, 0xFE]),           // invalid UTF-8
-            ("02-broken.glia", b"(unclosed"),         // parse error
-            ("03-good.glia", b"(cd \"/ok\")"),        // valid
-            ("04-also-bad.glia", b"(a) )unexpected"), // parse error
-            ("05-also-good.glia", b"(help)"),         // valid
-        ];
-
-        let results: Vec<Option<Vec<Val>>> = scripts
-            .iter()
-            .map(|(name, data)| parse_initd_script(name, data))
-            .collect();
-
-        assert!(results[0].is_none(), "invalid UTF-8 should fail");
-        assert!(results[1].is_none(), "unclosed paren should fail");
-        assert_eq!(
-            results[2].as_ref().unwrap().len(),
-            1,
-            "valid script should parse"
-        );
-        assert!(results[3].is_none(), "unexpected close should fail");
-        assert_eq!(
-            results[4].as_ref().unwrap().len(),
-            1,
-            "valid script should parse"
-        );
-    }
 
     // --- load ---
 
@@ -1850,6 +3882,49 @@ mod tests {
         assert_eq!(second.unwrap(), Val::Bytes(b"cached-bytes".to_vec()));
     }
 
+    #[test]
+    fn eval_path_is_dir_reports_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+        let missing = format!("{dir_path}/does-not-exist");
+        assert_eq!(
+            eval_path_is_dir(&[Val::Str(dir_path)]).unwrap(),
+            Val::Bool(true)
+        );
+        assert_eq!(
+            eval_path_is_dir(&[Val::Str(missing)]).unwrap(),
+            Val::Bool(false)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn eval_list_dir_includes_symlink_to_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.glia");
+        let link = dir.path().join("link.glia");
+        std::fs::write(&target, b"(+ 1 2)").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let listed = eval_list_dir(&[Val::Str(dir.path().to_str().unwrap().to_string())]).unwrap();
+        let names: Vec<String> = match listed {
+            Val::List(items) => items
+                .into_iter()
+                .filter_map(|v| match v {
+                    Val::Str(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected list of names, got {other}"),
+        };
+        assert!(
+            names.iter().any(|s| s == "link.glia"),
+            "expected symlinked file entry in list-dir output: {names:?}"
+        );
+    }
+
     // --- wrap_with_handlers ---
 
     #[test]
@@ -1878,7 +3953,15 @@ mod tests {
     #[test]
     fn dispatch_table_has_builtins() {
         let table = build_dispatch();
-        let expected = ["load", "cd", "help", "exit"];
+        let expected = [
+            "load",
+            "list-dir",
+            "path-is-dir",
+            "sort-strings",
+            "cd",
+            "help",
+            "exit",
+        ];
         for verb in &expected {
             assert!(table.contains_key(verb), "missing dispatch entry: {verb}");
         }
@@ -1886,6 +3969,46 @@ mod tests {
             table.len(),
             expected.len(),
             "unexpected extra entries in dispatch table"
+        );
+    }
+
+    #[test]
+    fn resolve_boot_file_path_uses_ww_root_without_host_fallback() {
+        let ww_root = tempfile::tempdir().unwrap();
+        let host_root = tempfile::tempdir().unwrap();
+        let host_rel = format!(
+            "tmp/{}/init.glia",
+            host_root.path().file_name().unwrap().to_string_lossy()
+        );
+        let host_path = std::path::Path::new("/").join(&host_rel);
+        std::fs::create_dir_all(host_path.parent().unwrap()).unwrap();
+        std::fs::write(&host_path, b"; host file").unwrap();
+
+        std::env::set_var("WW_ROOT", ww_root.path());
+        let resolved = resolve_boot_file_path(&host_rel);
+        std::env::remove_var("WW_ROOT");
+
+        assert!(
+            resolved.is_none(),
+            "WW_ROOT must not silently fall back to host path, got: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_boot_file_path_finds_file_under_ww_root() {
+        let ww_root = tempfile::tempdir().unwrap();
+        let rooted = ww_root.path().join("etc/init.glia");
+        std::fs::create_dir_all(rooted.parent().unwrap()).unwrap();
+        std::fs::write(&rooted, b"; rooted init").unwrap();
+
+        std::env::set_var("WW_ROOT", ww_root.path());
+        let resolved = resolve_boot_file_path("etc/init.glia");
+        std::env::remove_var("WW_ROOT");
+
+        assert_eq!(
+            resolved,
+            Some(rooted.to_string_lossy().to_string()),
+            "expected WW_ROOT-scoped init path"
         );
     }
 
@@ -1952,6 +4075,7 @@ mod tests {
             r.set_stream_dialer(capnp_rpc::new_client(TestStreamDialer));
             r.set_vat_listener(capnp_rpc::new_client(TestVatListener));
             r.set_vat_client(capnp_rpc::new_client(TestVatClient));
+            r.set_http_listener(capnp_rpc::new_client(TestHttpListener));
             Promise::ok(())
         }
     }
@@ -2107,6 +4231,9 @@ mod tests {
     struct TestVatClient;
     impl system_capnp::vat_client::Server for TestVatClient {}
 
+    struct TestHttpListener;
+    impl system_capnp::http_listener::Server for TestHttpListener {}
+
     // --- Stub Identity (unimplemented — not under test) ---
 
     struct TestIdentity;
@@ -2231,8 +4358,16 @@ mod tests {
                 runtime: runtime.clone(),
             });
             let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(Some(upstream)));
+            let policy = Rc::new(RefCell::new(Some(ExportPolicy {
+                caps: [("runtime".to_string(), ExportCapPolicy::default())]
+                    .into_iter()
+                    .collect(),
+            })));
 
-            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap { membrane: state });
+            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap {
+                membrane: state,
+                policy,
+            });
             let resp = bootstrap
                 .graft_request()
                 .send()
@@ -2255,22 +4390,221 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_kernel_bootstrap_errors_when_policy_references_unknown_cap() {
+        run_local(async {
+            let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(TestRuntime);
+            let upstream: Membrane = capnp_rpc::new_client(TestMembrane {
+                runtime: runtime.clone(),
+            });
+            let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(Some(upstream)));
+            let policy = Rc::new(RefCell::new(Some(ExportPolicy {
+                caps: [
+                    ("runtime".to_string(), ExportCapPolicy::default()),
+                    ("rutnime".to_string(), ExportCapPolicy::default()),
+                ]
+                .into_iter()
+                .collect(),
+            })));
+
+            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap {
+                membrane: state,
+                policy,
+            });
+
+            match bootstrap.graft_request().send().promise.await {
+                Ok(_) => panic!("bootstrap graft should fail for unknown policy cap"),
+                Err(err) => {
+                    let msg = format!("{err}");
+                    assert!(
+                        msg.contains("unknown cap"),
+                        "expected unknown cap error, got: {msg}"
+                    );
+                    assert!(
+                        msg.contains("rutnime"),
+                        "expected offending cap name in error, got: {msg}"
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_kernel_bootstrap_errors_when_membrane_not_ready() {
         run_local(async {
             let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(None));
-            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap { membrane: state });
+            let policy = Rc::new(RefCell::new(Some(ExportPolicy {
+                caps: [("runtime".to_string(), ExportCapPolicy::default())]
+                    .into_iter()
+                    .collect(),
+            })));
+            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap {
+                membrane: state,
+                policy,
+            });
 
             match bootstrap.graft_request().send().promise.await {
                 Ok(_) => panic!("bootstrap graft should fail before membrane is ready"),
                 Err(err) => {
                     assert!(
-                        format!("{err}").contains("not ready"),
+                        format!("{err}").contains(INIT_MEMBRANE_NOT_READY),
                         "unexpected error: {err}"
                     );
                 }
             }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_kernel_bootstrap_errors_when_policy_not_ready() {
+        run_local(async {
+            let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(TestRuntime);
+            let upstream: Membrane = capnp_rpc::new_client(TestMembrane { runtime });
+            let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(Some(upstream)));
+            let policy = Rc::new(RefCell::new(None));
+            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap {
+                membrane: state,
+                policy,
+            });
+
+            match bootstrap.graft_request().send().promise.await {
+                Ok(_) => panic!("bootstrap graft should fail before policy is ready"),
+                Err(err) => {
+                    assert!(
+                        format!("{err}").contains(INIT_POLICY_NOT_READY),
+                        "unexpected error: {err}"
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_kernel_bootstrap_enforces_recursive_policy_on_host_network_stream_listener() {
+        run_local(async {
+            struct HostOnlyMembrane {
+                host: system_capnp::host::Client,
+            }
+            #[allow(refining_impl_trait)]
+            impl membrane_capnp::membrane::Server for HostOnlyMembrane {
+                fn graft(
+                    self: capnp::capability::Rc<Self>,
+                    _params: membrane_capnp::membrane::GraftParams,
+                    mut results: membrane_capnp::membrane::GraftResults,
+                ) -> Promise<(), capnp::Error> {
+                    let mut caps = results.get().init_caps(1);
+                    let mut entry = caps.reborrow().get(0);
+                    entry.set_name("host");
+                    entry
+                        .reborrow()
+                        .init_cap()
+                        .set_as_capability(self.host.client.hook.clone());
+                    Promise::ok(())
+                }
+            }
+
+            let upstream: Membrane = capnp_rpc::new_client(HostOnlyMembrane {
+                host: capnp_rpc::new_client(TestHost),
+            });
+            let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(Some(upstream)));
+
+            let stream_listener_policy = ExportCapPolicy {
+                allow_methods: Some(BTreeSet::new()),
+                returns: BTreeMap::new(),
+            };
+            let host_policy = ExportCapPolicy {
+                allow_methods: Some(["network".to_string()].into_iter().collect()),
+                returns: BTreeMap::from([(
+                    "network".to_string(),
+                    BTreeMap::from([("streamListener".to_string(), stream_listener_policy)]),
+                )]),
+            };
+            let policy = Rc::new(RefCell::new(Some(ExportPolicy {
+                caps: BTreeMap::from([("host".to_string(), host_policy)]),
+            })));
+
+            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap {
+                membrane: state,
+                policy,
+            });
+            let resp = bootstrap
+                .graft_request()
+                .send()
+                .promise
+                .await
+                .expect("bootstrap graft should succeed");
+            let caps = resp.get().unwrap().get_caps().unwrap();
+            let forwarded_host: system_capnp::host::Client =
+                get_graft_cap(&caps, "host").expect("host cap should be forwarded");
+            let network_resp = forwarded_host
+                .network_request()
+                .send()
+                .promise
+                .await
+                .expect("host.network should be allowed");
+            let stream_listener = network_resp
+                .get()
+                .unwrap()
+                .get_stream_listener()
+                .expect("stream listener should be present");
+            match stream_listener.listen_request().send().promise.await {
+                Ok(_) => panic!("stream-listener.listen should be denied by recursive policy"),
+                Err(err) => {
+                    let msg = format!("{err}");
+                    assert!(
+                        msg.contains("permission denied"),
+                        "expected permission denied, got: {msg}"
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
+    #[test]
+    fn test_parse_export_policy_rejects_non_map() {
+        let err = parse_export_policy(&Val::Int(1)).unwrap_err();
+        assert!(format!("{err}").contains("must return a map"));
+    }
+
+    #[test]
+    fn test_parse_export_policy_rejects_legacy_export_shape() {
+        let policy = read("{:export {:caps [\"runtime\"] :methods {}}}").unwrap();
+        let err = parse_export_policy(&policy).unwrap_err();
+        assert!(format!("{err}").contains("legacy"));
+    }
+
+    #[test]
+    fn test_parse_export_policy_accepts_bare_map() {
+        let policy = Val::Map(glia::ValMap::from_pairs(vec![
+            (
+                Val::Keyword("runtime".into()),
+                test_cap("runtime", "runtime-cid"),
+            ),
+            (Val::Keyword("host".into()), test_cap("host", "host-cid")),
+        ]));
+        let parsed = parse_export_policy(&policy).unwrap();
+        assert!(parsed.caps.contains_key("runtime"));
+        assert!(parsed.caps.contains_key("host"));
+    }
+
+    #[test]
+    fn test_parse_export_policy_allows_empty_caps() {
+        let policy = read("{}").unwrap();
+        let parsed = parse_export_policy(&policy).unwrap();
+        assert!(parsed.caps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_export_policy_rejects_unknown_export_cap() {
+        let policy = Val::Map(glia::ValMap::from_pairs(vec![(
+            Val::Keyword("custom".into()),
+            test_cap("custom", "custom-cid"),
+        )]));
+        let err = parse_export_policy(&policy).unwrap_err();
+        assert!(format!("{err}").contains("unknown cap"));
     }
 
     // --- host tests ---
@@ -2612,10 +4946,7 @@ mod tests {
                             let peer_id = entries
                                 .get(&Val::Keyword("peer-id".into()))
                                 .expect("missing :peer-id key");
-                            assert_eq!(
-                                *peer_id,
-                                Val::Str(bs58::encode(b"peer-0").into_string())
-                            );
+                            assert_eq!(*peer_id, Val::Str(bs58::encode(b"peer-0").into_string()));
                         }
                         other => panic!("expected map, got {other:?}"),
                     }
@@ -2716,10 +5047,9 @@ mod tests {
         run_local(async {
             let s = test_session();
             let handler = make_routing_handler(s.routing.clone());
-            let result =
-                call_handler(&handler, "resolve", &[Val::Str("/ipns/k51qzi-test".into())])
-                    .await
-                    .unwrap();
+            let result = call_handler(&handler, "resolve", &[Val::Str("/ipns/k51qzi-test".into())])
+                .await
+                .unwrap();
             assert_eq!(result, Val::Str("/ipfs/bafyrei-test-resolved".into()));
         })
         .await;
@@ -2766,10 +5096,7 @@ mod tests {
             ),
         ];
         for (name, cid, inner, handler) in caps {
-            env.set(
-                name.to_string(),
-                make_cap(name, cid, inner),
-            );
+            env.set(name.to_string(), make_cap(name, cid, inner));
             env.set(format!("{name}-handler"), handler);
         }
         env.set("import".to_string(), make_import_cap());
@@ -2908,36 +5235,6 @@ mod tests {
         .await;
     }
 
-    // --- run_initd integration ---
-
-    /// run_initd with no WW_ROOT set returns false (no scripts to run).
-    #[tokio::test]
-    async fn test_run_initd_no_ww_root_skips() {
-        run_local(async {
-            let ctx = RefCell::new(test_session());
-            let dispatch = build_dispatch();
-            let mut env = Env::new();
-            std::env::remove_var("WW_ROOT");
-            let blocked = run_initd(&mut env, &ctx, &dispatch).await.unwrap();
-            assert!(!blocked, "should not block when WW_ROOT is unset");
-        })
-        .await;
-    }
-
-    /// run_initd with empty WW_ROOT skips gracefully.
-    #[tokio::test]
-    async fn test_run_initd_empty_ww_root_skips() {
-        run_local(async {
-            let ctx = RefCell::new(test_session());
-            let dispatch = build_dispatch();
-            let mut env = Env::new();
-            std::env::set_var("WW_ROOT", "");
-            let blocked = run_initd(&mut env, &ctx, &dispatch).await.unwrap();
-            assert!(!blocked, "should not block when WW_ROOT is empty");
-        })
-        .await;
-    }
-
     // --- extract_capnp_client tests ---
 
     #[test]
@@ -3047,7 +5344,14 @@ mod tests {
     #[test]
     fn schema_returns_bytes_for_each_known_cap() {
         let builtin = make_schema_builtin();
-        for name in ["host", "runtime", "routing", "identity", "http", "http-client"] {
+        for name in [
+            "host",
+            "runtime",
+            "routing",
+            "identity",
+            "http",
+            "http-client",
+        ] {
             let cap = test_cap(name, "test-cid");
             let result = call_builtin(&builtin, &[cap]).unwrap_or_else(|e| {
                 panic!("schema for '{name}' returned error: {e}");
@@ -3078,10 +5382,7 @@ mod tests {
     fn schema_arity_mismatch_returns_structured_error() {
         let builtin = make_schema_builtin();
         let err = call_builtin(&builtin, &[]).unwrap_err();
-        assert_eq!(
-            glia::error::type_tag(&err),
-            Some(glia::error::tag::ARITY)
-        );
+        assert_eq!(glia::error::type_tag(&err), Some(glia::error::tag::ARITY));
     }
 
     #[test]
@@ -3196,7 +5497,10 @@ mod tests {
             "glia:defcap:v1",
             Rc::new(AttenuatedCapInner {
                 base,
-                allow_methods: allow,
+                policy: AttenuationPolicy {
+                    allow_methods: allow,
+                    returns: BTreeMap::new(),
+                },
                 descriptor: descriptor.clone(),
             }),
         );
@@ -3207,19 +5511,12 @@ mod tests {
     #[test]
     fn unwrap_cap_arg_rejects_zero_args() {
         let err = unwrap_cap_arg("schema", &[]).unwrap_err();
-        assert_eq!(
-            glia::error::type_tag(&err),
-            Some(glia::error::tag::ARITY)
-        );
+        assert_eq!(glia::error::type_tag(&err), Some(glia::error::tag::ARITY));
     }
 
     #[test]
     fn unwrap_cap_arg_rejects_two_args() {
         let err = unwrap_cap_arg("schema", &[Val::Nil, Val::Nil]).unwrap_err();
-        assert_eq!(
-            glia::error::type_tag(&err),
-            Some(glia::error::tag::ARITY)
-        );
+        assert_eq!(glia::error::type_tag(&err), Some(glia::error::tag::ARITY));
     }
-
 }
