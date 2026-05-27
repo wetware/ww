@@ -1,0 +1,33 @@
+;; ww/os — minimal OS-facing helpers for init orchestration
+;;
+;; Usage: (def os (perform import "ww/os"))
+;;        (os :list-dir "/etc/init.d")
+;;        (os :dir-exists? "/etc/init.d")
+;;        (os :sort-strings ["b.glia" "a.glia"]) ;=> ("a.glia" "b.glia")
+;;
+;; TODO(post-PR3): expand ww/os beyond boot-orchestration needs (glob/stat/etc).
+
+(def s (perform import "ww/string"))
+
+(defn list-dir [path]
+  (perform :list-dir path))
+
+(defn dir-exists? [path]
+  (perform :path-is-dir path))
+
+(defn sort-strings [items]
+  (perform :sort-strings items))
+
+(defn discover-initd [path]
+  (filter
+    (fn [name]
+      (and
+        (s :ends-with? name ".glia")
+        (not (s :starts-with? name "."))))
+    (sort-strings (list-dir path))))
+
+(defn eval-initd [path entries]
+  (loop [remaining entries]
+    (when (not (empty? remaining))
+      (load-file (str path "/" (first remaining)))
+      (recur (rest remaining)))))

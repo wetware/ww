@@ -8,11 +8,49 @@ Each wetware image follows a minimal FHS convention:
     main.wasm          # agent entrypoint (required)
   svc/                 # nested service images (spawned by pid0)
   etc/                 # configuration (consumed by pid0)
-    init.d/            # boot scripts evaluated by the kernel
+    init.glia          # top-level boot orchestration + export policy
+    init.d/            # boot scripts discovered/evaluated by init.glia
 ```
 
 Only `bin/main.wasm` is required. Everything else is convention
 between the image author and the kernel (pid0).
+
+Boot is fail-closed: `etc/init.glia` is required, and any parse/eval error in
+`init.glia` or scripts it loads (including `init.d`) aborts boot.
+
+`init.d` is optional. If present, ordering is lexical; use numeric prefixes for
+deterministic intent, for example `00-setup.glia`, `10-http.glia`, `20-worker.glia`.
+
+## Minimal export policy
+
+A strict posture can export nothing:
+
+```clojure
+(load-file "/lib/init/default.glia")
+{}
+```
+
+Export selected capabilities with a bare map from cap name to cap value:
+
+```clojure
+(load-file "/lib/init/default.glia")
+
+{:host host
+ :runtime runtime}
+```
+
+Recursive attenuation uses normal `attenuate` syntax on map values:
+
+```clojure
+(load-file "/lib/init/default.glia")
+
+{:host
+ (attenuate host
+   :allow [:id :network]
+   :returns {:network
+             {:stream-dialer (attenuate :self :allow [:dial])
+              :stream-listener (attenuate :self :allow [:listen])}})}
+```
 
 ## Mount sources
 
