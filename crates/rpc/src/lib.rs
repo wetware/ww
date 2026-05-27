@@ -515,9 +515,22 @@ impl system_capnp::process::Server for ProcessImpl {
 
     fn bootstrap(
         self: capnp::capability::Rc<Self>,
-        _params: system_capnp::process::BootstrapParams,
+        params: system_capnp::process::BootstrapParams,
         mut results: system_capnp::process::BootstrapResults,
     ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+        let schema_len = match params.get() {
+            Ok(p) => match p.get_schema() {
+                Ok(schema) => schema.len(),
+                Err(e) => return Promise::err(capnp::Error::from(e)),
+            },
+            Err(e) => return Promise::err(capnp::Error::from(e)),
+        };
+        if schema_len == 0 {
+            return Promise::err(capnp::Error::failed(
+                "process.bootstrap schema must not be empty".into(),
+            ));
+        }
+
         let cap = self.bootstrap_cap.clone();
         Promise::from_future(async move {
             let cap = cap.ok_or_else(|| {
@@ -1060,7 +1073,13 @@ mod tests {
                 let process = setup_process_rpc(process_impl);
 
                 // Call bootstrap() — should return the stored cap.
-                let resp = process.bootstrap_request().send().promise.await.unwrap();
+                let resp = {
+                    let mut req = process.bootstrap_request();
+                    req.get().set_schema(b"test-schema");
+                    req.send().promise
+                }
+                .await
+                .unwrap();
                 let cap = resp.get().unwrap().get_cap();
 
                 // Cast it back to a Host and verify it works.
@@ -1082,7 +1101,12 @@ mod tests {
                 let process = setup_process_rpc(process_impl);
 
                 // Call bootstrap() without a stored cap — should error.
-                let result = process.bootstrap_request().send().promise.await;
+                let result = {
+                    let mut req = process.bootstrap_request();
+                    req.get().set_schema(b"test-schema");
+                    req.send().promise
+                }
+                .await;
                 assert!(
                     result.is_err() || {
                         let resp = result.unwrap();
@@ -1115,7 +1139,13 @@ mod tests {
 
                 // Call bootstrap() twice — both should return working caps.
                 for _ in 0..2 {
-                    let resp = process.bootstrap_request().send().promise.await.unwrap();
+                    let resp = {
+                        let mut req = process.bootstrap_request();
+                        req.get().set_schema(b"test-schema");
+                        req.send().promise
+                    }
+                    .await
+                    .unwrap();
                     let cap = resp.get().unwrap().get_cap();
                     let host2: system_capnp::host::Client = cap.get_as_capability().unwrap();
                     let id_resp = host2.id_request().send().promise.await.unwrap();
@@ -1159,7 +1189,13 @@ mod tests {
                 let process = setup_process_rpc(process_impl);
 
                 // Call bootstrap() immediately — the cap hasn't resolved yet.
-                let resp = process.bootstrap_request().send().promise.await.unwrap();
+                let resp = {
+                    let mut req = process.bootstrap_request();
+                    req.get().set_schema(b"test-schema");
+                    req.send().promise
+                }
+                .await
+                .unwrap();
                 let cap = resp.get().unwrap().get_cap();
                 let host2: system_capnp::host::Client = cap.get_as_capability().unwrap();
 
@@ -1317,7 +1353,13 @@ mod tests {
                 let process = setup_process_rpc(process_impl);
 
                 // 3. Call Process.bootstrap() to get the cap (what handle_rpc_connection does).
-                let resp = process.bootstrap_request().send().promise.await.unwrap();
+                let resp = {
+                    let mut req = process.bootstrap_request();
+                    req.get().set_schema(b"test-schema");
+                    req.send().promise
+                }
+                .await
+                .unwrap();
                 let bootstrap_cap: capnp::capability::Client =
                     resp.get().unwrap().get_cap().get_as_capability().unwrap();
 
@@ -1352,7 +1394,13 @@ mod tests {
                 );
                 let process = setup_process_rpc(process_impl);
 
-                let resp = process.bootstrap_request().send().promise.await.unwrap();
+                let resp = {
+                    let mut req = process.bootstrap_request();
+                    req.get().set_schema(b"test-schema");
+                    req.send().promise
+                }
+                .await
+                .unwrap();
                 let bootstrap_cap: capnp::capability::Client =
                     resp.get().unwrap().get_cap().get_as_capability().unwrap();
 
@@ -1388,7 +1436,13 @@ mod tests {
                 );
                 let process = setup_process_rpc(process_impl);
 
-                let resp = process.bootstrap_request().send().promise.await.unwrap();
+                let resp = {
+                    let mut req = process.bootstrap_request();
+                    req.get().set_schema(b"test-schema");
+                    req.send().promise
+                }
+                .await
+                .unwrap();
                 let bootstrap_cap: capnp::capability::Client =
                     resp.get().unwrap().get_cap().get_as_capability().unwrap();
 
@@ -1433,7 +1487,13 @@ mod tests {
                     );
                     let process = setup_process_rpc(process_impl);
 
-                    let resp = process.bootstrap_request().send().promise.await.unwrap();
+                    let resp = {
+                        let mut req = process.bootstrap_request();
+                        req.get().set_schema(b"test-schema");
+                        req.send().promise
+                    }
+                    .await
+                    .unwrap();
                     let cap: capnp::capability::Client =
                         resp.get().unwrap().get_cap().get_as_capability().unwrap();
 

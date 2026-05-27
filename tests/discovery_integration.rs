@@ -86,10 +86,11 @@ async fn spawn_greeter_on_pool(
                 let spawn_resp = req.send().promise.await.unwrap();
                 let process = spawn_resp.get().unwrap().get_process().unwrap();
 
-                let bootstrap_resp = tokio::time::timeout(
-                    std::time::Duration::from_secs(60),
-                    process.bootstrap_request().send().promise,
-                )
+                let bootstrap_resp = tokio::time::timeout(std::time::Duration::from_secs(60), {
+                    let mut req = process.bootstrap_request();
+                    req.get().set_schema(b"test-schema");
+                    req.send().promise
+                })
                 .await;
 
                 match bootstrap_resp {

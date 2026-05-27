@@ -124,6 +124,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                                 tracing::debug!("Incoming vat connection");
                                 let executor = executor.clone();
                                 let protocol_cid = protocol_cid.clone();
+                                let schema_bytes = schema_bytes.clone();
                                 let caps = extra_caps.clone();
                                 tokio::task::spawn_local(async move {
                                     let _handle_span = tracing::info_span!(
@@ -131,7 +132,14 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                                         protocol = protocol_cid,
                                     ).entered();
                                     if let Err(e) =
-                                        handle_vat_connection_spawn(executor, caps, stream, &protocol_cid).await
+                                        handle_vat_connection_spawn(
+                                            executor,
+                                            caps,
+                                            stream,
+                                            &protocol_cid,
+                                            &schema_bytes,
+                                        )
+                                        .await
                                     {
                                         tracing::error!("Vat cell connection error: {e}");
                                     }
@@ -224,6 +232,7 @@ pub async fn handle_vat_connection_spawn(
     caps: Vec<(String, capnp::capability::Client, Vec<u8>)>,
     stream: impl AsyncRead + AsyncWrite + 'static,
     protocol_cid: &str,
+    schema_bytes: &[u8],
 ) -> Result<(), capnp::Error> {
     // 1. Spawn cell process via Executor.spawn(), forwarding caps with
     //    their canonical Schema.Node bytes so the spawned cell's graft
@@ -260,10 +269,11 @@ pub async fn handle_vat_connection_spawn(
     // 3. Get the cell's exported bootstrap capability.
     //    Timeout guards against cells that never call system::serve().
     //    On failure, close stdin to clean up the orphaned cell process.
-    let bootstrap_resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        process.bootstrap_request().send().promise,
-    )
+    let bootstrap_resp = match tokio::time::timeout(std::time::Duration::from_secs(10), {
+        let mut req = process.bootstrap_request();
+        req.get().set_schema(&schema_bytes);
+        req.send().promise
+    })
     .await
     {
         Ok(Ok(resp)) => resp,

@@ -128,7 +128,7 @@ interface Process {
   wait @3 () -> (exitCode :Int32);
   # Block until the process exits and return its exit code.
 
-  bootstrap @4 () -> (cap :AnyPointer);
+  bootstrap @4 (schema :Data) -> (cap :AnyPointer);
   # Return the capability exported by the guest via system::serve().
   # The cap is type-erased — cast to the expected interface on the guest side.
   # Errors if the guest didn't export a capability.
