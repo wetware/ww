@@ -60,16 +60,36 @@ impl Default for Env {
 
 type Frame = std::collections::HashMap<String, Val>;
 
-fn resolve_guest_fs_path(path: &str) -> String {
+fn resolve_guest_fs_path(path: &str) -> Result<String, String> {
     if let Ok(root) = std::env::var("WW_ROOT") {
         let root = root.trim_end_matches('/');
-        let rel = path.strip_prefix('/').unwrap_or(path);
-        return format!("{root}/{rel}");
+        let mut rel = std::path::PathBuf::new();
+        for component in std::path::Path::new(path).components() {
+            use std::path::Component;
+            match component {
+                Component::Prefix(_) => {
+                    return Err(format!("load-file: invalid path '{path}'"));
+                }
+                Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => {
+                    if !rel.pop() {
+                        return Err(format!(
+                            "load-file: path escapes WW_ROOT via parent traversal: '{path}'"
+                        ));
+                    }
+                }
+                Component::Normal(seg) => rel.push(seg),
+            }
+        }
+        return Ok(std::path::Path::new(root)
+            .join(rel)
+            .to_string_lossy()
+            .to_string());
     }
     if path.starts_with('/') {
-        return path.to_string();
+        return Ok(path.to_string());
     }
-    format!("/{path}")
+    Ok(format!("/{path}"))
 }
 
 impl Env {
@@ -2547,7 +2567,8 @@ pub fn eval_expr<'a, D: Dispatch>(
                             return Err(error::type_mismatch("load-file path", "string", &other))
                         }
                     };
-                    let resolved = resolve_guest_fs_path(&path);
+                    let resolved = resolve_guest_fs_path(&path)
+                        .map_err(|e| error::internal("load-file", e))?;
                     let bytes = std::fs::read(&resolved)
                         .map_err(|e| error::internal("load-file", format!("{resolved}: {e}")))?;
                     let source = std::str::from_utf8(&bytes)
@@ -3288,7 +3309,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&ww_root).unwrap();
         std::env::set_var("WW_ROOT", &ww_root);
-        let resolved = resolve_guest_fs_path("/lib/init/default.glia");
+        let resolved = resolve_guest_fs_path("/lib/init/default.glia").unwrap();
         std::env::remove_var("WW_ROOT");
         let expected = ww_root.join("lib/init/default.glia");
         assert_eq!(resolved, expected.to_string_lossy().to_string());
@@ -3300,9 +3321,25 @@ mod tests {
         let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
         std::env::remove_var("WW_ROOT");
         assert_eq!(
-            resolve_guest_fs_path("lib/init/default.glia"),
+            resolve_guest_fs_path("lib/init/default.glia").unwrap(),
             "/lib/init/default.glia".to_string()
         );
+    }
+
+    #[test]
+    fn resolve_guest_fs_path_rejects_ww_root_escape() {
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
+        let ww_root = std::env::temp_dir().join(format!(
+            "glia-ww-root-escape-{}-{}",
+            std::process::id(),
+            GENSYM_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&ww_root).unwrap();
+        std::env::set_var("WW_ROOT", &ww_root);
+        let err = resolve_guest_fs_path("/../../etc/shadow").unwrap_err();
+        std::env::remove_var("WW_ROOT");
+        assert!(err.contains("path escapes WW_ROOT"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&ww_root);
     }
 
     // --- Env tests ---
@@ -7036,6 +7073,23 @@ mod tests {
             &err,
             ":self is only valid inside attenuate :returns"
         ));
+    }
+
+    #[test]
+    fn attenuate_empty_allow_is_explicit_deny_all() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let cap = make_test_cap("svc", 1);
+        env.set("svc".into(), cap);
+        let denied = eval_str(
+            "(with-effect-handler svc (fn [data] :ok)
+               (let [svc-none (attenuate svc [])]
+                 (perform svc-none :run 1)))",
+            &mut env,
+            &d,
+        );
+        assert!(denied.is_err());
+        assert!(err_contains(&denied.unwrap_err(), "denied"));
     }
 
     #[test]
