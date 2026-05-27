@@ -1899,7 +1899,11 @@ fn parse_export_policy(v: &Val) -> Result<ExportPolicy, capnp::Error> {
         };
         let cap_policy = parse_export_cap_value(&cap_name, v)?;
         validate_cap_policy(&cap_name, kind, &cap_policy)?;
-        caps.insert(cap_name, cap_policy);
+        if caps.insert(cap_name.clone(), cap_policy).is_some() {
+            return Err(capnp::Error::failed(format!(
+                "init.glia export contains duplicate cap key '{cap_name}'"
+            )));
+        }
     }
 
     Ok(ExportPolicy { caps })
@@ -2331,28 +2335,53 @@ fn eval_cd(args: &[Val], ctx: &RefCell<Session>) -> Result<Val, Val> {
     Ok(Val::Nil)
 }
 
+fn resolve_kernel_builtin_path(path: &str) -> String {
+    if let Ok(root) = std::env::var("WW_ROOT") {
+        let root = root.trim_end_matches('/');
+        let rel = path.strip_prefix('/').unwrap_or(path);
+        return format!("{root}/{rel}");
+    }
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    format!("/{path}")
+}
+
 fn eval_list_dir(args: &[Val]) -> Result<Val, Val> {
     let path = match args.first() {
         Some(Val::Str(s)) => s.clone(),
         _ => return Err("(list-dir \"<path>\")".into()),
     };
-    let resolved = if path.starts_with('/') {
-        path
-    } else {
-        format!("/{path}")
-    };
+    let resolved = resolve_kernel_builtin_path(&path);
     let entries = std::fs::read_dir(&resolved)
         .map_err(|e| Val::from(format!("list-dir: {resolved}: {e}")))?;
 
     let mut out = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| Val::from(format!("list-dir: {resolved}: {e}")))?;
-        let metadata = std::fs::metadata(entry.path())
-            .map_err(|e| Val::from(format!("list-dir: {resolved}: {e}")))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                log::warn!("list-dir: skipping unreadable entry in {resolved}: {e}");
+                continue;
+            }
+        };
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                log::warn!(
+                    "list-dir: skipping entry in {resolved} (metadata error, possibly broken symlink): {e}"
+                );
+                continue;
+            }
+        };
         if metadata.is_file() {
             if let Some(name) = entry.file_name().to_str() {
                 out.push(Val::Str(name.to_string()));
+            } else {
+                log::warn!("list-dir: skipping non-utf8 filename in {resolved}");
             }
+        } else {
+            log::debug!("list-dir: skipping non-file entry in {resolved}");
         }
     }
     Ok(Val::List(out))
@@ -2363,11 +2392,7 @@ fn eval_path_is_dir(args: &[Val]) -> Result<Val, Val> {
         Some(Val::Str(s)) => s.clone(),
         _ => return Err("(path-is-dir \"<path>\")".into()),
     };
-    let resolved = if path.starts_with('/') {
-        path
-    } else {
-        format!("/{path}")
-    };
+    let resolved = resolve_kernel_builtin_path(&path);
     Ok(Val::Bool(std::path::Path::new(&resolved).is_dir()))
 }
 
@@ -3341,6 +3366,8 @@ fn resolve_boot_file_path(rel_path: &str) -> Option<String> {
     if let Ok(ww_root) = std::env::var("WW_ROOT") {
         let root = ww_root.trim_end_matches('/');
         let rooted = format!("{root}/{rel_path}");
+        // Fail-closed with WW_ROOT: do not silently fall back to host /etc
+        // when the rooted file is missing.
         return std::path::Path::new(&rooted).exists().then_some(rooted);
     }
 
@@ -3837,6 +3864,7 @@ wasip2::cli::command::export!(Kernel);
 #[cfg(test)]
 mod tests {
     use super::*;
+    static WW_ROOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // --- load ---
 
@@ -3925,6 +3953,38 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn eval_list_dir_skips_broken_symlink_instead_of_failing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.glia");
+        let broken = dir.path().join("broken.glia");
+        std::fs::write(&good, b"(+ 1 2)").unwrap();
+        symlink(dir.path().join("missing-target.glia"), &broken).unwrap();
+
+        let listed = eval_list_dir(&[Val::Str(dir.path().to_str().unwrap().to_string())]).unwrap();
+        let names: Vec<String> = match listed {
+            Val::List(items) => items
+                .into_iter()
+                .filter_map(|v| match v {
+                    Val::Str(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected list of names, got {other}"),
+        };
+        assert!(
+            names.iter().any(|s| s == "good.glia"),
+            "got names: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|s| s == "broken.glia"),
+            "broken symlink should be skipped: {names:?}"
+        );
+    }
+
     // --- wrap_with_handlers ---
 
     #[test]
@@ -3974,6 +4034,7 @@ mod tests {
 
     #[test]
     fn resolve_boot_file_path_uses_ww_root_without_host_fallback() {
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
         let ww_root = tempfile::tempdir().unwrap();
         let host_root = tempfile::tempdir().unwrap();
         let host_rel = format!(
@@ -3996,6 +4057,7 @@ mod tests {
 
     #[test]
     fn resolve_boot_file_path_finds_file_under_ww_root() {
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
         let ww_root = tempfile::tempdir().unwrap();
         let rooted = ww_root.path().join("etc/init.glia");
         std::fs::create_dir_all(rooted.parent().unwrap()).unwrap();
@@ -4607,6 +4669,16 @@ mod tests {
         assert!(format!("{err}").contains("unknown cap"));
     }
 
+    #[test]
+    fn test_parse_export_policy_rejects_duplicate_cap_keys_after_canonicalization() {
+        let policy = Val::Map(glia::ValMap::from_pairs(vec![
+            (Val::Keyword("host".into()), test_cap("host", "host-cid")),
+            (Val::Str("host".into()), test_cap("host", "host-cid")),
+        ]));
+        let err = parse_export_policy(&policy).unwrap_err();
+        assert!(format!("{err}").contains("duplicate cap key"));
+    }
+
     // --- host tests ---
 
     #[tokio::test]
@@ -5124,7 +5196,6 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let file_path = dir.path().join("test.bin");
             std::fs::write(&file_path, b"hello-bytes").unwrap();
-            std::env::remove_var("WW_ROOT");
 
             let form = Val::List(vec![
                 Val::Sym("perform".into()),
@@ -5146,8 +5217,6 @@ mod tests {
             let dispatch = build_dispatch();
             let mut env = Env::new();
             bind_caps_in_env(&mut env, &ctx.borrow());
-
-            std::env::remove_var("WW_ROOT");
 
             let form = Val::List(vec![
                 Val::Sym("perform".into()),
@@ -5175,7 +5244,6 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let wasm_path = dir.path().join("chess-demo.wasm");
             std::fs::write(&wasm_path, b"fake-wasm-bytes").unwrap();
-            std::env::remove_var("WW_ROOT");
 
             let script = format!(
                 r#"(perform host :listen runtime (perform :load "{}"))"#,
@@ -5205,7 +5273,6 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let wasm_path = dir.path().join("chess-demo.wasm");
             std::fs::write(&wasm_path, b"fake-wasm-bytes").unwrap();
-            std::env::remove_var("WW_ROOT");
 
             let script = format!(
                 r#"(perform host :listen runtime (perform :load "{}"))
