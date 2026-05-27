@@ -196,6 +196,20 @@ fn bytes_to_aligned_words(bytes: &[u8]) -> Vec<capnp::Word> {
     words
 }
 
+fn canonicalize_schema_node_bytes(
+    node: capnp::schema_capnp::node::Reader<'_>,
+) -> Result<Vec<u8>, capnp::Error> {
+    let mut msg = capnp::message::Builder::new_default();
+    msg.set_root_canonical(node)?;
+    let segments = msg.get_segments_for_output();
+    if segments.len() != 1 {
+        return Err(capnp::Error::failed(
+            "schema node canonicalization produced unexpected segment layout".into(),
+        ));
+    }
+    Ok(segments[0].to_vec())
+}
+
 fn build_dynamic_method_policy(
     interface: &str,
     method: &str,
@@ -205,7 +219,7 @@ fn build_dynamic_method_policy(
 ) -> Result<DynamicMethodPolicy, capnp::Error> {
     if !policy.returns.is_empty() {
         return Err(capnp::Error::failed(format!(
-            "export policy {interface}.{method}.{field}: recursive :returns under AnyPointer is not supported yet"
+            "export policy {interface}.{method}.{field}: recursive :returns for unknown dynamic schema is not supported; use a known typed interface schema or omit nested :returns"
         )));
     }
 
@@ -231,6 +245,40 @@ fn build_dynamic_method_policy(
         methods_by_id: by_id,
         allowed_ids,
     })
+}
+
+fn known_cap_kind_for_schema(schema_bytes: &[u8]) -> Option<MethodFilterCap> {
+    if schema_bytes == schema_ids::HOST_SCHEMA {
+        return Some(MethodFilterCap::Host);
+    }
+    if schema_bytes == schema_ids::RUNTIME_SCHEMA {
+        return Some(MethodFilterCap::Runtime);
+    }
+    if schema_bytes == schema_ids::ROUTING_SCHEMA {
+        return Some(MethodFilterCap::Routing);
+    }
+    if schema_bytes == schema_ids::IDENTITY_SCHEMA {
+        return Some(MethodFilterCap::Identity);
+    }
+    if schema_bytes == schema_ids::HTTP_CLIENT_SCHEMA {
+        return Some(MethodFilterCap::HttpClient);
+    }
+    if schema_bytes == schema_ids::STREAM_DIALER_SCHEMA {
+        return Some(MethodFilterCap::StreamDialer);
+    }
+    if schema_bytes == schema_ids::STREAM_LISTENER_SCHEMA {
+        return Some(MethodFilterCap::StreamListener);
+    }
+    if schema_bytes == schema_ids::VAT_CLIENT_SCHEMA {
+        return Some(MethodFilterCap::VatClient);
+    }
+    if schema_bytes == schema_ids::VAT_LISTENER_SCHEMA {
+        return Some(MethodFilterCap::VatListener);
+    }
+    if schema_bytes == schema_ids::EXECUTOR_SCHEMA {
+        return Some(MethodFilterCap::Executor);
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -1423,12 +1471,50 @@ impl system_capnp::vat_listener::Server for MethodFilteredVatListener {
                         };
                         out_handler.set_spawn(executor);
                     }
-                    Ok(system_capnp::vat_handler::WhichReader::Serve(cap)) => {
-                        let cap = match cap.get_as_capability::<capnp::capability::Client>() {
+                    Ok(system_capnp::vat_handler::WhichReader::Serve(typed)) => {
+                        let typed = match typed {
                             Ok(v) => v,
                             Err(e) => return capnp::capability::Promise::err(e),
                         };
-                        out_handler.init_serve().set_as_capability(cap.hook.clone());
+                        let cap = match typed.get_cap().get_as_capability::<capnp::capability::Client>() {
+                            Ok(v) => v,
+                            Err(e) => return capnp::capability::Promise::err(e),
+                        };
+                        let mut out_typed = out_handler.init_serve();
+                        out_typed
+                            .reborrow()
+                            .init_cap()
+                            .set_as_capability(cap.hook.clone());
+                        if !typed.has_schema() {
+                            return capnp::capability::Promise::err(capnp::Error::failed(
+                                "vat-listener.listen serve handler TypedCap missing schema".into(),
+                            ));
+                        }
+                        let schema = match typed.get_schema() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return capnp::capability::Promise::err(capnp::Error::from(e));
+                            }
+                        };
+                        let root = match schema.get_root() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return capnp::capability::Promise::err(capnp::Error::from(e));
+                            }
+                        };
+                        let deps = match schema.get_deps() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return capnp::capability::Promise::err(capnp::Error::from(e));
+                            }
+                        };
+                        let mut out_schema = out_typed.reborrow().init_schema();
+                        if let Err(e) = out_schema.set_root(root) {
+                            return capnp::capability::Promise::err(e);
+                        }
+                        if let Err(e) = out_schema.set_deps(deps) {
+                            return capnp::capability::Promise::err(e);
+                        }
                     }
                     Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
                 }
@@ -1509,19 +1595,28 @@ impl system_capnp::vat_client::Server for MethodFilteredVatClient {
             req.get().set_peer(&peer);
             req.get().set_schema(&schema);
             let resp = req.send().promise.await?;
-            let cap = resp
-                .get()?
-                .get_cap()
-                .get_as_capability::<capnp::capability::Client>()?;
+            let typed = resp.get()?.get_typed()?;
+            let cap = typed.get_cap().get_as_capability::<capnp::capability::Client>()?;
+            let typed_schema = typed.get_schema()?;
+            let typed_schema_root = typed_schema.get_root()?;
+            let typed_schema_root_bytes = canonicalize_schema_node_bytes(typed_schema_root)?;
             let cap = maybe_wrap_returned_cap(
                 MethodFilterCap::DynamicAny,
                 "dial",
                 "cap",
                 cap,
                 &policy,
-                Some(&schema),
+                Some(&typed_schema_root_bytes),
             )?;
-            results.get().get_cap().set_as_capability(cap.hook.clone());
+            let mut out_typed = results.get().init_typed();
+            out_typed
+                .reborrow()
+                .init_cap()
+                .set_as_capability(cap.hook.clone());
+            let deps = typed_schema.get_deps()?;
+            let mut out_schema = out_typed.reborrow().init_schema();
+            out_schema.set_root(typed_schema_root)?;
+            out_schema.set_deps(deps)?;
             Ok(())
         })
     }
@@ -1814,19 +1909,28 @@ impl system_capnp::process::Server for MethodFilteredProcess {
             let mut req = inner.bootstrap_request();
             req.get().set_schema(&schema);
             let resp = req.send().promise.await?;
-            let cap = resp
-                .get()?
-                .get_cap()
-                .get_as_capability::<capnp::capability::Client>()?;
+            let typed = resp.get()?.get_typed()?;
+            let cap = typed.get_cap().get_as_capability::<capnp::capability::Client>()?;
+            let typed_schema = typed.get_schema()?;
+            let typed_schema_root = typed_schema.get_root()?;
+            let typed_schema_root_bytes = canonicalize_schema_node_bytes(typed_schema_root)?;
             let cap = maybe_wrap_returned_cap(
                 MethodFilterCap::DynamicAny,
                 "bootstrap",
                 "cap",
                 cap,
                 &policy,
-                Some(&schema),
+                Some(&typed_schema_root_bytes),
             )?;
-            results.get().get_cap().set_as_capability(cap.hook.clone());
+            let mut out_typed = results.get().init_typed();
+            out_typed
+                .reborrow()
+                .init_cap()
+                .set_as_capability(cap.hook.clone());
+            let deps = typed_schema.get_deps()?;
+            let mut out_schema = out_typed.reborrow().init_schema();
+            out_schema.set_root(typed_schema_root)?;
+            out_schema.set_deps(deps)?;
             Ok(())
         })
     }
@@ -2094,11 +2198,6 @@ fn validate_cap_policy(
     policy: &ExportCapPolicy,
 ) -> Result<(), capnp::Error> {
     if matches!(kind, MethodFilterCap::DynamicAny) {
-        if !policy.returns.is_empty() {
-            return Err(capnp::Error::failed(format!(
-                "init.glia export '{cap_name}' contains recursive :returns under AnyPointer capability; this is not supported yet"
-            )));
-        }
         return Ok(());
     }
 
@@ -2343,6 +2442,9 @@ fn maybe_wrap_returned_cap(
                 "internal: missing schema bytes for dynamic return policy on {method}.{field}"
             ))
         })?;
+        if let Some(known_kind) = known_cap_kind_for_schema(schema_bytes) {
+            return maybe_wrap_export_cap(known_kind, base, child_policy);
+        }
         let dyn_policy = build_dynamic_method_policy(
             "dynamic-cap",
             method,
@@ -2628,16 +2730,62 @@ fn eval_cd(args: &[Val], ctx: &RefCell<Session>) -> Result<Val, Val> {
     Ok(Val::Nil)
 }
 
-fn resolve_kernel_builtin_path(path: &str) -> String {
+fn resolve_kernel_builtin_path(path: &str) -> Result<String, String> {
+    fn enforce_under_root(
+        root: &std::path::Path,
+        resolved: &std::path::Path,
+        original: &str,
+    ) -> Result<(), String> {
+        let canonical_root = std::fs::canonicalize(root)
+            .map_err(|e| format!("WW_ROOT '{}' is not accessible: {e}", root.display()))?;
+        // Require the nearest existing ancestor to stay within WW_ROOT so
+        // symlink traversal cannot escape the sandbox.
+        let mut probe = resolved;
+        while !probe.exists() {
+            probe = probe.parent().ok_or_else(|| {
+                format!("failed to resolve parent while checking path '{original}'")
+            })?;
+        }
+        let canonical_probe = std::fs::canonicalize(probe)
+            .map_err(|e| format!("failed to canonicalize '{original}': {e}"))?;
+        if !canonical_probe.starts_with(&canonical_root) {
+            return Err(format!(
+                "path escapes WW_ROOT via symlink traversal: {original}"
+            ));
+        }
+        Ok(())
+    }
+
+    let mut rel = std::path::PathBuf::new();
+    for component in std::path::Path::new(path).components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => rel.push(part),
+            std::path::Component::ParentDir => {
+                return Err(format!("path escapes root via '..': {path}"));
+            }
+            std::path::Component::Prefix(_) => {
+                return Err(format!("path prefixes are not supported: {path}"));
+            }
+        }
+    }
+
     if let Ok(root) = std::env::var("WW_ROOT") {
         let root = root.trim_end_matches('/');
-        let rel = path.strip_prefix('/').unwrap_or(path);
-        return format!("{root}/{rel}");
+        let root_path = std::path::Path::new(root);
+        let resolved = if rel.as_os_str().is_empty() {
+            root_path.to_path_buf()
+        } else {
+            root_path.join(rel)
+        };
+        enforce_under_root(root_path, &resolved, path)?;
+        return Ok(resolved.to_string_lossy().to_string());
     }
-    if path.starts_with('/') {
-        return path.to_string();
+    if rel.as_os_str().is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", rel.to_string_lossy()))
     }
-    format!("/{path}")
 }
 
 fn eval_list_dir(args: &[Val]) -> Result<Val, Val> {
@@ -2645,7 +2793,8 @@ fn eval_list_dir(args: &[Val]) -> Result<Val, Val> {
         Some(Val::Str(s)) => s.clone(),
         _ => return Err("(list-dir \"<path>\")".into()),
     };
-    let resolved = resolve_kernel_builtin_path(&path);
+    let resolved = resolve_kernel_builtin_path(&path)
+        .map_err(|e| Val::from(format!("list-dir: {path}: {e}")))?;
     let entries = std::fs::read_dir(&resolved)
         .map_err(|e| Val::from(format!("list-dir: {resolved}: {e}")))?;
 
@@ -2685,7 +2834,8 @@ fn eval_path_is_dir(args: &[Val]) -> Result<Val, Val> {
         Some(Val::Str(s)) => s.clone(),
         _ => return Err("(path-is-dir \"<path>\")".into()),
     };
-    let resolved = resolve_kernel_builtin_path(&path);
+    let resolved = resolve_kernel_builtin_path(&path)
+        .map_err(|e| Val::from(format!("path-is-dir: {path}: {e}")))?;
     Ok(Val::Bool(std::path::Path::new(&resolved).is_dir()))
 }
 
@@ -3902,6 +4052,33 @@ fn make_schema_builtin() -> Val {
 }
 
 fn make_doc_builtin() -> Val {
+    fn count_recursive_return_edges(policy: &AttenuationPolicy) -> usize {
+        policy
+            .returns
+            .values()
+            .map(|fields| {
+                fields.len()
+                    + fields
+                        .values()
+                        .map(count_recursive_return_edges)
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    fn max_recursive_return_depth(policy: &AttenuationPolicy) -> usize {
+        let Some(max_child) = policy
+            .returns
+            .values()
+            .flat_map(|fields| fields.values())
+            .map(max_recursive_return_depth)
+            .max()
+        else {
+            return 0;
+        };
+        1 + max_child
+    }
+
     Val::NativeFn {
         name: "doc".into(),
         func: Rc::new(|args: &[Val]| -> Result<Val, Val> {
@@ -3925,9 +4102,11 @@ fn make_doc_builtin() -> Val {
                         )));
                     }
                     if let Some(att) = inner.downcast_ref::<AttenuatedCapInner>() {
+                        let return_edges = count_recursive_return_edges(&att.policy);
+                        let return_depth = max_recursive_return_depth(&att.policy);
                         return Ok(Val::Str(format!(
-                            "attenuated capability — method whitelist\n  cap-name:   {cap_name}\n  schema-cid: {schema_cid}\n  methods:    {}",
-                            att.policy.allow_methods.len()
+                            "attenuated capability — method whitelist\n  cap-name:      {cap_name}\n  schema-cid:    {schema_cid}\n  methods:       {}\n  return-edges:  {return_edges}\n  return-depth:  {return_depth}",
+                            att.policy.allow_methods.len(),
                         )));
                     }
                     return Err(glia::error::permission_denied(
@@ -4219,10 +4398,82 @@ mod tests {
     }
 
     #[test]
+    fn eval_path_is_dir_rejects_parent_traversal_under_ww_root() {
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
+        let ww_root = tempfile::tempdir().unwrap();
+        std::env::set_var("WW_ROOT", ww_root.path());
+        let result = eval_path_is_dir(&[Val::Str("/../../etc".into())]);
+        std::env::remove_var("WW_ROOT");
+
+        let err = result.expect_err("expected traversal to be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("path escapes root"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn eval_list_dir_rejects_parent_traversal_under_ww_root() {
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
+        let ww_root = tempfile::tempdir().unwrap();
+        std::env::set_var("WW_ROOT", ww_root.path());
+        let result = eval_list_dir(&[Val::Str("/../../etc".into())]);
+        std::env::remove_var("WW_ROOT");
+
+        let err = result.expect_err("expected traversal to be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("path escapes root"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn eval_path_is_dir_rejects_symlink_escape_under_ww_root() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
+        let ww_root = tempfile::tempdir().unwrap();
+        let link = ww_root.path().join("escape");
+        symlink("/etc", &link).unwrap();
+
+        std::env::set_var("WW_ROOT", ww_root.path());
+        let result = eval_path_is_dir(&[Val::Str("/escape".into())]);
+        std::env::remove_var("WW_ROOT");
+
+        let err = result.expect_err("expected symlink escape to be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("symlink traversal"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn eval_list_dir_rejects_symlink_escape_under_ww_root() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
+        let ww_root = tempfile::tempdir().unwrap();
+        let link = ww_root.path().join("escape");
+        symlink("/etc", &link).unwrap();
+
+        std::env::set_var("WW_ROOT", ww_root.path());
+        let result = eval_list_dir(&[Val::Str("/escape".into())]);
+        std::env::remove_var("WW_ROOT");
+
+        let err = result.expect_err("expected symlink escape to be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("symlink traversal"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn eval_list_dir_includes_symlink_to_file() {
         use std::os::unix::fs::symlink;
 
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("WW_ROOT");
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.glia");
         let link = dir.path().join("link.glia");
@@ -4597,10 +4848,20 @@ mod tests {
                 return Promise::err(capnp::Error::failed("schema is required".into()));
             }
             let host: system_capnp::host::Client = capnp_rpc::new_client(TestHost);
-            results
-                .get()
+            let aligned = bytes_to_aligned_words(schema);
+            let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
+            let segment_array = capnp::message::SegmentArray::new(segments);
+            let reader =
+                capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
+            let schema_node: capnp::schema_capnp::node::Reader<'_> = capnp_rpc::pry!(reader.get_root());
+            let mut typed = results.get().init_typed();
+            typed
+                .reborrow()
                 .init_cap()
                 .set_as_capability(host.client.hook.clone());
+            let mut out_schema = typed.reborrow().init_schema();
+            capnp_rpc::pry!(out_schema.set_root(schema_node));
+            out_schema.init_deps(0);
             Promise::ok(())
         }
     }
@@ -5018,6 +5279,8 @@ mod tests {
             let typed_host: system_capnp::host::Client = dial_resp
                 .get()
                 .unwrap()
+                .get_typed()
+                .unwrap()
                 .get_cap()
                 .get_as_capability()
                 .expect("returned cap should cast to host");
@@ -5055,10 +5318,21 @@ mod tests {
                         return Promise::err(capnp::Error::failed("schema required".into()));
                     }
                     let host: system_capnp::host::Client = capnp_rpc::new_client(TestHost);
-                    results
-                        .get()
+                    let aligned = bytes_to_aligned_words(schema);
+                    let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
+                    let segment_array = capnp::message::SegmentArray::new(segments);
+                    let reader =
+                        capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
+                    let schema_node: capnp::schema_capnp::node::Reader<'_> =
+                        capnp_rpc::pry!(reader.get_root());
+                    let mut typed = results.get().init_typed();
+                    typed
+                        .reborrow()
                         .init_cap()
                         .set_as_capability(host.client.hook.clone());
+                    let mut out_schema = typed.reborrow().init_schema();
+                    capnp_rpc::pry!(out_schema.set_root(schema_node));
+                    out_schema.init_deps(0);
                     Promise::ok(())
                 }
             }
@@ -5185,6 +5459,8 @@ mod tests {
             let typed_host: system_capnp::host::Client = boot_resp
                 .get()
                 .unwrap()
+                .get_typed()
+                .unwrap()
                 .get_cap()
                 .get_as_capability()
                 .expect("returned cap should cast to host");
@@ -5260,7 +5536,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_export_policy_rejects_recursive_returns_under_anypointer() {
+    fn test_parse_export_policy_accepts_recursive_returns_under_anypointer() {
         let deny_more = AttenuationPolicy {
             allow_methods: ["id".to_string()].into_iter().collect(),
             returns: BTreeMap::from([(
@@ -5292,8 +5568,8 @@ mod tests {
             }),
         );
         let policy = Val::Map(glia::ValMap::from_pairs(vec![(Val::Keyword("host".into()), host_att)]));
-        let err = parse_export_policy(&policy).unwrap_err();
-        assert!(format!("{err}").contains("AnyPointer"));
+        let parsed = parse_export_policy(&policy).unwrap();
+        assert!(parsed.caps.contains_key("host"));
     }
 
     // --- host tests ---
@@ -6106,6 +6382,62 @@ mod tests {
         assert_eq!(
             glia::error::type_tag(&err),
             Some(glia::error::tag::PERMISSION_DENIED)
+        );
+    }
+
+    #[test]
+    fn doc_attenuated_cap_reports_recursive_returns() {
+        let builtin = make_doc_builtin();
+        let base = test_cap("host-att", "host-cid");
+
+        let mut allow_host = BTreeSet::new();
+        allow_host.insert("network".to_string());
+        let mut allow_vat = BTreeSet::new();
+        allow_vat.insert("dial".to_string());
+        let mut allow_remote = BTreeSet::new();
+        allow_remote.insert("id".to_string());
+
+        let remote_policy = AttenuationPolicy {
+            allow_methods: allow_remote,
+            returns: BTreeMap::new(),
+        };
+        let vat_policy = AttenuationPolicy {
+            allow_methods: allow_vat,
+            returns: BTreeMap::from([(
+                "dial".to_string(),
+                BTreeMap::from([("cap".to_string(), remote_policy)]),
+            )]),
+        };
+        let host_policy = AttenuationPolicy {
+            allow_methods: allow_host,
+            returns: BTreeMap::from([(
+                "network".to_string(),
+                BTreeMap::from([("vatClient".to_string(), vat_policy)]),
+            )]),
+        };
+
+        let att_cap = make_cap(
+            "host-att",
+            "host-cid",
+            Rc::new(AttenuatedCapInner {
+                base,
+                policy: host_policy,
+                descriptor: b"attenuated".to_vec(),
+            }),
+        );
+
+        let result = call_builtin(&builtin, &[att_cap]).unwrap();
+        let text = match result {
+            Val::Str(s) => s,
+            other => panic!("expected Val::Str, got {other:?}"),
+        };
+        assert!(
+            text.contains("return-edges:  2"),
+            "doc should include recursive return edges: {text}"
+        );
+        assert!(
+            text.contains("return-depth:  2"),
+            "doc should include recursive return depth: {text}"
         );
     }
 

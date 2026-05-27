@@ -63,6 +63,9 @@ type Frame = std::collections::HashMap<String, Val>;
 fn resolve_guest_fs_path(path: &str) -> Result<String, String> {
     if let Ok(root) = std::env::var("WW_ROOT") {
         let root = root.trim_end_matches('/');
+        let root_path = std::path::Path::new(root);
+        let canonical_root = std::fs::canonicalize(root_path)
+            .map_err(|e| format!("load-file: WW_ROOT '{root}' is not accessible: {e}"))?;
         let mut rel = std::path::PathBuf::new();
         for component in std::path::Path::new(path).components() {
             use std::path::Component;
@@ -81,10 +84,25 @@ fn resolve_guest_fs_path(path: &str) -> Result<String, String> {
                 Component::Normal(seg) => rel.push(seg),
             }
         }
-        return Ok(std::path::Path::new(root)
-            .join(rel)
-            .to_string_lossy()
-            .to_string());
+        let resolved = root_path.join(rel);
+
+        // Prevent WW_ROOT escape through symlink traversal by requiring the
+        // nearest existing ancestor of the requested path to stay under WW_ROOT.
+        let mut probe = resolved.as_path();
+        while !probe.exists() {
+            probe = probe.parent().ok_or_else(|| {
+                format!("load-file: failed to resolve parent for path '{path}'")
+            })?;
+        }
+        let canonical_probe = std::fs::canonicalize(probe)
+            .map_err(|e| format!("load-file: failed to canonicalize '{path}': {e}"))?;
+        if !canonical_probe.starts_with(&canonical_root) {
+            return Err(format!(
+                "load-file: path escapes WW_ROOT via symlink traversal: '{path}'"
+            ));
+        }
+
+        return Ok(resolved.to_string_lossy().to_string());
     }
     if path.starts_with('/') {
         return Ok(path.to_string());
@@ -376,6 +394,12 @@ fn parse_returns_policy(
             method_key,
             "attenuate :returns method key",
         )?);
+        if out.contains_key(&method_name) {
+            return Err(error::internal(
+                "attenuate",
+                format!("duplicate :returns method key after canonicalization: {method_name}"),
+            ));
+        }
         let fields = match fields_val {
             Val::Map(m) => m,
             other => {
@@ -392,6 +416,14 @@ fn parse_returns_policy(
                 field_key,
                 "attenuate :returns field key",
             )?);
+            if parsed_fields.contains_key(&field_name) {
+                return Err(error::internal(
+                    "attenuate",
+                    format!(
+                        "duplicate :returns field key after canonicalization for method {method_name}: {field_name}"
+                    ),
+                ));
+            }
             let field_policy = parse_self_return_policy(field_policy_val)?;
             parsed_fields.insert(field_name, field_policy);
         }
@@ -3339,6 +3371,28 @@ mod tests {
         let err = resolve_guest_fs_path("/../../etc/shadow").unwrap_err();
         std::env::remove_var("WW_ROOT");
         assert!(err.contains("path escapes WW_ROOT"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&ww_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_guest_fs_path_rejects_symlink_escape() {
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
+        let ww_root = std::env::temp_dir().join(format!(
+            "glia-ww-root-symlink-{}-{}",
+            std::process::id(),
+            GENSYM_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&ww_root).unwrap();
+        let link = ww_root.join("escape");
+        std::os::unix::fs::symlink("/etc", &link).unwrap();
+
+        std::env::set_var("WW_ROOT", &ww_root);
+        let err = resolve_guest_fs_path("/escape/passwd").unwrap_err();
+        std::env::remove_var("WW_ROOT");
+
+        assert!(err.contains("symlink traversal"), "got: {err}");
+        let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&ww_root);
     }
 
@@ -7147,6 +7201,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(err_contains(&err, "duplicate :returns option"));
+    }
+
+    #[test]
+    fn attenuate_rejects_duplicate_returns_method_keys_after_canonicalization() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("svc".into(), make_test_cap("svc", 1));
+        let err = eval_str(
+            "(attenuate svc
+               :allow [:network]
+               :returns {:stream_dialer {:cap (attenuate :self [:dial])}
+                         :stream-dialer {:cap (attenuate :self [:dial])}})",
+            &mut env,
+            &d,
+        )
+        .unwrap_err();
+        assert!(err_contains(
+            &err,
+            "duplicate :returns method key after canonicalization"
+        ));
+    }
+
+    #[test]
+    fn attenuate_rejects_duplicate_returns_field_keys_after_canonicalization() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("svc".into(), make_test_cap("svc", 1));
+        let err = eval_str(
+            "(attenuate svc
+               :allow [:network]
+               :returns {:network {:stream_dialer (attenuate :self [:dial])
+                                   :stream-dialer (attenuate :self [:dial])}})",
+            &mut env,
+            &d,
+        )
+        .unwrap_err();
+        assert!(err_contains(
+            &err,
+            "duplicate :returns field key after canonicalization"
+        ));
     }
 
     #[test]
