@@ -57,3 +57,5 @@ Notes:
 - `:self` is only valid inside `:returns`.
 - Policy validation is strict: unknown cap names, methods, and return fields fail boot.
 - Enforcement is at kernel/RPC proxy boundaries (including returned sub-caps), not evaluator-local only.
+- For `AnyPointer` return edges (`vat-client.dial.cap`, `process.bootstrap.cap`), recursive method allowlists are enforced by schema-aware RPC proxies.
+- Nested `:returns` under those dynamic `:cap` policies are currently rejected (strict error).

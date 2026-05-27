@@ -98,6 +98,7 @@ enum MethodFilterCap {
     Process,
     Signer,
     ByteStream,
+    DynamicAny,
 }
 
 fn method_filter_cap(cap_name: &str) -> Option<MethodFilterCap> {
@@ -141,6 +142,221 @@ fn return_policy<'a>(
         .returns
         .get(method)
         .and_then(|fields| fields.get(field))
+}
+
+#[derive(Clone, Default)]
+struct DynamicMethodPolicy {
+    interface_id: u64,
+    methods_by_id: BTreeMap<u16, String>,
+    allowed_ids: Option<BTreeSet<u16>>,
+}
+
+fn parse_interface_methods_from_schema(
+    schema_bytes: &[u8],
+) -> Result<(u64, BTreeMap<String, u16>, BTreeMap<u16, String>), capnp::Error> {
+    if schema_bytes.is_empty() {
+        return Err(capnp::Error::failed(
+            "schema must not be empty for AnyPointer attenuation".into(),
+        ));
+    }
+
+    let words = bytes_to_aligned_words(schema_bytes);
+    let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&words)];
+    let segment_array = capnp::message::SegmentArray::new(segments);
+    let reader = capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
+    let node: capnp::schema_capnp::node::Reader<'_> = reader.get_root()?;
+    let iface = match node.which()? {
+        capnp::schema_capnp::node::Which::Interface(i) => i,
+        _ => {
+            return Err(capnp::Error::failed(
+                "schema must decode to a capnp interface node".into(),
+            ))
+        }
+    };
+
+    let mut by_name = BTreeMap::new();
+    let mut by_id = BTreeMap::new();
+    for method in iface.get_methods()?.iter() {
+        let name = method
+            .get_name()?
+            .to_str()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?
+            .to_string();
+        let id = method.get_code_order();
+        by_name.insert(name.clone(), id);
+        by_id.insert(id, name);
+    }
+    Ok((node.get_id(), by_name, by_id))
+}
+
+fn bytes_to_aligned_words(bytes: &[u8]) -> Vec<capnp::Word> {
+    let word_count = bytes.len().div_ceil(8);
+    let mut words = vec![capnp::word(0, 0, 0, 0, 0, 0, 0, 0); word_count];
+    capnp::Word::words_to_bytes_mut(&mut words)[..bytes.len()].copy_from_slice(bytes);
+    words
+}
+
+fn build_dynamic_method_policy(
+    interface: &str,
+    method: &str,
+    field: &str,
+    policy: &ExportCapPolicy,
+    schema_bytes: &[u8],
+) -> Result<DynamicMethodPolicy, capnp::Error> {
+    if !policy.returns.is_empty() {
+        return Err(capnp::Error::failed(format!(
+            "export policy {interface}.{method}.{field}: recursive :returns under AnyPointer is not supported yet"
+        )));
+    }
+
+    let (interface_id, by_name, by_id) = parse_interface_methods_from_schema(schema_bytes)?;
+    let allowed_ids = match &policy.allow_methods {
+        None => None,
+        Some(allow_names) => {
+            let mut ids = BTreeSet::new();
+            for name in allow_names {
+                let Some(id) = by_name.get(name) else {
+                    return Err(capnp::Error::failed(format!(
+                        "export policy {interface}.{method}.{field}: unknown method '{name}' for schema interface id 0x{interface_id:x}"
+                    )));
+                };
+                ids.insert(*id);
+            }
+            Some(ids)
+        }
+    };
+
+    Ok(DynamicMethodPolicy {
+        interface_id,
+        methods_by_id: by_id,
+        allowed_ids,
+    })
+}
+
+#[derive(Clone)]
+struct MethodFilteredDynamicCap {
+    inner: capnp::capability::Client,
+    policy: DynamicMethodPolicy,
+    path: String,
+}
+
+#[derive(Clone)]
+struct DynamicDispatch(std::rc::Rc<MethodFilteredDynamicCap>);
+
+impl std::ops::Deref for DynamicDispatch {
+    type Target = MethodFilteredDynamicCap;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl capnp::capability::Server for DynamicDispatch {
+    fn dispatch_call(
+        self,
+        interface_id: u64,
+        method_id: u16,
+        params: capnp::capability::Params<capnp::any_pointer::Owned>,
+        results: capnp::capability::Results<capnp::any_pointer::Owned>,
+    ) -> capnp::capability::DispatchCallResult {
+        (*self.0)
+            .clone()
+            .dispatch_call(interface_id, method_id, params, results)
+    }
+
+    fn as_ptr(&self) -> usize {
+        self.0.as_ptr()
+    }
+}
+
+struct UntypedDynamicClient(capnp::capability::Client);
+
+impl capnp::capability::FromClientHook for UntypedDynamicClient {
+    fn new(hook: Box<dyn capnp::private::capability::ClientHook>) -> Self {
+        Self(capnp::capability::Client::new(hook))
+    }
+
+    fn into_client_hook(self) -> Box<dyn capnp::private::capability::ClientHook> {
+        self.0.hook
+    }
+
+    fn as_client_hook(&self) -> &dyn capnp::private::capability::ClientHook {
+        self.0.hook.as_ref()
+    }
+}
+
+impl capnp::capability::FromServer<MethodFilteredDynamicCap> for UntypedDynamicClient {
+    type Dispatch = DynamicDispatch;
+
+    fn from_server(
+        s: capnp::capability::Rc<MethodFilteredDynamicCap>,
+    ) -> Self::Dispatch {
+        DynamicDispatch(s)
+    }
+}
+
+impl capnp::capability::Server for MethodFilteredDynamicCap {
+    fn dispatch_call(
+        self,
+        interface_id: u64,
+        method_id: u16,
+        params: capnp::capability::Params<capnp::any_pointer::Owned>,
+        mut results: capnp::capability::Results<capnp::any_pointer::Owned>,
+    ) -> capnp::capability::DispatchCallResult {
+        if interface_id != self.policy.interface_id {
+            return capnp::capability::DispatchCallResult::new(
+                capnp::capability::Promise::err(capnp::Error::failed(format!(
+                    "permission denied: {} rejected interface id 0x{interface_id:x} (expected 0x{:x})",
+                    self.path, self.policy.interface_id
+                ))),
+                false,
+            );
+        }
+
+        let method_name = self
+            .policy
+            .methods_by_id
+            .get(&method_id)
+            .cloned()
+            .unwrap_or_else(|| format!("<unknown:{method_id}>"));
+
+        if let Some(allowed) = &self.policy.allowed_ids {
+            if !allowed.contains(&method_id) {
+                return capnp::capability::DispatchCallResult::new(
+                    capnp::capability::Promise::err(capnp::Error::failed(format!(
+                        "permission denied: {}.{} blocked by export policy",
+                        self.path, method_name
+                    ))),
+                    false,
+                );
+            }
+        }
+
+        let req = self
+            .inner;
+        let maybe_request = params.get().and_then(|p| {
+            let mut request = req.new_call::<capnp::any_pointer::Owned, capnp::any_pointer::Owned>(
+                interface_id,
+                method_id,
+                Some(p.target_size()?),
+            );
+            request.get().set_as(p)?;
+            Ok(request)
+        });
+        let promise = match maybe_request {
+            Ok(request) => capnp::capability::Promise::from_future(async move {
+                let resp = request.send().promise.await?;
+                results.set(resp.get()?)?;
+                Ok(())
+            }),
+            Err(e) => capnp::capability::Promise::err(e),
+        };
+        capnp::capability::DispatchCallResult::new(promise, false)
+    }
+
+    fn as_ptr(&self) -> usize {
+        self as *const Self as usize
+    }
 }
 
 #[derive(Clone)]
@@ -236,6 +452,7 @@ impl system_capnp::host::Server for MethodFilteredHost {
                 "streamListener",
                 stream_listener.client,
                 &policy,
+                None,
             )?;
             let stream_listener: system_capnp::stream_listener::Client =
                 capnp::capability::FromClientHook::new(stream_listener.hook.clone());
@@ -248,6 +465,7 @@ impl system_capnp::host::Server for MethodFilteredHost {
                 "streamDialer",
                 stream_dialer.client,
                 &policy,
+                None,
             )?;
             let stream_dialer: system_capnp::stream_dialer::Client =
                 capnp::capability::FromClientHook::new(stream_dialer.hook.clone());
@@ -260,6 +478,7 @@ impl system_capnp::host::Server for MethodFilteredHost {
                 "vatListener",
                 vat_listener.client,
                 &policy,
+                None,
             )?;
             let vat_listener: system_capnp::vat_listener::Client =
                 capnp::capability::FromClientHook::new(vat_listener.hook.clone());
@@ -272,6 +491,7 @@ impl system_capnp::host::Server for MethodFilteredHost {
                 "vatClient",
                 vat_client.client,
                 &policy,
+                None,
             )?;
             let vat_client: system_capnp::vat_client::Client =
                 capnp::capability::FromClientHook::new(vat_client.hook.clone());
@@ -284,6 +504,7 @@ impl system_capnp::host::Server for MethodFilteredHost {
                 "httpListener",
                 http_listener.client,
                 &policy,
+                None,
             )?;
             let http_listener: system_capnp::http_listener::Client =
                 capnp::capability::FromClientHook::new(http_listener.hook.clone());
@@ -329,6 +550,7 @@ impl system_capnp::runtime::Server for MethodFilteredRuntime {
                 "executor",
                 executor.client,
                 &policy,
+                None,
             )?;
             let executor: system_capnp::executor::Client =
                 capnp::capability::FromClientHook::new(executor.hook.clone());
@@ -766,6 +988,7 @@ impl system_capnp::ipfs::Server for MethodFilteredIpfs {
                 "stream",
                 stream.client,
                 &policy,
+                None,
             )?;
             let stream: system_capnp::byte_stream::Client =
                 capnp::capability::FromClientHook::new(stream.hook.clone());
@@ -996,6 +1219,7 @@ impl auth_capnp::identity::Server for MethodFilteredIdentity {
                 "signer",
                 signer.client,
                 &policy,
+                None,
             )?;
             let signer: auth_capnp::signer::Client =
                 capnp::capability::FromClientHook::new(signer.hook.clone());
@@ -1142,6 +1366,7 @@ impl system_capnp::stream_dialer::Server for MethodFilteredStreamDialer {
                 "stream",
                 stream.client,
                 &policy,
+                None,
             )?;
             let stream: system_capnp::byte_stream::Client =
                 capnp::capability::FromClientHook::new(stream.hook.clone());
@@ -1264,6 +1489,7 @@ impl system_capnp::vat_client::Server for MethodFilteredVatClient {
             return capnp::capability::Promise::err(e);
         }
         let inner = self.inner.clone();
+        let policy = self.policy.clone();
         let (peer, schema) = match params.get() {
             Ok(p) => {
                 let peer = match p.get_peer() {
@@ -1287,6 +1513,14 @@ impl system_capnp::vat_client::Server for MethodFilteredVatClient {
                 .get()?
                 .get_cap()
                 .get_as_capability::<capnp::capability::Client>()?;
+            let cap = maybe_wrap_returned_cap(
+                MethodFilterCap::DynamicAny,
+                "dial",
+                "cap",
+                cap,
+                &policy,
+                Some(&schema),
+            )?;
             results.get().get_cap().set_as_capability(cap.hook.clone());
             Ok(())
         })
@@ -1441,6 +1675,7 @@ impl system_capnp::executor::Server for MethodFilteredExecutor {
                 "process",
                 process.client,
                 &policy,
+                None,
             )?;
             let process: system_capnp::process::Client =
                 capnp::capability::FromClientHook::new(process.hook.clone());
@@ -1477,6 +1712,7 @@ impl system_capnp::process::Server for MethodFilteredProcess {
                 "stream",
                 stream.client,
                 &policy,
+                None,
             )?;
             let stream: system_capnp::byte_stream::Client =
                 capnp::capability::FromClientHook::new(stream.hook.clone());
@@ -1504,6 +1740,7 @@ impl system_capnp::process::Server for MethodFilteredProcess {
                 "stream",
                 stream.client,
                 &policy,
+                None,
             )?;
             let stream: system_capnp::byte_stream::Client =
                 capnp::capability::FromClientHook::new(stream.hook.clone());
@@ -1531,6 +1768,7 @@ impl system_capnp::process::Server for MethodFilteredProcess {
                 "stream",
                 stream.client,
                 &policy,
+                None,
             )?;
             let stream: system_capnp::byte_stream::Client =
                 capnp::capability::FromClientHook::new(stream.hook.clone());
@@ -1557,19 +1795,37 @@ impl system_capnp::process::Server for MethodFilteredProcess {
 
     fn bootstrap(
         self: capnp::capability::Rc<Self>,
-        _params: system_capnp::process::BootstrapParams,
+        params: system_capnp::process::BootstrapParams,
         mut results: system_capnp::process::BootstrapResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
         if let Err(e) = allow_method(&self.policy, "process", "bootstrap") {
             return capnp::capability::Promise::err(e);
         }
         let inner = self.inner.clone();
+        let policy = self.policy.clone();
+        let schema = match params.get() {
+            Ok(p) => match p.get_schema() {
+                Ok(v) => v.to_vec(),
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            },
+            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+        };
         capnp::capability::Promise::from_future(async move {
-            let resp = inner.bootstrap_request().send().promise.await?;
+            let mut req = inner.bootstrap_request();
+            req.get().set_schema(&schema);
+            let resp = req.send().promise.await?;
             let cap = resp
                 .get()?
                 .get_cap()
                 .get_as_capability::<capnp::capability::Client>()?;
+            let cap = maybe_wrap_returned_cap(
+                MethodFilterCap::DynamicAny,
+                "bootstrap",
+                "cap",
+                cap,
+                &policy,
+                Some(&schema),
+            )?;
             results.get().get_cap().set_as_capability(cap.hook.clone());
             Ok(())
         })
@@ -1787,6 +2043,7 @@ fn is_supported_method(kind: MethodFilterCap, method: &str) -> bool {
         }
         MethodFilterCap::Signer => method == "sign",
         MethodFilterCap::ByteStream => matches!(method, "read" | "write" | "close"),
+        MethodFilterCap::DynamicAny => true,
     }
 }
 
@@ -1811,6 +2068,8 @@ fn return_field_cap_kind(
         (MethodFilterCap::Process, "stdin", "stream") => Some(MethodFilterCap::ByteStream),
         (MethodFilterCap::Process, "stdout", "stream") => Some(MethodFilterCap::ByteStream),
         (MethodFilterCap::Process, "stderr", "stream") => Some(MethodFilterCap::ByteStream),
+        (MethodFilterCap::Process, "bootstrap", "cap") => Some(MethodFilterCap::DynamicAny),
+        (MethodFilterCap::VatClient, "dial", "cap") => Some(MethodFilterCap::DynamicAny),
         _ => None,
     }
 }
@@ -1824,7 +2083,8 @@ fn method_supports_cap_returns(kind: MethodFilterCap, method: &str) -> bool {
             | (MethodFilterCap::Ipfs, "read")
             | (MethodFilterCap::StreamDialer, "dial")
             | (MethodFilterCap::Executor, "spawn")
-            | (MethodFilterCap::Process, "stdin" | "stdout" | "stderr")
+            | (MethodFilterCap::Process, "stdin" | "stdout" | "stderr" | "bootstrap")
+            | (MethodFilterCap::VatClient, "dial")
     )
 }
 
@@ -1833,6 +2093,15 @@ fn validate_cap_policy(
     kind: MethodFilterCap,
     policy: &ExportCapPolicy,
 ) -> Result<(), capnp::Error> {
+    if matches!(kind, MethodFilterCap::DynamicAny) {
+        if !policy.returns.is_empty() {
+            return Err(capnp::Error::failed(format!(
+                "init.glia export '{cap_name}' contains recursive :returns under AnyPointer capability; this is not supported yet"
+            )));
+        }
+        return Ok(());
+    }
+
     if let Some(allow) = &policy.allow_methods {
         for method in allow {
             if !is_supported_method(kind, method) {
@@ -2051,6 +2320,9 @@ fn maybe_wrap_export_cap(
                 });
             Ok(wrapped.client)
         }
+        MethodFilterCap::DynamicAny => Err(capnp::Error::failed(
+            "internal: dynamic AnyPointer wrapper requires schema bytes".into(),
+        )),
     }
 }
 
@@ -2060,10 +2332,31 @@ fn maybe_wrap_returned_cap(
     field: &str,
     base: capnp::capability::Client,
     policy: &ExportCapPolicy,
+    schema_bytes: Option<&[u8]>,
 ) -> Result<capnp::capability::Client, capnp::Error> {
     let Some(child_policy) = return_policy(policy, method, field) else {
         return Ok(base);
     };
+    if matches!(kind, MethodFilterCap::DynamicAny) {
+        let schema_bytes = schema_bytes.ok_or_else(|| {
+            capnp::Error::failed(format!(
+                "internal: missing schema bytes for dynamic return policy on {method}.{field}"
+            ))
+        })?;
+        let dyn_policy = build_dynamic_method_policy(
+            "dynamic-cap",
+            method,
+            field,
+            child_policy,
+            schema_bytes,
+        )?;
+        let wrapped: UntypedDynamicClient = capnp_rpc::new_client(MethodFilteredDynamicCap {
+            inner: base,
+            policy: dyn_policy,
+            path: format!("{method}.{field}"),
+        });
+        return Ok(wrapped.0);
+    }
     maybe_wrap_export_cap(kind, base, child_policy)
 }
 
@@ -4285,13 +4578,32 @@ mod tests {
         }
     }
 
-    // --- Stub StreamDialer + VatClient (unused, just satisfy network result) ---
+    // --- Stub StreamDialer + VatClient ---
 
     struct TestStreamDialer;
     impl system_capnp::stream_dialer::Server for TestStreamDialer {}
 
     struct TestVatClient;
-    impl system_capnp::vat_client::Server for TestVatClient {}
+    #[allow(refining_impl_trait)]
+    impl system_capnp::vat_client::Server for TestVatClient {
+        fn dial(
+            self: capnp::capability::Rc<Self>,
+            params: system_capnp::vat_client::DialParams,
+            mut results: system_capnp::vat_client::DialResults,
+        ) -> Promise<(), capnp::Error> {
+            let p = capnp_rpc::pry!(params.get());
+            let schema = capnp_rpc::pry!(p.get_schema());
+            if schema.is_empty() {
+                return Promise::err(capnp::Error::failed("schema is required".into()));
+            }
+            let host: system_capnp::host::Client = capnp_rpc::new_client(TestHost);
+            results
+                .get()
+                .init_cap()
+                .set_as_capability(host.client.hook.clone());
+            Promise::ok(())
+        }
+    }
 
     struct TestHttpListener;
     impl system_capnp::http_listener::Server for TestHttpListener {}
@@ -4625,6 +4937,274 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn test_kernel_bootstrap_enforces_recursive_policy_on_vat_client_dial_cap() {
+        run_local(async {
+            struct HostOnlyMembrane {
+                host: system_capnp::host::Client,
+            }
+            #[allow(refining_impl_trait)]
+            impl membrane_capnp::membrane::Server for HostOnlyMembrane {
+                fn graft(
+                    self: capnp::capability::Rc<Self>,
+                    _params: membrane_capnp::membrane::GraftParams,
+                    mut results: membrane_capnp::membrane::GraftResults,
+                ) -> Promise<(), capnp::Error> {
+                    let mut caps = results.get().init_caps(1);
+                    let mut entry = caps.reborrow().get(0);
+                    entry.set_name("host");
+                    entry
+                        .reborrow()
+                        .init_cap()
+                        .set_as_capability(self.host.client.hook.clone());
+                    Promise::ok(())
+                }
+            }
+
+            let upstream: Membrane = capnp_rpc::new_client(HostOnlyMembrane {
+                host: capnp_rpc::new_client(TestHost),
+            });
+            let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(Some(upstream)));
+
+            let cap_policy = ExportCapPolicy {
+                allow_methods: Some(["id".to_string()].into_iter().collect()),
+                returns: BTreeMap::new(),
+            };
+            let vat_client_policy = ExportCapPolicy {
+                allow_methods: Some(["dial".to_string()].into_iter().collect()),
+                returns: BTreeMap::from([("dial".to_string(), BTreeMap::from([("cap".to_string(), cap_policy)]))]),
+            };
+            let host_policy = ExportCapPolicy {
+                allow_methods: Some(["network".to_string()].into_iter().collect()),
+                returns: BTreeMap::from([(
+                    "network".to_string(),
+                    BTreeMap::from([("vatClient".to_string(), vat_client_policy)]),
+                )]),
+            };
+            let policy = Rc::new(RefCell::new(Some(ExportPolicy {
+                caps: BTreeMap::from([("host".to_string(), host_policy)]),
+            })));
+
+            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap {
+                membrane: state,
+                policy,
+            });
+            let resp = bootstrap
+                .graft_request()
+                .send()
+                .promise
+                .await
+                .expect("bootstrap graft should succeed");
+            let caps = resp.get().unwrap().get_caps().unwrap();
+            let forwarded_host: system_capnp::host::Client =
+                get_graft_cap(&caps, "host").expect("host cap should be forwarded");
+
+            let network_resp = forwarded_host
+                .network_request()
+                .send()
+                .promise
+                .await
+                .expect("host.network should be allowed");
+            let vat_client = network_resp
+                .get()
+                .unwrap()
+                .get_vat_client()
+                .expect("vat client should be present");
+
+            let mut dial_req = vat_client.dial_request();
+            dial_req.get().set_peer(STUB_PEER_ID);
+            dial_req.get().set_schema(schema_ids::HOST_SCHEMA);
+            let dial_resp = dial_req.send().promise.await.expect("dial should be allowed");
+            let typed_host: system_capnp::host::Client = dial_resp
+                .get()
+                .unwrap()
+                .get_cap()
+                .get_as_capability()
+                .expect("returned cap should cast to host");
+
+            let id_resp = typed_host.id_request().send().promise.await;
+            assert!(id_resp.is_ok(), "id should be allowed");
+            match typed_host.addrs_request().send().promise.await {
+                Ok(_) => panic!("host.addrs should be denied by recursive dial.cap policy"),
+                Err(err) => {
+                    let msg = format!("{err}");
+                    assert!(
+                        msg.contains("permission denied"),
+                        "expected permission denied, got: {msg}"
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_kernel_bootstrap_enforces_recursive_policy_on_process_bootstrap_cap() {
+        run_local(async {
+            struct TestProcessReturnsHost;
+            #[allow(refining_impl_trait)]
+            impl system_capnp::process::Server for TestProcessReturnsHost {
+                fn bootstrap(
+                    self: capnp::capability::Rc<Self>,
+                    params: system_capnp::process::BootstrapParams,
+                    mut results: system_capnp::process::BootstrapResults,
+                ) -> Promise<(), capnp::Error> {
+                    let p = capnp_rpc::pry!(params.get());
+                    let schema = capnp_rpc::pry!(p.get_schema());
+                    if schema.is_empty() {
+                        return Promise::err(capnp::Error::failed("schema required".into()));
+                    }
+                    let host: system_capnp::host::Client = capnp_rpc::new_client(TestHost);
+                    results
+                        .get()
+                        .init_cap()
+                        .set_as_capability(host.client.hook.clone());
+                    Promise::ok(())
+                }
+            }
+
+            struct TestExecutorReturnsProcess;
+            #[allow(refining_impl_trait)]
+            impl system_capnp::executor::Server for TestExecutorReturnsProcess {
+                fn spawn(
+                    self: capnp::capability::Rc<Self>,
+                    _params: system_capnp::executor::SpawnParams,
+                    mut results: system_capnp::executor::SpawnResults,
+                ) -> Promise<(), capnp::Error> {
+                    results
+                        .get()
+                        .set_process(capnp_rpc::new_client(TestProcessReturnsHost));
+                    Promise::ok(())
+                }
+            }
+
+            struct TestRuntimeReturnsExecutor;
+            #[allow(refining_impl_trait)]
+            impl system_capnp::runtime::Server for TestRuntimeReturnsExecutor {
+                fn load(
+                    self: capnp::capability::Rc<Self>,
+                    _params: system_capnp::runtime::LoadParams,
+                    mut results: system_capnp::runtime::LoadResults,
+                ) -> Promise<(), capnp::Error> {
+                    results
+                        .get()
+                        .set_executor(capnp_rpc::new_client(TestExecutorReturnsProcess));
+                    Promise::ok(())
+                }
+            }
+
+            struct RuntimeOnlyMembrane {
+                runtime: system_capnp::runtime::Client,
+            }
+            #[allow(refining_impl_trait)]
+            impl membrane_capnp::membrane::Server for RuntimeOnlyMembrane {
+                fn graft(
+                    self: capnp::capability::Rc<Self>,
+                    _params: membrane_capnp::membrane::GraftParams,
+                    mut results: membrane_capnp::membrane::GraftResults,
+                ) -> Promise<(), capnp::Error> {
+                    let mut caps = results.get().init_caps(1);
+                    let mut entry = caps.reborrow().get(0);
+                    entry.set_name("runtime");
+                    entry
+                        .reborrow()
+                        .init_cap()
+                        .set_as_capability(self.runtime.client.hook.clone());
+                    Promise::ok(())
+                }
+            }
+
+            let upstream: Membrane = capnp_rpc::new_client(RuntimeOnlyMembrane {
+                runtime: capnp_rpc::new_client(TestRuntimeReturnsExecutor),
+            });
+            let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(Some(upstream)));
+
+            let cap_policy = ExportCapPolicy {
+                allow_methods: Some(["id".to_string()].into_iter().collect()),
+                returns: BTreeMap::new(),
+            };
+            let process_policy = ExportCapPolicy {
+                allow_methods: Some(["bootstrap".to_string()].into_iter().collect()),
+                returns: BTreeMap::from([(
+                    "bootstrap".to_string(),
+                    BTreeMap::from([("cap".to_string(), cap_policy)]),
+                )]),
+            };
+            let executor_policy = ExportCapPolicy {
+                allow_methods: Some(["spawn".to_string()].into_iter().collect()),
+                returns: BTreeMap::from([(
+                    "spawn".to_string(),
+                    BTreeMap::from([("process".to_string(), process_policy)]),
+                )]),
+            };
+            let runtime_policy = ExportCapPolicy {
+                allow_methods: Some(["load".to_string()].into_iter().collect()),
+                returns: BTreeMap::from([(
+                    "load".to_string(),
+                    BTreeMap::from([("executor".to_string(), executor_policy)]),
+                )]),
+            };
+            let policy = Rc::new(RefCell::new(Some(ExportPolicy {
+                caps: BTreeMap::from([("runtime".to_string(), runtime_policy)]),
+            })));
+
+            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap {
+                membrane: state,
+                policy,
+            });
+            let resp = bootstrap
+                .graft_request()
+                .send()
+                .promise
+                .await
+                .expect("bootstrap graft should succeed");
+            let caps = resp.get().unwrap().get_caps().unwrap();
+            let runtime: system_capnp::runtime::Client =
+                get_graft_cap(&caps, "runtime").expect("runtime cap should be forwarded");
+
+            let mut load_req = runtime.load_request();
+            load_req.get().set_wasm(b"00");
+            let load_resp = load_req.send().promise.await.expect("load should be allowed");
+            let executor = load_resp.get().unwrap().get_executor().unwrap();
+
+            let spawn_resp = executor
+                .spawn_request()
+                .send()
+                .promise
+                .await
+                .expect("spawn should be allowed");
+            let process = spawn_resp.get().unwrap().get_process().unwrap();
+
+            let mut boot_req = process.bootstrap_request();
+            boot_req.get().set_schema(schema_ids::HOST_SCHEMA);
+            let boot_resp = boot_req
+                .send()
+                .promise
+                .await
+                .expect("process.bootstrap should be allowed");
+            let typed_host: system_capnp::host::Client = boot_resp
+                .get()
+                .unwrap()
+                .get_cap()
+                .get_as_capability()
+                .expect("returned cap should cast to host");
+
+            let id_resp = typed_host.id_request().send().promise.await;
+            assert!(id_resp.is_ok(), "id should be allowed");
+            match typed_host.peers_request().send().promise.await {
+                Ok(_) => panic!("host.peers should be denied by recursive bootstrap.cap policy"),
+                Err(err) => {
+                    let msg = format!("{err}");
+                    assert!(
+                        msg.contains("permission denied"),
+                        "expected permission denied, got: {msg}"
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
     #[test]
     fn test_parse_export_policy_rejects_non_map() {
         let err = parse_export_policy(&Val::Int(1)).unwrap_err();
@@ -4677,6 +5257,43 @@ mod tests {
         ]));
         let err = parse_export_policy(&policy).unwrap_err();
         assert!(format!("{err}").contains("duplicate cap key"));
+    }
+
+    #[test]
+    fn test_parse_export_policy_rejects_recursive_returns_under_anypointer() {
+        let deny_more = AttenuationPolicy {
+            allow_methods: ["id".to_string()].into_iter().collect(),
+            returns: BTreeMap::from([(
+                "id".to_string(),
+                BTreeMap::from([("x".to_string(), AttenuationPolicy::default())]),
+            )]),
+        };
+        let vat_client_policy = AttenuationPolicy {
+            allow_methods: ["dial".to_string()].into_iter().collect(),
+            returns: BTreeMap::from([(
+                "dial".to_string(),
+                BTreeMap::from([("cap".to_string(), deny_more)]),
+            )]),
+        };
+        let host_policy = AttenuationPolicy {
+            allow_methods: ["network".to_string()].into_iter().collect(),
+            returns: BTreeMap::from([(
+                "network".to_string(),
+                BTreeMap::from([("vatClient".to_string(), vat_client_policy)]),
+            )]),
+        };
+        let host_att = make_cap(
+            "host",
+            "host-cid",
+            Rc::new(AttenuatedCapInner {
+                base: test_cap("host", "host-cid"),
+                policy: host_policy,
+                descriptor: vec![],
+            }),
+        );
+        let policy = Val::Map(glia::ValMap::from_pairs(vec![(Val::Keyword("host".into()), host_att)]));
+        let err = parse_export_policy(&policy).unwrap_err();
+        assert!(format!("{err}").contains("AnyPointer"));
     }
 
     // --- host tests ---
