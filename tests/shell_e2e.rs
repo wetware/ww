@@ -81,10 +81,11 @@ async fn spawn_shell_on_pool(pool: &ExecutorPool) -> Result<shell_capnp::shell::
                 let process = spawn_resp.get().unwrap().get_process().unwrap();
                 eprintln!("  [worker] process spawned, waiting for bootstrap");
 
-                let bootstrap_resp = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    process.bootstrap_request().send().promise,
-                )
+                let bootstrap_resp = tokio::time::timeout(std::time::Duration::from_secs(10), {
+                    let mut req = process.bootstrap_request();
+                    req.get().set_schema(b"test-schema");
+                    req.send().promise
+                })
                 .await;
                 eprintln!("  [worker] bootstrap result: {:?}", bootstrap_resp.is_ok());
 

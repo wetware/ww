@@ -196,7 +196,7 @@ Full interface reference for the capabilities available to guests.
 | `stdout` | `() -> (stream: ByteStream)` | Readable stream from guest's stdout. |
 | `stderr` | `() -> (stream: ByteStream)` | Readable stream from guest's stderr. |
 | `wait` | `() -> (exitCode: Int32)` | Block until process exits. |
-| `bootstrap` | `() -> (cap: AnyPointer)` | Get the capability exported by the guest via `system::serve()`. Type-erased. |
+| `bootstrap` | `(schema: Data) -> (cap: AnyPointer)` | Get the capability exported by the guest via `system::serve()`. Type-erased. `schema` is required for method-level attenuation on returned caps. |
 
 ### ByteStream
 

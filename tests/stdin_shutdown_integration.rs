@@ -162,6 +162,7 @@ async fn test_vat_connection_closes_stdin_on_peer_disconnect() {
                     // Convert tokio duplex → futures-io via compat layer.
                     bridge_stream.compat(),
                     "test-protocol-cid",
+                    b"test-schema",
                 )
                 .await
             });
