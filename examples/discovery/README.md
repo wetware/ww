@@ -38,27 +38,43 @@ explicitly via RPC at runtime -- no custom sections.
 
 ## Running
 
-### Step 1: Boot the nodes
+### Step 1: Run the two nodes (daemon terminals)
 
-Stack the discovery layer on top of the kernel. The init.d script
-registers the greeter cell with the host's `VatListener`.
+Start two hosts:
 
 ```sh
-# Terminal A -- boots Agent A, provides Greeter on DHT
-ww run --port=2025 std/kernel examples/discovery
+# Terminal A
+ww run --port=2025 std/kernel
 
-# Terminal B -- boots Agent B, discovers A, calls greet()
-ww run --port=2026 std/kernel examples/discovery
+# Terminal B
+ww run --port=2026 std/kernel
 ```
 
-Each terminal drops you into a Glia shell.
+Leave both processes running.
 
-### Step 2: Start the service
+### Step 2: Connect with `ww shell` (two shell terminals)
 
-From each Glia shell, run the discovery demo in service mode:
+Open two more terminals:
+
+```sh
+# Terminal C (node on :2025)
+cd examples/discovery
+ww shell
+
+# Terminal D (node on :2026)
+cd examples/discovery
+ww shell
+```
+
+If prompted, select the matching host for each port.
+
+### Step 3: Load snippets on both nodes
+
+From each Glia prompt:
 
 ```clojure
-/ > (perform runtime :run (load "bin/discovery.wasm") "serve")
+/ > (load "glia/register.glia")
+/ > (load "glia/serve.glia")
 ```
 
 Expected output on Agent B:
@@ -114,9 +130,9 @@ The same binary serves both roles:
   `routing.find_providers()`, dials them with `VatClient`, and calls
   `greet()`. Exponential backoff (2 s to 15 min).
 
-## Init.d script
+## Demo snippets
 
-`etc/init.d/discovery.glia`:
+`glia/register.glia`:
 
 ```clojure
 ; Register vat cell for the Greeter capability.
@@ -128,13 +144,15 @@ The same binary serves both roles:
 (perform host :listen runtime discovery-wasm discovery-schema)
 ```
 
-The script registers the discovery binary with the host's
-`VatListener`. The schema is read from `bin/discovery.capnpc`
-(adjacent to the WASM binary). Each incoming RPC connection spawns
-a fresh cell that exports a `Greeter` capability.
+`glia/serve.glia`:
 
-The service mode is started interactively from the Glia shell --
-not from the init.d script.
+```clojure
+(perform runtime :run (load "bin/discovery.wasm") "serve")
+```
+
+`etc/init.d/discovery.glia` is now a deployment-only hook. Keep
+init-based boot scripts for packaged images, but use snippets as the
+default demo flow.
 
 ## Without Kubo
 
@@ -162,9 +180,12 @@ examples/discovery/
 ├── bin/                   # build output (gitignored)
 │   ├── discovery.wasm
 │   └── discovery.capnpc   # compiled schema bytes
+├── glia/
+│   ├── register.glia      # shell-loaded registration
+│   └── serve.glia         # DHT provide + discovery loop
 ├── etc/
 │   └── init.d/
-│       └── discovery.glia # cell registration
+│       └── discovery.glia # deployment-only hook
 └── src/
     └── lib.rs             # guest implementation
 ```

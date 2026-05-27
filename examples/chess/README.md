@@ -34,27 +34,43 @@ explicitly via RPC at runtime -- no custom sections.
 
 ## Running
 
-### Step 1: Boot the nodes
+### Step 1: Run the two nodes (daemon terminals)
 
-Stack the chess layer on top of the kernel. The init.d script
-registers the chess cell with the host's `VatListener`.
+Start two hosts:
 
 ```sh
 # Terminal 1
-ww run --port=2025 std/kernel examples/chess
+ww run --port=2025 std/kernel
 
 # Terminal 2
-ww run --port=2026 std/kernel examples/chess
+ww run --port=2026 std/kernel
 ```
 
-Each terminal drops you into a Glia shell.
+Leave both processes running.
 
-### Step 2: Start the service
+### Step 2: Connect with `ww shell` (two shell terminals)
 
-From each Glia shell, run the chess demo in service mode:
+Open two more terminals:
+
+```sh
+# Terminal 3 (node on :2025)
+cd examples/chess
+ww shell
+
+# Terminal 4 (node on :2026)
+cd examples/chess
+ww shell
+```
+
+If prompted, select the matching host for each port.
+
+### Step 3: Load snippets on both nodes
+
+From each Glia prompt:
 
 ```clojure
-/ > (perform runtime :run (load "bin/chess-demo.wasm") "serve")
+/ > (load "glia/register.glia")
+/ > (load "glia/serve.glia")
 ```
 
 Both nodes bootstrap into the DHT, exchange provider records,
@@ -67,40 +83,37 @@ discover each other, and play a game of random chess via typed RPC.
 The `ww run` command takes one or more **image layers** as positional
 args. Each layer is a directory that gets merged into a single FHS
 root, left to right. The kernel (PID 0) sees this merged root as
-its virtual filesystem.
+its virtual filesystem. If you run a layered image such as
+`ww run --port=2025 std/kernel examples/chess`, the merged tree looks
+like:
 
 ```
 $WW_ROOT/
 ├── bin/
 │   └── chess-demo.wasm    <- from examples/chess (built by make chess)
-├── etc/
-│   └── init.d/
-│       └── chess.glia     <- from examples/chess
+├── glia/
+│   └── register.glia      <- shell-loaded snippet
 ├── boot/
 │   └── main.wasm          <- from std/kernel
 └── ...
 ```
 
 The host publishes this merged directory to IPFS and sets `$WW_ROOT`
-to `/ipfs/<cid>`. When the kernel's init system reads
-`etc/init.d/chess.glia`, the `(load "bin/chess-demo.wasm")` call
-resolves the path relative to `$WW_ROOT`, fetching the bytes from
-the merged image via the WASI filesystem interceptor.
+to `/ipfs/<cid>`. In the shell-forward flow, registration is loaded
+explicitly from `glia/register.glia`.
 
 ### Architecture
 
 ```
-                 kernel boot
-                      |
-             chess.glia evaluated
-                      |
-         (perform host :listen ...)
-                      |
-                  cell mode
-               (per-connection)
+             ww shell loads glia/register.glia
+                           |
+               (perform host :listen ...)
+                           |
+                       cell mode
+                    (per-connection)
 ```
 
-Two execution modes, selected by the init.d script:
+Two execution modes, selected by runtime inputs:
 
 - **Cell mode** (`WW_CELL_MODE=vat`): per-connection vat cell
   spawned by `VatListener`. Creates a `ChessEngineImpl` and exports
@@ -139,9 +152,9 @@ interface ChessEngine {
 }
 ```
 
-## Init.d script
+## Demo snippets
 
-`etc/init.d/chess.glia`:
+`glia/register.glia`:
 
 ```clojure
 ; Register vat cell for the ChessEngine capability.
@@ -153,14 +166,15 @@ interface ChessEngine {
 (perform host :listen runtime chess-wasm chess-schema)
 ```
 
-The script registers the chess binary with the host's `VatListener`.
-The schema is read from `bin/chess-demo.capnpc` (adjacent to the
-WASM binary). Each incoming RPC connection spawns a fresh cell that
-exports a `ChessEngine` capability.
+`glia/serve.glia`:
 
-The service mode is started interactively from the Glia shell --
-not from the init.d script. The executor capability is passed
-explicitly -- no ambient authority.
+```clojure
+(perform runtime :run (load "bin/chess-demo.wasm") "serve")
+```
+
+`etc/init.d/chess.glia` is now a deployment-only hook. Keep
+init-based boot scripts for packaged images, but use snippets as the
+default demo flow.
 
 ## Tests
 
@@ -183,11 +197,14 @@ examples/chess/
 ├── bin/                  # build output (gitignored)
 │   ├── chess-demo.wasm
 │   └── chess-demo.capnpc # compiled schema bytes
+├── glia/
+│   ├── register.glia     # shell-loaded registration
+│   └── serve.glia        # discovery + game loop
 ├── doc/
 │   └── replay.md         # replay log format
 ├── etc/
 │   └── init.d/
-│       └── chess.glia    # cell registration + service launch
+│       └── chess.glia    # deployment-only hook
 └── src/
     └── lib.rs            # guest implementation
 ```

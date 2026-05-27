@@ -1,13 +1,6 @@
-; Chess init.d script — evaluated by the kernel at boot.
+; Deployment-only hook.
 ;
-; Registers the ChessEngine vat cell. VatListener spawns a cell per
-; connection (no args = cell mode); each cell exports ChessEngine
-; via system::serve().
-;
-; To start the discovery/game service from the shell:
-;   (perform runtime :run (load "bin/chess-demo.wasm") "serve")
-
-(def chess-wasm (load "bin/chess-demo.wasm"))
-(def chess-schema (load "bin/chess-demo.capnpc"))
-
-(perform host :listen runtime chess-wasm chess-schema)
+; Demos are shell-forward by default.
+; Load snippets from examples/chess/glia/ in ww shell:
+;   (load "glia/register.glia")
+;   (load "glia/serve.glia")

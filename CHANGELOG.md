@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Examples now default to shell-forward demos with explicit Glia snippets.** Example READMEs now guide users through daemon + `ww shell` flows (`load glia/register.glia`, plus `serve`/`consume` snippets where relevant), per-example demo wiring moved from `examples/*/etc/init.d/*.glia` into new `examples/*/glia/*.glia` snippet files, and `doc/images.md` now documents init.d boot as deployment guidance rather than the demo default.
 - **AutoNAT v2 probe observability exposed with bounded history (#512).** Added a ring-buffered `nat_probe_events` surface in runtime `NetworkState` (tested address, probing server peer ID, result, timestamp), wired capture from `AutonatV2` events, and exposed operator JSON at admin `GET /host/nat` alongside existing node-level `nat_status`.
 - **`system.Ipfs` read API is now stream-only (`read -> ByteStream`).** Removed `Ipfs.readStream` and changed `Ipfs.read` to return `ByteStream`, consolidating capability attenuation to a single read method while retaining chunked daemon-backed transfer semantics for `/ipfs`, `/ipns`, and `/ipld` paths.
 - **`ww shell --mcp` now runs MCP process-local in the shell path (#508).** Replaced daemon-spawned `std/mcp` WASM execution with a process-local MCP JSON-RPC loop in the CLI that reuses shell dial/login/graft auth flow and local Glia evaluation, while keeping daemon-backed transport/auth/capability dispatch unchanged.

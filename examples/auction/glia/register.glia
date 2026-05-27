@@ -1,0 +1,7 @@
+; Demo snippet: register auction on RPC + HTTP transports.
+(def auction
+  (cell (load "bin/auction.wasm")
+        (load "bin/auction.capnpc")))
+
+(perform host :listen auction)
+(perform host :listen auction "/auction")

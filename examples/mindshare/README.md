@@ -87,25 +87,30 @@ make mindshare
 
 ## Running
 
-### Step 1: Boot the node
+### Step 1: Run the first node (daemon terminal)
 
-Stack the mindshare layer on top of the kernel. The init.d script
-registers the Mindshare cell with the host's `VatListener` and grants
-it an `HttpClient` capability for local LLM queries.
+Start a host:
 
 ```sh
-ww run --port=2025 std/kernel examples/mindshare
+ww run --port=2025 std/kernel
 ```
 
-This drops you into a Glia shell.
+Leave this process running.
 
-### Step 2: Start the DHT service
+### Step 2: Connect with `ww shell` (first node shell)
 
-From the Glia shell, run mindshare in service mode to provide the
-schema CID on the DHT:
+In a second terminal:
+
+```sh
+cd examples/mindshare
+ww shell
+```
+
+Load snippets:
 
 ```clojure
-/ > (perform runtime :run (load "bin/mindshare.wasm") "serve")
+/ > (load "glia/register.glia")
+/ > (load "glia/serve.glia")
 ```
 
 ### Step 3: Connect a second peer
@@ -113,41 +118,53 @@ schema CID on the DHT:
 Open a second terminal:
 
 ```sh
-ww run --port=2026 std/kernel examples/mindshare
+ww run --port=2026 std/kernel
 ```
 
-From the second Glia shell, start the service and connect:
+From another shell terminal:
+
+```sh
+cd examples/mindshare
+ww shell
+```
+
+If prompted, select the host for the daemon you want to control.
+
+Then load the same snippets:
 
 ```clojure
-/ > (perform runtime :run (load "bin/mindshare.wasm") "serve")
+/ > (load "glia/register.glia")
+/ > (load "glia/serve.glia")
 ```
 
 The two peers will discover each other via DHT and exchange Mindshare
 capabilities automatically.
 
-> **Note:** Cell logic is currently a stub. The init.d script and
+> **Note:** Cell logic is currently a stub. The snippet wiring and
 > schema are ready; the runtime behavior will land in a follow-up PR.
 
-## Init.d script
+## Demo snippets
 
-`etc/init.d/mindshare.glia`:
+`glia/register.glia`:
 
 ```clojure
-;; Grant an HttpClient capability (for local LLM) and define the cell.
+;; Define and register the Mindshare vat cell.
 (def mindshare
-  (with [(http (perform host :http-client))]
-    (cell (load "bin/mindshare.wasm")
-          (load "bin/mindshare.capnpc"))))
+  (cell (load "bin/mindshare.wasm")
+        (load "bin/mindshare.capnpc")))
 
 (perform host :listen mindshare)
 ```
 
-**`with`** creates local capability bindings. **`cell`** bundles
-wasm + schema + all capabilities from scope. The `HttpClient` is
-needed for outbound HTTP calls to the local LLM server (Ollama).
+`glia/serve.glia`:
 
-The service mode is started interactively from the Glia shell --
-not from the init.d script.
+```clojure
+(perform runtime :run (load "bin/mindshare.wasm") "serve")
+```
+
+`etc/init.d/mindshare.glia` is now a deployment-only hook. Keep
+init-based boot scripts for packaged images, but use snippets as the
+default demo flow.
 
 ## From the shell
 
@@ -185,9 +202,12 @@ examples/mindshare/
 ├── bin/                   # build output (gitignored)
 │   ├── mindshare.wasm
 │   └── mindshare.capnpc   # compiled schema bytes
+├── glia/
+│   ├── register.glia      # shell-loaded registration
+│   └── serve.glia         # DHT provide loop
 ├── etc/
 │   └── init.d/
-│       └── mindshare.glia # cell registration
+│       └── mindshare.glia # deployment-only hook
 └── src/
     └── lib.rs             # guest implementation
 ```

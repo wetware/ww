@@ -88,7 +88,7 @@ The operator sets `base_price` and `total_capacity`.
 ## Curl it
 
 ```sh
-curl http://localhost:8080/auction
+curl http://127.0.0.1:2080/auction
 ```
 
 Returns JSON with current auction status:
@@ -108,43 +108,61 @@ RPC `status()` method.
 
 ## Running
 
-### Step 1: Boot the node
+### Step 1: Run the provider node (daemon terminal)
 
-Stack the auction layer on top of the kernel. The init.d script
-registers the ComputeProvider cell with the host's `VatListener`.
+Start a host with HTTP enabled:
 
 ```sh
-ww run --port=2025 std/kernel examples/auction
+ww run --http-listen 127.0.0.1:2080 --port=2025 std/kernel
 ```
 
-This drops you into a Glia shell.
+Leave this process running.
 
-### Step 2: Start the DHT service
+### Step 2: Connect with `ww shell` (provider shell)
 
-From the Glia shell, run the auction in service mode. This provides
-the schema CID on the DHT and re-provides periodically:
+In a second terminal:
+
+```sh
+cd examples/auction
+ww shell
+```
+
+If multiple local nodes are running, use `ww shell --select <index|peer-id>`.
+
+### Step 3: Load snippets to register and serve
 
 ```clojure
-/ > (perform runtime :run (load "bin/auction.wasm") "serve")
+/ > (load "glia/register.glia")
+/ > (load "glia/serve.glia")
 ```
 
-### Step 3: Query from a consumer (optional)
+### Step 4: Query from a consumer (optional)
 
 Open a second terminal and boot a consumer node:
 
 ```sh
-ww run --port=2026 std/kernel examples/auction
+ww run --port=2026 std/kernel
 ```
 
-From the consumer's Glia shell, compare quotes across providers:
+From another terminal, connect to that node:
+
+```sh
+cd examples/auction
+ww shell
+```
+
+If prompted, select the host for the `--port=2026` node.
+
+Then compare quotes from Glia:
 
 ```clojure
+/ > (load "glia/register.glia")
 / > (perform auction :compare "QmWasmCid...")
 ```
 
-## Init.d script
+## Demo snippets
 
-`etc/init.d/auction.glia`:
+`glia/register.glia`:
 
 ```clojure
 ;; One binary, two transports.
@@ -156,13 +174,15 @@ From the consumer's Glia shell, compare quotes across providers:
 (perform host :listen auction "/auction")   ;; HTTP/WAGI at /auction
 ```
 
-The script registers the auction binary on two transports: schema-keyed
-RPC via `VatListener` (each incoming connection spawns a fresh cell that
-exports `ComputeProvider`), and HTTP/WAGI at `/auction` (curl-friendly
-JSON status).
+`glia/serve.glia`:
 
-The service mode (DHT provide) is started interactively from the
-Glia shell -- not from the init.d script.
+```clojure
+(perform runtime :run (load "bin/auction.wasm") "serve")
+```
+
+`etc/init.d/auction.glia` is now a deployment-only hook. Keep
+init-based boot scripts for packaged images, but use snippets as the
+default demo flow.
 
 ## Comparing from the shell
 
@@ -188,9 +208,12 @@ examples/auction/
 ├── bin/                  # build output (gitignored)
 │   ├── auction.wasm
 │   └── auction.capnpc    # compiled schema bytes
+├── glia/
+│   ├── register.glia     # shell-loaded registration
+│   └── serve.glia        # DHT provide loop
 ├── etc/
 │   └── init.d/
-│       └── auction.glia  # cell registration
+│       └── auction.glia  # deployment-only hook
 └── src/
     └── lib.rs            # guest implementation
 ```

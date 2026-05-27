@@ -14,6 +14,17 @@ Each wetware image follows a minimal FHS convention:
 Only `bin/main.wasm` is required. Everything else is convention
 between the image author and the kernel (pid0).
 
+## Demo vs deployment boot flow
+
+- **Demo default:** run a node process, attach with `ww shell`, then
+  load explicit Glia snippets (for example `glia/register.glia`,
+  `glia/serve.glia`) from the example directory.
+- **Deployment default:** bake service wiring into `etc/init.d/*.glia`
+  so services auto-register at boot without an interactive shell.
+
+Use snippets for interactive walkthroughs and reproducible tutorials.
+Use init scripts for packaged images and unattended startup.
+
 ## Mount sources
 
 Mounts can be local paths or IPFS paths. Multiple mounts are merged
