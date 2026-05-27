@@ -225,13 +225,14 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                                 tracing::debug!("Incoming vat connection");
                                 let cap = bootstrap_cap.clone();
                                 let protocol_cid = protocol_cid.clone();
+                                let schema_bytes = schema_bytes.clone();
                                 tokio::task::spawn_local(async move {
                                     let _handle_span = tracing::info_span!(
                                         "vat.handle",
                                         protocol = protocol_cid,
                                     ).entered();
                                     if let Err(e) =
-                                        handle_vat_connection_serve(cap, stream, &protocol_cid).await
+                                        handle_vat_connection_serve(cap, stream, &protocol_cid, &schema_bytes).await
                                     {
                                         tracing::error!("Vat serve connection error: {e}");
                                     }
@@ -274,7 +275,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
 pub async fn handle_vat_connection_spawn(
     executor: system_capnp::executor::Client,
     caps: Vec<(String, capnp::capability::Client, Vec<u8>)>,
-    stream: impl AsyncRead + AsyncWrite + 'static,
+    stream: impl AsyncRead + AsyncWrite + Unpin + 'static,
     protocol_cid: &str,
     schema_bytes: &[u8],
 ) -> Result<(), capnp::Error> {
@@ -345,12 +346,16 @@ pub async fn handle_vat_connection_spawn(
         }
     };
 
-    // 4. Bridge: serve the cell's cap to the remote peer over the libp2p stream.
+    // 4. Write schema attestation first, then start Cap'n Proto RPC.
+    let mut stream = stream;
+    super::vat_dial::write_schema_attestation(&mut stream, schema_bytes).await?;
+
+    // 5. Bridge: serve the cell's cap to the remote peer over the libp2p stream.
     let (reader, writer) = Box::pin(stream).split();
     let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
     let peer_rpc = RpcSystem::new(Box::new(network), Some(bootstrap_cap));
 
-    // 5. Drive the peer RPC system and cell process concurrently.
+    // 6. Drive the peer RPC system and cell process concurrently.
     //    When EITHER side finishes (peer disconnects OR cell exits),
     //    we tear down both to avoid serving a dead capability or
     //    keeping a cell alive with no peer.
@@ -384,9 +389,13 @@ pub async fn handle_vat_connection_spawn(
 /// Generic over stream type for testability.
 pub async fn handle_vat_connection_serve(
     bootstrap_cap: capnp::capability::Client,
-    stream: impl AsyncRead + AsyncWrite + 'static,
+    stream: impl AsyncRead + AsyncWrite + Unpin + 'static,
     protocol_cid: &str,
+    schema_bytes: &[u8],
 ) -> Result<(), capnp::Error> {
+    let mut stream = stream;
+    super::vat_dial::write_schema_attestation(&mut stream, schema_bytes).await?;
+
     let (reader, writer) = Box::pin(stream).split();
     let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
     let peer_rpc = RpcSystem::new(Box::new(network), Some(bootstrap_cap));

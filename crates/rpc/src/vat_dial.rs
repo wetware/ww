@@ -103,7 +103,11 @@ use capnp::capability::FromClientHook;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+const SCHEMA_ATTEST_MAGIC: &[u8; 4] = b"WWSC";
+const SCHEMA_ATTEST_VERSION: u8 = 1;
+const MAX_SCHEMA_ATTEST_BYTES: usize = 1024 * 1024; // 1 MiB hard cap
 
 /// A bootstrapped Cap'n Proto vat connection.
 ///
@@ -177,6 +181,144 @@ where
     }
 }
 
+fn map_io_error(op: &str, e: std::io::Error) -> capnp::Error {
+    capnp::Error::failed(format!("schema attestation {op} failed: {e}"))
+}
+
+/// Write the schema-attestation preface for vat streams.
+///
+/// Frame format:
+/// - 4 bytes magic: `WWSC`
+/// - 1 byte version: currently `1`
+/// - 4 bytes big-endian schema length
+/// - schema bytes (canonical `schema.Node`)
+pub async fn write_schema_attestation<S>(
+    stream: &mut S,
+    schema_bytes: &[u8],
+) -> Result<(), capnp::Error>
+where
+    S: AsyncWrite + Unpin,
+{
+    if schema_bytes.is_empty() {
+        return Err(capnp::Error::failed(
+            "schema attestation payload must not be empty".into(),
+        ));
+    }
+    if schema_bytes.len() > MAX_SCHEMA_ATTEST_BYTES {
+        return Err(capnp::Error::failed(format!(
+            "schema attestation payload too large: {} bytes (max {})",
+            schema_bytes.len(),
+            MAX_SCHEMA_ATTEST_BYTES
+        )));
+    }
+
+    stream
+        .write_all(SCHEMA_ATTEST_MAGIC)
+        .await
+        .map_err(|e| map_io_error("write magic", e))?;
+    stream
+        .write_all(&[SCHEMA_ATTEST_VERSION])
+        .await
+        .map_err(|e| map_io_error("write version", e))?;
+    stream
+        .write_all(&(schema_bytes.len() as u32).to_be_bytes())
+        .await
+        .map_err(|e| map_io_error("write length", e))?;
+    stream
+        .write_all(schema_bytes)
+        .await
+        .map_err(|e| map_io_error("write payload", e))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| map_io_error("flush", e))?;
+
+    Ok(())
+}
+
+/// Read and validate the schema-attestation preface.
+///
+/// Returns canonicalized schema bytes if:
+/// - frame parses correctly,
+/// - schema payload canonicalizes,
+/// - `CIDv1(raw, blake3(schema))` matches `expected_cid`.
+pub async fn read_and_verify_schema_attestation<S>(
+    stream: &mut S,
+    expected_cid: &str,
+) -> Result<Vec<u8>, capnp::Error>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut magic = [0u8; 4];
+    stream
+        .read_exact(&mut magic)
+        .await
+        .map_err(|e| map_io_error("read magic", e))?;
+    if &magic != SCHEMA_ATTEST_MAGIC {
+        return Err(capnp::Error::failed(
+            "invalid vat schema attestation magic".into(),
+        ));
+    }
+
+    let mut version = [0u8; 1];
+    stream
+        .read_exact(&mut version)
+        .await
+        .map_err(|e| map_io_error("read version", e))?;
+    if version[0] != SCHEMA_ATTEST_VERSION {
+        return Err(capnp::Error::failed(format!(
+            "unsupported vat schema attestation version {} (expected {})",
+            version[0], SCHEMA_ATTEST_VERSION
+        )));
+    }
+
+    let mut len = [0u8; 4];
+    stream
+        .read_exact(&mut len)
+        .await
+        .map_err(|e| map_io_error("read length", e))?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len == 0 {
+        return Err(capnp::Error::failed(
+            "vat schema attestation payload must not be empty".into(),
+        ));
+    }
+    if len > MAX_SCHEMA_ATTEST_BYTES {
+        return Err(capnp::Error::failed(format!(
+            "vat schema attestation payload too large: {len} bytes (max {MAX_SCHEMA_ATTEST_BYTES})"
+        )));
+    }
+
+    let mut schema_bytes = vec![0u8; len];
+    stream
+        .read_exact(&mut schema_bytes)
+        .await
+        .map_err(|e| map_io_error("read payload", e))?;
+
+    let canonical = super::canonicalize_schema_bytes(&schema_bytes)?;
+    let attested_cid = super::schema_cid(&canonical);
+    if attested_cid != expected_cid {
+        return Err(capnp::Error::failed(format!(
+            "vat schema attestation CID mismatch: expected {expected_cid}, got {attested_cid}"
+        )));
+    }
+    Ok(canonical)
+}
+
+/// Open a vat connection and verify producer-sourced schema attestation
+/// before starting Cap'n Proto RPC.
+pub async fn connect_with_schema_attestation<S, C>(
+    mut stream: S,
+    expected_cid: &str,
+) -> Result<(VatDial<C>, Vec<u8>), capnp::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
+    C: FromClientHook,
+{
+    let canonical_schema = read_and_verify_schema_attestation(&mut stream, expected_cid).await?;
+    Ok((connect(stream), canonical_schema))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,7 +329,7 @@ mod tests {
     use membrane::system_capnp;
     use tokio::io;
     use tokio::sync::mpsc;
-    use tokio_util::compat::TokioAsyncWriteCompatExt;
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     /// Helper: spin up a server-side `host::Client` over a duplex pair and
     /// return the *client-side* half of the duplex for the test to dial.
@@ -304,6 +446,55 @@ mod tests {
                     Ok(Ok(_)) => panic!("expected error from closed transport, got Ok"),
                     Err(_) => panic!("call hung on closed transport — driver missing?"),
                 }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn schema_attestation_round_trip_verifies_cid() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let schema = membrane::schema_registry::HOST_SCHEMA.to_vec();
+                let expected_cid = crate::schema_cid(&schema);
+                let (reader, writer) = io::duplex(8 * 1024);
+
+                tokio::task::spawn_local(async move {
+                    let mut writer = writer.compat_write();
+                    write_schema_attestation(&mut writer, &schema).await.unwrap();
+                });
+
+                let mut reader = reader.compat();
+                let got = read_and_verify_schema_attestation(&mut reader, &expected_cid)
+                    .await
+                    .expect("attestation should verify");
+                assert_eq!(got, membrane::schema_registry::HOST_SCHEMA);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn schema_attestation_rejects_cid_mismatch() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let schema = membrane::schema_registry::HOST_SCHEMA.to_vec();
+                let wrong_cid = crate::schema_cid(membrane::schema_registry::RUNTIME_SCHEMA);
+                let (reader, writer) = io::duplex(8 * 1024);
+
+                tokio::task::spawn_local(async move {
+                    let mut writer = writer.compat_write();
+                    write_schema_attestation(&mut writer, &schema).await.unwrap();
+                });
+
+                let mut reader = reader.compat();
+                let err = read_and_verify_schema_attestation(&mut reader, &wrong_cid)
+                    .await
+                    .expect_err("CID mismatch should fail");
+                assert!(
+                    format!("{err}").contains("CID mismatch"),
+                    "unexpected error: {err}"
+                );
             })
             .await;
     }

@@ -83,18 +83,16 @@ impl system_capnp::vat_client::Server for VatClientImpl {
                 ))
             })?;
 
-            // Bootstrap Cap'n Proto RPC over the libp2p stream via the
-            // paved-path helper, which spawns the RpcSystem driver before
-            // returning. The driver flushes Bootstrap and receives the
-            // remote Return on its own.
-            //
-            // We don't await an explicit handshake check: `when_resolved()`
-            // on a bootstrap pipeline client doesn't fire reliably in
-            // capnp-rpc-rust 0.25 (see vat_dial docs).  The guest's first
-            // method call through the returned cap observes any remote
-            // failure via that call's own response timeout.
-            let super::vat_dial::VatDial { bootstrap, driver } =
-                super::vat_dial::connect::<_, capnp::capability::Client>(stream);
+            // Verify producer-sourced schema attestation first, then start
+            // Cap'n Proto RPC on the same stream.
+            let (
+                super::vat_dial::VatDial { bootstrap, driver },
+                attested_schema,
+            ) = super::vat_dial::connect_with_schema_attestation::<_, capnp::capability::Client>(
+                stream,
+                &protocol_cid,
+            )
+            .await?;
 
             // The driver runs detached. Cap'n Proto refcounting handles
             // shutdown: when the guest drops all capabilities obtained from
@@ -124,7 +122,7 @@ impl system_capnp::vat_client::Server for VatClientImpl {
 
             let mut typed = results.get().init_typed();
             typed.reborrow().init_cap().set_as_capability(bootstrap.hook);
-            let aligned = crate::graft::bytes_to_aligned_words(&schema_bytes);
+            let aligned = crate::graft::bytes_to_aligned_words(&attested_schema);
             let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
             let segment_array = capnp::message::SegmentArray::new(segments);
             let reader =
