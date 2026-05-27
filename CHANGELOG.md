@@ -600,6 +600,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - 14 unit tests covering host lifecycle, executor pool scheduling, round-robin distribution, panic handling, exit code piping, and bounded channel backpressure
 
 ### Changed
+- `Process.bootstrap` now requires `schema: Data` and enforces non-empty schema payloads.
+- Recursive export attenuation now enforces `AnyPointer` return edges at RPC proxy boundaries for `vat-client.dial.cap` and `process.bootstrap.cap`.
 - `spawn_rpc_inner` and child cell spawn paths use ambient `LocalSet` instead of nested `LocalSet`, enabling proper M:N cooperative scheduling across cells on the same worker thread
 - `SwarmService` and `EpochService` now respect shutdown signal via `tokio::select!`
 - `ExecutorPool` stores worker `JoinHandle`s and joins them on drop for clean shutdown
