@@ -1,21 +1,6 @@
-;; mindshare.glia — symmetric p2p context sharing for LLMs
+;; Deployment-only hook.
 ;;
-;; Registers the Mindshare vat cell. VatListener spawns a cell per
-;; RPC connection (no args = cell mode); each cell exports Mindshare
-;; via system::serve().
-;;
-;; All graft caps (including http-client) are auto-injected by
-;; the membrane. The cell obtains other capabilities (Identity,
-;; Routing) via membrane.graft() internally.
-;;
-;; NOTE: Cell logic is a stub — the init.d script is ready for when
-;; the implementation lands.
-;;
-;; Shell commands (after boot):
-;;   (perform runtime :run (load "bin/mindshare.wasm") "serve")   ;; DHT provide loop
-
-(def mindshare
-  (cell (load "bin/mindshare.wasm")
-        (load "bin/mindshare.capnpc")))
-
-(perform host :listen mindshare)
+;; Demos are shell-forward by default.
+;; Load snippets from examples/mindshare/glia/ in ww shell:
+;;   (load "glia/register.glia")
+;;   (load "glia/serve.glia")

@@ -1,0 +1,5 @@
+; Demo snippet: register Greeter vat handler.
+(def discovery-wasm (load "bin/discovery.wasm"))
+(def discovery-schema (load "bin/discovery.capnpc"))
+
+(perform host :listen runtime discovery-wasm discovery-schema)
