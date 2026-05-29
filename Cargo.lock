@@ -5387,7 +5387,6 @@ dependencies = [
  "atom",
  "auth",
  "base58",
- "base64",
  "blake3",
  "bytes",
  "capnp",

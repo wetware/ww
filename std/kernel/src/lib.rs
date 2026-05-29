@@ -176,13 +176,16 @@ fn parse_interface_methods_from_schema(
 
     let mut by_name = BTreeMap::new();
     let mut by_id = BTreeMap::new();
-    for method in iface.get_methods()?.iter() {
+    for (wire_ordinal, method) in iface.get_methods()?.iter().enumerate() {
         let name = method
             .get_name()?
             .to_str()
             .map_err(|e| capnp::Error::failed(e.to_string()))?
             .to_string();
-        let id = method.get_code_order();
+        // Cap'n Proto dispatch IDs are wire ordinals (method list index), not
+        // schema `codeOrder` (source declaration ordering metadata).
+        let id = u16::try_from(wire_ordinal)
+            .map_err(|_| capnp::Error::failed("method ordinal exceeds u16 range".into()))?;
         by_name.insert(name.clone(), id);
         by_id.insert(id, name);
     }
@@ -6523,6 +6526,57 @@ mod tests {
         );
         let out = call_builtin(&builtin, &[cap]).unwrap();
         assert_eq!(out, Val::Bytes(descriptor));
+    }
+
+    fn encode_test_interface_schema(methods: &[(&str, u16)]) -> Vec<u8> {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut node = msg.init_root::<capnp::schema_capnp::node::Builder<'_>>();
+            node.set_id(0xabad1dea);
+            let mut iface = node.reborrow().init_interface();
+            let mut out_methods = iface.reborrow().init_methods(methods.len() as u32);
+            for (i, (name, code_order)) in methods.iter().enumerate() {
+                let mut method = out_methods.reborrow().get(i as u32);
+                method.set_name(name);
+                method.set_code_order(*code_order);
+            }
+        }
+        let segments = msg.get_segments_for_output();
+        assert_eq!(segments.len(), 1, "test schema should fit in one segment");
+        segments[0].to_vec()
+    }
+
+    #[test]
+    fn parse_interface_methods_uses_wire_ordinals_not_code_order() {
+        let schema = encode_test_interface_schema(&[("alpha", 7), ("beta", 0)]);
+        let (_interface_id, by_name, by_id) = parse_interface_methods_from_schema(&schema).unwrap();
+
+        // Wire method IDs are list ordinals, so alpha=0 and beta=1.
+        assert_eq!(by_name.get("alpha"), Some(&0));
+        assert_eq!(by_name.get("beta"), Some(&1));
+        assert_eq!(by_id.get(&0).map(String::as_str), Some("alpha"));
+        assert_eq!(by_id.get(&1).map(String::as_str), Some("beta"));
+    }
+
+    #[test]
+    fn build_dynamic_method_policy_resolves_allow_names_to_wire_ordinals() {
+        let schema = encode_test_interface_schema(&[("alpha", 7), ("beta", 0)]);
+        let mut allow = BTreeSet::new();
+        allow.insert("alpha".to_string());
+        let policy = ExportCapPolicy {
+            allow_methods: Some(allow),
+            returns: BTreeMap::new(),
+        };
+
+        let dyn_policy =
+            build_dynamic_method_policy("iface", "dial", "cap", &policy, &schema).unwrap();
+        let allowed_ids = dyn_policy.allowed_ids.expect("allow set should be present");
+
+        assert!(allowed_ids.contains(&0), "alpha should map to wire ordinal 0");
+        assert!(
+            !allowed_ids.contains(&1),
+            "beta wire ordinal should not be in allow set"
+        );
     }
 
     #[test]

@@ -2892,7 +2892,8 @@ async fn perform_cap_value<'a, D: Dispatch>(
 
         if let Some(attenuated) = inner.downcast_ref::<AttenuatedCapInner>() {
             let (method, _) = cap_method_and_args(&payload, "perform (attenuated cap)")?;
-            if !attenuated.policy.allow_methods.contains(&method) {
+            let canonical_method = canonical_member_name(&method);
+            if !attenuated.policy.allow_methods.contains(&canonical_method) {
                 return Err(error::permission_denied(
                     &format!("method :{method} denied by attenuation policy on '{name}'"),
                     None,
@@ -7049,6 +7050,31 @@ mod tests {
         );
         assert!(denied.is_err());
         assert!(err_contains(&denied.unwrap_err(), "denied"));
+    }
+
+    #[test]
+    fn attenuate_allow_matches_canonicalized_method_names() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("svc".into(), make_test_cap("svc", 1));
+
+        let kebab_policy_camel_call = eval_str(
+            "(with-effect-handler svc (fn [data] :ok)
+               (let [svc-ro (attenuate svc [:stream-dialer])]
+                 (perform svc-ro :streamDialer 1)))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(kebab_policy_camel_call, Ok(Val::Keyword("ok".into())));
+
+        let snake_policy_kebab_call = eval_str(
+            "(with-effect-handler svc (fn [data] :ok)
+               (let [svc-ro (attenuate svc [:stream_dialer])]
+                 (perform svc-ro :stream-dialer 1)))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(snake_policy_kebab_call, Ok(Val::Keyword("ok".into())));
     }
 
     #[test]
