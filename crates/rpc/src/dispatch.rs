@@ -17,12 +17,6 @@ pub struct CgiRequest {
     pub query: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
-    /// JFS-verified `X-Snap-Payload` data, if the request carried a
-    /// valid one. `None` means no header, or verification failed
-    /// (currently logged-warn-and-drop in v1.0; v1.1 will return 4xx
-    /// per spec). Cells consume this through CGI env vars emitted by
-    /// `crate::wagi::build_cgi_env`.
-    pub verified_snap: Option<crate::jfs::VerifiedJfs>,
     pub response_tx: oneshot::Sender<CgiResponse>,
 }
 

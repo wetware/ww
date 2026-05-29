@@ -661,6 +661,8 @@ async fn wait_for_export_policy_ready(
     timeout: Duration,
 ) -> std::result::Result<(), String> {
     let started = Instant::now();
+    let mut retry_delay = Duration::from_millis(100);
+    let max_retry_delay = Duration::from_secs(2);
     loop {
         match membrane.graft_request().send().promise.await {
             Ok(_) => return Ok(()),
@@ -676,7 +678,8 @@ async fn wait_for_export_policy_ready(
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
     }
 }
 

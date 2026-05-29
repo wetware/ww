@@ -19,6 +19,57 @@ use membrane::system_capnp;
 /// Timeout for establishing the libp2p stream to a remote peer.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
+pub(crate) fn schema_bytes_for_descriptor_cid(schema_cid: &str) -> Option<&'static [u8]> {
+    if schema_cid == membrane::schema_registry::HOST_CID {
+        return Some(membrane::schema_registry::HOST_SCHEMA);
+    }
+    if schema_cid == membrane::schema_registry::RUNTIME_CID {
+        return Some(membrane::schema_registry::RUNTIME_SCHEMA);
+    }
+    if schema_cid == membrane::schema_registry::ROUTING_CID {
+        return Some(membrane::schema_registry::ROUTING_SCHEMA);
+    }
+    if schema_cid == membrane::schema_registry::IDENTITY_CID {
+        return Some(membrane::schema_registry::IDENTITY_SCHEMA);
+    }
+    if schema_cid == membrane::schema_registry::HTTP_CLIENT_CID {
+        return Some(membrane::schema_registry::HTTP_CLIENT_SCHEMA);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_schema_lookup_resolves_known_cid() {
+        let bytes = schema_bytes_for_descriptor_cid(membrane::schema_registry::HOST_CID)
+            .expect("HOST_CID should resolve");
+        assert_eq!(bytes, membrane::schema_registry::HOST_SCHEMA);
+    }
+
+    #[test]
+    fn descriptor_schema_lookup_rejects_unknown_cid() {
+        assert!(
+            schema_bytes_for_descriptor_cid("bafkr4iunknowncid").is_none(),
+            "unknown schema CID must not resolve"
+        );
+    }
+
+    #[test]
+    fn vat_client_dial_schema_lookup_bytes_decode_as_schema_node() {
+        let bytes = schema_bytes_for_descriptor_cid(membrane::schema_registry::HOST_CID)
+            .expect("HOST_CID should resolve");
+        let aligned = crate::graft::bytes_to_aligned_words(bytes);
+        let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
+        let segment_array = capnp::message::SegmentArray::new(segments);
+        let reader = capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
+        let _node: capnp::schema_capnp::node::Reader<'_> =
+            reader.get_root().expect("lookup bytes should decode as schema.Node");
+    }
+}
+
 pub struct VatClientImpl {
     stream_control: libp2p_stream::Control,
     guard: EpochGuard,
@@ -44,17 +95,38 @@ impl system_capnp::vat_client::Server for VatClientImpl {
 
         let params = pry!(params.get());
         let peer_bytes = pry!(params.get_peer()).to_vec();
-        let schema_bytes = pry!(params.get_schema()).to_vec();
-
-        if schema_bytes.is_empty() {
-            return Promise::err(capnp::Error::failed("schema must not be empty".into()));
+        let descriptor = pry!(params.get_descriptor());
+        let descriptor_schema_cid_bytes = pry!(descriptor.get_schema_cid()).to_vec();
+        let descriptor_schema_cid = match std::str::from_utf8(&descriptor_schema_cid_bytes) {
+            Ok(s) if !s.is_empty() => s.to_string(),
+            Ok(_) => {
+                return Promise::err(capnp::Error::failed(
+                    "descriptor.schemaCid must not be empty".into(),
+                ))
+            }
+            Err(e) => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "descriptor.schemaCid is not utf8: {e}"
+                )))
+            }
+        };
+        let descriptor_bytes = pry!(super::canonicalize_vat_descriptor(descriptor));
+        if descriptor_bytes.is_empty() {
+            return Promise::err(capnp::Error::failed("descriptor must not be empty".into()));
         }
-        let schema_bytes = pry!(super::canonicalize_schema_bytes(&schema_bytes));
+        let schema_bytes = match schema_bytes_for_descriptor_cid(&descriptor_schema_cid) {
+            Some(bytes) => bytes.to_vec(),
+            None => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "descriptor.schemaCid unresolved in local schema registry: {descriptor_schema_cid}"
+                )))
+            }
+        };
 
         let peer_id = pry!(PeerId::from_bytes(&peer_bytes)
             .map_err(|e| capnp::Error::failed(format!("invalid peer ID: {e}"))));
 
-        let protocol_cid = super::schema_cid(&schema_bytes);
+        let protocol_cid = super::descriptor_cid(&descriptor_bytes);
         let stream_protocol = pry!(super::schema_protocol(&protocol_cid));
 
         let mut control = self.stream_control.clone();
@@ -83,16 +155,7 @@ impl system_capnp::vat_client::Server for VatClientImpl {
                 ))
             })?;
 
-            // Bootstrap Cap'n Proto RPC over the libp2p stream via the
-            // paved-path helper, which spawns the RpcSystem driver before
-            // returning. The driver flushes Bootstrap and receives the
-            // remote Return on its own.
-            //
-            // We don't await an explicit handshake check: `when_resolved()`
-            // on a bootstrap pipeline client doesn't fire reliably in
-            // capnp-rpc-rust 0.25 (see vat_dial docs).  The guest's first
-            // method call through the returned cap observes any remote
-            // failure via that call's own response timeout.
+            // Start Cap'n Proto RPC directly on the stream.
             let super::vat_dial::VatDial { bootstrap, driver } =
                 super::vat_dial::connect::<_, capnp::capability::Client>(stream);
 
@@ -123,7 +186,10 @@ impl system_capnp::vat_client::Server for VatClientImpl {
             });
 
             let mut typed = results.get().init_typed();
-            typed.reborrow().init_cap().set_as_capability(bootstrap.hook);
+            typed
+                .reborrow()
+                .init_cap()
+                .set_as_capability(bootstrap.hook);
             let aligned = crate::graft::bytes_to_aligned_words(&schema_bytes);
             let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
             let segment_array = capnp::message::SegmentArray::new(segments);

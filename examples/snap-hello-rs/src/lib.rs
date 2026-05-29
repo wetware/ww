@@ -21,10 +21,8 @@
 //!
 //! Stateless. Fresh cell per request. No graft caps used.
 //!
-//! IMPORTANT — FID trust model: `X_SNAP_FID_CLAIMED` is
-//! cryptographically signed by the embedded JFS key, but the
-//! key↔FID binding is NOT Hub-verified in v1.0 of the wetware
-//! listener (see `crates/rpc/src/jfs.rs` module docs).
+//! IMPORTANT — FID trust model: `X_SNAP_FID_CLAIMED` is demo metadata
+//! supplied by the Farcaster snap example flow.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,8 +31,8 @@ use wasip2::exports::cli::run::Guest;
 
 const SNAP_TYPE: &str = "application/vnd.farcaster.snap+json";
 
-/// Render the viewer's greeting from JFS-verified env vars set by the
-/// listener. Returns `"FID #<n>"` when present, else `"@stranger"`.
+/// Render the viewer's greeting from snap-example env vars.
+/// Returns `"FID #<n>"` when present, else `"@stranger"`.
 fn viewer_greeting() -> String {
     match std::env::var("X_SNAP_FID_CLAIMED") {
         Ok(fid) if !fid.is_empty() => format!("FID #{fid}"),

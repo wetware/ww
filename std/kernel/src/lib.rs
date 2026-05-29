@@ -1451,8 +1451,16 @@ impl system_capnp::vat_listener::Server for MethodFilteredVatListener {
                 Ok(v) => v,
                 Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
             };
-            let schema = match p.get_schema() {
+            let descriptor = match p.get_descriptor() {
                 Ok(v) => v,
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            };
+            let descriptor_wasi_cid = match descriptor.get_wasi_cid() {
+                Ok(v) => v.to_vec(),
+                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+            };
+            let descriptor_schema_cid = match descriptor.get_schema_cid() {
+                Ok(v) => v.to_vec(),
                 Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
             };
             let caps = match p.get_caps() {
@@ -1519,7 +1527,9 @@ impl system_capnp::vat_listener::Server for MethodFilteredVatListener {
                     Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
                 }
             }
-            out.reborrow().set_schema(schema);
+            let mut out_descriptor = out.reborrow().init_descriptor();
+            out_descriptor.set_wasi_cid(&descriptor_wasi_cid);
+            out_descriptor.set_schema_cid(&descriptor_schema_cid);
             let mut out_caps = out.init_caps(caps.len());
             for i in 0..caps.len() {
                 let src = caps.get(i);
@@ -1576,24 +1586,34 @@ impl system_capnp::vat_client::Server for MethodFilteredVatClient {
         }
         let inner = self.inner.clone();
         let policy = self.policy.clone();
-        let (peer, schema) = match params.get() {
+        let (peer, descriptor_wasi_cid, descriptor_schema_cid) = match params.get() {
             Ok(p) => {
                 let peer = match p.get_peer() {
                     Ok(v) => v.to_vec(),
                     Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
                 };
-                let schema = match p.get_schema() {
+                let descriptor = match p.get_descriptor() {
+                    Ok(v) => v,
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                let descriptor_wasi_cid = match descriptor.get_wasi_cid() {
                     Ok(v) => v.to_vec(),
                     Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
                 };
-                (peer, schema)
+                let descriptor_schema_cid = match descriptor.get_schema_cid() {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
+                };
+                (peer, descriptor_wasi_cid, descriptor_schema_cid)
             }
             Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
         };
         capnp::capability::Promise::from_future(async move {
             let mut req = inner.dial_request();
             req.get().set_peer(&peer);
-            req.get().set_schema(&schema);
+            let mut out_descriptor = req.get().init_descriptor();
+            out_descriptor.set_wasi_cid(&descriptor_wasi_cid);
+            out_descriptor.set_schema_cid(&descriptor_schema_cid);
             let resp = req.send().promise.await?;
             let typed = resp.get()?.get_typed()?;
             let cap = typed.get_cap().get_as_capability::<capnp::capability::Client>()?;
@@ -1890,7 +1910,7 @@ impl system_capnp::process::Server for MethodFilteredProcess {
 
     fn bootstrap(
         self: capnp::capability::Rc<Self>,
-        params: system_capnp::process::BootstrapParams,
+        _params: system_capnp::process::BootstrapParams,
         mut results: system_capnp::process::BootstrapResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
         if let Err(e) = allow_method(&self.policy, "process", "bootstrap") {
@@ -1898,17 +1918,8 @@ impl system_capnp::process::Server for MethodFilteredProcess {
         }
         let inner = self.inner.clone();
         let policy = self.policy.clone();
-        let schema = match params.get() {
-            Ok(p) => match p.get_schema() {
-                Ok(v) => v.to_vec(),
-                Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
-            },
-            Err(e) => return capnp::capability::Promise::err(capnp::Error::from(e)),
-        };
         capnp::capability::Promise::from_future(async move {
-            let mut req = inner.bootstrap_request();
-            req.get().set_schema(&schema);
-            let resp = req.send().promise.await?;
+            let resp = inner.bootstrap_request().send().promise.await?;
             let typed = resp.get()?.get_typed()?;
             let cap = typed.get_cap().get_as_capability::<capnp::capability::Client>()?;
             let typed_schema = typed.get_schema()?;
@@ -2771,8 +2782,7 @@ fn resolve_kernel_builtin_path(path: &str) -> Result<String, String> {
     }
 
     if let Ok(root) = std::env::var("WW_ROOT") {
-        let root = root.trim_end_matches('/');
-        let root_path = std::path::Path::new(root);
+        let root_path = std::path::Path::new(&root);
         let resolved = if rel.as_os_str().is_empty() {
             root_path.to_path_buf()
         } else {
@@ -2795,15 +2805,18 @@ fn eval_list_dir(args: &[Val]) -> Result<Val, Val> {
     };
     let resolved = resolve_kernel_builtin_path(&path)
         .map_err(|e| Val::from(format!("list-dir: {path}: {e}")))?;
-    let entries = std::fs::read_dir(&resolved)
+    let canonical_resolved = std::fs::canonicalize(&resolved)
         .map_err(|e| Val::from(format!("list-dir: {resolved}: {e}")))?;
+    let canonical_resolved_str = canonical_resolved.to_string_lossy().to_string();
+    let entries = std::fs::read_dir(&canonical_resolved)
+        .map_err(|e| Val::from(format!("list-dir: {canonical_resolved_str}: {e}")))?;
 
     let mut out = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                log::warn!("list-dir: skipping unreadable entry in {resolved}: {e}");
+                log::warn!("list-dir: skipping unreadable entry in {canonical_resolved_str}: {e}");
                 continue;
             }
         };
@@ -2811,7 +2824,7 @@ fn eval_list_dir(args: &[Val]) -> Result<Val, Val> {
             Ok(metadata) => metadata,
             Err(e) => {
                 log::warn!(
-                    "list-dir: skipping entry in {resolved} (metadata error, possibly broken symlink): {e}"
+                    "list-dir: skipping entry in {canonical_resolved_str} (metadata error, possibly broken symlink): {e}"
                 );
                 continue;
             }
@@ -2820,10 +2833,12 @@ fn eval_list_dir(args: &[Val]) -> Result<Val, Val> {
             if let Some(name) = entry.file_name().to_str() {
                 out.push(Val::Str(name.to_string()));
             } else {
-                log::warn!("list-dir: skipping non-utf8 filename in {resolved}");
+                log::warn!(
+                    "list-dir: skipping non-utf8 filename in {canonical_resolved_str}"
+                );
             }
         } else {
-            log::debug!("list-dir: skipping non-file entry in {resolved}");
+            log::debug!("list-dir: skipping non-file entry in {canonical_resolved_str}");
         }
     }
     Ok(Val::List(out))
@@ -2836,7 +2851,11 @@ fn eval_path_is_dir(args: &[Val]) -> Result<Val, Val> {
     };
     let resolved = resolve_kernel_builtin_path(&path)
         .map_err(|e| Val::from(format!("path-is-dir: {path}: {e}")))?;
-    Ok(Val::Bool(std::path::Path::new(&resolved).is_dir()))
+    match std::fs::canonicalize(&resolved) {
+        Ok(canonical) => Ok(Val::Bool(canonical.is_dir())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Val::Bool(false)),
+        Err(e) => Err(Val::from(format!("path-is-dir: {resolved}: {e}"))),
+    }
 }
 
 fn eval_sort_strings(args: &[Val]) -> Result<Val, Val> {
@@ -3035,14 +3054,21 @@ fn make_host_handler(
                                     let listener = network
                                         .get_vat_listener()
                                         .map_err(|e| Val::from(e.to_string()))?;
+                                    let schema = schema.as_ref().ok_or_else(|| {
+                                        Val::from(
+                                            "host :listen <cell> requires cell schema bytes for vat descriptor identity",
+                                        )
+                                    })?;
+                                    let wasi_cid = schema_id::compute_cid(wasm);
+                                    let schema_cid = schema_id::compute_cid(schema);
                                     let mut req = listener.listen_request();
                                     {
                                         let mut handler = req.get().init_handler();
                                         handler.set_spawn(executor);
                                     }
-                                    if let Some(s) = schema {
-                                        req.get().set_schema(s);
-                                    }
+                                    let mut descriptor = req.get().init_descriptor();
+                                    descriptor.set_wasi_cid(wasi_cid.as_bytes());
+                                    descriptor.set_schema_cid(schema_cid.as_bytes());
                                     // Forward captured caps from the `with` block.
                                     // Pre-filter to avoid ghost entries in the capnp list.
                                     if !caps.is_empty() {
@@ -3170,48 +3196,11 @@ fn make_host_handler(
                         match rest.len() {
                             2 => {
                                 // VatListener mode: (perform host :listen runtime <wasm>)
-                                // Load wasm via Runtime → Executor, then call
-                                // VatListener.listen() with the Executor.
-                                let wasm = match rest.get(1) {
-                                    Some(Val::Bytes(b)) => b.clone(),
-                                    _ => {
-                                        return Err(Val::from(
-                                            "host :listen — expected wasm bytes as 2nd arg",
-                                        ))
-                                    }
-                                };
-
-                                // Load the wasm to get an Executor (pipelining).
-                                let mut load_req = runtime.load_request();
-                                load_req.get().set_wasm(&wasm);
-                                let executor = load_req
-                                    .send()
-                                    .pipeline
-                                    .get_executor();
-
-                                let network_resp = host
-                                    .network_request()
-                                    .send()
-                                    .promise
-                                    .await
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                let network = network_resp
-                                    .get()
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                let listener = network
-                                    .get_vat_listener()
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                let mut req = listener.listen_request();
-                                {
-                                    let mut handler = req.get().init_handler();
-                                    handler.set_spawn(executor);
-                                }
-                                req.send()
-                                    .promise
-                                    .await
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                log::info!("host :listen — registered vat handler");
-                                Val::Nil
+                                // This legacy path cannot provide schema bytes for
+                                // descriptor.schemaCid; require explicit cell input.
+                                return Err(Val::from(
+                                    "host :listen runtime <wasm> is deprecated for vat mode; use (perform host :listen (cell <wasm-bytes> <schema-bytes>))",
+                                ));
                             }
                             3 => {
                                 // StreamListener mode: (perform host :listen runtime "proto" <wasm>)
@@ -3268,7 +3257,7 @@ fn make_host_handler(
                             }
                             _ => {
                                 return Err(Val::from(
-                                    "host :listen — usage: (perform host :listen runtime <wasm>) or (perform host :listen runtime \"proto\" <wasm>)",
+                                    "host :listen — usage: (perform host :listen <cell>) or (perform host :listen <cell> \"/path\") or (perform host :listen runtime \"proto\" <wasm>)",
                                 ))
                             }
                         }
@@ -3686,7 +3675,7 @@ Capabilities (via perform):
   (perform host :id)                         Peer ID
   (perform host :addrs)                      Listen addresses
   (perform host :peers)                      Connected peers
-  (perform host :listen runtime <wasm>)      Register RPC handler
+  (perform host :listen (cell <wasm> <schema>)) Register RPC handler
   (perform host :listen runtime \"p\" <wasm>) Register stream handler
 
   (perform runtime :run <wasm> :env {})      Spawn foreground process
@@ -3807,11 +3796,12 @@ fn wrap_with_handlers(form: &Val) -> Val {
 
 fn resolve_boot_file_path(rel_path: &str) -> Option<String> {
     if let Ok(ww_root) = std::env::var("WW_ROOT") {
-        let root = ww_root.trim_end_matches('/');
-        let rooted = format!("{root}/{rel_path}");
+        let rooted = std::path::Path::new(&ww_root).join(rel_path);
         // Fail-closed with WW_ROOT: do not silently fall back to host /etc
         // when the rooted file is missing.
-        return std::path::Path::new(&rooted).exists().then_some(rooted);
+        return rooted
+            .exists()
+            .then_some(rooted.to_string_lossy().to_string());
     }
 
     let host = format!("/{rel_path}");
@@ -3826,9 +3816,10 @@ async fn run_init_glia(
     let init_path =
         resolve_boot_file_path("etc/init.glia").ok_or_else(|| match std::env::var("WW_ROOT") {
             Ok(root) => {
-                let root = root.trim_end_matches('/');
+                let root = std::path::Path::new(&root);
                 capnp::Error::failed(format!(
-                    "boot failed: missing required {root}/etc/init.glia"
+                    "boot failed: missing required {}/etc/init.glia",
+                    root.display()
                 ))
             }
             Err(_) => capnp::Error::failed("boot failed: missing required /etc/init.glia".into()),
@@ -4618,6 +4609,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_kernel_builtin_path_honors_ww_root_slash() {
+        let _guard = WW_ROOT_TEST_LOCK.lock().unwrap();
+        std::env::set_var("WW_ROOT", "/");
+        let resolved = resolve_kernel_builtin_path("/tmp").unwrap();
+        std::env::remove_var("WW_ROOT");
+        assert_eq!(resolved, "/tmp".to_string());
+    }
+
     // ===================================================================
     // Integration tests — dispatch handlers against capnp-rpc stub servers
     // ===================================================================
@@ -4843,12 +4843,15 @@ mod tests {
             mut results: system_capnp::vat_client::DialResults,
         ) -> Promise<(), capnp::Error> {
             let p = capnp_rpc::pry!(params.get());
-            let schema = capnp_rpc::pry!(p.get_schema());
-            if schema.is_empty() {
-                return Promise::err(capnp::Error::failed("schema is required".into()));
+            let descriptor = capnp_rpc::pry!(p.get_descriptor());
+            let schema_cid = capnp_rpc::pry!(descriptor.get_schema_cid());
+            if schema_cid != schema_ids::HOST_CID.as_bytes() {
+                return Promise::err(capnp::Error::failed(
+                    "expected descriptor.schemaCid to match host schema CID".into(),
+                ));
             }
             let host: system_capnp::host::Client = capnp_rpc::new_client(TestHost);
-            let aligned = bytes_to_aligned_words(schema);
+            let aligned = bytes_to_aligned_words(schema_ids::HOST_SCHEMA);
             let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
             let segment_array = capnp::message::SegmentArray::new(segments);
             let reader =
@@ -5274,7 +5277,11 @@ mod tests {
 
             let mut dial_req = vat_client.dial_request();
             dial_req.get().set_peer(STUB_PEER_ID);
-            dial_req.get().set_schema(schema_ids::HOST_SCHEMA);
+            {
+                let mut descriptor = dial_req.get().init_descriptor();
+                descriptor.set_wasi_cid(b"test-wasi-cid");
+                descriptor.set_schema_cid(schema_ids::HOST_CID.as_bytes());
+            }
             let dial_resp = dial_req.send().promise.await.expect("dial should be allowed");
             let typed_host: system_capnp::host::Client = dial_resp
                 .get()
@@ -5309,16 +5316,11 @@ mod tests {
             impl system_capnp::process::Server for TestProcessReturnsHost {
                 fn bootstrap(
                     self: capnp::capability::Rc<Self>,
-                    params: system_capnp::process::BootstrapParams,
+                    _params: system_capnp::process::BootstrapParams,
                     mut results: system_capnp::process::BootstrapResults,
                 ) -> Promise<(), capnp::Error> {
-                    let p = capnp_rpc::pry!(params.get());
-                    let schema = capnp_rpc::pry!(p.get_schema());
-                    if schema.is_empty() {
-                        return Promise::err(capnp::Error::failed("schema required".into()));
-                    }
                     let host: system_capnp::host::Client = capnp_rpc::new_client(TestHost);
-                    let aligned = bytes_to_aligned_words(schema);
+                    let aligned = bytes_to_aligned_words(schema_ids::HOST_SCHEMA);
                     let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
                     let segment_array = capnp::message::SegmentArray::new(segments);
                     let reader =
@@ -5449,8 +5451,7 @@ mod tests {
                 .expect("spawn should be allowed");
             let process = spawn_resp.get().unwrap().get_process().unwrap();
 
-            let mut boot_req = process.bootstrap_request();
-            boot_req.get().set_schema(schema_ids::HOST_SCHEMA);
+            let boot_req = process.bootstrap_request();
             let boot_resp = boot_req
                 .send()
                 .promise
@@ -6125,7 +6126,7 @@ mod tests {
 
     // --- init script eval integration ---
 
-    /// Eval (perform host :listen runtime (perform :load "path")) end-to-end.
+    /// Eval (perform host :listen (cell ...)) end-to-end.
     #[tokio::test]
     async fn test_chess_glia_listen_form_evals_end_to_end() {
         run_local(async {
@@ -6139,7 +6140,7 @@ mod tests {
             std::fs::write(&wasm_path, b"fake-wasm-bytes").unwrap();
 
             let script = format!(
-                r#"(perform host :listen runtime (perform :load "{}"))"#,
+                r#"(perform host :listen (cell (perform :load "{}") (schema host)))"#,
                 wasm_path.to_str().unwrap()
             );
             let form = read(&script).unwrap();
@@ -6168,7 +6169,7 @@ mod tests {
             std::fs::write(&wasm_path, b"fake-wasm-bytes").unwrap();
 
             let script = format!(
-                r#"(perform host :listen runtime (perform :load "{}"))
+                r#"(perform host :listen (cell (perform :load "{}") (schema host)))
                    (perform runtime :run (perform :load "{}"))"#,
                 wasm_path.to_str().unwrap(),
                 wasm_path.to_str().unwrap()

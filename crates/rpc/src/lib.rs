@@ -8,7 +8,6 @@ pub mod dispatch;
 pub mod graft;
 pub mod http_client;
 pub mod http_listener;
-pub mod jfs;
 pub mod keys;
 pub mod routing;
 pub mod stream_dialer;
@@ -73,10 +72,30 @@ pub fn schema_cid(schema_bytes: &[u8]) -> String {
     cid::Cid::new_v1(0x55, mh).to_string()
 }
 
+/// Derive CIDv1(raw, BLAKE3(canonical VatDescriptor bytes)).
+pub fn descriptor_cid(descriptor_bytes: &[u8]) -> String {
+    schema_cid(descriptor_bytes)
+}
+
 /// Build a `StreamProtocol` from a schema CID string.
 pub fn schema_protocol(cid: &str) -> Result<StreamProtocol, capnp::Error> {
     StreamProtocol::try_from_owned(format!("/ww/0.1.0/vat/{cid}"))
         .map_err(|e| capnp::Error::failed(format!("invalid protocol from schema CID: {e}")))
+}
+
+/// Canonicalize a VatDescriptor reader into raw single-segment bytes.
+pub fn canonicalize_vat_descriptor(
+    descriptor: system_capnp::vat_descriptor::Reader<'_>,
+) -> Result<Vec<u8>, capnp::Error> {
+    let mut msg = capnp::message::Builder::new_default();
+    msg.set_root_canonical(descriptor)?;
+    let segments = msg.get_segments_for_output();
+    if segments.len() != 1 {
+        return Err(capnp::Error::failed(
+            "descriptor canonicalization produced unexpected segment layout".into(),
+        ));
+    }
+    Ok(segments[0].to_vec())
 }
 
 /// Re-canonicalize a `Schema.Node` reader into raw single-segment bytes.
@@ -153,7 +172,7 @@ pub(crate) fn extract_wasm_custom_section<'a>(
 /// is not yet implemented (see TODOS.md: FastCGI / HttpListener).
 #[derive(Debug)]
 #[allow(dead_code)]
-pub(crate) enum CellType {
+pub enum CellType {
     /// Raw libp2p stream with protocol ID.
     Raw(String),
     /// HTTP/WAGI cell with path prefix.
@@ -169,7 +188,7 @@ pub(crate) enum CellType {
 /// section data is malformed.
 /// Used by tooling. Listeners use explicit params; custom sections are optional hints.
 #[allow(dead_code)]
-pub(crate) fn decode_cell_section(wasm_bytes: &[u8]) -> Result<Option<CellType>, capnp::Error> {
+pub fn decode_cell_section(wasm_bytes: &[u8]) -> Result<Option<CellType>, capnp::Error> {
     let section_data = match extract_wasm_custom_section(wasm_bytes, "cell.capnp")? {
         Some(data) if !data.is_empty() => data,
         Some(_) => {
@@ -455,6 +474,7 @@ pub struct ProcessImpl {
     stderr: system_capnp::byte_stream::Client,
     exit_rx: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<i32>>>>,
     bootstrap_cap: Option<capnp::capability::Client>,
+    bootstrap_schema: Option<Vec<u8>>,
     kill_tx: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
@@ -472,6 +492,7 @@ impl ProcessImpl {
             stderr,
             exit_rx: Arc::new(Mutex::new(Some(exit_rx))),
             bootstrap_cap: None,
+            bootstrap_schema: None,
             kill_tx: Arc::new(kill_tx),
         }
     }
@@ -482,6 +503,7 @@ impl ProcessImpl {
         stderr: system_capnp::byte_stream::Client,
         exit_rx: tokio::sync::oneshot::Receiver<i32>,
         bootstrap_cap: capnp::capability::Client,
+        bootstrap_schema: Vec<u8>,
         kill_tx: tokio::sync::watch::Sender<bool>,
     ) -> Self {
         Self {
@@ -490,6 +512,7 @@ impl ProcessImpl {
             stderr,
             exit_rx: Arc::new(Mutex::new(Some(exit_rx))),
             bootstrap_cap: Some(bootstrap_cap),
+            bootstrap_schema: Some(bootstrap_schema),
             kill_tx: Arc::new(kill_tx),
         }
     }
@@ -542,27 +565,20 @@ impl system_capnp::process::Server for ProcessImpl {
 
     fn bootstrap(
         self: capnp::capability::Rc<Self>,
-        params: system_capnp::process::BootstrapParams,
+        _params: system_capnp::process::BootstrapParams,
         mut results: system_capnp::process::BootstrapResults,
     ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
-        let schema_bytes = match params.get() {
-            Ok(p) => match p.get_schema() {
-                Ok(schema) => schema.to_vec(),
-                Err(e) => return Promise::err(capnp::Error::from(e)),
-            },
-            Err(e) => return Promise::err(capnp::Error::from(e)),
-        };
-        if schema_bytes.is_empty() {
-            return Promise::err(capnp::Error::failed(
-                "process.bootstrap schema must not be empty".into(),
-            ));
-        }
-
         let cap = self.bootstrap_cap.clone();
+        let schema_bytes = self.bootstrap_schema.clone();
         Promise::from_future(async move {
             let cap = cap.ok_or_else(|| {
                 capnp::Error::failed(
                     "process did not export a bootstrap capability via system::serve()".into(),
+                )
+            })?;
+            let schema_bytes = schema_bytes.ok_or_else(|| {
+                capnp::Error::failed(
+                    "process did not export bootstrap schema metadata via system::serve()".into(),
                 )
             })?;
             let canonical_schema = canonicalize_schema_bytes(&schema_bytes)?;
@@ -1106,14 +1122,14 @@ mod tests {
                     stderr,
                     exit_rx,
                     host.client.clone(),
+                    membrane::schema_registry::HOST_SCHEMA.to_vec(),
                     kill_tx,
                 );
                 let process = setup_process_rpc(process_impl);
 
                 // Call bootstrap() — should return the stored cap.
                 let resp = {
-                    let mut req = process.bootstrap_request();
-                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
+                    let req = process.bootstrap_request();
                     req.send().promise
                 }
                 .await
@@ -1140,8 +1156,7 @@ mod tests {
 
                 // Call bootstrap() without a stored cap — should error.
                 let result = {
-                    let mut req = process.bootstrap_request();
-                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
+                    let req = process.bootstrap_request();
                     req.send().promise
                 }
                 .await;
@@ -1171,6 +1186,7 @@ mod tests {
                     stderr,
                     exit_rx,
                     host.client.clone(),
+                    membrane::schema_registry::HOST_SCHEMA.to_vec(),
                     kill_tx,
                 );
                 let process = setup_process_rpc(process_impl);
@@ -1178,8 +1194,7 @@ mod tests {
                 // Call bootstrap() twice — both should return working caps.
                 for _ in 0..2 {
                     let resp = {
-                        let mut req = process.bootstrap_request();
-                        req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
+                        let req = process.bootstrap_request();
                         req.send().promise
                     }
                     .await
@@ -1222,14 +1237,14 @@ mod tests {
                     stderr,
                     exit_rx,
                     delayed_host.client.clone(),
+                    membrane::schema_registry::HOST_SCHEMA.to_vec(),
                     kill_tx,
                 );
                 let process = setup_process_rpc(process_impl);
 
                 // Call bootstrap() immediately — the cap hasn't resolved yet.
                 let resp = {
-                    let mut req = process.bootstrap_request();
-                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
+                    let req = process.bootstrap_request();
                     req.send().promise
                 }
                 .await
@@ -1386,14 +1401,14 @@ mod tests {
                     stderr,
                     exit_rx,
                     host.client.clone(),
+                    membrane::schema_registry::HOST_SCHEMA.to_vec(),
                     kill_tx,
                 );
                 let process = setup_process_rpc(process_impl);
 
                 // 3. Call Process.bootstrap() to get the cap (what handle_rpc_connection does).
                 let resp = {
-                    let mut req = process.bootstrap_request();
-                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
+                    let req = process.bootstrap_request();
                     req.send().promise
                 }
                 .await
@@ -1434,13 +1449,13 @@ mod tests {
                     stderr,
                     exit_rx,
                     host.client.clone(),
+                    membrane::schema_registry::HOST_SCHEMA.to_vec(),
                     kill_tx,
                 );
                 let process = setup_process_rpc(process_impl);
 
                 let resp = {
-                    let mut req = process.bootstrap_request();
-                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
+                    let req = process.bootstrap_request();
                     req.send().promise
                 }
                 .await
@@ -1482,13 +1497,13 @@ mod tests {
                     stderr,
                     exit_rx,
                     host.client.clone(),
+                    membrane::schema_registry::HOST_SCHEMA.to_vec(),
                     kill_tx,
                 );
                 let process = setup_process_rpc(process_impl);
 
                 let resp = {
-                    let mut req = process.bootstrap_request();
-                    req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
+                    let req = process.bootstrap_request();
                     req.send().promise
                 }
                 .await
@@ -1539,13 +1554,13 @@ mod tests {
                         stderr,
                         exit_rx,
                         host.client.clone(),
+                        membrane::schema_registry::HOST_SCHEMA.to_vec(),
                         kill_tx,
                     );
                     let process = setup_process_rpc(process_impl);
 
                     let resp = {
-                        let mut req = process.bootstrap_request();
-                        req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
+                        let req = process.bootstrap_request();
                         req.send().promise
                     }
                     .await
@@ -1617,6 +1632,15 @@ mod tests {
         capnp_rpc::new_client(StubExecutor)
     }
 
+    fn init_test_descriptor(
+        mut descriptor: system_capnp::vat_descriptor::Builder<'_>,
+        schema: &[u8],
+    ) {
+        descriptor.set_wasi_cid(b"test-wasi-cid");
+        let schema_cid = super::schema_cid(schema);
+        descriptor.set_schema_cid(schema_cid.as_bytes());
+    }
+
     /// Build a minimal WASM component with an optional custom section.
     /// Returns bytes that wasmparser can parse (valid WASM component header).
     fn wasm_with_custom_section(section_name: &str, data: &[u8]) -> Vec<u8> {
@@ -1660,7 +1684,11 @@ mod tests {
                     let mut handler = req.get().init_handler();
                     handler.set_spawn(executor);
                 }
-                req.get().set_schema(&[]); // empty schema
+                {
+                    let mut descriptor = req.get().init_descriptor();
+                    descriptor.set_wasi_cid(b"test-wasi-cid");
+                    descriptor.set_schema_cid(b"");
+                }
 
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "empty schema param should error");
@@ -1685,7 +1713,11 @@ mod tests {
                 let keypair = libp2p::identity::Keypair::generate_ed25519();
                 let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
                 req.get().set_peer(&peer_id.to_bytes());
-                req.get().set_schema(&[]); // empty schema
+                {
+                    let mut descriptor = req.get().init_descriptor();
+                    descriptor.set_wasi_cid(b"test-wasi-cid");
+                    descriptor.set_schema_cid(b"");
+                }
 
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "empty schema should error");
@@ -1704,10 +1736,48 @@ mod tests {
 
                 let mut req = dialer.dial_request();
                 req.get().set_peer(&[0xFF, 0xFF, 0xFF]); // garbage peer ID
-                req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
-
+                {
+                    let mut descriptor = req.get().init_descriptor();
+                    init_test_descriptor(
+                        descriptor.reborrow(),
+                        membrane::schema_registry::HOST_SCHEMA,
+                    );
+                }
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "invalid peer ID should error");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_vat_client_unresolved_schema_cid_errors() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_tx, guard) = test_epoch_guard(1);
+                let dialer_impl = vat_client::VatClientImpl::new(dummy_stream_control(), guard);
+                let dialer: system_capnp::vat_client::Client = capnp_rpc::new_client(dialer_impl);
+
+                let mut req = dialer.dial_request();
+                // Valid peer ID (Ed25519 public key)
+                let keypair = libp2p::identity::Keypair::generate_ed25519();
+                let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
+                req.get().set_peer(&peer_id.to_bytes());
+                {
+                    let mut descriptor = req.get().init_descriptor();
+                    descriptor.set_wasi_cid(b"test-wasi-cid");
+                    descriptor.set_schema_cid(b"bafkr4iunknowncid");
+                }
+
+                let err = match req.send().promise.await {
+                    Ok(_) => panic!("unresolved schema CID should fail"),
+                    Err(e) => e,
+                };
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("unresolved in local schema registry"),
+                    "unexpected error: {msg}"
+                );
             })
             .await;
     }
@@ -1738,8 +1808,6 @@ mod tests {
                     let mut handler = req.get().init_handler();
                     handler.set_spawn(executor);
                 }
-                req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
-
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "stale epoch should error");
             })
@@ -1768,8 +1836,6 @@ mod tests {
 
                 let mut req = dialer.dial_request();
                 req.get().set_peer(&peer_id.to_bytes());
-                req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
-
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "stale epoch should error");
             })
@@ -1804,7 +1870,10 @@ mod tests {
                     let mut handler = req1.get().init_handler();
                     handler.set_spawn(executor.clone());
                 }
-                req1.get().set_schema(schema);
+                {
+                    let mut descriptor = req1.get().init_descriptor();
+                    init_test_descriptor(descriptor.reborrow(), schema);
+                }
                 req1.send()
                     .promise
                     .await
@@ -1816,7 +1885,10 @@ mod tests {
                     let mut handler = req2.get().init_handler();
                     handler.set_spawn(executor);
                 }
-                req2.get().set_schema(schema);
+                {
+                    let mut descriptor = req2.get().init_descriptor();
+                    init_test_descriptor(descriptor.reborrow(), schema);
+                }
                 let result = req2.send().promise.await;
                 assert!(
                     result.is_err(),
@@ -1891,8 +1963,13 @@ mod tests {
                     let mut handler = req.get().init_handler();
                     handler.set_spawn(executor);
                 }
-                req.get().set_schema(membrane::schema_registry::HOST_SCHEMA);
-
+                {
+                    let mut descriptor = req.get().init_descriptor();
+                    init_test_descriptor(
+                        descriptor.reborrow(),
+                        membrane::schema_registry::HOST_SCHEMA,
+                    );
+                }
                 let result = req.send().promise.await;
                 assert!(
                     result.is_ok(),

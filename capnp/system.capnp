@@ -20,6 +20,11 @@ struct TypedCap {
   schema @1 :SchemaBundle;
 }
 
+struct VatDescriptor {
+  wasiCid @0 :Data;
+  schemaCid @1 :Data;
+}
+
 struct PeerInfo {
   peerId @0 :Data;       # libp2p peer ID, serialized.
   addrs @1 :List(Data);  # Multiaddrs for this peer, each serialized.
@@ -139,7 +144,7 @@ interface Process {
   wait @3 () -> (exitCode :Int32);
   # Block until the process exits and return its exit code.
 
-  bootstrap @4 (schema :Data) -> (typed :TypedCap);
+  bootstrap @4 () -> (typed :TypedCap);
   # Return the capability exported by the guest via system::serve() with
   # producer-attached schema metadata required for recursive attenuation.
   # Errors if the guest didn't export a capability.
@@ -158,10 +163,10 @@ struct VatHandler {
 }
 
 interface VatListener {
-  listen @0 (handler :VatHandler, schema :Data,
+  listen @0 (handler :VatHandler, descriptor :VatDescriptor,
              caps :List(MembraneSchema.Export)) -> ();
   # Accept incoming Cap'n Proto RPC connections on /ww/0.1.0/vat/{cid}
-  # where cid = CIDv1(raw, BLAKE3(schema)).
+  # where cid = CIDv1(raw, BLAKE3(canonical VatDescriptor)).
   #
   # handler.spawn: for each connection, spawn a cell via the Executor.
   # The cell calls system::serve() to export a bootstrap capability.
@@ -169,7 +174,8 @@ interface VatListener {
   # handler.serve: bootstrap each connection with the provided capability.
   # No cell spawning — one persistent capability serves all connections.
   #
-  # Schema param is authoritative. WASM custom sections are optional hints.
+  # Routing identity is descriptor-authoritative; recursive attenuation
+  # authority comes from producer-returned TypedCap.schema.
   #
   # caps: optional named capabilities from the init.d `with` block.
   # Forwarded into spawned cells' membranes as graft extras.
@@ -177,10 +183,9 @@ interface VatListener {
 }
 
 interface VatClient {
-  dial @0 (peer :Data, schema :Data) -> (typed :TypedCap);
+  dial @0 (peer :Data, descriptor :VatDescriptor) -> (typed :TypedCap);
   # Open a Cap'n Proto RPC connection to peer on /ww/0.1.0/vat/{cid}
-  # where cid = CIDv1(raw, BLAKE3(schema)).
-  # The schema is the canonical Cap'n Proto encoding of a schema.Node.
+  # where cid = CIDv1(raw, BLAKE3(canonical VatDescriptor)).
   # Bootstraps a Cap'n Proto vat over the stream and returns the remote
   # cell's bootstrap capability.
   #

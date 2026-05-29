@@ -92,6 +92,11 @@ fn short_id(peer_id: &[u8]) -> String {
     }
 }
 
+fn init_oracle_descriptor(mut descriptor: system_capnp::vat_descriptor::Builder<'_>) {
+    descriptor.set_wasi_cid(PRICE_ORACLE_CID.as_bytes());
+    descriptor.set_schema_cid(PRICE_ORACLE_CID.as_bytes());
+}
+
 // ---------------------------------------------------------------------------
 // Logging (WASI stderr)
 // ---------------------------------------------------------------------------
@@ -407,9 +412,13 @@ async fn query_oracle(
     // Dial the oracle peer.
     let mut req = vat_client.dial_request();
     req.get().set_peer(peer_id);
-    req.get().set_schema(PRICE_ORACLE_SCHEMA);
+    init_oracle_descriptor(req.get().init_descriptor());
     let resp = req.send().promise.await?;
-    let oracle: oracle_capnp::price_oracle::Client = resp.get()?.get_cap().get_as_capability()?;
+    let oracle: oracle_capnp::price_oracle::Client = resp
+        .get()?
+        .get_typed()?
+        .get_cap()
+        .get_as_capability()?;
 
     // Query available pairs.
     let pairs_resp = oracle.get_pairs_request().send().promise.await?;

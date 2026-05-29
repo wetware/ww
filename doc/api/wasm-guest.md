@@ -196,7 +196,7 @@ Full interface reference for the capabilities available to guests.
 | `stdout` | `() -> (stream: ByteStream)` | Readable stream from guest's stdout. |
 | `stderr` | `() -> (stream: ByteStream)` | Readable stream from guest's stderr. |
 | `wait` | `() -> (exitCode: Int32)` | Block until process exits. |
-| `bootstrap` | `(schema: Data) -> (typed: TypedCap)` | Get the capability exported by the guest via `system::serve()` with producer-attached schema metadata. |
+| `bootstrap` | `() -> (typed: TypedCap)` | Get the capability exported by the guest via `system::serve()` with producer-attached schema metadata. |
 
 ### ByteStream
 
@@ -222,13 +222,13 @@ Full interface reference for the capabilities available to guests.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `listen` | `(handler: VatHandler, schema: Data) -> ()` | Accept connections on `/ww/0.1.0/vat/{cid}` where cid = CIDv1(raw, BLAKE3(schema)). VatHandler is a union: `spawn` (Executor) for stateless per-connection cells, or `serve` (TypedCap) for a persistent bootstrap capability. |
+| `listen` | `(handler: VatHandler, descriptor: VatDescriptor, caps: List(Export)) -> ()` | Accept connections on `/ww/0.1.0/vat/{cid}` where cid = CIDv1(raw, BLAKE3(canonical VatDescriptor)). VatHandler is a union: `spawn` (Executor) for stateless per-connection cells, or `serve` (TypedCap) for a persistent bootstrap capability. |
 
 ### VatClient (capability mode)
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `dial` | `(peer: Data, schema: Data) -> (typed: TypedCap)` | Open connection to peer on `/ww/0.1.0/vat/{cid}`. Bootstrap RPC and return remote capability plus schema metadata. |
+| `dial` | `(peer: Data, descriptor: VatDescriptor) -> (typed: TypedCap)` | Open connection to peer on `/ww/0.1.0/vat/{cid}` keyed by descriptor CID. Bootstrap RPC and return remote capability plus schema metadata. |
 
 ## WASM Custom Sections
 
@@ -242,7 +242,7 @@ inspects before instantiation.
 **Cell variants:**
 - `Cell::raw(Text)` — registers a libp2p stream protocol at `/ww/0.1.0/stream/{name}`. stdin/stdout carry raw bytes.
 - `Cell::http(Text)` — registers at HTTP path prefix. stdin/stdout carry FastCGI records.
-- `Cell::capnp(Schema.Node)` — registers vat protocol at `/ww/0.1.0/vat/{cid}`. CID = `CIDv1(raw, BLAKE3(canonical schema bytes))`.
+- `Cell::capnp(VatDescriptor)` — registers vat protocol at `/ww/0.1.0/vat/{cid}`. CID = `CIDv1(raw, BLAKE3(canonical descriptor bytes))`.
 
 **Absence**: If `cell.capnp` is not present, the binary is a pid0 process (kernel/WIT mode).
 It is not a service cell and cannot be passed to any listener.

@@ -102,7 +102,6 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
                 &[], // no extra HTTP headers
                 "localhost",
                 2080,
-                None, // no JFS-verified snap payload
             );
 
             let mut spawn_req = executor.spawn_request();

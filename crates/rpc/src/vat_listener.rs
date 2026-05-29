@@ -52,16 +52,30 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
 
         let params = pry!(params.get());
 
-        // Read schema bytes from the explicit param.
-        let schema_bytes: Vec<u8> = pry!(params.get_schema()).to_vec();
-        if schema_bytes.is_empty() {
+        // Read descriptor metadata from the explicit param.
+        let descriptor = pry!(params.get_descriptor());
+        let descriptor_schema_cid_bytes = pry!(descriptor.get_schema_cid()).to_vec();
+        let descriptor_schema_cid = match std::str::from_utf8(&descriptor_schema_cid_bytes) {
+            Ok(s) if !s.is_empty() => s.to_string(),
+            Ok(_) => {
+                return Promise::err(capnp::Error::failed(
+                    "descriptor.schemaCid must not be empty".into(),
+                ))
+            }
+            Err(e) => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "descriptor.schemaCid is not utf8: {e}"
+                )))
+            }
+        };
+        let descriptor_bytes = pry!(super::canonicalize_vat_descriptor(descriptor));
+        if descriptor_bytes.is_empty() {
             return Promise::err(capnp::Error::failed(
-                "schema bytes must not be empty".into(),
+                "descriptor bytes must not be empty".into(),
             ));
         }
-        let schema_bytes = pry!(super::canonicalize_schema_bytes(&schema_bytes));
 
-        let protocol_cid = super::schema_cid(&schema_bytes);
+        let protocol_cid = super::descriptor_cid(&descriptor_bytes);
         let stream_protocol = pry!(super::schema_protocol(&protocol_cid));
 
         let mut control = self.stream_control.clone();
@@ -95,7 +109,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                                 )))
                             }
                         },
-                        Err(e) => return Promise::err(capnp::Error::from(e)),
+                        Err(e) => return Promise::err(e),
                     };
                     let cap = match entry.get_cap().get_as_capability() {
                         Ok(v) => v,
@@ -142,7 +156,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                                 tracing::debug!("Incoming vat connection");
                                 let executor = executor.clone();
                                 let protocol_cid = protocol_cid.clone();
-                                let schema_bytes = schema_bytes.clone();
+                                let descriptor_schema_cid = descriptor_schema_cid.clone();
                                 let caps = extra_caps.clone();
                                 tokio::task::spawn_local(async move {
                                     let _handle_span = tracing::info_span!(
@@ -155,7 +169,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                                             caps,
                                             stream,
                                             &protocol_cid,
-                                            &schema_bytes,
+                                            &descriptor_schema_cid,
                                         )
                                         .await
                                     {
@@ -185,11 +199,11 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                     };
                 let served_schema = match typed.get_schema() {
                     Ok(schema) => schema,
-                    Err(e) => return Promise::err(capnp::Error::from(e)),
+                    Err(e) => return Promise::err(e),
                 };
                 let served_root = match served_schema.get_root() {
                     Ok(root) => root,
-                    Err(e) => return Promise::err(capnp::Error::from(e)),
+                    Err(e) => return Promise::err(e),
                 };
                 let served_schema_bytes = match super::canonicalize_schema_node(served_root) {
                     Some(bytes) => bytes,
@@ -199,9 +213,10 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                         ))
                     }
                 };
-                if served_schema_bytes != schema_bytes {
+                let served_schema_cid = super::schema_cid(&served_schema_bytes);
+                if served_schema_cid != descriptor_schema_cid {
                     return Promise::err(capnp::Error::failed(
-                        "vat-listener.listen schema must match handler.serve typed schema".into(),
+                        "vat-listener.listen descriptor.schemaCid must match handler.serve typed schema CID".into(),
                     ));
                 }
 
@@ -225,13 +240,20 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                                 tracing::debug!("Incoming vat connection");
                                 let cap = bootstrap_cap.clone();
                                 let protocol_cid = protocol_cid.clone();
+                                let served_schema_bytes = served_schema_bytes.clone();
                                 tokio::task::spawn_local(async move {
                                     let _handle_span = tracing::info_span!(
                                         "vat.handle",
                                         protocol = protocol_cid,
                                     ).entered();
                                     if let Err(e) =
-                                        handle_vat_connection_serve(cap, stream, &protocol_cid).await
+                                        handle_vat_connection_serve(
+                                            cap,
+                                            stream,
+                                            &protocol_cid,
+                                            &served_schema_bytes,
+                                        )
+                                        .await
                                     {
                                         tracing::error!("Vat serve connection error: {e}");
                                     }
@@ -274,9 +296,9 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
 pub async fn handle_vat_connection_spawn(
     executor: system_capnp::executor::Client,
     caps: Vec<(String, capnp::capability::Client, Vec<u8>)>,
-    stream: impl AsyncRead + AsyncWrite + 'static,
+    stream: impl AsyncRead + AsyncWrite + Unpin + 'static,
     protocol_cid: &str,
-    schema_bytes: &[u8],
+    expected_schema_cid: &str,
 ) -> Result<(), capnp::Error> {
     // 1. Spawn cell process via Executor.spawn(), forwarding caps with
     //    their canonical Schema.Node bytes so the spawned cell's graft
@@ -314,8 +336,7 @@ pub async fn handle_vat_connection_spawn(
     //    Timeout guards against cells that never call system::serve().
     //    On failure, close stdin to clean up the orphaned cell process.
     let bootstrap_resp = match tokio::time::timeout(std::time::Duration::from_secs(10), {
-        let mut req = process.bootstrap_request();
-        req.get().set_schema(&schema_bytes);
+        let req = process.bootstrap_request();
         req.send().promise
     })
     .await
@@ -334,16 +355,33 @@ pub async fn handle_vat_connection_spawn(
             ));
         }
     };
-    let bootstrap_cap: capnp::capability::Client = match bootstrap_resp.get().and_then(|r| {
-        let typed = r.get_typed()?;
-        typed.get_cap().get_as_capability()
-    }) {
-        Ok(cap) => cap,
-        Err(e) => {
-            let _ = stdin.close_request().send().promise.await;
-            return Err(e);
-        }
-    };
+    let (bootstrap_cap, served_schema_bytes): (capnp::capability::Client, Vec<u8>) =
+        match bootstrap_resp.get().and_then(|r| {
+            let typed = r.get_typed()?;
+            let cap = typed.get_cap().get_as_capability()?;
+            let schema = typed.get_schema()?;
+            let root = schema.get_root()?;
+            let schema_bytes = super::canonicalize_schema_node(root).ok_or_else(|| {
+                capnp::Error::failed(
+                    "invalid bootstrap typed schema: canonicalization failed".into(),
+                )
+            })?;
+            Ok((cap, schema_bytes))
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = stdin.close_request().send().promise.await;
+                return Err(e);
+            }
+        };
+
+    let served_schema_cid = super::schema_cid(&served_schema_bytes);
+    if served_schema_cid != expected_schema_cid {
+        let _ = stdin.close_request().send().promise.await;
+        return Err(capnp::Error::failed(format!(
+            "process.bootstrap returned schema CID {served_schema_cid}, expected {expected_schema_cid}"
+        )));
+    }
 
     // 4. Bridge: serve the cell's cap to the remote peer over the libp2p stream.
     let (reader, writer) = Box::pin(stream).split();
@@ -384,8 +422,9 @@ pub async fn handle_vat_connection_spawn(
 /// Generic over stream type for testability.
 pub async fn handle_vat_connection_serve(
     bootstrap_cap: capnp::capability::Client,
-    stream: impl AsyncRead + AsyncWrite + 'static,
+    stream: impl AsyncRead + AsyncWrite + Unpin + 'static,
     protocol_cid: &str,
+    _schema_bytes: &[u8],
 ) -> Result<(), capnp::Error> {
     let (reader, writer) = Box::pin(stream).split();
     let network = VatNetwork::new(reader, writer, Side::Server, Default::default());

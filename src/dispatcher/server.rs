@@ -98,13 +98,6 @@ async fn handle_request(State(registry): State<RouteRegistry>, request: Request<
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
-    // Best-effort JFS verification of `X-Snap-Payload`. v1.0 is
-    // permissive: success populates `verified_snap`; failure logs a
-    // warning and treats the request as anonymous. v1.1 will follow
-    // the spec strictly (`MUST reject malformed/expired/invalid with
-    // 4xx`) once Hub key verification ships alongside.
-    let verified_snap = verify_snap_payload(&headers);
-
     // Read the request body.
     let body_bytes = match axum::body::to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
         Ok(b) => b.to_vec(),
@@ -119,7 +112,6 @@ async fn handle_request(State(registry): State<RouteRegistry>, request: Request<
         query,
         headers,
         body: body_bytes,
-        verified_snap,
         response_tx,
     };
 
@@ -173,70 +165,6 @@ fn error_response(status: StatusCode, msg: &str) -> Response {
 }
 
 pub use rpc::dispatch::extract_server_info;
-
-/// Find a header by name (case-insensitive). Returns the first match.
-fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
-}
-
-/// Build the audience string this server expects in the JFS payload.
-///
-/// `audience` per spec is the server origin: `scheme + host + port`
-/// (with port omitted if it's the default for the scheme). We derive
-/// it from the `Host` header + `X-Forwarded-Proto` (Traefik / any TLS
-/// terminator in front sets this); if `X-Forwarded-Proto` is absent
-/// we default to `https` because the production listener is intended
-/// to live behind TLS termination.
-///
-/// Returns `None` if there's no `Host` header (request wasn't HTTP/1.1
-/// or HTTP/2 in any normal sense — bail).
-fn derive_audience(headers: &[(String, String)]) -> Option<String> {
-    let host = find_header(headers, "host")?;
-    let scheme = find_header(headers, "x-forwarded-proto").unwrap_or("https");
-    Some(format!("{scheme}://{host}"))
-}
-
-/// Best-effort JFS verification of an `X-Snap-Payload` header.
-///
-/// v1.0 contract: success → `Some(VerifiedJfs)`; absent header → `None`;
-/// any verification failure → `None` + `WARN` log. v1.1 will follow
-/// the spec's `MUST reject 4xx on malformed/expired/invalid` once Hub
-/// key verification ships in lockstep.
-fn verify_snap_payload(headers: &[(String, String)]) -> Option<rpc::jfs::VerifiedJfs> {
-    let payload = find_header(headers, "x-snap-payload")?;
-    let audience = match derive_audience(headers) {
-        Some(a) => a,
-        None => {
-            tracing::warn!("X-Snap-Payload present but Host header missing — skipping JFS verify");
-            return None;
-        }
-    };
-    let now = chrono::Utc::now().timestamp();
-    match rpc::jfs::verify(
-        payload,
-        &audience,
-        now,
-        rpc::jfs::DEFAULT_TIMESTAMP_SKEW_SECS,
-    ) {
-        Ok(v) => {
-            tracing::debug!(
-                fid = v.payload.fid,
-                "X-Snap-Payload verified (FID claimed, NOT Hub-verified)"
-            );
-            Some(v)
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "X-Snap-Payload failed verification; treating request as anonymous (v1.0 permissive; v1.1 will reject 4xx per spec)"
-            );
-            None
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

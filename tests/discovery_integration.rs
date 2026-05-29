@@ -87,22 +87,21 @@ async fn spawn_greeter_on_pool(
                 let process = spawn_resp.get().unwrap().get_process().unwrap();
 
                 let bootstrap_resp = tokio::time::timeout(std::time::Duration::from_secs(60), {
-                    let mut req = process.bootstrap_request();
-                    req.get().set_schema(b"test-schema");
+                    let req = process.bootstrap_request();
                     req.send().promise
                 })
                 .await;
 
                 match bootstrap_resp {
                     Ok(Ok(resp)) => {
-                        let cap: capnp::capability::Client =
-                            resp.get()
-                                .unwrap()
-                                .get_typed()
-                                .unwrap()
-                                .get_cap()
-                                .get_as_capability()
-                                .unwrap();
+                        let cap: capnp::capability::Client = resp
+                            .get()
+                            .unwrap()
+                            .get_typed()
+                            .unwrap()
+                            .get_cap()
+                            .get_as_capability()
+                            .unwrap();
 
                         // Bridge the bootstrap cap to the duplex stream so the
                         // test thread can use it.

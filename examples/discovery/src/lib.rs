@@ -96,6 +96,11 @@ fn short_id(peer_id: &[u8]) -> String {
     }
 }
 
+fn init_greeter_descriptor(mut descriptor: system_capnp::vat_descriptor::Builder<'_>) {
+    descriptor.set_wasi_cid(GREETER_CID.as_bytes());
+    descriptor.set_schema_cid(GREETER_CID.as_bytes());
+}
+
 // ---------------------------------------------------------------------------
 // Logging (WASI stderr)
 // ---------------------------------------------------------------------------
@@ -228,9 +233,10 @@ async fn greet_peer(
 
     let mut req = vat_client.dial_request();
     req.get().set_peer(peer_id);
-    req.get().set_schema(GREETER_SCHEMA);
+    init_greeter_descriptor(req.get().init_descriptor());
     let resp = req.send().promise.await?;
-    let greeter: greeter_capnp::greeter::Client = resp.get()?.get_cap().get_as_capability()?;
+    let greeter: greeter_capnp::greeter::Client =
+        resp.get()?.get_typed()?.get_cap().get_as_capability()?;
 
     let mut greet_req = greeter.greet_request();
     greet_req.get().set_name(format!("peer {us}"));
