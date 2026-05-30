@@ -90,9 +90,9 @@ fn resolve_guest_fs_path(path: &str) -> Result<String, String> {
         // nearest existing ancestor of the requested path to stay under WW_ROOT.
         let mut probe = resolved.as_path();
         while !probe.exists() {
-            probe = probe.parent().ok_or_else(|| {
-                format!("load-file: failed to resolve parent for path '{path}'")
-            })?;
+            probe = probe
+                .parent()
+                .ok_or_else(|| format!("load-file: failed to resolve parent for path '{path}'"))?;
         }
         let canonical_probe = std::fs::canonicalize(probe)
             .map_err(|e| format!("load-file: failed to canonicalize '{path}': {e}"))?;

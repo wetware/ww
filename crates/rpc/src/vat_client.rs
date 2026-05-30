@@ -64,9 +64,11 @@ mod tests {
         let aligned = crate::graft::bytes_to_aligned_words(bytes);
         let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
         let segment_array = capnp::message::SegmentArray::new(segments);
-        let reader = capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
-        let _node: capnp::schema_capnp::node::Reader<'_> =
-            reader.get_root().expect("lookup bytes should decode as schema.Node");
+        let reader =
+            capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
+        let _node: capnp::schema_capnp::node::Reader<'_> = reader
+            .get_root()
+            .expect("lookup bytes should decode as schema.Node");
     }
 }
 
@@ -114,14 +116,14 @@ impl system_capnp::vat_client::Server for VatClientImpl {
         if descriptor_bytes.is_empty() {
             return Promise::err(capnp::Error::failed("descriptor must not be empty".into()));
         }
-        let schema_bytes = match schema_bytes_for_descriptor_cid(&descriptor_schema_cid) {
-            Some(bytes) => bytes.to_vec(),
-            None => {
+        let schema_bytes =
+            if let Some(bytes) = schema_bytes_for_descriptor_cid(&descriptor_schema_cid) {
+                bytes.to_vec()
+            } else {
                 return Promise::err(capnp::Error::failed(format!(
-                    "descriptor.schemaCid unresolved in local schema registry: {descriptor_schema_cid}"
-                )))
-            }
-        };
+                "descriptor.schemaCid unresolved in local schema registry: {descriptor_schema_cid}"
+            )));
+            };
 
         let peer_id = pry!(PeerId::from_bytes(&peer_bytes)
             .map_err(|e| capnp::Error::failed(format!("invalid peer ID: {e}"))));

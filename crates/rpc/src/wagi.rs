@@ -203,14 +203,7 @@ mod tests {
 
     #[test]
     fn cgi_env_with_query_string() {
-        let env = build_cgi_env(
-            "GET",
-            "/search",
-            "q=hello&page=1",
-            &[],
-            "localhost",
-            0,
-        );
+        let env = build_cgi_env("GET", "/search", "q=hello&page=1", &[], "localhost", 0);
         assert!(env.contains(&"QUERY_STRING=q=hello&page=1".to_string()));
     }
 
