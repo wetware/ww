@@ -1,0 +1,6 @@
+flowchart LR
+    A[Guest calls system::serve(cap)] --> B[Host stores TypedCap schema bundle]
+    B --> C[Process.bootstrap()]
+    C --> D[Kernel wrapper receives TypedCap]
+    D --> E[Dynamic policy gate built from TypedCap.schema.root]
+    E --> F[Returned cap wrapped with fail-closed method filter]

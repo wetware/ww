@@ -1,0 +1,17 @@
+;; Shared default init flow.
+;;
+;; This file only handles init.d orchestration (mechanism), not export policy.
+;; Image-local /etc/init.glia remains the policy authority and should return
+;; the final bare export map after loading this file.
+;;
+;; Deterministic order is lexical; use numeric prefixes such as:
+;;   00-setup.glia, 10-http.glia, 20-worker.glia
+;; If /etc/init.d is absent, orchestration is skipped.
+
+(def os (perform import "ww/os"))
+(def initd-path "/etc/init.d")
+(def initd-entries
+  (if (os :dir-exists? initd-path)
+    (os :discover-initd initd-path)
+    []))
+(os :eval-initd initd-path initd-entries)

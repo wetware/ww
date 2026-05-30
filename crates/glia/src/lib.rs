@@ -29,7 +29,7 @@ pub mod oneshot;
 pub mod pattern;
 pub mod valmap;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 pub use valmap::ValMap;
@@ -62,10 +62,17 @@ pub struct GliaCapInner {
 }
 
 /// Internal representation for attenuated capabilities created by `attenuate`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct AttenuationPolicy {
+    pub allow_methods: BTreeSet<String>,
+    pub returns: BTreeMap<String, BTreeMap<String, AttenuationPolicy>>,
+}
+
+/// Internal representation for attenuated capabilities created by `attenuate`.
 #[derive(Clone)]
 pub struct AttenuatedCapInner {
     pub base: Val,
-    pub allow_methods: BTreeSet<String>,
+    pub policy: AttenuationPolicy,
     pub descriptor: Vec<u8>,
 }
 

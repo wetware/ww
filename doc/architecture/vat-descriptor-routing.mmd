@@ -1,0 +1,10 @@
+flowchart TB
+    A[VatDescriptor{wasiCid,schemaCid}] --> B[Canonical Capnp Encoding]
+    B --> C[CIDv1(raw, BLAKE3(...))]
+    C --> D[/ww/0.1.0/vat/{cid}]
+
+    E[vat-listener.listen(handler, descriptor, caps)] --> D
+    F[vat-client.dial(peer, descriptor)] --> D
+
+    D --> G[Cap'n Proto RPC bootstrap]
+    G --> H[TypedCap returned to caller]

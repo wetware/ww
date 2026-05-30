@@ -381,6 +381,10 @@ impl system_capnp::executor::Server for ExecutorImpl {
         };
 
         let bytecode = self.bytecode.clone();
+        let bootstrap_schema = match rpc::decode_cell_section(&bytecode) {
+            Ok(Some(rpc::CellType::Capnp(schema))) => schema,
+            _ => Vec::new(),
+        };
         let component = self.component.clone();
         let engine = self.engine.clone();
         let wasm_debug = self.wasm_debug;
@@ -518,7 +522,15 @@ impl system_capnp::executor::Server for ExecutorImpl {
                 capnp_rpc::new_client(ByteStreamImpl::new(dummy_stderr, StreamMode::ReadOnly));
 
             let process_impl = if let Some(cap) = bootstrap_cap {
-                ProcessImpl::with_bootstrap(stdin, stdout, stderr, exit_rx, cap, kill_tx)
+                ProcessImpl::with_bootstrap(
+                    stdin,
+                    stdout,
+                    stderr,
+                    exit_rx,
+                    cap,
+                    bootstrap_schema.clone(),
+                    kill_tx,
+                )
             } else {
                 ProcessImpl::new(stdin, stdout, stderr, exit_rx, kill_tx)
             };

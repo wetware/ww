@@ -156,12 +156,15 @@ async fn test_vat_connection_closes_stdin_on_peer_disconnect() {
                 load_req.get().set_wasm(&wasm_clone);
                 let load_resp = load_req.send().promise.await.unwrap();
                 let executor = load_resp.get().unwrap().get_executor().unwrap();
+                let expected_schema_cid =
+                    ww::rpc::schema_cid(membrane::schema_registry::HOST_SCHEMA);
                 ww::rpc::vat_listener::handle_vat_connection_spawn(
                     executor,
                     Vec::new(), // no extra caps in test
                     // Convert tokio duplex → futures-io via compat layer.
                     bridge_stream.compat(),
                     "test-protocol-cid",
+                    &expected_schema_cid,
                 )
                 .await
             });

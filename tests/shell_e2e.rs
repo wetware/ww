@@ -81,17 +81,23 @@ async fn spawn_shell_on_pool(pool: &ExecutorPool) -> Result<shell_capnp::shell::
                 let process = spawn_resp.get().unwrap().get_process().unwrap();
                 eprintln!("  [worker] process spawned, waiting for bootstrap");
 
-                let bootstrap_resp = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    process.bootstrap_request().send().promise,
-                )
+                let bootstrap_resp = tokio::time::timeout(std::time::Duration::from_secs(10), {
+                    let req = process.bootstrap_request();
+                    req.send().promise
+                })
                 .await;
                 eprintln!("  [worker] bootstrap result: {:?}", bootstrap_resp.is_ok());
 
                 match bootstrap_resp {
                     Ok(Ok(resp)) => {
-                        let cap: capnp::capability::Client =
-                            resp.get().unwrap().get_cap().get_as_capability().unwrap();
+                        let cap: capnp::capability::Client = resp
+                            .get()
+                            .unwrap()
+                            .get_typed()
+                            .unwrap()
+                            .get_cap()
+                            .get_as_capability()
+                            .unwrap();
                         eprintln!("  [worker] got bootstrap cap, bridging to duplex");
 
                         let (reader, writer) = tokio::io::split(cell_end);

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
@@ -8,6 +8,7 @@ use libp2p::StreamProtocol;
 use membrane::{Epoch, Provenance};
 use std::io::IsTerminal;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{stderr, stdout, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -607,6 +608,14 @@ impl Cell {
         // other cells on the same thread.
         tokio::task::spawn_local(rpc_system.map(|_| ()));
 
+        if stream_control.is_some() {
+            let timeout = export_policy_ready_timeout();
+            if let Err(e) = wait_for_export_policy_ready(&guest_membrane, timeout).await {
+                join.abort();
+                return Err(anyhow!("kernel export policy did not become ready: {e}"));
+            }
+        }
+
         if let Some(control) = stream_control {
             let membrane = guest_membrane.clone();
             match terminal_signing_key {
@@ -645,6 +654,75 @@ impl Cell {
             epoch_tx,
         })
     }
+}
+
+async fn wait_for_export_policy_ready(
+    membrane: &GuestMembrane,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    let started = Instant::now();
+    let mut retry_delay = Duration::from_millis(100);
+    let max_retry_delay = Duration::from_secs(2);
+    loop {
+        match membrane.graft_request().send().promise.await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if !is_bootstrap_not_ready_error(&msg) {
+                    return Err(msg);
+                }
+                if started.elapsed() >= timeout {
+                    return Err(format!(
+                        "timeout waiting for export policy readiness: {msg}"
+                    ));
+                }
+            }
+        }
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+    }
+}
+
+fn export_policy_ready_timeout() -> Duration {
+    let raw = std::env::var("WW_EXPORT_POLICY_READY_TIMEOUT_SECS").ok();
+    parse_export_policy_ready_timeout(raw.as_deref())
+}
+
+fn parse_export_policy_ready_timeout(raw: Option<&str>) -> Duration {
+    const DEFAULT_SECS: u64 = 120;
+    match raw {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => Duration::from_secs(DEFAULT_SECS),
+        },
+        None => Duration::from_secs(DEFAULT_SECS),
+    }
+}
+
+fn is_bootstrap_not_ready_error(msg: &str) -> bool {
+    has_exact_error_code(msg, "INIT_MEMBRANE_NOT_READY")
+        || has_exact_error_code(msg, "INIT_POLICY_NOT_READY")
+}
+
+fn has_exact_error_code(msg: &str, code: &str) -> bool {
+    let mut search_start = 0usize;
+    while let Some(rel_idx) = msg[search_start..].find(code) {
+        let idx = search_start + rel_idx;
+        let end = idx + code.len();
+
+        let before_ok = idx == 0 || !is_error_code_word_char(msg.as_bytes()[idx - 1]);
+        let after_ok = end == msg.len() || !is_error_code_word_char(msg.as_bytes()[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+
+        search_start = idx + 1;
+    }
+    false
+}
+
+fn is_error_code_word_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// Accept incoming libp2p streams for the capnp protocol and serve each with
@@ -768,6 +846,56 @@ mod tests {
         assert!(
             msg.contains("doc/capabilities.md"),
             "error message should point at the architecture docs, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn bootstrap_not_ready_error_matching_is_explicit() {
+        assert!(is_bootstrap_not_ready_error(
+            "rpc failure: INIT_POLICY_NOT_READY: kernel export policy not ready",
+        ));
+        assert!(is_bootstrap_not_ready_error(
+            "rpc failure: INIT_MEMBRANE_NOT_READY: kernel bootstrap membrane not ready",
+        ));
+        assert!(
+            !is_bootstrap_not_ready_error("rpc failure: stream not ready"),
+            "must not retry generic 'not ready' errors"
+        );
+        assert!(
+            !is_bootstrap_not_ready_error(
+                "rpc failure: XINIT_POLICY_NOT_READY: malformed prefixed token",
+            ),
+            "must not retry on partial-token prefix matches"
+        );
+        assert!(
+            !is_bootstrap_not_ready_error(
+                "rpc failure: INIT_POLICY_NOT_READYX: malformed suffixed token",
+            ),
+            "must not retry on partial-token suffix matches"
+        );
+    }
+
+    #[test]
+    fn export_policy_ready_timeout_prefers_valid_env_value() {
+        assert_eq!(
+            parse_export_policy_ready_timeout(Some("7")),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn export_policy_ready_timeout_falls_back_on_invalid_env_value() {
+        assert_eq!(
+            parse_export_policy_ready_timeout(Some("0")),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            parse_export_policy_ready_timeout(Some("abc")),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            parse_export_policy_ready_timeout(None),
+            Duration::from_secs(120)
         );
     }
 }

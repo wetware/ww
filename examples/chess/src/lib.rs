@@ -99,6 +99,11 @@ fn short_id(peer_id: &[u8]) -> String {
     }
 }
 
+fn init_chess_descriptor(mut descriptor: system_capnp::vat_descriptor::Builder<'_>) {
+    descriptor.set_wasi_cid(CHESS_ENGINE_CID.as_bytes());
+    descriptor.set_schema_cid(CHESS_ENGINE_CID.as_bytes());
+}
+
 // ---------------------------------------------------------------------------
 // Logging (WASI stderr, same pattern as kernel)
 // ---------------------------------------------------------------------------
@@ -345,9 +350,10 @@ async fn play_rpc_against_peer(
     // Dial peer via VatClient — returns a typed ChessEngine capability.
     let mut req = vat_client.dial_request();
     req.get().set_peer(peer_id);
-    req.get().set_schema(CHESS_ENGINE_SCHEMA);
+    init_chess_descriptor(req.get().init_descriptor());
     let resp = req.send().promise.await?;
-    let engine: chess_capnp::chess_engine::Client = resp.get()?.get_cap().get_as_capability()?;
+    let engine: chess_capnp::chess_engine::Client =
+        resp.get()?.get_typed()?.get_cap().get_as_capability()?;
 
     log::info!("game {us} vs {them}: started (RPC)");
     play_rpc_game(&engine, &us, &them).await
