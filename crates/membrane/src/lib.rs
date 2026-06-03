@@ -42,13 +42,6 @@ pub mod membrane_capnp {
     include!(concat!(env!("OUT_DIR"), "/capnp/membrane_capnp.rs"));
 }
 
-// cell_capnp is still needed by the host for Raw/Http cell type decoding.
-// TODO: remove once Raw/Http cells migrate to envvars.
-#[allow(unused_parens, clippy::match_single_binding)]
-pub mod cell_capnp {
-    include!(concat!(env!("OUT_DIR"), "/capnp/cell_capnp.rs"));
-}
-
 #[allow(unused_parens, clippy::match_single_binding)]
 pub mod http_capnp {
     include!(concat!(env!("OUT_DIR"), "/capnp/http_capnp.rs"));
