@@ -95,110 +95,6 @@ pub fn canonicalize_schema_node(node: capnp::schema_capnp::node::Reader<'_>) -> 
     Some(segments[0].to_vec())
 }
 
-/// Extract a custom section from a WASM binary (component or module).
-///
-/// Returns the section data if found, or `None` if the section doesn't exist.
-/// Used by tooling (schema-inject, `ww inspect`). Listeners use explicit params.
-#[allow(dead_code)]
-pub(crate) fn extract_wasm_custom_section<'a>(
-    wasm_bytes: &'a [u8],
-    section_name: &str,
-) -> Result<Option<&'a [u8]>, capnp::Error> {
-    use wasmparser::{Parser, Payload};
-
-    for payload in Parser::new(0).parse_all(wasm_bytes) {
-        let payload = payload
-            .map_err(|e| capnp::Error::failed(format!("failed to parse WASM binary: {e}")))?;
-        match payload {
-            Payload::CustomSection(reader) if reader.name() == section_name => {
-                return Ok(Some(reader.data()));
-            }
-            _ => {}
-        }
-    }
-    Ok(None)
-}
-
-/// Decoded Cell type from a WASM custom section.
-///
-/// All variants are used at decode time; `Http` host-side handling
-/// is not yet implemented (see TODOS.md: FastCGI / HttpListener).
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) enum CellType {
-    /// Raw libp2p stream with protocol ID.
-    Raw(String),
-    /// HTTP/WAGI cell with path prefix.
-    Http(String),
-    /// Cap'n Proto vat cell with canonical schema bytes.
-    Capnp(Vec<u8>),
-}
-
-/// Decode the Cell type tag from a WASM binary's "cell.capnp" custom section.
-///
-/// Returns `Ok(Some(CellType))` if the section is present and valid,
-/// `Ok(None)` if the section is absent (pid0 mode), or `Err` if the
-/// section data is malformed.
-/// Used by tooling. Listeners use explicit params; custom sections are optional hints.
-#[allow(dead_code)]
-pub(crate) fn decode_cell_section(wasm_bytes: &[u8]) -> Result<Option<CellType>, capnp::Error> {
-    let section_data = match extract_wasm_custom_section(wasm_bytes, "cell.capnp")? {
-        Some(data) if !data.is_empty() => data,
-        Some(_) => {
-            return Err(capnp::Error::failed(
-                "cell.capnp custom section is empty".into(),
-            ));
-        }
-        None => return Ok(None),
-    };
-
-    // Copy section data to ensure 8-byte alignment (WASM custom sections
-    // are not guaranteed to be aligned within the binary).
-    let aligned_data = section_data.to_vec();
-    let message = capnp::serialize::read_message_from_flat_slice(
-        &mut aligned_data.as_slice(),
-        capnp::message::ReaderOptions::default(),
-    )
-    .map_err(|e| capnp::Error::failed(format!("failed to decode cell.capnp section: {e}")))?;
-
-    let cell: membrane::cell_capnp::cell::Reader = message
-        .get_root()
-        .map_err(|e| capnp::Error::failed(format!("failed to read Cell root: {e}")))?;
-
-    use membrane::cell_capnp::cell::Which;
-    match cell.which() {
-        Ok(Which::Raw(text)) => {
-            let protocol_id = text?.to_string()?;
-            Ok(Some(CellType::Raw(protocol_id)))
-        }
-        Ok(Which::Http(text)) => {
-            let path_prefix = text?.to_string()?;
-            Ok(Some(CellType::Http(path_prefix)))
-        }
-        Ok(Which::Capnp(node)) => {
-            let node = node?;
-            // Re-canonicalize the schema node to get raw segment bytes for CID derivation.
-            // Uses get_segments_for_output (no framing) to match the build-time path
-            // in schema_id::canonicalize_node, ensuring CID stability.
-            let mut canonical_msg = capnp::message::Builder::new_default();
-            canonical_msg
-                .set_root_canonical(node)
-                .map_err(|e| capnp::Error::failed(format!("failed to canonicalize schema: {e}")))?;
-            let segments = canonical_msg.get_segments_for_output();
-            if segments.len() != 1 {
-                return Err(capnp::Error::failed(format!(
-                    "canonical message produced {} segments, expected 1",
-                    segments.len()
-                )));
-            }
-            Ok(Some(CellType::Capnp(segments[0].to_vec())))
-        }
-        Err(capnp::NotInSchema(n)) => Err(capnp::Error::failed(format!(
-            "unknown Cell variant discriminant: {n}"
-        ))),
-    }
-}
-
 /// Maximum bytes a single ByteStream read may allocate.
 ///
 /// Guards against OOM from callers requesting u32::MAX bytes.
@@ -1494,31 +1390,6 @@ mod tests {
         capnp_rpc::new_client(StubExecutor)
     }
 
-    /// Build a minimal WASM component with an optional custom section.
-    /// Returns bytes that wasmparser can parse (valid WASM component header).
-    fn wasm_with_custom_section(section_name: &str, data: &[u8]) -> Vec<u8> {
-        use wasm_encoder::ComponentSection;
-        // Minimal WASM component: magic + version + layer
-        let mut bytes = vec![
-            0x00, 0x61, 0x73, 0x6d, // \0asm
-            0x0d, 0x00, 0x01, 0x00, // component version (13.0)
-        ];
-        let custom = wasm_encoder::CustomSection {
-            name: std::borrow::Cow::Borrowed(section_name),
-            data: std::borrow::Cow::Borrowed(data),
-        };
-        custom.append_to_component(&mut bytes);
-        bytes
-    }
-
-    /// Build a minimal WASM component with NO custom sections.
-    fn wasm_without_custom_section() -> Vec<u8> {
-        vec![
-            0x00, 0x61, 0x73, 0x6d, // \0asm
-            0x0d, 0x00, 0x01, 0x00, // component version (13.0)
-        ]
-    }
-
     #[tokio::test]
     async fn test_vat_listener_empty_schema_param_errors() {
         let local = tokio::task::LocalSet::new();
@@ -1718,34 +1589,6 @@ mod tests {
                 input.len()
             );
         }
-    }
-
-    #[test]
-    fn test_extract_wasm_custom_section_found() {
-        let data = b"canonical schema bytes";
-        let wasm = wasm_with_custom_section("schema.capnp", data);
-        let result = super::extract_wasm_custom_section(&wasm, "schema.capnp").unwrap();
-        assert_eq!(result, Some(data.as_slice()));
-    }
-
-    #[test]
-    fn test_extract_wasm_custom_section_not_found() {
-        let wasm = wasm_without_custom_section();
-        let result = super::extract_wasm_custom_section(&wasm, "schema.capnp").unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_extract_wasm_custom_section_wrong_name() {
-        let wasm = wasm_with_custom_section("other.section", b"data");
-        let result = super::extract_wasm_custom_section(&wasm, "schema.capnp").unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_extract_wasm_custom_section_invalid_wasm() {
-        let result = super::extract_wasm_custom_section(b"not wasm", "schema.capnp");
-        assert!(result.is_err());
     }
 
     /// End-to-end: pass schema bytes and an Executor to VatListener,

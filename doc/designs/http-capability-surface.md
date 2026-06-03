@@ -164,10 +164,8 @@ for observability only. Intentional deviation from CGI spec.
 
 ## Cap'n Proto Schema
 
-No schema change needed. `Cell::http(prefix)` already stores the path
-prefix in `cell.capnp`. The semantic meaning is the same: "this cell
-handles HTTP requests at this prefix." The wire format changed
-(FastCGI to WAGI/CGI) but the type tag is about routing, not framing.
+No schema change needed. HTTP listener registration receives the path prefix
+explicitly; WASM custom sections do not select HTTP routing.
 
 ### Outgoing HTTP (HttpClient, deferred)
 

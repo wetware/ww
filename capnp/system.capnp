@@ -158,7 +158,7 @@ interface VatListener {
   # handler.serve: bootstrap each connection with the provided capability.
   # No cell spawning — one persistent capability serves all connections.
   #
-  # Schema param is authoritative. WASM custom sections are optional hints.
+  # Schema param is authoritative.
   #
   # caps: optional named capabilities from the init.d `with` block.
   # Forwarded into spawned cells' membranes as graft extras.

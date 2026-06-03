@@ -7,16 +7,13 @@ fn main() {
 
     capnpc::CompilerCommand::new()
         .src_prefix("../../")
-        // Tell capnpc that schema.capnp types live in the `capnp` crate,
-        // not in this crate. Without this, generated code for cell.capnp
-        // emits `crate::schema_capnp::node` instead of `::capnp::schema_capnp::node`.
+        // Tell capnpc that schema.capnp types live in the `capnp` crate.
         .crate_provides("capnp", [0xa93fc509624c72d9])
         .file(capnp_dir.join("system.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("auth.capnp"))
         .file(capnp_dir.join("membrane.capnp"))
         .file(capnp_dir.join("stem.capnp"))
-        .file(capnp_dir.join("cell.capnp"))
         .file(capnp_dir.join("http.capnp"))
         .raw_code_generator_request_path(&raw_request)
         .run()
@@ -43,9 +40,7 @@ fn main() {
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
-    for schema in &[
-        "system", "routing", "auth", "membrane", "stem", "cell", "http",
-    ] {
+    for schema in &["system", "routing", "auth", "membrane", "stem", "http"] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()

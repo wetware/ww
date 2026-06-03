@@ -5423,8 +5423,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "wasm-encoder 0.243.0",
- "wasmparser 0.243.0",
  "ww-cache",
 ]
 
@@ -7013,10 +7011,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6d8db401b0528ec316dfbe579e6ab4152d61739cfe076706d2009127970159d"
 dependencies = [
  "bitflags",
- "hashbrown 0.15.5",
  "indexmap",
  "semver 1.0.28",
- "serde",
 ]
 
 [[package]]

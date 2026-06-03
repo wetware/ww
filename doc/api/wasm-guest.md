@@ -230,22 +230,11 @@ Full interface reference for the capabilities available to guests.
 |--------|-----------|-------------|
 | `dial` | `(peer: Data, schema: Data) -> (cap: AnyPointer)` | Open connection to peer on `/ww/0.1.0/vat/{cid}`. Bootstrap RPC, return remote's capability. Type-erased. |
 
-## WASM Custom Sections
+## Service Cell Registration
 
-Custom sections embedded in the WASM binary carry metadata that the host
-inspects before instantiation.
-
-| Section Name | Contents | Purpose |
-|--------------|----------|---------|
-| `cell.capnp` | Cap'n Proto `Cell` union message | Identifies the binary as a service cell. Variant determines plumbing: `raw` (libp2p stream), `http` (FastCGI), `capnp` (typed RPC). |
-
-**Cell variants:**
-- `Cell::raw(Text)` — registers a libp2p stream protocol at `/ww/0.1.0/stream/{name}`. stdin/stdout carry raw bytes.
-- `Cell::http(Text)` — registers at HTTP path prefix. stdin/stdout carry FastCGI records.
-- `Cell::capnp(Schema.Node)` — registers vat protocol at `/ww/0.1.0/vat/{cid}`. CID = `CIDv1(raw, BLAKE3(canonical schema bytes))`.
-
-**Absence**: If `cell.capnp` is not present, the binary is a pid0 process (kernel/WIT mode).
-It is not a service cell and cannot be passed to any listener.
+The host does not inspect WASM custom sections to decide whether a binary is a
+raw, HTTP, or vat service cell. Listener capabilities receive their routing
+inputs explicitly at registration time.
 
 ## Implementation Constraints
 
