@@ -513,10 +513,10 @@ fn poll_loop<T>(
 ///
 /// # Example
 ///
-/// ```ignore
-/// let engine: chess_capnp::chess_engine::Client =
-///     capnp_rpc::new_client(ChessEngineImpl::new());
-/// wetware_guest::serve_stdio(engine.client);
+/// ```no_run
+/// let bootstrap: capnp::capability::Client =
+///     todo!("construct the service capability exported by this guest");
+/// system::serve_stdio(bootstrap);
 /// ```
 pub fn serve_stdio(bootstrap: capnp::capability::Client) {
     let stdin = wasip2::cli::stdin::get_stdin();
@@ -564,11 +564,13 @@ pub fn serve_stdio(bootstrap: capnp::capability::Client) {
 ///
 /// # Example
 ///
-/// ```ignore
-/// let my_membrane: capnp::capability::Client = capnp_rpc::new_client(MyMembraneImpl).client;
-/// wetware_guest::serve(my_membrane, |host| async move {
-///     // ... use host capabilities, export my_membrane to host ...
-///     Ok(())
+/// ```no_run
+/// let bootstrap: capnp::capability::Client =
+///     todo!("construct the bootstrap capability exported by this guest");
+/// system::serve(bootstrap, |host: capnp::capability::Client| async move {
+///     // ... use host capabilities while exporting bootstrap to the host ...
+///     let _ = host;
+///     Ok::<(), capnp::Error>(())
 /// });
 /// ```
 pub fn serve<C, F, Fut>(bootstrap: capnp::capability::Client, f: F)
@@ -588,13 +590,11 @@ where
 ///
 /// # Example
 ///
-/// ```ignore
-/// wetware_guest::run(|membrane| async move {
-///     let graft = membrane.graft_request().send().promise.await?;
-///     let results = graft.get()?;
-///     let caps = results.get_caps()?;
-///     // Look up capabilities by name in the Export list.
-///     Ok(())
+/// ```no_run
+/// system::run(|membrane: capnp::capability::Client| async move {
+///     // Cast membrane to the generated Membrane client type in real guests.
+///     let _ = membrane;
+///     Ok::<(), capnp::Error>(())
 /// });
 /// ```
 pub fn run<C, F, Fut>(f: F)
