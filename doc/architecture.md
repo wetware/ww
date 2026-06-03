@@ -208,8 +208,8 @@ a new **Membrane**: an object that controls what the outside world can do.
 ```
 1. Host hands pid0 a Membrane reference
 2. pid0 calls graft(), receives capabilities (identity, host, runtime, routing, httpClient)
-3. pid0 wraps capabilities into an attenuated Membrane (adds policy, filters methods)
-4. pid0 exports the attenuated Membrane back to the host (optionally wrapped in Terminal)
+3. pid0 can wrap or filter capabilities into a new Membrane
+4. pid0 exports that Membrane back to the host (optionally wrapped in Terminal)
 5. Host serves the exported capability on a libp2p stream protocol
 6. Remote peers authenticate via Terminal (if present), then interact with the Membrane
 ```

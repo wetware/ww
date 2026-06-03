@@ -171,7 +171,7 @@ pub mod schema_registry {
             );
             assert_eq!(
                 IDENTITY_CID,
-                "bafkr4iggkvmx4tlhgge76adnmde65og2kjvnwz5h43k5pzuresvzsaduaq"
+                "bafkr4iakqlclxvdrgqk63shamitujssfmdnkzroyr5fw7wxjwcyhrqtpjy"
             );
             assert_eq!(
                 HTTP_CLIENT_CID,

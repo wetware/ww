@@ -103,9 +103,9 @@ Glia's effect system bridges evaluation and Cap'n Proto RPC.
 ### Types (`crates/glia/src/effect.rs`)
 
 - **`EffectTarget`** — what the effect targets: `Keyword(String)` for
-  environmental effects, or `Cap { name, schema_cid }` for
-  capability-scoped effects.  Caps match by schema CID (same capnp
-  interface = same type).
+  environmental effects, or `Cap { name, schema_cid, cap_id }` for
+  capability-scoped effects.  Caps match by per-instance `cap_id`; the
+  schema CID remains type/introspection metadata, not authority identity.
 
 - **`EffectSlot`** — shared state between `perform` and the handler loop.
   Holds `Option<(EffectTarget, Val, oneshot::Sender)>`.

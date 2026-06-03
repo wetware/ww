@@ -4,7 +4,7 @@
 
 Wetware lets you safely run code you didn't write, don't trust, and cannot see: third-party MCP servers, code your LLM produced at runtime, tools other agents handed you across the swarm. It's a decentralized operating system for multi-tool agent swarms.
 
-Cells are WASM processes that run with zero ambient authority. Their only access to the world is the membrane they were grafted, a typed bundle of capabilities served over Cap'n Proto RPC. When a cell calls another cell, the caller chooses which capabilities to hand over and how to attenuate each one, and the runtime enforces the boundary. Each call carries only the capabilities you handed it; the trust boundary is the membrane, not the audit. There is no scheduler, no central trust authority, no shared state. Cells coordinate through content-addressed data in IPFS, and over libp2p streams.
+Cells are WASM processes that run with zero ambient authority. Their only access to the world is the membrane they were grafted, a typed bundle of capabilities served over Cap'n Proto RPC. When a cell calls another cell, the caller chooses which capabilities to hand over; fine-grained recursive attenuation is a follow-up design area, not a hidden default. Each call carries only the capabilities you handed it; the trust boundary is the membrane, not the audit. There is no scheduler, no central trust authority, no shared state. Cells coordinate through content-addressed data in IPFS, and over libp2p streams.
 
 ## Try it in 60 seconds
 
@@ -66,12 +66,12 @@ Here is the capability surface in action, directly in the Wetware shell (Glia):
 
 ## Features
 
-- **Per-call capability attenuation.** Each cell starts with a typed bundle of capabilities and nothing else. When it spawns a sub-cell, it chooses which capabilities to hand down, narrowed however it likes (with per-method granularity). The runtime enforces the boundary at every call.
-- **Composable membranes.** Tool A calls tool B which calls tool C, each link carrying only what the previous layer authorized. Trust narrows at every hop. See [examples/oracle/](examples/oracle/) for the runnable version.
+- **Explicit capability grafts.** Each cell starts with a typed bundle of capabilities and nothing else. Parent cells choose which capabilities to hand down; recursive per-method attenuation is being redesigned before we document it as a runtime guarantee.
+- **Composable membranes.** Tool A calls tool B which calls tool C, each link carrying an explicit capability set. The membrane is the boundary at every hop. See [examples/oracle/](examples/oracle/) for the runnable version.
 - **Content-addressed code.** Cells are identified by CID. The binary that ran is the binary you pinned; no swap-under-the-rug between generation and execution.
 - **WASM cell scale.** ~10ms spawn, KB-scale binaries, language-agnostic via `wasm32-wasip2`. Per-call sandboxing is only feasible because cells are cheap; microVM cold-start is too slow for that.
-- **P2P capability sharing.** A cell can export a typed capability to a cell on a peer's machine over libp2p. Graft and attenuation work identically across the wire; the membrane is the boundary, not the host.
-- **MCP integration.** `ww perform install` wires the node into Claude Code as an MCP server. The same capability surface curl hits, an LLM reaches via attenuated capabilities. See [.agents/prompt.md](.agents/prompt.md).
+- **P2P capability sharing.** A cell can export a typed capability to a cell on a peer's machine over libp2p. The membrane is the boundary, not the host.
+- **MCP integration.** `ww perform install` wires the node into Claude Code as an MCP server. The same capability surface you can hit with `curl` is reachable from an LLM through the grafted membrane. See [.agents/prompt.md](.agents/prompt.md).
 - **Glia shell.** A Clojure-inspired language where capabilities are first-class values and every side effect (capability calls, exceptions, I/O) is gated by an effect system. The same shell serves humans (REPL) and LLMs (over MCP).
 
 ## Quickstart
@@ -121,13 +121,13 @@ Read [examples/oracle/README.md](examples/oracle/README.md) for the full walkthr
 ww perform install
 ```
 
-Wires the node into Claude Code as an MCP server. The LLM gets a Glia shell with attenuated capabilities, same membrane and same guarantees as the `curl` flow above. See [.agents/prompt.md](.agents/prompt.md).
+Wires the node into Claude Code as an MCP server. The LLM gets a Glia shell over the same grafted membrane as the `curl` flow above. See [.agents/prompt.md](.agents/prompt.md).
 
 ## How it works
 
 `ww run` starts a libp2p node on port 2025, merges any [image layers](doc/images.md) into a virtual FHS filesystem, and spawns `boot/main.wasm` with a Membrane: the typed capability hub the cell uses to reach the host.
 
-A guest calls `membrane.graft()` to obtain its capabilities as a `List(Export)`. When the on-chain epoch advances (new code deployed, configuration changed), the membrane revokes everything; the guest re-grafts and picks up the new state automatically. This is the same machinery a parent cell uses to grant a child cell an attenuated subset, so capability flow across cells, hosts, and revocation cycles all use one mechanism.
+A guest calls `membrane.graft()` to obtain its capabilities as a `List(Export)`. When the on-chain epoch advances (new code deployed, configuration changed), the membrane revokes everything; the guest re-grafts and picks up the new state automatically. Parent cells use the same membrane machinery to pass explicit capability sets to child cells.
 
 [doc/architecture.md](doc/architecture.md) is the canonical reference; [doc/capabilities.md](doc/capabilities.md) is the capability surface.
 
