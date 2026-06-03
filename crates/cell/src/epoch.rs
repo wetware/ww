@@ -212,6 +212,7 @@ pub async fn run_epoch_pipeline(
 mod tests {
     use super::*;
     use membrane::Provenance;
+    use std::collections::HashMap;
 
     fn test_stem_event(seq: u64) -> StemEvent {
         // Build a valid CIDv1 (raw codec, identity multihash) so
@@ -223,6 +224,14 @@ mod tests {
             cid: c.to_bytes(),
             provenance: Provenance::Block(42),
         }
+    }
+
+    fn event_cid_string(event: &StemEvent) -> String {
+        cid_bytes_to_ipfs_path(&event.cid)
+            .expect("valid event cid")
+            .strip_prefix("/ipfs/")
+            .expect("ipfs path prefix")
+            .to_string()
     }
 
     /// Drain delay defers epoch broadcast by the configured duration.
@@ -285,5 +294,65 @@ mod tests {
         epoch_rx.mark_changed();
         let epoch = epoch_rx.borrow_and_update().clone();
         assert_eq!(epoch.seq, 1);
+    }
+
+    /// CidTree root swap happens before the epoch broadcast drain completes.
+    #[tokio::test]
+    async fn cid_tree_root_swaps_to_event_cid_before_epoch_broadcast() {
+        let (epoch_tx, epoch_rx) = watch::channel(Epoch {
+            seq: 0,
+            head: vec![],
+            provenance: Provenance::Block(0),
+        });
+
+        let event = test_stem_event(1);
+        let target_cid = event_cid_string(&event);
+        let ipfs_client = ipfs::HttpClient::new("http://127.0.0.1:1".into());
+        let staging_dir = tempfile::tempdir().expect("temp staging dir");
+        let cid_tree = Arc::new(crate::vfs::CidTree::new(
+            "initial-root".to_string(),
+            ipfs_client.clone(),
+            HashMap::new(),
+            staging_dir.path().to_path_buf(),
+        ));
+        let mut prev_ipfs_path = None;
+        let drain = Duration::from_millis(500);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let handle = handle_epoch_advance(
+                &event,
+                &epoch_tx,
+                &ipfs_client,
+                &mut prev_ipfs_path,
+                Some(&cid_tree),
+                drain,
+            );
+            tokio::pin!(handle);
+
+            loop {
+                tokio::select! {
+                    result = &mut handle => {
+                        result.expect("epoch advance succeeds despite unreachable IPFS");
+                        panic!("epoch advance completed before observing CidTree root swap");
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if cid_tree.root_cid().as_ref() == &target_cid {
+                            assert_eq!(cid_tree.root_cid().as_ref(), &target_cid);
+                            assert!(
+                                !epoch_rx.has_changed().expect("epoch channel open"),
+                                "epoch broadcast should not happen until after drain"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+
+            handle.await.expect("epoch advance succeeds");
+        })
+        .await
+        .expect("CidTree root should swap promptly");
+
+        assert_eq!(cid_tree.root_cid().as_ref(), &target_cid);
     }
 }
