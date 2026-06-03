@@ -8,32 +8,32 @@ description = "Off-chain Atom runtime: head-following, finalization, and caching
 [dependencies]
 membrane = { path = "../membrane" }
 alloy = { version = "0.4", features = ["rpc-types", "sol-types"] }
-capnp = "0.25.3"
-anyhow = "1"
+capnp = { workspace = true }
+anyhow = { workspace = true }
 futures-util = "0.3"
-hex = "0.4"
+hex = { workspace = true }
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 sha3 = "0.10"
 thiserror = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
 tokio-tungstenite = "0.24"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-capnp-rpc = "0.25.0"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+capnp-rpc = { workspace = true }
 
 [dev-dependencies]
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
-libp2p-core = "0.43"
+libp2p-core = { workspace = true }
 libp2p-identity = { version = "0.2", features = ["ed25519", "secp256k1"] }
 rlp = "0.5"
 auth = { path = "../guest/auth" }
 tokio-test = "0.4"
-tokio-util = { version = "0.7", features = ["compat"] }
-futures = "0.3"
+tokio-util = { workspace = true, features = ["compat"] }
+futures = { workspace = true }
 
 [[example]]
 name = "atom_indexer"

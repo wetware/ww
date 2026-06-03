@@ -5,20 +5,20 @@ edition = "2021"
 description = "Epoch-scoped capability primitives over Cap'n Proto RPC"
 
 [build-dependencies]
-capnpc = "0.25.3"
+capnpc = { workspace = true }
 schema-id = { path = "../schema-id" }
 
 [dependencies]
-capnp = "0.25.3"
-capnp-rpc = "0.25.0"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-hex = "0.4"
-libp2p-core = "0.43"
+capnp = { workspace = true }
+capnp-rpc = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+hex = { workspace = true }
+libp2p-core = { workspace = true }
 libp2p-identity = { version = "0.2", features = ["ed25519"] }
 rand = "0.8"
 auth = { path = "../guest/auth" }
-tokio = { version = "1", features = ["sync"] }
-tracing = "0.1"
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

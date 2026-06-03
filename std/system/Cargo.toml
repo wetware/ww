@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-capnp = "0.25.3"
-capnp-rpc = "0.25.0"
-futures = "0.3"
-log = "0.4"
-wasip2 = "1.0.2"
+capnp = { workspace = true }
+capnp-rpc = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+wasip2 = { workspace = true }
 wit-bindgen = "0.41.0"

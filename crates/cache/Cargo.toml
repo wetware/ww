@@ -5,13 +5,13 @@ edition = "2021"
 description = "CID-keyed, weight-aware ARC cache managing IPFS pins"
 
 [dependencies]
-cid = "0.11"
+cid = { workspace = true }
 linked-hash-map = "0.5"
-tokio = { version = "1", features = ["sync", "rt", "time"] }
-anyhow = "1"
-async-trait = "0.1"
-tracing = "0.1"
-tempfile = "3"
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }

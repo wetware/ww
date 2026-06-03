@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Host workspace dependency versions are centralized (#539).** Added shared `[workspace.dependencies]` pins for common host-workspace crates and converted member manifests to `workspace = true` where versions should move together, while leaving intentional duplicate dependency families such as `rand` 0.8/0.9 and upstream-owned parser/runtime stacks alone.
 - **Epoch-guarded HTTP redirects are revalidated against the original allowlist (#533).** The RPC HTTP client follows redirects only when each target stays on `http`/`https` and matches the configured host allowlist, preserving useful redirect behavior without allowing redirects to escape host authority checks.
 - **Examples now default to shell-forward demos with explicit Glia snippets.** Example READMEs now guide users through daemon + `ww shell` flows (`load glia/register.glia`, plus `serve`/`consume` snippets where relevant), per-example demo wiring moved from `examples/*/etc/init.d/*.glia` into new `examples/*/glia/*.glia` snippet files, and `doc/images.md` now documents init.d boot as deployment guidance rather than the demo default.
 - **AutoNAT v2 probe observability exposed with bounded history (#512).** Added a ring-buffered `nat_probe_events` surface in runtime `NetworkState` (tested address, probing server peer ID, result, timestamp), wired capture from `AutonatV2` events, and exposed operator JSON at admin `GET /host/nat` alongside existing node-level `nat_status`.
