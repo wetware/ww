@@ -14,6 +14,7 @@
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use membrane::EpochGuard;
+use std::{fmt, time::Duration};
 use tokio::sync::mpsc;
 
 use crate::dispatch::{self, CgiRequest, CgiResponse, RouteRegistry};
@@ -21,6 +22,12 @@ use membrane::system_capnp;
 
 /// Maximum response size from a cell process (16 MiB).
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default wall-clock bound for one WAGI request.
+const WAGI_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Best-effort cleanup bound for a kill RPC after the response decision is made.
+const WAGI_KILL_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct HttpListenerImpl {
     guard: EpochGuard,
@@ -121,7 +128,16 @@ async fn handle_one_request(
     caps: &[ExtraCap],
     req: &CgiRequest,
 ) -> CgiResponse {
-    match spawn_and_run(executor, caps, req).await {
+    handle_one_request_with_timeout(executor, caps, req, WAGI_REQUEST_TIMEOUT).await
+}
+
+async fn handle_one_request_with_timeout(
+    executor: &system_capnp::executor::Client,
+    caps: &[ExtraCap],
+    req: &CgiRequest,
+    timeout: Duration,
+) -> CgiResponse {
+    match spawn_and_run(executor, caps, req, timeout).await {
         Ok(stdout) => match crate::wagi::parse_cgi_response(&stdout) {
             Ok(cgi) => CgiResponse {
                 status: cgi.status_code,
@@ -134,11 +150,37 @@ async fn handle_one_request(
                 body: format!("CGI parse error: {e}").into_bytes(),
             },
         },
-        Err(e) => CgiResponse {
+        Err(WagiRequestError::Timeout { timeout }) => CgiResponse {
+            status: 504,
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            body: format!("cell timed out after {}s", timeout.as_secs()).into_bytes(),
+        },
+        Err(WagiRequestError::Cell(e)) => CgiResponse {
             status: 502,
             headers: vec![("content-type".to_string(), "text/plain".to_string())],
             body: format!("cell error: {e}").into_bytes(),
         },
+    }
+}
+
+#[derive(Debug)]
+enum WagiRequestError {
+    Cell(capnp::Error),
+    Timeout { timeout: Duration },
+}
+
+impl fmt::Display for WagiRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cell(err) => write!(f, "{err}"),
+            Self::Timeout { timeout } => write!(f, "cell timed out after {timeout:?}"),
+        }
+    }
+}
+
+impl From<capnp::Error> for WagiRequestError {
+    fn from(err: capnp::Error) -> Self {
+        Self::Cell(err)
     }
 }
 
@@ -153,7 +195,8 @@ async fn spawn_and_run(
     executor: &system_capnp::executor::Client,
     caps: &[ExtraCap],
     req: &CgiRequest,
-) -> Result<Vec<u8>, capnp::Error> {
+    timeout: Duration,
+) -> Result<Vec<u8>, WagiRequestError> {
     let (server_name, server_port) = dispatch::extract_server_info(&req.headers);
     let env = crate::wagi::build_cgi_env(
         &req.method,
@@ -194,6 +237,30 @@ async fn spawn_and_run(
     let spawn_resp = spawn_req.send().promise.await?;
     let process = spawn_resp.get()?.get_process()?;
 
+    match tokio::time::timeout(timeout, run_spawned_process(&process, req)).await {
+        Ok(result) => result.map_err(WagiRequestError::Cell),
+        Err(_) => {
+            kill_process_best_effort(&process);
+            Err(WagiRequestError::Timeout { timeout })
+        }
+    }
+}
+
+fn kill_process_best_effort(process: &system_capnp::process::Client) {
+    let process = process.clone();
+    tokio::task::spawn_local(async move {
+        match tokio::time::timeout(WAGI_KILL_TIMEOUT, process.kill_request().send().promise).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!(error = %err, "process.kill failed during WAGI cleanup"),
+            Err(_) => tracing::warn!("process.kill timed out during WAGI cleanup"),
+        }
+    });
+}
+
+async fn run_spawned_process(
+    process: &system_capnp::process::Client,
+    req: &CgiRequest,
+) -> Result<Vec<u8>, capnp::Error> {
     // Write request body to stdin, then close.
     let stdin_resp = process.stdin_request().send().promise.await?;
     let stdin = stdin_resp.get()?.get_stream()?;
@@ -218,7 +285,7 @@ async fn spawn_and_run(
         }
         response.extend_from_slice(chunk);
         if response.len() > MAX_RESPONSE_BYTES {
-            let _ = process.kill_request().send().promise.await;
+            kill_process_best_effort(process);
             return Err(capnp::Error::failed(format!(
                 "cell response exceeded {MAX_RESPONSE_BYTES} bytes"
             )));
@@ -239,6 +306,9 @@ async fn spawn_and_run(
 mod tests {
     use super::*;
     use crate::dispatch::new_registry;
+    use crate::{ByteStreamImpl, ProcessImpl, StreamMode};
+    use tokio::io::{self, AsyncWriteExt};
+    use tokio::sync::{oneshot, watch};
 
     /// Build an EpochGuard at seq=1 paired with its sender.
     fn test_epoch_guard() -> (
@@ -277,6 +347,255 @@ mod tests {
 
     fn stub_executor() -> system_capnp::executor::Client {
         capnp_rpc::new_client(StubExecutor)
+    }
+
+    struct ProcessExecutor {
+        process: system_capnp::process::Client,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::executor::Server for ProcessExecutor {
+        fn spawn(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::executor::SpawnParams,
+            mut results: system_capnp::executor::SpawnResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_process(self.process.clone());
+            Promise::ok(())
+        }
+    }
+
+    fn executor_for_process(
+        process: system_capnp::process::Client,
+    ) -> system_capnp::executor::Client {
+        capnp_rpc::new_client(ProcessExecutor { process })
+    }
+
+    fn test_request() -> CgiRequest {
+        let (response_tx, _response_rx) = oneshot::channel();
+        CgiRequest {
+            method: "GET".to_string(),
+            path: "/status".to_string(),
+            query: String::new(),
+            headers: vec![("host".to_string(), "localhost:2080".to_string())],
+            body: Vec::new(),
+            response_tx,
+        }
+    }
+
+    fn process_with_stdout(
+        stdout_stream: io::DuplexStream,
+        kill_tx: watch::Sender<bool>,
+    ) -> system_capnp::process::Client {
+        let (stdin_stream, _stdin_peer) = io::duplex(64 * 1024);
+        let (stderr_stream, _stderr_peer) = io::duplex(1);
+        let stdin = capnp_rpc::new_client(ByteStreamImpl::new(stdin_stream, StreamMode::WriteOnly));
+        let stdout =
+            capnp_rpc::new_client(ByteStreamImpl::new(stdout_stream, StreamMode::ReadOnly));
+        let stderr =
+            capnp_rpc::new_client(ByteStreamImpl::new(stderr_stream, StreamMode::ReadOnly));
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let _ = exit_tx.send(0);
+        capnp_rpc::new_client(ProcessImpl::new(stdin, stdout, stderr, exit_rx, kill_tx))
+    }
+
+    struct HangingKillProcess {
+        stdin: system_capnp::byte_stream::Client,
+        stdout: system_capnp::byte_stream::Client,
+        stderr: system_capnp::byte_stream::Client,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::process::Server for HangingKillProcess {
+        fn stdin(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::process::StdinParams,
+            mut results: system_capnp::process::StdinResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_stream(self.stdin.clone());
+            Promise::ok(())
+        }
+
+        fn stdout(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::process::StdoutParams,
+            mut results: system_capnp::process::StdoutResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_stream(self.stdout.clone());
+            Promise::ok(())
+        }
+
+        fn stderr(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::process::StderrParams,
+            mut results: system_capnp::process::StderrResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_stream(self.stderr.clone());
+            Promise::ok(())
+        }
+
+        fn wait(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::process::WaitParams,
+            _results: system_capnp::process::WaitResults,
+        ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+            std::future::pending()
+        }
+
+        fn bootstrap(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::process::BootstrapParams,
+            _results: system_capnp::process::BootstrapResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::failed("no bootstrap".into()))
+        }
+
+        fn kill(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::process::KillParams,
+            _results: system_capnp::process::KillResults,
+        ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+            std::future::pending()
+        }
+    }
+
+    fn hanging_kill_process(stdout_stream: io::DuplexStream) -> system_capnp::process::Client {
+        let (stdin_stream, _stdin_peer) = io::duplex(64 * 1024);
+        let (stderr_stream, _stderr_peer) = io::duplex(1);
+        let stdin = capnp_rpc::new_client(ByteStreamImpl::new(stdin_stream, StreamMode::WriteOnly));
+        let stdout =
+            capnp_rpc::new_client(ByteStreamImpl::new(stdout_stream, StreamMode::ReadOnly));
+        let stderr =
+            capnp_rpc::new_client(ByteStreamImpl::new(stderr_stream, StreamMode::ReadOnly));
+        capnp_rpc::new_client(HangingKillProcess {
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
+
+    async fn response_for_process(
+        process: system_capnp::process::Client,
+        timeout: Duration,
+    ) -> CgiResponse {
+        let executor = executor_for_process(process);
+        let req = test_request();
+        handle_one_request_with_timeout(&executor, &[], &req, timeout).await
+    }
+
+    #[tokio::test]
+    async fn wagi_request_completes_before_timeout() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (stdout_stream, mut stdout_writer) = io::duplex(64 * 1024);
+                let (kill_tx, kill_rx) = watch::channel(false);
+                let process = process_with_stdout(stdout_stream, kill_tx);
+                tokio::task::spawn_local(async move {
+                    stdout_writer
+                        .write_all(b"Status: 201 Created\r\nContent-Type: text/plain\r\n\r\nok")
+                        .await
+                        .expect("write CGI response");
+                    stdout_writer.shutdown().await.expect("close stdout");
+                });
+
+                let response = response_for_process(process, Duration::from_secs(1)).await;
+
+                assert_eq!(response.status, 201);
+                assert_eq!(response.body, b"ok");
+                assert!(!*kill_rx.borrow(), "normal request should not be killed");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn wagi_request_timeout_kills_process_and_returns_504() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (stdout_stream, _stdout_writer) = io::duplex(64 * 1024);
+                let (kill_tx, mut kill_rx) = watch::channel(false);
+                let process = process_with_stdout(stdout_stream, kill_tx);
+
+                let response = response_for_process(process, Duration::from_millis(20)).await;
+
+                assert_eq!(response.status, 504);
+                assert!(
+                    String::from_utf8_lossy(&response.body).contains("timed out"),
+                    "timeout response body should explain the failure"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), kill_rx.changed())
+                        .await
+                        .expect("kill signal should arrive")
+                        .is_ok(),
+                    "kill watch should stay open"
+                );
+                assert!(
+                    *kill_rx.borrow(),
+                    "timeout path should call process.kill() best-effort"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn wagi_timeout_returns_504_even_when_kill_rpc_hangs() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (stdout_stream, _stdout_writer) = io::duplex(64 * 1024);
+                let process = hanging_kill_process(stdout_stream);
+
+                let response = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    response_for_process(process, Duration::from_millis(20)),
+                )
+                .await
+                .expect("hung kill RPC should not delay timeout response");
+
+                assert_eq!(response.status, 504);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn oversized_wagi_response_still_kills_and_returns_502() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (stdout_stream, mut stdout_writer) = io::duplex(64 * 1024);
+                let (kill_tx, mut kill_rx) = watch::channel(false);
+                let process = process_with_stdout(stdout_stream, kill_tx);
+                tokio::task::spawn_local(async move {
+                    let oversized = vec![b'x'; MAX_RESPONSE_BYTES + 1];
+                    stdout_writer
+                        .write_all(&oversized)
+                        .await
+                        .expect("write oversized response");
+                    stdout_writer.shutdown().await.expect("close stdout");
+                });
+
+                let response = response_for_process(process, Duration::from_secs(5)).await;
+
+                assert_eq!(response.status, 502);
+                assert!(
+                    String::from_utf8_lossy(&response.body).contains("exceeded"),
+                    "oversized response should keep existing error mapping"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), kill_rx.changed())
+                        .await
+                        .expect("kill signal should arrive")
+                        .is_ok(),
+                    "kill watch should stay open"
+                );
+                assert!(
+                    *kill_rx.borrow(),
+                    "oversized response path should still kill the process"
+                );
+            })
+            .await;
     }
 
     /// `HttpListener.listen` should accept an empty caps list and register
