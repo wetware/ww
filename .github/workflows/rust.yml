@@ -84,13 +84,17 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
+        targets: wasm32-wasip2
 
     - uses: ./.github/actions/setup-capnp
 
     - uses: Swatinem/rust-cache@v2
 
-    - name: cargo clippy (host crates)
-      run: cargo clippy -p ww -p membrane -p atom -p glia -- -D warnings
+    - name: Build WASI example fixture
+      run: make -C examples/echo
+
+    - name: cargo clippy (host workspace)
+      run: cargo clippy --workspace --all-targets -- -D warnings
 
   solidity:
     name: Solidity (Foundry)
@@ -142,8 +146,8 @@ jobs:
       with:
         key: build-test
 
-    - name: Build (compile all crates + test binaries)
-      run: cargo build --tests
+    - name: Build host workspace test binaries
+      run: cargo build --workspace --tests
 
   test:
     name: Test
@@ -194,8 +198,8 @@ jobs:
     - name: Build WASI example binaries
       run: make -C examples/echo
 
-    - name: Run tests (hot cache from build job)
-      run: cargo test
+    - name: Run host workspace tests (hot cache from build job)
+      run: cargo test --workspace
 
   # === Master-only: fan out after checks pass ===
 

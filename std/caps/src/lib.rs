@@ -853,7 +853,7 @@ mod tests {
 
                 // Poll the future (should resolve immediately for cached imports)
                 let waker = std::task::Waker::noop();
-                let mut cx = std::task::Context::from_waker(&waker);
+                let mut cx = std::task::Context::from_waker(waker);
                 let mut pinned = fut;
                 match std::pin::Pin::new(&mut pinned).poll(&mut cx) {
                     std::task::Poll::Ready(Ok(_)) => {}
@@ -918,7 +918,7 @@ mod tests {
 
             let fut = func(vec![data, resume]);
             let waker = std::task::Waker::noop();
-            let mut cx = std::task::Context::from_waker(&waker);
+            let mut cx = std::task::Context::from_waker(waker);
             let mut pinned = fut;
             match std::pin::Pin::new(&mut pinned).poll(&mut cx) {
                 std::task::Poll::Ready(Ok(_)) => {}
@@ -953,7 +953,7 @@ mod tests {
 
         let fut = func(vec![data, resume]);
         let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(waker);
         let mut pinned = fut;
         match std::pin::Pin::new(&mut pinned).poll(&mut cx) {
             std::task::Poll::Ready(Err(_)) => {} // expected — file doesn't exist

@@ -109,14 +109,8 @@ mod tests {
     };
     use std::task::Wake;
 
-    struct NoopWake;
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn poll_rx(rx: &mut Receiver) -> Poll<Result<Val, Val>> {
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         Pin::new(rx).poll(&mut cx)
     }
 
