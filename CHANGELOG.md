@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Host workspace dependency versions are centralized (#539).** Added shared `[workspace.dependencies]` pins for common host-workspace crates and converted member manifests to `workspace = true` where versions should move together, while leaving intentional duplicate dependency families such as `rand` 0.8/0.9 and upstream-owned parser/runtime stacks alone.
 - **CI now exercises the full host workspace for Rust lint/build/test coverage (#537).** Pull request checks run clippy with `--workspace --all-targets`, build host workspace test binaries with `--workspace --tests`, and run host workspace tests instead of checking only selected packages or the root default member.
 - **Epoch-guarded HTTP redirects are revalidated against the original allowlist (#533).** The RPC HTTP client follows redirects only when each target stays on `http`/`https` and matches the configured host allowlist, preserving useful redirect behavior without allowing redirects to escape host authority checks.
 - **MCP/Glia adapter helpers are shared across shell and standalone MCP paths (#538).** Moved Glia string escaping, safe action validation, MCP tool-call expression rendering, `Val` JSON conversion, and structured Glia error serialization into `std/caps::mcp_adapter`; both `ww shell --mcp` and `std/mcp` now use the shared implementation while keeping their intentionally different tool surfaces table-driven.

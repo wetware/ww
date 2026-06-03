@@ -5,7 +5,7 @@ edition = "2021"
 description = "Build-time helper: extract canonical schema bytes and CIDs from Cap'n Proto schemas"
 
 [dependencies]
-capnp = "0.25.3"
-capnpc = "0.25.3" # runtime dep: extract_schemas uses capnpc for canonical encoding
-blake3 = "1"
-cid = "0.11"
+capnp = { workspace = true }
+capnpc = { workspace = true } # runtime dep: extract_schemas uses capnpc for canonical encoding
+blake3 = { workspace = true }
+cid = { workspace = true }

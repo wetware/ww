@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1"
-async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "json", "stream", "multipart"] }
 tar = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-cid = "0.11"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+cid = { workspace = true }
 cache = { package = "ww-cache", path = "../cache" }
-tokio = { version = "1", features = ["fs", "io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util"] }
