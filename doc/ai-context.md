@@ -35,14 +35,14 @@ Architecture (three layers):
 - **Kernel** (pid0): calls `membrane.graft()` to obtain capabilities
   (Host, Runtime, Routing, Identity, HttpClient).  Interprets the FHS
   image layout.  All policy lives here.
-- **Children**: spawned by pid0 with attenuated capabilities.
+- **Children**: spawned by pid0 with explicit capability grants.
 
 Key abstractions:
 - **Cell type system**: schema bytes passed explicitly via RPC;
   `WW_CELL_MODE` envvar indicates transport (vat, raw, http).
 - **Membrane**: the capability hub.  `graft()` returns epoch-scoped
-  capabilities.  pid0 can wrap/filter capabilities and export an
-  attenuated Membrane to the network.
+  capabilities.  pid0 can wrap/filter capabilities and export a
+  derived Membrane to the network.
 - **Epoch lifecycle**: when `--stem` points to an on-chain Atom
   contract, capabilities are revoked on each epoch advance.
 - **FHS images**: layers are stacked with per-file union.  Later

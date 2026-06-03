@@ -6519,7 +6519,7 @@ mod tests {
 
     #[test]
     fn perform_cap_different_cid_no_match() {
-        // Different schema CIDs — does NOT match (type semantics).
+        // Different test caps have different instance identities, so they do not match.
         let mut env = Env::new();
         let d = RecordingDispatch::new();
         let cap1 = make_test_cap("executor", 1);

@@ -74,9 +74,10 @@ The current landscape is "agent code sandboxing":
 
 What none of them have:
 
-- **Per-call capability attenuation.** A tool can be granted
-  capability `X` for one invocation and not the next. A sub-tool
-  invoked by a tool inherits an attenuated subset, automatically.
+- **Explicit capability handoff.** A tool can be granted capability
+  `X` for one invocation and not the next. Fine-grained recursive
+  attenuation is the next design step, not something we should imply
+  is already complete.
 - **Composable trust graphs.** The membrane is the trust boundary,
   and graft composes naturally: when tool A calls tool B which
   calls tool C, each call carries a capability set the previous
@@ -90,7 +91,7 @@ What none of them have:
   on a friend's bare-metal, on a peer-to-peer swarm, or on a
   hosted Wetware tier. The product doesn't change.
 
-Two of those (per-call attenuation, composable membranes) are
+Two of those (explicit capability handoff, composable membranes) are
 deep enough to win deals on. The others are proof points.
 
 ## How Wetware satisfies it
@@ -178,13 +179,13 @@ A few framings we've explicitly *not* chosen, and why:
 
 What we have today:
 
-- WASM cell runtime with per-call membrane attenuation.
-- Composable graft (tools-call-tools inherits attenuated grants).
+- WASM cell runtime with explicit membrane-grafted capabilities.
+- Composable graft (tools-call-tools receives explicit grants).
 - Content-addressed code via IPFS (CIDs flow through the runtime).
-- MCP/Glia bridge with capability-attenuated agent execution.
+- MCP/Glia bridge with membrane-grafted agent execution.
 - Optional P2P (libp2p swarm, DHT routing, schema-CID-addressable
   services).
-- Engagement demo: install, hit a capability-attenuated WASM cell
+- Engagement demo: install, hit a membrane-grafted WASM cell
   from curl in 60 seconds.
 
 What we don't have today, and won't pretend to:
@@ -208,9 +209,8 @@ What we don't have today, and won't pretend to:
 
 Three documents:
 
-1. **Per-call capability attenuation deep dive** -- documenting
-   the property with the tax-prep example as a worked case.
-   Not new code; new narrative.
+1. **Recursive capability attenuation design** -- lock the property
+   and implementation plan with the tax-prep example as a worked case.
 2. **Composable membranes doc** -- ASCII diagrams of how graft
    composes when tools call tools, with a worked agent example.
    Documents an existing structural property nobody else can
