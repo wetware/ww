@@ -10,6 +10,8 @@ use membrane::EpochGuard;
 
 use membrane::http_capnp;
 
+const MAX_REDIRECTS: usize = 10;
+
 /// Epoch-guarded HTTP proxy that enforces domain scoping.
 ///
 /// Only created when the operator passes `--http-dial` flags.
@@ -23,8 +25,28 @@ pub struct EpochGuardedHttpProxy {
 
 impl EpochGuardedHttpProxy {
     pub fn new(allowed_hosts: Vec<String>, guard: EpochGuard) -> Self {
+        let redirect_allowed_hosts = allowed_hosts.clone();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() > MAX_REDIRECTS {
+                    return attempt.error(std::io::Error::other("too many redirects"));
+                }
+
+                if let Err(message) =
+                    Self::validate_url_authorized(attempt.url(), &redirect_allowed_hosts)
+                {
+                    return attempt.error(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        message,
+                    ));
+                }
+
+                // Reqwest removes Authorization, Cookie, Proxy-Authorization, and
+                // related sensitive headers on cross-host redirects after this
+                // policy returns Follow.
+                attempt.follow()
+            }))
             .build()
             .expect("failed to build reqwest client");
         Self {
@@ -42,22 +64,34 @@ impl EpochGuardedHttpProxy {
 
         let parsed = reqwest::Url::parse(url_str)
             .map_err(|e| capnp::Error::failed(format!("invalid URL: {e}")))?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| capnp::Error::failed("URL has no host".into()))?;
 
-        if !self.host_matches(host) {
-            return Err(capnp::Error::failed(format!(
-                "host {host:?} not in allowlist"
-            )));
-        }
+        Self::validate_url_authorized(&parsed, &self.allowed_hosts)
+            .map_err(capnp::Error::failed)?;
 
         Ok(parsed)
     }
 
-    /// Check whether `host` is permitted by the allowlist.
-    fn host_matches(&self, host: &str) -> bool {
-        self.allowed_hosts.iter().any(|pattern| {
+    fn validate_url_authorized(
+        parsed: &reqwest::Url,
+        allowed_hosts: &[String],
+    ) -> Result<(), String> {
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(format!("URL scheme {:?} is not allowed", parsed.scheme()));
+        }
+
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "URL has no host".to_string())?;
+
+        if !Self::host_matches_allowed(host, allowed_hosts) {
+            return Err(format!("host {host:?} not in allowlist"));
+        }
+
+        Ok(())
+    }
+
+    fn host_matches_allowed(host: &str, allowed_hosts: &[String]) -> bool {
+        allowed_hosts.iter().any(|pattern| {
             if pattern == "*" {
                 true
             } else if let Some(suffix) = pattern.strip_prefix("*.") {
@@ -99,10 +133,12 @@ impl EpochGuardedHttpProxy {
     where
         T: ResponseBuilder,
     {
-        let response = client
-            .execute(request)
-            .await
-            .map_err(|e| capnp::Error::failed(format!("HTTP request failed: {e}")))?;
+        let response = client.execute(request).await.map_err(|e| {
+            capnp::Error::failed(format!(
+                "HTTP request failed: {}",
+                Self::format_reqwest_error(&e)
+            ))
+        })?;
 
         let status = response.status().as_u16();
         let resp_headers: Vec<(String, String)> = response
@@ -117,6 +153,17 @@ impl EpochGuardedHttpProxy {
 
         results.set_response(status, &resp_headers, &body);
         Ok(())
+    }
+
+    fn format_reqwest_error(error: &reqwest::Error) -> String {
+        let mut message = error.to_string();
+        let mut current = std::error::Error::source(error);
+        while let Some(source) = current {
+            message.push_str(": ");
+            message.push_str(&source.to_string());
+            current = source.source();
+        }
+        message
     }
 }
 
@@ -218,7 +265,12 @@ impl http_capnp::http_client::Server for EpochGuardedHttpProxy {
 mod tests {
     use super::*;
     use membrane::epoch::{Epoch, Provenance};
+    use std::error::Error;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
+    use tokio::task::JoinHandle;
 
     fn test_proxy(allowed_hosts: Vec<String>) -> EpochGuardedHttpProxy {
         let epoch = Epoch {
@@ -248,10 +300,208 @@ mod tests {
         EpochGuardedHttpProxy::new(allowed_hosts, guard)
     }
 
+    struct TestResponse {
+        status: u16,
+        headers: Vec<(&'static str, String)>,
+        body: &'static str,
+    }
+
+    impl TestResponse {
+        fn ok(body: &'static str) -> Self {
+            Self {
+                status: 200,
+                headers: Vec::new(),
+                body,
+            }
+        }
+
+        fn redirect(location: impl Into<String>) -> Self {
+            Self {
+                status: 302,
+                headers: vec![("Location", location.into())],
+                body: "",
+            }
+        }
+    }
+
+    struct TestServer {
+        base_url: String,
+        handle: JoinHandle<()>,
+    }
+
+    impl TestServer {
+        async fn spawn(
+            handler: impl Fn(String) -> TestResponse + Send + Sync + 'static,
+        ) -> std::io::Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let base_url = format!("http://{}", listener.local_addr()?);
+            let handler = Arc::new(handler);
+            let handle = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let handler = Arc::clone(&handler);
+                    tokio::spawn(async move {
+                        let _ = serve_connection(stream, handler).await;
+                    });
+                }
+            });
+
+            Ok(Self { base_url, handle })
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("{}{}", self.base_url, path)
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn serve_connection<F>(mut stream: TcpStream, handler: Arc<F>) -> std::io::Result<()>
+    where
+        F: Fn(String) -> TestResponse + Send + Sync + 'static,
+    {
+        let mut buf = [0_u8; 2048];
+        let n = stream.read(&mut buf).await?;
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        let response = handler(path);
+        let reason = match response.status {
+            200 => "OK",
+            302 => "Found",
+            _ => "Error",
+        };
+
+        let mut raw = format!(
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            response.status,
+            reason,
+            response.body.len()
+        );
+        for (name, value) in response.headers {
+            raw.push_str(name);
+            raw.push_str(": ");
+            raw.push_str(&value);
+            raw.push_str("\r\n");
+        }
+        raw.push_str("\r\n");
+        raw.push_str(response.body);
+
+        stream.write_all(raw.as_bytes()).await
+    }
+
+    fn error_chain_contains(err: &(dyn Error + 'static), needle: &str) -> bool {
+        let mut current = Some(err);
+        while let Some(err) = current {
+            if err.to_string().contains(needle) {
+                return true;
+            }
+            current = err.source();
+        }
+        false
+    }
+
     #[test]
     fn allowlist_permits_listed_host() {
         let proxy = test_proxy(vec!["example.com".into()]);
         assert!(proxy.validate_request("https://example.com/path").is_ok());
+    }
+
+    #[tokio::test]
+    async fn follows_allowed_redirect() {
+        let server = TestServer::spawn(|path| match path.as_str() {
+            "/start" => TestResponse::redirect("/final"),
+            "/final" => TestResponse::ok("final body"),
+            _ => TestResponse {
+                status: 404,
+                headers: Vec::new(),
+                body: "not found",
+            },
+        })
+        .await
+        .unwrap();
+        let proxy = test_proxy(vec!["127.0.0.1".into()]);
+
+        let response = proxy.client.get(server.url("/start")).send().await.unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "final body");
+    }
+
+    #[tokio::test]
+    async fn rejects_redirect_to_disallowed_host() {
+        let server = TestServer::spawn(|path| match path.as_str() {
+            "/start" => TestResponse::redirect("http://127.0.0.2/blocked"),
+            _ => TestResponse::ok("unexpected"),
+        })
+        .await
+        .unwrap();
+        let proxy = test_proxy(vec!["127.0.0.1".into()]);
+
+        let err = proxy
+            .client
+            .get(server.url("/start"))
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(
+            error_chain_contains(&err, "not in allowlist"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_redirects_after_max_depth() {
+        let server = TestServer::spawn(|_| TestResponse::redirect("/loop"))
+            .await
+            .unwrap();
+        let proxy = test_proxy(vec!["127.0.0.1".into()]);
+
+        let err = proxy
+            .client
+            .get(server.url("/loop"))
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(
+            error_chain_contains(&err, "too many redirects"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_redirect_to_non_http_scheme() {
+        let server = TestServer::spawn(|path| match path.as_str() {
+            "/start" => TestResponse::redirect("ftp://127.0.0.1/blocked"),
+            _ => TestResponse::ok("unexpected"),
+        })
+        .await
+        .unwrap();
+        let proxy = test_proxy(vec!["127.0.0.1".into()]);
+
+        let err = proxy
+            .client
+            .get(server.url("/start"))
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(
+            error_chain_contains(&err, "not allowed"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -310,10 +560,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_url_without_host() {
+    fn rejects_initial_non_http_scheme() {
         let proxy = test_proxy(vec!["*".into()]);
         let err = proxy.validate_request("data:text/plain,hello").unwrap_err();
-        assert!(err.to_string().contains("no host"));
+        assert!(err.to_string().contains("not allowed"));
     }
 
     #[test]
