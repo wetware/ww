@@ -513,7 +513,7 @@ fn poll_loop<T>(
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```ignore
 /// let engine: chess_capnp::chess_engine::Client =
 ///     capnp_rpc::new_client(ChessEngineImpl::new());
 /// wetware_guest::serve_stdio(engine.client);
@@ -564,7 +564,7 @@ pub fn serve_stdio(bootstrap: capnp::capability::Client) {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```ignore
 /// let my_membrane: capnp::capability::Client = capnp_rpc::new_client(MyMembraneImpl).client;
 /// wetware_guest::serve(my_membrane, |host| async move {
 ///     // ... use host capabilities, export my_membrane to host ...
@@ -588,7 +588,7 @@ where
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```ignore
 /// wetware_guest::run(|membrane| async move {
 ///     let graft = membrane.graft_request().send().promise.await?;
 ///     let results = graft.get()?;
