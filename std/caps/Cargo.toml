@@ -9,6 +9,7 @@ capnp-rpc = "0.25.0"
 glia      = { path = "../../crates/glia" }
 bs58      = "0.5"
 multiaddr = "0.18.2"
+serde_json = "1"
 
 [lib]
 crate-type = ["rlib"]

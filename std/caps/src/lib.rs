@@ -11,6 +11,8 @@ use std::rc::Rc;
 
 use glia::{make_cap, Val};
 
+pub mod mcp_adapter;
+
 // Re-export extract_method from glia for downstream consumers (shell, MCP).
 pub use glia::extract_method;
 
