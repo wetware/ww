@@ -162,7 +162,6 @@ async fn spawn_and_run(
         &req.headers,
         &server_name,
         server_port,
-        req.verified_snap.as_ref(),
     );
 
     let mut spawn_req = executor.spawn_request();

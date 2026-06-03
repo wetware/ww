@@ -3,12 +3,10 @@
 //! v1.5 surface: text + button. GET renders an anonymous "Hello,
 //! @stranger" greeting plus a "Ping me" button. Pressing the button
 //! POSTs back to the same URL with a JFS-signed payload (POST is
-//! REQUIRED to be JFS-signed per spec); the response renders
-//! "Hello, FID #N — pinged at <utc-timestamp>" plus another button
-//! to ping again. The button forces every clicking user's client to
-//! send `X-Snap-Payload`, which is how we exercise viewer-aware
-//! rendering even on Farcaster clients whose render-time GETs are
-//! anonymous server-side fetches.
+//! REQUIRED to be JFS-signed per spec); this example verifies
+//! `X-Snap-Payload` itself from the generic WAGI header env and renders
+//! "Hello, FID #N — pinged at <utc-timestamp>" when verification
+//! succeeds.
 //!
 //! Content negotiation:
 //!   - `Accept: application/vnd.farcaster.snap+json` → snap-JSON
@@ -21,37 +19,68 @@
 //!
 //! Stateless. Fresh cell per request. No graft caps used.
 //!
-//! IMPORTANT — FID trust model: `X_SNAP_FID_CLAIMED` is
-//! cryptographically signed by the embedded JFS key, but the
-//! key↔FID binding is NOT Hub-verified in v1.0 of the wetware
-//! listener (see `crates/rpc/src/jfs.rs` module docs).
+//! IMPORTANT — FID trust model: this example verifies the payload
+//! signature, but does not query a Farcaster Hub to confirm that the
+//! embedded key is currently registered to the claimed FID. Treat the
+//! FID as demo context, not authorization authority.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use wagi_guest as wagi;
 use wasip2::exports::cli::run::Guest;
 
+mod jfs;
+
 const SNAP_TYPE: &str = "application/vnd.farcaster.snap+json";
 
-/// Render the viewer's greeting from JFS-verified env vars set by the
-/// listener. Returns `"FID #<n>"` when present, else `"@stranger"`.
+/// Render the viewer's greeting from a locally verified `X-Snap-Payload`
+/// header. Returns `"FID #<n>"` when verification succeeds, else
+/// `"@stranger"`.
 fn viewer_greeting() -> String {
-    match std::env::var("X_SNAP_FID_CLAIMED") {
-        Ok(fid) if !fid.is_empty() => format!("FID #{fid}"),
-        _ => "@stranger".to_string(),
-    }
+    let Some(payload) = wagi::header("X-Snap-Payload") else {
+        return "@stranger".to_string();
+    };
+    let Ok(verified) = jfs::verify(
+        &payload,
+        &expected_audience(),
+        current_unix_secs(),
+        jfs::DEFAULT_TIMESTAMP_SKEW_SECS,
+    ) else {
+        return "@stranger".to_string();
+    };
+    format!("FID #{}", verified.payload.fid)
+}
+
+/// Build the origin string expected by the Farcaster JFS `audience`
+/// field. This is deliberately example-local Snap behavior; the host
+/// only forwards ordinary HTTP headers through WAGI.
+fn expected_audience() -> String {
+    let host = wagi::header("Host").unwrap_or_else(|| "master.wetware.run".to_string());
+    let scheme = wagi::header("X-Forwarded-Proto").unwrap_or_else(|| "https".to_string());
+    format!("{scheme}://{host}")
+}
+
+fn current_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Build the absolute URL that snap submit-action buttons should POST
 /// to. Per spec, `params.target` is required and must be an HTTPS URL.
-/// Reads `HTTP_HOST` (the Host header forwarded by the listener) +
+/// Reads `HTTP_HOST` (the Host header forwarded through generic WAGI env) +
 /// `PATH_INFO` and assumes HTTPS (production deploys behind a TLS
 /// terminator like Traefik). For local-dev `http://` setups the cell
 /// would need a plumbing tweak, out of scope for this demo.
 fn compute_target_url() -> String {
     let host = wagi::header("Host").unwrap_or_else(|| "master.wetware.run".to_string());
     let path = wagi::path();
-    let path = if path.is_empty() { "/snaps/hello" } else { &path };
+    let path = if path.is_empty() {
+        "/snaps/hello"
+    } else {
+        &path
+    };
     format!("https://{host}{path}")
 }
 
@@ -138,6 +167,10 @@ fn wants_snap(accept: &str) -> bool {
 ///   per spec; the timestamp gives the response visible dynamism).
 fn snap_text(method: &str) -> String {
     let greeting = viewer_greeting();
+    snap_text_for_greeting(method, &greeting)
+}
+
+fn snap_text_for_greeting(method: &str, greeting: &str) -> String {
     if method == "POST" {
         format!("Hello, {greeting} — pinged at {}", now_utc_string())
     } else {
@@ -232,8 +265,7 @@ mod tests {
 
     #[test]
     fn snap_response_required_top_level_fields() {
-        let body =
-            snap_response_json("Hello, @stranger", "https://master.wetware.run/snaps/hello");
+        let body = snap_response_json("Hello, @stranger", "https://master.wetware.run/snaps/hello");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["version"], "2.0");
         assert_eq!(v["ui"]["root"], "root");
@@ -241,8 +273,7 @@ mod tests {
 
     #[test]
     fn snap_response_stack_root_with_two_children() {
-        let body =
-            snap_response_json("Hello, @stranger", "https://master.wetware.run/snaps/hello");
+        let body = snap_response_json("Hello, @stranger", "https://master.wetware.run/snaps/hello");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ui"]["elements"]["root"]["type"], "stack");
         let children = v["ui"]["elements"]["root"]["children"]
@@ -266,8 +297,7 @@ mod tests {
 
     #[test]
     fn snap_response_button_props_match_spec() {
-        let body =
-            snap_response_json("Hello, @stranger", "https://master.wetware.run/snaps/hello");
+        let body = snap_response_json("Hello, @stranger", "https://master.wetware.run/snaps/hello");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let btn = &v["ui"]["elements"]["ping_button"];
         assert_eq!(btn["type"], "button");
@@ -291,43 +321,36 @@ mod tests {
 
     #[test]
     fn snap_text_get_anonymous_returns_stranger() {
-        // Clean env to avoid pollution from other tests (cargo runs
-        // tests in the same process, so X_SNAP_FID_CLAIMED could leak).
-        std::env::remove_var("X_SNAP_FID_CLAIMED");
-        let s = snap_text("GET");
+        let s = snap_text_for_greeting("GET", "@stranger");
         assert_eq!(s, "Hello, @stranger");
     }
 
     #[test]
     fn snap_text_get_viewer_aware_renders_fid() {
-        std::env::set_var("X_SNAP_FID_CLAIMED", "12345");
-        let s = snap_text("GET");
-        std::env::remove_var("X_SNAP_FID_CLAIMED");
+        let s = snap_text_for_greeting("GET", "FID #12345");
         assert_eq!(s, "Hello, FID #12345");
     }
 
     #[test]
     fn snap_text_post_includes_timestamp_marker() {
-        std::env::remove_var("X_SNAP_FID_CLAIMED");
-        let s = snap_text("POST");
+        let s = snap_text_for_greeting("POST", "@stranger");
         assert!(s.starts_with("Hello, @stranger — pinged at "));
         assert!(s.ends_with(" UTC (unix)"));
     }
 
     #[test]
     fn snap_text_post_viewer_aware_includes_fid_and_timestamp() {
-        std::env::set_var("X_SNAP_FID_CLAIMED", "7");
-        let s = snap_text("POST");
-        std::env::remove_var("X_SNAP_FID_CLAIMED");
+        let s = snap_text_for_greeting("POST", "FID #7");
         assert!(s.starts_with("Hello, FID #7 — pinged at "));
     }
 
     #[test]
     fn snap_response_text_content_under_320_chars() {
         // Worst-case: max-FID + POST timestamp.
-        std::env::set_var("X_SNAP_FID_CLAIMED", "18446744073709551615");
-        let body = snap_response_json(&snap_text("POST"), "https://x/snaps/hello");
-        std::env::remove_var("X_SNAP_FID_CLAIMED");
+        let body = snap_response_json(
+            &snap_text_for_greeting("POST", "FID #18446744073709551615"),
+            "https://x/snaps/hello",
+        );
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let content = v["ui"]["elements"]["greeting"]["props"]["content"]
             .as_str()

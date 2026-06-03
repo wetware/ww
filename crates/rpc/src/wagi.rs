@@ -47,22 +47,6 @@ impl std::error::Error for WagiError {}
 /// Returns a `Vec<String>` of `KEY=VALUE` pairs suitable for passing to
 /// `ProcBuilder::with_env()` or `Executor.bind()`.
 ///
-/// `verified_snap`, when `Some`, adds Snap-specific env vars carrying
-/// the JFS-verified viewer context. Cells consume these to render
-/// viewer-aware UIs:
-///   - `X_SNAP_FID_CLAIMED` — the FID from the verified payload.
-///     Naming is explicit: cryptographically signed against the
-///     embedded key, but the key↔FID binding is NOT Hub-verified in
-///     v1.0. Cells that grant authority based on FID identity SHOULD
-///     wait for v1.1.
-///   - `X_SNAP_TIMESTAMP` — Unix-seconds the payload was signed.
-///   - `X_SNAP_AUDIENCE` — server origin the client signed for
-///     (already verified to match this server).
-///   - `X_SNAP_PAYLOAD_B64URL` — verbatim BASE64URL of the original
-///     payload bytes, so cells that want the inputs/user/surface
-///     fields can decode + parse them directly without re-walking
-///     header validation.
-///
 /// Header values are converted with `to_string_lossy()` to handle non-UTF8.
 pub fn build_cgi_env(
     method: &str,
@@ -71,9 +55,8 @@ pub fn build_cgi_env(
     headers: &[(String, String)],
     server_name: &str,
     server_port: u16,
-    verified_snap: Option<&crate::jfs::VerifiedJfs>,
 ) -> Vec<String> {
-    let mut env = Vec::with_capacity(8 + headers.len() + verified_snap.map_or(0, |_| 4));
+    let mut env = Vec::with_capacity(8 + headers.len());
 
     env.push(format!("REQUEST_METHOD={method}"));
     env.push(format!("PATH_INFO={path}"));
@@ -90,13 +73,6 @@ pub fn build_cgi_env(
             "CONTENT_LENGTH" => env.push(format!("CONTENT_LENGTH={value}")),
             _ => env.push(format!("HTTP_{upper}={value}")),
         }
-    }
-
-    if let Some(v) = verified_snap {
-        env.push(format!("X_SNAP_FID_CLAIMED={}", v.payload.fid));
-        env.push(format!("X_SNAP_TIMESTAMP={}", v.payload.timestamp));
-        env.push(format!("X_SNAP_AUDIENCE={}", v.payload.audience));
-        env.push(format!("X_SNAP_PAYLOAD_B64URL={}", v.payload_b64url));
     }
 
     env
@@ -215,7 +191,7 @@ mod tests {
 
     #[test]
     fn cgi_env_basic() {
-        let env = build_cgi_env("GET", "/counter", "", &[], "localhost", 8080, None);
+        let env = build_cgi_env("GET", "/counter", "", &[], "localhost", 8080);
         assert!(env.contains(&"REQUEST_METHOD=GET".to_string()));
         assert!(env.contains(&"PATH_INFO=/counter".to_string()));
         assert!(env.contains(&"QUERY_STRING=".to_string()));
@@ -227,15 +203,7 @@ mod tests {
 
     #[test]
     fn cgi_env_with_query_string() {
-        let env = build_cgi_env(
-            "GET",
-            "/search",
-            "q=hello&page=1",
-            &[],
-            "localhost",
-            0,
-            None,
-        );
+        let env = build_cgi_env("GET", "/search", "q=hello&page=1", &[], "localhost", 0);
         assert!(env.contains(&"QUERY_STRING=q=hello&page=1".to_string()));
     }
 
@@ -246,7 +214,7 @@ mod tests {
             ("Host".to_string(), "example.com".to_string()),
             ("X-Custom-Header".to_string(), "value".to_string()),
         ];
-        let env = build_cgi_env("POST", "/api", "", &headers, "localhost", 8080, None);
+        let env = build_cgi_env("POST", "/api", "", &headers, "localhost", 8080);
         assert!(env.contains(&"HTTP_ACCEPT=text/html".to_string()));
         assert!(env.contains(&"HTTP_HOST=example.com".to_string()));
         assert!(env.contains(&"HTTP_X_CUSTOM_HEADER=value".to_string()));
@@ -258,38 +226,12 @@ mod tests {
             ("Content-Type".to_string(), "application/json".to_string()),
             ("Content-Length".to_string(), "42".to_string()),
         ];
-        let env = build_cgi_env("POST", "/api", "", &headers, "localhost", 8080, None);
+        let env = build_cgi_env("POST", "/api", "", &headers, "localhost", 8080);
         assert!(env.contains(&"CONTENT_TYPE=application/json".to_string()));
         assert!(env.contains(&"CONTENT_LENGTH=42".to_string()));
         // Should NOT have HTTP_ prefix
         assert!(!env.iter().any(|e| e.starts_with("HTTP_CONTENT_TYPE")));
         assert!(!env.iter().any(|e| e.starts_with("HTTP_CONTENT_LENGTH")));
-    }
-
-    #[test]
-    fn cgi_env_with_verified_snap_emits_snap_envs() {
-        let verified = crate::jfs::VerifiedJfs {
-            payload: crate::jfs::JfsPayload {
-                fid: 12345,
-                inputs: serde_json::json!({"button": "yes"}),
-                audience: "https://master.wetware.run".to_string(),
-                timestamp: 1_700_000_000,
-                user: serde_json::json!({"fid": 12345}),
-                surface: serde_json::json!({"type": "standalone"}),
-            },
-            payload_b64url: "abcDEF123".to_string(),
-        };
-        let env = build_cgi_env("POST", "/snap", "", &[], "localhost", 8080, Some(&verified));
-        assert!(env.contains(&"X_SNAP_FID_CLAIMED=12345".to_string()));
-        assert!(env.contains(&"X_SNAP_TIMESTAMP=1700000000".to_string()));
-        assert!(env.contains(&"X_SNAP_AUDIENCE=https://master.wetware.run".to_string()));
-        assert!(env.contains(&"X_SNAP_PAYLOAD_B64URL=abcDEF123".to_string()));
-    }
-
-    #[test]
-    fn cgi_env_without_verified_snap_omits_snap_envs() {
-        let env = build_cgi_env("GET", "/snap", "", &[], "localhost", 8080, None);
-        assert!(!env.iter().any(|e| e.starts_with("X_SNAP_")));
     }
 
     // ===== parse_cgi_response tests =====
