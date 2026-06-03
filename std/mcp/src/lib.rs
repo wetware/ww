@@ -20,15 +20,16 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use glia::eval::{self, Dispatch, Env};
-use glia::{Val, make_cap};
+use glia::{make_cap, Val};
 
 use wasip2::exports::cli::run::Guest;
 
 // Shared effect handler factories from the caps crate.
 use caps::{
-    eval_load_async, get_graft_cap, make_host_handler, make_import_handler,
-    make_routing_handler, membrane_capnp, routing_capnp, system_capnp, wrap_with_handlers,
+    eval_load_async, get_graft_cap, make_host_handler, make_import_handler, make_routing_handler,
+    mcp_adapter, membrane_capnp, routing_capnp, system_capnp, wrap_with_handlers,
 };
+use mcp_adapter::{ActionPolicy, ExprPart, ToolAction, ToolSpec};
 
 type Membrane = membrane_capnp::membrane::Client;
 
@@ -82,6 +83,184 @@ fn write_error(id: &serde_json::Value, code: i64, message: &str) {
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "wetware";
 const SERVER_VERSION: &str = "0.1.0";
+
+const MCP_HOST_ID_EXPR: &[ExprPart] = &[ExprPart::Literal("(perform host :id)")];
+const MCP_HOST_PEERS_EXPR: &[ExprPart] = &[ExprPart::Literal("(perform host :peers)")];
+const MCP_HOST_ADDRS_EXPR: &[ExprPart] = &[ExprPart::Literal("(perform host :addrs)")];
+const MCP_HOST_ACTIONS: &[ToolAction] = &[
+    ToolAction {
+        action: Some("id"),
+        template: MCP_HOST_ID_EXPR,
+    },
+    ToolAction {
+        action: Some("peers"),
+        template: MCP_HOST_PEERS_EXPR,
+    },
+    ToolAction {
+        action: Some("addrs"),
+        template: MCP_HOST_ADDRS_EXPR,
+    },
+];
+
+const MCP_ROUTING_PROVIDE_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(perform routing :provide (bytes "),
+    ExprPart::QuotedStringField {
+        field: "cid",
+        default: "",
+    },
+    ExprPart::Literal("))"),
+];
+const MCP_ROUTING_FIND_PROVIDERS_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(perform routing :find-providers (bytes "),
+    ExprPart::QuotedStringField {
+        field: "cid",
+        default: "",
+    },
+    ExprPart::Literal("))"),
+];
+const MCP_ROUTING_ACTIONS: &[ToolAction] = &[
+    ToolAction {
+        action: Some("provide"),
+        template: MCP_ROUTING_PROVIDE_EXPR,
+    },
+    ToolAction {
+        action: Some("find_providers"),
+        template: MCP_ROUTING_FIND_PROVIDERS_EXPR,
+    },
+];
+
+const MCP_RUNTIME_RUN_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(perform runtime :run (load "),
+    ExprPart::QuotedStringField {
+        field: "wasm_path",
+        default: "",
+    },
+    ExprPart::Literal("))"),
+];
+const MCP_RUNTIME_ACTIONS: &[ToolAction] = &[ToolAction {
+    action: Some("run"),
+    template: MCP_RUNTIME_RUN_EXPR,
+}];
+
+const MCP_IDENTITY_SIGN_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(perform identity :sign "),
+    ExprPart::QuotedStringField {
+        field: "domain",
+        default: "default",
+    },
+    ExprPart::Literal(" "),
+    ExprPart::U64Field {
+        field: "nonce",
+        default: 0,
+    },
+    ExprPart::Literal(")"),
+];
+const MCP_IDENTITY_VERIFY_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(perform identity :verify (bytes "),
+    ExprPart::QuotedStringField {
+        field: "data",
+        default: "",
+    },
+    ExprPart::Literal(") (bytes "),
+    ExprPart::QuotedStringField {
+        field: "signature",
+        default: "",
+    },
+    ExprPart::Literal(") (bytes "),
+    ExprPart::QuotedStringField {
+        field: "pubkey",
+        default: "",
+    },
+    ExprPart::Literal("))"),
+];
+const MCP_IDENTITY_ACTIONS: &[ToolAction] = &[
+    ToolAction {
+        action: Some("sign"),
+        template: MCP_IDENTITY_SIGN_EXPR,
+    },
+    ToolAction {
+        action: Some("verify"),
+        template: MCP_IDENTITY_VERIFY_EXPR,
+    },
+];
+
+const MCP_HTTP_GET_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(perform http-client :get "),
+    ExprPart::QuotedStringField {
+        field: "url",
+        default: "",
+    },
+    ExprPart::Literal(")"),
+];
+const MCP_HTTP_POST_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(perform http-client :post "),
+    ExprPart::QuotedStringField {
+        field: "url",
+        default: "",
+    },
+    ExprPart::Literal(" "),
+    ExprPart::QuotedStringField {
+        field: "body",
+        default: "",
+    },
+    ExprPart::Literal(")"),
+];
+const MCP_HTTP_ACTIONS: &[ToolAction] = &[
+    ToolAction {
+        action: Some("get"),
+        template: MCP_HTTP_GET_EXPR,
+    },
+    ToolAction {
+        action: Some("post"),
+        template: MCP_HTTP_POST_EXPR,
+    },
+];
+
+const MCP_IMPORT_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(def imported (perform import "),
+    ExprPart::QuotedStringField {
+        field: "path",
+        default: "",
+    },
+    ExprPart::Literal("))"),
+];
+const MCP_IMPORT_ACTIONS: &[ToolAction] = &[ToolAction {
+    action: None,
+    template: MCP_IMPORT_EXPR,
+}];
+
+const MCP_TOOL_SPECS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "host",
+        action_policy: ActionPolicy::RequiredSafe,
+        actions: MCP_HOST_ACTIONS,
+    },
+    ToolSpec {
+        name: "routing",
+        action_policy: ActionPolicy::RequiredSafe,
+        actions: MCP_ROUTING_ACTIONS,
+    },
+    ToolSpec {
+        name: "runtime",
+        action_policy: ActionPolicy::RequiredSafe,
+        actions: MCP_RUNTIME_ACTIONS,
+    },
+    ToolSpec {
+        name: "identity",
+        action_policy: ActionPolicy::RequiredSafe,
+        actions: MCP_IDENTITY_ACTIONS,
+    },
+    ToolSpec {
+        name: "http-client",
+        action_policy: ActionPolicy::RequiredSafe,
+        actions: MCP_HTTP_ACTIONS,
+    },
+    ToolSpec {
+        name: "import",
+        action_policy: ActionPolicy::Ignore,
+        actions: MCP_IMPORT_ACTIONS,
+    },
+];
 
 fn initialize_result() -> serde_json::Value {
     serde_json::json!({
@@ -272,86 +451,12 @@ fn build_tools_list(cap_names: &[String]) -> serde_json::Value {
     serde_json::json!({ "tools": tools })
 }
 
-/// Escape a string for safe embedding inside a Glia double-quoted string literal.
-/// Prevents injection by escaping `"` and `\`.
-fn glia_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Validate that a name contains only safe characters (alphanumeric, hyphens, underscores).
-/// Rejects anything that could be used for Glia injection.
-fn is_safe_identifier(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 /// Translate a per-cap tool call into a Glia expression for eval.
 ///
 /// Only known capabilities are supported.  Unknown caps must use the `eval` tool
 /// directly — we do not generate expressions from untrusted capability names.
 fn tool_call_to_glia(tool_name: &str, args: &serde_json::Value) -> Option<String> {
-    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-
-    // Reject actions that aren't safe identifiers (prevents injection via :action keywords).
-    if !action.is_empty() && !is_safe_identifier(action) {
-        return None;
-    }
-
-    match tool_name {
-        "host" => match action {
-            "id" | "peers" | "addrs" => Some(format!("(perform host :{action})")),
-            _ => None,
-        },
-        "routing" => {
-            let cid = glia_escape(args.get("cid").and_then(|v| v.as_str()).unwrap_or(""));
-            match action {
-                "provide" => Some(format!("(perform routing :provide (bytes \"{cid}\"))")),
-                "find_providers" => {
-                    Some(format!("(perform routing :find-providers (bytes \"{cid}\"))"))
-                }
-                _ => None,
-            }
-        }
-        "runtime" => {
-            let path = glia_escape(args.get("wasm_path").and_then(|v| v.as_str()).unwrap_or(""));
-            match action {
-                "run" => Some(format!("(perform runtime :run (load \"{path}\"))")),
-                _ => None,
-            }
-        }
-        "identity" => match action {
-            "sign" => {
-                let domain = glia_escape(args.get("domain").and_then(|v| v.as_str()).unwrap_or("default"));
-                let nonce = args.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0);
-                Some(format!("(perform identity :sign \"{domain}\" {nonce})"))
-            }
-            "verify" => {
-                let data = glia_escape(args.get("data").and_then(|v| v.as_str()).unwrap_or(""));
-                let sig = glia_escape(args.get("signature").and_then(|v| v.as_str()).unwrap_or(""));
-                let pk = glia_escape(args.get("pubkey").and_then(|v| v.as_str()).unwrap_or(""));
-                Some(format!(
-                    "(perform identity :verify (bytes \"{data}\") (bytes \"{sig}\") (bytes \"{pk}\"))"
-                ))
-            }
-            _ => None,
-        },
-        "http-client" => {
-            let url = glia_escape(args.get("url").and_then(|v| v.as_str()).unwrap_or(""));
-            match action {
-                "get" => Some(format!("(perform http-client :get \"{url}\")")),
-                "post" => {
-                    let body = glia_escape(args.get("body").and_then(|v| v.as_str()).unwrap_or(""));
-                    Some(format!("(perform http-client :post \"{url}\" \"{body}\")"))
-                }
-                _ => None,
-            }
-        }
-        "import" => {
-            let path = glia_escape(args.get("path").and_then(|v| v.as_str()).unwrap_or(""));
-            Some(format!("(def imported (perform import \"{path}\"))"))
-        }
-        // Unknown caps: no tool dispatch.  Use eval directly.
-        _ => None,
-    }
+    mcp_adapter::tool_call_to_glia(MCP_TOOL_SPECS, tool_name, args)
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +521,7 @@ MCP Glia evaluator. Available commands:
 /// the structured-error MCP envelope adapter.
 async fn eval_expression(
     expr_text: &str,
-    env: &RefCell<Env>,
+    env: &mut Env,
     ctx: &RefCell<McpSession>,
     dispatch_table: &HashMap<&'static str, HandlerFn>,
 ) -> Result<String, Val> {
@@ -427,99 +532,10 @@ async fn eval_expression(
         ctx,
         table: dispatch_table,
     };
-    match eval::eval_toplevel(&wrapped, &mut env.borrow_mut(), &dispatch).await {
+    match eval::eval_toplevel(&wrapped, env, &dispatch).await {
         Ok(Val::Nil) => Ok("nil".to_string()),
         Ok(result) => Ok(format!("{result}")),
         Err(e) => Err(e),
-    }
-}
-
-/// Convert an error `Val` produced by Glia eval into a JSON-RPC error
-/// payload suitable for an MCP `tools/call` `isError: true` response.
-///
-/// Structured errors (constructed via `glia::error::*`) are rendered with
-/// their full schema attached as `data` so MCP clients can route on
-/// `:glia.error/type` and inspect variant-specific fields. Plain-string
-/// (legacy) errors fall back to a generic envelope with the message
-/// preserved verbatim.
-fn val_to_mcp_error_text(err: &Val) -> String {
-    use glia::error;
-
-    // Unhandled `(throw ...)` arrives wrapped as Val::Effect{
-    // effect_type: "glia.exception", data: <err> } — peel before
-    // inspecting structured fields.
-    let inner = error::unwrap_thrown(err).unwrap_or(err);
-
-    let msg = error::message(inner)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{inner}"));
-
-    let Some(tag) = error::type_tag(inner) else {
-        // Legacy / unstructured error: just return the message.
-        return msg;
-    };
-
-    // Structured error: include the type tag and hint (if any) inline so
-    // the human-readable text MCP clients display still surfaces the
-    // recovery info. Full structured data also serializes via
-    // `val_to_mcp_error_data` below for clients that want to introspect.
-    let mut buf = format!("[{tag}] {msg}");
-    if let Some(h) = error::hint(inner) {
-        buf.push_str("\n\nhint: ");
-        buf.push_str(h);
-    }
-    buf
-}
-
-/// Best-effort serialization of an error `Val`'s structured `data` map to
-/// a JSON object. Plain-string and non-structured errors return `Null`.
-/// Used by MCP `tools/call` responses to give clients machine-readable
-/// access to variant fields beyond the human-readable message.
-fn val_to_mcp_error_data(err: &Val) -> serde_json::Value {
-    let inner = glia::error::unwrap_thrown(err).unwrap_or(err);
-    let Some(data) = glia::error::data(inner) else {
-        return serde_json::Value::Null;
-    };
-    let mut obj = serde_json::Map::new();
-    for (k, v) in data {
-        let key = match k {
-            Val::Keyword(s) | Val::Str(s) | Val::Sym(s) => s.clone(),
-            other => format!("{other}"),
-        };
-        obj.insert(key, val_to_json_scalar(v));
-    }
-    serde_json::Value::Object(obj)
-}
-
-/// Render a `Val` into its JSON scalar/structural equivalent. Composite
-/// types (List, Vector, Map, Set) are recursively rendered so nested
-/// data in error fields survives the conversion. Non-data variants
-/// (Fn, Cap, Cell, etc.) render to their display string.
-fn val_to_json_scalar(v: &Val) -> serde_json::Value {
-    match v {
-        Val::Nil => serde_json::Value::Null,
-        Val::Bool(b) => serde_json::Value::Bool(*b),
-        Val::Int(i) => serde_json::Value::from(*i),
-        Val::Float(f) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Val::Str(s) | Val::Sym(s) | Val::Keyword(s) => serde_json::Value::String(s.clone()),
-        Val::List(xs) | Val::Vector(xs) | Val::Set(xs) => {
-            serde_json::Value::Array(xs.iter().map(val_to_json_scalar).collect())
-        }
-        Val::Map(m) => {
-            let mut obj = serde_json::Map::new();
-            for (k, v) in m {
-                let key = match k {
-                    Val::Keyword(s) | Val::Str(s) | Val::Sym(s) => s.clone(),
-                    other => format!("{other}"),
-                };
-                obj.insert(key, val_to_json_scalar(v));
-            }
-            serde_json::Value::Object(obj)
-        }
-        Val::Bytes(b) => serde_json::Value::String(format!("<{} bytes>", b.len())),
-        other => serde_json::Value::String(format!("{other}")),
     }
 }
 
@@ -528,7 +544,7 @@ fn val_to_json_scalar(v: &Val) -> serde_json::Value {
 /// Returns `true` to continue the loop, `false` on exit conditions.
 async fn handle_request(
     line: &str,
-    env: &RefCell<Env>,
+    env: &mut Env,
     ctx: &RefCell<McpSession>,
     dispatch_table: &HashMap<&'static str, HandlerFn>,
     tools_list: &serde_json::Value,
@@ -560,10 +576,7 @@ async fn handle_request(
         }
         "tools/call" => {
             let params = req.params.unwrap_or(serde_json::Value::Null);
-            let tool_name = params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = params
                 .get("arguments")
                 .cloned()
@@ -582,33 +595,35 @@ async fn handle_request(
                     match eval_expression(expression, env, ctx, dispatch_table).await {
                         Ok(result) => write_tool_result(&id, &result),
                         Err(err) => {
-                            let text = val_to_mcp_error_text(&err);
-                            let data = val_to_mcp_error_data(&err);
+                            let text = mcp_adapter::val_to_mcp_error_text(&err);
+                            let data = mcp_adapter::val_to_mcp_error_data(&err);
                             write_tool_error(&id, &text, &data);
                         }
                     }
                 }
-            } else if cap_names.iter().any(|n| n == tool_name) || tool_def_for_cap(tool_name).is_some() {
+            } else if cap_names.iter().any(|n| n == tool_name)
+                || tool_def_for_cap(tool_name).is_some()
+            {
                 // Per-cap tool: translate to Glia expression and eval.
                 match tool_call_to_glia(tool_name, &arguments) {
-                    Some(expr) => {
-                        match eval_expression(&expr, env, ctx, dispatch_table).await {
-                            Ok(result) => write_tool_result(&id, &result),
-                            Err(err) => {
-                                let action = arguments.get("action")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                let text = format!(
+                    Some(expr) => match eval_expression(&expr, env, ctx, dispatch_table).await {
+                        Ok(result) => write_tool_result(&id, &result),
+                        Err(err) => {
+                            let action = arguments
+                                .get("action")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            let text = format!(
                                     "{}\n\nhint: capability '{tool_name}' action '{action}' failed. Try: (perform {tool_name} :{action})",
-                                    val_to_mcp_error_text(&err),
+                                    mcp_adapter::val_to_mcp_error_text(&err),
                                 );
-                                let data = val_to_mcp_error_data(&err);
-                                write_tool_error(&id, &text, &data);
-                            }
+                            let data = mcp_adapter::val_to_mcp_error_data(&err);
+                            write_tool_error(&id, &text, &data);
                         }
-                    }
+                    },
                     None => {
-                        let action = arguments.get("action")
+                        let action = arguments
+                            .get("action")
                             .and_then(|v| v.as_str())
                             .unwrap_or("(none)");
                         write_tool_error(
@@ -684,7 +699,6 @@ wasip2::cli::command::export!(McpCell);
 fn run_impl() {
     use futures::io::{AsyncBufReadExt, BufReader};
 
-    let env = Rc::new(RefCell::new(Env::new()));
     let ctx = Rc::new(RefCell::new(McpSession {
         host: None,
         routing: None,
@@ -702,11 +716,12 @@ fn run_impl() {
     // stdin/stdout remain free for JSON-RPC I/O. The poll set
     // ensures poll_loop wakes on stdin data as well as RPC messages.
     system::run_with(poll_set, |membrane: Membrane| {
-        let env = Rc::clone(&env);
         let ctx = Rc::clone(&ctx);
         let dispatch_table = Rc::clone(&dispatch_table);
 
         async move {
+            let mut env = Env::new();
+
             // 1. Graft the membrane to obtain capabilities.
             let graft_resp = membrane.graft_request().send().promise.await?;
             let results = graft_resp.get()?;
@@ -714,7 +729,12 @@ fn run_impl() {
 
             // Extract capability names from the graft for dynamic tool generation.
             let cap_names: Vec<String> = (0..caps.len())
-                .filter_map(|i| caps.get(i).get_name().ok().map(|s| s.to_string().ok()).flatten())
+                .filter_map(|i| {
+                    caps.get(i)
+                        .get_name()
+                        .ok()
+                        .and_then(|s| s.to_string().ok())
+                })
                 .collect();
 
             let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
@@ -735,24 +755,22 @@ fn run_impl() {
             //    Each cap must be Val::Cap (not Val::Nil) so that
             //    with-effect-handler can match on it.
             {
-                let mut e = env.borrow_mut();
                 let cap_handlers: [(&str, Val); 3] = [
                     ("host", make_host_handler(host)),
                     ("routing", make_routing_handler(routing)),
                     ("import", make_import_handler()),
                 ];
                 for (name, handler) in cap_handlers {
-                    e.set(
+                    env.set(
                         name.to_string(),
                         make_cap(name, format!("mcp:{name}"), std::rc::Rc::new(())),
                     );
-                    e.set(format!("{name}-handler"), handler);
+                    env.set(format!("{name}-handler"), handler);
                 }
             }
 
             // 3. Load the prelude (macro definitions).
             {
-                let mut e = env.borrow_mut();
                 let prelude_forms = glia::read_many(glia::PRELUDE).expect("prelude: parse error");
                 struct NoopDispatch;
                 impl Dispatch for NoopDispatch {
@@ -768,9 +786,9 @@ fn run_impl() {
                 }
                 let noop = NoopDispatch;
                 for form in &prelude_forms {
-                    let mut fut = Box::pin(eval::eval_toplevel(form, &mut e, &noop));
+                    let mut fut = Box::pin(eval::eval_toplevel(form, &mut env, &noop));
                     let waker = std::task::Waker::noop();
-                    let mut cx = std::task::Context::from_waker(&waker);
+                    let mut cx = std::task::Context::from_waker(waker);
                     match fut.as_mut().poll(&mut cx) {
                         std::task::Poll::Ready(Ok(_)) => {}
                         std::task::Poll::Ready(Err(e)) => log::error!("prelude: {e}"),
@@ -794,9 +812,14 @@ fn run_impl() {
                             continue;
                         }
                         let cont = handle_request(
-                            trimmed, &env, &ctx, &dispatch_table,
-                            &tools_list, &cap_names,
-                        ).await;
+                            trimmed,
+                            &mut env,
+                            &ctx,
+                            &dispatch_table,
+                            &tools_list,
+                            &cap_names,
+                        )
+                        .await;
                         if !cont {
                             break;
                         }
@@ -818,63 +841,6 @@ fn run_impl() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- is_safe_identifier --
-
-    #[test]
-    fn safe_identifier_alphanumeric() {
-        assert!(is_safe_identifier("peers"));
-        assert!(is_safe_identifier("findProviders123"));
-    }
-
-    #[test]
-    fn safe_identifier_with_hyphens_and_underscores() {
-        assert!(is_safe_identifier("find-providers"));
-        assert!(is_safe_identifier("my_tool"));
-        assert!(is_safe_identifier("a-b_c"));
-    }
-
-    #[test]
-    fn safe_identifier_rejects_empty() {
-        assert!(!is_safe_identifier(""));
-    }
-
-    #[test]
-    fn safe_identifier_rejects_injection_chars() {
-        assert!(!is_safe_identifier("foo bar"));
-        assert!(!is_safe_identifier("foo\"bar"));
-        assert!(!is_safe_identifier("foo)bar"));
-        assert!(!is_safe_identifier("foo(bar"));
-        assert!(!is_safe_identifier(":keyword"));
-        assert!(!is_safe_identifier("foo;bar"));
-    }
-
-    // -- glia_escape --
-
-    #[test]
-    fn glia_escape_passthrough() {
-        assert_eq!(glia_escape("hello world"), "hello world");
-    }
-
-    #[test]
-    fn glia_escape_quotes() {
-        assert_eq!(glia_escape(r#"say "hi""#), r#"say \"hi\""#);
-    }
-
-    #[test]
-    fn glia_escape_backslashes() {
-        assert_eq!(glia_escape(r"path\to\file"), r"path\\to\\file");
-    }
-
-    #[test]
-    fn glia_escape_both() {
-        assert_eq!(glia_escape(r#"a\"b"#), r#"a\\\"b"#);
-    }
-
-    #[test]
-    fn glia_escape_empty() {
-        assert_eq!(glia_escape(""), "");
-    }
 
     // -- tool_call_to_glia --
 
@@ -948,10 +914,46 @@ mod tests {
             "identity",
             &args(serde_json::json!({"action": "sign", "domain": "test", "nonce": 42})),
         );
+        assert_eq!(result, Some(r#"(perform identity :sign "test" 42)"#.into()));
+    }
+
+    #[test]
+    fn tool_call_identity_verify() {
+        let result = tool_call_to_glia(
+            "identity",
+            &args(serde_json::json!({
+                "action": "verify",
+                "data": "deadbeef",
+                "signature": "sig",
+                "pubkey": "pk"
+            })),
+        );
         assert_eq!(
             result,
-            Some(r#"(perform identity :sign "test" 42)"#.into())
+            Some(r#"(perform identity :verify (bytes "deadbeef") (bytes "sig") (bytes "pk"))"#.into())
         );
+    }
+
+    #[test]
+    fn tool_call_http_post() {
+        let result = tool_call_to_glia(
+            "http-client",
+            &args(serde_json::json!({
+                "action": "post",
+                "url": "https://example.test",
+                "body": r#"{"ok":true}"#
+            })),
+        );
+        assert_eq!(
+            result,
+            Some(r#"(perform http-client :post "https://example.test" "{\"ok\":true}")"#.into())
+        );
+    }
+
+    #[test]
+    fn tool_call_import_uses_standalone_mcp_binding() {
+        let result = tool_call_to_glia("import", &args(serde_json::json!({"path": "core"})));
+        assert_eq!(result, Some(r#"(def imported (perform import "core"))"#.into()));
     }
 
     #[test]
@@ -963,10 +965,7 @@ mod tests {
     #[test]
     fn tool_call_rejects_injection_in_action() {
         // Action with injection chars should be rejected by is_safe_identifier
-        let result = tool_call_to_glia(
-            "host",
-            &args(serde_json::json!({"action": "id) (evil"})),
-        );
+        let result = tool_call_to_glia("host", &args(serde_json::json!({"action": "id) (evil"})));
         assert_eq!(result, None);
     }
 
@@ -987,7 +986,14 @@ mod tests {
 
     #[test]
     fn tool_def_known_caps() {
-        for name in &["host", "routing", "runtime", "identity", "http-client", "import"] {
+        for name in &[
+            "host",
+            "routing",
+            "runtime",
+            "identity",
+            "http-client",
+            "import",
+        ] {
             assert!(
                 tool_def_for_cap(name).is_some(),
                 "expected tool def for {name}"
@@ -1049,107 +1055,5 @@ mod tests {
         assert_eq!(info.get("name").unwrap(), SERVER_NAME);
         assert_eq!(info.get("version").unwrap(), SERVER_VERSION);
         assert!(result.get("capabilities").unwrap().get("tools").is_some());
-    }
-
-    // -- val_to_mcp_error_text / val_to_mcp_error_data —
-    //    REGRESSION GUARD on the envelope shape from #419.
-    //    AI agents on the wire today rely on:
-    //      - error.code mapped from :glia.error/type
-    //      - error.message → :glia.error/message
-    //      - error.data.structuredContent carries the full Val map
-    //    These tests pin those contracts.
-
-    fn unbound_err() -> Val {
-        glia::error::unbound_symbol("foo", Some("did you mean 'bar'?"))
-    }
-
-    #[test]
-    fn envelope_text_includes_tag_and_message_for_structured_error() {
-        let err = unbound_err();
-        let text = val_to_mcp_error_text(&err);
-        // Tag prefix preserved verbatim — clients route on this.
-        assert!(text.starts_with("[glia.error/unbound-symbol]"), "got: {text}");
-        // Message body preserved.
-        assert!(text.contains("unbound symbol: foo"), "got: {text}");
-        // Hint surfaced inline so human-facing UIs see recovery guidance.
-        assert!(text.contains("hint: did you mean 'bar'?"), "got: {text}");
-    }
-
-    #[test]
-    fn envelope_text_falls_back_to_plain_string_for_legacy_errors() {
-        let err = Val::Str("legacy plain error".into());
-        assert_eq!(val_to_mcp_error_text(&err), "legacy plain error");
-    }
-
-    #[test]
-    fn envelope_data_carries_full_structured_map() {
-        let err = unbound_err();
-        let data = val_to_mcp_error_data(&err);
-        let obj = data.as_object().expect("structured data should be object");
-        // Every canonical field round-trips into the JSON envelope.
-        assert_eq!(
-            obj.get("glia.error/type").and_then(|v| v.as_str()),
-            Some("glia.error/unbound-symbol")
-        );
-        assert!(obj
-            .get("glia.error/message")
-            .and_then(|v| v.as_str())
-            .map(|s| s.contains("unbound symbol: foo"))
-            .unwrap_or(false));
-        assert_eq!(
-            obj.get("glia.error/hint").and_then(|v| v.as_str()),
-            Some("did you mean 'bar'?")
-        );
-        assert_eq!(
-            obj.get("glia.error/symbol").and_then(|v| v.as_str()),
-            Some("foo")
-        );
-    }
-
-    #[test]
-    fn envelope_data_returns_null_for_legacy_string_errors() {
-        let err = Val::Str("legacy".into());
-        assert!(val_to_mcp_error_data(&err).is_null());
-    }
-
-    #[test]
-    fn envelope_peels_glia_exception_carrier() {
-        // Unhandled (throw ...) escapes eval as Val::Effect{
-        // effect_type: "glia.exception", data: <inner err> }.
-        // The envelope helpers must peel before inspecting.
-        let inner = unbound_err();
-        let carrier = Val::Effect {
-            effect_type: "glia.exception".into(),
-            data: Box::new(inner),
-        };
-        let text = val_to_mcp_error_text(&carrier);
-        assert!(text.starts_with("[glia.error/unbound-symbol]"), "got: {text}");
-        let data = val_to_mcp_error_data(&carrier);
-        assert!(data.is_object());
-        assert_eq!(
-            data.get("glia.error/type").and_then(|v| v.as_str()),
-            Some("glia.error/unbound-symbol")
-        );
-    }
-
-    #[test]
-    fn envelope_text_honors_user_thrown_ex_info() {
-        // ex-info-style error: user :type becomes :glia.error/type tag,
-        // and the envelope formats with that user-supplied tag.
-        let err = glia::error::user(
-            Val::Keyword("network".into()),
-            "peer unreachable",
-            glia::ValMap::from_pairs(vec![(
-                Val::Keyword("peer".into()),
-                Val::Str("QmFoo".into()),
-            )]),
-        );
-        let text = val_to_mcp_error_text(&err);
-        // User tag is the dispatch surface — not namespaced.
-        assert!(text.starts_with("[network]"), "got: {text}");
-        let data = val_to_mcp_error_data(&err);
-        let obj = data.as_object().unwrap();
-        // User extras carry through into structuredContent.
-        assert_eq!(obj.get("peer").and_then(|v| v.as_str()), Some("QmFoo"));
     }
 }

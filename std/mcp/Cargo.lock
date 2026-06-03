@@ -137,6 +137,7 @@ dependencies = [
  "capnpc",
  "glia",
  "multiaddr",
+ "serde_json",
 ]
 
 [[package]]

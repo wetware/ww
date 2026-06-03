@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use auth::SigningDomain;
 use capnp::capability::FromClientHook;
 use capnp_rpc::{new_client, pry};
+use caps::mcp_adapter::{self, ActionPolicy, ExprPart, ToolAction, ToolSpec};
 use caps::{
     clear_import_cache, clear_load_backend, clear_load_cache, eval_load_async, extract_method,
     make_import_cap, make_import_handler, set_load_backend, wrap_with_handlers, LoadBackend,
@@ -42,6 +43,94 @@ Remote Glia shell. Available commands:
   (perform routing :resolve \"/ipns/<name>\") — IPNS resolve
   (help)                   — this message
   (exit)                   — disconnect";
+
+const SHELL_MCP_HOST_ID_EXPR: &[ExprPart] = &[ExprPart::Literal("(perform host :id)")];
+const SHELL_MCP_HOST_PEERS_EXPR: &[ExprPart] = &[ExprPart::Literal("(perform host :peers)")];
+const SHELL_MCP_HOST_ADDRS_EXPR: &[ExprPart] = &[ExprPart::Literal("(perform host :addrs)")];
+const SHELL_MCP_HOST_ACTIONS: &[ToolAction] = &[
+    ToolAction {
+        action: Some("id"),
+        template: SHELL_MCP_HOST_ID_EXPR,
+    },
+    ToolAction {
+        action: Some("peers"),
+        template: SHELL_MCP_HOST_PEERS_EXPR,
+    },
+    ToolAction {
+        action: Some("addrs"),
+        template: SHELL_MCP_HOST_ADDRS_EXPR,
+    },
+];
+
+const SHELL_MCP_ROUTING_PROVIDE_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(perform routing :provide "),
+    ExprPart::QuotedStringField {
+        field: "key",
+        default: "",
+    },
+    ExprPart::Literal(")"),
+];
+const SHELL_MCP_ROUTING_RESOLVE_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(perform routing :resolve "),
+    ExprPart::QuotedStringField {
+        field: "name",
+        default: "",
+    },
+    ExprPart::Literal(")"),
+];
+const SHELL_MCP_ROUTING_HASH_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(perform routing :hash "),
+    ExprPart::QuotedStringField {
+        field: "data",
+        default: "",
+    },
+    ExprPart::Literal(")"),
+];
+const SHELL_MCP_ROUTING_ACTIONS: &[ToolAction] = &[
+    ToolAction {
+        action: Some("provide"),
+        template: SHELL_MCP_ROUTING_PROVIDE_EXPR,
+    },
+    ToolAction {
+        action: Some("resolve"),
+        template: SHELL_MCP_ROUTING_RESOLVE_EXPR,
+    },
+    ToolAction {
+        action: Some("hash"),
+        template: SHELL_MCP_ROUTING_HASH_EXPR,
+    },
+];
+
+const SHELL_MCP_IMPORT_EXPR: &[ExprPart] = &[
+    ExprPart::Literal("(perform import "),
+    ExprPart::QuotedStringField {
+        field: "path",
+        default: "",
+    },
+    ExprPart::Literal(")"),
+];
+const SHELL_MCP_IMPORT_ACTIONS: &[ToolAction] = &[ToolAction {
+    action: None,
+    template: SHELL_MCP_IMPORT_EXPR,
+}];
+
+const SHELL_MCP_TOOL_SPECS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "host",
+        action_policy: ActionPolicy::RequiredSafe,
+        actions: SHELL_MCP_HOST_ACTIONS,
+    },
+    ToolSpec {
+        name: "routing",
+        action_policy: ActionPolicy::RequiredSafe,
+        actions: SHELL_MCP_ROUTING_ACTIONS,
+    },
+    ToolSpec {
+        name: "import",
+        action_policy: ActionPolicy::Ignore,
+        actions: SHELL_MCP_IMPORT_ACTIONS,
+    },
+];
 
 #[derive(Clone, Debug)]
 struct Candidate {
@@ -315,119 +404,8 @@ fn mcp_tools_list() -> serde_json::Value {
     })
 }
 
-fn glia_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn is_safe_identifier(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 fn mcp_tool_to_glia(tool_name: &str, args: &serde_json::Value) -> Option<String> {
-    match tool_name {
-        "host" => {
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-            if !is_safe_identifier(action) {
-                return None;
-            }
-            match action {
-                "id" | "peers" | "addrs" => Some(format!("(perform host :{action})")),
-                _ => None,
-            }
-        }
-        "routing" => {
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-            if !is_safe_identifier(action) {
-                return None;
-            }
-            match action {
-                "provide" => {
-                    let key = glia_escape(args.get("key").and_then(|v| v.as_str()).unwrap_or(""));
-                    Some(format!("(perform routing :provide \"{key}\")"))
-                }
-                "resolve" => {
-                    let name = glia_escape(args.get("name").and_then(|v| v.as_str()).unwrap_or(""));
-                    Some(format!("(perform routing :resolve \"{name}\")"))
-                }
-                "hash" => {
-                    let data = glia_escape(args.get("data").and_then(|v| v.as_str()).unwrap_or(""));
-                    Some(format!("(perform routing :hash \"{data}\")"))
-                }
-                _ => None,
-            }
-        }
-        "import" => {
-            let path = glia_escape(args.get("path").and_then(|v| v.as_str()).unwrap_or(""));
-            Some(format!("(perform import \"{path}\")"))
-        }
-        _ => None,
-    }
-}
-
-fn val_to_mcp_error_text(err: &Val) -> String {
-    let inner = glia::error::unwrap_thrown(err).unwrap_or(err);
-
-    let msg = glia::error::message(inner)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{inner}"));
-
-    let Some(tag) = glia::error::type_tag(inner) else {
-        return msg;
-    };
-
-    let mut text = format!("[{tag}] {msg}");
-    if let Some(hint) = glia::error::hint(inner) {
-        text.push_str("\n\nhint: ");
-        text.push_str(hint);
-    }
-    text
-}
-
-fn val_to_json(v: &Val) -> serde_json::Value {
-    match v {
-        Val::Nil => serde_json::Value::Null,
-        Val::Bool(b) => serde_json::Value::Bool(*b),
-        Val::Int(i) => serde_json::Value::from(*i),
-        Val::Float(f) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Val::Str(s) | Val::Sym(s) | Val::Keyword(s) => serde_json::Value::String(s.clone()),
-        Val::List(items) | Val::Vector(items) | Val::Set(items) => {
-            serde_json::Value::Array(items.iter().map(val_to_json).collect())
-        }
-        Val::Map(map) => {
-            let mut object = serde_json::Map::new();
-            for (k, v) in map {
-                let key = match k {
-                    Val::Keyword(s) | Val::Str(s) | Val::Sym(s) => s.clone(),
-                    other => format!("{other}"),
-                };
-                object.insert(key, val_to_json(v));
-            }
-            serde_json::Value::Object(object)
-        }
-        Val::Bytes(bytes) => serde_json::Value::String(format!("<{} bytes>", bytes.len())),
-        other => serde_json::Value::String(format!("{other}")),
-    }
-}
-
-fn val_to_mcp_error_data(err: &Val) -> serde_json::Value {
-    let inner = glia::error::unwrap_thrown(err).unwrap_or(err);
-    let Some(data) = glia::error::data(inner) else {
-        return serde_json::Value::Null;
-    };
-
-    let mut object = serde_json::Map::new();
-    for (k, v) in data {
-        let key = match k {
-            Val::Keyword(s) | Val::Str(s) | Val::Sym(s) => s.clone(),
-            other => format!("{other}"),
-        };
-        object.insert(key, val_to_json(v));
-    }
-    serde_json::Value::Object(object)
+    mcp_adapter::tool_call_to_glia(SHELL_MCP_TOOL_SPECS, tool_name, args)
 }
 
 async fn run_mcp_stdio(runtime: &mut LocalShellRuntime) -> Result<()> {
@@ -495,8 +473,8 @@ async fn run_mcp_stdio(runtime: &mut LocalShellRuntime) -> Result<()> {
                     Ok(Val::Nil) => write_mcp_tool_result(&id, "nil"),
                     Ok(value) => write_mcp_tool_result(&id, &format!("{value}")),
                     Err(err) => {
-                        let text = val_to_mcp_error_text(&err);
-                        let data = val_to_mcp_error_data(&err);
+                        let text = mcp_adapter::val_to_mcp_error_text(&err);
+                        let data = mcp_adapter::val_to_mcp_error_data(&err);
                         write_mcp_tool_error(&id, &text, &data);
                     }
                 }
@@ -2210,6 +2188,57 @@ mod tests {
         let args = serde_json::json!({ "action": "id" });
         let expr = mcp_tool_to_glia("host", &args);
         assert_eq!(expr, Some("(perform host :id)".to_string()));
+    }
+
+    #[test]
+    fn mcp_tool_routing_uses_shell_actions() {
+        let provide = mcp_tool_to_glia(
+            "routing",
+            &serde_json::json!({ "action": "provide", "key": "QmFoo" }),
+        );
+        assert_eq!(
+            provide,
+            Some(r#"(perform routing :provide "QmFoo")"#.into())
+        );
+
+        let resolve = mcp_tool_to_glia(
+            "routing",
+            &serde_json::json!({ "action": "resolve", "name": "/ipns/example" }),
+        );
+        assert_eq!(
+            resolve,
+            Some(r#"(perform routing :resolve "/ipns/example")"#.into())
+        );
+
+        let hash = mcp_tool_to_glia(
+            "routing",
+            &serde_json::json!({ "action": "hash", "data": "payload" }),
+        );
+        assert_eq!(hash, Some(r#"(perform routing :hash "payload")"#.into()));
+
+        let standalone_only = mcp_tool_to_glia(
+            "routing",
+            &serde_json::json!({ "action": "find_providers", "cid": "QmFoo" }),
+        );
+        assert_eq!(standalone_only, None);
+    }
+
+    #[test]
+    fn mcp_tool_import_uses_shell_expression() {
+        let expr = mcp_tool_to_glia("import", &serde_json::json!({ "path": "core" }));
+        assert_eq!(expr, Some(r#"(perform import "core")"#.into()));
+    }
+
+    #[test]
+    fn mcp_tool_escapes_shell_user_input() {
+        let expr = mcp_tool_to_glia(
+            "routing",
+            &serde_json::json!({ "action": "hash", "data": r#"payload") (evil"# }),
+        );
+        assert_eq!(
+            expr,
+            Some(r#"(perform routing :hash "payload\") (evil")"#.into())
+        );
     }
 
     #[test]
