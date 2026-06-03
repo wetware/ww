@@ -21,7 +21,10 @@ wagi-guest = { path = "../../crates/wagi-guest" }
 crate-type = ["cdylib"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["time"] }
 
 [build-dependencies]
 capnpc = "0.25.3"

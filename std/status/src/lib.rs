@@ -19,6 +19,7 @@
 //! WAGI mode only. Runs once per HTTP request — fresh cell, no state.
 
 use capnp::capability::FromClientHook;
+use std::future::Future;
 use wasip2::cli::stderr::get_stderr;
 use wasip2::exports::cli::run::Guest;
 
@@ -53,6 +54,8 @@ mod http_capnp {
 }
 
 type Membrane = membrane_capnp::membrane::Client;
+
+const HOST_CALL_TIMEOUT_NS: u64 = 500_000_000; // 500ms
 
 /// Look up a typed capability by name in the graft caps list.
 /// Returns `None` if the cap is missing — used for graceful degradation.
@@ -96,31 +99,100 @@ fn init_logging() {
 /// Best-effort host introspection. Each call swallows errors and returns
 /// `None` so the JSON response can degrade per field instead of failing
 /// the whole request.
+async fn with_host_timeout<T>(future: impl Future<Output = Option<T>>) -> Option<T> {
+    timeout_future(future, HOST_CALL_TIMEOUT_NS).await.flatten()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn timeout_future<F>(future: F, timeout_ns: u64) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::time::timeout(std::time::Duration::from_nanos(timeout_ns), future)
+        .await
+        .ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn timeout_future<F>(future: F, timeout_ns: u64) -> Option<F::Output>
+where
+    F: Future,
+{
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct WasiDeadline<F> {
+        future: Pin<Box<F>>,
+        deadline_ns: u64,
+    }
+
+    impl<F> Future for WasiDeadline<F>
+    where
+        F: Future,
+    {
+        type Output = Option<F::Output>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if wasip2::clocks::monotonic_clock::now() >= self.deadline_ns {
+                return Poll::Ready(None);
+            }
+
+            let this = self.as_mut().get_mut();
+            match this.future.as_mut().poll(cx) {
+                Poll::Ready(value) => Poll::Ready(Some(value)),
+                Poll::Pending => {
+                    if wasip2::clocks::monotonic_clock::now() >= this.deadline_ns {
+                        Poll::Ready(None)
+                    } else {
+                        Poll::Pending
+                    }
+                }
+            }
+        }
+    }
+
+    let deadline_ns = wasip2::clocks::monotonic_clock::now().saturating_add(timeout_ns);
+    WasiDeadline {
+        future: Box::pin(future),
+        deadline_ns,
+    }
+    .await
+}
+
 async fn host_id(host: &system_capnp::host::Client) -> Option<String> {
-    let resp = host.id_request().send().promise.await.ok()?;
-    let bytes = resp.get().ok()?.get_peer_id().ok()?;
-    Some(bs58::encode(bytes).into_string())
+    with_host_timeout(async {
+        let resp = host.id_request().send().promise.await.ok()?;
+        let bytes = resp.get().ok()?.get_peer_id().ok()?;
+        Some(bs58::encode(bytes).into_string())
+    })
+    .await
 }
 
 async fn host_addrs(host: &system_capnp::host::Client) -> Option<Vec<String>> {
-    let resp = host.addrs_request().send().promise.await.ok()?;
-    let addrs = resp.get().ok()?.get_addrs().ok()?;
-    Some(
-        addrs
-            .iter()
-            .filter_map(|a| {
-                let bytes = a.ok()?;
-                let ma = multiaddr::Multiaddr::try_from(bytes.to_vec()).ok()?;
-                Some(ma.to_string())
-            })
-            .collect(),
-    )
+    with_host_timeout(async {
+        let resp = host.addrs_request().send().promise.await.ok()?;
+        let addrs = resp.get().ok()?.get_addrs().ok()?;
+        Some(
+            addrs
+                .iter()
+                .filter_map(|a| {
+                    let bytes = a.ok()?;
+                    let ma = multiaddr::Multiaddr::try_from(bytes.to_vec()).ok()?;
+                    Some(ma.to_string())
+                })
+                .collect(),
+        )
+    })
+    .await
 }
 
 async fn host_peer_count(host: &system_capnp::host::Client) -> Option<usize> {
-    let resp = host.peers_request().send().promise.await.ok()?;
-    let peers = resp.get().ok()?.get_peers().ok()?;
-    Some(peers.len() as usize)
+    with_host_timeout(async {
+        let resp = host.peers_request().send().promise.await.ok()?;
+        let peers = resp.get().ok()?.get_peers().ok()?;
+        Some(peers.len() as usize)
+    })
+    .await
 }
 
 /// Build the JSON body for `/status`. `host_cap` is `None` when the
@@ -142,8 +214,7 @@ async fn build_status_json(host_cap: Option<system_capnp::host::Client>) -> Stri
         "listen_addrs": listen_addrs,
         "peer_count":   peer_count,
     });
-    serde_json::to_string(&body)
-        .unwrap_or_else(|_| r#"{"status":"err","reason":"json"}"#.into())
+    serde_json::to_string(&body).unwrap_or_else(|_| r#"{"status":"err","reason":"json"}"#.into())
 }
 
 fn run_http() -> Result<(), ()> {
@@ -194,6 +265,56 @@ wasip2::cli::command::export!(StatusGuest);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capnp::capability::Promise;
+
+    const TEST_PEER_ID: &[u8] = b"status-test-peer";
+
+    struct SlowPeersHost;
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::host::Server for SlowPeersHost {
+        fn id(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::host::IdParams,
+            mut results: system_capnp::host::IdResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_peer_id(TEST_PEER_ID);
+            Promise::ok(())
+        }
+
+        fn addrs(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::host::AddrsParams,
+            mut results: system_capnp::host::AddrsResults,
+        ) -> Promise<(), capnp::Error> {
+            let addr: multiaddr::Multiaddr = "/ip4/127.0.0.1/tcp/2025"
+                .parse()
+                .expect("valid test multiaddr");
+            let mut addrs = results.get().init_addrs(1);
+            addrs.set(0, &addr.to_vec());
+            Promise::ok(())
+        }
+
+        fn peers(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::host::PeersParams,
+            _results: system_capnp::host::PeersResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::from_future(async {
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                Ok(())
+            })
+        }
+
+        fn network(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::host::NetworkParams,
+            _results: system_capnp::host::NetworkResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("test host network".into()))
+        }
+    }
 
     /// `build_status_json` with `None` host cap must return null for
     /// host-derived fields and populate `status` + `version`. This is
@@ -202,8 +323,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn build_status_json_null_host_returns_null_fields_and_populates_static() {
         let json = build_status_json(None).await;
-        let v: serde_json::Value =
-            serde_json::from_str(&json).expect("body should parse as JSON");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("body should parse as JSON");
         assert_eq!(v["status"], "ok");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert!(
@@ -217,6 +337,35 @@ mod tests {
         assert!(
             v["peer_count"].is_null(),
             "peer_count should be null when host cap is absent"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_status_json_times_out_slow_peer_count_only() {
+        let host: system_capnp::host::Client = capnp_rpc::new_client(SlowPeersHost);
+        let started = tokio::time::Instant::now();
+
+        let json = build_status_json(Some(host)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "status host timeout should return promptly, took {elapsed:?}"
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&json).expect("body should parse as JSON");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(
+            v["peer_id"],
+            bs58::encode(TEST_PEER_ID).into_string(),
+            "fast host.id should still populate"
+        );
+        assert_eq!(
+            v["listen_addrs"][0], "/ip4/127.0.0.1/tcp/2025",
+            "fast host.addrs should still populate"
+        );
+        assert!(
+            v["peer_count"].is_null(),
+            "slow host.peers should degrade to null"
         );
     }
 }
