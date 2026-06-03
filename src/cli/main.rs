@@ -1471,7 +1471,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                         epoch_tx,
                         confirmation_depth,
                         ipfs_client: ipfs_client.clone(),
-                        cid_tree: None, // TODO: pass CidTree when virtual FS is wired
+                        cid_tree: Some(cid_tree.clone()),
                         drain_duration: std::time::Duration::from_secs(epoch_drain_secs),
                     },
                 )?;
