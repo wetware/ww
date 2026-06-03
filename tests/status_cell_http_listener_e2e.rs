@@ -150,7 +150,6 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
                 query: String::new(),
                 headers: Vec::new(),
                 body: Vec::new(),
-                verified_snap: None,
                 response_tx,
             };
             tx.send(cgi_req)

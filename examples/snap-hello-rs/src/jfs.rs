@@ -60,6 +60,7 @@ struct JfsHeader {
 /// Field naming matches the spec exactly. Using `serde_json::Value` for
 /// `inputs` and `surface` lets us pass them through to cells without
 /// constraining their shape.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct JfsPayload {
     /// FID claimed in the payload. MUST match the header's `fid`.
@@ -79,14 +80,10 @@ pub struct JfsPayload {
     pub surface: serde_json::Value,
 }
 
-/// Successful JFS verification result. Returned to the listener so it
-/// can plumb verified-context CGI env vars into the cell.
+/// Successful JFS verification result for the Snap example.
 #[derive(Debug, Clone)]
 pub struct VerifiedJfs {
     pub payload: JfsPayload,
-    /// The original BASE64URL(payload) string, kept verbatim so the
-    /// listener can pass it through to the cell unmangled.
-    pub payload_b64url: String,
 }
 
 /// Split a JFS compact serialization on `.` into its three parts.
@@ -211,10 +208,7 @@ pub fn verify(
         );
     }
 
-    Ok(VerifiedJfs {
-        payload,
-        payload_b64url: payload_b64.to_string(),
-    })
+    Ok(VerifiedJfs { payload })
 }
 
 #[cfg(test)]
@@ -509,15 +503,5 @@ mod tests {
     fn split_compact_three_parts() {
         let (a, b, c) = split_compact("aaa.bbb.ccc").unwrap();
         assert_eq!((a, b, c), ("aaa", "bbb", "ccc"));
-    }
-
-    #[test]
-    fn payload_b64url_passthrough_preserved() {
-        let now = 1_700_000_000;
-        let (compact, _, _, audience, _) =
-            make_jfs(7, "https://x.example", now, serde_json::json!({}));
-        let original_payload_b64 = compact.split('.').nth(1).unwrap().to_string();
-        let verified = verify(&compact, &audience, now, DEFAULT_TIMESTAMP_SKEW_SECS).unwrap();
-        assert_eq!(verified.payload_b64url, original_payload_b64);
     }
 }
