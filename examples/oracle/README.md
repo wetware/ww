@@ -33,7 +33,7 @@ make oracle
 
 This compiles the WASM guest and embeds canonical `SchemaBundle` bytes in the
 `ww.schema.v1` WASM custom section. The vat route uses the service name
-`oracle`; schema and WASM CIDs are metadata returned by `VatConnection`.
+`oracle`; `VatConnection` exposes the embedded schema to dialers.
 
 ## Running
 

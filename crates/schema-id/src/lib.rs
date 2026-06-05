@@ -318,7 +318,7 @@ pub fn validate_schema_bundle(bytes: &[u8]) -> capnp::Result<ValidatedSchemaBund
 
     let service_interface_id = bundle.get_service_interface_id();
     let nodes = bundle.get_nodes()?;
-    let mut seen_node_ids = std::collections::BTreeSet::new();
+    let mut seen_node_ids = std::collections::HashSet::new();
     let mut service_node = None;
     for node in nodes.iter() {
         let node_id = node.get_id();

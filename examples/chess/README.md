@@ -30,7 +30,7 @@ make chess
 
 This compiles the WASM guest and embeds canonical `SchemaBundle` bytes in the
 `ww.schema.v1` WASM custom section. The vat route uses the service name
-`chess`; schema and WASM CIDs are metadata returned by `VatConnection`.
+`chess`; `VatConnection` exposes the embedded schema to dialers.
 
 ## Running
 
@@ -127,8 +127,8 @@ Two execution modes, selected by runtime inputs:
 ### Service Name And Schema Metadata
 
 The protocol address is `/ww/0.1.0/vat/chess`. The name is a locator, not type
-authority. The embedded schema bundle is content-addressed as metadata:
-`schemaBundleCid = CIDv1(raw, BLAKE3(canonical SchemaBundle bytes))`.
+authority. The embedded schema bundle declares the `ChessEngine` capability
+interface returned by `VatConnection.bind()`.
 
 ### Schema
 

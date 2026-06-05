@@ -1423,7 +1423,7 @@ mod tests {
     }
 
     struct TestExecutorResolver {
-        metadata: Result<vat_listener::ExecutorVatMetadata, String>,
+        metadata: Result<vat_listener::VatSchemaMetadata, String>,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -1431,7 +1431,7 @@ mod tests {
         async fn resolve(
             &self,
             _executor: system_capnp::executor::Client,
-        ) -> Result<vat_listener::ExecutorVatMetadata, capnp::Error> {
+        ) -> Result<vat_listener::VatSchemaMetadata, capnp::Error> {
             self.metadata.clone().map_err(capnp::Error::failed)
         }
     }
@@ -1459,14 +1459,10 @@ mod tests {
         segments[0].to_vec()
     }
 
-    fn test_vat_metadata() -> vat_listener::ExecutorVatMetadata {
+    fn test_vat_metadata() -> vat_listener::VatSchemaMetadata {
         let schema_bundle = test_schema_bundle_bytes();
         schema_id::validate_schema_bundle(&schema_bundle).expect("valid test schema bundle");
-        vat_listener::ExecutorVatMetadata {
-            wasm_artifact_cid: schema_id::compute_cid_bytes(b"test wasm artifact"),
-            schema_bundle_cid: schema_id::compute_cid_bytes(&schema_bundle),
-            schema_bundle,
-        }
+        vat_listener::VatSchemaMetadata { schema_bundle }
     }
 
     fn resolver_with_metadata() -> Rc<dyn vat_listener::ExecutorResolver> {
@@ -1700,8 +1696,8 @@ mod tests {
         }
     }
 
-    /// End-to-end: pass an Executor to VatListener, resolve host-derived
-    /// metadata, and verify listen returns the CIDs.
+    /// End-to-end: pass an Executor to VatListener, resolve host-derived schema
+    /// metadata, and verify listen accepts the publication.
     #[tokio::test]
     async fn test_vat_listener_accepts_valid_executor_metadata() {
         let local = tokio::task::LocalSet::new();
@@ -1725,16 +1721,10 @@ mod tests {
                 req.get().set_executor(executor);
                 req.get().set_protocol("chess");
 
-                let response = req.send().promise.await.expect("listen should succeed");
-                let results = response.get().expect("listen results");
-                assert_eq!(
-                    results.get_wasm_artifact_cid().unwrap().to_vec(),
-                    expected.wasm_artifact_cid
-                );
-                assert_eq!(
-                    results.get_schema_bundle_cid().unwrap().to_vec(),
-                    expected.schema_bundle_cid
-                );
+                req.send()
+                    .promise
+                    .await
+                    .expect("listen should accept host-derived schema metadata");
             })
             .await;
     }

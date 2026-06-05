@@ -32,8 +32,8 @@ make discovery
 ```
 
 This compiles the WASM guest and embeds canonical `SchemaBundle` bytes in the
-`ww.schema.v1` WASM custom section. Vat routes use service names; schema and
-WASM CIDs are metadata returned by `VatConnection`.
+`ww.schema.v1` WASM custom section. Vat routes use service names;
+`VatConnection` exposes the embedded schema to dialers.
 
 ## Running
 
@@ -80,7 +80,7 @@ Expected output on Agent B:
 
 ```
 [INFO] service: peer ..a1b2c3d4
-[INFO] service: schema CID bafy...
+[INFO] service: locator greeter, schema CID bafy...
 [INFO] service: looking for peers...
 [INFO] service: found 1 peer(s)
 [INFO] ..a1b2c3d4 -> ..e5f6g7h8: Hello, peer ..a1b2c3d4! I'm ..e5f6g7h8
@@ -104,8 +104,8 @@ AGENT A (service mode):                    AGENT B (service mode):
 ```
 
 The vat route is `/ww/0.1.0/vat/greeter`. The embedded schema bundle is still
-content-addressed as metadata: `schemaBundleCid = CIDv1(raw,
-BLAKE3(canonical SchemaBundle bytes))`.
+the typed declaration for the `Greeter` capability returned by
+`VatConnection.bind()`.
 
 ### Schema
 

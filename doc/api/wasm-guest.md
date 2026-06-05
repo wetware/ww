@@ -222,19 +222,19 @@ Full interface reference for the capabilities available to guests.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `listen` | `(executor: Executor, protocol: Text, caps: List(Export)) -> (wasmArtifactCid: Data, schemaBundleCid: Data)` | Accept connections on `/ww/0.1.0/vat/{protocol}`. `protocol` is a caller-chosen service name/locator, not type authority. The host derives both CIDs from the same host-minted `Runtime.load` executor that will spawn the vat cell. |
+| `listen` | `(executor: Executor, protocol: Text, caps: List(Export)) -> ()` | Accept connections on `/ww/0.1.0/vat/{protocol}`. `protocol` is a caller-chosen service name/locator, not type authority. The host derives the schema from the same host-minted `Runtime.load` executor that will spawn the vat cell. |
 
 ### VatClient (capability mode)
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `dial` | `(peer: Data, protocol: Text) -> (connection: VatConnection)` | Open connection to peer on `/ww/0.1.0/vat/{protocol}`. Use `connection.describe()` to inspect trusted metadata without spawning, then `connection.bind()` to lazily obtain the exported app capability. |
+| `dial` | `(peer: Data, protocol: Text) -> (connection: VatConnection)` | Open connection to peer on `/ww/0.1.0/vat/{protocol}`. Use `connection.describe()` to inspect the declared schema without spawning, then `connection.bind()` to lazily obtain the exported app capability. |
 
 ### VatConnection (capability mode)
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `describe` | `() -> (info: VatServiceInfo)` | Return `wasmArtifactCid`, `schemaBundleCid`, and typed `SchemaBundle` metadata without spawning a cell. |
+| `describe` | `() -> (schemaBundle: SchemaBundle)` | Return the typed `SchemaBundle` without spawning a cell. |
 | `bind` | `() -> (schemaBundle: SchemaBundle, cap: AnyPointer)` | Lazily spawn once for executor-bound services. Repeated calls on the same connection return the same schema and cap. |
 
 ## Service Cell Registration
