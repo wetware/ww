@@ -318,14 +318,24 @@ pub fn validate_schema_bundle(bytes: &[u8]) -> capnp::Result<ValidatedSchemaBund
 
     let service_interface_id = bundle.get_service_interface_id();
     let nodes = bundle.get_nodes()?;
-    let service_node = nodes
-        .iter()
-        .find(|node| node.get_id() == service_interface_id)
-        .ok_or_else(|| {
-            capnp::Error::failed(format!(
-                "SchemaBundle serviceInterfaceId 0x{service_interface_id:016x} not found in nodes"
-            ))
-        })?;
+    let mut seen_node_ids = std::collections::BTreeSet::new();
+    let mut service_node = None;
+    for node in nodes.iter() {
+        let node_id = node.get_id();
+        if !seen_node_ids.insert(node_id) {
+            return Err(capnp::Error::failed(format!(
+                "SchemaBundle contains duplicate node id 0x{node_id:016x}"
+            )));
+        }
+        if node_id == service_interface_id {
+            service_node = Some(node);
+        }
+    }
+    let service_node = service_node.ok_or_else(|| {
+        capnp::Error::failed(format!(
+            "SchemaBundle serviceInterfaceId 0x{service_interface_id:016x} not found in nodes"
+        ))
+    })?;
     require_interface_node(service_node, service_interface_id)?;
 
     let canonical_bytes = canonicalize_schema_bundle(bundle)?;
@@ -522,8 +532,14 @@ pub fn extract_custom_section(
     wasm: &[u8],
     name: &str,
 ) -> Result<Option<Vec<u8>>, WasmSectionError> {
+    Ok(extract_custom_sections(wasm, name)?.into_iter().next())
+}
+
+/// Return all custom sections with `name`, preserving WASM section order.
+pub fn extract_custom_sections(wasm: &[u8], name: &str) -> Result<Vec<Vec<u8>>, WasmSectionError> {
     ensure_wasm_header(wasm)?;
 
+    let mut matches = Vec::new();
     let mut pos = 8;
     while pos < wasm.len() {
         let section_start = pos;
@@ -543,30 +559,36 @@ pub fn extract_custom_section(
             let payload = &wasm[payload_start..payload_end];
             if let Some((section_name, body)) = parse_custom_payload(payload)? {
                 if section_name == name {
-                    return Ok(Some(body.to_vec()));
+                    matches.push(body.to_vec());
                 }
             }
         }
         pos = payload_end;
     }
 
-    Ok(None)
+    Ok(matches)
 }
 
 /// Extract and validate the `ww.schema.v1` custom section from a WASM artifact.
 pub fn extract_schema_bundle_section(
     wasm: &[u8],
 ) -> Result<Option<ValidatedSchemaBundle>, capnp::Error> {
-    let Some(bytes) = extract_custom_section(wasm, SCHEMA_SECTION_NAME).map_err(|e| {
+    let sections = extract_custom_sections(wasm, SCHEMA_SECTION_NAME).map_err(|e| {
         capnp::Error::failed(format!(
             "failed to parse WASM custom sections while looking for {SCHEMA_SECTION_NAME}: {e}"
         ))
-    })?
-    else {
-        return Ok(None);
-    };
-
-    validate_schema_bundle(&bytes).map(Some)
+    })?;
+    match sections.len() {
+        0 => Ok(None),
+        1 => {
+            let mut sections = sections;
+            let bytes = sections.pop().expect("exactly one section");
+            validate_schema_bundle(&bytes).map(Some)
+        }
+        n => Err(capnp::Error::failed(format!(
+            "WASM artifact contains {n} {SCHEMA_SECTION_NAME} custom sections; expected exactly one"
+        ))),
+    }
 }
 
 /// Remove all custom sections with `name`.
@@ -761,6 +783,31 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_schema_bundle_node_ids_rejected() {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut root = message.init_root::<system_capnp::schema_bundle::Builder>();
+            root.set_format_version(SCHEMA_BUNDLE_FORMAT_VERSION);
+            root.set_service_interface_id(TEST_INTERFACE_ID);
+            let mut nodes = root.init_nodes(2);
+            for idx in 0..2 {
+                let mut node = nodes.reborrow().get(idx);
+                node.set_id(TEST_INTERFACE_ID);
+                node.set_display_name("test.capnp:TestService");
+                node.init_interface();
+            }
+        }
+        let reader: system_capnp::schema_bundle::Reader<'_> = message.get_root_as_reader().unwrap();
+        let bundle = canonicalize_schema_bundle(reader).unwrap();
+
+        let error = validate_schema_bundle(&bundle).expect_err("duplicate node id rejected");
+        assert!(
+            error.to_string().contains("duplicate node id"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
     fn wasm_schema_custom_section_round_trips() {
         let wasm = minimal_wasm();
         let bundle = test_schema_bundle_bytes();
@@ -788,6 +835,22 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_wasm_schema_custom_sections_rejected() {
+        let wasm = minimal_wasm();
+        let bundle = test_schema_bundle_bytes();
+        let mut injected = inject_schema_bundle_section(&wasm, &bundle).expect("inject");
+
+        append_raw_custom_section(&mut injected, SCHEMA_SECTION_NAME, &bundle);
+
+        let error = extract_schema_bundle_section(&injected)
+            .expect_err("duplicate schema sections rejected");
+        assert!(
+            error.to_string().contains("expected exactly one"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
     fn replacing_schema_custom_section_keeps_one_section() {
         let wasm = minimal_wasm();
         let first = inject_schema_bundle_section(&wasm, &test_schema_bundle_bytes()).unwrap();
@@ -807,6 +870,17 @@ mod tests {
 
     fn minimal_wasm() -> Vec<u8> {
         b"\0asm\x01\0\0\0".to_vec()
+    }
+
+    fn append_raw_custom_section(wasm: &mut Vec<u8>, name: &str, body: &[u8]) {
+        let mut payload = Vec::new();
+        write_leb_u32(name.len() as u32, &mut payload);
+        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(body);
+
+        wasm.push(0);
+        write_leb_u32(payload.len() as u32, wasm);
+        wasm.extend_from_slice(&payload);
     }
 
     fn test_schema_bundle_bytes() -> Vec<u8> {
