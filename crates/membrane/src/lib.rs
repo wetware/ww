@@ -159,11 +159,11 @@ pub mod schema_registry {
             // CID snapshots guard against accidental protocol drift.
             assert_eq!(
                 HOST_CID,
-                "bafkr4ic7cpeyps4vztynjvnyygid47przo5aqtkgjswb5ns4yoqiox4pnu"
+                "bafkr4igsegudkpusfsovfzun74xed4d433r7gh2gh7acujjiy6cy5um42a"
             );
             assert_eq!(
                 RUNTIME_CID,
-                "bafkr4idvcyjadh3aefmdcis7ejmbi7jevfyutk7ifj7o3pi2tmfyrgcglm"
+                "bafkr4ibig2jnysgetthrw3xv4h373dvzua4hao7f2mowbwydjmzw75fwpy"
             );
             assert_eq!(
                 ROUTING_CID,
