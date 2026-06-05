@@ -104,8 +104,9 @@ Returns JSON with current auction status:
 
 The HTTP endpoint returns static defaults (each WAGI invocation is a
 fresh cell with no shared state). Real-time data comes from the vat
-RPC `status()` method. Existing-cap persistent vat publication is tracked as
-a follow-up to the executor-backed `VatConnection` cutover.
+RPC `status()` method. The `serve` mode publishes one persistent
+`ComputeProvider` through `VatListener.serve()`, so vat calls share live auction
+state.
 
 ## Running
 
@@ -209,7 +210,7 @@ examples/auction/
 │   └── auction.wasm      # final WASM with ww.schema.v1
 ├── glia/
 │   ├── register.glia     # shell-loaded registration
-│   └── serve.glia        # DHT provide loop
+│   └── serve.glia        # persistent vat service + DHT provide loop
 ├── etc/
 │   └── init.d/
 │       └── auction.glia  # deployment-only hook

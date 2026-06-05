@@ -250,6 +250,10 @@ pub struct HostGraftBuilder {
     /// Host-side resolver proving that Executor clients were minted by the
     /// trusted RuntimeImpl and carrying executor-bound artifact metadata.
     executor_resolver: Option<Rc<dyn crate::vat_listener::ExecutorResolver>>,
+    /// Metadata for the WASM artifact that owns this membrane session.
+    /// VatListener.serve uses this as the authority for persistent capability
+    /// publication metadata.
+    publisher_metadata: Option<crate::vat_listener::PublisherVatMetadata>,
     /// Named capabilities from init.d `with` block, forwarded to the child
     /// cell's graft response as `extras`. Each entry carries the cap name,
     /// the typed client, and the canonical Schema.Node bytes the original
@@ -283,6 +287,7 @@ impl HostGraftBuilder {
             route_registry: None,
             runtime_client,
             executor_resolver: None,
+            publisher_metadata: None,
             extras: Vec::new(),
             ipfs_client,
         }
@@ -300,6 +305,15 @@ impl HostGraftBuilder {
         resolver: Rc<dyn crate::vat_listener::ExecutorResolver>,
     ) -> Self {
         self.executor_resolver = Some(resolver);
+        self
+    }
+
+    /// Set publisher metadata for persistent vat service publication.
+    pub fn with_publisher_metadata(
+        mut self,
+        metadata: crate::vat_listener::PublisherVatMetadata,
+    ) -> Self {
+        self.publisher_metadata = Some(metadata);
         self
     }
 
@@ -339,6 +353,9 @@ impl GraftBuilder for HostGraftBuilder {
         }
         if let Some(ref resolver) = self.executor_resolver {
             host_impl = host_impl.with_executor_resolver(resolver.clone());
+        }
+        if let Some(ref metadata) = self.publisher_metadata {
+            host_impl = host_impl.with_publisher_metadata(metadata.clone());
         }
         let host: system_capnp::host::Client = capnp_rpc::new_client(host_impl);
 
@@ -507,6 +524,7 @@ pub fn build_membrane_rpc<R, W>(
     route_registry: Option<crate::dispatch::RouteRegistry>,
     runtime_client: system_capnp::runtime::Client,
     executor_resolver: Option<Rc<dyn crate::vat_listener::ExecutorResolver>>,
+    publisher_metadata: Option<crate::vat_listener::PublisherVatMetadata>,
     extras: Vec<(String, capnp::capability::Client, Vec<u8>)>,
     ipfs_client: ipfs::HttpClient,
     http_dial: Vec<String>,
@@ -527,6 +545,9 @@ where
     );
     if let Some(resolver) = executor_resolver {
         sess_builder = sess_builder.with_executor_resolver(resolver);
+    }
+    if let Some(metadata) = publisher_metadata {
+        sess_builder = sess_builder.with_publisher_metadata(metadata);
     }
     if !extras.is_empty() {
         sess_builder = sess_builder.with_extras(extras);

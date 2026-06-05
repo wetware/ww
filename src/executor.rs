@@ -598,6 +598,7 @@ impl Cell {
             route_registry,
             runtime_client,
             Some(runtime_handle.executor_resolver),
+            None,
             Vec::new(), // pid0 gets full membrane, no extras
             ipfs_client,
             http_dial,

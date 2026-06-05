@@ -13,8 +13,8 @@
 //! connection.  Creates a ComputeProvider and exports it via
 //! `system::serve()`.
 //!
-//! **`serve`**: provides the auction service locator on the DHT and
-//! re-provides periodically.
+//! **`serve`**: publishes one persistent ComputeProvider vat service, provides
+//! the auction service locator on the DHT, and re-provides periodically.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -660,14 +660,16 @@ fn run_cell() {
 }
 
 // ---------------------------------------------------------------------------
-// Service mode — DHT registration
+// Service mode — persistent vat service + DHT registration
 // ---------------------------------------------------------------------------
 
 async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
     let graft_resp = membrane.graft_request().send().promise.await?;
     let results = graft_resp.get()?;
     let caps = results.get_caps()?;
+    let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
     let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
+    let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
     let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
 
     let id_resp = host.id_request().send().promise.await?;
@@ -675,6 +677,47 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
     let dht_key = service_key(&routing, AUCTION_SERVICE).await?;
     log::info!("auction: peer {}", short_id(&self_id));
     log::info!("auction: locator {AUCTION_SERVICE}, schema CID {COMPUTE_PROVIDER_CID}");
+
+    let network_resp = host.network_request().send().promise.await?;
+    let network = network_resp.get()?;
+    let vat_listener = network.get_vat_listener()?;
+
+    let mut signer_req = identity.signer_request();
+    signer_req.get().set_domain("auction");
+    let signer_resp = signer_req.send().promise.await?;
+    let signer = signer_resp.get()?.get_signer()?;
+
+    let base_price = std::env::var("AUCTION_BASE_PRICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BASE_PRICE);
+    let total_capacity = std::env::var("AUCTION_TOTAL_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_TOTAL_CAPACITY);
+    let state = Rc::new(RefCell::new(AuctionState::new(base_price, total_capacity)));
+    let provider = ComputeProviderImpl {
+        state: state.clone(),
+        self_id,
+        signer,
+        identity,
+        runtime,
+    };
+    let client: auction_capnp::compute_provider::Client = capnp_rpc::new_client(provider);
+
+    let mut serve_req = vat_listener.serve_request();
+    serve_req.get().set_protocol(AUCTION_SERVICE);
+    serve_req
+        .get()
+        .init_cap()
+        .set_as_capability(client.client.hook.clone());
+    let serve_resp = serve_req.send().promise.await?;
+    let serve_results = serve_resp.get()?;
+    log::info!(
+        "auction: persistent vat service registered (wasmCid={}, schemaBundleCid={})",
+        hex::encode(serve_results.get_wasm_artifact_cid()?),
+        hex::encode(serve_results.get_schema_bundle_cid()?),
+    );
 
     // Provide service-name-derived CID on DHT for discovery.
     let mut provide_req = routing.provide_request();
@@ -691,6 +734,7 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
 
         let pause = wasip2::clocks::monotonic_clock::subscribe_duration(cooldown_ms * 1_000_000);
         pause.block();
+        state.borrow_mut().prune_expired_nonces();
         cooldown_ms = cooldown_ms.min(60_000);
     }
 }
@@ -752,7 +796,7 @@ impl Guest for AuctionGuest {
 
         match std::env::args().nth(1).as_deref() {
             Some("serve") => {
-                log::info!("auction: serve — DHT provide loop");
+                log::info!("auction: serve — persistent vat service + DHT provide loop");
                 system::run(|membrane: Membrane| async move { run_service(membrane).await });
             }
             _ => {

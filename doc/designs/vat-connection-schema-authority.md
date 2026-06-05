@@ -3,8 +3,7 @@
 ## Status
 
 Implemented design for the vat schema-authority cutover, including
-executor-bound vat cells. Persistent existing-cap publication is a follow-up
-branch built on this substrate.
+executor-bound vat cells and persistent existing-cap publication.
 
 ## Problem
 
@@ -114,6 +113,11 @@ interface VatListener {
     protocol :Text,
     caps :List(MembraneSchema.Export)
   ) -> (wasmArtifactCid :Data, schemaBundleCid :Data);
+
+  serve @1 (
+    cap :AnyPointer,
+    protocol :Text
+  ) -> (wasmArtifactCid :Data, schemaBundleCid :Data);
 }
 
 interface VatClient {
@@ -125,10 +129,12 @@ Semantics:
 
 - `describe()` never spawns a cell.
 - `bind()` lazily spawns once for that `VatConnection`.
+- `serve()` connections bind to the already-existing published cap; no cell is
+  spawned.
 - Repeated `bind()` on the same `VatConnection` returns the same schema and cap.
 - Dialing again creates a fresh `VatConnection`.
 - Disconnect after `bind()` closes the spawned cell's stdin for executor-bound
-  cells.
+  cells. Persistent-cap publications have no spawned stdin to close.
 
 ## Provenance Rule
 
@@ -147,12 +153,16 @@ on host-minted capability resolvers, not interface shape alone. `Executor` vat
 metadata is enforced here; `http-client` host-policy mint checks are a P0
 follow-up.
 
+`VatListener.serve` takes no schema argument. It derives `VatServiceInfo` from
+the WASM artifact that owns the caller's membrane session. The publisher
+artifact must have a valid `ww.schema.v1` bundle; otherwise `serve()` fails
+before registering the route. This is the safe replacement for the old
+`VatHandler.serve` shape.
+
 ## Non-Goals
 
 - No recursive attenuation in this effort.
 - No caller-supplied schema authority.
-- Existing-cap vat publication is a follow-up branch. That branch should derive
-  metadata from the publisher artifact rather than accepting schema bytes.
 - No Routing/DHT API changes.
 - No schema-CID-derived vat route registration.
 - No content-store schema publication in this cutover.

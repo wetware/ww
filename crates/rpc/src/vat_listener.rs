@@ -9,6 +9,9 @@
 //! `VatConnection.describe()` returns metadata without spawning a cell.
 //! `VatConnection.bind()` lazily spawns the executor-bound cell once and returns
 //! the application capability exported by the cell.
+//! `VatListener.serve(cap, protocol)` publishes an already-existing capability
+//! using metadata derived from the publishing WASM artifact, not from caller
+//! supplied schema bytes.
 //!
 //! Stdin semantics for vat cells: stdin is a shutdown signal channel, not a
 //! data transport. The host never writes bytes. It closes stdin to signal the
@@ -39,6 +42,8 @@ pub struct ExecutorVatMetadata {
     pub schema_bundle: Vec<u8>,
 }
 
+pub type PublisherVatMetadata = Result<ExecutorVatMetadata, String>;
+
 /// Host-side provenance resolver for Executor capabilities.
 ///
 /// Implementations must only return metadata for Executors minted by the
@@ -56,6 +61,7 @@ pub struct VatListenerImpl {
     stream_control: libp2p_stream::Control,
     guard: EpochGuard,
     executor_resolver: Option<Rc<dyn ExecutorResolver>>,
+    publisher_metadata: Option<PublisherVatMetadata>,
 }
 
 impl VatListenerImpl {
@@ -64,6 +70,7 @@ impl VatListenerImpl {
             stream_control,
             guard,
             executor_resolver: None,
+            publisher_metadata: None,
         }
     }
 
@@ -71,11 +78,13 @@ impl VatListenerImpl {
         stream_control: libp2p_stream::Control,
         guard: EpochGuard,
         executor_resolver: Option<Rc<dyn ExecutorResolver>>,
+        publisher_metadata: Option<PublisherVatMetadata>,
     ) -> Self {
         Self {
             stream_control,
             guard,
             executor_resolver,
+            publisher_metadata,
         }
     }
 }
@@ -178,6 +187,102 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
             Ok(())
         })
     }
+
+    fn serve(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::vat_listener::ServeParams,
+        mut results: system_capnp::vat_listener::ServeResults,
+    ) -> Promise<(), capnp::Error> {
+        pry!(self.guard.check());
+
+        let params = pry!(params.get());
+        let cap: capnp::capability::Client = pry!(params.get_cap().get_as_capability());
+        let protocol_reader = pry!(params.get_protocol());
+        let protocol = pry!(protocol_reader
+            .to_str()
+            .map_err(|e| capnp::Error::failed(format!("vat protocol is not UTF-8: {e}"))))
+        .to_string();
+        let stream_protocol = pry!(super::vat_protocol(&protocol));
+
+        let metadata = match &self.publisher_metadata {
+            Some(Ok(metadata)) => metadata.clone(),
+            Some(Err(message)) => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "VatListener.serve requires valid publisher WASM schema metadata: {message}"
+                )))
+            }
+            None => {
+                return Promise::err(capnp::Error::failed(
+                    "VatListener.serve requires publisher WASM metadata".into(),
+                ))
+            }
+        };
+
+        let mut control = self.stream_control.clone();
+        let mut epoch_rx = self.guard.receiver.clone();
+        let issued_seq = self.guard.issued_seq;
+
+        Promise::from_future(async move {
+            let mut incoming = control.accept(stream_protocol.clone()).map_err(|e| {
+                capnp::Error::failed(format!("failed to register vat protocol: {e}"))
+            })?;
+
+            tracing::info!(
+                protocol = %stream_protocol,
+                schema_bundle_cid = %cid_display(&metadata.schema_bundle_cid),
+                wasm_artifact_cid = %cid_display(&metadata.wasm_artifact_cid),
+                "Registered persistent vat service"
+            );
+
+            results
+                .get()
+                .set_wasm_artifact_cid(&metadata.wasm_artifact_cid);
+            results
+                .get()
+                .set_schema_bundle_cid(&metadata.schema_bundle_cid);
+
+            tokio::task::spawn_local(async move {
+                loop {
+                    tokio::select! {
+                        conn = incoming.next() => {
+                            let Some((peer_id, stream)) = conn else {
+                                tracing::warn!(protocol = %stream_protocol, "Vat accept loop ended unexpectedly");
+                                break;
+                            };
+                            let _accept_span = tracing::info_span!(
+                                "vat.accept",
+                                peer = %peer_id,
+                                protocol = %stream_protocol,
+                                mode = "serve",
+                            ).entered();
+                            tracing::debug!("Incoming persistent vat connection");
+
+                            let metadata = metadata.clone();
+                            let source = VatConnectionSource::Serve { cap: cap.clone() };
+
+                            tokio::task::spawn_local(async move {
+                                if let Err(e) = handle_vat_connection(metadata, source, stream).await
+                                {
+                                    tracing::error!("Vat serve connection error: {e}");
+                                }
+                            });
+                        }
+                        _ = epoch_rx.changed() => {
+                            if epoch_rx.borrow().seq != issued_seq {
+                                tracing::warn!(
+                                    protocol = %stream_protocol,
+                                    "Epoch became stale, closing vat accept loop"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+            Ok(())
+        })
+    }
 }
 
 fn read_extra_caps(
@@ -216,7 +321,8 @@ async fn handle_vat_connection(
     stream: impl AsyncRead + AsyncWrite + 'static,
 ) -> Result<(), capnp::Error> {
     let close_state = match &source {
-        VatConnectionSource::Spawn { state, .. } => state.clone(),
+        VatConnectionSource::Spawn { state, .. } => Some(state.clone()),
+        VatConnectionSource::Serve { .. } => None,
     };
     let vat_connection: system_capnp::vat_connection::Client =
         capnp_rpc::new_client(VatConnectionImpl { metadata, source });
@@ -226,7 +332,9 @@ async fn handle_vat_connection(
     let peer_rpc = RpcSystem::new(Box::new(network), Some(vat_connection.client));
 
     let _ = peer_rpc.await;
-    close_bound_stdin(&close_state).await;
+    if let Some(state) = close_state {
+        close_bound_stdin(&state).await;
+    }
 
     Ok(())
 }
@@ -236,6 +344,9 @@ enum VatConnectionSource {
         executor: system_capnp::executor::Client,
         caps: Vec<(String, capnp::capability::Client, Vec<u8>)>,
         state: Rc<RefCell<BindState>>,
+    },
+    Serve {
+        cap: capnp::capability::Client,
     },
 }
 
@@ -264,6 +375,9 @@ impl system_capnp::vat_connection::Server for VatConnectionImpl {
         results: system_capnp::vat_connection::BindResults,
     ) -> Promise<(), capnp::Error> {
         let (executor, caps, state) = match &self.source {
+            VatConnectionSource::Serve { cap } => {
+                return finish_bind_parts(results, &self.metadata.schema_bundle, cap.clone());
+            }
             VatConnectionSource::Spawn {
                 executor,
                 caps,
@@ -363,6 +477,17 @@ fn finish_bind(
     bound: BoundVatCell,
 ) -> Promise<(), capnp::Error> {
     match set_bind_results(results, &bound.schema_bundle, bound.app_cap) {
+        Ok(()) => Promise::ok(()),
+        Err(e) => Promise::err(e),
+    }
+}
+
+fn finish_bind_parts(
+    results: system_capnp::vat_connection::BindResults,
+    schema_bundle: &[u8],
+    app_cap: capnp::capability::Client,
+) -> Promise<(), capnp::Error> {
+    match set_bind_results(results, schema_bundle, app_cap) {
         Ok(()) => Promise::ok(()),
         Err(e) => Promise::err(e),
     }
@@ -678,6 +803,49 @@ mod tests {
 
                 close_bound_stdin(&state).await;
                 assert_eq!(closed.get(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn served_bind_returns_schema_and_cap_without_spawning() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let connection: system_capnp::vat_connection::Client =
+                    capnp_rpc::new_client(VatConnectionImpl {
+                        metadata: test_metadata(),
+                        source: VatConnectionSource::Serve {
+                            cap: test_bootstrap_cap(),
+                        },
+                    });
+
+                let first = connection
+                    .bind_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("first bind");
+                let first_results = first.get().unwrap();
+                let first_schema = first_results.get_schema_bundle().unwrap();
+                assert_eq!(first_schema.get_format_version(), 1);
+                let _first_cap: capnp::capability::Client =
+                    first_results.get_cap().get_as_capability().unwrap();
+
+                let second = connection
+                    .bind_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("second bind");
+                let second_results = second.get().unwrap();
+                let second_schema = second_results.get_schema_bundle().unwrap();
+                assert_eq!(
+                    second_schema.get_service_interface_id(),
+                    0xd0ac_8299_df07_9c61
+                );
+                let _second_cap: capnp::capability::Client =
+                    second_results.get_cap().get_as_capability().unwrap();
             })
             .await;
     }

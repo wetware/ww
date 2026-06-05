@@ -160,7 +160,9 @@ struct VatServiceInfo {
   # CID bytes.
 
   schemaBundle @2 :SchemaBundle;
-  # Parsed schema bundle from the executor-bound cell artifact.
+  # Parsed schema bundle from the service authority WASM artifact: the
+  # executor-bound cell artifact for listen(), or the publisher artifact for
+  # serve().
 }
 
 interface VatConnection {
@@ -185,6 +187,16 @@ interface VatListener {
   # caps: optional named capabilities from the init.d `with` block.
   # Forwarded into spawned cells' membranes as graft extras.
   # Empty list (default) = no extra caps.
+
+  serve @1 (cap :AnyPointer, protocol :Text)
+      -> (wasmArtifactCid :Data, schemaBundleCid :Data);
+  # Accept incoming Cap'n Proto RPC connections on /ww/0.1.0/vat/{protocol}
+  # and bind each connection to an already-existing application capability.
+  #
+  # This is the persistent-capability publication path. It does not accept
+  # schema bytes. The host derives VatConnection metadata from the WASM artifact
+  # that is calling serve(); that publisher artifact must have a valid
+  # ww.schema.v1 SchemaBundle custom section.
 }
 
 interface VatClient {

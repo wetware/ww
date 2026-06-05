@@ -543,6 +543,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
         let stream_control = self.stream_control.clone();
         let runtime_client = self.runtime_client.clone();
         let executor_resolver = self.executor_resolver.clone();
+        let publisher_metadata = Some(self.vat_metadata().map_err(|e| e.to_string()));
         let ipfs_client = self.ipfs_client.clone();
         let http_dial = self.http_dial.clone();
 
@@ -594,6 +595,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
                     None, // route_registry: spawned cells don't get HTTP routes
                     runtime_client,
                     Some(executor_resolver),
+                    publisher_metadata,
                     extra_caps,
                     ipfs_client,
                     http_dial,

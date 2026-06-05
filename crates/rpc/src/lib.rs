@@ -459,6 +459,7 @@ pub struct HostImpl {
     stream_control: Option<libp2p_stream::Control>,
     route_registry: Option<crate::dispatch::RouteRegistry>,
     executor_resolver: Option<Rc<dyn vat_listener::ExecutorResolver>>,
+    publisher_metadata: Option<vat_listener::PublisherVatMetadata>,
 }
 
 impl HostImpl {
@@ -477,6 +478,7 @@ impl HostImpl {
             stream_control,
             route_registry: None,
             executor_resolver: None,
+            publisher_metadata: None,
         }
     }
 
@@ -493,6 +495,14 @@ impl HostImpl {
         resolver: Rc<dyn vat_listener::ExecutorResolver>,
     ) -> Self {
         self.executor_resolver = Some(resolver);
+        self
+    }
+
+    /// Set the metadata for the WASM artifact that owns this host graft
+    /// session. VatListener.serve uses this as publication authority for
+    /// already-existing capabilities.
+    pub fn with_publisher_metadata(mut self, metadata: vat_listener::PublisherVatMetadata) -> Self {
+        self.publisher_metadata = Some(metadata);
         self
     }
 
@@ -592,6 +602,7 @@ impl system_capnp::host::Server for HostImpl {
                 stream_control.clone(),
                 guard.clone(),
                 self.executor_resolver.clone(),
+                self.publisher_metadata.clone(),
             ));
         let vat_client: system_capnp::vat_client::Client = capnp_rpc::new_client(
             vat_client::VatClientImpl::new(stream_control, guard.clone()),
@@ -1505,6 +1516,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_vat_listener_serve_without_publisher_metadata_errors() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_tx, guard) = test_epoch_guard(1);
+                let listener_impl =
+                    vat_listener::VatListenerImpl::new(dummy_stream_control(), guard);
+                let listener: system_capnp::vat_listener::Client =
+                    capnp_rpc::new_client(listener_impl);
+
+                let cap = stub_executor();
+                let mut req = listener.serve_request();
+                req.get().init_cap().set_as_capability(cap.client.hook);
+                req.get().set_protocol("auction");
+
+                let result = req.send().promise.await;
+                let Err(error) = result else {
+                    panic!("serve without publisher metadata should error");
+                };
+                let message = error.to_string();
+                assert!(
+                    message.contains("publisher WASM metadata"),
+                    "got: {message}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_vat_listener_serve_invalid_publisher_metadata_errors() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_tx, guard) = test_epoch_guard(1);
+                let listener_impl = vat_listener::VatListenerImpl::with_executor_resolver(
+                    dummy_stream_control(),
+                    guard,
+                    None,
+                    Some(Err("missing ww.schema.v1".into())),
+                );
+                let listener: system_capnp::vat_listener::Client =
+                    capnp_rpc::new_client(listener_impl);
+
+                let cap = stub_executor();
+                let mut req = listener.serve_request();
+                req.get().init_cap().set_as_capability(cap.client.hook);
+                req.get().set_protocol("auction");
+
+                let result = req.send().promise.await;
+                let Err(error) = result else {
+                    panic!("serve with invalid publisher metadata should error");
+                };
+                let message = error.to_string();
+                assert!(message.contains("missing ww.schema.v1"), "got: {message}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_vat_listener_serve_accepts_valid_publisher_metadata() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_tx, guard) = test_epoch_guard(1);
+                let expected = test_vat_metadata();
+                let listener_impl = vat_listener::VatListenerImpl::with_executor_resolver(
+                    dummy_stream_control(),
+                    guard,
+                    None,
+                    Some(Ok(expected.clone())),
+                );
+                let listener: system_capnp::vat_listener::Client =
+                    capnp_rpc::new_client(listener_impl);
+
+                let cap = stub_executor();
+                let mut req = listener.serve_request();
+                req.get().init_cap().set_as_capability(cap.client.hook);
+                req.get().set_protocol("auction");
+
+                let response = req.send().promise.await.expect("serve should succeed");
+                let results = response.get().expect("serve results");
+                assert_eq!(
+                    results.get_wasm_artifact_cid().unwrap().to_vec(),
+                    expected.wasm_artifact_cid
+                );
+                assert_eq!(
+                    results.get_schema_bundle_cid().unwrap().to_vec(),
+                    expected.schema_bundle_cid
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn test_vat_listener_resolver_rejection_errors() {
         let local = tokio::task::LocalSet::new();
         local
@@ -1514,6 +1619,7 @@ mod tests {
                     dummy_stream_control(),
                     guard,
                     Some(rejecting_resolver("fake executor rejected")),
+                    None,
                 );
                 let listener: system_capnp::vat_listener::Client =
                     capnp_rpc::new_client(listener_impl);
@@ -1649,6 +1755,7 @@ mod tests {
                     control1,
                     guard.clone(),
                     Some(resolver_with_metadata()),
+                    None,
                 );
                 let client1: system_capnp::vat_listener::Client = capnp_rpc::new_client(listener1);
 
@@ -1656,6 +1763,7 @@ mod tests {
                     control2,
                     guard,
                     Some(resolver_with_metadata()),
+                    None,
                 );
                 let client2: system_capnp::vat_listener::Client = capnp_rpc::new_client(listener2);
 
@@ -1715,6 +1823,7 @@ mod tests {
                     Some(Rc::new(TestExecutorResolver {
                         metadata: Ok(expected.clone()),
                     })),
+                    None,
                 );
                 let listener: system_capnp::vat_listener::Client =
                     capnp_rpc::new_client(listener_impl);

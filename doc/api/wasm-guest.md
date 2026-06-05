@@ -223,6 +223,7 @@ Full interface reference for the capabilities available to guests.
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `listen` | `(executor: Executor, protocol: Text, caps: List(Export)) -> (wasmArtifactCid: Data, schemaBundleCid: Data)` | Accept connections on `/ww/0.1.0/vat/{protocol}`. `protocol` is a caller-chosen service name/locator, not type authority. The host derives both CIDs from the same host-minted `Runtime.load` executor that will spawn the vat cell. |
+| `serve` | `(cap: AnyPointer, protocol: Text) -> (wasmArtifactCid: Data, schemaBundleCid: Data)` | Publish an already-existing capability on `/ww/0.1.0/vat/{protocol}`. No schema bytes are accepted; metadata comes from the publishing WASM artifact's `ww.schema.v1` section. |
 
 ### VatClient (capability mode)
 
@@ -235,7 +236,7 @@ Full interface reference for the capabilities available to guests.
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `describe` | `() -> (info: VatServiceInfo)` | Return `wasmArtifactCid`, `schemaBundleCid`, and typed `SchemaBundle` metadata without spawning a cell. |
-| `bind` | `() -> (schemaBundle: SchemaBundle, cap: AnyPointer)` | Lazily spawn once for executor-bound services. Repeated calls on the same connection return the same schema and cap. |
+| `bind` | `() -> (schemaBundle: SchemaBundle, cap: AnyPointer)` | Spawn/attach once for executor-bound services, or return the persistent published cap for `serve()` services. Repeated calls on the same connection return the same schema and cap. |
 
 ## Service Cell Registration
 
@@ -247,6 +248,11 @@ Vat cells must embed canonical `SchemaBundle` bytes in the `ww.schema.v1` WASM
 custom section. `Runtime.load` records schema metadata but remains transport
 neutral; `VatListener.listen` is where missing or invalid vat schema metadata
 fails clearly.
+
+`VatListener.serve` uses the same metadata requirement for the caller artifact:
+the publishing process must have been spawned from a WASM artifact with a valid
+`ww.schema.v1` section. This keeps persistent-cap publication from reintroducing
+caller-supplied schema authority.
 
 Glia registration forms:
 
