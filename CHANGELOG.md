@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Vat RPC can publish existing capabilities as services (#548).** Added `VatListener.serve(cap, protocol)` for persistent existing-cap publication, with metadata derived from the publisher WASM artifact instead of caller-supplied schema bytes, and moved the auction `serve` mode onto the shared-state vat service path.
 - **Vat RPC schema authority now comes from executor-bound WASM metadata (#547).** Added canonical `SchemaBundle` metadata in the `ww.schema.v1` WASM custom section, switched vat protocols to caller-chosen service names, returned host-derived artifact/schema CIDs through `VatConnection.describe()` and `bind()`, and rejected non-host-minted executor capabilities before vat publication.
 - **Host workspace dependency versions are centralized (#539).** Added shared `[workspace.dependencies]` pins for common host-workspace crates and converted member manifests to `workspace = true` where versions should move together, while leaving intentional duplicate dependency families such as `rand` 0.8/0.9 and upstream-owned parser/runtime stacks alone.
 - **CI now exercises the full host workspace for Rust lint/build/test coverage (#537).** Pull request checks run clippy with `--workspace --all-targets`, build host workspace test binaries with `--workspace --tests`, and run host workspace tests instead of checking only selected packages or the root default member.
