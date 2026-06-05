@@ -38,16 +38,12 @@ const MAX_WASM_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone)]
 enum ExecutorSchemaMetadata {
     Absent,
-    Valid {
-        schema_bundle: Vec<u8>,
-        schema_bundle_cid: Vec<u8>,
-    },
+    Valid { schema_bundle: Vec<u8> },
     Invalid(String),
 }
 
 #[derive(Clone)]
 struct ExecutorMetadata {
-    wasm_artifact_cid: Vec<u8>,
     schema: ExecutorSchemaMetadata,
 }
 
@@ -63,7 +59,7 @@ impl rpc::vat_listener::ExecutorResolver for RuntimeExecutorResolver {
     async fn resolve(
         &self,
         executor: system_capnp::executor::Client,
-    ) -> Result<rpc::vat_listener::ExecutorVatMetadata, capnp::Error> {
+    ) -> Result<rpc::vat_listener::VatSchemaMetadata, capnp::Error> {
         let resolved: system_capnp::executor::Client = capnp::capability::get_resolved_cap(
             <system_capnp::executor::Client as FromClientHook>::new(
                 executor.as_client_hook().add_ref(),
@@ -300,19 +296,42 @@ pub fn create_runtime_client(
 }
 
 fn executor_metadata_for_wasm(wasm: &[u8]) -> ExecutorMetadata {
-    let wasm_artifact_cid = schema_id::compute_cid_bytes(wasm);
     let schema = match schema_id::extract_schema_bundle_section(wasm) {
         Ok(Some(bundle)) => ExecutorSchemaMetadata::Valid {
             schema_bundle: bundle.canonical_bytes,
-            schema_bundle_cid: bundle.cid_bytes,
         },
         Ok(None) => ExecutorSchemaMetadata::Absent,
         Err(error) => ExecutorSchemaMetadata::Invalid(error.to_string()),
     };
-    ExecutorMetadata {
-        wasm_artifact_cid,
-        schema,
+    ExecutorMetadata { schema }
+}
+
+fn vat_metadata_from_executor_metadata(
+    metadata: &ExecutorMetadata,
+    artifact_label: &str,
+) -> Result<rpc::vat_listener::VatSchemaMetadata, capnp::Error> {
+    match &metadata.schema {
+        ExecutorSchemaMetadata::Valid { schema_bundle } => {
+            Ok(rpc::vat_listener::VatSchemaMetadata {
+                schema_bundle: schema_bundle.clone(),
+            })
+        }
+        ExecutorSchemaMetadata::Absent => Err(capnp::Error::failed(format!(
+            "{artifact_label} WASM is missing required {} custom section for vat publication",
+            schema_id::SCHEMA_SECTION_NAME
+        ))),
+        ExecutorSchemaMetadata::Invalid(error) => Err(capnp::Error::failed(format!(
+            "{artifact_label} WASM has invalid {} custom section: {error}",
+            schema_id::SCHEMA_SECTION_NAME
+        ))),
     }
+}
+
+pub(crate) fn publisher_vat_metadata_for_wasm(
+    wasm: &[u8],
+) -> rpc::vat_listener::PublisherVatMetadata {
+    vat_metadata_from_executor_metadata(&executor_metadata_for_wasm(wasm), "publisher")
+        .map_err(|e| e.to_string())
 }
 
 fn read_text_list(list: capnp::text_list::Reader<'_>) -> Vec<String> {
@@ -447,25 +466,8 @@ pub struct ExecutorImpl {
 }
 
 impl ExecutorImpl {
-    fn vat_metadata(&self) -> Result<rpc::vat_listener::ExecutorVatMetadata, capnp::Error> {
-        match &self.metadata.schema {
-            ExecutorSchemaMetadata::Valid {
-                schema_bundle,
-                schema_bundle_cid,
-            } => Ok(rpc::vat_listener::ExecutorVatMetadata {
-                wasm_artifact_cid: self.metadata.wasm_artifact_cid.clone(),
-                schema_bundle_cid: schema_bundle_cid.clone(),
-                schema_bundle: schema_bundle.clone(),
-            }),
-            ExecutorSchemaMetadata::Absent => Err(capnp::Error::failed(format!(
-                "executor WASM is missing required {} custom section for vat publication",
-                schema_id::SCHEMA_SECTION_NAME
-            ))),
-            ExecutorSchemaMetadata::Invalid(error) => Err(capnp::Error::failed(format!(
-                "executor WASM has invalid {} custom section: {error}",
-                schema_id::SCHEMA_SECTION_NAME
-            ))),
-        }
+    fn vat_metadata(&self) -> Result<rpc::vat_listener::VatSchemaMetadata, capnp::Error> {
+        vat_metadata_from_executor_metadata(&self.metadata, "executor")
     }
 }
 
@@ -740,16 +742,30 @@ mod tests {
                     .resolve(executor)
                     .await
                     .expect("pipelined Runtime.load executor should resolve");
-                assert_eq!(
-                    metadata.wasm_artifact_cid,
-                    schema_id::compute_cid_bytes(&wasm)
-                );
-                assert_eq!(
-                    metadata.schema_bundle_cid,
-                    schema_id::compute_cid_bytes(&test_schema_bundle_bytes())
-                );
+                assert_eq!(metadata.schema_bundle, test_schema_bundle_bytes());
             })
             .await;
+    }
+
+    #[test]
+    fn publisher_vat_metadata_for_wasm_accepts_valid_schema() {
+        let wasm = test_component_with_schema();
+
+        let metadata =
+            publisher_vat_metadata_for_wasm(&wasm).expect("publisher metadata should be valid");
+        assert_eq!(metadata.schema_bundle, test_schema_bundle_bytes());
+    }
+
+    #[test]
+    fn publisher_vat_metadata_for_wasm_reports_missing_schema() {
+        let wasm = wasm_encoder::Component::new().finish();
+
+        let error = publisher_vat_metadata_for_wasm(&wasm)
+            .expect_err("publisher metadata should reject missing schema");
+        assert!(
+            error.contains("publisher WASM is missing required ww.schema.v1"),
+            "got: {error}"
+        );
     }
 
     fn test_runtime_handle() -> RuntimeHandle {

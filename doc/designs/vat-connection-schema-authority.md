@@ -36,13 +36,13 @@ The protocol path is a locator only. It is not type authority, schema identity,
 or implementation identity. Examples should use ordinary names such as
 `greeter`, `chess`, `oracle`, and `auction`.
 
-Schema and implementation identities are metadata:
+The functional publication contract is the declared schema and the exported
+application capability. Schema and WASM CIDs remain useful for binary
+distribution, caches, logs, and operator verification, but `VatConnection` does
+not expose them as service metadata.
 
-- `schemaBundleCid`: `CIDv1(raw, BLAKE3(canonical SchemaBundle bytes))`
-- `wasmArtifactCid`: `CIDv1(raw, BLAKE3(final WASM bytes))`
-
-Remote callers dial a service name, call `describe()` to inspect host-derived
-metadata without spawning, then call `bind()` to obtain the application
+Remote callers dial a service name, call `describe()` to inspect the declared
+schema without spawning, then call `bind()` to obtain the application
 capability.
 
 ## Schema Artifact
@@ -66,19 +66,22 @@ Validation rules:
 - `serviceInterfaceId` must match exactly one node in `nodes`.
 - The matching node must be a Cap'n Proto interface.
 - The bundle must parse as the typed `SchemaBundle`.
+- `nodes` must not contain duplicate `Schema.Node.id` values.
+- The WASM artifact must contain at most one `ww.schema.v1` custom section.
 - Tooling is responsible for canonical encoding before insertion.
 
-CIDs are transported as `Data` containing canonical `Cid::to_bytes()`. Text CIDs
-are for logs, CLI output, docs, and operator-facing verification only.
+When other APIs or tools expose CIDs, they should transport them as `Data`
+containing canonical `Cid::to_bytes()`. Text CIDs are for logs, CLI output,
+docs, and operator-facing verification only.
 
 ## Runtime Semantics
 
-`Runtime.load` is transport-neutral. It computes `wasmArtifactCid` for every
-artifact and records the `ww.schema.v1` state if present:
+`Runtime.load` is transport-neutral. It records the `ww.schema.v1` state if
+present:
 
 ```text
 Absent
-Valid { schemaBundle, schemaBundleCid }
+Valid { schemaBundle }
 Invalid { error }
 ```
 
@@ -96,14 +99,8 @@ vat, HTTP/WAGI, stream/raw, or direct process spawn.
 ## Public API
 
 ```capnp
-struct VatServiceInfo {
-  wasmArtifactCid @0 :Data;
-  schemaBundleCid @1 :Data;
-  schemaBundle @2 :SchemaBundle;
-}
-
 interface VatConnection {
-  describe @0 () -> (info :VatServiceInfo);
+  describe @0 () -> (schemaBundle :SchemaBundle);
   bind @1 () -> (schemaBundle :SchemaBundle, cap :AnyPointer);
 }
 
@@ -112,12 +109,12 @@ interface VatListener {
     executor :Executor,
     protocol :Text,
     caps :List(MembraneSchema.Export)
-  ) -> (wasmArtifactCid :Data, schemaBundleCid :Data);
+  ) -> ();
 
   serve @1 (
     cap :AnyPointer,
     protocol :Text
-  ) -> (wasmArtifactCid :Data, schemaBundleCid :Data);
+  ) -> ();
 }
 
 interface VatClient {
@@ -140,21 +137,21 @@ Semantics:
 
 `VatListener.listen` accepts only host-minted `Runtime.load` executors.
 `Executor` is an object-capability interface, so untrusted guest code can
-implement an object with the same interface and lie about artifact metadata.
+implement an object with the same interface and lie about its provenance.
 
 The host runtime owns a `CapabilityServerSet<ExecutorImpl, executor::Client>`.
 The RPC layer receives an injected provenance resolver, which recovers verified
-executor metadata from host-minted executors and rejects fake executors before
+schema metadata from host-minted executors and rejects fake executors before
 protocol registration.
 
 This is the general rule for host-policy claims: if an interface claims
 host-enforced provenance or policy, consumers at that trust boundary must rely
 on host-minted capability resolvers, not interface shape alone. `Executor` vat
-metadata is enforced here; `http-client` host-policy mint checks are a P0
+schema metadata is enforced here; `http-client` host-policy mint checks are a P0
 follow-up.
 
-`VatListener.serve` takes no schema argument. It derives `VatServiceInfo` from
-the WASM artifact that owns the caller's membrane session. The publisher
+`VatListener.serve` takes no schema argument. It derives the declared schema
+from the WASM artifact that owns the caller's membrane session. The publisher
 artifact must have a valid `ww.schema.v1` bundle; otherwise `serve()` fails
 before registering the route. This is the safe replacement for the old
 `VatHandler.serve` shape.

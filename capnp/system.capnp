@@ -148,26 +148,12 @@ struct SchemaBundle {
   nodes @2 :List(Schema.Node);
   # Canonical transitive schema graph needed to understand serviceInterfaceId.
   # Producers must canonicalize the complete SchemaBundle before embedding it
-  # in the ww.schema.v1 WASM custom section or deriving schemaBundleCid.
-}
-
-struct VatServiceInfo {
-  wasmArtifactCid @0 :Data;
-  # CIDv1(raw, BLAKE3(final WASM bytes)), encoded as canonical CID bytes.
-
-  schemaBundleCid @1 :Data;
-  # CIDv1(raw, BLAKE3(canonical SchemaBundle bytes)), encoded as canonical
-  # CID bytes.
-
-  schemaBundle @2 :SchemaBundle;
-  # Parsed schema bundle from the service authority WASM artifact: the
-  # executor-bound cell artifact for listen(), or the publisher artifact for
-  # serve().
+  # in the ww.schema.v1 WASM custom section.
 }
 
 interface VatConnection {
-  describe @0 () -> (info :VatServiceInfo);
-  # Return host-derived service metadata without spawning a vat cell.
+  describe @0 () -> (schemaBundle :SchemaBundle);
+  # Return the declared application schema without spawning a vat cell.
 
   bind @1 () -> (schemaBundle :SchemaBundle, cap :AnyPointer);
   # Return the application capability for this connection, spawning the
@@ -177,24 +163,22 @@ interface VatConnection {
 
 interface VatListener {
   listen @0 (executor :Executor, protocol :Text,
-             caps :List(MembraneSchema.Export))
-      -> (wasmArtifactCid :Data, schemaBundleCid :Data);
+             caps :List(MembraneSchema.Export)) -> ();
   # Accept incoming Cap'n Proto RPC connections on /ww/0.1.0/vat/{protocol}.
   # Protocol is a caller-chosen service name/locator, not type authority.
-  # The host derives wasmArtifactCid and schemaBundleCid from the same
-  # host-minted Runtime.load executor that will spawn the vat cell.
+  # The host derives the declared schema bundle from the same host-minted
+  # Runtime.load executor that will spawn the vat cell.
   #
   # caps: optional named capabilities from the init.d `with` block.
   # Forwarded into spawned cells' membranes as graft extras.
   # Empty list (default) = no extra caps.
 
-  serve @1 (cap :AnyPointer, protocol :Text)
-      -> (wasmArtifactCid :Data, schemaBundleCid :Data);
+  serve @1 (cap :AnyPointer, protocol :Text) -> ();
   # Accept incoming Cap'n Proto RPC connections on /ww/0.1.0/vat/{protocol}
   # and bind each connection to an already-existing application capability.
   #
   # This is the persistent-capability publication path. It does not accept
-  # schema bytes. The host derives VatConnection metadata from the WASM artifact
+  # schema bytes. The host exposes the declared schema from the WASM artifact
   # that is calling serve(); that publisher artifact must have a valid
   # ww.schema.v1 SchemaBundle custom section.
 }
@@ -203,7 +187,7 @@ interface VatClient {
   dial @0 (peer :Data, protocol :Text) -> (connection :VatConnection);
   # Open a Cap'n Proto RPC connection to peer on /ww/0.1.0/vat/{protocol}.
   # Returns a trusted host-side VatConnection wrapper. Call describe() to
-  # inspect metadata without spawning, or bind() to acquire the exported
+  # inspect the schema without spawning, or bind() to acquire the exported
   # application capability.
 }
 

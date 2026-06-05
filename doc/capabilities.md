@@ -85,10 +85,9 @@ callers must not infer host policy from type alone.
 
 For vat publication, `VatListener.listen` accepts only host-minted
 `Runtime.load` executors. The host resolves the executor through its runtime
-provenance registry, then derives `wasmArtifactCid`, `schemaBundleCid`, and the
-typed `SchemaBundle` from the same executor-bound WASM artifact that will spawn
-the vat cell. Fake executor implementations are rejected before protocol
-registration.
+provenance registry, then derives the typed `SchemaBundle` from the same
+executor-bound WASM artifact that will spawn the vat cell. Fake executor
+implementations are rejected before protocol registration.
 
 Apply the same rule whenever an API makes host-policy claims. For example, an
 `http-client` capability only represents host-enforced allowlist policy when it

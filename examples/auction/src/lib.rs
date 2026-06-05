@@ -711,13 +711,8 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
         .get()
         .init_cap()
         .set_as_capability(client.client.hook.clone());
-    let serve_resp = serve_req.send().promise.await?;
-    let serve_results = serve_resp.get()?;
-    log::info!(
-        "auction: persistent vat service registered (wasmCid={}, schemaBundleCid={})",
-        hex::encode(serve_results.get_wasm_artifact_cid()?),
-        hex::encode(serve_results.get_schema_bundle_cid()?),
-    );
+    serve_req.send().promise.await?.get()?;
+    log::info!("auction: persistent vat service registered");
 
     // Provide service-name-derived CID on DHT for discovery.
     let mut provide_req = routing.provide_request();

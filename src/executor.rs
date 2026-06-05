@@ -340,6 +340,13 @@ pub struct SpawnResult {
     pub epoch_tx: Option<watch::Sender<Epoch>>,
 }
 
+/// Running process plus host-side stream handles for an RPC-enabled cell.
+pub struct StreamsSpawnResult {
+    pub join: JoinHandle<Result<()>>,
+    pub handles: DataStreamHandles,
+    pub publisher_metadata: rpc::vat_listener::PublisherVatMetadata,
+}
+
 impl Cell {
     /// Execute the cell command using wetware streams for RPC transport.
     ///
@@ -365,7 +372,7 @@ impl Cell {
     /// This enables bidirectional data streams so the host can speak Cap'n Proto
     /// RPC to the guest over in-memory duplex pipes, while the guest's WASI stdio
     /// is bound to the host process's stdin/stdout/stderr.
-    pub async fn spawn_with_streams(self) -> Result<(JoinHandle<Result<()>>, DataStreamHandles)> {
+    pub async fn spawn_with_streams(self) -> Result<StreamsSpawnResult> {
         let Cell {
             path,
             args,
@@ -411,6 +418,7 @@ impl Cell {
         let bytecode = loader.load(&wasm_path).await.with_context(|| {
             format!("Failed to load bin/main.wasm from image: {path} (resolved to: {wasm_path})")
         })?;
+        let publisher_metadata = crate::launcher::publisher_vat_metadata_for_wasm(&bytecode);
         let wasm_cid = {
             let digest = blake3::hash(&bytecode);
             let mh = cid::multihash::Multihash::<64>::wrap(0x1e, digest.as_bytes())
@@ -509,7 +517,11 @@ impl Cell {
         tracing::debug!(binary = %path, "Guest process ready");
         let join = tokio::spawn(async move { proc.run().await });
 
-        Ok((join, handles))
+        Ok(StreamsSpawnResult {
+            join,
+            handles,
+            publisher_metadata,
+        })
     }
 
     /// Execute the cell command and serve Cap'n Proto RPC over wetware streams.
@@ -540,8 +552,10 @@ impl Cell {
             head: vec![],
             provenance: Provenance::Block(0),
         });
-        let (join, handles) = self.spawn_with_streams().await?;
-        let mut handles = handles;
+        let streams = self.spawn_with_streams().await?;
+        let join = streams.join;
+        let mut handles = streams.handles;
+        let publisher_metadata = streams.publisher_metadata;
         let (reader, writer) = handles
             .take_host_split()
             .ok_or_else(|| anyhow::anyhow!("host stream missing; RPC streams already consumed"))?;
@@ -598,7 +612,7 @@ impl Cell {
             route_registry,
             runtime_client,
             Some(runtime_handle.executor_resolver),
-            None,
+            Some(publisher_metadata),
             Vec::new(), // pid0 gets full membrane, no extras
             ipfs_client,
             http_dial,

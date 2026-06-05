@@ -6,11 +6,11 @@
 //! host-minted `Runtime.load()` executor and serves a `VatConnection` wrapper
 //! to dialers.
 //!
-//! `VatConnection.describe()` returns metadata without spawning a cell.
+//! `VatConnection.describe()` returns the declared schema without spawning a cell.
 //! `VatConnection.bind()` lazily spawns the executor-bound cell once and returns
 //! the application capability exported by the cell.
 //! `VatListener.serve(cap, protocol)` publishes an already-existing capability
-//! using metadata derived from the publishing WASM artifact, not from caller
+//! using schema metadata derived from the publishing WASM artifact, not from caller
 //! supplied schema bytes.
 //!
 //! Stdin semantics for vat cells: stdin is a shutdown signal channel, not a
@@ -33,16 +33,14 @@ use tokio::sync::oneshot;
 
 use membrane::system_capnp;
 
-/// Host-derived metadata for a Runtime-minted executor that is valid for vat
-/// publication.
+/// Host-derived schema metadata for a Runtime-minted executor that is valid for
+/// vat publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutorVatMetadata {
-    pub wasm_artifact_cid: Vec<u8>,
-    pub schema_bundle_cid: Vec<u8>,
+pub struct VatSchemaMetadata {
     pub schema_bundle: Vec<u8>,
 }
 
-pub type PublisherVatMetadata = Result<ExecutorVatMetadata, String>;
+pub type PublisherVatMetadata = Result<VatSchemaMetadata, String>;
 
 /// Host-side provenance resolver for Executor capabilities.
 ///
@@ -54,7 +52,7 @@ pub trait ExecutorResolver {
     async fn resolve(
         &self,
         executor: system_capnp::executor::Client,
-    ) -> Result<ExecutorVatMetadata, capnp::Error>;
+    ) -> Result<VatSchemaMetadata, capnp::Error>;
 }
 
 pub struct VatListenerImpl {
@@ -94,7 +92,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
     fn listen(
         self: capnp::capability::Rc<Self>,
         params: system_capnp::vat_listener::ListenParams,
-        mut results: system_capnp::vat_listener::ListenResults,
+        _results: system_capnp::vat_listener::ListenResults,
     ) -> Promise<(), capnp::Error> {
         pry!(self.guard.check());
 
@@ -130,17 +128,8 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
 
             tracing::info!(
                 protocol = %stream_protocol,
-                schema_bundle_cid = %cid_display(&metadata.schema_bundle_cid),
-                wasm_artifact_cid = %cid_display(&metadata.wasm_artifact_cid),
                 "Registered vat service"
             );
-
-            results
-                .get()
-                .set_wasm_artifact_cid(&metadata.wasm_artifact_cid);
-            results
-                .get()
-                .set_schema_bundle_cid(&metadata.schema_bundle_cid);
 
             tokio::task::spawn_local(async move {
                 loop {
@@ -191,7 +180,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
     fn serve(
         self: capnp::capability::Rc<Self>,
         params: system_capnp::vat_listener::ServeParams,
-        mut results: system_capnp::vat_listener::ServeResults,
+        _results: system_capnp::vat_listener::ServeResults,
     ) -> Promise<(), capnp::Error> {
         pry!(self.guard.check());
 
@@ -229,17 +218,8 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
 
             tracing::info!(
                 protocol = %stream_protocol,
-                schema_bundle_cid = %cid_display(&metadata.schema_bundle_cid),
-                wasm_artifact_cid = %cid_display(&metadata.wasm_artifact_cid),
                 "Registered persistent vat service"
             );
-
-            results
-                .get()
-                .set_wasm_artifact_cid(&metadata.wasm_artifact_cid);
-            results
-                .get()
-                .set_schema_bundle_cid(&metadata.schema_bundle_cid);
 
             tokio::task::spawn_local(async move {
                 loop {
@@ -316,7 +296,7 @@ fn read_extra_caps(
 
 /// Serve one incoming peer stream with a host-side VatConnection wrapper.
 async fn handle_vat_connection(
-    metadata: ExecutorVatMetadata,
+    metadata: VatSchemaMetadata,
     source: VatConnectionSource,
     stream: impl AsyncRead + AsyncWrite + 'static,
 ) -> Result<(), capnp::Error> {
@@ -351,7 +331,7 @@ enum VatConnectionSource {
 }
 
 struct VatConnectionImpl {
-    metadata: ExecutorVatMetadata,
+    metadata: VatSchemaMetadata,
     source: VatConnectionSource,
 }
 
@@ -363,7 +343,9 @@ impl system_capnp::vat_connection::Server for VatConnectionImpl {
         mut results: system_capnp::vat_connection::DescribeResults,
     ) -> Promise<(), capnp::Error> {
         let metadata = self.metadata.clone();
-        match set_info(results.get().init_info(), &metadata) {
+        match with_schema_bundle_reader(&metadata.schema_bundle, |schema_bundle| {
+            results.get().set_schema_bundle(schema_bundle)
+        }) {
             Ok(()) => Promise::ok(()),
             Err(e) => Promise::err(e),
         }
@@ -493,17 +475,6 @@ fn finish_bind_parts(
     }
 }
 
-fn set_info(
-    mut info: system_capnp::vat_service_info::Builder<'_>,
-    metadata: &ExecutorVatMetadata,
-) -> Result<(), capnp::Error> {
-    info.set_wasm_artifact_cid(&metadata.wasm_artifact_cid);
-    info.set_schema_bundle_cid(&metadata.schema_bundle_cid);
-    with_schema_bundle_reader(&metadata.schema_bundle, |schema_bundle| {
-        info.set_schema_bundle(schema_bundle)
-    })
-}
-
 fn set_bind_results(
     mut results: system_capnp::vat_connection::BindResults,
     schema_bundle: &[u8],
@@ -629,12 +600,6 @@ async fn close_bound_stdin(state: &Rc<RefCell<BindState>>) {
     }
 }
 
-fn cid_display(bytes: &[u8]) -> String {
-    cid::Cid::try_from(bytes)
-        .map(|cid| cid.to_string())
-        .unwrap_or_else(|_| hex::encode(bytes))
-}
-
 /// Compatibility helper for older tests that validate the direct bridge.
 /// Production VatListener now serves `VatConnection` and calls this through
 /// `VatConnection.bind()`.
@@ -740,10 +705,10 @@ mod tests {
                     .promise
                     .await
                     .expect("describe");
-                let info = response.get().unwrap().get_info().unwrap();
+                let schema_bundle = response.get().unwrap().get_schema_bundle().unwrap();
                 assert_eq!(
-                    info.get_schema_bundle_cid().unwrap().to_vec(),
-                    schema_id::compute_cid_bytes(&test_schema_bundle_bytes())
+                    schema_bundle.get_service_interface_id(),
+                    0xd0ac_8299_df07_9c61
                 );
                 assert_eq!(spawn_count.get(), 0);
             })
@@ -900,13 +865,9 @@ mod tests {
         host.client
     }
 
-    fn test_metadata() -> ExecutorVatMetadata {
+    fn test_metadata() -> VatSchemaMetadata {
         let schema_bundle = test_schema_bundle_bytes();
-        ExecutorVatMetadata {
-            wasm_artifact_cid: schema_id::compute_cid_bytes(b"test wasm"),
-            schema_bundle_cid: schema_id::compute_cid_bytes(&schema_bundle),
-            schema_bundle,
-        }
+        VatSchemaMetadata { schema_bundle }
     }
 
     fn test_schema_bundle_bytes() -> Vec<u8> {
