@@ -1,17 +1,16 @@
 # Discovery -- Greeter RPC
 
-Two-agent Greeter demo showing schema-keyed peer discovery over
-the DHT. Agent A publishes a Greeter service. Agent B discovers
-it by schema CID alone, dials it via Cap'n Proto RPC, and gets a
-typed greeting back. No configuration, no service registry, no
-hardcoded addresses.
+Two-agent Greeter demo showing peer discovery over the DHT plus typed vat RPC.
+Agent A publishes a `greeter` service. Agent B discovers a provider, dials the
+`greeter` vat protocol, binds the returned `VatConnection`, and gets a typed
+greeting back. No hardcoded addresses.
 
 ## What it demonstrates
 
-- **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- schema-keyed RPC
+- **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- service-name vat RPC
 - `VatListener` for per-connection capability cells
-- `VatClient` for typed RPC dialing
-- Schema-keyed DHT discovery via `routing.provide()` / `findProviders()`
+- `VatClient` for `VatConnection` dialing and lazy binding
+- DHT discovery via `routing.provide()` / `findProviders()`
 - Dual-mode binary: cell mode (RPC server) + service mode (discovery loop)
 - Exponential backoff with jitter for peer discovery
 
@@ -32,9 +31,9 @@ hardcoded addresses.
 make discovery
 ```
 
-This compiles the WASM guest and copies the compiled schema bytes
-(`discovery.capnpc`) next to the binary. The schema is passed
-explicitly via RPC at runtime -- no custom sections.
+This compiles the WASM guest and embeds canonical `SchemaBundle` bytes in the
+`ww.schema.v1` WASM custom section. Vat routes use service names; schema and
+WASM CIDs are metadata returned by `VatConnection`.
 
 ## Running
 
@@ -91,23 +90,22 @@ Expected output on Agent B:
 
 ```
 BUILD TIME:
-  greeter.capnp --> capnpc --> greeter_schema.bin --> discovery.wasm + discovery.capnpc
+  greeter.capnp --> capnpc --> SchemaBundle --> ww.schema.v1 --> discovery.wasm
 
 AGENT A (service mode):                    AGENT B (service mode):
   membrane.graft()                           membrane.graft()
-  routing.provide(CID)  --DHT-->            routing.find_providers(CID)
+  routing.provide(name) --DHT-->            routing.find_providers(name)
                                              |
-                         <--libp2p stream--  vat_client.dial(A, schema)
+                         <--libp2p stream--  vat_client.dial(A, "greeter")
   VatListener accepts                        |
   spawns cell (cell mode)                    bootstrap --> Greeter cap
   cell serves Greeter                        greeter.greet("peer B")
                          --RPC response-->   "Hello, peer B! I'm A"
 ```
 
-The schema CID is derived deterministically from the Greeter
-interface definition: `CIDv1(raw, BLAKE3(canonical(schema.Node)))`.
-Two nodes with the same schema automatically find each other on
-the Kademlia DHT.
+The vat route is `/ww/0.1.0/vat/greeter`. The embedded schema bundle is still
+content-addressed as metadata: `schemaBundleCid = CIDv1(raw,
+BLAKE3(canonical SchemaBundle bytes))`.
 
 ### Schema
 
@@ -125,10 +123,10 @@ The same binary serves both roles:
   per incoming RPC connection. Creates a `GreeterImpl` and exports
   it via `system::serve()`. The host bridges the capability to the
   connecting peer.
-- **Service mode** (default): long-running discovery loop. Provides
-  the schema CID on the DHT, discovers peers via
-  `routing.find_providers()`, dials them with `VatClient`, and calls
-  `greet()`. Exponential backoff (2 s to 15 min).
+- **Service mode** (default): long-running discovery loop. Provides the service
+  locator on the DHT, discovers peers via `routing.find_providers()`, dials them
+  with `VatClient`, binds the `VatConnection`, and calls `greet()`. Exponential
+  backoff (2 s to 15 min).
 
 ## Demo snippets
 
@@ -139,9 +137,8 @@ The same binary serves both roles:
 ; VatListener spawns a cell per connection; the cell exports
 ; a Greeter capability via system::serve().
 (def discovery-wasm (load "bin/discovery.wasm"))
-(def discovery-schema (load "bin/discovery.capnpc"))
 
-(perform host :listen runtime discovery-wasm discovery-schema)
+(perform host :listen :vat "greeter" (cell discovery-wasm))
 ```
 
 `glia/serve.glia`:
@@ -156,9 +153,8 @@ default demo flow.
 
 ## Without Kubo
 
-The demo works without Kubo. Schema push to IPFS is best-effort
-at build time. Discovery happens via DHT `provide/findProviders`
-regardless.
+The demo works without Kubo for local testing. DHT provider discovery needs a
+connected libp2p routing backend in real multi-host runs.
 
 ## Tests
 
@@ -178,8 +174,7 @@ examples/discovery/
 ├── README.md              # this file
 ├── greeter.capnp          # Greeter schema source
 ├── bin/                   # build output (gitignored)
-│   ├── discovery.wasm
-│   └── discovery.capnpc   # compiled schema bytes
+│   └── discovery.wasm     # final WASM with ww.schema.v1
 ├── glia/
 │   ├── register.glia      # shell-loaded registration
 │   └── serve.glia         # DHT provide + discovery loop

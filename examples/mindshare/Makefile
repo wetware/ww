@@ -21,6 +21,12 @@ all:
 		else \
 			echo "WARNING: mindshare_schema.bin not found"; \
 		fi
+	@MINDSHARE_BUNDLE=$$(find target/$(WASM_TARGET)/release/build -path '*/mindshare-*/out/mindshare_schema_bundle.bin' | head -1) && \
+		if [ -n "$$MINDSHARE_BUNDLE" ]; then \
+			$(CARGO) run -q --manifest-path ../../crates/schema-id/Cargo.toml --bin schema-bundle-inject -- bin/mindshare.wasm "$$MINDSHARE_BUNDLE"; \
+		else \
+			echo "WARNING: mindshare_schema_bundle.bin not found"; \
+		fi
 
 clean:
 	rm -f bin/mindshare.wasm bin/mindshare.capnpc

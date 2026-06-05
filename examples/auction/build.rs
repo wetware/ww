@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 /// Build script for the auction example.
 ///
 /// Compiles auction.capnp and shared system schemas, extracts the
-/// ComputeProvider interface's canonical bytes, and derives its schema CID.
+/// ComputeProvider interface's canonical bytes, derives schema metadata, and
+/// writes the SchemaBundle bytes later embedded in `ww.schema.v1`.
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
@@ -35,7 +36,7 @@ fn main() {
         .run()
         .expect("failed to compile shared capnp schemas");
 
-    // Pass 2: auction schema + schema CID
+    // Pass 2: auction schema + schema bundle
     let raw_request = out_dir.join("auction_request.bin");
     capnpc::CompilerCommand::new()
         .src_prefix(manifest_path)
@@ -50,12 +51,17 @@ fn main() {
     let schemas =
         schema_id::extract_schemas(&raw_request, &[("COMPUTE_PROVIDER", provider_id)])
             .expect("extract ComputeProvider schema");
+    let bundles =
+        schema_id::extract_schema_bundles(&raw_request, &[("COMPUTE_PROVIDER", provider_id)])
+            .expect("extract ComputeProvider schema bundle");
 
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
     schema_id::write_schema_bytes(&out_dir.join("auction_schema.bin"), &schemas[0])
         .expect("write schema bytes");
+    schema_id::write_schema_bundle_bytes(&out_dir.join("auction_schema_bundle.bin"), &bundles[0])
+        .expect("write schema bundle bytes");
 
     // Cargo rebuild triggers
     for schema in &["system", "routing", "auth", "membrane", "stem", "http"] {
@@ -77,13 +83,14 @@ fn find_interface_id(raw_request_path: &Path, name: &str) -> Option<u64> {
     let request: capnp::schema_capnp::code_generator_request::Reader = reader.get_root().ok()?;
     for node in request.get_nodes().ok()?.iter() {
         if let Ok(n) = node.get_display_name() {
-            if n.to_str().ok()?.ends_with(&format!(":{name}")) || n.to_str().ok()? == name {
-                if matches!(
-                    node.which(),
-                    Ok(capnp::schema_capnp::node::Which::Interface(_))
-                ) {
-                    return Some(node.get_id());
-                }
+            let display_name = n.to_str().ok()?;
+            let name_matches = display_name.ends_with(&format!(":{name}")) || display_name == name;
+            let is_interface = matches!(
+                node.which(),
+                Ok(capnp::schema_capnp::node::Which::Interface(_))
+            );
+            if name_matches && is_interface {
+                return Some(node.get_id());
             }
         }
     }

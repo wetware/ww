@@ -103,6 +103,7 @@ cache = { package = "ww-cache", path = "crates/cache" }
 cell = { path = "crates/cell" }
 rpc = { path = "crates/rpc" }
 caps = { path = "std/caps" }
+schema-id = { path = "crates/schema-id" }
 blake3 = { workspace = true }
 cid = { workspace = true }
 hex = { workspace = true }

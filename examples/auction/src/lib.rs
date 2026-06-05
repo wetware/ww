@@ -3,7 +3,7 @@
 //! Demonstrates:
 //!   - FuelPolicy::Oneshot for budget-tracked cell execution
 //!   - Identity.signer() for domain-scoped signing (quotes)
-//!   - VatHandler::Serve for persistent capability export
+//!   - Service-name vat RPC via VatConnection
 //!   - DHT discovery via routing.provide()
 //!   - Runtime.load() + Executor.spawn() for spawning child cells
 //!
@@ -13,7 +13,8 @@
 //! connection.  Creates a ComputeProvider and exports it via
 //! `system::serve()`.
 //!
-//! **`serve`**: provides schema CID on the DHT, re-provides periodically.
+//! **`serve`**: provides the auction service locator on the DHT and
+//! re-provides periodically.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -28,43 +29,45 @@ use wasip2::exports::cli::run::Guest;
 // Cap'n Proto generated modules
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod system_capnp {
     include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod auth_capnp {
     include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod membrane_capnp {
     include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod http_capnp {
     include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod auction_capnp {
     include!(concat!(env!("OUT_DIR"), "/auction_capnp.rs"));
 }
 
 // Build-time schema constants: COMPUTE_PROVIDER_SCHEMA (&[u8]) and COMPUTE_PROVIDER_CID (&str).
 include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
+
+const AUCTION_SERVICE: &str = "auction";
 
 type Membrane = membrane_capnp::membrane::Client;
 
@@ -92,6 +95,22 @@ fn short_id(peer_id: &[u8]) -> String {
     } else {
         h
     }
+}
+
+async fn service_key(
+    routing: &routing_capnp::routing::Client,
+    service: &str,
+) -> Result<String, capnp::Error> {
+    let mut req = routing.hash_request();
+    req.get().set_data(service.as_bytes());
+    let resp = req.send().promise.await?;
+    let key = resp
+        .get()?
+        .get_key()?
+        .to_str()
+        .map_err(|e| capnp::Error::failed(e.to_string()))?
+        .to_string();
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +507,70 @@ impl auction_capnp::compute_provider::Server for ComputeProviderImpl {
     }
 }
 
+struct DeferredComputeProvider {
+    inner: Rc<RefCell<Option<Rc<ComputeProviderImpl>>>>,
+}
+
+impl DeferredComputeProvider {
+    fn ready(&self) -> Result<Rc<ComputeProviderImpl>, capnp::Error> {
+        self.inner
+            .borrow()
+            .clone()
+            .ok_or_else(|| capnp::Error::failed("ComputeProvider is not initialized yet".into()))
+    }
+}
+
+#[allow(refining_impl_trait)]
+impl auction_capnp::compute_provider::Server for DeferredComputeProvider {
+    fn quote(
+        self: Rc<Self>,
+        params: auction_capnp::compute_provider::QuoteParams,
+        results: auction_capnp::compute_provider::QuoteResults,
+    ) -> Promise<(), capnp::Error> {
+        match self.ready() {
+            Ok(provider) => auction_capnp::compute_provider::Server::quote(provider, params, results),
+            Err(e) => Promise::err(e),
+        }
+    }
+
+    fn accept(
+        self: Rc<Self>,
+        params: auction_capnp::compute_provider::AcceptParams,
+        results: auction_capnp::compute_provider::AcceptResults,
+    ) -> Promise<(), capnp::Error> {
+        match self.ready() {
+            Ok(provider) => {
+                auction_capnp::compute_provider::Server::accept(provider, params, results)
+            }
+            Err(e) => Promise::err(e),
+        }
+    }
+
+    fn price(
+        self: Rc<Self>,
+        params: auction_capnp::compute_provider::PriceParams,
+        results: auction_capnp::compute_provider::PriceResults,
+    ) -> Promise<(), capnp::Error> {
+        match self.ready() {
+            Ok(provider) => auction_capnp::compute_provider::Server::price(provider, params, results),
+            Err(e) => Promise::err(e),
+        }
+    }
+
+    fn status(
+        self: Rc<Self>,
+        params: auction_capnp::compute_provider::StatusParams,
+        results: auction_capnp::compute_provider::StatusResults,
+    ) -> Promise<(), capnp::Error> {
+        match self.ready() {
+            Ok(provider) => {
+                auction_capnp::compute_provider::Server::status(provider, params, results)
+            }
+            Err(e) => Promise::err(e),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cell mode — vat capability export via system::serve()
 // ---------------------------------------------------------------------------
@@ -509,12 +592,16 @@ fn run_cell() {
         .unwrap_or(DEFAULT_TOTAL_CAPACITY);
 
     let state = Rc::new(RefCell::new(AuctionState::new(base_price, total_capacity)));
+    let provider_slot: Rc<RefCell<Option<Rc<ComputeProviderImpl>>>> = Rc::new(RefCell::new(None));
+    let client: auction_capnp::compute_provider::Client = capnp_rpc::new_client(
+        DeferredComputeProvider {
+            inner: provider_slot.clone(),
+        },
+    );
 
-    // We need to create the provider client *after* grafting the membrane,
-    // but system::serve() needs the client upfront.  Use a two-phase approach:
-    // run() to get membrane, then set up provider inside the async block.
-    system::run(|membrane: Membrane| {
+    system::serve(client.client, |membrane: Membrane| {
         let state = state.clone();
+        let provider_slot = provider_slot.clone();
         async move {
             let graft_resp = membrane.graft_request().send().promise.await?;
             let results = graft_resp.get()?;
@@ -536,29 +623,20 @@ fn run_cell() {
             let signer_resp = signer_req.send().promise.await?;
             let signer = signer_resp.get()?.get_signer()?;
 
-            let provider = ComputeProviderImpl {
+            let provider = Rc::new(ComputeProviderImpl {
                 state: state.clone(),
                 self_id,
                 signer,
                 identity,
                 runtime,
-            };
-            let client: auction_capnp::compute_provider::Client =
-                capnp_rpc::new_client(provider);
+            });
+            *provider_slot.borrow_mut() = Some(provider);
 
             log::info!(
                 "auction: ComputeProvider ready (base_price={}, capacity={})",
                 base_price,
                 total_capacity,
             );
-
-            // Export the provider as bootstrap capability.
-            // NOTE: In the current system::serve() API, the bootstrap cap must
-            // be passed before the async block.  Since we need membrane caps
-            // first, we use system::run() and hold the connection open.
-            // The provider is accessible via VatHandler::Serve in the init.d
-            // script, which passes the persistent capability directly.
-            let _ = client;
 
             // Keep the cell alive.
             loop {
@@ -594,12 +672,13 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
 
     let id_resp = host.id_request().send().promise.await?;
     let self_id = id_resp.get()?.get_peer_id()?.to_vec();
+    let dht_key = service_key(&routing, AUCTION_SERVICE).await?;
     log::info!("auction: peer {}", short_id(&self_id));
-    log::info!("auction: schema CID {COMPUTE_PROVIDER_CID}");
+    log::info!("auction: locator {AUCTION_SERVICE}, schema CID {COMPUTE_PROVIDER_CID}");
 
-    // Provide schema CID on DHT for discovery.
+    // Provide service-name-derived CID on DHT for discovery.
     let mut provide_req = routing.provide_request();
-    provide_req.get().set_key(COMPUTE_PROVIDER_CID);
+    provide_req.get().set_key(&dht_key);
     provide_req.send().promise.await?;
     log::info!("auction: provided on DHT");
 
@@ -607,7 +686,7 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
     let mut cooldown_ms: u64 = 30_000;
     loop {
         let mut provide_req = routing.provide_request();
-        provide_req.get().set_key(COMPUTE_PROVIDER_CID);
+        provide_req.get().set_key(&dht_key);
         let _ = provide_req.send().promise.await;
 
         let pause = wasip2::clocks::monotonic_clock::subscribe_duration(cooldown_ms * 1_000_000);

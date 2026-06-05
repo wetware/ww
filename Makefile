@@ -34,6 +34,10 @@ shell:
 		if [ -n "$$SCHEMA_OUT" ]; then \
 			cp "$$SCHEMA_OUT" std/shell/bin/shell.capnpc; \
 		fi
+	@SHELL_BUNDLE=$$(find std/shell/target/$(WASM_TARGET)/release/build -path '*/shell-*/out/shell_schema_bundle.bin' | head -1) && \
+		if [ -n "$$SHELL_BUNDLE" ]; then \
+			cargo run -q -p schema-id --bin schema-bundle-inject -- std/shell/bin/shell.wasm "$$SHELL_BUNDLE"; \
+		fi
 
 status:
 	cargo build -p status --target $(WASM_TARGET) --release --manifest-path std/status/Cargo.toml

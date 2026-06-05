@@ -9,6 +9,7 @@
 //! This module provides the `GraftBuilder` impl that injects wetware-specific
 //! capabilities into the graft response, plus the epoch-guarded identity wrapper.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use capnp::capability::Promise;
@@ -246,6 +247,9 @@ pub struct HostGraftBuilder {
     route_registry: Option<crate::dispatch::RouteRegistry>,
     /// Pre-created Runtime client (singleton — same backend for every graft).
     runtime_client: system_capnp::runtime::Client,
+    /// Host-side resolver proving that Executor clients were minted by the
+    /// trusted RuntimeImpl and carrying executor-bound artifact metadata.
+    executor_resolver: Option<Rc<dyn crate::vat_listener::ExecutorResolver>>,
     /// Named capabilities from init.d `with` block, forwarded to the child
     /// cell's graft response as `extras`. Each entry carries the cap name,
     /// the typed client, and the canonical Schema.Node bytes the original
@@ -278,6 +282,7 @@ impl HostGraftBuilder {
             allowed_hosts,
             route_registry: None,
             runtime_client,
+            executor_resolver: None,
             extras: Vec::new(),
             ipfs_client,
         }
@@ -286,6 +291,15 @@ impl HostGraftBuilder {
     /// Set the HTTP route registry for WAGI integration.
     pub fn with_route_registry(mut self, registry: crate::dispatch::RouteRegistry) -> Self {
         self.route_registry = Some(registry);
+        self
+    }
+
+    /// Set the Executor provenance resolver for VatListener.
+    pub fn with_executor_resolver(
+        mut self,
+        resolver: Rc<dyn crate::vat_listener::ExecutorResolver>,
+    ) -> Self {
+        self.executor_resolver = Some(resolver);
         self
     }
 
@@ -322,6 +336,9 @@ impl GraftBuilder for HostGraftBuilder {
         );
         if let Some(ref registry) = self.route_registry {
             host_impl = host_impl.with_route_registry(registry.clone());
+        }
+        if let Some(ref resolver) = self.executor_resolver {
+            host_impl = host_impl.with_executor_resolver(resolver.clone());
         }
         let host: system_capnp::host::Client = capnp_rpc::new_client(host_impl);
 
@@ -363,6 +380,8 @@ impl GraftBuilder for HostGraftBuilder {
         }
 
         // Append init.d-scoped extras.
+        // P0 TODO: reject extras whose names shadow reserved core graft names,
+        // especially `http-client`, before they can confuse guest lookup.
         let extras_owned: Vec<(String, capnp::capability::Client, Vec<u8>)> = self
             .extras
             .iter()
@@ -487,6 +506,7 @@ pub fn build_membrane_rpc<R, W>(
     stream_control: libp2p_stream::Control,
     route_registry: Option<crate::dispatch::RouteRegistry>,
     runtime_client: system_capnp::runtime::Client,
+    executor_resolver: Option<Rc<dyn crate::vat_listener::ExecutorResolver>>,
     extras: Vec<(String, capnp::capability::Client, Vec<u8>)>,
     ipfs_client: ipfs::HttpClient,
     http_dial: Vec<String>,
@@ -505,6 +525,9 @@ where
         runtime_client,
         ipfs_client,
     );
+    if let Some(resolver) = executor_resolver {
+        sess_builder = sess_builder.with_executor_resolver(resolver);
+    }
     if !extras.is_empty() {
         sess_builder = sess_builder.with_extras(extras);
     }

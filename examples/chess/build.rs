@@ -8,17 +8,14 @@ use std::path::{Path, PathBuf};
 /// 1. Compile Cap'n Proto schemas into Rust types so the chess WASM
 ///    guest can speak typed RPC with the host.
 ///
-/// 2. Derive a content-addressed **schema CID** from the ChessEngine
-///    interface definition. This CID becomes the DHT key *and* the
-///    subprotocol address (`/ww/0.1.0/<cid>`), so two nodes with the
-///    same schema automatically find each other on the network.
+/// 2. Derive schema metadata from the ChessEngine interface definition and
+///    write the SchemaBundle bytes later embedded in `ww.schema.v1`.
 ///
-/// The schema CID pipeline:
+/// The schema pipeline:
 ///   chess.capnp  →  capnpc (CodeGeneratorRequest)
-///                →  schema_id::extract_schemas (canonical bytes + BLAKE3)
-///                →  `CHESS_ENGINE_SCHEMA_CID` const in generated Rust
-///                →  embedded in WASM custom section "schema.capnp"
-///                   (post-build injection via `make chess`)
+///                →  schema_id::extract_schemas / extract_schema_bundles
+///                →  generated schema constants + chess_schema_bundle.bin
+///                →  embedded in WASM custom section "ww.schema.v1"
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
@@ -58,12 +55,12 @@ fn main() {
         .run()
         .expect("failed to compile shared capnp schemas");
 
-    // ── Pass 2: chess-specific schema + schema CID ──────────────────
+    // ── Pass 2: chess-specific schema + schema bundle ───────────────
     // We need two outputs from chess.capnp:
     //   a) Rust types (ChessEngine client/server traits)
     //   b) The raw CodeGeneratorRequest binary, which contains the
     //      canonical encoding of every schema node. We feed this into
-    //      schema_id to derive the content-addressed CID.
+    //      schema_id to derive schema constants and the SchemaBundle.
     let raw_request = out_dir.join("chess_request.bin");
     capnpc::CompilerCommand::new()
         .src_prefix(manifest_path)
@@ -73,26 +70,28 @@ fn main() {
         .expect("failed to compile chess.capnp");
 
     // Extract the canonical bytes for the ChessEngine interface node
-    // (type ID 0xd0ac8299df079c61) and compute its CID:
-    //   CIDv1(raw, BLAKE3(canonical(schema.Node)))
-    //
-    // This produces a (name, cid, bytes) tuple. The `name` is "CHESS_ENGINE",
-    // used to emit a Rust const: `pub const CHESS_ENGINE_SCHEMA_CID: &str = "bafy..."`.
+    // (type ID 0xd0ac8299df079c61) and its transitive SchemaBundle.
     let schemas = schema_id::extract_schemas(&raw_request, &[("CHESS_ENGINE", 0xd0ac8299df079c61)])
         .expect("extract ChessEngine schema");
+    let bundles =
+        schema_id::extract_schema_bundles(&raw_request, &[("CHESS_ENGINE", 0xd0ac8299df079c61)])
+            .expect("extract ChessEngine schema bundle");
 
     // Emit `CHESS_ENGINE_SCHEMA_CID` and `CHESS_ENGINE_SCHEMA_BYTES`
     // constants. The guest includes these via `include!(concat!(env!("OUT_DIR"), ...))`.
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
-    // Write the raw canonical schema bytes to a separate file. The
-    // `make chess` target injects these into the compiled WASM binary
-    // as a custom section named "schema.capnp". At runtime, the host
-    // reads this section to derive the protocol CID without needing
-    // the .capnp source files.
+    // Write the raw canonical schema bytes and the transitive bundle. The
+    // `make chess` target injects the bundle into the compiled WASM binary
+    // as a custom section named "ww.schema.v1".
     schema_id::write_schema_bytes(&out_dir.join("chess_engine_schema.bin"), &schemas[0])
         .expect("write schema bytes");
+    schema_id::write_schema_bundle_bytes(
+        &out_dir.join("chess_engine_schema_bundle.bin"),
+        &bundles[0],
+    )
+    .expect("write schema bundle bytes");
 
     // ── Cargo rebuild triggers ──────────────────────────────────────
     // Re-run this build script whenever any schema file changes.

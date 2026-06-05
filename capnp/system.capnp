@@ -8,6 +8,7 @@
 @0xbf5147b78c0e6a2f;
 
 using MembraneSchema = import "membrane.capnp";
+using Schema = import "/capnp/schema.capnp";
 
 struct PeerInfo {
   peerId @0 :Data;       # libp2p peer ID, serialized.
@@ -137,28 +138,49 @@ interface Process {
   # Terminate the process immediately. Fuel is revoked and the cell traps.
 }
 
-struct VatHandler {
-  union {
-    spawn @0 :Executor;
-    # Stateless: spawn a fresh cell per connection.
-    serve @1 :AnyPointer;
-    # Stateful: bootstrap all connections with this persistent capability.
-  }
+struct SchemaBundle {
+  formatVersion @0 :UInt16;
+  # Version of this bundle wire format. Current value: 1.
+
+  serviceInterfaceId @1 :Schema.Id;
+  # Cap'n Proto type ID of the application capability exported by the vat cell.
+
+  nodes @2 :List(Schema.Node);
+  # Canonical transitive schema graph needed to understand serviceInterfaceId.
+  # Producers must canonicalize the complete SchemaBundle before embedding it
+  # in the ww.schema.v1 WASM custom section or deriving schemaBundleCid.
+}
+
+struct VatServiceInfo {
+  wasmArtifactCid @0 :Data;
+  # CIDv1(raw, BLAKE3(final WASM bytes)), encoded as canonical CID bytes.
+
+  schemaBundleCid @1 :Data;
+  # CIDv1(raw, BLAKE3(canonical SchemaBundle bytes)), encoded as canonical
+  # CID bytes.
+
+  schemaBundle @2 :SchemaBundle;
+  # Parsed schema bundle from the executor-bound cell artifact.
+}
+
+interface VatConnection {
+  describe @0 () -> (info :VatServiceInfo);
+  # Return host-derived service metadata without spawning a vat cell.
+
+  bind @1 () -> (schemaBundle :SchemaBundle, cap :AnyPointer);
+  # Return the application capability for this connection, spawning the
+  # executor-bound vat cell lazily if needed. Repeated calls are stable:
+  # the same connection returns the same capability and schema bundle.
 }
 
 interface VatListener {
-  listen @0 (handler :VatHandler, schema :Data,
-             caps :List(MembraneSchema.Export)) -> ();
-  # Accept incoming Cap'n Proto RPC connections on /ww/0.1.0/vat/{cid}
-  # where cid = CIDv1(raw, BLAKE3(schema)).
-  #
-  # handler.spawn: for each connection, spawn a cell via the Executor.
-  # The cell calls system::serve() to export a bootstrap capability.
-  #
-  # handler.serve: bootstrap each connection with the provided capability.
-  # No cell spawning — one persistent capability serves all connections.
-  #
-  # Schema param is authoritative.
+  listen @0 (executor :Executor, protocol :Text,
+             caps :List(MembraneSchema.Export))
+      -> (wasmArtifactCid :Data, schemaBundleCid :Data);
+  # Accept incoming Cap'n Proto RPC connections on /ww/0.1.0/vat/{protocol}.
+  # Protocol is a caller-chosen service name/locator, not type authority.
+  # The host derives wasmArtifactCid and schemaBundleCid from the same
+  # host-minted Runtime.load executor that will spawn the vat cell.
   #
   # caps: optional named capabilities from the init.d `with` block.
   # Forwarded into spawned cells' membranes as graft extras.
@@ -166,15 +188,11 @@ interface VatListener {
 }
 
 interface VatClient {
-  dial @0 (peer :Data, schema :Data) -> (cap :AnyPointer);
-  # Open a Cap'n Proto RPC connection to peer on /ww/0.1.0/vat/{cid}
-  # where cid = CIDv1(raw, BLAKE3(schema)).
-  # The schema is the canonical Cap'n Proto encoding of a schema.Node.
-  # Bootstraps a Cap'n Proto vat over the stream and returns the remote
-  # cell's bootstrap capability.
-  #
-  # The returned cap is type-erased (AnyPointer) — cast it to the expected
-  # interface type on the guest side.
+  dial @0 (peer :Data, protocol :Text) -> (connection :VatConnection);
+  # Open a Cap'n Proto RPC connection to peer on /ww/0.1.0/vat/{protocol}.
+  # Returns a trusted host-side VatConnection wrapper. Call describe() to
+  # inspect metadata without spawning, or bind() to acquire the exported
+  # application capability.
 }
 
 interface ByteStream {

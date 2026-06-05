@@ -567,7 +567,7 @@ impl Cell {
         // Create the Runtime singleton for this cell's worker thread.
         // The same client is cloned into every membrane graft on this worker,
         // so all child cells share the same compilation/executor cache.
-        let runtime_client = crate::launcher::create_runtime_client(
+        let runtime_handle = crate::launcher::create_runtime_handle(
             network_state.clone(),
             swarm_cmd_tx.clone(),
             wasm_debug,
@@ -581,6 +581,7 @@ impl Cell {
             ipfs_client.clone(),
             http_dial.clone(),
         );
+        let runtime_client = runtime_handle.client.clone();
 
         // Clone epoch receiver for Terminal auth before it's moved into the RPC system.
         let terminal_epoch_rx = epoch_rx.clone();
@@ -596,6 +597,7 @@ impl Cell {
             membrane_stream_control,
             route_registry,
             runtime_client,
+            Some(runtime_handle.executor_resolver),
             Vec::new(), // pid0 gets full membrane, no extras
             ipfs_client,
             http_dial,

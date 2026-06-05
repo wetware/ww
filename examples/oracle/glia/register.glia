@@ -1,7 +1,5 @@
 ; Demo snippet: register oracle on RPC + HTTP transports.
-(def oracle
-  (cell (load "bin/oracle.wasm")
-        (load "bin/oracle.capnpc")))
+(def oracle (cell (load "bin/oracle.wasm")))
 
-(perform host :listen oracle)
-(perform host :listen oracle "/oracle")
+(perform host :listen :vat "oracle" oracle)
+(perform host :listen :http "/oracle" oracle)

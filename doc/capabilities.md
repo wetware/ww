@@ -77,6 +77,25 @@ appearing in the top-level graft list.
 Every capability is epoch-guarded: it fails with `staleEpoch` once the
 on-chain head advances, forcing a re-graft.
 
+### Host-Minted Policy Capabilities
+
+Interface shape is not provenance. An untrusted guest can implement an
+object-capability interface with the same methods as a host capability, so
+callers must not infer host policy from type alone.
+
+For vat publication, `VatListener.listen` accepts only host-minted
+`Runtime.load` executors. The host resolves the executor through its runtime
+provenance registry, then derives `wasmArtifactCid`, `schemaBundleCid`, and the
+typed `SchemaBundle` from the same executor-bound WASM artifact that will spawn
+the vat cell. Fake executor implementations are rejected before protocol
+registration.
+
+Apply the same rule whenever an API makes host-policy claims. For example, an
+`http-client` capability only represents host-enforced allowlist policy when it
+was minted by the host path that owns that policy. Reserving core graft names
+and enforcing host-minted checks for policy caps is tracked as P0 follow-up
+work.
+
 ### Content access (WASI path I/O only)
 
 Cells do not receive an explicit filesystem capability over the

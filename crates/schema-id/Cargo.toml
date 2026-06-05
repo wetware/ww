@@ -6,6 +6,8 @@ description = "Build-time helper: extract canonical schema bytes and CIDs from C
 
 [dependencies]
 capnp = { workspace = true }
-capnpc = { workspace = true } # runtime dep: extract_schemas uses capnpc for canonical encoding
 blake3 = { workspace = true }
 cid = { workspace = true }
+
+[build-dependencies]
+capnpc = { workspace = true }

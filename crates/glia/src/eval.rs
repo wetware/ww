@@ -2323,24 +2323,15 @@ pub fn eval_expr<'a, D: Dispatch>(
                                 other,
                             ))
                         }
-                        None => return Err(error::arity("cell", "1-2", 0)),
+                        None => return Err(error::arity("cell", "1", 0)),
                     };
-                    let schema = match evaled_args.get(1) {
-                        Some(Val::Bytes(b)) => Some(b.clone()),
-                        None => None,
-                        Some(other) => {
-                            return Err(error::type_mismatch(
-                                "cell second arg (schema)",
-                                "bytes",
-                                other,
-                            ))
-                        }
-                    };
-                    if evaled_args.len() > 2 {
-                        return Err(error::arity("cell", "1-2", evaled_args.len()));
+                    if evaled_args.len() > 1 {
+                        return Err(Val::from(
+                            "cell no longer accepts schema bytes; embed canonical SchemaBundle bytes in the WASM ww.schema.v1 custom section",
+                        ));
                     }
                     let caps = env.collect_caps();
-                    return Ok(Val::Cell { wasm, schema, caps });
+                    return Ok(Val::Cell { wasm, caps });
                 }
 
                 // 5. Sync builtins
@@ -2800,25 +2791,16 @@ pub fn eval<'a, D: Dispatch>(
                                 other,
                             ))
                         }
-                        None => return Err(error::arity("cell", "1-2", 0)),
+                        None => return Err(error::arity("cell", "1", 0)),
                     };
-                    let schema = match args.get(1) {
-                        Some(Val::Bytes(b)) => Some(b.clone()),
-                        None => None,
-                        Some(other) => {
-                            return Err(error::type_mismatch(
-                                "cell second arg (schema)",
-                                "bytes",
-                                other,
-                            ))
-                        }
-                    };
-                    if args.len() > 2 {
-                        return Err(error::arity("cell", "1-2", args.len()));
+                    if args.len() > 1 {
+                        return Err(Val::from(
+                            "cell no longer accepts schema bytes; embed canonical SchemaBundle bytes in the WASM ww.schema.v1 custom section",
+                        ));
                     }
                     // Capture all Val::Cap bindings from the lexical environment.
                     let caps = env.collect_caps();
-                    return Ok(Val::Cell { wasm, schema, caps });
+                    return Ok(Val::Cell { wasm, caps });
                 }
 
                 // --- Higher-order builtins (need env + dispatch for fn invocation) ---
@@ -3783,7 +3765,6 @@ mod tests {
             "c".into(),
             Val::Cell {
                 wasm: vec![],
-                schema: None,
                 caps: vec![],
             },
         );
@@ -3890,7 +3871,6 @@ mod tests {
             "c".into(),
             Val::Cell {
                 wasm: vec![],
-                schema: None,
                 caps: vec![],
             },
         );

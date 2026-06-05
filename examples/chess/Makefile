@@ -1,4 +1,4 @@
-# Chess engine — Cap'n Proto vat cell with schema-keyed discovery
+# Chess engine — Cap'n Proto vat cell with service-name discovery
 #
 # Usage: make -C examples/chess
 
@@ -20,6 +20,12 @@ all:
 			cp "$$CHESS_OUT" bin/chess-demo.capnpc; \
 		else \
 			echo "WARNING: chess_engine_schema.bin not found"; \
+		fi
+	@CHESS_BUNDLE=$$(find $(ROOT)/target/$(WASM_TARGET)/release/build -path '*/chess-*/out/chess_engine_schema_bundle.bin' | head -1) && \
+		if [ -n "$$CHESS_BUNDLE" ]; then \
+			$(CARGO) run -q -p schema-id --bin schema-bundle-inject -- bin/chess-demo.wasm "$$CHESS_BUNDLE"; \
+		else \
+			echo "WARNING: chess_engine_schema_bundle.bin not found"; \
 		fi
 
 clean:

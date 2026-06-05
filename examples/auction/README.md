@@ -7,8 +7,8 @@ Peer-to-peer compute marketplace via RFQ (request-for-quote) protocol.
 - **ComputeProvider as a vat cell** -- the auction provider is a regular WASM guest, not host-side code
 - `FuelPolicy::Oneshot` for budget-tracked cell execution (cells trap at fuel exhaustion)
 - `Identity.signer()` for quote signing + `Identity.verify()` for signature verification
-- `VatHandler::Serve` for persistent capability export (one auction object serves all bidders)
-- Schema-keyed DHT discovery via `routing.provide()` / `findProviders()`
+- Service-name vat RPC via `VatConnection`
+- DHT discovery via `routing.provide()` / `findProviders()`
 - `Runtime.load()` + `Executor.spawn()` with fuel policy for spawning metered child cells
 - Nonce-based replay prevention with TTL pruning
 
@@ -104,7 +104,8 @@ Returns JSON with current auction status:
 
 The HTTP endpoint returns static defaults (each WAGI invocation is a
 fresh cell with no shared state). Real-time data comes from the vat
-RPC `status()` method.
+RPC `status()` method. Existing-cap persistent vat publication is tracked as
+a follow-up to the executor-backed `VatConnection` cutover.
 
 ## Running
 
@@ -167,11 +168,10 @@ Then compare quotes from Glia:
 ```clojure
 ;; One binary, two transports.
 (def auction
-  (cell (load "bin/auction.wasm")
-        (load "bin/auction.capnpc")))
+  (cell (load "bin/auction.wasm")))
 
-(perform host :listen auction)              ;; vat RPC (schema-keyed, libp2p)
-(perform host :listen auction "/auction")   ;; HTTP/WAGI at /auction
+(perform host :listen :vat "auction" auction)
+(perform host :listen :http "/auction" auction)
 ```
 
 `glia/serve.glia`:
@@ -206,8 +206,7 @@ examples/auction/
 ├── README.md             # this file
 ├── auction.capnp         # ComputeProvider schema source
 ├── bin/                  # build output (gitignored)
-│   ├── auction.wasm
-│   └── auction.capnpc    # compiled schema bytes
+│   └── auction.wasm      # final WASM with ww.schema.v1
 ├── glia/
 │   ├── register.glia     # shell-loaded registration
 │   └── serve.glia        # DHT provide loop

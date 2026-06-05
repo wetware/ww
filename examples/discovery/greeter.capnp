@@ -1,6 +1,6 @@
 # Greeter capability — minimal RPC interface for discovery demo.
 #
-# One method. The point is schema-keyed discovery, not the service.
+# One method. The demo focuses on service-name discovery plus typed vat RPC.
 
 @0xa9134eb34ed79666;
 

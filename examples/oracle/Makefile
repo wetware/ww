@@ -1,4 +1,4 @@
-# Oracle — gas price feed with schema-keyed RPC + Terminal auth
+# Oracle — gas price feed with service-name vat RPC + Terminal auth
 #
 # Usage: make -C examples/oracle
 
@@ -20,6 +20,12 @@ all:
 			cp "$$ORACLE_OUT" bin/oracle.capnpc; \
 		else \
 			echo "WARNING: oracle_schema.bin not found"; \
+		fi
+	@ORACLE_BUNDLE=$$(find target/$(WASM_TARGET)/release/build -path '*/oracle-*/out/oracle_schema_bundle.bin' | head -1) && \
+		if [ -n "$$ORACLE_BUNDLE" ]; then \
+			$(CARGO) run -q --manifest-path ../../crates/schema-id/Cargo.toml --bin schema-bundle-inject -- bin/oracle.wasm "$$ORACLE_BUNDLE"; \
+		else \
+			echo "WARNING: oracle_schema_bundle.bin not found"; \
 		fi
 
 test:

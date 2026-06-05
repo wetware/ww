@@ -1,18 +1,17 @@
 # Oracle -- Gas Price Feed
 
-Decentralized gas price oracle over schema-keyed RPC and HTTP.
-Fetches live gas prices from Blocknative via `HttpClient`, serves
-them over typed Cap'n Proto RPC **and** HTTP/JSON, and advertises
-on the DHT for peer discovery.
+Decentralized gas price oracle over service-name vat RPC and HTTP. Fetches live
+gas prices from Blocknative via `HttpClient`, serves them over typed Cap'n Proto
+RPC **and** HTTP/JSON, and advertises on the DHT for peer discovery.
 
 ## What it demonstrates
 
 - **Dual transport** -- one binary, two transports (vat RPC + HTTP)
-- **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- schema-keyed RPC
+- **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- service-name vat RPC
 - **WAGI cell** (`WW_CELL_MODE=http`) -- CGI, curl-friendly JSON
 - `HttpClient` capability for outbound HTTP (domain-scoped)
 - `with`/`cell`/`listen` DX for capability-scoped cell definitions
-- Schema-keyed DHT discovery via `routing.provide()` / `findProviders()`
+- DHT discovery via `routing.provide()` / `findProviders()`
 - Four-mode binary: vat cell, WAGI cell, service (DHT), consumer (query)
 
 ## Prerequisites
@@ -32,9 +31,9 @@ on the DHT for peer discovery.
 make oracle
 ```
 
-This compiles the WASM guest and copies the compiled schema bytes
-(`oracle.capnpc`) next to the binary. The schema is passed
-explicitly via RPC at runtime -- no custom sections.
+This compiles the WASM guest and embeds canonical `SchemaBundle` bytes in the
+`ww.schema.v1` WASM custom section. The vat route uses the service name
+`oracle`; schema and WASM CIDs are metadata returned by `VatConnection`.
 
 ## Running
 
@@ -148,7 +147,7 @@ ORACLE NODE:                            CURL CLIENT:
     write to stdout
 
                                         CONSUMER NODE:
-  VatListener accepts      <--libp2p--  vat_client.dial(oracle, schema)
+  VatListener accepts      <--libp2p--  vat_client.dial(peer, "oracle")
   spawns cell (cell mode)               bootstrap --> PriceOracle cap
     membrane.graft()                    oracle.get_pairs() -> ["ETH/gas", ...]
     http_client.get(blocknative)        oracle.get_price("ETH/gas")
@@ -177,10 +176,11 @@ The same binary serves all modes. Detection:
   per HTTP request. Grafts the membrane over `wetware:streams`
   (side-channel), fetches prices via `HttpClient`, writes a JSON
   response to stdout via CGI. Stateless -- one cell per request.
-- **Service mode**: long-running DHT provider loop. Provides the
-  schema CID on the DHT and re-provides periodically (records expire).
-- **Consumer mode**: discovers oracle providers via DHT, dials them
-  with `VatClient`, queries prices. Exponential backoff (2 s to 60 s).
+- **Service mode**: long-running DHT provider loop. Provides the service
+  locator on the DHT and re-provides periodically (records expire).
+- **Consumer mode**: discovers oracle providers via DHT, dials them with
+  `VatClient`, binds the returned `VatConnection`, and queries prices.
+  Exponential backoff (2 s to 60 s).
 
 ### Schema
 
@@ -209,12 +209,11 @@ RPC. Confidence decays toward 0.0 if data goes stale.
 ```clojure
 ;; Define the oracle cell (HttpClient arrives via membrane graft in-cell).
 (def oracle
-  (cell (load "bin/oracle.wasm")
-        (load "bin/oracle.capnpc")))
+  (cell (load "bin/oracle.wasm")))
 
 ;; Mount on both transports.
-(perform host :listen oracle)              ;; vat RPC
-(perform host :listen oracle "/oracle")    ;; HTTP/WAGI
+(perform host :listen :vat "oracle" oracle)
+(perform host :listen :http "/oracle" oracle)
 ```
 
 `glia/serve.glia`:
@@ -230,8 +229,8 @@ RPC. Confidence decays toward 0.0 if data goes stale.
 ```
 
 `(perform host :listen ...)` registers the cell with the host:
-- Cell alone → VatListener (schema-keyed RPC over libp2p)
-- Cell + path → HttpListener (WAGI at the given prefix)
+- `:vat "oracle"` -> VatListener on `/ww/0.1.0/vat/oracle`
+- `:http "/oracle"` -> HttpListener (WAGI at the given prefix)
 
 The same binary handles both transports. It detects HTTP mode via
 the `REQUEST_METHOD` CGI env var (injected by HttpListener).
@@ -259,8 +258,7 @@ examples/oracle/
 ├── README.md             # this file
 ├── oracle.capnp          # PriceOracle schema source
 ├── bin/                  # build output (gitignored)
-│   ├── oracle.wasm
-│   └── oracle.capnpc     # compiled schema bytes
+│   └── oracle.wasm       # final WASM with ww.schema.v1
 ├── glia/
 │   ├── register.glia     # shell-loaded registration
 │   ├── serve.glia        # DHT provide loop

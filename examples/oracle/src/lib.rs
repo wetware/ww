@@ -1,4 +1,4 @@
-//! Price oracle guest: gas price feed via schema-keyed RPC.
+//! Price oracle guest: gas price feed via service-name vat RPC.
 //!
 //! Demonstrates:
 //!   - HttpClient capability for outbound HTTP (domain-scoped)
@@ -11,10 +11,11 @@
 //! connection. Creates a PriceOracle, fetches prices via HttpClient,
 //! and exports it via `system::serve()`.
 //!
-//! **`serve`**: provides schema CID on the DHT, re-provides periodically.
+//! **`serve`**: provides the oracle service locator on the DHT, re-provides
+//! periodically.
 //!
 //! **`consume`**: discovers oracle providers via DHT, dials via VatClient,
-//! queries prices.
+//! binds the returned `VatConnection`, and queries prices.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -64,6 +65,8 @@ mod oracle_capnp {
 // Build-time schema constants: PRICE_ORACLE_SCHEMA (&[u8]) and PRICE_ORACLE_CID (&str).
 include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
+const ORACLE_SERVICE: &str = "oracle";
+
 type Membrane = membrane_capnp::membrane::Client;
 
 /// Look up a typed capability by name from the graft caps list.
@@ -90,6 +93,22 @@ fn short_id(peer_id: &[u8]) -> String {
     } else {
         h
     }
+}
+
+async fn service_key(
+    routing: &routing_capnp::routing::Client,
+    service: &str,
+) -> Result<String, capnp::Error> {
+    let mut req = routing.hash_request();
+    req.get().set_data(service.as_bytes());
+    let resp = req.send().promise.await?;
+    let key = resp
+        .get()?
+        .get_key()?
+        .to_str()
+        .map_err(|e| capnp::Error::failed(e.to_string()))?
+        .to_string();
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -334,12 +353,13 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
 
     let id_resp = host.id_request().send().promise.await?;
     let self_id = id_resp.get()?.get_peer_id()?.to_vec();
+    let dht_key = service_key(&routing, ORACLE_SERVICE).await?;
     log::info!("oracle: peer {}", short_id(&self_id));
-    log::info!("oracle: schema CID {PRICE_ORACLE_CID}");
+    log::info!("oracle: locator {ORACLE_SERVICE}, schema CID {PRICE_ORACLE_CID}");
 
-    // Provide schema CID on DHT for discovery.
+    // Provide service-name-derived CID on DHT for discovery.
     let mut provide_req = routing.provide_request();
-    provide_req.get().set_key(PRICE_ORACLE_CID);
+    provide_req.get().set_key(&dht_key);
     provide_req.send().promise.await?;
     log::info!("oracle: provided on DHT");
 
@@ -347,7 +367,7 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
     let mut cooldown_ms: u64 = 30_000;
     loop {
         let mut provide_req = routing.provide_request();
-        provide_req.get().set_key(PRICE_ORACLE_CID);
+        provide_req.get().set_key(&dht_key);
         let _ = provide_req.send().promise.await;
 
         let pause = wasip2::clocks::monotonic_clock::subscribe_duration(cooldown_ms * 1_000_000);
@@ -407,9 +427,12 @@ async fn query_oracle(
     // Dial the oracle peer.
     let mut req = vat_client.dial_request();
     req.get().set_peer(peer_id);
-    req.get().set_schema(PRICE_ORACLE_SCHEMA);
+    req.get().set_protocol(ORACLE_SERVICE);
     let resp = req.send().promise.await?;
-    let oracle: oracle_capnp::price_oracle::Client = resp.get()?.get_cap().get_as_capability()?;
+    let connection = resp.get()?.get_connection()?;
+    let bind_resp = connection.bind_request().send().promise.await?;
+    let oracle: oracle_capnp::price_oracle::Client =
+        bind_resp.get()?.get_cap().get_as_capability()?;
 
     // Query available pairs.
     let pairs_resp = oracle.get_pairs_request().send().promise.await?;
@@ -451,6 +474,7 @@ async fn run_consumer(membrane: Membrane) -> Result<(), capnp::Error> {
 
     let id_resp = host.id_request().send().promise.await?;
     let self_id = id_resp.get()?.get_peer_id()?.to_vec();
+    let dht_key = service_key(&routing, ORACLE_SERVICE).await?;
     log::info!("consumer: peer {}", short_id(&self_id));
     log::info!("consumer: looking for oracle providers...");
 
@@ -470,7 +494,7 @@ async fn run_consumer(membrane: Membrane) -> Result<(), capnp::Error> {
         let mut fp_req = routing.find_providers_request();
         {
             let mut b = fp_req.get();
-            b.set_key(PRICE_ORACLE_CID);
+            b.set_key(&dht_key);
             b.set_count(5);
             b.set_sink(sink);
         }

@@ -218,15 +218,13 @@ pub enum Val {
         cap_id: u64,
         inner: std::rc::Rc<dyn std::any::Any>,
     },
-    /// A cell definition: WASM binary + optional schema + captured capabilities.
+    /// A cell definition: WASM binary + captured capabilities.
     ///
-    /// Created by the `cell` function, which bundles wasm/schema bytes with
-    /// all `Val::Cap` bindings from its lexical scope. When the cell is
-    /// registered via `(perform host :listen ...)`, the host extracts wasm,
-    /// schema, and caps — injecting the caps into spawned children's membranes.
+    /// Created by the `cell` function, which bundles WASM bytes with all
+    /// `Val::Cap` bindings from its lexical scope. Vat schema authority comes
+    /// from the `ww.schema.v1` custom section embedded in the WASM artifact.
     Cell {
         wasm: Vec<u8>,
-        schema: Option<Vec<u8>>,
         caps: Vec<(String, Val)>,
     },
 }
@@ -258,15 +256,9 @@ impl core::fmt::Debug for Val {
             Val::AsyncNativeFn { name, .. } => write!(f, "AsyncNativeFn({name})"),
             Val::Resume(v) => f.debug_tuple("Resume").field(v).finish(),
             Val::Cap { name, .. } => write!(f, "Cap({name})"),
-            Val::Cell { wasm, schema, caps } => write!(
-                f,
-                "Cell({} bytes, schema={}, {} caps)",
-                wasm.len(),
-                schema
-                    .as_ref()
-                    .map_or("none".to_string(), |s| format!("{} bytes", s.len())),
-                caps.len()
-            ),
+            Val::Cell { wasm, caps } => {
+                write!(f, "Cell({} bytes, {} caps)", wasm.len(), caps.len())
+            }
         }
     }
 }
@@ -341,19 +333,8 @@ impl PartialEq for Val {
             }
             // Caps match by instance identity.
             (Val::Cap { cap_id: a, .. }, Val::Cap { cap_id: b, .. }) => a == b,
-            // Cells are equal if wasm and schema match (caps are opaque).
-            (
-                Val::Cell {
-                    wasm: wa,
-                    schema: sa,
-                    ..
-                },
-                Val::Cell {
-                    wasm: wb,
-                    schema: sb,
-                    ..
-                },
-            ) => wa == wb && sa == sb,
+            // Cells are equal if wasm matches (caps are opaque).
+            (Val::Cell { wasm: wa, .. }, Val::Cell { wasm: wb, .. }) => wa == wb,
             // Recur, Effect, and Resume are internal sentinels — never equal.
             (Val::Recur(_), _) | (_, Val::Recur(_)) => false,
             (Val::Effect { .. }, _) | (_, Val::Effect { .. }) => false,
@@ -396,9 +377,8 @@ impl std::hash::Hash for Val {
                 (std::rc::Rc::as_ptr(func) as *const () as usize).hash(state)
             }
             Val::Cap { cap_id, .. } => cap_id.hash(state),
-            Val::Cell { wasm, schema, .. } => {
+            Val::Cell { wasm, .. } => {
                 wasm.hash(state);
-                schema.hash(state);
             }
             // Sentinels: hash by discriminant only (already done above).
             Val::Recur(_) | Val::Effect { .. } | Val::Resume(_) => {}
@@ -450,11 +430,8 @@ impl core::fmt::Display for Val {
             Val::NativeFn { name, .. } => write!(f, "#<native-fn {name}>"),
             Val::AsyncNativeFn { name, .. } => write!(f, "#<async-native-fn {name}>"),
             Val::Cap { name, .. } => write!(f, "#<cap {name}>"),
-            Val::Cell { wasm, schema, caps } => {
+            Val::Cell { wasm, caps } => {
                 write!(f, "#<cell {} bytes", wasm.len())?;
-                if let Some(s) = schema {
-                    write!(f, ", schema {} bytes", s.len())?;
-                }
                 if !caps.is_empty() {
                     let names: Vec<&str> = caps.iter().map(|(n, _)| n.as_str()).collect();
                     write!(f, ", caps [{}]", names.join(" "))?;

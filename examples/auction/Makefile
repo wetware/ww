@@ -21,6 +21,12 @@ all:
 		else \
 			echo "WARNING: auction_schema.bin not found"; \
 		fi
+	@AUCTION_BUNDLE=$$(find target/$(WASM_TARGET)/release/build -path '*/auction-*/out/auction_schema_bundle.bin' | head -1) && \
+		if [ -n "$$AUCTION_BUNDLE" ]; then \
+			$(CARGO) run -q --manifest-path ../../crates/schema-id/Cargo.toml --bin schema-bundle-inject -- bin/auction.wasm "$$AUCTION_BUNDLE"; \
+		else \
+			echo "WARNING: auction_schema_bundle.bin not found"; \
+		fi
 
 clean:
 	rm -f bin/auction.wasm bin/auction.capnpc

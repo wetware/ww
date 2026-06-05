@@ -423,251 +423,191 @@ fn make_host_handler(
                         Val::List(items)
                     }
                     "listen" => {
-                        // Cell-based registration:
-                        //   (perform host :listen <cell>)          → VatListener
-                        //   (perform host :listen <cell> "/path")  → HttpListener
-                        if let Some(Val::Cell { wasm, schema, caps }) = rest.first() {
+                        let collect_caps =
+                            |caps: &[(String, Val)]| -> Vec<(String, capnp::capability::Client)> {
+                                caps.iter()
+                                    .filter_map(|(name, val)| {
+                                        if let Val::Cap { inner, .. } = val {
+                                            if let Some(client) = extract_capnp_client(inner) {
+                                                return Some((name.clone(), client));
+                                            }
+                                            log::debug!(
+                                                "host :listen — cap '{name}' is not a capnp client, skipping"
+                                            );
+                                        }
+                                        None
+                                    })
+                                    .collect()
+                            };
+
+                        let load_cell_executor = |wasm: &[u8]| {
                             let mut load_req = runtime.load_request();
                             load_req.get().set_wasm(wasm);
-                            let executor = load_req.send().pipeline.get_executor();
-
-                            let network_resp = host
-                                .network_request()
-                                .send()
-                                .promise
-                                .await
-                                .map_err(|e| Val::from(e.to_string()))?;
-                            let network =
-                                network_resp.get().map_err(|e| Val::from(e.to_string()))?;
-
-                            match rest.get(1) {
-                                None => {
-                                    // VatListener: (perform host :listen <cell>)
-                                    let listener = network
-                                        .get_vat_listener()
-                                        .map_err(|e| Val::from(e.to_string()))?;
-                                    let mut req = listener.listen_request();
-                                    {
-                                        let mut handler = req.get().init_handler();
-                                        handler.set_spawn(executor);
-                                    }
-                                    if let Some(s) = schema {
-                                        req.get().set_schema(s);
-                                    }
-                                    // Forward captured caps from the `with` block.
-                                    // Pre-filter to avoid ghost entries in the capnp list.
-                                    if !caps.is_empty() {
-                                        let valid_caps: Vec<(&str, capnp::capability::Client)> =
-                                            caps.iter()
-                                                .filter_map(|(name, val)| {
-                                                    if let Val::Cap { inner, .. } = val {
-                                                        if let Some(client) =
-                                                            extract_capnp_client(inner)
-                                                        {
-                                                            return Some((name.as_str(), client));
-                                                        }
-                                                        // Not all caps are capnp clients (e.g. ipfs
-                                                        // is a VFS placeholder). Skip silently.
-                                                        log::debug!(
-                                                            "host :listen — cap '{name}' is not a capnp client, skipping"
-                                                        );
-                                                    }
-                                                    None
-                                                })
-                                                .collect();
-                                        if !valid_caps.is_empty() {
-                                            let mut caps_builder =
-                                                req.get().init_caps(valid_caps.len() as u32);
-                                            for (i, (name, client)) in
-                                                valid_caps.into_iter().enumerate()
-                                            {
-                                                let mut entry =
-                                                    caps_builder.reborrow().get(i as u32);
-                                                entry.set_name(name);
-                                                entry.init_cap().set_as_capability(client.hook);
-                                            }
-                                        }
-                                    }
-                                    req.send()
-                                        .promise
-                                        .await
-                                        .map_err(|e| Val::from(e.to_string()))?;
-                                    log::info!("host :listen — registered vat handler (cell)");
-                                    return call_resume(resume, Val::Nil);
-                                }
-                                Some(Val::Str(prefix)) => {
-                                    // HttpListener: (perform host :listen <cell> "/path")
-                                    let listener = network
-                                        .get_http_listener()
-                                        .map_err(|e| Val::from(e.to_string()))?;
-                                    let mut req = listener.listen_request();
-                                    req.get().set_executor(executor);
-                                    req.get().set_prefix(prefix);
-                                    // Forward captured caps from the `with` block.
-                                    // Mirrors the VatListener path above so WAGI cells
-                                    // see only the caps the init.d author granted.
-                                    if !caps.is_empty() {
-                                        let valid_caps: Vec<(&str, capnp::capability::Client)> =
-                                            caps.iter()
-                                                .filter_map(|(name, val)| {
-                                                    if let Val::Cap { inner, .. } = val {
-                                                        if let Some(client) =
-                                                            extract_capnp_client(inner)
-                                                        {
-                                                            return Some((name.as_str(), client));
-                                                        }
-                                                        log::debug!(
-                                                            "host :listen — cap '{name}' is not a capnp client, skipping"
-                                                        );
-                                                    }
-                                                    None
-                                                })
-                                                .collect();
-                                        if !valid_caps.is_empty() {
-                                            let mut caps_builder =
-                                                req.get().init_caps(valid_caps.len() as u32);
-                                            for (i, (name, client)) in
-                                                valid_caps.into_iter().enumerate()
-                                            {
-                                                let mut entry =
-                                                    caps_builder.reborrow().get(i as u32);
-                                                entry.set_name(name);
-                                                entry.init_cap().set_as_capability(client.hook);
-                                            }
-                                        }
-                                    }
-                                    req.send()
-                                        .promise
-                                        .await
-                                        .map_err(|e| Val::from(e.to_string()))?;
-                                    log::info!(
-                                        "host :listen — registered HTTP handler at {prefix} (cell)"
-                                    );
-                                    return call_resume(resume, Val::Nil);
-                                }
-                                Some(other) => {
-                                    return Err(Val::from(format!(
-                                        "host :listen <cell> — optional 2nd arg must be a path string, got {other}"
-                                    )));
-                                }
-                            }
-                        }
-
-                        // Legacy path: (perform host :listen runtime <wasm>)         → VatListener
-                        //              (perform host :listen runtime "proto" <wasm>) → StreamListener
-                        let runtime = match rest.first() {
-                            Some(Val::Cap { name, inner, .. }) if name == "runtime" => inner
-                                .downcast_ref::<system_capnp::runtime::Client>()
-                                .cloned()
-                                .ok_or_else(|| {
-                                    Val::from("host :listen — runtime cap has wrong inner type")
-                                })?,
-                            Some(Val::Cap { name, .. }) => {
-                                return Err(Val::from(format!(
-                                    "host :listen — expected a cell or runtime cap, got cap '{name}'"
-                                )))
-                            }
-                            Some(other) => {
-                                return Err(Val::from(format!(
-                                    "host :listen — expected a cell (from (cell (load ...) ...)), got {other}"
-                                )))
-                            }
-                            None => {
-                                return Err(Val::from(
-                                    "host :listen — missing argument. Usage: (perform host :listen <cell>) or (perform host :listen <cell> \"/path\")"
-                                ))
-                            }
+                            load_req.send().pipeline.get_executor()
                         };
-                        match rest.len() {
-                            2 => {
-                                // VatListener mode: (perform host :listen runtime <wasm>)
-                                // Load wasm via Runtime → Executor, then call
-                                // VatListener.listen() with the Executor.
-                                let wasm = match rest.get(1) {
-                                    Some(Val::Bytes(b)) => b.clone(),
-                                    _ => {
-                                        return Err(Val::from(
-                                            "host :listen — expected wasm bytes as 2nd arg",
-                                        ))
-                                    }
-                                };
 
-                                // Load the wasm to get an Executor (pipelining).
-                                let mut load_req = runtime.load_request();
-                                load_req.get().set_wasm(&wasm);
-                                let executor = load_req
-                                    .send()
-                                    .pipeline
-                                    .get_executor();
+                        let network_resp = host
+                            .network_request()
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let network = network_resp.get().map_err(|e| Val::from(e.to_string()))?;
 
-                                let network_resp = host
-                                    .network_request()
-                                    .send()
-                                    .promise
-                                    .await
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                let network = network_resp
-                                    .get()
-                                    .map_err(|e| Val::from(e.to_string()))?;
+                        match rest {
+                            [Val::Keyword(mode), Val::Str(protocol), Val::Cell { wasm, caps }]
+                                if mode == "vat" =>
+                            {
                                 let listener = network
                                     .get_vat_listener()
                                     .map_err(|e| Val::from(e.to_string()))?;
                                 let mut req = listener.listen_request();
-                                {
-                                    let mut handler = req.get().init_handler();
-                                    handler.set_spawn(executor);
+                                req.get().set_executor(load_cell_executor(wasm));
+                                req.get().set_protocol(protocol);
+                                let valid_caps = collect_caps(caps);
+                                if !valid_caps.is_empty() {
+                                    let mut caps_builder =
+                                        req.get().init_caps(valid_caps.len() as u32);
+                                    for (i, (name, client)) in valid_caps.into_iter().enumerate() {
+                                        let mut entry = caps_builder.reborrow().get(i as u32);
+                                        entry.set_name(&name);
+                                        entry.init_cap().set_as_capability(client.hook);
+                                    }
                                 }
                                 req.send()
                                     .promise
                                     .await
                                     .map_err(|e| Val::from(e.to_string()))?;
-                                log::info!("host :listen — registered vat handler");
-                                Val::Nil
+                                log::info!(
+                                    "host :listen — registered vat service /ww/0.1.0/vat/{protocol}"
+                                );
+                                return call_resume(resume, Val::Nil);
                             }
-                            3 => {
-                                // StreamListener mode: (perform host :listen runtime "proto" <wasm>)
-                                // Load wasm via Runtime → Executor, then call
-                                // StreamListener.listen() with Executor + protocol.
-                                let protocol = match rest.get(1) {
-                                    Some(Val::Str(s)) => s.clone(),
-                                    _ => {
-                                        return Err(Val::from(
-                                            "host :listen — protocol must be a string",
-                                        ))
+                            [Val::Keyword(mode), Val::Str(prefix), Val::Cell { wasm, caps }]
+                                if mode == "http" =>
+                            {
+                                let listener = network
+                                    .get_http_listener()
+                                    .map_err(|e| Val::from(e.to_string()))?;
+                                let mut req = listener.listen_request();
+                                req.get().set_executor(load_cell_executor(wasm));
+                                req.get().set_prefix(prefix);
+                                let valid_caps = collect_caps(caps);
+                                if !valid_caps.is_empty() {
+                                    let mut caps_builder =
+                                        req.get().init_caps(valid_caps.len() as u32);
+                                    for (i, (name, client)) in valid_caps.into_iter().enumerate() {
+                                        let mut entry = caps_builder.reborrow().get(i as u32);
+                                        entry.set_name(&name);
+                                        entry.init_cap().set_as_capability(client.hook);
                                     }
-                                };
-                                let wasm = match rest.get(2) {
-                                    Some(Val::Bytes(b)) => b.clone(),
-                                    _ => {
-                                        return Err(Val::from(
-                                            "host :listen — expected wasm bytes",
-                                        ))
-                                    }
-                                };
-
-                                // Load the wasm to get an Executor (pipelining).
-                                let mut load_req = runtime.load_request();
-                                load_req.get().set_wasm(&wasm);
-                                let executor = load_req
-                                    .send()
-                                    .pipeline
-                                    .get_executor();
-
-                                let network_resp = host
-                                    .network_request()
-                                    .send()
+                                }
+                                req.send()
                                     .promise
                                     .await
                                     .map_err(|e| Val::from(e.to_string()))?;
-                                let network = network_resp
-                                    .get()
-                                    .map_err(|e| Val::from(e.to_string()))?;
+                                log::info!(
+                                    "host :listen — registered HTTP handler at {prefix} (cell)"
+                                );
+                                return call_resume(resume, Val::Nil);
+                            }
+                            [Val::Keyword(mode), Val::Str(protocol), Val::Cap { name, inner, .. }, Val::Bytes(wasm)]
+                                if mode == "raw" || mode == "stream" =>
+                            {
+                                if name != "runtime" {
+                                    return Err(Val::from(format!(
+                                        "host :listen :raw — expected runtime cap, got cap '{name}'"
+                                    )));
+                                }
+                                let runtime = inner
+                                    .downcast_ref::<system_capnp::runtime::Client>()
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        Val::from(
+                                            "host :listen :raw — runtime cap has wrong inner type",
+                                        )
+                                    })?;
+                                let mut load_req = runtime.load_request();
+                                load_req.get().set_wasm(wasm);
+                                let executor = load_req.send().pipeline.get_executor();
                                 let listener = network
                                     .get_stream_listener()
                                     .map_err(|e| Val::from(e.to_string()))?;
                                 let mut req = listener.listen_request();
                                 req.get().set_executor(executor);
-                                req.get().set_protocol(&protocol);
+                                req.get().set_protocol(protocol);
+                                req.send()
+                                    .promise
+                                    .await
+                                    .map_err(|e| Val::from(e.to_string()))?;
+                                log::info!(
+                                    "host :listen — registered raw stream /ww/0.1.0/stream/{protocol}"
+                                );
+                                Val::Nil
+                            }
+                            [Val::Cell { wasm, caps }, Val::Str(prefix)]
+                                if prefix.starts_with('/') =>
+                            {
+                                let listener = network
+                                    .get_http_listener()
+                                    .map_err(|e| Val::from(e.to_string()))?;
+                                let mut req = listener.listen_request();
+                                req.get().set_executor(load_cell_executor(wasm));
+                                req.get().set_prefix(prefix);
+                                let valid_caps = collect_caps(caps);
+                                if !valid_caps.is_empty() {
+                                    let mut caps_builder =
+                                        req.get().init_caps(valid_caps.len() as u32);
+                                    for (i, (name, client)) in valid_caps.into_iter().enumerate() {
+                                        let mut entry = caps_builder.reborrow().get(i as u32);
+                                        entry.set_name(&name);
+                                        entry.init_cap().set_as_capability(client.hook);
+                                    }
+                                }
+                                req.send()
+                                    .promise
+                                    .await
+                                    .map_err(|e| Val::from(e.to_string()))?;
+                                log::info!(
+                                    "host :listen — registered HTTP handler at {prefix} (cell)"
+                                );
+                                return call_resume(resume, Val::Nil);
+                            }
+                            [Val::Cell { .. }] => {
+                                return Err(Val::from(
+                                    "host :listen vat services now require a service name; use (perform host :listen :vat \"service\" <cell>)",
+                                ))
+                            }
+                            [Val::Cap { name, .. }, Val::Bytes(_)] if name == "runtime" => {
+                                return Err(Val::from(
+                                    "host :listen runtime <wasm> vat registration was removed; use (perform host :listen :vat \"service\" (cell <wasm>))",
+                                ))
+                            }
+                            [Val::Cap { name, .. }, Val::Bytes(_)] => {
+                                return Err(Val::from(format!(
+                                    "host :listen — expected runtime cap, got cap '{name}'"
+                                )))
+                            }
+                            [Val::Cap { name, inner, .. }, Val::Str(protocol), Val::Bytes(wasm)]
+                                if name == "runtime" =>
+                            {
+                                let runtime = inner
+                                    .downcast_ref::<system_capnp::runtime::Client>()
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        Val::from(
+                                            "host :listen — runtime cap has wrong inner type",
+                                        )
+                                    })?;
+                                let mut load_req = runtime.load_request();
+                                load_req.get().set_wasm(wasm);
+                                let executor = load_req.send().pipeline.get_executor();
+                                let listener = network
+                                    .get_stream_listener()
+                                    .map_err(|e| Val::from(e.to_string()))?;
+                                let mut req = listener.listen_request();
+                                req.get().set_executor(executor);
+                                req.get().set_protocol(protocol);
                                 req.send()
                                     .promise
                                     .await
@@ -677,9 +617,19 @@ fn make_host_handler(
                                 );
                                 Val::Nil
                             }
+                            [Val::Cap { name, .. }, Val::Str(_), Val::Bytes(_)] => {
+                                return Err(Val::from(format!(
+                                    "host :listen — expected runtime cap, got cap '{name}'"
+                                )))
+                            }
+                            [] => {
+                                return Err(Val::from(
+                                    "host :listen — missing arguments. Usage: (perform host :listen :vat \"service\" <cell>), :http \"/path\" <cell>, or :raw \"protocol\" runtime <wasm>",
+                                ))
+                            }
                             _ => {
                                 return Err(Val::from(
-                                    "host :listen — usage: (perform host :listen runtime <wasm>) or (perform host :listen runtime \"proto\" <wasm>)",
+                                    "host :listen — usage: (perform host :listen :vat \"service\" <cell>), (perform host :listen :http \"/path\" <cell>), or (perform host :listen :raw \"protocol\" runtime <wasm>)",
                                 ))
                             }
                         }
@@ -1095,8 +1045,9 @@ Capabilities (via perform):
   (perform host :id)                         Peer ID
   (perform host :addrs)                      Listen addresses
   (perform host :peers)                      Connected peers
-  (perform host :listen runtime <wasm>)      Register RPC handler
-  (perform host :listen runtime \"p\" <wasm>) Register stream handler
+  (perform host :listen :vat \"svc\" <cell>)  Register vat service
+  (perform host :listen :http \"/p\" <cell>)  Register HTTP handler
+  (perform host :listen :raw \"p\" runtime <wasm>) Register stream handler
 
   (perform runtime :run <wasm> :env {})      Spawn foreground process
 
@@ -2054,7 +2005,7 @@ mod tests {
         }
     }
 
-    // --- Stub VatListener: asserts handler is present ---
+    // --- Stub VatListener: asserts executor and protocol are present ---
 
     struct TestVatListener;
 
@@ -2066,8 +2017,11 @@ mod tests {
             _results: system_capnp::vat_listener::ListenResults,
         ) -> Promise<(), capnp::Error> {
             let params = capnp_rpc::pry!(params.get());
-            if !params.has_handler() {
-                return Promise::err(capnp::Error::failed("handler not set".into()));
+            if !params.has_executor() {
+                return Promise::err(capnp::Error::failed("executor not set".into()));
+            }
+            if !params.has_protocol() {
+                return Promise::err(capnp::Error::failed("protocol not set".into()));
             }
             Promise::ok(())
         }
@@ -2347,16 +2301,19 @@ mod tests {
     // --- host listen tests ---
 
     #[tokio::test]
-    async fn test_host_listen_vat_passes_runtime() {
+    async fn test_host_listen_vat_passes_cell() {
         run_local(async {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let runtime_cap = make_cap("runtime", "test-runtime-cid", Rc::new(s.runtime.clone()));
+            let cell = Val::Cell {
+                wasm: b"fake-wasm".to_vec(),
+                caps: vec![],
+            };
             let result = call_handler(
                 &handler,
                 "listen",
-                &[runtime_cap, Val::Bytes(b"fake-wasm".to_vec())],
+                &[Val::Keyword("vat".into()), Val::Str("test".into()), cell],
             )
             .await;
             assert!(
@@ -2435,7 +2392,12 @@ mod tests {
             let err = call_handler(
                 &handler,
                 "listen",
-                &[forged_cap, Val::Bytes(b"wasm".to_vec())],
+                &[
+                    Val::Keyword("raw".into()),
+                    Val::Str("my-protocol".into()),
+                    forged_cap,
+                    Val::Bytes(b"wasm".to_vec()),
+                ],
             )
             .await;
             assert!(err.is_err(), "forged cap should be rejected");
@@ -2459,7 +2421,7 @@ mod tests {
             .await;
             assert!(err.is_err(), "string should not pass as runtime cap");
             let msg = format!("{}", err.unwrap_err());
-            assert!(msg.contains("expected a cell"), "got: {msg}");
+            assert!(msg.contains("usage") && msg.contains(":raw"), "got: {msg}");
         })
         .await;
     }
@@ -2832,7 +2794,7 @@ mod tests {
 
     // --- init script eval integration ---
 
-    /// Eval (perform host :listen runtime (perform :load "path")) end-to-end.
+    /// Eval (perform host :listen :vat "chess" (cell (perform :load "path"))) end-to-end.
     #[tokio::test]
     async fn test_chess_glia_listen_form_evals_end_to_end() {
         run_local(async {
@@ -2847,7 +2809,7 @@ mod tests {
             std::env::remove_var("WW_ROOT");
 
             let script = format!(
-                r#"(perform host :listen runtime (perform :load "{}"))"#,
+                r#"(perform host :listen :vat "chess" (cell (perform :load "{}")))"#,
                 wasm_path.to_str().unwrap()
             );
             let form = read(&script).unwrap();
@@ -2877,7 +2839,7 @@ mod tests {
             std::env::remove_var("WW_ROOT");
 
             let script = format!(
-                r#"(perform host :listen runtime (perform :load "{}"))
+                r#"(perform host :listen :vat "chess" (cell (perform :load "{}")))
                    (perform runtime :run (perform :load "{}"))"#,
                 wasm_path.to_str().unwrap(),
                 wasm_path.to_str().unwrap()
@@ -2989,10 +2951,14 @@ mod tests {
             );
             let cell = Val::Cell {
                 wasm: b"fake-wasm".to_vec(),
-                schema: Some(b"fake-schema".to_vec()),
                 caps: vec![("http".to_string(), http_cap)],
             };
-            let result = call_handler(&handler, "listen", &[cell]).await;
+            let result = call_handler(
+                &handler,
+                "listen",
+                &[Val::Keyword("vat".into()), Val::Str("test".into()), cell],
+            )
+            .await;
             assert!(
                 result.is_ok(),
                 "cell-based listen with caps failed: {:?}",
@@ -3010,10 +2976,14 @@ mod tests {
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
             let cell = Val::Cell {
                 wasm: b"fake-wasm".to_vec(),
-                schema: Some(b"fake-schema".to_vec()),
                 caps: vec![],
             };
-            let result = call_handler(&handler, "listen", &[cell]).await;
+            let result = call_handler(
+                &handler,
+                "listen",
+                &[Val::Keyword("vat".into()), Val::Str("test".into()), cell],
+            )
+            .await;
             assert!(
                 result.is_ok(),
                 "cell-based listen without caps failed: {:?}",

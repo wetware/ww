@@ -8,9 +8,10 @@
 //! **Cell mode** (no args, default): spawned by VatListener per RPC
 //! connection. Creates a ChessEngine and exports it via `system::serve()`.
 //!
-//! **`serve`**: provides the schema CID on the DHT, discovers peers via
-//! `routing.find_providers()`, dials them via `VatClient` to get typed
-//! ChessEngine capabilities, and plays random games logging replays.
+//! **`serve`**: provides the chess service locator on the DHT, discovers peers
+//! via `routing.find_providers()`, dials them via `VatClient`, binds the
+//! returned `VatConnection` to get typed ChessEngine capabilities, and plays
+//! random games logging replays.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -66,6 +67,8 @@ mod chess_capnp {
 // Build-time schema constants: CHESS_ENGINE_SCHEMA (&[u8]) and CHESS_ENGINE_CID (&str).
 include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
+const CHESS_SERVICE: &str = "chess";
+
 /// Bootstrap capability: the concrete Membrane defined in membrane.capnp.
 type Membrane = membrane_capnp::membrane::Client;
 
@@ -97,6 +100,22 @@ fn short_id(peer_id: &[u8]) -> String {
     } else {
         h
     }
+}
+
+async fn service_key(
+    routing: &routing_capnp::routing::Client,
+    service: &str,
+) -> Result<String, capnp::Error> {
+    let mut req = routing.hash_request();
+    req.get().set_data(service.as_bytes());
+    let resp = req.send().promise.await?;
+    let key = resp
+        .get()?
+        .get_key()?
+        .to_str()
+        .map_err(|e| capnp::Error::failed(e.to_string()))?
+        .to_string();
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -342,12 +361,15 @@ async fn play_rpc_against_peer(
     let us = short_id(self_id);
     let them = short_id(peer_id);
 
-    // Dial peer via VatClient — returns a typed ChessEngine capability.
+    // Dial peer via VatClient, then bind the VatConnection to get ChessEngine.
     let mut req = vat_client.dial_request();
     req.get().set_peer(peer_id);
-    req.get().set_schema(CHESS_ENGINE_SCHEMA);
+    req.get().set_protocol(CHESS_SERVICE);
     let resp = req.send().promise.await?;
-    let engine: chess_capnp::chess_engine::Client = resp.get()?.get_cap().get_as_capability()?;
+    let connection = resp.get()?.get_connection()?;
+    let bind_resp = connection.bind_request().send().promise.await?;
+    let engine: chess_capnp::chess_engine::Client =
+        bind_resp.get()?.get_cap().get_as_capability()?;
 
     log::info!("game {us} vs {them}: started (RPC)");
     play_rpc_game(&engine, &us, &them).await
@@ -506,8 +528,9 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
     // Resolve peer identity.
     let id_resp = host.id_request().send().promise.await?;
     let self_id = id_resp.get()?.get_peer_id()?.to_vec();
+    let dht_key = service_key(&routing, CHESS_SERVICE).await?;
     log::info!("service: peer {}", short_id(&self_id));
-    log::info!("service: schema CID {CHESS_ENGINE_CID}");
+    log::info!("service: locator {CHESS_SERVICE}, schema CID {CHESS_ENGINE_CID}");
 
     log::info!("service: looking for opponent...");
 
@@ -522,7 +545,7 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
 
         // Re-provide (DHT records expire).
         let mut provide_req = routing.provide_request();
-        provide_req.get().set_key(CHESS_ENGINE_CID);
+        provide_req.get().set_key(&dht_key);
         provide_req.send().promise.await?;
 
         // Search for peers; RpcDialingSink dials new ones via RPC.
@@ -534,7 +557,7 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
         let mut fp_req = routing.find_providers_request();
         {
             let mut b = fp_req.get();
-            b.set_key(CHESS_ENGINE_CID);
+            b.set_key(&dht_key);
             b.set_count(5);
             b.set_sink(sink);
         }

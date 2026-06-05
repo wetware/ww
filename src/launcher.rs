@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use capnp::capability::Promise;
-use capnp_rpc::pry;
+use capnp::capability::{FromClientHook, Promise};
+use capnp_rpc::{pry, CapabilityServerSet};
 use futures::FutureExt;
 use tokio::io;
 use tokio::sync::{mpsc, oneshot};
@@ -34,6 +34,60 @@ use rpc::{
 /// CPU spent on untrusted guest code while still accommodating larger
 /// practical WASM guests.
 const MAX_WASM_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone)]
+enum ExecutorSchemaMetadata {
+    Absent,
+    Valid {
+        schema_bundle: Vec<u8>,
+        schema_bundle_cid: Vec<u8>,
+    },
+    Invalid(String),
+}
+
+#[derive(Clone)]
+struct ExecutorMetadata {
+    wasm_artifact_cid: Vec<u8>,
+    schema: ExecutorSchemaMetadata,
+}
+
+type ExecutorRegistry =
+    Rc<RefCell<CapabilityServerSet<ExecutorImpl, system_capnp::executor::Client>>>;
+
+struct RuntimeExecutorResolver {
+    registry: ExecutorRegistry,
+}
+
+#[async_trait::async_trait(?Send)]
+impl rpc::vat_listener::ExecutorResolver for RuntimeExecutorResolver {
+    async fn resolve(
+        &self,
+        executor: system_capnp::executor::Client,
+    ) -> Result<rpc::vat_listener::ExecutorVatMetadata, capnp::Error> {
+        let resolved: system_capnp::executor::Client = capnp::capability::get_resolved_cap(
+            <system_capnp::executor::Client as FromClientHook>::new(
+                executor.as_client_hook().add_ref(),
+            ),
+        )
+        .await;
+
+        let server = self
+            .registry
+            .borrow()
+            .get_local_server_of_resolved(&resolved)
+            .ok_or_else(|| {
+                capnp::Error::failed("Executor was not minted by this host Runtime.load".into())
+            })?;
+
+        server.vat_metadata()
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimeHandle {
+    pub client: system_capnp::runtime::Client,
+    pub executor_resolver: Rc<dyn rpc::vat_listener::ExecutorResolver>,
+}
 
 // =========================================================================
 // RuntimeImpl — system-wide WASM compilation + execution runtime
@@ -64,6 +118,11 @@ pub struct RuntimeImpl {
     /// RefCell is correct because Cap'n Proto server dispatch runs on a
     /// single-threaded LocalSet.
     executor_cache: RefCell<HashMap<[u8; 32], system_capnp::executor::Client>>,
+    /// Host-side set of executors minted by this RuntimeImpl.
+    executor_registry: ExecutorRegistry,
+    /// Resolver shared with membrane grafts so VatListener can verify executor
+    /// provenance even when the executor is pipelined through Runtime.load().
+    executor_resolver: Rc<dyn rpc::vat_listener::ExecutorResolver>,
     /// Back-reference to this Runtime's own client. Injected by
     /// [`create_runtime_client`] after construction. Cloned into each
     /// ExecutorImpl so child cells receive the same Runtime through their
@@ -92,15 +151,17 @@ impl RuntimeImpl {
         &self,
         bytecode: Arc<Vec<u8>>,
         component: Option<Arc<wasmtime::component::Component>>,
+        metadata: Arc<ExecutorMetadata>,
     ) -> system_capnp::executor::Client {
         let runtime_client = self
             .self_client
             .borrow()
             .clone()
             .expect("runtime self-reference must be set (use create_runtime_client)");
-        capnp_rpc::new_client(ExecutorImpl {
+        let executor = Rc::new(ExecutorImpl {
             bytecode,
             component,
+            metadata,
             engine: self.engine.clone(),
             wasm_debug: self.wasm_debug,
             network_state: self.network_state.clone(),
@@ -110,9 +171,13 @@ impl RuntimeImpl {
             signing_key: self.signing_key.clone(),
             stream_control: self.stream_control.clone(),
             runtime_client,
+            executor_resolver: self.executor_resolver.clone(),
             ipfs_client: self.ipfs_client.clone(),
             http_dial: self.http_dial.clone(),
-        })
+        });
+        self.executor_registry
+            .borrow_mut()
+            .new_client_from_rc(executor)
     }
 }
 
@@ -155,6 +220,54 @@ async fn compile_with_service(
 /// The returned client is a singleton — clone it wherever a Runtime is needed to
 /// ensure all cells share the same compilation/executor cache.
 #[allow(clippy::too_many_arguments)]
+pub fn create_runtime_handle(
+    network_state: NetworkState,
+    swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
+    wasm_debug: bool,
+    guard: Option<EpochGuard>,
+    epoch_rx: Option<tokio::sync::watch::Receiver<::membrane::Epoch>>,
+    signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
+    stream_control: Option<libp2p_stream::Control>,
+    engine: Option<Arc<wasmtime::Engine>>,
+    compile_tx: Option<mpsc::Sender<CompileRequest>>,
+    cache_policy: CachePolicy,
+    ipfs_client: crate::ipfs::HttpClient,
+    http_dial: Vec<String>,
+) -> RuntimeHandle {
+    let self_client = Rc::new(RefCell::new(None));
+    let executor_registry = Rc::new(RefCell::new(CapabilityServerSet::new()));
+    let executor_resolver: Rc<dyn rpc::vat_listener::ExecutorResolver> =
+        Rc::new(RuntimeExecutorResolver {
+            registry: executor_registry.clone(),
+        });
+    let runtime = RuntimeImpl {
+        network_state,
+        swarm_cmd_tx,
+        wasm_debug,
+        guard,
+        epoch_rx,
+        signing_key,
+        stream_control,
+        cache_policy,
+        executor_cache: RefCell::new(HashMap::new()),
+        executor_registry,
+        executor_resolver: executor_resolver.clone(),
+        self_client: self_client.clone(),
+        engine: engine.unwrap_or_else(build_wasmtime_engine),
+        compile_tx,
+        ipfs_client,
+        http_dial,
+    };
+    let client: system_capnp::runtime::Client = capnp_rpc::new_client(runtime);
+    *self_client.borrow_mut() = Some(client.clone());
+    RuntimeHandle {
+        client,
+        executor_resolver,
+    }
+}
+
+/// Compatibility wrapper for callers that only need the Runtime capability.
+#[allow(clippy::too_many_arguments)]
 pub fn create_runtime_client(
     network_state: NetworkState,
     swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
@@ -169,8 +282,7 @@ pub fn create_runtime_client(
     ipfs_client: crate::ipfs::HttpClient,
     http_dial: Vec<String>,
 ) -> system_capnp::runtime::Client {
-    let self_client = Rc::new(RefCell::new(None));
-    let runtime = RuntimeImpl {
+    create_runtime_handle(
         network_state,
         swarm_cmd_tx,
         wasm_debug,
@@ -178,17 +290,29 @@ pub fn create_runtime_client(
         epoch_rx,
         signing_key,
         stream_control,
-        cache_policy,
-        executor_cache: RefCell::new(HashMap::new()),
-        self_client: self_client.clone(),
-        engine: engine.unwrap_or_else(build_wasmtime_engine),
+        engine,
         compile_tx,
+        cache_policy,
         ipfs_client,
         http_dial,
+    )
+    .client
+}
+
+fn executor_metadata_for_wasm(wasm: &[u8]) -> ExecutorMetadata {
+    let wasm_artifact_cid = schema_id::compute_cid_bytes(wasm);
+    let schema = match schema_id::extract_schema_bundle_section(wasm) {
+        Ok(Some(bundle)) => ExecutorSchemaMetadata::Valid {
+            schema_bundle: bundle.canonical_bytes,
+            schema_bundle_cid: bundle.cid_bytes,
+        },
+        Ok(None) => ExecutorSchemaMetadata::Absent,
+        Err(error) => ExecutorSchemaMetadata::Invalid(error.to_string()),
     };
-    let client: system_capnp::runtime::Client = capnp_rpc::new_client(runtime);
-    *self_client.borrow_mut() = Some(client.clone());
-    client
+    ExecutorMetadata {
+        wasm_artifact_cid,
+        schema,
+    }
 }
 
 fn read_text_list(list: capnp::text_list::Reader<'_>) -> Vec<String> {
@@ -236,6 +360,7 @@ impl system_capnp::runtime::Server for RuntimeImpl {
         }
 
         let key = *blake3::hash(&wasm).as_bytes();
+        let metadata = Arc::new(executor_metadata_for_wasm(&wasm));
         let bytecode = Arc::new(wasm);
         let compile_tx = self.compile_tx.clone();
         let engine = self.engine.clone();
@@ -256,7 +381,8 @@ impl system_capnp::runtime::Server for RuntimeImpl {
                             bytecode.clone(),
                         )
                         .await?;
-                        let client = server.make_executor(bytecode.clone(), component);
+                        let client =
+                            server.make_executor(bytecode.clone(), component, metadata.clone());
                         server
                             .executor_cache
                             .borrow_mut()
@@ -268,7 +394,7 @@ impl system_capnp::runtime::Server for RuntimeImpl {
                     tracing::debug!(?key, "runtime.load: creating isolated executor");
                     let component =
                         compile_with_service(compile_tx, engine, bytecode.clone()).await?;
-                    server.make_executor(bytecode, component)
+                    server.make_executor(bytecode, component, metadata)
                 }
             };
 
@@ -301,6 +427,7 @@ impl system_capnp::runtime::Server for RuntimeImpl {
 pub struct ExecutorImpl {
     bytecode: Arc<Vec<u8>>,
     component: Option<Arc<wasmtime::component::Component>>,
+    metadata: Arc<ExecutorMetadata>,
     engine: Arc<wasmtime::Engine>,
     wasm_debug: bool,
     network_state: NetworkState,
@@ -311,10 +438,35 @@ pub struct ExecutorImpl {
     stream_control: Option<libp2p_stream::Control>,
     /// Runtime client (singleton) — passed to child cells through their membrane graft.
     runtime_client: system_capnp::runtime::Client,
+    /// Executor provenance resolver — passed to child cells through their membrane graft.
+    executor_resolver: Rc<dyn rpc::vat_listener::ExecutorResolver>,
     /// IPFS HTTP client — passed to child cells through their membrane graft.
     ipfs_client: crate::ipfs::HttpClient,
     /// Allowed outbound HTTP hosts — inherited by child cells.
     http_dial: Vec<String>,
+}
+
+impl ExecutorImpl {
+    fn vat_metadata(&self) -> Result<rpc::vat_listener::ExecutorVatMetadata, capnp::Error> {
+        match &self.metadata.schema {
+            ExecutorSchemaMetadata::Valid {
+                schema_bundle,
+                schema_bundle_cid,
+            } => Ok(rpc::vat_listener::ExecutorVatMetadata {
+                wasm_artifact_cid: self.metadata.wasm_artifact_cid.clone(),
+                schema_bundle_cid: schema_bundle_cid.clone(),
+                schema_bundle: schema_bundle.clone(),
+            }),
+            ExecutorSchemaMetadata::Absent => Err(capnp::Error::failed(format!(
+                "executor WASM is missing required {} custom section for vat publication",
+                schema_id::SCHEMA_SECTION_NAME
+            ))),
+            ExecutorSchemaMetadata::Invalid(error) => Err(capnp::Error::failed(format!(
+                "executor WASM has invalid {} custom section: {error}",
+                schema_id::SCHEMA_SECTION_NAME
+            ))),
+        }
+    }
 }
 
 #[allow(refining_impl_trait)]
@@ -390,6 +542,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
         let signing_key = self.signing_key.clone();
         let stream_control = self.stream_control.clone();
         let runtime_client = self.runtime_client.clone();
+        let executor_resolver = self.executor_resolver.clone();
         let ipfs_client = self.ipfs_client.clone();
         let http_dial = self.http_dial.clone();
 
@@ -440,6 +593,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
                     sc,
                     None, // route_registry: spawned cells don't get HTTP routes
                     runtime_client,
+                    Some(executor_resolver),
                     extra_caps,
                     ipfs_client,
                     http_dial,
@@ -527,5 +681,119 @@ impl system_capnp::executor::Server for ExecutorImpl {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeExecutor;
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::executor::Server for FakeExecutor {
+        fn spawn(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::executor::SpawnParams,
+            _results: system_capnp::executor::SpawnResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::failed("fake executor".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_resolver_rejects_fake_executor() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let handle = test_runtime_handle();
+                let fake: system_capnp::executor::Client = capnp_rpc::new_client(FakeExecutor);
+                let error = handle
+                    .executor_resolver
+                    .resolve(fake)
+                    .await
+                    .expect_err("fake executor should be rejected");
+                assert!(
+                    error.to_string().contains("not minted"),
+                    "unexpected error: {error}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn executor_resolver_accepts_pipelined_runtime_load_executor() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let handle = test_runtime_handle();
+                let wasm = test_component_with_schema();
+
+                let mut req = handle.client.load_request();
+                req.get().set_wasm(&wasm);
+                let executor = req.send().pipeline.get_executor();
+
+                let metadata = handle
+                    .executor_resolver
+                    .resolve(executor)
+                    .await
+                    .expect("pipelined Runtime.load executor should resolve");
+                assert_eq!(
+                    metadata.wasm_artifact_cid,
+                    schema_id::compute_cid_bytes(&wasm)
+                );
+                assert_eq!(
+                    metadata.schema_bundle_cid,
+                    schema_id::compute_cid_bytes(&test_schema_bundle_bytes())
+                );
+            })
+            .await;
+    }
+
+    fn test_runtime_handle() -> RuntimeHandle {
+        let (swarm_cmd_tx, _swarm_cmd_rx) = mpsc::channel(1);
+        create_runtime_handle(
+            NetworkState::from_peer_id(vec![1, 2, 3, 4]),
+            swarm_cmd_tx,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            CachePolicy::Isolated,
+            crate::ipfs::HttpClient::new("http://127.0.0.1:5001".to_string()),
+            Vec::new(),
+        )
+    }
+
+    fn test_component_with_schema() -> Vec<u8> {
+        let component = wasm_encoder::Component::new().finish();
+        schema_id::inject_schema_bundle_section(&component, &test_schema_bundle_bytes())
+            .expect("inject schema bundle")
+    }
+
+    fn test_schema_bundle_bytes() -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut root = message.init_root::<system_capnp::schema_bundle::Builder>();
+            root.set_format_version(schema_id::SCHEMA_BUNDLE_FORMAT_VERSION);
+            root.set_service_interface_id(0xd0ac_8299_df07_9c61);
+            let nodes = root.init_nodes(1);
+            let mut node = nodes.get(0);
+            node.set_id(0xd0ac_8299_df07_9c61);
+            node.set_display_name("test.capnp:ChessEngine");
+            node.init_interface();
+        }
+        let reader: system_capnp::schema_bundle::Reader<'_> =
+            message.get_root_as_reader().expect("schema bundle root");
+        let mut canonical = capnp::message::Builder::new_default();
+        canonical
+            .set_root_canonical(reader)
+            .expect("canonical schema bundle");
+        let segments = canonical.get_segments_for_output();
+        assert_eq!(segments.len(), 1);
+        segments[0].to_vec()
     }
 }

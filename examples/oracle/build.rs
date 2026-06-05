@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 /// Build script for the oracle example.
 ///
 /// Compiles oracle.capnp and shared system schemas, extracts the
-/// PriceOracle interface's canonical bytes, and derives its schema CID.
+/// PriceOracle interface's canonical bytes, derives schema metadata, and writes
+/// the SchemaBundle bytes later embedded in `ww.schema.v1`.
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
@@ -35,7 +36,7 @@ fn main() {
         .run()
         .expect("failed to compile shared capnp schemas");
 
-    // Pass 2: oracle schema + schema CID
+    // Pass 2: oracle schema + schema bundle
     let raw_request = out_dir.join("oracle_request.bin");
     capnpc::CompilerCommand::new()
         .src_prefix(manifest_path)
@@ -49,12 +50,17 @@ fn main() {
 
     let schemas = schema_id::extract_schemas(&raw_request, &[("PRICE_ORACLE", oracle_id)])
         .expect("extract PriceOracle schema");
+    let bundles =
+        schema_id::extract_schema_bundles(&raw_request, &[("PRICE_ORACLE", oracle_id)])
+            .expect("extract PriceOracle schema bundle");
 
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
     schema_id::write_schema_bytes(&out_dir.join("oracle_schema.bin"), &schemas[0])
         .expect("write schema bytes");
+    schema_id::write_schema_bundle_bytes(&out_dir.join("oracle_schema_bundle.bin"), &bundles[0])
+        .expect("write schema bundle bytes");
 
     // Cargo rebuild triggers
     for schema in &["system", "routing", "auth", "membrane", "stem", "http"] {

@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 /// Build script for the discovery example.
 ///
 /// Compiles greeter.capnp and shared system schemas, extracts the
-/// Greeter interface's canonical bytes, and derives its schema CID.
+/// Greeter interface's canonical bytes, derives schema metadata, and writes the
+/// SchemaBundle bytes later embedded in `ww.schema.v1`.
 ///
-/// The schema CID pipeline:
+/// The schema pipeline:
 ///   greeter.capnp → capnpc (CodeGeneratorRequest)
 ///                 → find Greeter interface node by name
-///                 → schema_id::extract_schemas (canonical bytes + BLAKE3)
-///                 → `GREETER_SCHEMA_CID` const in generated Rust
-///                 → schema bytes passed explicitly via RPC at runtime
+///                 → schema_id::extract_schemas / extract_schema_bundles
+///                 → generated schema constants + greeter_schema_bundle.bin
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
@@ -42,7 +42,7 @@ fn main() {
         .run()
         .expect("failed to compile shared capnp schemas");
 
-    // ── Pass 2: greeter schema + schema CID ─────────────────────────
+    // ── Pass 2: greeter schema + schema bundle ──────────────────────
     let raw_request = out_dir.join("greeter_request.bin");
     capnpc::CompilerCommand::new()
         .src_prefix(manifest_path)
@@ -58,12 +58,16 @@ fn main() {
 
     let schemas = schema_id::extract_schemas(&raw_request, &[("GREETER", greeter_id)])
         .expect("extract Greeter schema");
+    let bundles = schema_id::extract_schema_bundles(&raw_request, &[("GREETER", greeter_id)])
+        .expect("extract Greeter schema bundle");
 
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
     schema_id::write_schema_bytes(&out_dir.join("greeter_schema.bin"), &schemas[0])
         .expect("write schema bytes");
+    schema_id::write_schema_bundle_bytes(&out_dir.join("greeter_schema_bundle.bin"), &bundles[0])
+        .expect("write schema bundle bytes");
 
     // ── Cargo rebuild triggers ──────────────────────────────────────
     for schema in &["system", "routing", "auth", "membrane", "http", "stem"] {

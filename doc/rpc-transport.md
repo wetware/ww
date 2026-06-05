@@ -217,10 +217,12 @@ transport. The host never writes bytes. It only closes stdin to tell the cell
 to drain gracefully (equivalent to Go's `<-chan struct{}`). All RPC I/O goes
 through the WIT data_streams side-channel.
 
-`handle_vat_connection` in `src/rpc/vat_listener.rs` demonstrates the pattern:
-when a peer disconnects, the host closes stdin to signal the cell to shut down.
-Error paths (bootstrap timeout, capability extraction failure) also close stdin
-to prevent orphaned cell processes.
+`VatConnection.bind()` in `crates/rpc/src/vat_listener.rs` demonstrates the
+pattern: `describe()` returns metadata without spawning, while the first
+`bind()` spawns the executor-bound cell and records its stdin. When the peer
+disconnects after binding, the host closes stdin to signal the cell to shut
+down. Error paths (bootstrap timeout, capability extraction failure) also close
+stdin to prevent orphaned cell processes.
 
 ## Executor pool and M:N scheduling
 

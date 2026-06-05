@@ -17,6 +17,7 @@ pub mod vat_dial;
 pub mod vat_listener;
 pub mod wagi;
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use capnp::capability::Promise;
@@ -72,10 +73,23 @@ pub fn schema_cid(schema_bytes: &[u8]) -> String {
     cid::Cid::new_v1(0x55, mh).to_string()
 }
 
-/// Build a `StreamProtocol` from a schema CID string.
-pub fn schema_protocol(cid: &str) -> Result<StreamProtocol, capnp::Error> {
-    StreamProtocol::try_from_owned(format!("/ww/0.1.0/vat/{cid}"))
-        .map_err(|e| capnp::Error::failed(format!("invalid protocol from schema CID: {e}")))
+/// Build a vat `StreamProtocol` from a caller-chosen service locator.
+///
+/// The locator is intentionally not type authority. Schema and artifact CIDs
+/// are returned as metadata by VatConnection, not embedded in the route.
+pub fn vat_protocol(protocol: &str) -> Result<StreamProtocol, capnp::Error> {
+    if protocol.is_empty() {
+        return Err(capnp::Error::failed(
+            "vat protocol must not be empty".into(),
+        ));
+    }
+    if protocol.contains('/') {
+        return Err(capnp::Error::failed(format!(
+            "vat protocol must be a single path component, got {protocol:?}"
+        )));
+    }
+    StreamProtocol::try_from_owned(format!("/ww/0.1.0/vat/{protocol}"))
+        .map_err(|e| capnp::Error::failed(format!("invalid vat protocol {protocol:?}: {e}")))
 }
 
 /// Re-canonicalize a `Schema.Node` reader into raw single-segment bytes.
@@ -444,6 +458,7 @@ pub struct HostImpl {
     guard: Option<EpochGuard>,
     stream_control: Option<libp2p_stream::Control>,
     route_registry: Option<crate::dispatch::RouteRegistry>,
+    executor_resolver: Option<Rc<dyn vat_listener::ExecutorResolver>>,
 }
 
 impl HostImpl {
@@ -461,12 +476,23 @@ impl HostImpl {
             guard,
             stream_control,
             route_registry: None,
+            executor_resolver: None,
         }
     }
 
     /// Set the HTTP route registry for WAGI service integration.
     pub fn with_route_registry(mut self, registry: crate::dispatch::RouteRegistry) -> Self {
         self.route_registry = Some(registry);
+        self
+    }
+
+    /// Set the host-side provenance resolver used by VatListener to reject
+    /// guest-implemented fake Executor capabilities.
+    pub fn with_executor_resolver(
+        mut self,
+        resolver: Rc<dyn vat_listener::ExecutorResolver>,
+    ) -> Self {
+        self.executor_resolver = Some(resolver);
         self
     }
 
@@ -561,9 +587,12 @@ impl system_capnp::host::Server for HostImpl {
         let stream_dialer: system_capnp::stream_dialer::Client = capnp_rpc::new_client(
             stream_dialer::StreamDialerImpl::new(stream_control.clone(), guard.clone()),
         );
-        let vat_listener: system_capnp::vat_listener::Client = capnp_rpc::new_client(
-            vat_listener::VatListenerImpl::new(stream_control.clone(), guard.clone()),
-        );
+        let vat_listener: system_capnp::vat_listener::Client =
+            capnp_rpc::new_client(vat_listener::VatListenerImpl::with_executor_resolver(
+                stream_control.clone(),
+                guard.clone(),
+                self.executor_resolver.clone(),
+            ));
         let vat_client: system_capnp::vat_client::Client = capnp_rpc::new_client(
             vat_client::VatClientImpl::new(stream_control, guard.clone()),
         );
@@ -832,7 +861,7 @@ mod tests {
     }
 
     // =========================================================================
-    // schema_cid / schema_protocol tests
+    // schema_cid / vat_protocol tests
     // =========================================================================
 
     #[test]
@@ -868,14 +897,17 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_protocol_builds_valid_protocol() {
-        let schema = b"test schema";
-        let cid_str = super::schema_cid(schema);
-        let protocol = super::schema_protocol(&cid_str);
+    fn test_vat_protocol_builds_valid_protocol() {
+        let protocol = super::vat_protocol("chess");
         assert!(protocol.is_ok());
         let proto = protocol.unwrap();
-        assert!(proto.as_ref().starts_with("/ww/0.1.0/"));
-        assert!(proto.as_ref().contains(&cid_str));
+        assert_eq!(proto.as_ref(), "/ww/0.1.0/vat/chess");
+    }
+
+    #[test]
+    fn test_vat_protocol_rejects_path_separators() {
+        let protocol = super::vat_protocol("bad/name");
+        assert!(protocol.is_err());
     }
 
     // =========================================================================
@@ -1390,8 +1422,67 @@ mod tests {
         capnp_rpc::new_client(StubExecutor)
     }
 
+    struct TestExecutorResolver {
+        metadata: Result<vat_listener::ExecutorVatMetadata, String>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl vat_listener::ExecutorResolver for TestExecutorResolver {
+        async fn resolve(
+            &self,
+            _executor: system_capnp::executor::Client,
+        ) -> Result<vat_listener::ExecutorVatMetadata, capnp::Error> {
+            self.metadata.clone().map_err(capnp::Error::failed)
+        }
+    }
+
+    fn test_schema_bundle_bytes() -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut root = message.init_root::<system_capnp::schema_bundle::Builder>();
+            root.set_format_version(schema_id::SCHEMA_BUNDLE_FORMAT_VERSION);
+            root.set_service_interface_id(0xd0ac_8299_df07_9c61);
+            let nodes = root.init_nodes(1);
+            let mut node = nodes.get(0);
+            node.set_id(0xd0ac_8299_df07_9c61);
+            node.set_display_name("test.capnp:ChessEngine");
+            node.init_interface();
+        }
+        let reader: system_capnp::schema_bundle::Reader<'_> =
+            message.get_root_as_reader().expect("schema bundle root");
+        let mut canonical = capnp::message::Builder::new_default();
+        canonical
+            .set_root_canonical(reader)
+            .expect("canonical schema bundle");
+        let segments = canonical.get_segments_for_output();
+        assert_eq!(segments.len(), 1);
+        segments[0].to_vec()
+    }
+
+    fn test_vat_metadata() -> vat_listener::ExecutorVatMetadata {
+        let schema_bundle = test_schema_bundle_bytes();
+        schema_id::validate_schema_bundle(&schema_bundle).expect("valid test schema bundle");
+        vat_listener::ExecutorVatMetadata {
+            wasm_artifact_cid: schema_id::compute_cid_bytes(b"test wasm artifact"),
+            schema_bundle_cid: schema_id::compute_cid_bytes(&schema_bundle),
+            schema_bundle,
+        }
+    }
+
+    fn resolver_with_metadata() -> Rc<dyn vat_listener::ExecutorResolver> {
+        Rc::new(TestExecutorResolver {
+            metadata: Ok(test_vat_metadata()),
+        })
+    }
+
+    fn rejecting_resolver(message: &str) -> Rc<dyn vat_listener::ExecutorResolver> {
+        Rc::new(TestExecutorResolver {
+            metadata: Err(message.to_string()),
+        })
+    }
+
     #[tokio::test]
-    async fn test_vat_listener_empty_schema_param_errors() {
+    async fn test_vat_listener_without_resolver_errors() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1404,23 +1495,45 @@ mod tests {
                 let executor = stub_executor();
 
                 let mut req = listener.listen_request();
-                {
-                    let mut handler = req.get().init_handler();
-                    handler.set_spawn(executor);
-                }
-                req.get().set_schema(&[]); // empty schema
+                req.get().set_executor(executor);
+                req.get().set_protocol("chess");
 
                 let result = req.send().promise.await;
-                assert!(result.is_err(), "empty schema param should error");
+                assert!(result.is_err(), "missing resolver should error");
             })
             .await;
     }
 
-    // (test_vat_listener_empty_schema_section_errors removed — schema is now
-    // an explicit param, tested by test_vat_listener_empty_schema_param_errors)
+    #[tokio::test]
+    async fn test_vat_listener_resolver_rejection_errors() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_tx, guard) = test_epoch_guard(1);
+                let listener_impl = vat_listener::VatListenerImpl::with_executor_resolver(
+                    dummy_stream_control(),
+                    guard,
+                    Some(rejecting_resolver("fake executor rejected")),
+                );
+                let listener: system_capnp::vat_listener::Client =
+                    capnp_rpc::new_client(listener_impl);
+
+                let mut req = listener.listen_request();
+                req.get().set_executor(stub_executor());
+                req.get().set_protocol("chess");
+
+                let result = req.send().promise.await;
+                let Err(error) = result else {
+                    panic!("resolver rejection should error");
+                };
+                let message = error.to_string();
+                assert!(message.contains("fake executor rejected"), "got: {message}");
+            })
+            .await;
+    }
 
     #[tokio::test]
-    async fn test_vat_client_empty_schema_errors() {
+    async fn test_vat_client_empty_protocol_errors() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1433,10 +1546,10 @@ mod tests {
                 let keypair = libp2p::identity::Keypair::generate_ed25519();
                 let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
                 req.get().set_peer(&peer_id.to_bytes());
-                req.get().set_schema(&[]); // empty schema
+                req.get().set_protocol("");
 
                 let result = req.send().promise.await;
-                assert!(result.is_err(), "empty schema should error");
+                assert!(result.is_err(), "empty protocol should error");
             })
             .await;
     }
@@ -1452,7 +1565,7 @@ mod tests {
 
                 let mut req = dialer.dial_request();
                 req.get().set_peer(&[0xFF, 0xFF, 0xFF]); // garbage peer ID
-                req.get().set_schema(b"valid schema bytes");
+                req.get().set_protocol("chess");
 
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "invalid peer ID should error");
@@ -1482,11 +1595,8 @@ mod tests {
                 let executor = stub_executor();
 
                 let mut req = listener.listen_request();
-                {
-                    let mut handler = req.get().init_handler();
-                    handler.set_spawn(executor);
-                }
-                req.get().set_schema(b"some schema");
+                req.get().set_executor(executor);
+                req.get().set_protocol("chess");
 
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "stale epoch should error");
@@ -1516,7 +1626,7 @@ mod tests {
 
                 let mut req = dialer.dial_request();
                 req.get().set_peer(&peer_id.to_bytes());
-                req.get().set_schema(b"some schema");
+                req.get().set_protocol("chess");
 
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "stale epoch should error");
@@ -1535,36 +1645,35 @@ mod tests {
                 let control1 = behaviour.new_control();
                 let control2 = behaviour.new_control();
 
-                let listener1 = vat_listener::VatListenerImpl::new(control1, guard.clone());
+                let listener1 = vat_listener::VatListenerImpl::with_executor_resolver(
+                    control1,
+                    guard.clone(),
+                    Some(resolver_with_metadata()),
+                );
                 let client1: system_capnp::vat_listener::Client = capnp_rpc::new_client(listener1);
 
-                let listener2 = vat_listener::VatListenerImpl::new(control2, guard);
+                let listener2 = vat_listener::VatListenerImpl::with_executor_resolver(
+                    control2,
+                    guard,
+                    Some(resolver_with_metadata()),
+                );
                 let client2: system_capnp::vat_listener::Client = capnp_rpc::new_client(listener2);
 
                 let executor = stub_executor();
 
-                // Both registrations use the same schema → same protocol CID.
-                let schema = b"some schema bytes";
-
                 // First registration should succeed.
                 let mut req1 = client1.listen_request();
-                {
-                    let mut handler = req1.get().init_handler();
-                    handler.set_spawn(executor.clone());
-                }
-                req1.get().set_schema(schema);
+                req1.get().set_executor(executor.clone());
+                req1.get().set_protocol("chess");
                 req1.send()
                     .promise
                     .await
                     .expect("first listen should succeed");
 
-                // Second registration with same schema should fail (same protocol CID).
+                // Second registration with same service protocol should fail.
                 let mut req2 = client2.listen_request();
-                {
-                    let mut handler = req2.get().init_handler();
-                    handler.set_spawn(executor);
-                }
-                req2.get().set_schema(schema);
+                req2.get().set_executor(executor);
+                req2.get().set_protocol("chess");
                 let result = req2.send().promise.await;
                 assert!(
                     result.is_err(),
@@ -1591,33 +1700,40 @@ mod tests {
         }
     }
 
-    /// End-to-end: pass schema bytes and an Executor to VatListener,
-    /// and verify it successfully registers a protocol.
+    /// End-to-end: pass an Executor to VatListener, resolve host-derived
+    /// metadata, and verify listen returns the CIDs.
     #[tokio::test]
-    async fn test_vat_listener_accepts_valid_schema_and_handler() {
+    async fn test_vat_listener_accepts_valid_executor_metadata() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let (_tx, guard) = test_epoch_guard(1);
-                let listener_impl =
-                    vat_listener::VatListenerImpl::new(dummy_stream_control(), guard);
+                let expected = test_vat_metadata();
+                let listener_impl = vat_listener::VatListenerImpl::with_executor_resolver(
+                    dummy_stream_control(),
+                    guard,
+                    Some(Rc::new(TestExecutorResolver {
+                        metadata: Ok(expected.clone()),
+                    })),
+                );
                 let listener: system_capnp::vat_listener::Client =
                     capnp_rpc::new_client(listener_impl);
 
                 let executor = stub_executor();
 
                 let mut req = listener.listen_request();
-                {
-                    let mut handler = req.get().init_handler();
-                    handler.set_spawn(executor);
-                }
-                req.get().set_schema(b"valid schema bytes");
+                req.get().set_executor(executor);
+                req.get().set_protocol("chess");
 
-                let result = req.send().promise.await;
-                assert!(
-                    result.is_ok(),
-                    "valid schema + handler should be accepted: {:?}",
-                    result.err()
+                let response = req.send().promise.await.expect("listen should succeed");
+                let results = response.get().expect("listen results");
+                assert_eq!(
+                    results.get_wasm_artifact_cid().unwrap().to_vec(),
+                    expected.wasm_artifact_cid
+                );
+                assert_eq!(
+                    results.get_schema_bundle_cid().unwrap().to_vec(),
+                    expected.schema_bundle_cid
                 );
             })
             .await;

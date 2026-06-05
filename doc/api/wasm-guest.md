@@ -222,19 +222,39 @@ Full interface reference for the capabilities available to guests.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `listen` | `(handler: VatHandler, schema: Data) -> ()` | Accept connections on `/ww/0.1.0/vat/{cid}` where cid = CIDv1(raw, BLAKE3(schema)). VatHandler is a union: `spawn` (Executor) for stateless per-connection cells, or `serve` (AnyPointer) for a persistent bootstrap capability. |
+| `listen` | `(executor: Executor, protocol: Text, caps: List(Export)) -> (wasmArtifactCid: Data, schemaBundleCid: Data)` | Accept connections on `/ww/0.1.0/vat/{protocol}`. `protocol` is a caller-chosen service name/locator, not type authority. The host derives both CIDs from the same host-minted `Runtime.load` executor that will spawn the vat cell. |
 
 ### VatClient (capability mode)
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `dial` | `(peer: Data, schema: Data) -> (cap: AnyPointer)` | Open connection to peer on `/ww/0.1.0/vat/{cid}`. Bootstrap RPC, return remote's capability. Type-erased. |
+| `dial` | `(peer: Data, protocol: Text) -> (connection: VatConnection)` | Open connection to peer on `/ww/0.1.0/vat/{protocol}`. Use `connection.describe()` to inspect trusted metadata without spawning, then `connection.bind()` to lazily obtain the exported app capability. |
+
+### VatConnection (capability mode)
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `describe` | `() -> (info: VatServiceInfo)` | Return `wasmArtifactCid`, `schemaBundleCid`, and typed `SchemaBundle` metadata without spawning a cell. |
+| `bind` | `() -> (schemaBundle: SchemaBundle, cap: AnyPointer)` | Lazily spawn once for executor-bound services. Repeated calls on the same connection return the same schema and cap. |
 
 ## Service Cell Registration
 
 The host does not inspect WASM custom sections to decide whether a binary is a
 raw, HTTP, or vat service cell. Listener capabilities receive their routing
 inputs explicitly at registration time.
+
+Vat cells must embed canonical `SchemaBundle` bytes in the `ww.schema.v1` WASM
+custom section. `Runtime.load` records schema metadata but remains transport
+neutral; `VatListener.listen` is where missing or invalid vat schema metadata
+fails clearly.
+
+Glia registration forms:
+
+```clojure
+(perform host :listen :vat "greeter" (cell (load "bin/greeter.wasm")))
+(perform host :listen :http "/status" (cell (load "bin/status.wasm")))
+(perform host :listen :raw "echo" runtime (load "bin/echo.wasm"))
+```
 
 ## Implementation Constraints
 

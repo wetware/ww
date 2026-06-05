@@ -26,7 +26,7 @@ curl http://localhost:2080/status
 The second command hit a WebAssembly cell running inside the daemon. The cell can't read your filesystem, reach the network, or see your environment variables. The only thing it can do is what the membrane handed it; in this case, the `host` capability, so it can report your peer ID and connected peers. The wiring that hands the `host` capability (and nothing else) to the HTTP handler cell lives at `~/.ww/etc/init.d/05-status.glia`:
 
 ```clojure
-(perform host :listen (cell (load "bin/status.wasm")) "/status")
+(perform host :listen :http "/status" (cell (load "bin/status.wasm")))
 ```
 
 That's the whole registration.

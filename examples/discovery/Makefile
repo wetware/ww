@@ -1,4 +1,4 @@
-# Discovery — Greeter vat cell with schema-keyed peer discovery
+# Discovery — Greeter vat cell with service-name peer discovery
 #
 # Usage: make -C examples/discovery
 
@@ -20,6 +20,12 @@ all:
 			cp "$$GREETER_OUT" bin/discovery.capnpc; \
 		else \
 			echo "WARNING: greeter_schema.bin not found"; \
+		fi
+	@GREETER_BUNDLE=$$(find $(ROOT)/target/$(WASM_TARGET)/release/build -path '*/discovery-*/out/greeter_schema_bundle.bin' | head -1) && \
+		if [ -n "$$GREETER_BUNDLE" ]; then \
+			$(CARGO) run -q -p schema-id --bin schema-bundle-inject -- bin/discovery.wasm "$$GREETER_BUNDLE"; \
+		else \
+			echo "WARNING: greeter_schema_bundle.bin not found"; \
 		fi
 
 clean:

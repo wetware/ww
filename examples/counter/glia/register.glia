@@ -1,4 +1,4 @@
 ; Demo snippet: register counter HTTP handler.
 (def counter (cell (load "bin/counter.wasm")))
 
-(perform host :listen counter "/counter")
+(perform host :listen :http "/counter" counter)

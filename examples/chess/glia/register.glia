@@ -1,5 +1,4 @@
 ; Demo snippet: register ChessEngine vat handler.
 (def chess-wasm (load "bin/chess-demo.wasm"))
-(def chess-schema (load "bin/chess-demo.capnpc"))
 
-(perform host :listen runtime chess-wasm chess-schema)
+(perform host :listen :vat "chess" (cell chess-wasm))

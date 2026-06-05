@@ -35,12 +35,16 @@ fn main() {
 
     let schemas = schema_id::extract_schemas(&raw_request, &[("SHELL", shell_id)])
         .expect("extract Shell schema");
+    let bundles = schema_id::extract_schema_bundles(&raw_request, &[("SHELL", shell_id)])
+        .expect("extract Shell schema bundle");
 
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
     schema_id::write_schema_bytes(&out_dir.join("shell_schema.bin"), &schemas[0])
         .expect("write schema bytes");
+    schema_id::write_schema_bundle_bytes(&out_dir.join("shell_schema_bundle.bin"), &bundles[0])
+        .expect("write schema bundle bytes");
 
     // Auction schema — needed for :compare handler to dial ComputeProviders.
     let auction_schema = manifest_path
@@ -66,6 +70,9 @@ fn main() {
     let auction_schemas =
         schema_id::extract_schemas(&auction_raw, &[("COMPUTE_PROVIDER", provider_id)])
             .expect("extract ComputeProvider schema");
+    let auction_bundles =
+        schema_id::extract_schema_bundles(&auction_raw, &[("COMPUTE_PROVIDER", provider_id)])
+            .expect("extract ComputeProvider schema bundle");
 
     let auction_consts_path = out_dir.join("auction_schema_ids.rs");
     schema_id::emit_schema_consts(&auction_consts_path, &auction_schemas)
@@ -73,6 +80,11 @@ fn main() {
 
     schema_id::write_schema_bytes(&out_dir.join("auction_schema.bin"), &auction_schemas[0])
         .expect("write auction schema bytes");
+    schema_id::write_schema_bundle_bytes(
+        &out_dir.join("auction_schema_bundle.bin"),
+        &auction_bundles[0],
+    )
+    .expect("write auction schema bundle bytes");
 
     // Cargo rebuild triggers
     println!(

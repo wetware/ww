@@ -702,6 +702,7 @@ fn main() {{
     // Pass 1: shared schemas
     capnpc::CompilerCommand::new()
         .src_prefix(&capnp_dir)
+        .crate_provides("capnp", [0xa93fc509624c72d9])
         .file(capnp_dir.join("system.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("auth.capnp"))
@@ -728,12 +729,22 @@ fn main() {{
         &[("{const_name}", iface_id)],
     )
     .expect("extract schema");
+    let bundles = schema_id::extract_schema_bundles(
+        &raw_request,
+        &[("{const_name}", iface_id)],
+    )
+    .expect("extract schema bundle");
 
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
     schema_id::write_schema_bytes(&out_dir.join("{name}_schema.bin"), &schemas[0])
         .expect("write schema bytes");
+    schema_id::write_schema_bundle_bytes(
+        &out_dir.join("{name}_schema_bundle.bin"),
+        &bundles[0],
+    )
+    .expect("write schema bundle bytes");
 
     for schema in &["system", "routing", "auth", "membrane", "stem", "http"] {{
         println!(
@@ -912,9 +923,8 @@ wasip2::cli::command::export!({iface_name}Guest);
 ;   (executor run (load "bin/{name}.wasm") "serve")
 
 (def {snake_name}-wasm (load "bin/{name}.wasm"))
-(def {snake_name}-schema (load "bin/{name}.capnpc"))
 
-(perform host :listen executor {snake_name}-wasm {snake_name}-schema)
+(perform host :listen :vat "{name}" (cell {snake_name}-wasm))
 "#,
             snake_name = name.replace('-', "_"),
         );
@@ -1029,6 +1039,17 @@ wasip2::cli::command::export!({iface_name}Guest);
             ))?;
             println!("  bin/{crate_name}.capnpc");
         }
+        if let Ok(bundle_bin) = Self::find_schema_bundle_bin(&build_dir, &path) {
+            let wasm_bytes = std::fs::read(&dst_wasm)
+                .with_context(|| format!("Failed to read {}", dst_wasm.display()))?;
+            let bundle_bytes = std::fs::read(&bundle_bin)
+                .with_context(|| format!("Failed to read {}", bundle_bin.display()))?;
+            let injected = schema_id::inject_schema_bundle_section(&wasm_bytes, &bundle_bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to inject ww.schema.v1: {e}"))?;
+            std::fs::write(&dst_wasm, injected)
+                .with_context(|| format!("Failed to write {}", dst_wasm.display()))?;
+            println!("  bin/{crate_name}.wasm: embedded ww.schema.v1");
+        }
 
         println!("Build complete: {}", path.display());
         Ok(())
@@ -1067,6 +1088,35 @@ wasip2::cli::command::export!({iface_name}Guest);
              \n\
              The project's build.rs should produce this file.\n\
              Make sure the build.rs calls schema_id::write_schema_bytes()."
+        )
+    }
+
+    /// Find the `*_schema_bundle.bin` file in the cargo build output.
+    fn find_schema_bundle_bin(build_dir: &Path, project_dir: &Path) -> Result<PathBuf> {
+        let project_name = project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("Invalid project directory name")?
+            .replace('-', "_");
+
+        let pattern = format!("{project_name}_schema_bundle.bin");
+
+        if build_dir.exists() {
+            for entry in std::fs::read_dir(build_dir)? {
+                let entry = entry?;
+                let out_dir = entry.path().join("out");
+                let candidate = out_dir.join(&pattern);
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
+            }
+        }
+
+        bail!(
+            "Schema bundle binary not found: {pattern}\n\
+             \n\
+             The project's build.rs should produce this file.\n\
+             Make sure the build.rs calls schema_id::write_schema_bundle_bytes()."
         )
     }
 

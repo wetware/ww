@@ -9,14 +9,14 @@ Symmetric peer-to-peer context sharing for LLMs.
 - **Rate limiting as capability wrapper** -- token bucket intrinsic to the Prompt object, not an external policy check
 - **Content-addressed push** -- context pushed as IPFS CIDs, resolved from the receiver's local content store
 - **Local LLM integration** -- HttpClient POST to Ollama/llama-server, no cloud APIs
-- **Schema-keyed DHT discovery** -- peers running Mindshare find each other automatically via schema CID
+- **Service-name vat registration** -- peers publish the `mindshare` service locator
 
 ## How it works
 
 ```
 Louis                        DHT                        Casey
   |                           |                           |
-  |-- find_providers(BD) ---->|                           |
+  |-- find_providers(key("mindshare")) ------------------>|
   |<-- [casey, ...] ----------|                           |
   |                           |                           |
   |-- dial + trust ceremony --------------------------->  |
@@ -137,7 +137,7 @@ Then load the same snippets:
 / > (load "glia/serve.glia")
 ```
 
-The two peers will discover each other via DHT and exchange Mindshare
+The intended full example will discover peers via DHT and exchange Mindshare
 capabilities automatically.
 
 > **Note:** Cell logic is currently a stub. The snippet wiring and
@@ -150,10 +150,9 @@ capabilities automatically.
 ```clojure
 ;; Define and register the Mindshare vat cell.
 (def mindshare
-  (cell (load "bin/mindshare.wasm")
-        (load "bin/mindshare.capnpc")))
+  (cell (load "bin/mindshare.wasm")))
 
-(perform host :listen mindshare)
+(perform host :listen :vat "mindshare" mindshare)
 ```
 
 `glia/serve.glia`:
@@ -200,8 +199,7 @@ examples/mindshare/
 ├── README.md              # this file
 ├── mindshare.capnp        # Mindshare schema source
 ├── bin/                   # build output (gitignored)
-│   ├── mindshare.wasm
-│   └── mindshare.capnpc   # compiled schema bytes
+│   └── mindshare.wasm     # final WASM with ww.schema.v1
 ├── glia/
 │   ├── register.glia      # shell-loaded registration
 │   └── serve.glia         # DHT provide loop

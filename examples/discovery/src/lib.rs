@@ -1,7 +1,7 @@
-//! Discovery guest: two-agent Greeter demo via schema-keyed RPC.
+//! Discovery guest: two-agent Greeter demo via service-name vat RPC.
 //!
 //! Demonstrates the full Wetware discovery flow:
-//!   build → schema-inject → IPFS push → provide on DHT →
+//!   build → schema-inject → provide service locator on DHT →
 //!   findProviders → dial via VatClient → typed RPC call
 //!
 //! Two modes, selected by subcommand:
@@ -9,8 +9,9 @@
 //! **Cell mode** (no args, default): spawned by VatListener per RPC
 //! connection. Creates a Greeter and exports it via `system::serve()`.
 //!
-//! **`serve`**: provides the schema CID on the DHT, discovers peers via
-//! `routing.find_providers()`, dials them via `VatClient`, calls `greet()`.
+//! **`serve`**: provides the greeter service locator on the DHT, discovers
+//! peers via `routing.find_providers()`, dials them via `VatClient`, binds the
+//! returned `VatConnection`, and calls `greet()`.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -63,6 +64,8 @@ mod greeter_capnp {
 // Build-time schema constants: GREETER_SCHEMA (&[u8]) and GREETER_CID (&str).
 include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
+const GREETER_SERVICE: &str = "greeter";
+
 /// Bootstrap capability: the concrete Membrane defined in membrane.capnp.
 type Membrane = membrane_capnp::membrane::Client;
 
@@ -94,6 +97,22 @@ fn short_id(peer_id: &[u8]) -> String {
     } else {
         h
     }
+}
+
+async fn service_key(
+    routing: &routing_capnp::routing::Client,
+    service: &str,
+) -> Result<String, capnp::Error> {
+    let mut req = routing.hash_request();
+    req.get().set_data(service.as_bytes());
+    let resp = req.send().promise.await?;
+    let key = resp
+        .get()?
+        .get_key()?
+        .to_str()
+        .map_err(|e| capnp::Error::failed(e.to_string()))?
+        .to_string();
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -228,9 +247,11 @@ async fn greet_peer(
 
     let mut req = vat_client.dial_request();
     req.get().set_peer(peer_id);
-    req.get().set_schema(GREETER_SCHEMA);
+    req.get().set_protocol(GREETER_SERVICE);
     let resp = req.send().promise.await?;
-    let greeter: greeter_capnp::greeter::Client = resp.get()?.get_cap().get_as_capability()?;
+    let connection = resp.get()?.get_connection()?;
+    let bind_resp = connection.bind_request().send().promise.await?;
+    let greeter: greeter_capnp::greeter::Client = bind_resp.get()?.get_cap().get_as_capability()?;
 
     let mut greet_req = greeter.greet_request();
     greet_req.get().set_name(format!("peer {us}"));
@@ -262,8 +283,9 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
 
     let id_resp = host.id_request().send().promise.await?;
     let self_id = id_resp.get()?.get_peer_id()?.to_vec();
+    let dht_key = service_key(&routing, GREETER_SERVICE).await?;
     log::info!("service: peer {}", short_id(&self_id));
-    log::info!("service: schema CID {GREETER_CID}");
+    log::info!("service: locator {GREETER_SERVICE}, schema CID {GREETER_CID}");
     log::info!("service: looking for peers...");
 
     let seen = Rc::new(RefCell::new(HashSet::<Vec<u8>>::new()));
@@ -276,7 +298,7 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
 
         // Re-provide (DHT records expire).
         let mut provide_req = routing.provide_request();
-        provide_req.get().set_key(GREETER_CID);
+        provide_req.get().set_key(&dht_key);
         provide_req.send().promise.await?;
 
         // Search for peers; GreetingSink dials new ones via RPC.
@@ -288,7 +310,7 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
         let mut fp_req = routing.find_providers_request();
         {
             let mut b = fp_req.get();
-            b.set_key(GREETER_CID);
+            b.set_key(&dht_key);
             b.set_count(5);
             b.set_sink(sink);
         }
