@@ -75,8 +75,8 @@ pub fn schema_cid(schema_bytes: &[u8]) -> String {
 
 /// Build a vat `StreamProtocol` from a caller-chosen service locator.
 ///
-/// The locator is intentionally not type authority. Schema and artifact CIDs
-/// are returned as metadata by VatConnection, not embedded in the route.
+/// The locator is intentionally not type authority. VatConnection exposes the
+/// declared SchemaBundle; CIDs stay in tooling, logs, and distribution paths.
 pub fn vat_protocol(protocol: &str) -> Result<StreamProtocol, capnp::Error> {
     if protocol.is_empty() {
         return Err(capnp::Error::failed(
