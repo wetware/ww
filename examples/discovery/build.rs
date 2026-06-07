@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 /// Build script for the discovery example.
 ///
 /// Compiles greeter.capnp and shared system schemas, extracts the
-/// Greeter interface's canonical bytes, and derives its schema CID.
+/// Greeter interface's canonical bytes, and derives its schema CID metadata.
 ///
 /// The schema CID pipeline:
 ///   greeter.capnp → capnpc (CodeGeneratorRequest)
 ///                 → find Greeter interface node by name
 ///                 → schema_id::extract_schemas (canonical bytes + BLAKE3)
-///                 → `GREETER_SCHEMA_CID` const in generated Rust
-///                 → schema bytes passed explicitly via RPC at runtime
+///                 → `GREETER_CID` const in generated Rust
+///                 → schema bytes copied next to the WASM for tooling
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);

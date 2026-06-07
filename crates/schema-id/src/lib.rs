@@ -1,7 +1,7 @@
 //! Build-time helper for content-addressed Cap'n Proto schema identification.
 //!
 //! Extracts canonical schema bytes from a `CodeGeneratorRequest` and derives
-//! deterministic CIDs for use as subprotocol addresses and DHT keys.
+//! deterministic CIDs for schema metadata, diagnostics, and tooling.
 //!
 //! # Usage in build.rs
 //!

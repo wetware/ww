@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 /// Build script for the mindshare example.
 ///
 /// Compiles mindshare.capnp and shared system schemas, extracts the
-/// Mindshare interface's canonical bytes, and derives its schema CID.
+/// Mindshare interface's canonical bytes, and derives its schema CID metadata.
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);

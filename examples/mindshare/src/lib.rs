@@ -18,7 +18,10 @@ use wasip2::exports::cli::run::Guest;
 // mod mindshare_capnp { include!(concat!(env!("OUT_DIR"), "/mindshare_capnp.rs")); }
 
 // Build-time schema constants: MINDSHARE_SCHEMA (&[u8]) and MINDSHARE_CID (&str).
+// Vat publication will use the service name below; the schema CID is metadata.
 include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
+
+const MINDSHARE_SERVICE: &str = "mindshare";
 
 // ---------------------------------------------------------------------------
 // Logging (WASI stderr)
@@ -62,8 +65,8 @@ impl Guest for MindshareGuest {
     fn run() -> Result<(), ()> {
         init_logging();
         // Stub: cell logic will be implemented in a follow-up PR.
-        // For now, just verify the schema compiles and CID is derived.
-        log::info!("mindshare schema CID: {MINDSHARE_CID}");
+        // For now, just verify the schema compiles.
+        log::info!("mindshare service name: {MINDSHARE_SERVICE}");
         Ok(())
     }
 }

@@ -3,17 +3,16 @@
 //! Demonstrates:
 //!   - FuelPolicy::Oneshot for budget-tracked cell execution
 //!   - Identity.signer() for domain-scoped signing (quotes)
-//!   - VatHandler::Serve for persistent capability export
+//!   - VatListener.serve for persistent capability export
 //!   - DHT discovery via routing.provide()
 //!   - Runtime.load() + Executor.spawn() for spawning child cells
 //!
 //! Three modes, selected by subcommand:
 //!
-//! **Cell mode** (no args, default): spawned by VatListener per RPC
-//! connection.  Creates a ComputeProvider and exports it via
-//! `system::serve()`.
+//! **Cell mode** (no args, default): creates a ComputeProvider and exports it
+//! via `system::serve()`.
 //!
-//! **`serve`**: provides schema CID on the DHT, re-provides periodically.
+//! **`serve`**: provides on the DHT, re-provides periodically.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -64,7 +63,10 @@ mod auction_capnp {
 }
 
 // Build-time schema constants: COMPUTE_PROVIDER_SCHEMA (&[u8]) and COMPUTE_PROVIDER_CID (&str).
+// Vat publication uses the service name below; the schema CID is metadata.
 include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
+
+const AUCTION_SERVICE: &str = "auction";
 
 type Membrane = membrane_capnp::membrane::Client;
 
@@ -92,6 +94,22 @@ fn short_id(peer_id: &[u8]) -> String {
     } else {
         h
     }
+}
+
+async fn routing_key(
+    routing: &routing_capnp::routing::Client,
+    service: &str,
+) -> Result<String, capnp::Error> {
+    let mut req = routing.hash_request();
+    req.get().set_data(service.as_bytes());
+    let resp = req.send().promise.await?;
+    let key = resp
+        .get()?
+        .get_key()?
+        .to_str()
+        .map_err(|e| capnp::Error::failed(e.to_string()))?
+        .to_string();
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -556,8 +574,8 @@ fn run_cell() {
             // NOTE: In the current system::serve() API, the bootstrap cap must
             // be passed before the async block.  Since we need membrane caps
             // first, we use system::run() and hold the connection open.
-            // The provider is accessible via VatHandler::Serve in the init.d
-            // script, which passes the persistent capability directly.
+            // The publisher can obtain this bootstrap cap and pass it to
+            // VatListener.serve as a persistent capability.
             let _ = client;
 
             // Keep the cell alive.
@@ -595,11 +613,13 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
     let id_resp = host.id_request().send().promise.await?;
     let self_id = id_resp.get()?.get_peer_id()?.to_vec();
     log::info!("auction: peer {}", short_id(&self_id));
-    log::info!("auction: schema CID {COMPUTE_PROVIDER_CID}");
+    log::info!("auction: service name {AUCTION_SERVICE}");
+    let service_key = routing_key(&routing, AUCTION_SERVICE).await?;
+    log::info!("auction: routing key {service_key}");
 
-    // Provide schema CID on DHT for discovery.
+    // Provide service-name routing key on DHT for discovery.
     let mut provide_req = routing.provide_request();
-    provide_req.get().set_key(COMPUTE_PROVIDER_CID);
+    provide_req.get().set_key(&service_key);
     provide_req.send().promise.await?;
     log::info!("auction: provided on DHT");
 
@@ -607,7 +627,7 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
     let mut cooldown_ms: u64 = 30_000;
     loop {
         let mut provide_req = routing.provide_request();
-        provide_req.get().set_key(COMPUTE_PROVIDER_CID);
+        provide_req.get().set_key(&service_key);
         let _ = provide_req.send().promise.await;
 
         let pause = wasip2::clocks::monotonic_clock::subscribe_duration(cooldown_ms * 1_000_000);
@@ -666,7 +686,7 @@ impl Guest for AuctionGuest {
         init_logging();
 
         // HTTP/WAGI mode: detected by CGI env var presence.
-        // HttpListener injects REQUEST_METHOD; VatListener does not.
+        // HttpListener injects REQUEST_METHOD; vat publication does not.
         if std::env::var("REQUEST_METHOD").is_ok() {
             return run_http();
         }
@@ -677,7 +697,7 @@ impl Guest for AuctionGuest {
                 system::run(|membrane: Membrane| async move { run_service(membrane).await });
             }
             _ => {
-                // Default (no args): cell mode — spawned by VatListener.
+                // Default (no args): cell mode — export the ComputeProvider capability.
                 run_cell();
             }
         }

@@ -58,24 +58,34 @@ pub enum SwarmCommand {
     },
 }
 
-/// Derive a content-addressed protocol ID from canonical schema bytes.
-///
-/// The input is the canonical Cap'n Proto encoding of a `schema.Node`, which
-/// includes the 64-bit unique type ID. Two interfaces with identical structure
-/// but different type IDs produce different CIDs.
-///
-/// Returns the CID as a string: `CIDv1(raw, BLAKE3(schema_bytes))`.
-pub fn schema_cid(schema_bytes: &[u8]) -> String {
-    let digest = blake3::hash(schema_bytes);
-    let mh = cid::multihash::Multihash::<64>::wrap(0x1e, digest.as_bytes())
-        .expect("blake3 digest always fits in 64-byte multihash");
-    cid::Cid::new_v1(0x55, mh).to_string()
+fn validate_service_protocol_name(protocol: &str) -> Result<(), capnp::Error> {
+    if protocol.is_empty() {
+        return Err(capnp::Error::failed(
+            "protocol name must not be empty".into(),
+        ));
+    }
+    if protocol.contains('/') {
+        return Err(capnp::Error::failed(
+            "protocol name must not contain '/'".into(),
+        ));
+    }
+    Ok(())
 }
 
-/// Build a `StreamProtocol` from a schema CID string.
-pub fn schema_protocol(cid: &str) -> Result<StreamProtocol, capnp::Error> {
-    StreamProtocol::try_from_owned(format!("/ww/0.1.0/vat/{cid}"))
-        .map_err(|e| capnp::Error::failed(format!("invalid protocol from schema CID: {e}")))
+/// Build the libp2p protocol for a vat service-name locator.
+///
+/// The protocol string is not authority; it only selects the remote service.
+pub fn vat_protocol(protocol: &str) -> Result<StreamProtocol, capnp::Error> {
+    validate_service_protocol_name(protocol)?;
+    StreamProtocol::try_from_owned(format!("/ww/0.1.0/vat/{protocol}"))
+        .map_err(|e| capnp::Error::failed(format!("invalid vat protocol: {e}")))
+}
+
+/// Build the libp2p protocol for a byte-stream service-name locator.
+pub fn stream_protocol(protocol: &str) -> Result<StreamProtocol, capnp::Error> {
+    validate_service_protocol_name(protocol)?;
+    StreamProtocol::try_from_owned(format!("/ww/0.1.0/stream/{protocol}"))
+        .map_err(|e| capnp::Error::failed(format!("invalid stream protocol: {e}")))
 }
 
 /// Re-canonicalize a `Schema.Node` reader into raw single-segment bytes.
@@ -832,50 +842,35 @@ mod tests {
     }
 
     // =========================================================================
-    // schema_cid / schema_protocol tests
+    // vat_protocol tests
     // =========================================================================
 
     #[test]
-    fn test_schema_cid_deterministic() {
-        let schema = b"some canonical schema bytes with id 0xdeadbeef";
-        let cid1 = super::schema_cid(schema);
-        let cid2 = super::schema_cid(schema);
-        assert_eq!(cid1, cid2, "same schema bytes must produce same CID");
-    }
-
-    #[test]
-    fn test_schema_cid_different_for_different_schemas() {
-        let schema_a = b"\x00\x00\x00\x00\x00\x00\x00\x01interface A";
-        let schema_b = b"\x00\x00\x00\x00\x00\x00\x00\x02interface A";
-        let cid_a = super::schema_cid(schema_a);
-        let cid_b = super::schema_cid(schema_b);
-        assert_ne!(
-            cid_a, cid_b,
-            "different type IDs must produce different CIDs"
-        );
-    }
-
-    #[test]
-    fn test_schema_cid_is_valid_cid() {
-        let schema = b"test schema node bytes";
-        let cid_str = super::schema_cid(schema);
-        // Must parse back as a valid CID.
-        let parsed = cid_str.parse::<cid::Cid>();
-        assert!(parsed.is_ok(), "schema_cid must produce a valid CID string");
-        let cid = parsed.unwrap();
-        assert_eq!(cid.version(), cid::Version::V1);
-        assert_eq!(cid.codec(), 0x55); // raw codec
-    }
-
-    #[test]
-    fn test_schema_protocol_builds_valid_protocol() {
-        let schema = b"test schema";
-        let cid_str = super::schema_cid(schema);
-        let protocol = super::schema_protocol(&cid_str);
+    fn test_vat_protocol_builds_valid_protocol() {
+        let protocol = super::vat_protocol("greeter");
         assert!(protocol.is_ok());
         let proto = protocol.unwrap();
-        assert!(proto.as_ref().starts_with("/ww/0.1.0/"));
-        assert!(proto.as_ref().contains(&cid_str));
+        assert_eq!(proto.as_ref(), "/ww/0.1.0/vat/greeter");
+    }
+
+    #[test]
+    fn test_vat_protocol_rejects_path_like_name() {
+        let err = super::vat_protocol("foo/bar").unwrap_err();
+        assert!(err.to_string().contains("must not contain '/'"));
+    }
+
+    #[test]
+    fn test_stream_protocol_builds_valid_protocol() {
+        let protocol = super::stream_protocol("echo");
+        assert!(protocol.is_ok());
+        let proto = protocol.unwrap();
+        assert_eq!(proto.as_ref(), "/ww/0.1.0/stream/echo");
+    }
+
+    #[test]
+    fn test_stream_protocol_rejects_path_like_name() {
+        let err = super::stream_protocol("foo/bar").unwrap_err();
+        assert!(err.to_string().contains("must not contain '/'"));
     }
 
     // =========================================================================
@@ -1371,56 +1366,32 @@ mod tests {
         libp2p_stream::Behaviour::new().new_control()
     }
 
-    /// Stub Executor for tests that need an executor::Client without real WASM.
-    struct StubExecutor;
-
-    #[allow(refining_impl_trait)]
-    impl system_capnp::executor::Server for StubExecutor {
-        fn spawn(
-            self: capnp::capability::Rc<Self>,
-            _params: system_capnp::executor::SpawnParams,
-            _results: system_capnp::executor::SpawnResults,
-        ) -> Promise<(), capnp::Error> {
-            Promise::err(capnp::Error::failed("stub executor".into()))
-        }
-    }
-
-    /// Create a stub Executor client for tests.
-    fn stub_executor() -> system_capnp::executor::Client {
-        capnp_rpc::new_client(StubExecutor)
-    }
-
     #[tokio::test]
-    async fn test_vat_listener_empty_schema_param_errors() {
+    async fn test_vat_listener_empty_protocol_errors() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
+                let (host, _server, _rx) = setup_rpc();
                 let (_tx, guard) = test_epoch_guard(1);
                 let listener_impl =
                     vat_listener::VatListenerImpl::new(dummy_stream_control(), guard);
                 let listener: system_capnp::vat_listener::Client =
                     capnp_rpc::new_client(listener_impl);
 
-                let executor = stub_executor();
-
-                let mut req = listener.listen_request();
-                {
-                    let mut handler = req.get().init_handler();
-                    handler.set_spawn(executor);
-                }
-                req.get().set_schema(&[]); // empty schema
+                let mut req = listener.serve_request();
+                req.get()
+                    .init_cap()
+                    .set_as_capability(host.client.hook.clone());
+                req.get().set_protocol("");
 
                 let result = req.send().promise.await;
-                assert!(result.is_err(), "empty schema param should error");
+                assert!(result.is_err(), "empty protocol should error");
             })
             .await;
     }
 
-    // (test_vat_listener_empty_schema_section_errors removed — schema is now
-    // an explicit param, tested by test_vat_listener_empty_schema_param_errors)
-
     #[tokio::test]
-    async fn test_vat_client_empty_schema_errors() {
+    async fn test_vat_client_empty_protocol_errors() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1433,10 +1404,10 @@ mod tests {
                 let keypair = libp2p::identity::Keypair::generate_ed25519();
                 let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
                 req.get().set_peer(&peer_id.to_bytes());
-                req.get().set_schema(&[]); // empty schema
+                req.get().set_protocol("");
 
                 let result = req.send().promise.await;
-                assert!(result.is_err(), "empty schema should error");
+                assert!(result.is_err(), "empty protocol should error");
             })
             .await;
     }
@@ -1452,7 +1423,7 @@ mod tests {
 
                 let mut req = dialer.dial_request();
                 req.get().set_peer(&[0xFF, 0xFF, 0xFF]); // garbage peer ID
-                req.get().set_schema(b"valid schema bytes");
+                req.get().set_protocol("greeter");
 
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "invalid peer ID should error");
@@ -1465,6 +1436,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
+                let (host, _server, _rx) = setup_rpc();
                 let (tx, guard) = test_epoch_guard(1);
                 let listener_impl =
                     vat_listener::VatListenerImpl::new(dummy_stream_control(), guard);
@@ -1479,14 +1451,11 @@ mod tests {
                 })
                 .unwrap();
 
-                let executor = stub_executor();
-
-                let mut req = listener.listen_request();
-                {
-                    let mut handler = req.get().init_handler();
-                    handler.set_spawn(executor);
-                }
-                req.get().set_schema(b"some schema");
+                let mut req = listener.serve_request();
+                req.get()
+                    .init_cap()
+                    .set_as_capability(host.client.hook.clone());
+                req.get().set_protocol("greeter");
 
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "stale epoch should error");
@@ -1516,7 +1485,7 @@ mod tests {
 
                 let mut req = dialer.dial_request();
                 req.get().set_peer(&peer_id.to_bytes());
-                req.get().set_schema(b"some schema");
+                req.get().set_protocol("greeter");
 
                 let result = req.send().promise.await;
                 assert!(result.is_err(), "stale epoch should error");
@@ -1529,6 +1498,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
+                let (host, _server, _rx) = setup_rpc();
                 let (_tx, guard) = test_epoch_guard(1);
                 // Share the same Behaviour so both listeners see the same protocol registry.
                 let behaviour = libp2p_stream::Behaviour::new();
@@ -1541,30 +1511,23 @@ mod tests {
                 let listener2 = vat_listener::VatListenerImpl::new(control2, guard);
                 let client2: system_capnp::vat_listener::Client = capnp_rpc::new_client(listener2);
 
-                let executor = stub_executor();
-
-                // Both registrations use the same schema → same protocol CID.
-                let schema = b"some schema bytes";
-
                 // First registration should succeed.
-                let mut req1 = client1.listen_request();
-                {
-                    let mut handler = req1.get().init_handler();
-                    handler.set_spawn(executor.clone());
-                }
-                req1.get().set_schema(schema);
+                let mut req1 = client1.serve_request();
+                req1.get()
+                    .init_cap()
+                    .set_as_capability(host.client.hook.clone());
+                req1.get().set_protocol("greeter");
                 req1.send()
                     .promise
                     .await
-                    .expect("first listen should succeed");
+                    .expect("first serve should succeed");
 
-                // Second registration with same schema should fail (same protocol CID).
-                let mut req2 = client2.listen_request();
-                {
-                    let mut handler = req2.get().init_handler();
-                    handler.set_spawn(executor);
-                }
-                req2.get().set_schema(schema);
+                // Second registration with the same service name should fail.
+                let mut req2 = client2.serve_request();
+                req2.get()
+                    .init_cap()
+                    .set_as_capability(host.client.hook.clone());
+                req2.get().set_protocol("greeter");
                 let result = req2.send().promise.await;
                 assert!(
                     result.is_err(),
@@ -1574,49 +1537,30 @@ mod tests {
             .await;
     }
 
-    #[test]
-    fn test_schema_cid_matches_schema_id_compute_cid() {
-        // Verify the runtime schema_cid() in mod.rs produces the same CID
-        // as the build-time compute_cid() in the schema-id crate.
-        let test_inputs: &[&[u8]] = &[b"test schema bytes", b"\x00\x01\x02\x03", b"", &[0xff; 256]];
-        for input in test_inputs {
-            let runtime_cid = super::schema_cid(input);
-            let buildtime_cid = schema_id::compute_cid(input);
-            assert_eq!(
-                runtime_cid,
-                buildtime_cid,
-                "CID mismatch for input of length {}",
-                input.len()
-            );
-        }
-    }
-
-    /// End-to-end: pass schema bytes and an Executor to VatListener,
-    /// and verify it successfully registers a protocol.
+    /// End-to-end: pass an existing cap to VatListener and verify it
+    /// successfully registers a service-name protocol.
     #[tokio::test]
-    async fn test_vat_listener_accepts_valid_schema_and_handler() {
+    async fn test_vat_listener_accepts_valid_cap_and_protocol() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
+                let (host, _server, _rx) = setup_rpc();
                 let (_tx, guard) = test_epoch_guard(1);
                 let listener_impl =
                     vat_listener::VatListenerImpl::new(dummy_stream_control(), guard);
                 let listener: system_capnp::vat_listener::Client =
                     capnp_rpc::new_client(listener_impl);
 
-                let executor = stub_executor();
-
-                let mut req = listener.listen_request();
-                {
-                    let mut handler = req.get().init_handler();
-                    handler.set_spawn(executor);
-                }
-                req.get().set_schema(b"valid schema bytes");
+                let mut req = listener.serve_request();
+                req.get()
+                    .init_cap()
+                    .set_as_capability(host.client.hook.clone());
+                req.get().set_protocol("greeter");
 
                 let result = req.send().promise.await;
                 assert!(
                     result.is_ok(),
-                    "valid schema + handler should be accepted: {:?}",
+                    "valid cap + protocol should be accepted: {:?}",
                     result.err()
                 );
             })

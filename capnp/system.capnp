@@ -84,15 +84,19 @@ interface Executor {
   # injects per-request CGI env vars (REQUEST_METHOD, PATH_INFO, etc.).
   #
   # caps: optional named capabilities to inject into the child's
-  # membrane graft as extras.  Forwarded from init.d `with` blocks
-  # via VatListener.listen().
+  # membrane graft as extras.  Forwarded from init.d `with` blocks.
 }
 
 interface StreamListener {
-  listen @0 (executor :Executor, protocol :Text) -> ();
+  listen @0 (executor :Executor, protocol :Text,
+             caps :List(MembraneSchema.Export)) -> ();
   # Accept incoming libp2p streams on /ww/0.1.0/stream/{protocol}.
   # For each stream, spawn a cell process via Executor
   # and wire stdin/stdout to the stream.
+  #
+  # caps: optional named capabilities from the init.d `with` block.
+  # Forwarded into spawned cells' membranes as graft extras.
+  # Empty list (default) = no extra caps.
 }
 
 interface HttpListener {
@@ -128,53 +132,25 @@ interface Process {
   wait @3 () -> (exitCode :Int32);
   # Block until the process exits and return its exit code.
 
-  bootstrap @4 () -> (cap :AnyPointer);
+  bootstrap @4 () -> (cap :Capability);
   # Return the capability exported by the guest via system::serve().
-  # The cap is type-erased — cast to the expected interface on the guest side.
   # Errors if the guest didn't export a capability.
 
   kill @5 () -> ();
   # Terminate the process immediately. Fuel is revoked and the cell traps.
 }
 
-struct VatHandler {
-  union {
-    spawn @0 :Executor;
-    # Stateless: spawn a fresh cell per connection.
-    serve @1 :AnyPointer;
-    # Stateful: bootstrap all connections with this persistent capability.
-  }
-}
-
 interface VatListener {
-  listen @0 (handler :VatHandler, schema :Data,
-             caps :List(MembraneSchema.Export)) -> ();
-  # Accept incoming Cap'n Proto RPC connections on /ww/0.1.0/vat/{cid}
-  # where cid = CIDv1(raw, BLAKE3(schema)).
-  #
-  # handler.spawn: for each connection, spawn a cell via the Executor.
-  # The cell calls system::serve() to export a bootstrap capability.
-  #
-  # handler.serve: bootstrap each connection with the provided capability.
-  # No cell spawning — one persistent capability serves all connections.
-  #
-  # Schema param is authoritative.
-  #
-  # caps: optional named capabilities from the init.d `with` block.
-  # Forwarded into spawned cells' membranes as graft extras.
-  # Empty list (default) = no extra caps.
+  serve @0 (cap :Capability, protocol :Text) -> ();
+  # Accept incoming Cap'n Proto RPC connections on /ww/0.1.0/vat/{protocol}.
+  # Each connection bootstraps with the provided capability. The protocol is a
+  # locator only; capability authority comes from the cap, not from the name.
 }
 
 interface VatClient {
-  dial @0 (peer :Data, schema :Data) -> (cap :AnyPointer);
-  # Open a Cap'n Proto RPC connection to peer on /ww/0.1.0/vat/{cid}
-  # where cid = CIDv1(raw, BLAKE3(schema)).
-  # The schema is the canonical Cap'n Proto encoding of a schema.Node.
-  # Bootstraps a Cap'n Proto vat over the stream and returns the remote
-  # cell's bootstrap capability.
-  #
-  # The returned cap is type-erased (AnyPointer) — cast it to the expected
-  # interface type on the guest side.
+  dial @0 (peer :Data, protocol :Text) -> (cap :Capability);
+  # Open a Cap'n Proto RPC connection to peer on /ww/0.1.0/vat/{protocol}.
+  # Bootstraps a Cap'n Proto vat over the stream and returns the remote cap.
 }
 
 interface ByteStream {

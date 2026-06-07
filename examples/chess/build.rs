@@ -9,16 +9,14 @@ use std::path::{Path, PathBuf};
 ///    guest can speak typed RPC with the host.
 ///
 /// 2. Derive a content-addressed **schema CID** from the ChessEngine
-///    interface definition. This CID becomes the DHT key *and* the
-///    subprotocol address (`/ww/0.1.0/<cid>`), so two nodes with the
-///    same schema automatically find each other on the network.
+///    interface definition. This is schema metadata; vat publication
+///    uses a normal service name such as "chess".
 ///
 /// The schema CID pipeline:
 ///   chess.capnp  →  capnpc (CodeGeneratorRequest)
 ///                →  schema_id::extract_schemas (canonical bytes + BLAKE3)
 ///                →  `CHESS_ENGINE_SCHEMA_CID` const in generated Rust
-///                →  embedded in WASM custom section "schema.capnp"
-///                   (post-build injection via `make chess`)
+///                →  copied next to the WASM for tooling/introspection
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
@@ -87,7 +85,7 @@ fn main() {
         .expect("emit schema consts");
 
     // Write the raw canonical schema bytes to a separate file. The
-    // `make chess` target injects these into the compiled WASM binary
+    // `make chess` target copies these next to the compiled WASM binary
     // as a custom section named "schema.capnp". At runtime, the host
     // reads this section to derive the protocol CID without needing
     // the .capnp source files.

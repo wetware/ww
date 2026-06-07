@@ -882,7 +882,7 @@ impl Guest for {iface_name}Guest {{
                 }});
             }}
             _ => {{
-                // Default (no args): cell mode — spawned by VatListener.
+                // Default (no args): export the service capability.
                 let impl_ = {iface_name}Impl;
                 let client: {name}_capnp::{snake_name}::Client = capnp_rpc::new_client(impl_);
                 log::info!("{name}: cell mode");
@@ -905,16 +905,18 @@ wasip2::cli::command::export!({iface_name}Guest);
         let glia = format!(
             r#"; {name} init.d script — evaluated by the kernel at boot.
 ;
-; Registers the vat cell. VatListener spawns a cell per connection;
-; each cell exports its capability via system::serve().
+; Starts one cell, obtains its exported capability, and publishes it as
+; a vat service under the "{name}" protocol.
 ;
 ; To run the service from the shell:
-;   (executor run (load "bin/{name}.wasm") "serve")
+;   (perform runtime :run (load "bin/{name}.wasm") :args ["serve"])
 
 (def {snake_name}-wasm (load "bin/{name}.wasm"))
-(def {snake_name}-schema (load "bin/{name}.capnpc"))
+(def {snake_name}-executor (perform runtime :load {snake_name}-wasm))
+(def {snake_name}-process (perform {snake_name}-executor :spawn))
+(def {snake_name}-cap (perform {snake_name}-process :bootstrap))
 
-(perform host :listen executor {snake_name}-wasm {snake_name}-schema)
+(perform host :serve-vat {snake_name}-cap "{name}")
 "#,
             snake_name = name.replace('-', "_"),
         );

@@ -1,4 +1,4 @@
-# Discovery — Greeter vat cell with schema-keyed peer discovery
+# Discovery — Greeter vat service with service-name peer discovery
 #
 # Usage: make -C examples/discovery
 

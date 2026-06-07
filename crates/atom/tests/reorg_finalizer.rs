@@ -32,8 +32,8 @@ impl Drop for CleanupGuard {
 
 #[tokio::test]
 async fn test_reorg_indexer_false_positive_finalizer_filters() {
-    if !common::foundry_available() {
-        eprintln!("skipping test_reorg_indexer_false_positive_finalizer_filters: anvil/forge/cast not in PATH");
+    if let Some(reason) = common::foundry_unavailable_reason() {
+        eprintln!("skipping test_reorg_indexer_false_positive_finalizer_filters: {reason}");
         return;
     }
     let _ = tracing_subscriber::fmt()

@@ -1,4 +1,4 @@
-# Oracle — gas price feed with schema-keyed RPC + Terminal auth
+# Oracle — gas price feed with named vat RPC + Terminal auth
 #
 # Usage: make -C examples/oracle
 

@@ -12,8 +12,8 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::test]
 async fn test_indexer_against_anvil() {
-    if !common::foundry_available() {
-        eprintln!("skipping test_indexer_against_anvil: anvil/forge/cast not in PATH");
+    if let Some(reason) = common::foundry_unavailable_reason() {
+        eprintln!("skipping test_indexer_against_anvil: {reason}");
         return;
     }
     let _ = tracing_subscriber::fmt()

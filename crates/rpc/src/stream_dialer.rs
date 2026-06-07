@@ -8,14 +8,18 @@
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use futures::io::AsyncReadExt;
-use libp2p::{PeerId, StreamProtocol};
+use libp2p::PeerId;
 use membrane::EpochGuard;
+use std::time::Duration;
 use tokio::io;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
 use membrane::system_capnp;
 
 use super::{ByteStreamImpl, StreamMode};
+
+/// Timeout for establishing the libp2p stream to a remote peer.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct StreamDialerImpl {
     stream_control: libp2p_stream::Control,
@@ -46,24 +50,10 @@ impl system_capnp::stream_dialer::Server for StreamDialerImpl {
             .to_str()
             .map_err(|e| capnp::Error::failed(e.to_string())));
 
-        if protocol_str.is_empty() {
-            return Promise::err(capnp::Error::failed(
-                "protocol name must not be empty".into(),
-            ));
-        }
-        if protocol_str.contains('/') {
-            return Promise::err(capnp::Error::failed(
-                "protocol name must not contain '/'".into(),
-            ));
-        }
-
         let peer_id = pry!(PeerId::from_bytes(&peer_bytes)
             .map_err(|e| capnp::Error::failed(format!("invalid peer ID: {e}"))));
 
-        let stream_protocol = pry!(StreamProtocol::try_from_owned(format!(
-            "/ww/0.1.0/stream/{protocol_str}"
-        ))
-        .map_err(|e| capnp::Error::failed(format!("invalid protocol: {e}"))));
+        let stream_protocol = pry!(super::stream_protocol(protocol_str));
 
         let mut control = self.stream_control.clone();
 
@@ -74,14 +64,21 @@ impl system_capnp::stream_dialer::Server for StreamDialerImpl {
                 "Dialing stream subprotocol"
             );
 
-            let stream = control
-                .open_stream(peer_id, stream_protocol.clone())
-                .await
-                .map_err(|e| {
-                    capnp::Error::failed(format!(
-                        "failed to open stream to {peer_id} on {stream_protocol}: {e}"
-                    ))
-                })?;
+            let stream = tokio::time::timeout(
+                DIAL_TIMEOUT,
+                control.open_stream(peer_id, stream_protocol.clone()),
+            )
+            .await
+            .map_err(|_| {
+                capnp::Error::failed(format!(
+                    "timeout dialing {peer_id} on {stream_protocol} after {DIAL_TIMEOUT:?}"
+                ))
+            })?
+            .map_err(|e| {
+                capnp::Error::failed(format!(
+                    "failed to open stream to {peer_id} on {stream_protocol}: {e}"
+                ))
+            })?;
 
             // Create a duplex pair: guest_side ↔ host_side.
             // The guest reads/writes via ByteStream RPC on guest_side.

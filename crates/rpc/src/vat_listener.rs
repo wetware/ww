@@ -1,20 +1,11 @@
-//! VatListener capability: guest-exported subprotocols via Cap'n Proto RPC.
+//! VatListener capability: publish existing capabilities over Cap'n Proto RPC.
 //!
-//! The `VatListener` capability lets a guest register a libp2p subprotocol cell
-//! that exports a typed capability. Two modes are supported:
+//! The `VatListener` capability registers a caller-chosen service-name protocol
+//! and bootstraps each incoming connection with an already-existing capability.
+//! It does not spawn cells. Publishers own the served capability's lifecycle.
 //!
-//! **Spawn mode** (VatHandler::spawn): for each incoming connection, spawn a fresh
-//! cell process via the Executor, capture its `system::serve()` exported
-//! bootstrap capability, and serve it to the connecting peer via Cap'n Proto RPC.
-//!
-//! **Serve mode** (VatHandler::serve): bootstrap each connection with a persistent
-//! capability — no cell spawning. One capability serves all connections.
-//!
-//! **Stdin semantics for vat cells (spawn mode):** stdin is a shutdown signal
-//! channel, not a data transport. The host never writes bytes — it only closes
-//! stdin to signal the cell to drain gracefully (equivalent to Go's `<-chan struct{}`).
-//!
-//! This is the capability-mode counterpart of `StreamListener` (byte-stream mode).
+//! The protocol name is a locator only; authority comes from the capability
+//! reference passed to `serve`.
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
@@ -43,303 +34,95 @@ impl VatListenerImpl {
 
 #[allow(refining_impl_trait)]
 impl system_capnp::vat_listener::Server for VatListenerImpl {
-    fn listen(
+    fn serve(
         self: capnp::capability::Rc<Self>,
-        params: system_capnp::vat_listener::ListenParams,
-        _results: system_capnp::vat_listener::ListenResults,
+        params: system_capnp::vat_listener::ServeParams,
+        _results: system_capnp::vat_listener::ServeResults,
     ) -> Promise<(), capnp::Error> {
         pry!(self.guard.check());
 
         let params = pry!(params.get());
-
-        // Read schema bytes from the explicit param.
-        let schema_bytes: Vec<u8> = pry!(params.get_schema()).to_vec();
-        if schema_bytes.is_empty() {
-            return Promise::err(capnp::Error::failed(
-                "schema bytes must not be empty".into(),
-            ));
-        }
-
-        let protocol_cid = super::schema_cid(&schema_bytes);
-        let stream_protocol = pry!(super::schema_protocol(&protocol_cid));
+        let bootstrap_cap: capnp::capability::Client = pry!(params.get_cap().get_as_capability());
+        let protocol = pry!(pry!(params.get_protocol())
+            .to_str()
+            .map_err(|e| capnp::Error::failed(e.to_string())));
+        let protocol_name = protocol.to_string();
+        let stream_protocol = pry!(super::vat_protocol(&protocol_name));
 
         let mut control = self.stream_control.clone();
         let mut incoming =
             pry!(control
                 .accept(stream_protocol.clone())
                 .map_err(|e| capnp::Error::failed(format!(
-                    "failed to register vat protocol cell: {e}"
+                    "failed to register vat service '{protocol_name}': {e}"
                 ))));
 
-        tracing::info!(protocol = %stream_protocol, "Registered vat subprotocol cell");
+        tracing::info!(
+            protocol = %stream_protocol,
+            service = %protocol_name,
+            "registered vat service"
+        );
 
-        // Read the VatHandler union to determine mode.
-        let handler = pry!(params.get_handler());
-        let handler_which = pry!(handler.which());
-
-        // Read optional caps from the listen request (init.d `with` block grants).
-        // Collect as (name, client, schema_bytes) tuples; the schema bytes are
-        // re-emitted on each spawned-cell graft so guests can introspect the
-        // cap's interface end-to-end.
-        let extra_caps: Vec<(String, capnp::capability::Client, Vec<u8>)> = {
-            let mut caps_vec = Vec::new();
-            if let Ok(caps_reader) = params.get_caps() {
-                for entry in caps_reader.iter() {
-                    if let (Ok(name), Ok(cap)) = (
-                        entry.get_name().map(|n| n.to_string().unwrap_or_default()),
-                        entry.get_cap().get_as_capability(),
-                    ) {
-                        let schema_bytes = match entry.get_schema() {
-                            Ok(node) => super::canonicalize_schema_node(node).unwrap_or_default(),
-                            Err(_) => Vec::new(),
+        let mut epoch_rx = self.guard.receiver.clone();
+        let issued_seq = self.guard.issued_seq;
+        tokio::task::spawn_local(async move {
+            loop {
+                tokio::select! {
+                    conn = incoming.next() => {
+                        let Some((peer_id, stream)) = conn else {
+                            tracing::warn!(protocol = %stream_protocol, "vat accept loop ended unexpectedly");
+                            break;
                         };
-                        caps_vec.push((name, cap, schema_bytes));
+                        let _accept_span = tracing::info_span!(
+                            "vat.accept",
+                            peer = %peer_id,
+                            protocol = %stream_protocol,
+                            service = %protocol_name,
+                        ).entered();
+                        tracing::debug!("incoming vat connection");
+                        let cap = bootstrap_cap.clone();
+                        let protocol = protocol_name.clone();
+                        tokio::task::spawn_local(async move {
+                            let _handle_span = tracing::info_span!(
+                                "vat.handle",
+                                service = protocol.as_str(),
+                            ).entered();
+                            if let Err(e) = handle_vat_connection_serve(cap, stream, &protocol).await {
+                                tracing::error!("vat service connection error: {e}");
+                            }
+                        });
+                    }
+                    _ = epoch_rx.changed() => {
+                        if epoch_rx.borrow().seq != issued_seq {
+                            tracing::warn!(
+                                protocol = %stream_protocol,
+                                "epoch became stale, closing vat accept loop"
+                            );
+                            break;
+                        }
                     }
                 }
             }
-            caps_vec
-        };
-
-        match handler_which {
-            system_capnp::vat_handler::Which::Spawn(executor) => {
-                let executor: system_capnp::executor::Client = pry!(executor);
-
-                // Accept loop: for each incoming connection, spawn a cell and bridge RPC.
-                let mut epoch_rx = self.guard.receiver.clone();
-                let issued_seq = self.guard.issued_seq;
-                tokio::task::spawn_local(async move {
-                    loop {
-                        tokio::select! {
-                            conn = incoming.next() => {
-                                let Some((peer_id, stream)) = conn else {
-                                    tracing::warn!(protocol = %stream_protocol, "Vat accept loop ended unexpectedly");
-                                    break;
-                                };
-                                let _accept_span = tracing::info_span!(
-                                    "vat.accept",
-                                    peer = %peer_id,
-                                    protocol = %stream_protocol,
-                                    mode = "spawn",
-                                ).entered();
-                                tracing::debug!("Incoming vat connection");
-                                let executor = executor.clone();
-                                let protocol_cid = protocol_cid.clone();
-                                let caps = extra_caps.clone();
-                                tokio::task::spawn_local(async move {
-                                    let _handle_span = tracing::info_span!(
-                                        "vat.handle",
-                                        protocol = protocol_cid,
-                                    ).entered();
-                                    if let Err(e) =
-                                        handle_vat_connection_spawn(executor, caps, stream, &protocol_cid).await
-                                    {
-                                        tracing::error!("Vat cell connection error: {e}");
-                                    }
-                                });
-                            }
-                            _ = epoch_rx.changed() => {
-                                if epoch_rx.borrow().seq != issued_seq {
-                                    tracing::warn!(
-                                        protocol = %stream_protocol,
-                                        "Epoch became stale, closing vat accept loop"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            system_capnp::vat_handler::Which::Serve(cap_ptr) => {
-                let bootstrap_cap: capnp::capability::Client = pry!(cap_ptr.get_as_capability());
-
-                // Accept loop: for each incoming connection, bootstrap with the persistent cap.
-                let mut epoch_rx = self.guard.receiver.clone();
-                let issued_seq = self.guard.issued_seq;
-                tokio::task::spawn_local(async move {
-                    loop {
-                        tokio::select! {
-                            conn = incoming.next() => {
-                                let Some((peer_id, stream)) = conn else {
-                                    tracing::warn!(protocol = %stream_protocol, "Vat accept loop ended unexpectedly");
-                                    break;
-                                };
-                                let _accept_span = tracing::info_span!(
-                                    "vat.accept",
-                                    peer = %peer_id,
-                                    protocol = %stream_protocol,
-                                    mode = "serve",
-                                ).entered();
-                                tracing::debug!("Incoming vat connection");
-                                let cap = bootstrap_cap.clone();
-                                let protocol_cid = protocol_cid.clone();
-                                tokio::task::spawn_local(async move {
-                                    let _handle_span = tracing::info_span!(
-                                        "vat.handle",
-                                        protocol = protocol_cid,
-                                    ).entered();
-                                    if let Err(e) =
-                                        handle_vat_connection_serve(cap, stream, &protocol_cid).await
-                                    {
-                                        tracing::error!("Vat serve connection error: {e}");
-                                    }
-                                });
-                            }
-                            _ = epoch_rx.changed() => {
-                                if epoch_rx.borrow().seq != issued_seq {
-                                    tracing::warn!(
-                                        protocol = %stream_protocol,
-                                        "Epoch became stale, closing vat accept loop"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        }
+        });
 
         Promise::ok(())
     }
 }
 
-/// Spawn mode: spawn a cell process for a single connection and bridge its
-/// exported bootstrap capability to the connecting peer via Cap'n Proto RPC.
-///
-/// Architecture (two-RPC-system bridge):
-///
-/// ```text
-/// Remote peer  <──[libp2p stream]──>  Host bridge  <──[WASI bidi]──>  Cell
-///                  RPC system B                        RPC system A
-///                  (Side::Server)                      (Side::Server)
-///                  bootstrap =                         bootstrap = Membrane
-///                  cell_cap <── captures <───────── cell exports via serve()
-/// ```
-///
-/// Generic over stream type so integration tests can substitute an in-memory
-/// duplex for the libp2p stream. Production callers pass `libp2p::Stream`.
-pub async fn handle_vat_connection_spawn(
-    executor: system_capnp::executor::Client,
-    caps: Vec<(String, capnp::capability::Client, Vec<u8>)>,
-    stream: impl AsyncRead + AsyncWrite + 'static,
-    protocol_cid: &str,
-) -> Result<(), capnp::Error> {
-    // 1. Spawn cell process via Executor.spawn(), forwarding caps with
-    //    their canonical Schema.Node bytes so the spawned cell's graft
-    //    can populate Export.schema for the guest.
-    let mut spawn_req = executor.spawn_request();
-    if !caps.is_empty() {
-        let mut caps_builder = spawn_req.get().init_caps(caps.len() as u32);
-        for (i, (name, client, schema_bytes)) in caps.iter().enumerate() {
-            let mut entry = caps_builder.reborrow().get(i as u32);
-            entry.set_name(name);
-            if !schema_bytes.is_empty() {
-                let aligned = crate::graft::bytes_to_aligned_words(schema_bytes);
-                let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
-                let segment_array = capnp::message::SegmentArray::new(segments);
-                let reader = capnp::message::Reader::new(
-                    segment_array,
-                    capnp::message::ReaderOptions::new(),
-                );
-                let schema_node: capnp::schema_capnp::node::Reader = reader.get_root()?;
-                entry.reborrow().set_schema(schema_node)?;
-            }
-            entry.init_cap().set_as_capability(client.hook.clone());
-        }
-    }
-    let response = spawn_req.send().promise.await?;
-    let process = response.get()?.get_process()?;
-
-    // 2. Get stdin handle. For vat cells, stdin is a shutdown signal:
-    //    closing it tells the cell to drain and exit gracefully.
-    //    No bytes are ever written — it's a <-chan struct{}.
-    let stdin_resp = process.stdin_request().send().promise.await?;
-    let stdin = stdin_resp.get()?.get_stream()?;
-
-    // 3. Get the cell's exported bootstrap capability.
-    //    Timeout guards against cells that never call system::serve().
-    //    On failure, close stdin to clean up the orphaned cell process.
-    let bootstrap_resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        process.bootstrap_request().send().promise,
-    )
-    .await
-    {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
-            let _ = stdin.close_request().send().promise.await;
-            return Err(e);
-        }
-        Err(_timeout) => {
-            let _ = stdin.close_request().send().promise.await;
-            return Err(capnp::Error::failed(
-                "cell did not export bootstrap capability within 10s \
-                 (did the guest call system::serve()?)"
-                    .into(),
-            ));
-        }
-    };
-    let bootstrap_cap: capnp::capability::Client = match bootstrap_resp
-        .get()
-        .and_then(|r| r.get_cap().get_as_capability())
-    {
-        Ok(cap) => cap,
-        Err(e) => {
-            let _ = stdin.close_request().send().promise.await;
-            return Err(e);
-        }
-    };
-
-    // 4. Bridge: serve the cell's cap to the remote peer over the libp2p stream.
-    let (reader, writer) = Box::pin(stream).split();
-    let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
-    let peer_rpc = RpcSystem::new(Box::new(network), Some(bootstrap_cap));
-
-    // 5. Drive the peer RPC system and cell process concurrently.
-    //    When EITHER side finishes (peer disconnects OR cell exits),
-    //    we tear down both to avoid serving a dead capability or
-    //    keeping a cell alive with no peer.
-    let wait_fut = async {
-        let resp = process.wait_request().send().promise.await;
-        match resp {
-            Ok(r) => r.get().map(|r| r.get_exit_code()).unwrap_or(1),
-            Err(_) => 1,
-        }
-    };
-
-    tokio::select! {
-        _ = peer_rpc => {
-            tracing::debug!(protocol = protocol_cid, "Peer disconnected, signaling cell shutdown");
-            // Peer disconnected. Close stdin to signal graceful shutdown.
-            let _ = stdin.close_request().send().promise.await;
-        }
-        exit_code = wait_fut => {
-            tracing::debug!(exit_code, protocol = protocol_cid, "Vat cell process exited");
-            // Cell exited on its own. The peer RPC will get disconnected
-            // errors on subsequent calls since the bootstrap cap is dead.
-        }
-    }
-
-    Ok(())
-}
-
-/// Serve mode: bootstrap each connection with a persistent capability.
-/// No cell spawning — one capability serves all connections.
+/// Bootstrap one remote peer with a persistent capability.
 ///
 /// Generic over stream type for testability.
 pub async fn handle_vat_connection_serve(
     bootstrap_cap: capnp::capability::Client,
     stream: impl AsyncRead + AsyncWrite + 'static,
-    protocol_cid: &str,
+    protocol: &str,
 ) -> Result<(), capnp::Error> {
     let (reader, writer) = Box::pin(stream).split();
     let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
     let peer_rpc = RpcSystem::new(Box::new(network), Some(bootstrap_cap));
 
-    // Drive the RPC system until the peer disconnects.
     let _ = peer_rpc.await;
-    tracing::debug!(protocol = protocol_cid, "Serve-mode peer disconnected");
+    tracing::debug!(protocol, "vat peer disconnected");
 
     Ok(())
 }

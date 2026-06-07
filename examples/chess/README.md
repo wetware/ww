@@ -4,10 +4,10 @@ Two-node cross-network chess over libp2p RPC capabilities.
 
 ## What it demonstrates
 
-- **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- schema-keyed RPC
-- `VatListener` for per-connection capability cells
+- **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- named vat RPC
+- `VatListener.serve` for persistent capability export
 - `VatClient` for typed RPC dialing
-- Schema-keyed DHT discovery via `routing.provide()` / `findProviders()`
+- Service-name DHT discovery via `routing.provide()` / `findProviders()`
 - IPFS replay log publishing
 - Dual-mode binary: cell mode (RPC server) + service mode (discovery loop)
 
@@ -29,8 +29,8 @@ make chess
 ```
 
 This compiles the WASM guest and copies the compiled schema bytes
-(`chess-demo.capnpc`) next to the binary. The schema is passed
-explicitly via RPC at runtime -- no custom sections.
+(`chess-demo.capnpc`) next to the binary for tooling/introspection.
+Vat publication uses the service name `chess`.
 
 ## Running
 
@@ -107,32 +107,28 @@ explicitly from `glia/register.glia`.
 ```
              ww shell loads glia/register.glia
                            |
-               (perform host :listen ...)
+               (perform host :serve-vat ...)
                            |
-                       cell mode
-                    (per-connection)
+                  persistent ChessEngine cap
 ```
 
 Two execution modes, selected by runtime inputs:
 
-- **Cell mode** (`WW_CELL_MODE=vat`): per-connection vat cell
-  spawned by `VatListener`. Creates a `ChessEngineImpl` and exports
-  it via `system::serve()`. The host bridges the capability to the
-  connecting peer via Cap'n Proto RPC bootstrapping.
+- **Cell mode** (no args): spawned by Glia before publication.
+  Creates a `ChessEngineImpl` and exports it via `system::serve()`.
+  `host :serve-vat` publishes that exported capability under `chess`.
 - **Service mode** (default): long-running discovery loop. Provides
-  the schema CID on the DHT, discovers peers via
+  the service-name routing key on the DHT, discovers peers via
   `routing.find_providers()`, dials them with `VatClient` to get
   typed `ChessEngine` capabilities, and plays random games.
   Exponential backoff (2 s to 15 min).
 
-### Schema CID
+### Service Name
 
-The protocol address is derived at build time from the ChessEngine
-Cap'n Proto schema: `CIDv1(raw, BLAKE3(canonical(schema.Node)))`.
-This CID serves as both the DHT key and the subprotocol address
-(`/ww/0.1.0/vat/{cid}`). Schema bytes are compiled at build time
-and passed explicitly via RPC -- the host reads `bin/chess-demo.capnpc`
-from the image to derive the CID.
+The vat protocol is the normal service name `chess`. The DHT key is
+`routing.hash("chess")`, so the Routing API still receives a CID-shaped
+key without making schema identity the locator. Schema bytes are
+compiled at build time for tooling/introspection.
 
 ### Schema
 
@@ -157,13 +153,12 @@ interface ChessEngine {
 `glia/register.glia`:
 
 ```clojure
-; Register vat cell for the ChessEngine capability.
-; VatListener spawns a cell process per connection; the cell exports
-; a ChessEngine capability via system::serve().
 (def chess-wasm (load "bin/chess-demo.wasm"))
-(def chess-schema (load "bin/chess-demo.capnpc"))
+(def chess-executor (perform runtime :load chess-wasm))
+(def chess-process (perform chess-executor :spawn))
+(def chess-cap (perform chess-process :bootstrap))
 
-(perform host :listen runtime chess-wasm chess-schema)
+(perform host :serve-vat chess-cap "chess")
 ```
 
 `glia/serve.glia`:

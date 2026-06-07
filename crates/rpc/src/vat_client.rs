@@ -44,17 +44,14 @@ impl system_capnp::vat_client::Server for VatClientImpl {
 
         let params = pry!(params.get());
         let peer_bytes = pry!(params.get_peer()).to_vec();
-        let schema_bytes = pry!(params.get_schema()).to_vec();
-
-        if schema_bytes.is_empty() {
-            return Promise::err(capnp::Error::failed("schema must not be empty".into()));
-        }
-
+        let protocol = pry!(pry!(params.get_protocol())
+            .to_str()
+            .map_err(|e| capnp::Error::failed(e.to_string())));
         let peer_id = pry!(PeerId::from_bytes(&peer_bytes)
             .map_err(|e| capnp::Error::failed(format!("invalid peer ID: {e}"))));
 
-        let protocol_cid = super::schema_cid(&schema_bytes);
-        let stream_protocol = pry!(super::schema_protocol(&protocol_cid));
+        let protocol_name = protocol.to_string();
+        let stream_protocol = pry!(super::vat_protocol(&protocol_name));
 
         let mut control = self.stream_control.clone();
 
@@ -62,7 +59,8 @@ impl system_capnp::vat_client::Server for VatClientImpl {
             tracing::debug!(
                 peer = %peer_id,
                 protocol = %stream_protocol,
-                "Dialing vat subprotocol"
+                service = %protocol_name,
+                "dialing vat service"
             );
 
             // Open stream with timeout to avoid hanging on unreachable peers.
@@ -101,22 +99,26 @@ impl system_capnp::vat_client::Server for VatClientImpl {
             // We log the eventual RpcSystem outcome for observability.
             let driver_peer = peer_id;
             let driver_protocol = stream_protocol.clone();
+            let driver_service = protocol_name.clone();
             tokio::task::spawn_local(async move {
                 match driver.await {
                     Ok(Ok(())) => tracing::debug!(
                         peer = %driver_peer,
                         protocol = %driver_protocol,
-                        "Vat dial session ended cleanly"
+                        service = %driver_service,
+                        "vat dial session ended cleanly"
                     ),
                     Ok(Err(e)) => tracing::warn!(
                         peer = %driver_peer,
                         protocol = %driver_protocol,
-                        "Vat dial session ended with error: {e}"
+                        service = %driver_service,
+                        "vat dial session ended with error: {e}"
                     ),
                     Err(e) => tracing::warn!(
                         peer = %driver_peer,
                         protocol = %driver_protocol,
-                        "Vat dial driver task aborted: {e}"
+                        service = %driver_service,
+                        "vat dial driver task aborted: {e}"
                     ),
                 }
             });

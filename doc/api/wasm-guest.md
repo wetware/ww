@@ -186,7 +186,7 @@ Full interface reference for the capabilities available to guests.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `spawn` | `(args: List(Text), env: List(Text)) -> (process: Process)` | Spawn a new instance of the bound WASM binary with the given args and env. |
+| `spawn` | `(args: List(Text), env: List(Text), caps: List(Export), fuelPolicy: FuelPolicy) -> (process: Process)` | Spawn a new instance of the bound WASM binary with args, env, optional graft extras, and fuel policy. |
 
 ### Process
 
@@ -196,7 +196,7 @@ Full interface reference for the capabilities available to guests.
 | `stdout` | `() -> (stream: ByteStream)` | Readable stream from guest's stdout. |
 | `stderr` | `() -> (stream: ByteStream)` | Readable stream from guest's stderr. |
 | `wait` | `() -> (exitCode: Int32)` | Block until process exits. |
-| `bootstrap` | `() -> (cap: AnyPointer)` | Get the capability exported by the guest via `system::serve()`. Type-erased. |
+| `bootstrap` | `() -> (cap: Capability)` | Get the capability exported by the guest via `system::serve()`. |
 
 ### ByteStream
 
@@ -210,7 +210,7 @@ Full interface reference for the capabilities available to guests.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `listen` | `(executor: Executor, protocol: Text) -> ()` | Accept streams on `/ww/0.1.0/stream/{protocol}`. Per-stream: spawn handler via Executor, wire stdin/stdout. |
+| `listen` | `(executor: Executor, protocol: Text, caps: List(Export)) -> ()` | Accept streams on `/ww/0.1.0/stream/{protocol}`. Per-stream: spawn handler via Executor, wire stdin/stdout, and forward optional caps. |
 
 ### StreamDialer (byte-stream mode)
 
@@ -222,19 +222,21 @@ Full interface reference for the capabilities available to guests.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `listen` | `(handler: VatHandler, schema: Data) -> ()` | Accept connections on `/ww/0.1.0/vat/{cid}` where cid = CIDv1(raw, BLAKE3(schema)). VatHandler is a union: `spawn` (Executor) for stateless per-connection cells, or `serve` (AnyPointer) for a persistent bootstrap capability. |
+| `serve` | `(cap: Capability, protocol: Text) -> ()` | Accept connections on `/ww/0.1.0/vat/{protocol}` and bootstrap each connection with the provided capability. The protocol is a locator only. |
 
 ### VatClient (capability mode)
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `dial` | `(peer: Data, schema: Data) -> (cap: AnyPointer)` | Open connection to peer on `/ww/0.1.0/vat/{cid}`. Bootstrap RPC, return remote's capability. Type-erased. |
+| `dial` | `(peer: Data, protocol: Text) -> (cap: Capability)` | Open connection to peer on `/ww/0.1.0/vat/{protocol}`. Bootstrap RPC and return the remote capability. |
 
 ## Service Cell Registration
 
 The host does not inspect WASM custom sections to decide whether a binary is a
-raw, HTTP, or vat service cell. Listener capabilities receive their routing
-inputs explicitly at registration time.
+raw, HTTP, or vat service cell. Byte adapters receive their routing inputs
+explicitly at registration time. Vat publication serves an already-existing
+capability; spawn, bootstrap, wrapping, and attenuation happen before
+`VatListener.serve()`.
 
 ## Implementation Constraints
 

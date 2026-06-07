@@ -97,8 +97,8 @@ async fn atom_head(
 
 #[tokio::test]
 async fn test_reorg_naive_observer_mismatch() {
-    if !common::foundry_available() {
-        eprintln!("skipping test_reorg_naive_observer_mismatch: anvil/forge/cast not in PATH");
+    if let Some(reason) = common::foundry_unavailable_reason() {
+        eprintln!("skipping test_reorg_naive_observer_mismatch: {reason}");
         return;
     }
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();

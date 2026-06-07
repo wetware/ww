@@ -23,9 +23,8 @@ fn shell_wasm_exists() -> bool {
 
 /// Spawn a shell cell on the executor pool and return a Shell client.
 ///
-/// Creates a duplex stream: one end goes to the cell (via
-/// handle_vat_connection_spawn on the worker thread), the other end
-/// stays on the test thread for the capnp client.
+/// Creates a duplex stream: one end goes to the cell on the worker thread,
+/// the other end stays on the test thread for the capnp client.
 async fn spawn_shell_on_pool(pool: &ExecutorPool) -> Result<shell_capnp::shell::Client> {
     // Duplex: cell_end goes to the worker, test_end stays here.
     let (test_end, cell_end) = tokio::io::duplex(64 * 1024);

@@ -1,4 +1,4 @@
-//! Price oracle guest: gas price feed via schema-keyed RPC.
+//! Price oracle guest: gas price feed via named vat RPC.
 //!
 //! Demonstrates:
 //!   - HttpClient capability for outbound HTTP (domain-scoped)
@@ -7,11 +7,10 @@
 //!
 //! Three modes, selected by subcommand:
 //!
-//! **Cell mode** (no args, default): spawned by VatListener per RPC
-//! connection. Creates a PriceOracle, fetches prices via HttpClient,
-//! and exports it via `system::serve()`.
+//! **Cell mode** (no args, default): creates a PriceOracle, fetches prices via
+//! HttpClient, and exports it via `system::serve()`.
 //!
-//! **`serve`**: provides schema CID on the DHT, re-provides periodically.
+//! **`serve`**: provides on the DHT, re-provides periodically.
 //!
 //! **`consume`**: discovers oracle providers via DHT, dials via VatClient,
 //! queries prices.
@@ -62,7 +61,10 @@ mod oracle_capnp {
 }
 
 // Build-time schema constants: PRICE_ORACLE_SCHEMA (&[u8]) and PRICE_ORACLE_CID (&str).
+// Vat publication uses the service name below; the schema CID is metadata.
 include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
+
+const ORACLE_SERVICE: &str = "oracle";
 
 type Membrane = membrane_capnp::membrane::Client;
 
@@ -90,6 +92,22 @@ fn short_id(peer_id: &[u8]) -> String {
     } else {
         h
     }
+}
+
+async fn routing_key(
+    routing: &routing_capnp::routing::Client,
+    service: &str,
+) -> Result<String, capnp::Error> {
+    let mut req = routing.hash_request();
+    req.get().set_data(service.as_bytes());
+    let resp = req.send().promise.await?;
+    let key = resp
+        .get()?
+        .get_key()?
+        .to_str()
+        .map_err(|e| capnp::Error::failed(e.to_string()))?
+        .to_string();
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -335,11 +353,13 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
     let id_resp = host.id_request().send().promise.await?;
     let self_id = id_resp.get()?.get_peer_id()?.to_vec();
     log::info!("oracle: peer {}", short_id(&self_id));
-    log::info!("oracle: schema CID {PRICE_ORACLE_CID}");
+    log::info!("oracle: service name {ORACLE_SERVICE}");
+    let service_key = routing_key(&routing, ORACLE_SERVICE).await?;
+    log::info!("oracle: routing key {service_key}");
 
-    // Provide schema CID on DHT for discovery.
+    // Provide service-name routing key on DHT for discovery.
     let mut provide_req = routing.provide_request();
-    provide_req.get().set_key(PRICE_ORACLE_CID);
+    provide_req.get().set_key(&service_key);
     provide_req.send().promise.await?;
     log::info!("oracle: provided on DHT");
 
@@ -347,7 +367,7 @@ async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
     let mut cooldown_ms: u64 = 30_000;
     loop {
         let mut provide_req = routing.provide_request();
-        provide_req.get().set_key(PRICE_ORACLE_CID);
+        provide_req.get().set_key(&service_key);
         let _ = provide_req.send().promise.await;
 
         let pause = wasip2::clocks::monotonic_clock::subscribe_duration(cooldown_ms * 1_000_000);
@@ -407,7 +427,7 @@ async fn query_oracle(
     // Dial the oracle peer.
     let mut req = vat_client.dial_request();
     req.get().set_peer(peer_id);
-    req.get().set_schema(PRICE_ORACLE_SCHEMA);
+    req.get().set_protocol(ORACLE_SERVICE);
     let resp = req.send().promise.await?;
     let oracle: oracle_capnp::price_oracle::Client = resp.get()?.get_cap().get_as_capability()?;
 
@@ -453,6 +473,8 @@ async fn run_consumer(membrane: Membrane) -> Result<(), capnp::Error> {
     let self_id = id_resp.get()?.get_peer_id()?.to_vec();
     log::info!("consumer: peer {}", short_id(&self_id));
     log::info!("consumer: looking for oracle providers...");
+    let service_key = routing_key(&routing, ORACLE_SERVICE).await?;
+    log::info!("consumer: routing key {service_key}");
 
     let seen = Rc::new(RefCell::new(std::collections::HashSet::<Vec<u8>>::new()));
     let mut cooldown_ms: u64 = 2_000;
@@ -470,7 +492,7 @@ async fn run_consumer(membrane: Membrane) -> Result<(), capnp::Error> {
         let mut fp_req = routing.find_providers_request();
         {
             let mut b = fp_req.get();
-            b.set_key(PRICE_ORACLE_CID);
+            b.set_key(&service_key);
             b.set_count(5);
             b.set_sink(sink);
         }
@@ -579,7 +601,7 @@ impl Guest for OracleGuest {
         init_logging();
 
         // HTTP/WAGI mode: detected by CGI env var presence.
-        // HttpListener injects REQUEST_METHOD; VatListener does not.
+        // HttpListener injects REQUEST_METHOD; vat publication does not.
         if std::env::var("REQUEST_METHOD").is_ok() {
             return run_http();
         }
@@ -594,7 +616,7 @@ impl Guest for OracleGuest {
                 system::run(|membrane: Membrane| async move { run_consumer(membrane).await });
             }
             _ => {
-                // Default (no args): cell mode — spawned by VatListener.
+                // Default (no args): cell mode — export the PriceOracle capability.
                 run_cell();
             }
         }
