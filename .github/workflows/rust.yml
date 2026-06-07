@@ -72,6 +72,13 @@ jobs:
     - name: cargo fmt --all -- --check
       run: cargo fmt --all -- --check
 
+    - name: Check IPFS release publish scripts
+      run: |
+        bash tests/test_ipfs_release_publish.sh
+        if command -v shellcheck >/dev/null 2>&1; then
+          shellcheck scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh
+        fi
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -187,7 +194,7 @@ jobs:
           ipfs bootstrap add "$IPFS_PEER_ADDR"
         fi
         ipfs daemon --enable-gc &
-        for i in $(seq 1 30); do ipfs id >/dev/null 2>&1 && break; sleep 0.5; done
+        for _ in $(seq 1 30); do ipfs id >/dev/null 2>&1 && break; sleep 0.5; done
       env:
         IPFS_PEER_ADDR: ${{ secrets.IPFS_PEER_ADDR }}
 
@@ -653,10 +660,13 @@ jobs:
         # Rsync release tree to VPS
         rsync -a -e "$SSH_CMD" "$STAGE/" ${{ secrets.VPS_SSH }}:/tmp/ww-release-tree/
 
-        # kubectl cp into pod, ipfs add, pin, publish, then push provide
-        # records to the DHT so installers resolving from elsewhere can
-        # actually fetch the new content (otherwise IPNS may resolve before
-        # provides propagate, and `ipfs cat` from a remote node stalls).
+        # kubectl cp into pod, ipfs add with implicit pinning disabled,
+        # explicitly pin the new root, publish IPNS, then prune only stale
+        # release roots that are already present in the CI-managed state file.
+        # It also pushes provide records to the DHT so installers resolving
+        # from elsewhere can actually fetch the new content (otherwise IPNS
+        # may resolve before provides propagate, and `ipfs cat` from a remote
+        # node stalls).
         #
         # `set -e` inside the SSH script propagates kubectl-exec failures,
         # and `set -o pipefail` here propagates the SSH exit status through
@@ -664,20 +674,13 @@ jobs:
         # publish failures masquerade as success — see issue uncovered in #421).
         set -o pipefail
         published=false
+        rsync -a -e "$SSH_CMD" scripts/ipfs_publish_release.sh ${{ secrets.VPS_SSH }}:/tmp/ww-ipfs-publish-release.sh
         for attempt in 1 2 3; do
           echo "Publish attempt $attempt..."
           if $SSH_CMD ${{ secrets.VPS_SSH }} "
             set -e
-            K='kubectl --request-timeout=5m'
-            \$K cp /tmp/ww-release-tree $POD:/tmp/release-tree
-            CID=\$(\$K exec $POD -- ipfs add -rQ --cid-version=1 /tmp/release-tree/)
-            echo \"CID=\$CID\"
-            \$K exec $POD -- ipfs pin add \$CID
-            \$K exec $POD -- ipfs name publish --key=ww-release /ipfs/\$CID
-            \$K exec $POD -- timeout 60 ipfs routing provide -r \$CID || \
-              echo 'WARNING: provide announce timed out; DHT propagation may lag'
-            \$K exec $POD -- rm -rf /tmp/release-tree
-            rm -rf /tmp/ww-release-tree
+            chmod +x /tmp/ww-ipfs-publish-release.sh
+            POD='$POD' WW_RELEASE_PIN_RETAIN=10 /tmp/ww-ipfs-publish-release.sh
           " | tee /tmp/ipfs-publish-output.txt; then
             published=true
             break
@@ -695,16 +698,36 @@ jobs:
         fi
 
         # Extract CID from output
-        CID=$(grep '^CID=' /tmp/ipfs-publish-output.txt | cut -d= -f2)
+        extract_publish_field() {
+          grep "^$1=" /tmp/ipfs-publish-output.txt | tail -n 1 | cut -d= -f2-
+        }
+
+        CID=$(extract_publish_field CID)
         if [ -z "$CID" ]; then
           echo "ERROR: publish produced empty CID — IPNS was NOT updated"
           exit 1
         fi
         echo "Release CID: $CID"
-        echo "CID=$CID" >> "$GITHUB_ENV"
+        {
+          echo "CID=$CID"
+          echo "RETAINED_COUNT=$(extract_publish_field RETAINED_COUNT)"
+          echo "UNPINNED_COUNT=$(extract_publish_field UNPINNED_COUNT)"
+          echo "UNPINNED_CIDS=$(extract_publish_field UNPINNED_CIDS)"
+          echo "FAILED_UNPIN_CIDS=$(extract_publish_field FAILED_UNPIN_CIDS)"
+          echo "REPO_STAT_BEFORE=$(extract_publish_field REPO_STAT_BEFORE)"
+          echo "REPO_STAT_AFTER=$(extract_publish_field REPO_STAT_AFTER)"
+        } >> "$GITHUB_ENV"
 
     - name: Record CID
       run: |
-        echo "## IPFS Publish" >> "$GITHUB_STEP_SUMMARY"
-        echo "- CID: \`${{ env.CID }}\`" >> "$GITHUB_STEP_SUMMARY"
-        echo "- IPNS: \`/ipns/${{ secrets.IPNS_KEY_ID }}\`" >> "$GITHUB_STEP_SUMMARY"
+        {
+          echo "## IPFS Publish"
+          echo "- CID: \`${{ env.CID }}\`"
+          echo "- IPNS: \`/ipns/${{ secrets.IPNS_KEY_ID }}\`"
+          echo "- Retained release CIDs: \`${{ env.RETAINED_COUNT }}\`"
+          echo "- Stale release CIDs unpinned: \`${{ env.UNPINNED_COUNT }}\`"
+          echo "- Unpinned CIDs: \`${{ env.UNPINNED_CIDS }}\`"
+          echo "- Failed managed unpins: \`${{ env.FAILED_UNPIN_CIDS }}\`"
+          echo "- Repo size before: \`${{ env.REPO_STAT_BEFORE }}\`"
+          echo "- Repo size after: \`${{ env.REPO_STAT_AFTER }}\`"
+        } >> "$GITHUB_STEP_SUMMARY"
