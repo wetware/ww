@@ -20,7 +20,7 @@ envvar tells the guest what plumbing it's running under:
 
 | `WW_CELL_MODE` | stdio carries | Host wires up |
 |----------------|--------------|---------------|
-| `vat` | Cap'n Proto RPC | `/ww/0.1.0/vat/{cid}` listener |
+| `vat` | Cap'n Proto RPC | `/ww/0.1.0/vat/{protocol}` named service |
 | `raw` | raw libp2p stream bytes | `/ww/0.1.0/stream/{protocol}` listener |
 | `http` | CGI env vars + stdin/stdout | WAGI (CGI for WASM) |
 | absent | Cap'n Proto RPC (host channel) | pid0 -- full Membrane graft |
@@ -38,8 +38,9 @@ Architecture (three layers):
 - **Children**: spawned by pid0 with explicit capability grants.
 
 Key abstractions:
-- **Cell type system**: schema bytes passed explicitly via RPC;
-  `WW_CELL_MODE` envvar indicates transport (vat, raw, http).
+- **Cell type system**: Glia spawns cells, obtains exported capabilities,
+  and publishes them with named vat services; HTTP/raw listeners are byte
+  adapters and still spawn handler cells.
 - **Membrane**: the capability hub.  `graft()` returns epoch-scoped
   capabilities.  pid0 can wrap/filter capabilities and export a
   derived Membrane to the network.

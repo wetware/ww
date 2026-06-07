@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 /// Build script for the oracle example.
 ///
 /// Compiles oracle.capnp and shared system schemas, extracts the
-/// PriceOracle interface's canonical bytes, and derives its schema CID.
+/// PriceOracle interface's canonical bytes, and derives its schema CID metadata.
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);

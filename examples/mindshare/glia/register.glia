@@ -1,6 +1,7 @@
 ; Demo snippet: register Mindshare vat handler.
-(def mindshare
-  (cell (load "bin/mindshare.wasm")
-        (load "bin/mindshare.capnpc")))
+(def mindshare-wasm (load "bin/mindshare.wasm"))
+(def mindshare-executor (perform runtime :load mindshare-wasm))
+(def mindshare-process (perform mindshare-executor :spawn))
+(def mindshare-cap (perform mindshare-process :bootstrap))
 
-(perform host :listen mindshare)
+(perform host :serve-vat mindshare-cap "mindshare")

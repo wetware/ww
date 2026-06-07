@@ -183,7 +183,7 @@ What we have today:
 - Composable graft (tools-call-tools receives explicit grants).
 - Content-addressed code via IPFS (CIDs flow through the runtime).
 - MCP/Glia bridge with membrane-grafted agent execution.
-- Optional P2P (libp2p swarm, DHT routing, schema-CID-addressable
+- Optional P2P (libp2p swarm, DHT routing, named Cap'n Proto
   services).
 - Engagement demo: install, hit a membrane-grafted WASM cell
   from curl in 60 seconds.

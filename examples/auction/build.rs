@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 /// Build script for the auction example.
 ///
 /// Compiles auction.capnp and shared system schemas, extracts the
-/// ComputeProvider interface's canonical bytes, and derives its schema CID.
+/// ComputeProvider interface's canonical bytes, and derives its schema CID metadata.
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);

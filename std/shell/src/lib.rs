@@ -1,8 +1,8 @@
 //! Shell cell — remote Glia REPL over Cap'n Proto.
 //!
 //! Evaluates Glia s-expressions in a persistent environment with
-//! capability-scoped dispatch.  Registered via VatListener; each
-//! incoming connection spawns a fresh cell with its own Env.
+//! capability-scoped dispatch.  When served over vat RPC, the publisher
+//! serves the shell capability; process lifetime remains publisher-owned.
 //!
 //! This is the "nREPL for Wetware": client sends text, cell evaluates,
 //! result comes back.  State persists across evals (def sticks).

@@ -31,8 +31,8 @@ impl Drop for CleanupGuard {
 
 #[tokio::test]
 async fn test_finalizer_confirmation_depth_gates_and_adopts() {
-    if !common::foundry_available() {
-        eprintln!("skipping test_finalizer_confirmation_depth_gates_and_adopts: anvil/forge/cast not in PATH");
+    if let Some(reason) = common::foundry_unavailable_reason() {
+        eprintln!("skipping test_finalizer_confirmation_depth_gates_and_adopts: {reason}");
         return;
     }
     let _ = tracing_subscriber::fmt()

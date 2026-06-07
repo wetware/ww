@@ -172,6 +172,10 @@ struct Session {
 fn extract_capnp_client(
     inner: &std::rc::Rc<dyn std::any::Any>,
 ) -> Option<capnp::capability::Client> {
+    if let Some(c) = inner.downcast_ref::<capnp::capability::Client>() {
+        return Some(c.clone());
+    }
+
     macro_rules! try_downcast {
         ($ty:ty) => {
             if let Some(c) = inner.downcast_ref::<$ty>() {
@@ -186,6 +190,287 @@ fn extract_capnp_client(
     try_downcast!(http_capnp::http_client::Client);
     try_downcast!(system_capnp::executor::Client);
     None
+}
+
+fn collect_forwardable_caps(
+    caps: &[(String, Val)],
+    context: &str,
+) -> Vec<(String, capnp::capability::Client)> {
+    caps.iter()
+        .filter_map(|(name, val)| {
+            if let Val::Cap { inner, .. } = val {
+                if let Some(client) = extract_capnp_client(inner) {
+                    return Some((name.clone(), client));
+                }
+                log::debug!("{context} — cap '{name}' is not a capnp client, skipping");
+            }
+            None
+        })
+        .collect()
+}
+
+fn make_generic_cap(cap: capnp::capability::Client) -> Val {
+    make_cap("cap", "capnp:capability", Rc::new(cap))
+}
+
+fn make_process_cap(process: system_capnp::process::Client) -> Val {
+    let mut methods = HashMap::new();
+
+    let bootstrap_process = process.clone();
+    methods.insert(
+        "bootstrap".to_string(),
+        Val::AsyncNativeFn {
+            name: "process-bootstrap".into(),
+            func: Rc::new(move |args: Vec<Val>| {
+                let process = bootstrap_process.clone();
+                Box::pin(async move {
+                    if !args.is_empty() {
+                        return Err(glia::error::arity("process :bootstrap", "0", args.len()));
+                    }
+                    let resp = process
+                        .bootstrap_request()
+                        .send()
+                        .promise
+                        .await
+                        .map_err(|e| Val::from(e.to_string()))?;
+                    let cap = resp
+                        .get()
+                        .map_err(|e| Val::from(e.to_string()))?
+                        .get_cap()
+                        .get_as_capability::<capnp::capability::Client>()
+                        .map_err(|e| Val::from(e.to_string()))?;
+                    Ok(make_generic_cap(cap))
+                })
+            }),
+        },
+    );
+
+    let wait_process = process.clone();
+    methods.insert(
+        "wait".to_string(),
+        Val::AsyncNativeFn {
+            name: "process-wait".into(),
+            func: Rc::new(move |args: Vec<Val>| {
+                let process = wait_process.clone();
+                Box::pin(async move {
+                    if !args.is_empty() {
+                        return Err(glia::error::arity("process :wait", "0", args.len()));
+                    }
+                    let resp = process
+                        .wait_request()
+                        .send()
+                        .promise
+                        .await
+                        .map_err(|e| Val::from(e.to_string()))?;
+                    let exit_code = resp
+                        .get()
+                        .map_err(|e| Val::from(e.to_string()))?
+                        .get_exit_code();
+                    Ok(Val::Int(exit_code as i64))
+                })
+            }),
+        },
+    );
+
+    methods.insert(
+        "kill".to_string(),
+        Val::AsyncNativeFn {
+            name: "process-kill".into(),
+            func: Rc::new(move |args: Vec<Val>| {
+                let process = process.clone();
+                Box::pin(async move {
+                    if !args.is_empty() {
+                        return Err(glia::error::arity("process :kill", "0", args.len()));
+                    }
+                    process
+                        .kill_request()
+                        .send()
+                        .promise
+                        .await
+                        .map_err(|e| Val::from(e.to_string()))?;
+                    Ok(Val::Nil)
+                })
+            }),
+        },
+    );
+
+    make_cap(
+        "process",
+        "ww.process.v1",
+        Rc::new(GliaCapInner {
+            methods,
+            descriptor: b"ww.process.v1\nmethods=bootstrap,wait,kill\n".to_vec(),
+        }),
+    )
+}
+
+fn make_executor_cap(executor: system_capnp::executor::Client) -> Val {
+    let mut methods = HashMap::new();
+    methods.insert(
+        "spawn".to_string(),
+        Val::AsyncNativeFn {
+            name: "executor-spawn".into(),
+            func: Rc::new(move |args: Vec<Val>| {
+                let executor = executor.clone();
+                Box::pin(async move {
+                    let mut spawn_args: Vec<String> = Vec::new();
+                    let mut env_pairs: Vec<String> = Vec::new();
+                    let mut cap_pairs: Vec<(String, capnp::capability::Client)> = Vec::new();
+
+                    let mut i = 0;
+                    while i < args.len() {
+                        let key = match &args[i] {
+                            Val::Keyword(k) => k.as_str(),
+                            other => {
+                                return Err(glia::error::type_mismatch(
+                                    "executor :spawn option",
+                                    "keyword",
+                                    other,
+                                ))
+                            }
+                        };
+                        i += 1;
+                        let value = args.get(i).ok_or_else(|| {
+                            Val::from(format!("executor :spawn — missing value for :{key}"))
+                        })?;
+                        match key {
+                            "args" => match value {
+                                Val::List(items) | Val::Vector(items) => {
+                                    spawn_args = items
+                                        .iter()
+                                        .map(|v| match v {
+                                            Val::Str(s) | Val::Sym(s) => Ok(s.clone()),
+                                            other => Err(glia::error::type_mismatch(
+                                                "executor :spawn :args item",
+                                                "string",
+                                                other,
+                                            )),
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?;
+                                }
+                                other => {
+                                    return Err(glia::error::type_mismatch(
+                                        "executor :spawn :args",
+                                        "list or vector",
+                                        other,
+                                    ))
+                                }
+                            },
+                            "env" => match value {
+                                Val::Map(pairs) => {
+                                    env_pairs = pairs
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            let key = match k {
+                                                Val::Str(s) | Val::Sym(s) => s.clone(),
+                                                other => format!("{other}"),
+                                            };
+                                            let val = match v {
+                                                Val::Str(s) | Val::Sym(s) => s.clone(),
+                                                other => format!("{other}"),
+                                            };
+                                            format!("{key}={val}")
+                                        })
+                                        .collect();
+                                }
+                                other => {
+                                    return Err(glia::error::type_mismatch(
+                                        "executor :spawn :env",
+                                        "map",
+                                        other,
+                                    ))
+                                }
+                            },
+                            "caps" => match value {
+                                Val::Map(pairs) => {
+                                    for (name_val, cap_val) in pairs.iter() {
+                                        let name = match name_val {
+                                            Val::Str(s) | Val::Sym(s) => s.clone(),
+                                            other => {
+                                                return Err(glia::error::type_mismatch(
+                                                    "executor :spawn :caps key",
+                                                    "string",
+                                                    other,
+                                                ))
+                                            }
+                                        };
+                                        let Val::Cap { inner, .. } = cap_val else {
+                                            return Err(glia::error::type_mismatch(
+                                                "executor :spawn :caps value",
+                                                "cap",
+                                                cap_val,
+                                            ));
+                                        };
+                                        if let Some(client) = extract_capnp_client(inner) {
+                                            cap_pairs.push((name, client));
+                                        }
+                                    }
+                                }
+                                other => {
+                                    return Err(glia::error::type_mismatch(
+                                        "executor :spawn :caps",
+                                        "map",
+                                        other,
+                                    ))
+                                }
+                            },
+                            other => {
+                                return Err(Val::from(format!(
+                                    "executor :spawn — unknown option :{other}"
+                                )))
+                            }
+                        }
+                        i += 1;
+                    }
+
+                    let mut req = executor.spawn_request();
+                    {
+                        let mut b = req.get();
+                        if !spawn_args.is_empty() {
+                            let mut arg_list = b.reborrow().init_args(spawn_args.len() as u32);
+                            for (j, a) in spawn_args.iter().enumerate() {
+                                arg_list.set(j as u32, a);
+                            }
+                        }
+                        if !env_pairs.is_empty() {
+                            let mut env_list = b.reborrow().init_env(env_pairs.len() as u32);
+                            for (j, e) in env_pairs.iter().enumerate() {
+                                env_list.set(j as u32, e);
+                            }
+                        }
+                        if !cap_pairs.is_empty() {
+                            let mut caps_builder = b.init_caps(cap_pairs.len() as u32);
+                            for (j, (name, client)) in cap_pairs.into_iter().enumerate() {
+                                let mut entry = caps_builder.reborrow().get(j as u32);
+                                entry.set_name(&name);
+                                entry.init_cap().set_as_capability(client.hook);
+                            }
+                        }
+                    }
+                    let resp = req
+                        .send()
+                        .promise
+                        .await
+                        .map_err(|e| Val::from(e.to_string()))?;
+                    let process = resp
+                        .get()
+                        .map_err(|e| Val::from(e.to_string()))?
+                        .get_process()
+                        .map_err(|e| Val::from(e.to_string()))?;
+                    Ok(make_process_cap(process))
+                })
+            }),
+        },
+    );
+
+    make_cap(
+        "executor",
+        schema_ids::EXECUTOR_CID.to_string(),
+        Rc::new(GliaCapInner {
+            methods,
+            descriptor: b"ww.executor.v1\nmethods=spawn\n".to_vec(),
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -423,266 +708,156 @@ fn make_host_handler(
                         Val::List(items)
                     }
                     "listen" => {
-                        // Cell-based registration:
-                        //   (perform host :listen <cell>)          → VatListener
-                        //   (perform host :listen <cell> "/path")  → HttpListener
-                        if let Some(Val::Cell { wasm, schema, caps }) = rest.first() {
-                            let mut load_req = runtime.load_request();
-                            load_req.get().set_wasm(wasm);
-                            let executor = load_req.send().pipeline.get_executor();
-
-                            let network_resp = host
-                                .network_request()
-                                .send()
-                                .promise
-                                .await
-                                .map_err(|e| Val::from(e.to_string()))?;
-                            let network =
-                                network_resp.get().map_err(|e| Val::from(e.to_string()))?;
-
-                            match rest.get(1) {
-                                None => {
-                                    // VatListener: (perform host :listen <cell>)
-                                    let listener = network
-                                        .get_vat_listener()
-                                        .map_err(|e| Val::from(e.to_string()))?;
-                                    let mut req = listener.listen_request();
-                                    {
-                                        let mut handler = req.get().init_handler();
-                                        handler.set_spawn(executor);
-                                    }
-                                    if let Some(s) = schema {
-                                        req.get().set_schema(s);
-                                    }
-                                    // Forward captured caps from the `with` block.
-                                    // Pre-filter to avoid ghost entries in the capnp list.
-                                    if !caps.is_empty() {
-                                        let valid_caps: Vec<(&str, capnp::capability::Client)> =
-                                            caps.iter()
-                                                .filter_map(|(name, val)| {
-                                                    if let Val::Cap { inner, .. } = val {
-                                                        if let Some(client) =
-                                                            extract_capnp_client(inner)
-                                                        {
-                                                            return Some((name.as_str(), client));
-                                                        }
-                                                        // Not all caps are capnp clients (e.g. ipfs
-                                                        // is a VFS placeholder). Skip silently.
-                                                        log::debug!(
-                                                            "host :listen — cap '{name}' is not a capnp client, skipping"
-                                                        );
-                                                    }
-                                                    None
-                                                })
-                                                .collect();
-                                        if !valid_caps.is_empty() {
-                                            let mut caps_builder =
-                                                req.get().init_caps(valid_caps.len() as u32);
-                                            for (i, (name, client)) in
-                                                valid_caps.into_iter().enumerate()
-                                            {
-                                                let mut entry =
-                                                    caps_builder.reborrow().get(i as u32);
-                                                entry.set_name(name);
-                                                entry.init_cap().set_as_capability(client.hook);
-                                            }
-                                        }
-                                    }
-                                    req.send()
-                                        .promise
-                                        .await
-                                        .map_err(|e| Val::from(e.to_string()))?;
-                                    log::info!("host :listen — registered vat handler (cell)");
-                                    return call_resume(resume, Val::Nil);
-                                }
-                                Some(Val::Str(prefix)) => {
-                                    // HttpListener: (perform host :listen <cell> "/path")
-                                    let listener = network
-                                        .get_http_listener()
-                                        .map_err(|e| Val::from(e.to_string()))?;
-                                    let mut req = listener.listen_request();
-                                    req.get().set_executor(executor);
-                                    req.get().set_prefix(prefix);
-                                    // Forward captured caps from the `with` block.
-                                    // Mirrors the VatListener path above so WAGI cells
-                                    // see only the caps the init.d author granted.
-                                    if !caps.is_empty() {
-                                        let valid_caps: Vec<(&str, capnp::capability::Client)> =
-                                            caps.iter()
-                                                .filter_map(|(name, val)| {
-                                                    if let Val::Cap { inner, .. } = val {
-                                                        if let Some(client) =
-                                                            extract_capnp_client(inner)
-                                                        {
-                                                            return Some((name.as_str(), client));
-                                                        }
-                                                        log::debug!(
-                                                            "host :listen — cap '{name}' is not a capnp client, skipping"
-                                                        );
-                                                    }
-                                                    None
-                                                })
-                                                .collect();
-                                        if !valid_caps.is_empty() {
-                                            let mut caps_builder =
-                                                req.get().init_caps(valid_caps.len() as u32);
-                                            for (i, (name, client)) in
-                                                valid_caps.into_iter().enumerate()
-                                            {
-                                                let mut entry =
-                                                    caps_builder.reborrow().get(i as u32);
-                                                entry.set_name(name);
-                                                entry.init_cap().set_as_capability(client.hook);
-                                            }
-                                        }
-                                    }
-                                    req.send()
-                                        .promise
-                                        .await
-                                        .map_err(|e| Val::from(e.to_string()))?;
-                                    log::info!(
-                                        "host :listen — registered HTTP handler at {prefix} (cell)"
-                                    );
-                                    return call_resume(resume, Val::Nil);
-                                }
-                                Some(other) => {
-                                    return Err(Val::from(format!(
-                                        "host :listen <cell> — optional 2nd arg must be a path string, got {other}"
-                                    )));
-                                }
-                            }
-                        }
-
-                        // Legacy path: (perform host :listen runtime <wasm>)         → VatListener
-                        //              (perform host :listen runtime "proto" <wasm>) → StreamListener
-                        let runtime = match rest.first() {
-                            Some(Val::Cap { name, inner, .. }) if name == "runtime" => inner
-                                .downcast_ref::<system_capnp::runtime::Client>()
-                                .cloned()
-                                .ok_or_else(|| {
-                                    Val::from("host :listen — runtime cap has wrong inner type")
-                                })?,
-                            Some(Val::Cap { name, .. }) => {
-                                return Err(Val::from(format!(
-                                    "host :listen — expected a cell or runtime cap, got cap '{name}'"
-                                )))
-                            }
-                            Some(other) => {
-                                return Err(Val::from(format!(
-                                    "host :listen — expected a cell (from (cell (load ...) ...)), got {other}"
-                                )))
-                            }
-                            None => {
+                        let (cell, prefix) = match rest {
+                            [Val::Cell { wasm, caps }, Val::Str(prefix)] => ((wasm, caps), prefix),
+                            [Val::Cell { .. }] => {
                                 return Err(Val::from(
-                                    "host :listen — missing argument. Usage: (perform host :listen <cell>) or (perform host :listen <cell> \"/path\")"
+                                    "host :listen — vat cell listen was removed; use (perform runtime :load ...), (perform executor :spawn), (perform process :bootstrap), then (perform host :serve-vat cap \"service\")",
                                 ))
+                            }
+                            [] => {
+                                return Err(Val::from(
+                                    "host :listen — usage: (perform host :listen <cell> \"/path\") for HTTP cells",
+                                ))
+                            }
+                            [other, ..] => {
+                                return Err(Val::from(format!(
+                                    "host :listen — expected cell and HTTP path string, got {other}"
+                                )))
                             }
                         };
-                        match rest.len() {
-                            2 => {
-                                // VatListener mode: (perform host :listen runtime <wasm>)
-                                // Load wasm via Runtime → Executor, then call
-                                // VatListener.listen() with the Executor.
-                                let wasm = match rest.get(1) {
-                                    Some(Val::Bytes(b)) => b.clone(),
-                                    _ => {
-                                        return Err(Val::from(
-                                            "host :listen — expected wasm bytes as 2nd arg",
-                                        ))
-                                    }
-                                };
 
-                                // Load the wasm to get an Executor (pipelining).
-                                let mut load_req = runtime.load_request();
-                                load_req.get().set_wasm(&wasm);
-                                let executor = load_req
-                                    .send()
-                                    .pipeline
-                                    .get_executor();
+                        let (wasm, caps) = cell;
+                        let mut load_req = runtime.load_request();
+                        load_req.get().set_wasm(wasm);
+                        let executor = load_req.send().pipeline.get_executor();
 
-                                let network_resp = host
-                                    .network_request()
-                                    .send()
-                                    .promise
-                                    .await
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                let network = network_resp
-                                    .get()
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                let listener = network
-                                    .get_vat_listener()
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                let mut req = listener.listen_request();
-                                {
-                                    let mut handler = req.get().init_handler();
-                                    handler.set_spawn(executor);
-                                }
-                                req.send()
-                                    .promise
-                                    .await
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                log::info!("host :listen — registered vat handler");
-                                Val::Nil
-                            }
-                            3 => {
-                                // StreamListener mode: (perform host :listen runtime "proto" <wasm>)
-                                // Load wasm via Runtime → Executor, then call
-                                // StreamListener.listen() with Executor + protocol.
-                                let protocol = match rest.get(1) {
-                                    Some(Val::Str(s)) => s.clone(),
-                                    _ => {
-                                        return Err(Val::from(
-                                            "host :listen — protocol must be a string",
-                                        ))
-                                    }
-                                };
-                                let wasm = match rest.get(2) {
-                                    Some(Val::Bytes(b)) => b.clone(),
-                                    _ => {
-                                        return Err(Val::from(
-                                            "host :listen — expected wasm bytes",
-                                        ))
-                                    }
-                                };
+                        let network_resp = host
+                            .network_request()
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let network = network_resp.get().map_err(|e| Val::from(e.to_string()))?;
+                        let listener = network
+                            .get_http_listener()
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let mut req = listener.listen_request();
+                        req.get().set_executor(executor);
+                        req.get().set_prefix(prefix);
 
-                                // Load the wasm to get an Executor (pipelining).
-                                let mut load_req = runtime.load_request();
-                                load_req.get().set_wasm(&wasm);
-                                let executor = load_req
-                                    .send()
-                                    .pipeline
-                                    .get_executor();
-
-                                let network_resp = host
-                                    .network_request()
-                                    .send()
-                                    .promise
-                                    .await
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                let network = network_resp
-                                    .get()
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                let listener = network
-                                    .get_stream_listener()
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                let mut req = listener.listen_request();
-                                req.get().set_executor(executor);
-                                req.get().set_protocol(&protocol);
-                                req.send()
-                                    .promise
-                                    .await
-                                    .map_err(|e| Val::from(e.to_string()))?;
-                                log::info!(
-                                    "host :listen — registered stream handler /ww/0.1.0/stream/{protocol}"
-                                );
-                                Val::Nil
-                            }
-                            _ => {
-                                return Err(Val::from(
-                                    "host :listen — usage: (perform host :listen runtime <wasm>) or (perform host :listen runtime \"proto\" <wasm>)",
-                                ))
+                        let valid_caps = collect_forwardable_caps(caps, "host :listen");
+                        if !valid_caps.is_empty() {
+                            let mut caps_builder = req.get().init_caps(valid_caps.len() as u32);
+                            for (i, (name, client)) in valid_caps.into_iter().enumerate() {
+                                let mut entry = caps_builder.reborrow().get(i as u32);
+                                entry.set_name(&name);
+                                entry.init_cap().set_as_capability(client.hook);
                             }
                         }
+
+                        req.send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        log::info!("host :listen — registered HTTP handler at {prefix} (cell)");
+                        Val::Nil
+                    }
+                    "listen-stream" => {
+                        let (wasm, caps, protocol) = match rest {
+                            [Val::Cell { wasm, caps }, Val::Str(protocol)] => {
+                                (wasm, caps, protocol)
+                            }
+                            [] | [_] => {
+                                return Err(Val::from(
+                                    "host :listen-stream — usage: (perform host :listen-stream <cell> \"protocol\")",
+                                ))
+                            }
+                            [other, ..] => {
+                                return Err(Val::from(format!(
+                                    "host :listen-stream — expected cell and protocol string, got {other}"
+                                )))
+                            }
+                        };
+
+                        let mut load_req = runtime.load_request();
+                        load_req.get().set_wasm(wasm);
+                        let executor = load_req.send().pipeline.get_executor();
+
+                        let network_resp = host
+                            .network_request()
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let network = network_resp.get().map_err(|e| Val::from(e.to_string()))?;
+                        let listener = network
+                            .get_stream_listener()
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let mut req = listener.listen_request();
+                        req.get().set_executor(executor);
+                        req.get().set_protocol(protocol);
+
+                        let valid_caps = collect_forwardable_caps(caps, "host :listen-stream");
+                        if !valid_caps.is_empty() {
+                            let mut caps_builder = req.get().init_caps(valid_caps.len() as u32);
+                            for (i, (name, client)) in valid_caps.into_iter().enumerate() {
+                                let mut entry = caps_builder.reborrow().get(i as u32);
+                                entry.set_name(&name);
+                                entry.init_cap().set_as_capability(client.hook);
+                            }
+                        }
+
+                        req.send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        log::info!(
+                            "host :listen-stream — registered stream handler /ww/0.1.0/stream/{protocol}"
+                        );
+                        Val::Nil
+                    }
+                    "serve-vat" => {
+                        let (cap, protocol) = match rest {
+                            [Val::Cap { inner, .. }, Val::Str(protocol)] => {
+                                let cap = extract_capnp_client(inner).ok_or_else(|| {
+                                    Val::from(
+                                        "host :serve-vat — cap is not backed by a Cap'n Proto client",
+                                    )
+                                })?;
+                                (cap, protocol)
+                            }
+                            [] | [_] => {
+                                return Err(Val::from(
+                                    "host :serve-vat — usage: (perform host :serve-vat cap \"service\")",
+                                ))
+                            }
+                            [other, ..] => {
+                                return Err(Val::from(format!(
+                                    "host :serve-vat — expected cap and protocol string, got {other}"
+                                )))
+                            }
+                        };
+
+                        let network_resp = host
+                            .network_request()
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let network = network_resp.get().map_err(|e| Val::from(e.to_string()))?;
+                        let listener = network
+                            .get_vat_listener()
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let mut req = listener.serve_request();
+                        req.get().init_cap().set_as_capability(cap.hook);
+                        req.get().set_protocol(protocol);
+                        req.send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        log::info!("host :serve-vat — registered vat service {protocol}");
+                        Val::Nil
                     }
                     "http-client" => {
                         // (perform host :http-client) → Val::Cap wrapping HttpClient
@@ -715,6 +890,24 @@ fn make_runtime_handler(runtime: system_capnp::runtime::Client) -> Val {
                 let (method, rest) = extract_method(&args[0])?;
                 let resume = &args[1];
                 let result = match method {
+                    "load" => {
+                        let wasm = match rest.first() {
+                            Some(Val::Bytes(b)) => b.clone(),
+                            _ => {
+                                return Err(Val::from(
+                                    "runtime :load — first arg must be wasm bytes",
+                                ))
+                            }
+                        };
+                        if rest.len() != 1 {
+                            return Err(glia::error::arity("runtime :load", "1", rest.len()));
+                        }
+
+                        let mut load_req = runtime.load_request();
+                        load_req.get().set_wasm(&wasm);
+                        let executor = load_req.send().pipeline.get_executor();
+                        make_executor_cap(executor)
+                    }
                     "run" => {
                         // (perform runtime :run <wasm-bytes> :env {"KEY" "VAL" ...})
                         let wasm = match rest.first() {
@@ -727,7 +920,7 @@ fn make_runtime_handler(runtime: system_capnp::runtime::Client) -> Val {
                         };
                         // Parse optional keyword args: :env {map}, :args [list]
                         let mut env_pairs: Vec<String> = Vec::new();
-                        let spawn_args: Vec<String> = Vec::new();
+                        let mut spawn_args: Vec<String> = Vec::new();
                         let mut i = 1;
                         while i < rest.len() {
                             if let Val::Keyword(k) = &rest[i] {
@@ -745,6 +938,22 @@ fn make_runtime_handler(runtime: system_capnp::runtime::Client) -> Val {
                                             };
                                             env_pairs.push(format!("{key}={val}"));
                                         }
+                                    }
+                                } else if k == "args" {
+                                    i += 1;
+                                    if let Some(Val::List(items) | Val::Vector(items)) = rest.get(i)
+                                    {
+                                        spawn_args = items
+                                            .iter()
+                                            .map(|v| match v {
+                                                Val::Str(s) | Val::Sym(s) => Ok(s.clone()),
+                                                other => Err(glia::error::type_mismatch(
+                                                    "runtime :run :args item",
+                                                    "string",
+                                                    other,
+                                                )),
+                                            })
+                                            .collect::<Result<Vec<_>, _>>()?;
                                     }
                                 }
                             }
@@ -1095,10 +1304,16 @@ Capabilities (via perform):
   (perform host :id)                         Peer ID
   (perform host :addrs)                      Listen addresses
   (perform host :peers)                      Connected peers
-  (perform host :listen runtime <wasm>)      Register RPC handler
-  (perform host :listen runtime \"p\" <wasm>) Register stream handler
+  (perform host :listen <cell> \"/path\")     Register HTTP/WAGI cell
+  (perform host :listen-stream <cell> \"p\")  Register byte-stream cell
+  (perform host :serve-vat cap \"service\")   Register vat capability
 
+  (perform runtime :load <wasm>)             Load wasm, return executor
   (perform runtime :run <wasm> :env {})      Spawn foreground process
+  (perform executor :spawn)                  Spawn process
+  (perform process :bootstrap)               Get exported cap
+  (perform process :wait)                    Wait for process exit
+  (perform process :kill)                    Kill process
 
   (perform routing :provide \"<name>\")        Announce to DHT (hashes internally)
   (perform routing :find \"<name>\" :count N)  Discover providers (default 20)
@@ -2054,20 +2269,23 @@ mod tests {
         }
     }
 
-    // --- Stub VatListener: asserts handler is present ---
+    // --- Stub VatListener: asserts cap + protocol are present ---
 
     struct TestVatListener;
 
     #[allow(refining_impl_trait)]
     impl system_capnp::vat_listener::Server for TestVatListener {
-        fn listen(
+        fn serve(
             self: capnp::capability::Rc<Self>,
-            params: system_capnp::vat_listener::ListenParams,
-            _results: system_capnp::vat_listener::ListenResults,
+            params: system_capnp::vat_listener::ServeParams,
+            _results: system_capnp::vat_listener::ServeResults,
         ) -> Promise<(), capnp::Error> {
             let params = capnp_rpc::pry!(params.get());
-            if !params.has_handler() {
-                return Promise::err(capnp::Error::failed("handler not set".into()));
+            if !params.has_cap() {
+                return Promise::err(capnp::Error::failed("cap not set".into()));
+            }
+            if !params.has_protocol() {
+                return Promise::err(capnp::Error::failed("protocol not set".into()));
             }
             Promise::ok(())
         }
@@ -2344,209 +2562,99 @@ mod tests {
         .await;
     }
 
-    // --- host listen tests ---
+    // --- host listen / serve tests ---
+
+    fn test_cell() -> Val {
+        Val::Cell {
+            wasm: b"fake-wasm".to_vec(),
+            caps: vec![],
+        }
+    }
 
     #[tokio::test]
-    async fn test_host_listen_vat_passes_runtime() {
+    async fn test_host_listen_http_cell_succeeds() {
         run_local(async {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let runtime_cap = make_cap("runtime", "test-runtime-cid", Rc::new(s.runtime.clone()));
+            let result =
+                call_handler(&handler, "listen", &[test_cell(), Val::Str("/demo".into())]).await;
+            assert!(result.is_ok(), "HTTP listen failed: {:?}", result.err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_host_listen_vat_cell_removed_errors() {
+        run_local(async {
+            let s = test_session();
+            let handler =
+                make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
+            let err = call_handler(&handler, "listen", &[test_cell()])
+                .await
+                .unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("vat cell listen was removed"), "got: {msg}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_host_listen_stream_cell_succeeds() {
+        run_local(async {
+            let s = test_session();
+            let handler =
+                make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
             let result = call_handler(
                 &handler,
-                "listen",
-                &[runtime_cap, Val::Bytes(b"fake-wasm".to_vec())],
+                "listen-stream",
+                &[test_cell(), Val::Str("my-protocol".into())],
             )
             .await;
-            assert!(
-                result.is_ok(),
-                "VatListener listen failed: {:?}",
-                result.unwrap_err()
-            );
+            assert!(result.is_ok(), "StreamListener listen failed: {:?}", result.err());
         })
         .await;
     }
 
     #[tokio::test]
-    async fn test_host_listen_stream_passes_runtime() {
+    async fn test_host_serve_vat_cap_succeeds() {
         run_local(async {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let runtime_cap = make_cap("runtime", "test-runtime-cid", Rc::new(s.runtime.clone()));
-            let result = call_handler(
-                &handler,
-                "listen",
-                &[
-                    runtime_cap,
-                    Val::Str("my-protocol".into()),
-                    Val::Bytes(b"fake-wasm".to_vec()),
-                ],
-            )
-            .await;
-            assert!(
-                result.is_ok(),
-                "StreamListener listen failed: {:?}",
-                result.unwrap_err()
-            );
+            let cap = make_cap("host", "test-host-cid", Rc::new(s.host.clone()));
+            let result =
+                call_handler(&handler, "serve-vat", &[cap, Val::Str("greeter".into())]).await;
+            assert!(result.is_ok(), "VatListener serve failed: {:?}", result.err());
         })
         .await;
     }
 
     #[tokio::test]
-    async fn test_host_listen_missing_runtime_errors() {
+    async fn test_host_serve_vat_non_capnp_cap_errors() {
         run_local(async {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let err = call_handler(&handler, "listen", &[Val::Bytes(b"wasm".to_vec())]).await;
-            assert!(err.is_err(), "should require runtime capability");
+            let cap = make_cap("not-capnp", "test-cid", Rc::new(42i32));
+            let err = call_handler(&handler, "serve-vat", &[cap, Val::Str("greeter".into())])
+                .await
+                .unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("not backed by a Cap'n Proto client"), "got: {msg}");
         })
         .await;
     }
 
     #[tokio::test]
-    async fn test_host_listen_wrong_cap_type_errors() {
+    async fn test_host_listen_and_serve_wrong_arity_returns_error() {
         run_local(async {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let bad_cap = make_cap("not-runtime", "test-not-runtime-cid", Rc::new(42i32));
-            let err =
-                call_handler(&handler, "listen", &[bad_cap, Val::Bytes(b"wasm".to_vec())]).await;
-            assert!(err.is_err(), "should reject wrong capability type");
-            let msg = format!("{}", err.unwrap_err());
-            assert!(
-                msg.contains("not-runtime"),
-                "error should name the wrong cap: {msg}"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_host_listen_forged_runtime_cap_wrong_inner_type() {
-        run_local(async {
-            let s = test_session();
-            let handler =
-                make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let forged_cap = make_cap("runtime", "test-runtime-cid", Rc::new(42i32));
-            let err = call_handler(
-                &handler,
-                "listen",
-                &[forged_cap, Val::Bytes(b"wasm".to_vec())],
-            )
-            .await;
-            assert!(err.is_err(), "forged cap should be rejected");
-            let msg = format!("{}", err.unwrap_err());
-            assert!(msg.contains("wrong inner type"), "got: {msg}");
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_host_listen_string_instead_of_cap_errors() {
-        run_local(async {
-            let s = test_session();
-            let handler =
-                make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let err = call_handler(
-                &handler,
-                "listen",
-                &[Val::Str("runtime".into()), Val::Bytes(b"wasm".to_vec())],
-            )
-            .await;
-            assert!(err.is_err(), "string should not pass as runtime cap");
-            let msg = format!("{}", err.unwrap_err());
-            assert!(msg.contains("expected a cell"), "got: {msg}");
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_host_listen_nil_instead_of_cap_errors() {
-        run_local(async {
-            let s = test_session();
-            let handler =
-                make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let err = call_handler(
-                &handler,
-                "listen",
-                &[Val::Nil, Val::Bytes(b"wasm".to_vec())],
-            )
-            .await;
-            assert!(err.is_err(), "nil should not pass as runtime cap");
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_host_listen_stream_wrong_cap_type_errors() {
-        run_local(async {
-            let s = test_session();
-            let handler =
-                make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let bad_cap = make_cap("imposter", "test-imposter-cid", Rc::new(42i32));
-            let err = call_handler(
-                &handler,
-                "listen",
-                &[
-                    bad_cap,
-                    Val::Str("my-protocol".into()),
-                    Val::Bytes(b"wasm".to_vec()),
-                ],
-            )
-            .await;
-            assert!(err.is_err(), "wrong cap should be rejected in stream mode");
-            let msg = format!("{}", err.unwrap_err());
-            assert!(
-                msg.contains("imposter"),
-                "error should name the wrong cap: {msg}"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_host_listen_stream_missing_runtime_errors() {
-        run_local(async {
-            let s = test_session();
-            let handler =
-                make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let err = call_handler(
-                &handler,
-                "listen",
-                &[Val::Str("my-protocol".into()), Val::Bytes(b"wasm".to_vec())],
-            )
-            .await;
-            assert!(err.is_err(), "stream listen without runtime should error");
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_host_listen_wrong_arity_returns_error() {
-        run_local(async {
-            let s = test_session();
-            let handler =
-                make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            // 0 args after :listen — should error
             assert!(call_handler(&handler, "listen", &[]).await.is_err());
-            // 4 args after :listen — should error
-            let runtime_cap = make_cap("runtime", "test-runtime-cid", Rc::new(s.runtime.clone()));
-            assert!(call_handler(
-                &handler,
-                "listen",
-                &[
-                    runtime_cap,
-                    Val::Str("a".into()),
-                    Val::Bytes(b"b".to_vec()),
-                    Val::Str("extra".into()),
-                ],
-            )
-            .await
-            .is_err());
+            assert!(call_handler(&handler, "listen-stream", &[test_cell()]).await.is_err());
+            assert!(call_handler(&handler, "serve-vat", &[]).await.is_err());
         })
         .await;
     }
@@ -2832,9 +2940,9 @@ mod tests {
 
     // --- init script eval integration ---
 
-    /// Eval (perform host :listen runtime (perform :load "path")) end-to-end.
+    /// Eval an HTTP cell listen form end-to-end.
     #[tokio::test]
-    async fn test_chess_glia_listen_form_evals_end_to_end() {
+    async fn test_glia_http_listen_form_evals_end_to_end() {
         run_local(async {
             let ctx = RefCell::new(test_session());
             let dispatch = build_dispatch();
@@ -2847,7 +2955,7 @@ mod tests {
             std::env::remove_var("WW_ROOT");
 
             let script = format!(
-                r#"(perform host :listen runtime (perform :load "{}"))"#,
+                r#"(perform host :listen (cell (perform :load "{}")) "/demo")"#,
                 wasm_path.to_str().unwrap()
             );
             let form = read(&script).unwrap();
@@ -2855,16 +2963,16 @@ mod tests {
             let result = eval(&wrapped, &mut env, &ctx, &dispatch).await;
             assert!(
                 result.is_ok(),
-                "chess.glia listen form failed: {:?}",
+                "HTTP listen form failed: {:?}",
                 result.unwrap_err()
             );
         })
         .await;
     }
 
-    /// Eval the full chess.glia script through the kernel eval pipeline.
+    /// Eval stream listen + runtime run forms through the kernel eval pipeline.
     #[tokio::test]
-    async fn test_chess_glia_full_script_parses_and_first_form_evals() {
+    async fn test_glia_stream_listen_and_runtime_run_forms_eval() {
         run_local(async {
             let ctx = RefCell::new(test_session());
             let dispatch = build_dispatch();
@@ -2877,7 +2985,7 @@ mod tests {
             std::env::remove_var("WW_ROOT");
 
             let script = format!(
-                r#"(perform host :listen runtime (perform :load "{}"))
+                r#"(perform host :listen-stream (cell (perform :load "{}")) "chess")
                    (perform runtime :run (perform :load "{}"))"#,
                 wasm_path.to_str().unwrap(),
                 wasm_path.to_str().unwrap()
@@ -2886,7 +2994,7 @@ mod tests {
             let forms = read_many(&script).unwrap();
             assert_eq!(forms.len(), 2, "chess.glia should have 2 forms");
 
-            // First form: (perform host :listen ...) — should succeed.
+            // First form: stream listen should succeed.
             let wrapped = wrap_with_handlers(&forms[0]);
             let result = eval(&wrapped, &mut env, &ctx, &dispatch).await;
             assert!(
@@ -2989,10 +3097,10 @@ mod tests {
             );
             let cell = Val::Cell {
                 wasm: b"fake-wasm".to_vec(),
-                schema: Some(b"fake-schema".to_vec()),
                 caps: vec![("http".to_string(), http_cap)],
             };
-            let result = call_handler(&handler, "listen", &[cell]).await;
+            let result =
+                call_handler(&handler, "listen", &[cell, Val::Str("/demo".into())]).await;
             assert!(
                 result.is_ok(),
                 "cell-based listen with caps failed: {:?}",
@@ -3010,10 +3118,10 @@ mod tests {
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
             let cell = Val::Cell {
                 wasm: b"fake-wasm".to_vec(),
-                schema: Some(b"fake-schema".to_vec()),
                 caps: vec![],
             };
-            let result = call_handler(&handler, "listen", &[cell]).await;
+            let result =
+                call_handler(&handler, "listen", &[cell, Val::Str("/demo".into())]).await;
             assert!(
                 result.is_ok(),
                 "cell-based listen without caps failed: {:?}",

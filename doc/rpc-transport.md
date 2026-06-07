@@ -213,14 +213,14 @@ channel is universal. What differs is the stdin/stdout semantics:
 | **pid0** (no cell section) | Host terminal / daemon stdin | Host terminal |
 
 For Cap'n Proto (RPC) cells, stdin is a shutdown signal channel, not a data
-transport. The host never writes bytes. It only closes stdin to tell the cell
-to drain gracefully (equivalent to Go's `<-chan struct{}`). All RPC I/O goes
-through the WIT data_streams side-channel.
+transport. The host never writes bytes. All RPC I/O goes through the WIT
+data_streams side-channel.
 
-`handle_vat_connection` in `src/rpc/vat_listener.rs` demonstrates the pattern:
-when a peer disconnects, the host closes stdin to signal the cell to shut down.
-Error paths (bootstrap timeout, capability extraction failure) also close stdin
-to prevent orphaned cell processes.
+Vat publication is publisher-owned: the publisher spawns a cell, imports its
+bootstrap capability with `Process.bootstrap`, and passes that capability to
+`VatListener.serve`. `handle_vat_connection_serve` in
+`crates/rpc/src/vat_listener.rs` only bridges one incoming libp2p stream to the
+already-served capability; it does not own or spawn the publishing cell.
 
 ## Executor pool and M:N scheduling
 

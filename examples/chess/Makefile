@@ -1,4 +1,4 @@
-# Chess engine — Cap'n Proto vat cell with schema-keyed discovery
+# Chess engine — Cap'n Proto vat service with service-name discovery
 #
 # Usage: make -C examples/chess
 

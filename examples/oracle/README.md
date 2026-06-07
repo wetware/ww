@@ -1,6 +1,6 @@
 # Oracle -- Gas Price Feed
 
-Decentralized gas price oracle over schema-keyed RPC and HTTP.
+Decentralized gas price oracle over named vat RPC and HTTP.
 Fetches live gas prices from Blocknative via `HttpClient`, serves
 them over typed Cap'n Proto RPC **and** HTTP/JSON, and advertises
 on the DHT for peer discovery.
@@ -8,11 +8,11 @@ on the DHT for peer discovery.
 ## What it demonstrates
 
 - **Dual transport** -- one binary, two transports (vat RPC + HTTP)
-- **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- schema-keyed RPC
+- **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- named vat RPC
 - **WAGI cell** (`WW_CELL_MODE=http`) -- CGI, curl-friendly JSON
 - `HttpClient` capability for outbound HTTP (domain-scoped)
 - `with`/`cell`/`listen` DX for capability-scoped cell definitions
-- Schema-keyed DHT discovery via `routing.provide()` / `findProviders()`
+- Service-name DHT discovery via `routing.provide()` / `findProviders()`
 - Four-mode binary: vat cell, WAGI cell, service (DHT), consumer (query)
 
 ## Prerequisites
@@ -33,8 +33,8 @@ make oracle
 ```
 
 This compiles the WASM guest and copies the compiled schema bytes
-(`oracle.capnpc`) next to the binary. The schema is passed
-explicitly via RPC at runtime -- no custom sections.
+(`oracle.capnpc`) next to the binary for tooling/introspection.
+Vat publication uses the service name `oracle`.
 
 ## Running
 
@@ -148,12 +148,12 @@ ORACLE NODE:                            CURL CLIENT:
     write to stdout
 
                                         CONSUMER NODE:
-  VatListener accepts      <--libp2p--  vat_client.dial(oracle, schema)
-  spawns cell (cell mode)               bootstrap --> PriceOracle cap
-    membrane.graft()                    oracle.get_pairs() -> ["ETH/gas", ...]
-    http_client.get(blocknative)        oracle.get_price("ETH/gas")
-    cache prices                           |
-    serve PriceOracle       --RPC-->    display prices
+  VatListener serves       <--libp2p--  vat_client.dial(oracle, "oracle")
+  persistent PriceOracle cap            bootstrap --> PriceOracle cap
+                                        oracle.get_pairs() -> ["ETH/gas", ...]
+                                        oracle.get_price("ETH/gas")
+                                           |
+                            --RPC-->    display prices
     refresh loop (30s)
 ```
 
@@ -168,17 +168,18 @@ The same binary serves all modes. Detection:
 | **Service** | `serve` subcommand | DHT provide loop |
 | **Consumer** | `consume` subcommand | DHT discover + RPC query |
 
-- **Vat cell mode** (`WW_CELL_MODE=vat`): spawned by `VatListener`
-  per incoming RPC connection. Creates a `PriceOracleImpl`, grafts
-  to obtain `HttpClient`, fetches prices from Blocknative, and
-  exports the oracle as the bootstrap capability. Refreshes prices
-  every 30-60 seconds while the connection is alive.
+- **Vat cell mode** (no args): spawned by Glia before publication.
+  Creates a `PriceOracleImpl`, grafts to obtain `HttpClient`, fetches
+  prices from Blocknative, and exports the oracle as the bootstrap
+  capability. `host :serve-vat` publishes that capability under
+  `oracle`.
 - **WAGI cell mode** (`WW_CELL_MODE=http`): spawned by `HttpListener`
   per HTTP request. Grafts the membrane over `wetware:streams`
   (side-channel), fetches prices via `HttpClient`, writes a JSON
   response to stdout via CGI. Stateless -- one cell per request.
 - **Service mode**: long-running DHT provider loop. Provides the
-  schema CID on the DHT and re-provides periodically (records expire).
+  service-name routing key on the DHT and re-provides periodically
+  (records expire).
 - **Consumer mode**: discovers oracle providers via DHT, dials them
   with `VatClient`, queries prices. Exponential backoff (2 s to 60 s).
 
@@ -207,14 +208,15 @@ RPC. Confidence decays toward 0.0 if data goes stale.
 `glia/register.glia`:
 
 ```clojure
-;; Define the oracle cell (HttpClient arrives via membrane graft in-cell).
-(def oracle
-  (cell (load "bin/oracle.wasm")
-        (load "bin/oracle.capnpc")))
+(def oracle-wasm (load "bin/oracle.wasm"))
+(def oracle-http (cell oracle-wasm))
 
-;; Mount on both transports.
-(perform host :listen oracle)              ;; vat RPC
-(perform host :listen oracle "/oracle")    ;; HTTP/WAGI
+(def oracle-executor (perform runtime :load oracle-wasm))
+(def oracle-process (perform oracle-executor :spawn))
+(def oracle-cap (perform oracle-process :bootstrap))
+
+(perform host :serve-vat oracle-cap "oracle")
+(perform host :listen oracle-http "/oracle")
 ```
 
 `glia/serve.glia`:
@@ -229,8 +231,8 @@ RPC. Confidence decays toward 0.0 if data goes stale.
 (perform runtime :run (load "bin/oracle.wasm") "consume")
 ```
 
-`(perform host :listen ...)` registers the cell with the host:
-- Cell alone → VatListener (schema-keyed RPC over libp2p)
+The host registration forms split by transport:
+- `:serve-vat` publishes an exported capability over named vat RPC
 - Cell + path → HttpListener (WAGI at the given prefix)
 
 The same binary handles both transports. It detects HTTP mode via

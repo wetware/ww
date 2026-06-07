@@ -32,5 +32,4 @@ auth = { path = "../guest/auth" }
 cache = { package = "ww-cache", path = "../cache" }
 ipfs = { path = "../ipfs" }
 membrane = { path = "../membrane" }
-schema-id = { path = "../schema-id" }
 stem = { path = "../stem" }

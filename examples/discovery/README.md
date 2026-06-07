@@ -1,17 +1,17 @@
 # Discovery -- Greeter RPC
 
-Two-agent Greeter demo showing schema-keyed peer discovery over
+Two-agent Greeter demo showing named vat peer discovery over
 the DHT. Agent A publishes a Greeter service. Agent B discovers
-it by schema CID alone, dials it via Cap'n Proto RPC, and gets a
+it by service name, dials it via Cap'n Proto RPC, and gets a
 typed greeting back. No configuration, no service registry, no
 hardcoded addresses.
 
 ## What it demonstrates
 
-- **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- schema-keyed RPC
-- `VatListener` for per-connection capability cells
+- **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- named vat RPC
+- `VatListener.serve` for persistent capability export
 - `VatClient` for typed RPC dialing
-- Schema-keyed DHT discovery via `routing.provide()` / `findProviders()`
+- Service-name DHT discovery via `routing.provide()` / `findProviders()`
 - Dual-mode binary: cell mode (RPC server) + service mode (discovery loop)
 - Exponential backoff with jitter for peer discovery
 
@@ -33,8 +33,8 @@ make discovery
 ```
 
 This compiles the WASM guest and copies the compiled schema bytes
-(`discovery.capnpc`) next to the binary. The schema is passed
-explicitly via RPC at runtime -- no custom sections.
+(`discovery.capnpc`) next to the binary for tooling/introspection.
+Vat publication uses the service name `greeter`.
 
 ## Running
 
@@ -81,7 +81,8 @@ Expected output on Agent B:
 
 ```
 [INFO] service: peer ..a1b2c3d4
-[INFO] service: schema CID bafy...
+[INFO] service: name greeter
+[INFO] service: routing key bafy...
 [INFO] service: looking for peers...
 [INFO] service: found 1 peer(s)
 [INFO] ..a1b2c3d4 -> ..e5f6g7h8: Hello, peer ..a1b2c3d4! I'm ..e5f6g7h8
@@ -91,23 +92,23 @@ Expected output on Agent B:
 
 ```
 BUILD TIME:
-  greeter.capnp --> capnpc --> greeter_schema.bin --> discovery.wasm + discovery.capnpc
+  greeter.capnp --> capnpc --> discovery.wasm + discovery.capnpc
 
 AGENT A (service mode):                    AGENT B (service mode):
   membrane.graft()                           membrane.graft()
-  routing.provide(CID)  --DHT-->            routing.find_providers(CID)
+  routing.hash("greeter")                    routing.hash("greeter")
+  routing.provide(key)  --DHT-->            routing.find_providers(key)
                                              |
-                         <--libp2p stream--  vat_client.dial(A, schema)
-  VatListener accepts                        |
-  spawns cell (cell mode)                    bootstrap --> Greeter cap
-  cell serves Greeter                        greeter.greet("peer B")
+                         <--libp2p stream--  vat_client.dial(A, "greeter")
+  VatListener serves                         |
+  persistent Greeter cap                     bootstrap --> Greeter cap
+                                             greeter.greet("peer B")
                          --RPC response-->   "Hello, peer B! I'm A"
 ```
 
-The schema CID is derived deterministically from the Greeter
-interface definition: `CIDv1(raw, BLAKE3(canonical(schema.Node)))`.
-Two nodes with the same schema automatically find each other on
-the Kademlia DHT.
+The DHT key is derived deterministically from the service name via
+`routing.hash("greeter")`. The vat protocol is the normal service name
+`greeter`; schema CIDs remain build-time metadata, not locators.
 
 ### Schema
 
@@ -121,12 +122,11 @@ interface Greeter {
 
 The same binary serves both roles:
 
-- **Cell mode** (`WW_CELL_MODE=vat`): spawned by `VatListener`
-  per incoming RPC connection. Creates a `GreeterImpl` and exports
-  it via `system::serve()`. The host bridges the capability to the
-  connecting peer.
+- **Cell mode** (no args): spawned by Glia before publication.
+  Creates a `GreeterImpl` and exports it via `system::serve()`.
+  `host :serve-vat` publishes that exported capability under `greeter`.
 - **Service mode** (default): long-running discovery loop. Provides
-  the schema CID on the DHT, discovers peers via
+  the service-name routing key on the DHT, discovers peers via
   `routing.find_providers()`, dials them with `VatClient`, and calls
   `greet()`. Exponential backoff (2 s to 15 min).
 
@@ -135,13 +135,12 @@ The same binary serves both roles:
 `glia/register.glia`:
 
 ```clojure
-; Register vat cell for the Greeter capability.
-; VatListener spawns a cell per connection; the cell exports
-; a Greeter capability via system::serve().
 (def discovery-wasm (load "bin/discovery.wasm"))
-(def discovery-schema (load "bin/discovery.capnpc"))
+(def discovery-executor (perform runtime :load discovery-wasm))
+(def discovery-process (perform discovery-executor :spawn))
+(def discovery-cap (perform discovery-process :bootstrap))
 
-(perform host :listen runtime discovery-wasm discovery-schema)
+(perform host :serve-vat discovery-cap "greeter")
 ```
 
 `glia/serve.glia`:

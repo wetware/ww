@@ -7,8 +7,8 @@ Peer-to-peer compute marketplace via RFQ (request-for-quote) protocol.
 - **ComputeProvider as a vat cell** -- the auction provider is a regular WASM guest, not host-side code
 - `FuelPolicy::Oneshot` for budget-tracked cell execution (cells trap at fuel exhaustion)
 - `Identity.signer()` for quote signing + `Identity.verify()` for signature verification
-- `VatHandler::Serve` for persistent capability export (one auction object serves all bidders)
-- Schema-keyed DHT discovery via `routing.provide()` / `findProviders()`
+- `VatListener.serve` for persistent capability export (one auction object serves all bidders)
+- Service-name DHT discovery via `routing.provide()` / `findProviders()`
 - `Runtime.load()` + `Executor.spawn()` with fuel policy for spawning metered child cells
 - Nonce-based replay prevention with TTL pruning
 
@@ -165,13 +165,15 @@ Then compare quotes from Glia:
 `glia/register.glia`:
 
 ```clojure
-;; One binary, two transports.
-(def auction
-  (cell (load "bin/auction.wasm")
-        (load "bin/auction.capnpc")))
+(def auction-wasm (load "bin/auction.wasm"))
+(def auction-http (cell auction-wasm))
 
-(perform host :listen auction)              ;; vat RPC (schema-keyed, libp2p)
-(perform host :listen auction "/auction")   ;; HTTP/WAGI at /auction
+(def auction-executor (perform runtime :load auction-wasm))
+(def auction-process (perform auction-executor :spawn))
+(def auction-cap (perform auction-process :bootstrap))
+
+(perform host :serve-vat auction-cap "auction")
+(perform host :listen auction-http "/auction")
 ```
 
 `glia/serve.glia`:

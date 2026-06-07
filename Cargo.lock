@@ -5417,7 +5417,6 @@ dependencies = [
  "membrane",
  "rand 0.9.4",
  "reqwest",
- "schema-id",
  "serde",
  "serde_json",
  "stem",

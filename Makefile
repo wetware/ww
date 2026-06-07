@@ -6,7 +6,7 @@
 WASM_TARGET := wasm32-wasip2
 
 .PHONY: all host std kernel shell status examples chess echo counter discovery oracle auction mindshare snap-hello-rs clean run-kernel
-.PHONY: publish-std try-publish-std publish test-wasm
+.PHONY: publish-std try-publish-std publish test-deps test test-wasm
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
 
@@ -16,6 +16,12 @@ all: std try-publish-std examples host
 
 host:
 	cargo build --release
+
+test-deps:
+	git submodule update --init contracts/stem/lib/forge-std
+
+test: test-deps
+	cargo test --workspace
 
 # --- Std components ----------------------------------------------------------
 

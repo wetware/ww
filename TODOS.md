@@ -1,5 +1,21 @@
 # TODOs
 
+## Recursive attenuation for named vat services
+**What:** Design and implement general recursive attenuation after the serve-only vat transport cutover lands. The expected shape is still "spawn/export/wrap/serve", but method-level policy, schema authority, nested attenuation composition, and dynamic caller UX need a fresh design pass.
+**Why:** Vat transport now forwards capabilities by service-name locator only. Fine-grained authority reduction belongs upstream of publication, where the publisher can wrap or attenuate the capability it serves.
+**Context:** Run a fresh office-hours workflow first, then a plan-eng-review before slicing PRs. Do not resurrect schema-CID vat routing, `VatConnection`, or vat `listen` as hidden shortcuts. Related: #526, #527, #97.
+**Effort:** L
+**Priority:** P0
+**Depends on:** serve-only vat transport cutover
+
+## Glia lexical/isolate confinement design review
+**What:** Revisit Glia `def`, dynamic handler stacks, lexical scope, and `isolate` return semantics before tightening confinement further. Add tests for returning capabilities from `isolate`, including whether their methods remain self-contained without ambient outer handlers.
+**Why:** Serve-only publication makes "construct a narrow cap, then serve it" a core workflow. `isolate` appears to have the right general shape, but the exported-cap use case needs explicit semantics and tests before documentation promises it.
+**Context:** Run a separate office-hours/design pass. Balance E-style object-capability purity with Glia/Clojure ergonomics; avoid mixing this into vat transport. Tracking: #549.
+**Effort:** M
+**Priority:** P1
+**Depends on:** serve-only vat transport cutover
+
 ## AutoNAT v2: expose per-address reachability (follow-up after node-level parity)
 **What:** Extend runtime network state to expose per-address reachability outcomes from AutoNAT v2 probes, instead of only the node-level `NatReachability` enum.
 **Why:** Node-level state is enough for current relay/Kad policy, but operators and future policy layers may need richer diagnostics (which address was tested, by which server, and why it failed).
@@ -70,8 +86,8 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 
 ## Shell session memory limits / TTL
 **What:** Bound memory growth in long-lived shell cell sessions. Each `def` grows the Glia `Env`, each `load` caches bytes in a `thread_local! HashMap` with no eviction. A long-lived session or malicious client can grow WASM linear memory until the host OOMs.
-**Why:** Per-session isolation via VatListener spawn mode means each shell connection is a separate WASM process. But there's no ceiling on how large that process can grow.
-**Context:** Options: (a) WASM linear memory limit via wasmtime config, (b) session TTL (kill after N minutes), (c) Env size limit in glia, (d) `load` cache eviction. The VatListener connection rate limiting TODO (P2) provides the multiplier backstop (max concurrent sessions). This TODO handles per-session growth. Design doc: `~/.gstack/projects/wetware-ww/lthibault-master-design-20260402-192805.md`.
+**Why:** Each shell session is a separate WASM process, but there's no ceiling on how large that process can grow.
+**Context:** Options: (a) WASM linear memory limit via wasmtime config, (b) session TTL (kill after N minutes), (c) Env size limit in glia, (d) `load` cache eviction. This TODO handles per-session growth. Design doc: `~/.gstack/projects/wetware-ww/lthibault-master-design-20260402-192805.md`.
 **Effort:** S
 **Priority:** P2
 **Depends on:** Shell cell (ww shell)
@@ -128,12 +144,12 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 
 ## ~~Protocol namespace collision between StreamListener and VatListener~~
 **RESOLVED:** Stream and vat protocols now use distinct prefixes:
-`/ww/0.1.0/stream/{name}` vs `/ww/0.1.0/vat/{cid}`.
+`/ww/0.1.0/stream/{name}` vs `/ww/0.1.0/vat/{name}`.
 
 ## Connection rate limiting for VatListener
-**What:** Every incoming connection in `VatListenerImpl` spawns a new WASI cell process with no concurrency limit. A malicious peer (or many peers) can flood connections, causing unbounded process spawning.
-**Why:** Each cell holds WASM memory, an RPC system, and a libp2p stream. Unbounded spawning is a resource exhaustion vector.
-**Context:** Add a semaphore or max-connections limit to the accept loop. Consider making the limit configurable via the `listen()` params or a sensible default (e.g., 64 concurrent cells per protocol).
+**What:** Every incoming connection in `VatListenerImpl` starts a Cap'n Proto RPC session to the served capability with no concurrency limit. A malicious peer (or many peers) can flood connections, causing unbounded session and stream work.
+**Why:** Serve-only vat transport no longer spawns a WASI cell per connection, but each connection still holds an RPC system, stream, tasks, and references to the served capability.
+**Context:** Add a semaphore or max-connections limit to the accept loop. Consider making the limit configurable via `serve()` params or a sensible default (e.g. 64 concurrent connections per protocol).
 **Effort:** S
 **Priority:** P2
 
@@ -219,7 +235,7 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 ## Cap'n Proto schema-boundary refactor (stem/auth/membrane/system) (#509)
 **What:** Refactor schema ownership so epoch/provenance types stay in `stem.capnp`, auth/session types move to `auth.capnp`, membrane transport types (`Membrane`, `Export`) move to `membrane.capnp`, and core host/runtime/listener contracts remain in `system.capnp`.
 **Why:** `stem.capnp` currently mixes unrelated concerns and `system.capnp` imports `stem.Export` for core spawn/listener surfaces, which obscures ownership boundaries and complicates protocol evolution.
-**Context:** This is a staged-compat migration, not a redesign. Keep authority semantics unchanged (`Terminal(Membrane)` and no new ambient privileges), preserve runtime behavior, and plan explicit compatibility for schema bytes/type IDs/CID-derived vat addresses. Must audit all capnp build scripts and generated-module consumers (`crates/membrane`, `std/kernel`, `std/caps`, `std/status`, examples, CLI template scaffolding) plus schema-introspection paths (`schema_registry`, `Export.schema` propagation). Include a rollback path and a temporary shim period where old and new schema surfaces coexist long enough to land cross-crate updates atomically.
+**Context:** This is a staged-compat migration, not a redesign. Keep authority semantics unchanged (`Terminal(Membrane)` and no new ambient privileges), preserve runtime behavior, and plan explicit compatibility for schema bytes and type IDs. Vat addresses are service-name locators and should not be coupled back to schema CIDs. Must audit all capnp build scripts and generated-module consumers (`crates/membrane`, `std/kernel`, `std/caps`, `std/status`, examples, CLI template scaffolding) plus schema-introspection paths (`schema_registry`, `Export.schema` propagation). Include a rollback path and a temporary shim period where old and new schema surfaces coexist long enough to land cross-crate updates atomically.
 **Effort:** L
 **Priority:** P2
 **Depends on:** issue #509 design approval, cross-crate capnp migration plan, compatibility decision for schema/type IDs
@@ -281,7 +297,7 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 **Depends on:** IPFS-first distribution (this plan), stem infrastructure
 
 ## Write doc/ARCHITECTURE.md (daemon runtime topology overview)
-**What:** A 10-minute-readable overview of the daemon's runtime topology for new contributors and re-onboarding founders. Cover: (a) the Service-based pattern (`src/services.rs`) — each long-lived component on its own thread with `current_thread + LocalSet`; (b) the singleton-backing-state + per-connection-dispatcher pattern (`HostImpl`, `RuntimeImpl` are thin dispatchers; expensive state in shared `Send + Clone` references); (c) ExecutorPool — M workers, mpsc-distributed `SpawnRequest`s, shared `Arc<Engine>`; (d) fuel/epoch scheduling — cooperative yield, atomic epoch bumps, refuel via `epoch_deadline_callback`; (e) membrane graft model — `HostGraftBuilder` assembles per-graft, capnp clients are `!Send` so cap routing is single-threaded; (f) capnp surface map (`Host::network()` returns listener/dialer clients, init.d's `(perform host :listen ...)` routes to VatListener.listen, etc.). Diagrams in ASCII per project convention.
+**What:** A 10-minute-readable overview of the daemon's runtime topology for new contributors and re-onboarding founders. Cover: (a) the Service-based pattern (`src/services.rs`) — each long-lived component on its own thread with `current_thread + LocalSet`; (b) the singleton-backing-state + per-connection-dispatcher pattern (`HostImpl`, `RuntimeImpl` are thin dispatchers; expensive state in shared `Send + Clone` references); (c) ExecutorPool — M workers, mpsc-distributed `SpawnRequest`s, shared `Arc<Engine>`; (d) fuel/epoch scheduling — cooperative yield, atomic epoch bumps, refuel via `epoch_deadline_callback`; (e) membrane graft model — `HostGraftBuilder` assembles per-graft, capnp clients are `!Send` so cap routing is single-threaded; (f) capnp surface map (`Host::network()` returns listener/dialer clients; Glia routes HTTP via `host :listen`, byte streams via `host :listen-stream`, and vat publication via `host :serve-vat`). Diagrams in ASCII per project convention.
 **Why:** Three architectural mistakes in the lthibault/ww-shell-usable design session were re-derivations of things the codebase already knows but doesn't document: (1) wrongly assumed daemon main was the runtime everything lived on (true in form, but every long-lived component is on its own thread); (2) muddled the "where does cap state live" question (HostImpl per-connection vs. singleton state); (3) framed pre-warm as "spawn idle cell" rather than "compile cache at startup." All three would have been caught by a 10-minute architecture overview. Each subsequent contributor saves the re-derivation cost.
 **Context:** Reference points: `src/services.rs` (Service trait, ExecutorPool, worker_loop); `crates/rpc/src/lib.rs:684-710` (build_peer_rpc, HostImpl); `src/launcher.rs:42-130` (RuntimeImpl singleton); `std/system/src/lib.rs:570-680` (cell-side serve() and poll_loop). Existing `doc/architecture.md` covers the conceptual stack (cells/membranes/ocap) — the new doc complements it with daemon runtime mechanics, doesn't duplicate.
 **Effort:** M (human) → S-M (CC, with a /design-consultation pass to set scope)

@@ -9,7 +9,7 @@ Symmetric peer-to-peer context sharing for LLMs.
 - **Rate limiting as capability wrapper** -- token bucket intrinsic to the Prompt object, not an external policy check
 - **Content-addressed push** -- context pushed as IPFS CIDs, resolved from the receiver's local content store
 - **Local LLM integration** -- HttpClient POST to Ollama/llama-server, no cloud APIs
-- **Schema-keyed DHT discovery** -- peers running Mindshare find each other automatically via schema CID
+- **Named vat discovery** -- peers running Mindshare publish and dial a named vat service
 
 ## How it works
 
@@ -148,12 +148,12 @@ capabilities automatically.
 `glia/register.glia`:
 
 ```clojure
-;; Define and register the Mindshare vat cell.
-(def mindshare
-  (cell (load "bin/mindshare.wasm")
-        (load "bin/mindshare.capnpc")))
+(def mindshare-wasm (load "bin/mindshare.wasm"))
+(def mindshare-executor (perform runtime :load mindshare-wasm))
+(def mindshare-process (perform mindshare-executor :spawn))
+(def mindshare-cap (perform mindshare-process :bootstrap))
 
-(perform host :listen mindshare)
+(perform host :serve-vat mindshare-cap "mindshare")
 ```
 
 `glia/serve.glia`:

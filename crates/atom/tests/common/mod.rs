@@ -357,9 +357,9 @@ pub async fn atom_head_http(
     decode_head_return(&bytes).context("decode head()")
 }
 
-/// True if `anvil`, `forge`, and `cast` are in PATH (Foundry toolchain available).
+/// Returns a skip reason when the Foundry-backed integration tests cannot run.
 /// Use at the start of integration tests to skip when not in CI/local dev with Foundry.
-pub fn foundry_available() -> bool {
+pub fn foundry_unavailable_reason() -> Option<String> {
     fn in_path(cmd: &str, args: &[&str]) -> bool {
         Command::new(cmd)
             .args(args)
@@ -370,7 +370,39 @@ pub fn foundry_available() -> bool {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
-    in_path("anvil", &["--help"]) && in_path("forge", &["--help"]) && in_path("cast", &["--help"])
+
+    let mut missing = Vec::new();
+    for cmd in ["anvil", "forge", "cast"] {
+        if !in_path(cmd, &["--help"]) {
+            missing.push(cmd);
+        }
+    }
+    if !missing.is_empty() {
+        return Some(format!(
+            "{} not in PATH; install Foundry before running these tests",
+            missing.join("/")
+        ));
+    }
+
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/atom should be two levels below repo root");
+    let forge_std_script = repo_root.join("contracts/stem/lib/forge-std/src/Script.sol");
+    let forge_std_test = repo_root.join("contracts/stem/lib/forge-std/src/Test.sol");
+    if !forge_std_script.exists() || !forge_std_test.exists() {
+        return Some(
+            "contracts/stem/lib/forge-std is not initialized; run `git submodule update --init contracts/stem/lib/forge-std`"
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+/// True if Foundry tooling and contract submodules are available.
+pub fn foundry_available() -> bool {
+    foundry_unavailable_reason().is_none()
 }
 
 /// Spawn Anvil on a dynamic port and wait until ready.

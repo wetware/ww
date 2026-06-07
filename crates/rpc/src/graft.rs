@@ -293,8 +293,8 @@ impl HostGraftBuilder {
     ///
     /// The third tuple element is the canonical `Schema.Node` bytes for the
     /// cap. The wire format already carries these (see `membrane.capnp:Export`);
-    /// callers that received the cap over `Executor.spawn` /
-    /// `VatListener.listen` should preserve `entry.get_schema()` and pass
+    /// callers that received the cap over `Executor.spawn` should preserve
+    /// `entry.get_schema()` and pass
     /// it through. Pass an empty Vec only when the schema is genuinely
     /// unknown — graft will then leave `Export.schema` empty and warn.
     pub fn with_extras(
@@ -1013,7 +1013,7 @@ mod tests {
 
     #[test]
     fn item1b_canonicalize_schema_node_matches_registry_bytes() {
-        // The Executor.spawn / VatListener.listen handlers call
+        // The Executor.spawn handler calls
         // super::canonicalize_schema_node on the wire-side Schema.Node
         // reader to recover canonical bytes for forwarding. Ensure the
         // recipe matches what the build-time pipeline emits — a guest

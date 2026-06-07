@@ -9,7 +9,6 @@ use capnp::capability::Promise;
 use capnp_rpc::pry;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::StreamExt;
-use libp2p::StreamProtocol;
 use membrane::EpochGuard;
 
 use membrane::system_capnp;
@@ -28,6 +27,10 @@ impl StreamListenerImpl {
     }
 }
 
+/// A captured init.d `with`-block grant: name + capnp client + canonical Schema.Node bytes.
+/// Cloned per incoming stream and re-emitted on the spawned cell's graft.
+type ExtraCap = (String, capnp::capability::Client, Vec<u8>);
+
 #[allow(refining_impl_trait)]
 impl system_capnp::stream_listener::Server for StreamListenerImpl {
     fn listen(
@@ -43,22 +46,27 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
             .to_str()
             .map_err(|e| capnp::Error::failed(e.to_string())));
 
-        if protocol_str.is_empty() {
-            return Promise::err(capnp::Error::failed(
-                "protocol name must not be empty".into(),
-            ));
-        }
-        if protocol_str.contains('/') {
-            return Promise::err(capnp::Error::failed(
-                "protocol name must not contain '/'".into(),
-            ));
-        }
-
         let protocol_suffix = protocol_str.to_string();
-        let stream_protocol = pry!(StreamProtocol::try_from_owned(format!(
-            "/ww/0.1.0/stream/{protocol_suffix}"
-        ))
-        .map_err(|e| capnp::Error::failed(format!("invalid protocol: {e}"))));
+        let stream_protocol = pry!(super::stream_protocol(&protocol_suffix));
+
+        let extra_caps: Vec<ExtraCap> = {
+            let mut caps_vec = Vec::new();
+            if let Ok(caps_reader) = params.get_caps() {
+                for entry in caps_reader.iter() {
+                    if let (Ok(name), Ok(cap)) = (
+                        entry.get_name().map(|n| n.to_string().unwrap_or_default()),
+                        entry.get_cap().get_as_capability(),
+                    ) {
+                        let schema_bytes = match entry.get_schema() {
+                            Ok(node) => super::canonicalize_schema_node(node).unwrap_or_default(),
+                            Err(_) => Vec::new(),
+                        };
+                        caps_vec.push((name, cap, schema_bytes));
+                    }
+                }
+            }
+            caps_vec
+        };
 
         let mut control = self.stream_control.clone();
         let mut incoming = pry!(control
@@ -87,12 +95,13 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
                         tracing::debug!("Incoming stream connection");
                         let executor = executor.clone();
                         let protocol = protocol_suffix.clone();
+                        let caps = extra_caps.clone();
                         tokio::task::spawn_local(async move {
                             let _handle_span = tracing::info_span!(
                                 "stream.handle",
                                 protocol = protocol.as_str(),
                             ).entered();
-                            if let Err(e) = handle_connection(executor, stream, &protocol).await {
+                            if let Err(e) = handle_connection(executor, caps, stream, &protocol).await {
                                 tracing::error!("Stream cell connection error: {e}");
                             }
                         });
@@ -116,13 +125,34 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
 
 /// Spawn a cell process for a single connection and pump
 /// stdin/stdout between the libp2p stream and the process.
-pub(crate) async fn handle_connection(
+async fn handle_connection(
     executor: system_capnp::executor::Client,
+    caps: Vec<ExtraCap>,
     stream: libp2p::Stream,
     protocol: &str,
 ) -> Result<(), capnp::Error> {
     // Spawn cell process via Executor.spawn().
-    let response = executor.spawn_request().send().promise.await?;
+    let mut spawn_req = executor.spawn_request();
+    if !caps.is_empty() {
+        let mut caps_builder = spawn_req.get().init_caps(caps.len() as u32);
+        for (i, (name, client, schema_bytes)) in caps.iter().enumerate() {
+            let mut entry = caps_builder.reborrow().get(i as u32);
+            entry.set_name(name);
+            if !schema_bytes.is_empty() {
+                let aligned = crate::graft::bytes_to_aligned_words(schema_bytes);
+                let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
+                let segment_array = capnp::message::SegmentArray::new(segments);
+                let reader = capnp::message::Reader::new(
+                    segment_array,
+                    capnp::message::ReaderOptions::new(),
+                );
+                let schema_node: capnp::schema_capnp::node::Reader = reader.get_root()?;
+                entry.reborrow().set_schema(schema_node)?;
+            }
+            entry.init_cap().set_as_capability(client.hook.clone());
+        }
+    }
+    let response = spawn_req.send().promise.await?;
     let process = response.get()?.get_process()?;
 
     // Get stdin (write-only) and stdout (read-only) ByteStream clients.
