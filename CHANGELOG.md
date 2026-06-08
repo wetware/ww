@@ -54,6 +54,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - **IPFS release publishing now fails boundedly instead of hanging indefinitely.** The GitHub publish job has a 30-minute cap, each VPS publish attempt is wrapped in a 12-minute timeout, and the release publish script applies explicit timeouts to IPFS add, pin, IPNS publish, and DHT provide operations.
+- **IPFS release publishing no longer depends on flaky `kubectl cp`.** The VPS release tree is streamed into the IPFS pod as a tar archive over `kubectl exec -i`, avoiding repeated short `context deadline exceeded` failures from the Kubernetes copy helper.
 - **CI IPFS release publishing now tolerates slow pod staging.** The publish helper uses a unique pod staging path, retries `kubectl cp`, keeps repo stats and pod cleanup best-effort, and logs each production publish phase so slow k3s API behavior is diagnosable without changing release pin retention semantics.
 - **WAGI HTTP requests now time out and kill hung cells (#535).** `HttpListener` bounds each spawned request's stdin/stdout/wait phase with a 30s wall-clock timeout, returns `504 Gateway Timeout` on expiry, and calls `Process.kill()` best-effort while preserving the existing oversized-response kill path.
 - **Epoch advances now update the live CidTree root before broadcasting (#536).** Daemon startup wires the runtime `CidTree` into `EpochService`, so epoch commit handling swaps the virtual filesystem root to the committed event CID before the delayed epoch notification is released.
