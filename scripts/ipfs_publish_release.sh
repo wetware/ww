@@ -12,6 +12,10 @@ STATE_FILE="${WW_RELEASE_PIN_STATE:-/data/ipfs/ww-release-pins.txt}"
 RETAIN="${WW_RELEASE_PIN_RETAIN:-10}"
 KUBECTL_TIMEOUT="${KUBECTL_TIMEOUT:-10m}"
 KUBECTL_BEST_EFFORT_TIMEOUT="${KUBECTL_BEST_EFFORT_TIMEOUT:-45s}"
+IPFS_ADD_TIMEOUT="${IPFS_ADD_TIMEOUT:-5m}"
+IPFS_PIN_TIMEOUT="${IPFS_PIN_TIMEOUT:-2m}"
+IPFS_NAME_PUBLISH_TIMEOUT="${IPFS_NAME_PUBLISH_TIMEOUT:-5m}"
+IPFS_PROVIDE_TIMEOUT="${IPFS_PROVIDE_TIMEOUT:-60s}"
 
 case "$RETAIN" in
   ''|*[!0-9]*)
@@ -82,7 +86,7 @@ repo_stat_before="$(repo_stat_size)"
 copy_release_tree
 
 log "adding release tree to IPFS with implicit pinning disabled"
-CID="$(pod ipfs add --pin=false -rQ --cid-version=1 "$POD_RELEASE_TREE" | tail -n 1 | tr -d '\r')"
+CID="$(pod sh -c "if command -v timeout >/dev/null 2>&1; then timeout '$IPFS_ADD_TIMEOUT' ipfs add --pin=false -rQ --cid-version=1 '$POD_RELEASE_TREE'; else ipfs add --pin=false -rQ --cid-version=1 '$POD_RELEASE_TREE'; fi" | tail -n 1 | tr -d '\r')"
 if [ -z "$CID" ]; then
   echo "ERROR: ipfs add produced an empty CID" >&2
   exit 1
@@ -90,12 +94,12 @@ fi
 
 echo "CID=$CID"
 log "pinning release CID $CID"
-pod ipfs pin add "$CID"
+pod sh -c "if command -v timeout >/dev/null 2>&1; then timeout '$IPFS_PIN_TIMEOUT' ipfs pin add '$CID'; else ipfs pin add '$CID'; fi"
 log "publishing IPNS ww-release to $CID"
-pod ipfs name publish --key=ww-release "/ipfs/$CID"
+pod sh -c "if command -v timeout >/dev/null 2>&1; then timeout '$IPFS_NAME_PUBLISH_TIMEOUT' ipfs name publish --key=ww-release '/ipfs/$CID'; else ipfs name publish --key=ww-release '/ipfs/$CID'; fi"
 
 log "announcing release CID to the DHT (best effort)"
-if ! pod sh -c "if command -v timeout >/dev/null 2>&1; then timeout 60 ipfs routing provide -r '$CID'; else ipfs routing provide -r '$CID'; fi"; then
+if ! pod sh -c "if command -v timeout >/dev/null 2>&1; then timeout '$IPFS_PROVIDE_TIMEOUT' ipfs routing provide -r '$CID'; else ipfs routing provide -r '$CID'; fi"; then
   echo "WARNING: provide announce timed out or failed; DHT propagation may lag" >&2
 fi
 

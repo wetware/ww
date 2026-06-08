@@ -480,6 +480,7 @@ jobs:
       && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'
           || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v5
@@ -662,7 +663,7 @@ jobs:
         rsync -a -e "$SSH_CMD" scripts/ipfs_publish_release.sh ${{ secrets.VPS_SSH }}:/tmp/ww-ipfs-publish-release.sh
         for attempt in 1 2 3; do
           echo "Publish attempt $attempt..."
-          if $SSH_CMD ${{ secrets.VPS_SSH }} "
+          if timeout 12m $SSH_CMD ${{ secrets.VPS_SSH }} "
             set -e
             chmod +x /tmp/ww-ipfs-publish-release.sh
             POD='$POD' WW_RELEASE_PIN_RETAIN=10 /tmp/ww-ipfs-publish-release.sh
