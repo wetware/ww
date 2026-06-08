@@ -597,7 +597,7 @@ impl Proc {
                 let consumed = est.budget.saturating_sub(current_fuel);
                 *remaining = remaining.saturating_sub(consumed);
                 if *remaining == 0 {
-                    tracing::info!(remaining_budget = 0, "fuel.auction.exhausted");
+                    tracing::info!(remaining_budget = 0, "fuel.budget.exhausted");
                     return Ok(wasmtime::UpdateDeadline::Continue(1));
                 }
                 let remaining_snap = *remaining;
@@ -606,7 +606,7 @@ impl Proc {
                     remaining_budget = remaining_snap,
                     consumed_this_epoch = consumed,
                     avg_ratio = avg,
-                    "fuel.auction.epoch_tick"
+                    "fuel.budget.epoch_tick"
                 );
             }
 

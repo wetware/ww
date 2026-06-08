@@ -2516,6 +2516,23 @@ async fn perform_cap_value<'a, D: Dispatch>(
             return Err(error::type_mismatch("perform target", "cap", &current));
         };
 
+        let effect_target = effect::EffectTarget::Cap {
+            name: name.clone(),
+            schema_cid: schema_cid.clone(),
+            cap_id: *cap_id,
+        };
+        match perform_dispatch(
+            &env.handler_stack,
+            effect_target,
+            Val::List(payload.clone()),
+        )
+        .await
+        {
+            Ok(value) => return Ok(value),
+            Err(Val::Effect { effect_type, .. }) if effect_type == format!("cap:{name}") => {}
+            Err(err) => return Err(err),
+        }
+
         if let Some(attenuated) = inner.downcast_ref::<AttenuatedCapInner>() {
             let (method, _) = cap_method_and_args(&payload, "perform (attenuated cap)")?;
             if !attenuated.allow_methods.contains(&method) {
@@ -2539,12 +2556,10 @@ async fn perform_cap_value<'a, D: Dispatch>(
             return invoke_cap_method_value(method_val, &method_args, env, dispatch).await;
         }
 
-        let effect_target = effect::EffectTarget::Cap {
-            name: name.clone(),
-            schema_cid: schema_cid.clone(),
-            cap_id: *cap_id,
-        };
-        return perform_dispatch(&env.handler_stack, effect_target, Val::List(payload)).await;
+        return Err(Val::Effect {
+            effect_type: format!("cap:{name}"),
+            data: Box::new(Val::List(payload)),
+        });
     }
 }
 
@@ -6556,6 +6571,21 @@ mod tests {
             &d,
         );
         assert_eq!(result, Ok(Val::Str("service".into())));
+    }
+
+    #[test]
+    fn defcap_perform_hits_cap_handler_before_method_table() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(do (defcap directory :lookup (fn [name] :backend))
+                 (with-effect-handler directory
+                   (fn [data] :handled)
+                   (perform directory :lookup \"service\")))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Keyword("handled".into())));
     }
 
     #[test]

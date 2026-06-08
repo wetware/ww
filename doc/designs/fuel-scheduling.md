@@ -161,7 +161,7 @@ deliberate: the trap happens deterministically at the next fuel
 consumption point, not at an arbitrary epoch boundary.
 
 The `OneshotFuel` schema allows per-cell `maxPerEpoch` / `minPerEpoch`
-overrides, clamped to system limits.  This lets auction callers
+overrides, clamped to system limits.  This lets fuel-market callers
 constrain burst behavior independently of total budget.
 
 ## Epoch tick placement

@@ -5,7 +5,7 @@
 
 WASM_TARGET := wasm32-wasip2
 
-.PHONY: all host std kernel shell status examples chess echo counter discovery oracle auction mindshare snap-hello-rs clean run-kernel
+.PHONY: all host std kernel shell status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
 .PHONY: publish-std try-publish-std publish test-deps test test-wasm
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
@@ -36,10 +36,6 @@ shell:
 	cargo build -p shell --target $(WASM_TARGET) --release --manifest-path std/shell/Cargo.toml
 	@mkdir -p std/shell/bin
 	cp std/shell/target/$(WASM_TARGET)/release/shell.wasm std/shell/bin/shell.wasm
-	@SCHEMA_OUT=$$(find std/shell/target/$(WASM_TARGET)/release/build -path '*/shell-*/out/shell_schema.bin' | head -1) && \
-		if [ -n "$$SCHEMA_OUT" ]; then \
-			cp "$$SCHEMA_OUT" std/shell/bin/shell.capnpc; \
-		fi
 
 status:
 	cargo build -p status --target $(WASM_TARGET) --release --manifest-path std/status/Cargo.toml
@@ -48,7 +44,7 @@ status:
 
 # --- Examples ----------------------------------------------------------------
 
-examples: chess echo counter discovery oracle auction mindshare snap-hello-rs
+examples: chess echo counter discovery oracle snap-hello-rs
 
 chess:
 	$(MAKE) -C examples/chess
@@ -64,12 +60,6 @@ discovery:
 
 oracle:
 	$(MAKE) -C examples/oracle
-
-auction:
-	$(MAKE) -C examples/auction
-
-mindshare:
-	$(MAKE) -C examples/mindshare
 
 snap-hello-rs:
 	$(MAKE) -C examples/snap-hello-rs
@@ -194,15 +184,13 @@ run-kernel: kernel
 clean:
 	cargo clean
 	rm -f std/kernel/bin/main.wasm
-	rm -f std/shell/bin/shell.wasm std/shell/bin/shell.capnpc
+	rm -f std/shell/bin/shell.wasm
 	rm -f std/status/bin/status.wasm
 	$(MAKE) -C examples/chess clean
 	$(MAKE) -C examples/echo clean
 	$(MAKE) -C examples/counter clean
 	$(MAKE) -C examples/discovery clean
 	$(MAKE) -C examples/oracle clean
-	$(MAKE) -C examples/auction clean
-	$(MAKE) -C examples/mindshare clean
 	$(MAKE) -C examples/snap-hello-rs clean
 
 # --- Agent skills ------------------------------------------------------------

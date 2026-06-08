@@ -201,7 +201,7 @@ What we don't have today, and won't pretend to:
 - **Hosted Wetware as a product.** The substrate runs anywhere,
   but the "deploy and stop thinking about servers" experience
   needs a hosted tier we haven't built yet.
-- **Wallet integration / fuel auctions.** Designed but not built.
+- **Wallet integration / fuel markets.** Designed but not built.
   Becomes load-bearing once the swarm-of-strangers story is
   v1; today it's second-act.
 

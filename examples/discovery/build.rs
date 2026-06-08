@@ -6,12 +6,11 @@ use std::path::{Path, PathBuf};
 /// Compiles greeter.capnp and shared system schemas, extracts the
 /// Greeter interface's canonical bytes, and derives its schema CID metadata.
 ///
-/// The schema CID pipeline:
+/// The schema descriptor pipeline:
 ///   greeter.capnp → capnpc (CodeGeneratorRequest)
 ///                 → find Greeter interface node by name
 ///                 → schema_id::extract_schemas (canonical bytes + BLAKE3)
 ///                 → `GREETER_CID` const in generated Rust
-///                 → schema bytes copied next to the WASM for tooling
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
@@ -34,6 +33,7 @@ fn main() {
         // schema.capnp types live in the `capnp` crate
         .crate_provides("capnp", [0xa93fc509624c72d9])
         .file(capnp_dir.join("system.capnp"))
+        .file(capnp_dir.join("synapse.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("http.capnp"))
         .file(capnp_dir.join("auth.capnp"))
@@ -62,11 +62,10 @@ fn main() {
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
-    schema_id::write_schema_bytes(&out_dir.join("greeter_schema.bin"), &schemas[0])
-        .expect("write schema bytes");
-
     // ── Cargo rebuild triggers ──────────────────────────────────────
-    for schema in &["system", "routing", "auth", "membrane", "http", "stem"] {
+    for schema in &[
+        "system", "synapse", "routing", "auth", "membrane", "http", "stem",
+    ] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()

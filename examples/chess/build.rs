@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 ///   chess.capnp  →  capnpc (CodeGeneratorRequest)
 ///                →  schema_id::extract_schemas (canonical bytes + BLAKE3)
 ///                →  `CHESS_ENGINE_SCHEMA_CID` const in generated Rust
-///                →  copied next to the WASM for tooling/introspection
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
@@ -48,6 +47,7 @@ fn main() {
         // schema.capnp types live in the `capnp` crate
         .crate_provides("capnp", [0xa93fc509624c72d9])
         .file(capnp_dir.join("system.capnp"))
+        .file(capnp_dir.join("synapse.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("http.capnp"))
         .file(capnp_dir.join("auth.capnp"))
@@ -84,17 +84,11 @@ fn main() {
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
-    // Write the raw canonical schema bytes to a separate file. The
-    // `make chess` target copies these next to the compiled WASM binary
-    // as a custom section named "schema.capnp". At runtime, the host
-    // reads this section to derive the protocol CID without needing
-    // the .capnp source files.
-    schema_id::write_schema_bytes(&out_dir.join("chess_engine_schema.bin"), &schemas[0])
-        .expect("write schema bytes");
-
     // ── Cargo rebuild triggers ──────────────────────────────────────
     // Re-run this build script whenever any schema file changes.
-    for schema in &["system", "routing", "auth", "membrane", "http", "stem"] {
+    for schema in &[
+        "system", "synapse", "routing", "auth", "membrane", "http", "stem",
+    ] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()

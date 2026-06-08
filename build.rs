@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target_dir = resolve_target_dir(manifest_path);
 
     // Compile example schemas so integration tests get typed access.
@@ -19,24 +18,14 @@ fn main() {
         println!("cargo:rerun-if-changed={}", greeter_schema.display());
     }
 
-    // Compile shell schema so the ww shell CLI gets typed access + schema bytes.
+    // Compile shell schema so the ww shell CLI gets typed access.
     let shell_schema = manifest_path.join("capnp/shell.capnp");
     if shell_schema.exists() {
-        let raw_request = out_dir.join("shell_request.bin");
         capnpc::CompilerCommand::new()
             .src_prefix(manifest_path.join("capnp"))
             .file(&shell_schema)
-            .raw_code_generator_request_path(&raw_request)
             .run()
             .expect("failed to compile shell.capnp");
-
-        // Extract Shell interface schema bytes for protocol CID computation.
-        if let Some(shell_id) = find_interface_id(&raw_request, "Shell") {
-            let schemas = schema_id::extract_schemas(&raw_request, &[("SHELL", shell_id)])
-                .expect("extract Shell schema");
-            schema_id::write_schema_bytes(&out_dir.join("shell_schema.bin"), &schemas[0])
-                .expect("write shell schema bytes");
-        }
         println!("cargo:rerun-if-changed={}", shell_schema.display());
     }
     let cid_file = target_dir.join("default-config.cid");
@@ -156,27 +145,4 @@ fn resolve_target_dir(manifest_path: &Path) -> PathBuf {
         }
         _ => manifest_path.join("target"),
     }
-}
-
-/// Scan a raw CodeGeneratorRequest for an interface node with the given
-/// display name and return its type ID.
-fn find_interface_id(raw_request_path: &Path, name: &str) -> Option<u64> {
-    let data = std::fs::read(raw_request_path).ok()?;
-    let reader =
-        capnp::serialize::read_message(&mut data.as_slice(), capnp::message::ReaderOptions::new())
-            .ok()?;
-    let request: capnp::schema_capnp::code_generator_request::Reader = reader.get_root().ok()?;
-    for node in request.get_nodes().ok()?.iter() {
-        if let Ok(n) = node.get_display_name() {
-            if (n.to_str().ok()?.ends_with(&format!(":{name}")) || n.to_str().ok()? == name)
-                && matches!(
-                    node.which(),
-                    Ok(capnp::schema_capnp::node::Which::Interface(_))
-                )
-            {
-                return Some(node.get_id());
-            }
-        }
-    }
-    None
 }

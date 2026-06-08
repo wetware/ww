@@ -1,2 +1,0 @@
-; Demo snippet: start auction DHT provide loop.
-(perform runtime :run (load "bin/auction.wasm") "serve")

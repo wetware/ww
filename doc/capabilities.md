@@ -57,9 +57,8 @@ layer is as simple as not installing the handler.
 
 After calling `membrane.graft()`, an agent holds references to a list
 of named `Export`s (`stem.capnp:Export`). Each entry carries the cap
-name, a typed client, and the canonical `Schema.Node` bytes that
-describe the cap's interface (so consumers can introspect without
-hardcoded fallbacks).
+name and a Synapse. The name is the local binding key; the Synapse carries
+the descriptor and invokable capability.
 
 | Capability | What it does |
 |------------|--------------|
@@ -68,7 +67,7 @@ hardcoded fallbacks).
 | **runtime** | Load WASM binaries and obtain scoped Executors (with compilation caching) |
 | **routing** | Kademlia DHT: provide and find content/services |
 | **http-client** | Outbound HTTP requests, gated by `--http-dial` allowlist |
-| `with`-scoped extras | Init.d-granted caps (e.g. `auction`, application-specific RPC interfaces). Each carries its own `Schema.Node` so guests can introspect. |
+| `with`-scoped extras | Init.d-granted caps for application-specific RPC interfaces. Each carries a Synapse descriptor so guests can introspect. |
 
 The wire-side `StreamListener` / `StreamDialer` / `VatListener` /
 `VatClient` interfaces are reached via `host.network()` rather than
@@ -246,9 +245,6 @@ Schema definitions live in `capnp/`:
 - **`routing.capnp`** — Kademlia DHT (provide, findProviders, hash)
 - **`http.capnp`** — HttpClient
 
-Compiled schemas (`.capnpc` files) are the binary form consumed at
-runtime: `crates/membrane/build.rs` extracts canonical `Schema.Node`
-bytes for the core caps and `crates/membrane/src/schema_registry`
-exposes them. The bytes flow into `Export.schema` at graft time (see
-`src/rpc/membrane.rs:write_schema_for_core_cap`), so guests can
-introspect every cap without hardcoded fallbacks.
+Build scripts extract canonical `Schema.Node` bytes for descriptor
+construction and schema CIDs. These bytes are descriptor inputs, not
+runtime sidecars: exported capabilities cross membranes as Synapses.

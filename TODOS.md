@@ -224,18 +224,10 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 **Priority:** P3
 **Depends on:** CidTree virtual filesystem (src/vfs.rs)
 
-## Export.schema population for MCP tool introspection
-**What:** Populate `Export.schema` in the membrane graft with real `Schema.Node` bytes. Host capabilities get their schemas from compiled capnp at build time; guest-contributed capabilities get theirs from `.schema` files in the FHS layer.
-**Why:** Enables MCP dynamic tools to derive action lists and parameter schemas from the actual Cap'n Proto interface definitions, replacing the current hardcoded fallback descriptions in `std/mcp/src/lib.rs`.
-**Context:** Currently `init_schema()` in `src/rpc/membrane.rs` creates empty Schema.Node entries. The schema bytes are produced at build time by `schema_id::extract_schemas()` but aren't threaded into the runtime graft. Requires a build-time → runtime pipeline: either `include_bytes!()` on compiled schema artifacts, or runtime loading from the FHS. Once populated, the MCP cell can parse Schema.Node to discover interface methods and their parameter types automatically.
-**Effort:** M
-**Priority:** P2
-**Depends on:** MCP dynamic tools (done)
-
 ## Cap'n Proto schema-boundary refactor (stem/auth/membrane/system) (#509)
 **What:** Refactor schema ownership so epoch/provenance types stay in `stem.capnp`, auth/session types move to `auth.capnp`, membrane transport types (`Membrane`, `Export`) move to `membrane.capnp`, and core host/runtime/listener contracts remain in `system.capnp`.
 **Why:** `stem.capnp` currently mixes unrelated concerns and `system.capnp` imports `stem.Export` for core spawn/listener surfaces, which obscures ownership boundaries and complicates protocol evolution.
-**Context:** This is a staged-compat migration, not a redesign. Keep authority semantics unchanged (`Terminal(Membrane)` and no new ambient privileges), preserve runtime behavior, and plan explicit compatibility for schema bytes and type IDs. Vat addresses are service-name locators and should not be coupled back to schema CIDs. Must audit all capnp build scripts and generated-module consumers (`crates/membrane`, `std/kernel`, `std/caps`, `std/status`, examples, CLI template scaffolding) plus schema-introspection paths (`schema_registry`, `Export.schema` propagation). Include a rollback path and a temporary shim period where old and new schema surfaces coexist long enough to land cross-crate updates atomically.
+**Context:** This is a staged-compat migration, not a redesign. Keep authority semantics unchanged (`Terminal(Membrane)` and no new ambient privileges), preserve runtime behavior, and plan explicit compatibility for schema type IDs. Vat addresses are service-name locators and should not be coupled back to schema CIDs. Must audit all capnp build scripts and generated-module consumers (`crates/membrane`, `std/kernel`, `std/caps`, `std/status`, examples, CLI template scaffolding) plus Synapse descriptor introspection paths.
 **Effort:** L
 **Priority:** P2
 **Depends on:** issue #509 design approval, cross-crate capnp migration plan, compatibility decision for schema/type IDs

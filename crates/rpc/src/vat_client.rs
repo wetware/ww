@@ -14,6 +14,7 @@ use capnp_rpc::pry;
 use libp2p::PeerId;
 use membrane::EpochGuard;
 
+use membrane::synapse_capnp;
 use membrane::system_capnp;
 
 /// Timeout for establishing the libp2p stream to a remote peer.
@@ -91,7 +92,7 @@ impl system_capnp::vat_client::Server for VatClientImpl {
             // method call through the returned cap observes any remote
             // failure via that call's own response timeout.
             let super::vat_dial::VatDial { bootstrap, driver } =
-                super::vat_dial::connect::<_, capnp::capability::Client>(stream);
+                super::vat_dial::connect::<_, synapse_capnp::bootstrap::Client>(stream);
 
             // The driver runs detached. Cap'n Proto refcounting handles
             // shutdown: when the guest drops all capabilities obtained from
@@ -123,7 +124,9 @@ impl system_capnp::vat_client::Server for VatClientImpl {
                 }
             });
 
-            results.get().init_cap().set_as_capability(bootstrap.hook);
+            let synapse_resp = bootstrap.get_request().send().promise.await?;
+            let synapse = synapse_resp.get()?.get_synapse()?;
+            results.get().set_synapse(synapse)?;
 
             Ok(())
         })

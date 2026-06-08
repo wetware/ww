@@ -1,2 +1,0 @@
-; Demo snippet: start Mindshare DHT provide loop.
-(perform runtime :run (load "bin/mindshare.wasm") "serve")

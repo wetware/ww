@@ -195,4 +195,4 @@ ww run /ipfs/<CID>                           # run from content-addressed image
 - [RPC transport](doc/rpc-transport.md): transport plumbing and scheduling model
 - [Guest runtime](doc/guest-runtime.md): async runtime for WASM guests
 - [Replay protection](doc/replay-protection.md): epoch-bound authentication
-- [Examples](examples/): echo, counter, oracle, chess, mindshare, and more
+- [Examples](examples/): echo, counter, oracle, chess, discovery, and snap-hello-rs

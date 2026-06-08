@@ -31,6 +31,7 @@ use membrane::routing_capnp;
 use membrane::system_capnp;
 
 use super::NetworkState;
+use crate::synapse_abi::{write_owned_synapse, write_placeholder_synapse, OwnedSynapse};
 
 // ---------------------------------------------------------------------------
 // EpochGuardedIdentity — host-side node identity hub
@@ -246,13 +247,9 @@ pub struct HostGraftBuilder {
     route_registry: Option<crate::dispatch::RouteRegistry>,
     /// Pre-created Runtime client (singleton — same backend for every graft).
     runtime_client: system_capnp::runtime::Client,
-    /// Named capabilities from init.d `with` block, forwarded to the child
-    /// cell's graft response as `extras`. Each entry carries the cap name,
-    /// the typed client, and the canonical Schema.Node bytes the original
-    /// caller observed on the wire (or an empty Vec if the caller didn't
-    /// have schema bytes — graft will then leave `Export.schema` empty and
-    /// emit a warning).
-    extras: Vec<(String, capnp::capability::Client, Vec<u8>)>,
+    /// Named capabilities from init.d `with` blocks, forwarded to the child
+    /// cell's graft response as Synapse exports.
+    extras: Vec<(String, OwnedSynapse)>,
     /// IPFS HTTP client for Kubo API calls (e.g. IPNS resolution).
     ipfs_client: ipfs::HttpClient,
 }
@@ -291,16 +288,7 @@ impl HostGraftBuilder {
 
     /// Set named capabilities from init.d `with` block to inject into graft.
     ///
-    /// The third tuple element is the canonical `Schema.Node` bytes for the
-    /// cap. The wire format already carries these (see `membrane.capnp:Export`);
-    /// callers that received the cap over `Executor.spawn` should preserve
-    /// `entry.get_schema()` and pass
-    /// it through. Pass an empty Vec only when the schema is genuinely
-    /// unknown — graft will then leave `Export.schema` empty and warn.
-    pub fn with_extras(
-        mut self,
-        extras: Vec<(String, capnp::capability::Client, Vec<u8>)>,
-    ) -> Self {
+    pub fn with_extras(mut self, extras: Vec<(String, OwnedSynapse)>) -> Self {
         self.extras = extras;
         self
     }
@@ -363,10 +351,10 @@ impl GraftBuilder for HostGraftBuilder {
         }
 
         // Append init.d-scoped extras.
-        let extras_owned: Vec<(String, capnp::capability::Client, Vec<u8>)> = self
+        let extras_owned: Vec<(String, OwnedSynapse)> = self
             .extras
             .iter()
-            .map(|(name, client, schema)| (name.clone(), client.clone(), schema.clone()))
+            .map(|(name, synapse)| (name.clone(), synapse.clone()))
             .collect();
 
         let count = (entries.len() + extras_owned.len()) as u32;
@@ -375,77 +363,19 @@ impl GraftBuilder for HostGraftBuilder {
         for (i, (name, client)) in entries.iter().enumerate() {
             let mut entry = caps_builder.reborrow().get(i as u32);
             entry.set_name(name);
-            write_schema_for_core_cap(entry.reborrow(), name)?;
-            entry.init_cap().set_as_capability(client.hook.clone());
+            let _ = client;
+            write_placeholder_synapse(entry.init_synapse(), *name);
         }
 
         let offset = entries.len();
-        for (i, (name, client, schema_bytes)) in extras_owned.iter().enumerate() {
+        for (i, (name, synapse)) in extras_owned.iter().enumerate() {
             let mut entry = caps_builder.reborrow().get((offset + i) as u32);
             entry.set_name(name);
-            if schema_bytes.is_empty() {
-                tracing::warn!(
-                    name = name.as_str(),
-                    "extra cap registered without schema bytes; Export.schema will be empty"
-                );
-                entry.reborrow().init_schema();
-            } else {
-                write_schema_bytes(entry.reborrow(), schema_bytes)?;
-            }
-            entry.init_cap().set_as_capability(client.hook.clone());
+            write_owned_synapse(entry.init_synapse(), synapse);
         }
 
         Ok(())
     }
-}
-
-/// Populate `Export.schema` with the canonical Schema.Node bytes for a core
-/// capability name. Core caps (`identity`, `host`, `runtime`, `routing`,
-/// `http-client`) have schemas baked into the binary at build time by
-/// `crates/membrane/build.rs`. Unknown names get an empty Schema.Node —
-/// callers then fall back to string-name lookup.
-fn write_schema_for_core_cap(
-    mut entry: membrane_capnp::export::Builder<'_>,
-    name: &str,
-) -> Result<(), capnp::Error> {
-    let Some(bytes) = membrane::schema_registry::schema_by_name(name) else {
-        entry.init_schema();
-        return Ok(());
-    };
-    write_schema_bytes(entry.reborrow(), bytes)
-}
-
-/// Populate `Export.schema` from canonical Schema.Node bytes.
-///
-/// Shared between the core-cap path (bytes baked in at build time) and the
-/// extras path (bytes received from upstream over the wire and threaded
-/// through `HostGraftBuilder::with_extras`). Caller is responsible for
-/// handling the empty-bytes case before calling this.
-///
-/// Canonical encoding is the raw single-segment payload (no framing
-/// header). Capnp segments must be 8-byte aligned, but byte slices may
-/// only be byte-aligned, so copy into a Word-aligned buffer first.
-fn write_schema_bytes(
-    mut entry: membrane_capnp::export::Builder<'_>,
-    bytes: &[u8],
-) -> Result<(), capnp::Error> {
-    let aligned = bytes_to_aligned_words(bytes);
-    let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
-    let segment_array = capnp::message::SegmentArray::new(segments);
-    let reader = capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
-    let schema_node: capnp::schema_capnp::node::Reader = reader.get_root()?;
-    entry.set_schema(schema_node)?;
-    Ok(())
-}
-
-/// Copy a byte slice into an 8-byte-aligned `Vec<Word>` buffer. Trailing
-/// bytes (if `bytes.len()` is not word-multiple) are zero-padded; canonical
-/// capnp encodings are always word-aligned, so this should be lossless.
-pub(super) fn bytes_to_aligned_words(bytes: &[u8]) -> Vec<capnp::Word> {
-    let word_count = bytes.len().div_ceil(8);
-    let mut words = vec![capnp::word(0, 0, 0, 0, 0, 0, 0, 0); word_count];
-    capnp::Word::words_to_bytes_mut(&mut words)[..bytes.len()].copy_from_slice(bytes);
-    words
 }
 
 // IPFS content access goes through the WASI virtual filesystem (CidTree).
@@ -487,7 +417,7 @@ pub fn build_membrane_rpc<R, W>(
     stream_control: libp2p_stream::Control,
     route_registry: Option<crate::dispatch::RouteRegistry>,
     runtime_client: system_capnp::runtime::Client,
-    extras: Vec<(String, capnp::capability::Client, Vec<u8>)>,
+    extras: Vec<(String, OwnedSynapse)>,
     ipfs_client: ipfs::HttpClient,
     http_dial: Vec<String>,
 ) -> (RpcSystem<Side>, GuestMembrane)
@@ -758,286 +688,5 @@ mod tests {
                 }
             })
             .await;
-    }
-
-    // -----------------------------------------------------------------
-    // Item 1a: Export.schema population end-to-end
-    // -----------------------------------------------------------------
-    //
-    // These tests exercise the full pipeline:
-    //   1. crates/membrane/build.rs extracts canonical Schema.Node bytes
-    //   2. write_schema_for_core_cap reconstructs an aligned Reader and
-    //      copies into Export.schema
-    //   3. The freshly-built Export message is reparsed (mimicking the
-    //      guest read path) and Schema.Node fields are inspected
-    //
-    // Catches regressions in: byte alignment, SegmentArray construction,
-    // set_schema copy semantics, and build-script silent failures (e.g.,
-    // empty bytes from a misconfigured cargo cache).
-
-    /// Type IDs for each core cap interface, kept in sync with
-    /// `crates/membrane/build.rs`. If the capnp interfaces change IDs
-    /// these constants must be updated; the test then catches that
-    /// renamed/regenerated bytes still resolve to the right interface.
-    const HOST_TYPE_ID: u64 = 0x9ea7_0c8c_9aef_b70c;
-    const RUNTIME_TYPE_ID: u64 = 0x8738_4748_df10_173c;
-    const ROUTING_TYPE_ID: u64 = 0xc033_44a7_b0a3_17be;
-    const IDENTITY_TYPE_ID: u64 = 0xa7c2_00e5_b472_6d89;
-    const HTTP_CLIENT_TYPE_ID: u64 = 0xf00a_15d0_9fb8_f360;
-
-    /// Build a fresh Export message, write the schema for `name` into
-    /// it, then reparse the resulting bytes (round-tripping through
-    /// capnp serialization just as a graft response would) and return
-    /// the Schema.Node id along with whether the node is an Interface.
-    fn write_then_read_schema(name: &str) -> (u64, bool) {
-        let mut message = capnp::message::Builder::new_default();
-        let entry: membrane_capnp::export::Builder<'_> = message.init_root();
-        write_schema_for_core_cap(entry, name).expect("write_schema_for_core_cap");
-
-        // Round-trip via capnp serialization, mimicking what a guest sees
-        // when the graft response arrives over the RPC channel.
-        let mut buf = Vec::new();
-        capnp::serialize::write_message(&mut buf, &message).expect("serialize export");
-        let reader = capnp::serialize::read_message_from_flat_slice(
-            &mut buf.as_slice(),
-            capnp::message::ReaderOptions::new(),
-        )
-        .expect("deserialize export");
-        let entry: membrane_capnp::export::Reader<'_> = reader.get_root().expect("export root");
-        let schema_node: capnp::schema_capnp::node::Reader =
-            entry.get_schema().expect("schema field present");
-        let id = schema_node.get_id();
-        let is_interface = matches!(
-            schema_node.which().expect("Which resolves"),
-            capnp::schema_capnp::node::Which::Interface(_)
-        );
-        (id, is_interface)
-    }
-
-    #[test]
-    fn item1a_host_schema_round_trips_with_correct_type_id() {
-        let (id, is_interface) = write_then_read_schema("host");
-        assert_eq!(id, HOST_TYPE_ID, "host schema type ID mismatch");
-        assert!(is_interface, "host schema must be an interface node");
-    }
-
-    #[test]
-    fn item1a_runtime_schema_round_trips_with_correct_type_id() {
-        let (id, is_interface) = write_then_read_schema("runtime");
-        assert_eq!(id, RUNTIME_TYPE_ID, "runtime schema type ID mismatch");
-        assert!(is_interface, "runtime schema must be an interface node");
-    }
-
-    #[test]
-    fn item1a_routing_schema_round_trips_with_correct_type_id() {
-        let (id, is_interface) = write_then_read_schema("routing");
-        assert_eq!(id, ROUTING_TYPE_ID, "routing schema type ID mismatch");
-        assert!(is_interface, "routing schema must be an interface node");
-    }
-
-    #[test]
-    fn item1a_identity_schema_round_trips_with_correct_type_id() {
-        let (id, is_interface) = write_then_read_schema("identity");
-        assert_eq!(id, IDENTITY_TYPE_ID, "identity schema type ID mismatch");
-        assert!(is_interface, "identity schema must be an interface node");
-    }
-
-    #[test]
-    fn item1a_http_client_schema_round_trips_with_correct_type_id() {
-        let (id, is_interface) = write_then_read_schema("http-client");
-        assert_eq!(
-            id, HTTP_CLIENT_TYPE_ID,
-            "http-client schema type ID mismatch"
-        );
-        assert!(is_interface, "http-client schema must be an interface node");
-    }
-
-    #[test]
-    fn item1a_unknown_cap_yields_empty_schema() {
-        let mut message = capnp::message::Builder::new_default();
-        let entry: membrane_capnp::export::Builder<'_> = message.init_root();
-        write_schema_for_core_cap(entry, "not-a-real-cap").expect("returns Ok with empty");
-
-        let mut buf = Vec::new();
-        capnp::serialize::write_message(&mut buf, &message).expect("serialize");
-        let reader = capnp::serialize::read_message_from_flat_slice(
-            &mut buf.as_slice(),
-            capnp::message::ReaderOptions::new(),
-        )
-        .expect("deserialize");
-        let entry: membrane_capnp::export::Reader<'_> = reader.get_root().expect("export root");
-        let schema_node: capnp::schema_capnp::node::Reader =
-            entry.get_schema().expect("schema field present");
-        // Empty Schema.Node has id=0 and a default (uninterpreted) Which.
-        assert_eq!(schema_node.get_id(), 0, "unknown cap should produce id=0");
-    }
-
-    #[test]
-    fn item1a_methods_enumerable_post_round_trip() {
-        // The whole point of populating Export.schema is so that consumers
-        // (MCP tool description generator, future (schema cap) builtin) can
-        // walk methods. Verify host's methods are non-empty and have names.
-        let mut message = capnp::message::Builder::new_default();
-        let entry: membrane_capnp::export::Builder<'_> = message.init_root();
-        write_schema_for_core_cap(entry, "host").expect("write host schema");
-
-        let mut buf = Vec::new();
-        capnp::serialize::write_message(&mut buf, &message).expect("serialize");
-        let reader = capnp::serialize::read_message_from_flat_slice(
-            &mut buf.as_slice(),
-            capnp::message::ReaderOptions::new(),
-        )
-        .expect("deserialize");
-        let entry: membrane_capnp::export::Reader<'_> = reader.get_root().expect("export root");
-        let schema_node: capnp::schema_capnp::node::Reader =
-            entry.get_schema().expect("schema field present");
-
-        let interface = match schema_node.which().expect("Which") {
-            capnp::schema_capnp::node::Which::Interface(iface) => iface,
-            _ => panic!("expected interface node, got a non-interface variant"),
-        };
-        let methods = interface.get_methods().expect("methods list");
-        assert!(!methods.is_empty(), "host interface should have methods");
-        // Sanity: each method has a non-empty name reachable from the
-        // round-tripped schema. This is the property MCP tool generation
-        // depends on.
-        for method in methods.iter() {
-            let name = method.get_name().expect("method name");
-            assert!(!name.is_empty(), "method names should be non-empty");
-        }
-    }
-
-    // -----------------------------------------------------------------
-    // Item 1b: Export.schema population for init.d-scoped extras
-    // -----------------------------------------------------------------
-    //
-    // These tests exercise the extras path of the graft loop. Extras
-    // travel as `(name, client, schema_bytes)` tuples; each iteration of
-    // the extras loop calls `write_schema_bytes` with the caller-provided
-    // bytes, or falls back to an empty Schema.Node + warn log when the
-    // bytes are empty.
-    //
-    // We exercise `write_schema_bytes` directly rather than driving a
-    // full graft (constructing a `HostGraftBuilder` requires a long
-    // tail of fixtures unrelated to the schema-population path under
-    // test).
-
-    /// Build a fresh Export message, populate its schema field via the
-    /// generic `write_schema_bytes`, then round-trip through capnp
-    /// serialization (mimicking the wire) and return the resulting
-    /// `Schema.Node` id and whether it parses as an interface.
-    fn write_then_read_extras_schema(bytes: &[u8]) -> (u64, bool) {
-        let mut message = capnp::message::Builder::new_default();
-        let entry: membrane_capnp::export::Builder<'_> = message.init_root();
-        write_schema_bytes(entry, bytes).expect("write_schema_bytes");
-
-        let mut buf = Vec::new();
-        capnp::serialize::write_message(&mut buf, &message).expect("serialize");
-        let reader = capnp::serialize::read_message_from_flat_slice(
-            &mut buf.as_slice(),
-            capnp::message::ReaderOptions::new(),
-        )
-        .expect("deserialize");
-        let entry: membrane_capnp::export::Reader<'_> = reader.get_root().expect("export root");
-        let schema_node: capnp::schema_capnp::node::Reader =
-            entry.get_schema().expect("schema field present");
-        let id = schema_node.get_id();
-        let is_interface = matches!(
-            schema_node.which().expect("Which resolves"),
-            capnp::schema_capnp::node::Which::Interface(_)
-        );
-        (id, is_interface)
-    }
-
-    #[test]
-    fn item1b_extras_path_writes_caller_provided_bytes() {
-        // Drive the extras path with a known-good Schema.Node payload —
-        // any of the core-cap schemas works (they're real interface nodes
-        // available to host-side tests via the schema_registry constants).
-        let bytes = membrane::schema_registry::HOST_SCHEMA;
-        let (id, is_interface) = write_then_read_extras_schema(bytes);
-        assert_eq!(id, HOST_TYPE_ID, "extras-path schema type ID mismatch");
-        assert!(is_interface, "extras-path schema must parse as interface");
-    }
-
-    #[test]
-    fn item1b_extras_path_handles_each_core_schema() {
-        // Sanity: every byte slice schema_registry exposes round-trips
-        // through the extras path. Catches regressions where the
-        // extras path diverges from the core-cap path's handling.
-        for (name, expected_id) in [
-            ("host", HOST_TYPE_ID),
-            ("runtime", RUNTIME_TYPE_ID),
-            ("routing", ROUTING_TYPE_ID),
-            ("identity", IDENTITY_TYPE_ID),
-            ("http-client", HTTP_CLIENT_TYPE_ID),
-        ] {
-            let bytes = membrane::schema_registry::schema_by_name(name)
-                .unwrap_or_else(|| panic!("registry missing '{name}'"));
-            let (id, is_interface) = write_then_read_extras_schema(bytes);
-            assert_eq!(
-                id, expected_id,
-                "extras path for '{name}' produced wrong id"
-            );
-            assert!(is_interface, "extras path for '{name}' lost interface tag");
-        }
-    }
-
-    #[test]
-    fn item1b_empty_bytes_path_yields_empty_schema() {
-        // The HostGraftBuilder loop calls `init_schema()` directly when
-        // bytes are empty and emits a warn log; the bytes path itself is
-        // never invoked. Verify the runtime invariant that an empty
-        // `init_schema()` produces a Schema.Node with id=0, which is the
-        // shape consumers see for "extra cap registered without schema".
-        let mut message = capnp::message::Builder::new_default();
-        let entry: membrane_capnp::export::Builder<'_> = message.init_root();
-        entry.init_schema();
-
-        let mut buf = Vec::new();
-        capnp::serialize::write_message(&mut buf, &message).expect("serialize");
-        let reader = capnp::serialize::read_message_from_flat_slice(
-            &mut buf.as_slice(),
-            capnp::message::ReaderOptions::new(),
-        )
-        .expect("deserialize");
-        let entry: membrane_capnp::export::Reader<'_> = reader.get_root().expect("export root");
-        let schema_node: capnp::schema_capnp::node::Reader =
-            entry.get_schema().expect("schema field present");
-        assert_eq!(
-            schema_node.get_id(),
-            0,
-            "empty init_schema must produce id=0"
-        );
-    }
-
-    #[test]
-    fn item1b_canonicalize_schema_node_matches_registry_bytes() {
-        // The Executor.spawn handler calls
-        // super::canonicalize_schema_node on the wire-side Schema.Node
-        // reader to recover canonical bytes for forwarding. Ensure the
-        // recipe matches what the build-time pipeline emits — a guest
-        // round-tripping a core cap's schema through this path must
-        // produce bytes that re-parse to the same type ID.
-        for name in ["host", "runtime", "routing", "identity", "http-client"] {
-            let canonical = membrane::schema_registry::schema_by_name(name)
-                .unwrap_or_else(|| panic!("registry missing '{name}'"));
-
-            // Re-parse the registry bytes as a Schema.Node...
-            let aligned = bytes_to_aligned_words(canonical);
-            let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
-            let segment_array = capnp::message::SegmentArray::new(segments);
-            let reader =
-                capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
-            let node: capnp::schema_capnp::node::Reader = reader.get_root().expect("node");
-
-            // ...then re-canonicalize via the wire-side helper and compare.
-            let recovered = crate::canonicalize_schema_node(node).expect("canonicalize succeeds");
-            assert_eq!(
-                canonical,
-                &recovered[..],
-                "canonicalize_schema_node must reproduce build-time bytes for '{name}'"
-            );
-        }
     }
 }

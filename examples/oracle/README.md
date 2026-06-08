@@ -33,7 +33,7 @@ make oracle
 ```
 
 This compiles the WASM guest and copies the compiled schema bytes
-(`oracle.capnpc`) next to the binary for tooling/introspection.
+using the generated Synapse descriptor metadata.
 Vat publication uses the service name `oracle`.
 
 ## Running
@@ -262,7 +262,7 @@ examples/oracle/
 ├── oracle.capnp          # PriceOracle schema source
 ├── bin/                  # build output (gitignored)
 │   ├── oracle.wasm
-│   └── oracle.capnpc     # compiled schema bytes
+│   └── oracle.wasm
 ├── glia/
 │   ├── register.glia     # shell-loaded registration
 │   ├── serve.glia        # DHT provide loop

@@ -2,7 +2,7 @@
 
 Schema authority is not part of vat transport. Vat transport serves and dials
 capabilities by caller-chosen service-name protocol strings such as `greeter`,
-`chess`, `oracle`, or `auction`.
+`chess` or `oracle`.
 
 The native vat publication flow is:
 
@@ -21,19 +21,19 @@ names are locators, not type authority and not provenance proofs.
 
 ```capnp
 interface VatListener {
-  serve @0 (cap :Capability, protocol :Text) -> ();
+  serve @0 (synapse :Synapse, protocol :Text) -> ();
 }
 
 interface VatClient {
-  dial @0 (peer :Data, protocol :Text) -> (cap :Capability);
+  dial @0 (peer :Data, protocol :Text) -> (synapse :Synapse);
 }
 ```
 
-`VatListener.serve` registers an already-existing capability. It does not spawn
+`VatListener.serve` registers an already-existing Synapse. It does not spawn
 cells. Publisher lifecycle is owned by the publisher that created the capability.
 
 `VatClient.dial` opens `/ww/<version>/vat/<protocol>` and returns the remote
-bootstrap capability.
+bootstrap Synapse.
 
 ## Non-Goals
 

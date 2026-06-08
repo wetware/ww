@@ -33,6 +33,11 @@ mod system_capnp {
     include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
 }
 
+#[allow(dead_code)]
+mod synapse_capnp {
+    include!(concat!(env!("OUT_DIR"), "/synapse_capnp.rs"));
+}
+
 #[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
@@ -84,7 +89,8 @@ fn get_graft_cap<T: capnp::capability::FromClientHook>(
             .to_str()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         if n == name {
-            return entry.get_cap().get_as_capability();
+            let invokable = entry.get_synapse()?.get_invokable()?;
+            return Ok(T::new(invokable.client.hook));
         }
     }
     Err(capnp::Error::failed(format!(
@@ -366,7 +372,9 @@ async fn play_rpc_against_peer(
     req.get().set_peer(peer_id);
     req.get().set_protocol(CHESS_SERVICE);
     let resp = req.send().promise.await?;
-    let engine: chess_capnp::chess_engine::Client = resp.get()?.get_cap().get_as_capability()?;
+    let invokable = resp.get()?.get_synapse()?.get_invokable()?;
+    let engine: chess_capnp::chess_engine::Client =
+        capnp::capability::FromClientHook::new(invokable.client.hook);
 
     log::info!("game {us} vs {them}: started (RPC)");
     play_rpc_game(&engine, &us, &them).await

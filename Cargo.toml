@@ -9,6 +9,7 @@ members = [
     "crates/membrane",
     "crates/rpc",
     "crates/schema-id",
+    "crates/synapse",
     "crates/stem",
     "crates/guest/auth",
     "std/system",
@@ -23,7 +24,6 @@ exclude = [
     "examples/echo",     # WASI guest — targets wasm32-wasip2, not host
     "examples/counter",  # WASI guest — targets wasm32-wasip2, not host
     "examples/oracle",   # WASI guest — targets wasm32-wasip2, not host
-    "examples/auction",  # WASI guest — targets wasm32-wasip2, not host
 ]
 
 [workspace.dependencies]
@@ -102,6 +102,7 @@ stem = { path = "crates/stem" }
 cache = { package = "ww-cache", path = "crates/cache" }
 cell = { path = "crates/cell" }
 rpc = { path = "crates/rpc" }
+synapse = { path = "crates/synapse" }
 caps = { path = "std/caps" }
 blake3 = { workspace = true }
 cid = { workspace = true }

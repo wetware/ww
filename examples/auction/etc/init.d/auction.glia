@@ -1,6 +1,0 @@
-;; Deployment-only hook.
-;;
-;; Demos are shell-forward by default.
-;; Load snippets from examples/auction/glia/ in ww shell:
-;;   (load "glia/register.glia")
-;;   (load "glia/serve.glia")

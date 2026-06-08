@@ -12,6 +12,7 @@ pub mod keys;
 pub mod routing;
 pub mod stream_dialer;
 pub mod stream_listener;
+pub mod synapse_abi;
 pub mod vat_client;
 pub mod vat_dial;
 pub mod vat_listener;
@@ -34,6 +35,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use tokio::sync::oneshot;
 
 use membrane::system_capnp;
+use synapse_abi::write_placeholder_synapse;
 
 /// Commands sent from vat cells to the swarm event loop.
 pub enum SwarmCommand {
@@ -430,7 +432,8 @@ impl system_capnp::process::Server for ProcessImpl {
                     "process did not export a bootstrap capability via system::serve()".into(),
                 )
             })?;
-            results.get().init_cap().set_as_capability(cap.hook);
+            let _ = cap;
+            write_placeholder_synapse(results.get().init_synapse(), "process-bootstrap");
             Ok(())
         })
     }
@@ -949,15 +952,20 @@ mod tests {
                 );
                 let process = setup_process_rpc(process_impl);
 
-                // Call bootstrap() — should return the stored cap.
+                // Call bootstrap() — public shape is now Synapse.
                 let resp = process.bootstrap_request().send().promise.await.unwrap();
-                let cap = resp.get().unwrap().get_cap();
-
-                // Cast it back to a Host and verify it works.
-                let host2: system_capnp::host::Client = cap.get_as_capability().unwrap();
-                let id_resp = host2.id_request().send().promise.await.unwrap();
-                let peer_id = id_resp.get().unwrap().get_peer_id().unwrap();
-                assert_eq!(peer_id, &[1, 2, 3, 4]);
+                let synapse = resp.get().unwrap().get_synapse().unwrap();
+                assert_eq!(
+                    synapse
+                        .get_descriptor()
+                        .unwrap()
+                        .get_display_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                    "process-bootstrap"
+                );
+                synapse.get_invokable().unwrap();
             })
             .await;
     }
@@ -976,7 +984,7 @@ mod tests {
                 assert!(
                     result.is_err() || {
                         let resp = result.unwrap();
-                        // The error may come from get_cap() trying to read a missing cap,
+                        // The error may come from reading a missing Synapse,
                         // or from the server returning an error in the response.
                         resp.get().is_err()
                     }
@@ -1006,11 +1014,8 @@ mod tests {
                 // Call bootstrap() twice — both should return working caps.
                 for _ in 0..2 {
                     let resp = process.bootstrap_request().send().promise.await.unwrap();
-                    let cap = resp.get().unwrap().get_cap();
-                    let host2: system_capnp::host::Client = cap.get_as_capability().unwrap();
-                    let id_resp = host2.id_request().send().promise.await.unwrap();
-                    let peer_id = id_resp.get().unwrap().get_peer_id().unwrap();
-                    assert_eq!(peer_id, &[1, 2, 3, 4]);
+                    let synapse = resp.get().unwrap().get_synapse().unwrap();
+                    synapse.get_invokable().unwrap();
                 }
             })
             .await;
@@ -1050,13 +1055,8 @@ mod tests {
 
                 // Call bootstrap() immediately — the cap hasn't resolved yet.
                 let resp = process.bootstrap_request().send().promise.await.unwrap();
-                let cap = resp.get().unwrap().get_cap();
-                let host2: system_capnp::host::Client = cap.get_as_capability().unwrap();
-
-                // Use the cap — should block until the delayed future resolves.
-                let id_resp = host2.id_request().send().promise.await.unwrap();
-                let peer_id = id_resp.get().unwrap().get_peer_id().unwrap();
-                assert_eq!(peer_id, &[1, 2, 3, 4]);
+                let synapse = resp.get().unwrap().get_synapse().unwrap();
+                synapse.get_invokable().unwrap();
             })
             .await;
     }
@@ -1194,28 +1194,14 @@ mod tests {
                 // 1. Create a Host cap (the "cell's exported cap").
                 let (host, _server, _rx) = setup_rpc();
 
-                // 2. Store it in a ProcessImpl (simulates build_membrane_rpc capture).
-                let (stdin, stdout, stderr, exit_rx, kill_tx) = dummy_process_parts();
-                let process_impl = ProcessImpl::with_bootstrap(
-                    stdin,
-                    stdout,
-                    stderr,
-                    exit_rx,
-                    host.client.clone(),
-                    kill_tx,
-                );
-                let process = setup_process_rpc(process_impl);
+                // 2. Bridge the internal cap directly; public bootstrap now carries Synapse.
+                let bootstrap_cap = host.client.clone();
 
-                // 3. Call Process.bootstrap() to get the cap (what handle_rpc_connection does).
-                let resp = process.bootstrap_request().send().promise.await.unwrap();
-                let bootstrap_cap: capnp::capability::Client =
-                    resp.get().unwrap().get_cap().get_as_capability().unwrap();
-
-                // 4. Bridge: serve it over a duplex (simulates the libp2p stream bridge).
+                // 3. Bridge: serve it over a duplex (simulates the libp2p stream bridge).
                 let (remote_host, _bridge): (system_capnp::host::Client, _) =
                     setup_bridge(bootstrap_cap);
 
-                // 5. Remote peer uses the cap through the bridge.
+                // 4. Remote peer uses the cap through the bridge.
                 let id_resp = remote_host.id_request().send().promise.await.unwrap();
                 let peer_id = id_resp.get().unwrap().get_peer_id().unwrap();
                 assert_eq!(peer_id, &[1, 2, 3, 4]);
@@ -1231,20 +1217,7 @@ mod tests {
             .run_until(async {
                 let (host, _server, _rx) = setup_rpc();
 
-                let (stdin, stdout, stderr, exit_rx, kill_tx) = dummy_process_parts();
-                let process_impl = ProcessImpl::with_bootstrap(
-                    stdin,
-                    stdout,
-                    stderr,
-                    exit_rx,
-                    host.client.clone(),
-                    kill_tx,
-                );
-                let process = setup_process_rpc(process_impl);
-
-                let resp = process.bootstrap_request().send().promise.await.unwrap();
-                let bootstrap_cap: capnp::capability::Client =
-                    resp.get().unwrap().get_cap().get_as_capability().unwrap();
+                let bootstrap_cap = host.client.clone();
 
                 let (remote_host, _bridge): (system_capnp::host::Client, _) =
                     setup_bridge(bootstrap_cap);
@@ -1267,20 +1240,7 @@ mod tests {
             .run_until(async {
                 let (host, _server, _rx) = setup_rpc();
 
-                let (stdin, stdout, stderr, exit_rx, kill_tx) = dummy_process_parts();
-                let process_impl = ProcessImpl::with_bootstrap(
-                    stdin,
-                    stdout,
-                    stderr,
-                    exit_rx,
-                    host.client.clone(),
-                    kill_tx,
-                );
-                let process = setup_process_rpc(process_impl);
-
-                let resp = process.bootstrap_request().send().promise.await.unwrap();
-                let bootstrap_cap: capnp::capability::Client =
-                    resp.get().unwrap().get_cap().get_as_capability().unwrap();
+                let bootstrap_cap = host.client.clone();
 
                 let (remote_host, _bridge): (system_capnp::host::Client, _) =
                     setup_bridge(bootstrap_cap);
@@ -1312,20 +1272,7 @@ mod tests {
                 // Create two independent process+bridge chains.
                 let mut remote_hosts = Vec::new();
                 for _ in 0..2 {
-                    let (stdin, stdout, stderr, exit_rx, kill_tx) = dummy_process_parts();
-                    let process_impl = ProcessImpl::with_bootstrap(
-                        stdin,
-                        stdout,
-                        stderr,
-                        exit_rx,
-                        host.client.clone(),
-                        kill_tx,
-                    );
-                    let process = setup_process_rpc(process_impl);
-
-                    let resp = process.bootstrap_request().send().promise.await.unwrap();
-                    let cap: capnp::capability::Client =
-                        resp.get().unwrap().get_cap().get_as_capability().unwrap();
+                    let cap = host.client.clone();
 
                     let (remote, _bridge): (system_capnp::host::Client, _) = setup_bridge(cap);
                     remote_hosts.push(remote);
@@ -1371,7 +1318,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
+                let (_host, _server, _rx) = setup_rpc();
                 let (_tx, guard) = test_epoch_guard(1);
                 let listener_impl =
                     vat_listener::VatListenerImpl::new(dummy_stream_control(), guard);
@@ -1379,9 +1326,7 @@ mod tests {
                     capnp_rpc::new_client(listener_impl);
 
                 let mut req = listener.serve_request();
-                req.get()
-                    .init_cap()
-                    .set_as_capability(host.client.hook.clone());
+                write_placeholder_synapse(req.get().init_synapse(), "host");
                 req.get().set_protocol("");
 
                 let result = req.send().promise.await;
@@ -1436,7 +1381,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
+                let (_host, _server, _rx) = setup_rpc();
                 let (tx, guard) = test_epoch_guard(1);
                 let listener_impl =
                     vat_listener::VatListenerImpl::new(dummy_stream_control(), guard);
@@ -1452,9 +1397,7 @@ mod tests {
                 .unwrap();
 
                 let mut req = listener.serve_request();
-                req.get()
-                    .init_cap()
-                    .set_as_capability(host.client.hook.clone());
+                write_placeholder_synapse(req.get().init_synapse(), "host");
                 req.get().set_protocol("greeter");
 
                 let result = req.send().promise.await;
@@ -1498,7 +1441,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
+                let (_host, _server, _rx) = setup_rpc();
                 let (_tx, guard) = test_epoch_guard(1);
                 // Share the same Behaviour so both listeners see the same protocol registry.
                 let behaviour = libp2p_stream::Behaviour::new();
@@ -1513,9 +1456,7 @@ mod tests {
 
                 // First registration should succeed.
                 let mut req1 = client1.serve_request();
-                req1.get()
-                    .init_cap()
-                    .set_as_capability(host.client.hook.clone());
+                write_placeholder_synapse(req1.get().init_synapse(), "host");
                 req1.get().set_protocol("greeter");
                 req1.send()
                     .promise
@@ -1524,9 +1465,7 @@ mod tests {
 
                 // Second registration with the same service name should fail.
                 let mut req2 = client2.serve_request();
-                req2.get()
-                    .init_cap()
-                    .set_as_capability(host.client.hook.clone());
+                write_placeholder_synapse(req2.get().init_synapse(), "host");
                 req2.get().set_protocol("greeter");
                 let result = req2.send().promise.await;
                 assert!(
@@ -1544,7 +1483,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
+                let (_host, _server, _rx) = setup_rpc();
                 let (_tx, guard) = test_epoch_guard(1);
                 let listener_impl =
                     vat_listener::VatListenerImpl::new(dummy_stream_control(), guard);
@@ -1552,9 +1491,7 @@ mod tests {
                     capnp_rpc::new_client(listener_impl);
 
                 let mut req = listener.serve_request();
-                req.get()
-                    .init_cap()
-                    .set_as_capability(host.client.hook.clone());
+                write_placeholder_synapse(req.get().init_synapse(), "host");
                 req.get().set_protocol("greeter");
 
                 let result = req.send().promise.await;
