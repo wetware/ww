@@ -1145,7 +1145,8 @@ fn get_graft_cap<T: FromClientHook>(
             .to_str()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         if n == name {
-            return entry.get_cap().get_as_capability();
+            let invokable = entry.get_synapse()?.get_invokable()?;
+            return Ok(T::new(invokable.client.hook));
         }
     }
 
@@ -1507,6 +1508,7 @@ fn candidate_from_parts(peer: Option<PeerId>, addrs: Vec<Multiaddr>) -> Result<C
 mod tests {
     use super::*;
     use capnp::capability::Promise;
+    use capnp::traits::HasTypeId;
     use capnp_rpc::rpc_twoparty_capnp::Side;
     use capnp_rpc::twoparty::VatNetwork;
     use capnp_rpc::RpcSystem;
@@ -1681,6 +1683,23 @@ mod tests {
         (caps, seen_paths)
     }
 
+    fn write_test_synapse(
+        mut builder: ww::synapse_capnp::synapse::Builder<'_>,
+        name: &str,
+        invokable: ww::synapse_capnp::invokable::Client,
+    ) {
+        let mut descriptor = builder.reborrow().init_descriptor();
+        descriptor.set_display_name(name);
+        descriptor.set_interface_id(0);
+        descriptor.set_schema_cid("");
+        descriptor.set_payload_codec(ww::synapse_capnp::PayloadCodec::Capnp);
+        descriptor.reborrow().init_methods(0);
+        let mut invoker_ids = descriptor.reborrow().init_invoker_interface_ids(1);
+        invoker_ids.set(0, ww::synapse_capnp::invokable::Client::TYPE_ID);
+        descriptor.init_schema_nodes(0);
+        builder.set_invokable(invokable);
+    }
+
     struct TestMembrane {
         host: ww::system_capnp::host::Client,
         routing: ww::routing_capnp::routing::Client,
@@ -1700,21 +1719,22 @@ mod tests {
             {
                 let mut entry = caps.reborrow().get(0);
                 entry.set_name("host");
-                entry
-                    .init_cap()
-                    .set_as_capability(self.host.client.hook.clone());
+                let invokable =
+                    ww::synapse_capnp::invokable::Client::new(self.host.client.hook.clone());
+                write_test_synapse(entry.init_synapse(), "host", invokable);
             }
             {
                 let mut entry = caps.reborrow().get(1);
                 entry.set_name("routing");
-                entry
-                    .init_cap()
-                    .set_as_capability(self.routing.client.hook.clone());
+                let invokable =
+                    ww::synapse_capnp::invokable::Client::new(self.routing.client.hook.clone());
+                write_test_synapse(entry.init_synapse(), "routing", invokable);
             }
             if let Some(ipfs) = &self.ipfs {
                 let mut entry = caps.reborrow().get(2);
                 entry.set_name("ipfs");
-                entry.init_cap().set_as_capability(ipfs.client.hook.clone());
+                let invokable = ww::synapse_capnp::invokable::Client::new(ipfs.client.hook.clone());
+                write_test_synapse(entry.init_synapse(), "ipfs", invokable);
             }
 
             Promise::ok(())

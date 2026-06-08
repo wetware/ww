@@ -19,6 +19,7 @@ fn main() {
         // emits `crate::schema_capnp::node` instead of `::capnp::schema_capnp::node`.
         .crate_provides("capnp", [0xa93fc509624c72d9])
         .file(capnp_dir.join("system.capnp"))
+        .file(capnp_dir.join("synapse.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("auth.capnp"))
         .file(capnp_dir.join("membrane.capnp"))
@@ -52,6 +53,10 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         capnp_dir.join("system.capnp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        capnp_dir.join("synapse.capnp").display()
     );
     println!(
         "cargo:rerun-if-changed={}",

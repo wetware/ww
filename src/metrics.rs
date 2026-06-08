@@ -5,7 +5,7 @@
 //!
 //! Fuel metrics (`ww_cell_fuel_remaining`, `ww_cell_fuel_consumed_total`)
 //! are live from host-side [`FuelEstimator`] state.  Auction-specific
-//! metrics (`ww_auction_*`) are stubbed pending a `ComputeProvider` client.
+//! metrics.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -180,37 +180,6 @@ struct AdminState {
 /// Render all metrics in Prometheus text exposition format.
 fn render_metrics(state: &AdminState) -> String {
     let mut out = String::with_capacity(2048);
-
-    // ---- Auction metrics (Phase 1: stubs) ----
-    //
-    // These require a ComputeProvider client reference to query the auction
-    // vat cell's status() method.  Wired in a future PR.
-
-    out.push_str("# HELP ww_auction_bids_total Total bids processed.\n");
-    out.push_str("# TYPE ww_auction_bids_total counter\n");
-    // TODO: populate from ComputeProvider.status() when available
-    // ww_auction_bids_total{status="accepted"} 0
-    // ww_auction_bids_total{status="rejected"} 0
-
-    out.push_str("# HELP ww_auction_capacity_fuel Total fuel capacity this epoch.\n");
-    out.push_str("# TYPE ww_auction_capacity_fuel gauge\n");
-    // TODO: populate from ComputeProvider.status()
-
-    out.push_str("# HELP ww_auction_available_fuel Uncommitted fuel capacity.\n");
-    out.push_str("# TYPE ww_auction_available_fuel gauge\n");
-    // TODO: populate from ComputeProvider.status()
-
-    out.push_str("# HELP ww_auction_utilization_ratio Committed / total fuel.\n");
-    out.push_str("# TYPE ww_auction_utilization_ratio gauge\n");
-    // TODO: populate from ComputeProvider.status()
-
-    out.push_str("# HELP ww_auction_price_per_mfuel Current posted price.\n");
-    out.push_str("# TYPE ww_auction_price_per_mfuel gauge\n");
-    // TODO: populate from ComputeProvider.status()
-
-    out.push_str("# HELP ww_auction_active_tickets Active fuel tickets.\n");
-    out.push_str("# TYPE ww_auction_active_tickets gauge\n");
-    // TODO: populate from ComputeProvider.status()
 
     // ---- Per-cell fuel metrics (Phase 1: live) ----
 
@@ -456,7 +425,6 @@ mod tests {
         let output = render_metrics(&state);
         assert!(output.contains("# TYPE ww_cell_fuel_remaining gauge"));
         assert!(output.contains("# TYPE ww_cell_fuel_consumed_total counter"));
-        assert!(output.contains("# TYPE ww_auction_bids_total counter"));
         assert!(output.contains("# TYPE ww_rpc_calls_total counter"));
         assert!(output.contains("# TYPE ww_rpc_duration_seconds histogram"));
         assert!(output.contains("# TYPE ww_cache_hits_total counter"));

@@ -18,6 +18,7 @@ use std::{fmt, time::Duration};
 use tokio::sync::mpsc;
 
 use crate::dispatch::{self, CgiRequest, CgiResponse, RouteRegistry};
+use crate::synapse_abi::{read_owned_synapse, write_owned_synapse, OwnedSynapse};
 use membrane::system_capnp;
 
 /// Maximum response size from a cell process (16 MiB).
@@ -40,10 +41,9 @@ impl HttpListenerImpl {
     }
 }
 
-/// A captured init.d `with`-block grant: name + capnp client + canonical Schema.Node bytes.
-/// Cloned per request and re-emitted on each spawned cell's graft so guests can
-/// introspect each cap's interface end-to-end (`(schema cap)`).
-type ExtraCap = (String, capnp::capability::Client, Vec<u8>);
+/// A captured init.d `with`-block grant. Cloned per request and re-emitted on
+/// each spawned cell's graft.
+type ExtraCap = (String, OwnedSynapse);
 
 #[allow(refining_impl_trait)]
 impl system_capnp::http_listener::Server for HttpListenerImpl {
@@ -71,15 +71,10 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
             let mut caps_vec = Vec::new();
             if let Ok(caps_reader) = reader.get_caps() {
                 for entry in caps_reader.iter() {
-                    if let (Ok(name), Ok(cap)) = (
-                        entry.get_name().map(|n| n.to_string().unwrap_or_default()),
-                        entry.get_cap().get_as_capability(),
-                    ) {
-                        let schema_bytes = match entry.get_schema() {
-                            Ok(node) => super::canonicalize_schema_node(node).unwrap_or_default(),
-                            Err(_) => Vec::new(),
-                        };
-                        caps_vec.push((name, cap, schema_bytes));
+                    if let Ok(name) = entry.get_name().map(|n| n.to_string().unwrap_or_default()) {
+                        if let Ok(synapse) = entry.get_synapse().and_then(read_owned_synapse) {
+                            caps_vec.push((name, synapse));
+                        }
                     }
                 }
             }
@@ -217,21 +212,10 @@ async fn spawn_and_run(
     }
     if !caps.is_empty() {
         let mut caps_builder = spawn_req.get().init_caps(caps.len() as u32);
-        for (i, (name, client, schema_bytes)) in caps.iter().enumerate() {
+        for (i, (name, synapse)) in caps.iter().enumerate() {
             let mut entry = caps_builder.reborrow().get(i as u32);
             entry.set_name(name);
-            if !schema_bytes.is_empty() {
-                let aligned = crate::graft::bytes_to_aligned_words(schema_bytes);
-                let segments: &[&[u8]] = &[capnp::Word::words_to_bytes(&aligned)];
-                let segment_array = capnp::message::SegmentArray::new(segments);
-                let reader = capnp::message::Reader::new(
-                    segment_array,
-                    capnp::message::ReaderOptions::new(),
-                );
-                let schema_node: capnp::schema_capnp::node::Reader = reader.get_root()?;
-                entry.reborrow().set_schema(schema_node)?;
-            }
-            entry.init_cap().set_as_capability(client.hook.clone());
+            write_owned_synapse(entry.init_synapse(), synapse);
         }
     }
     let spawn_resp = spawn_req.send().promise.await?;
@@ -652,11 +636,7 @@ mod tests {
                     let mut caps_builder = req.get().init_caps(1);
                     let mut entry = caps_builder.reborrow().get(0);
                     entry.set_name("host");
-                    // Use the stub executor as a stand-in capability — any
-                    // capnp client works here; this test verifies the listen
-                    // request shape, not what the cap does.
-                    let placeholder = stub_executor();
-                    entry.init_cap().set_as_capability(placeholder.client.hook);
+                    crate::synapse_abi::write_placeholder_synapse(entry.init_synapse(), "host");
                 }
 
                 req.send()

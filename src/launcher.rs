@@ -23,9 +23,9 @@ use crate::host::SwarmCommand;
 use crate::services::CompileRequest;
 use crate::system_capnp;
 use cell::proc::{Builder as ProcBuilder, FuelEstimator};
+use rpc::synapse_abi::{read_owned_synapse, OwnedSynapse};
 use rpc::{
-    build_peer_rpc, canonicalize_schema_node, graft, ByteStreamImpl, CachePolicy, NetworkState,
-    ProcessImpl, StreamMode,
+    build_peer_rpc, graft, ByteStreamImpl, CachePolicy, NetworkState, ProcessImpl, StreamMode,
 };
 
 /// Maximum WASM binary size accepted by the Executor.
@@ -357,23 +357,16 @@ impl system_capnp::executor::Server for ExecutorImpl {
             None // Default: scheduled (unlimited)
         };
 
-        // Read optional caps from spawn request (forwarded from init.d `with` block).
-        // Each entry carries its canonical Schema.Node bytes through to the
-        // child cell's graft response so guests can introspect the cap's
-        // interface without hardcoded fallbacks.
-        let extra_caps: Vec<(String, capnp::capability::Client, Vec<u8>)> = {
+        // Read optional Synapse caps from spawn request (forwarded from init.d
+        // `with` blocks) and preserve them for the child graft response.
+        let extra_caps: Vec<(String, OwnedSynapse)> = {
             let mut caps_vec = Vec::new();
             if let Ok(caps_reader) = params.get_caps() {
                 for entry in caps_reader.iter() {
-                    if let (Ok(name), Ok(cap)) = (
-                        entry.get_name().map(|n| n.to_string().unwrap_or_default()),
-                        entry.get_cap().get_as_capability(),
-                    ) {
-                        let schema_bytes = match entry.get_schema() {
-                            Ok(node) => canonicalize_schema_node(node).unwrap_or_default(),
-                            Err(_) => Vec::new(),
-                        };
-                        caps_vec.push((name, cap, schema_bytes));
+                    if let Ok(name) = entry.get_name().map(|n| n.to_string().unwrap_or_default()) {
+                        if let Ok(synapse) = entry.get_synapse().and_then(read_owned_synapse) {
+                            caps_vec.push((name, synapse));
+                        }
                     }
                 }
             }

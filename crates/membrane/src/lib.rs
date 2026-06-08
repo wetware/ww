@@ -11,6 +11,11 @@ pub mod system_capnp {
 }
 
 #[allow(unused_parens, clippy::match_single_binding)]
+pub mod synapse_capnp {
+    include!(concat!(env!("OUT_DIR"), "/capnp/synapse_capnp.rs"));
+}
+
+#[allow(unused_parens, clippy::match_single_binding)]
 pub mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/capnp/routing_capnp.rs"));
 }
@@ -48,15 +53,13 @@ pub mod http_capnp {
 }
 
 /// Canonical Schema.Node bytes for each grafted capability interface.
-/// Populated into `Export.schema` at graft time so guests can introspect
-/// the interface without hardcoded descriptions. See `build.rs`.
+/// These are descriptor inputs for lifted Synapses, not sidecar authority.
 pub mod schema_registry {
     include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
     /// Resolve canonical Schema.Node bytes by the canonical cap name used
     /// in the membrane graft loop (e.g. "host", "runtime", "routing",
-    /// "identity", "http-client"). Returns `None` for unknown names so
-    /// callers can fall back to an empty schema rather than panicking.
+    /// "identity", "http-client").
     pub fn schema_by_name(name: &str) -> Option<&'static [u8]> {
         match name {
             "host" => Some(HOST_SCHEMA),
@@ -159,11 +162,11 @@ pub mod schema_registry {
             // CID snapshots guard against accidental protocol drift.
             assert_eq!(
                 HOST_CID,
-                "bafkr4ic7cpeyps4vztynjvnyygid47przo5aqtkgjswb5ns4yoqiox4pnu"
+                "bafkr4ie7d2lzj7ktjj5j5jmampbskj6wqi4hssa37ccgwtvxe5euxkbday"
             );
             assert_eq!(
                 RUNTIME_CID,
-                "bafkr4idvcyjadh3aefmdcis7ejmbi7jevfyutk7ifj7o3pi2tmfyrgcglm"
+                "bafkr4ifljlnaebne6hrnoxgzzlnuxcynbxn6hr6ebcoip455vn4sfdzoqm"
             );
             assert_eq!(
                 ROUTING_CID,

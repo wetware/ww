@@ -33,7 +33,7 @@ make discovery
 ```
 
 This compiles the WASM guest and copies the compiled schema bytes
-(`discovery.capnpc`) next to the binary for tooling/introspection.
+using the generated Synapse descriptor metadata.
 Vat publication uses the service name `greeter`.
 
 ## Running
@@ -92,7 +92,7 @@ Expected output on Agent B:
 
 ```
 BUILD TIME:
-  greeter.capnp --> capnpc --> discovery.wasm + discovery.capnpc
+  greeter.capnp --> capnpc --> discovery.wasm
 
 AGENT A (service mode):                    AGENT B (service mode):
   membrane.graft()                           membrane.graft()
@@ -178,7 +178,7 @@ examples/discovery/
 ├── greeter.capnp          # Greeter schema source
 ├── bin/                   # build output (gitignored)
 │   ├── discovery.wasm
-│   └── discovery.capnpc   # compiled schema bytes
+│   └── discovery.wasm
 ├── glia/
 │   ├── register.glia      # shell-loaded registration
 │   └── serve.glia         # DHT provide + discovery loop

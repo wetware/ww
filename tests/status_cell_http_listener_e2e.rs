@@ -39,21 +39,6 @@ fn synth_peer_id_bytes() -> Vec<u8> {
     libp2p::PeerId::from_public_key(&kp.public()).to_bytes()
 }
 
-/// Stand-in capnp client used as the named cap value in the caps list.
-/// Any client works for shape validation — the status cell ignores extras.
-struct StubExecutor;
-
-#[allow(refining_impl_trait)]
-impl system_capnp::executor::Server for StubExecutor {
-    fn spawn(
-        self: capnp::capability::Rc<Self>,
-        _params: system_capnp::executor::SpawnParams,
-        _results: system_capnp::executor::SpawnResults,
-    ) -> capnp::capability::Promise<(), capnp::Error> {
-        capnp::capability::Promise::err(capnp::Error::failed("stub executor".into()))
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id() {
     if !status_wasm_exists() {
@@ -125,9 +110,7 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
                 let mut caps_builder = listen_req.get().init_caps(1);
                 let mut entry = caps_builder.reborrow().get(0);
                 entry.set_name("test-extra");
-                let placeholder: system_capnp::executor::Client =
-                    capnp_rpc::new_client(StubExecutor);
-                entry.init_cap().set_as_capability(placeholder.client.hook);
+                ww::rpc::synapse_abi::write_placeholder_synapse(entry.init_synapse(), "test-extra");
             }
             listen_req
                 .send()

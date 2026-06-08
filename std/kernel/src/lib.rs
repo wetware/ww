@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
+use capnp::capability::FromClientHook;
+use capnp::traits::HasTypeId;
 use caps::{make_import_cap, make_import_handler};
 use glia::eval::{self, Dispatch, Env};
 use glia::{extract_method, make_cap, read, read_many, AttenuatedCapInner, GliaCapInner, Val};
@@ -17,6 +19,11 @@ use wasip2::exports::cli::run::Guest;
 #[allow(dead_code)]
 mod system_capnp {
     include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
+}
+
+#[allow(dead_code)]
+mod synapse_capnp {
+    include!(concat!(env!("OUT_DIR"), "/synapse_capnp.rs"));
 }
 
 #[allow(dead_code, clippy::extra_unused_type_parameters)]
@@ -53,6 +60,23 @@ mod schema_ids {
 /// Bootstrap capability: the concrete Membrane defined in membrane.capnp.
 type Membrane = membrane_capnp::membrane::Client;
 
+fn write_synapse_from_client(
+    mut builder: synapse_capnp::synapse::Builder<'_>,
+    name: &str,
+    client: capnp::capability::Client,
+) {
+    let mut descriptor = builder.reborrow().init_descriptor();
+    descriptor.set_display_name(name);
+    descriptor.set_interface_id(0);
+    descriptor.set_schema_cid("");
+    descriptor.set_payload_codec(synapse_capnp::PayloadCodec::Capnp);
+    descriptor.reborrow().init_methods(0);
+    let mut invoker_ids = descriptor.reborrow().init_invoker_interface_ids(1);
+    invoker_ids.set(0, synapse_capnp::invokable::Client::TYPE_ID);
+    descriptor.init_schema_nodes(0);
+    builder.set_invokable(synapse_capnp::invokable::Client::new(client.hook));
+}
+
 /// Exported kernel bootstrap capability.
 ///
 /// The kernel boots with host-provided `Membrane` access, and the shell client
@@ -88,17 +112,7 @@ impl membrane_capnp::membrane::Server for KernelBootstrap {
                 let src = src_caps.get(i);
                 let mut dst = dst_caps.reborrow().get(i);
                 dst.set_name(src.get_name()?);
-                dst.reborrow()
-                    .init_cap()
-                    .set_as_capability(
-                        src.get_cap()
-                            .get_as_capability::<capnp::capability::Client>()?
-                            .hook
-                            .clone(),
-                    );
-                if src.has_schema() {
-                    dst.set_schema(src.get_schema()?)?;
-                }
+                dst.set_synapse(src.get_synapse()?)?;
             }
 
             Ok(())
@@ -236,10 +250,11 @@ fn make_process_cap(process: system_capnp::process::Client) -> Val {
                     let cap = resp
                         .get()
                         .map_err(|e| Val::from(e.to_string()))?
-                        .get_cap()
-                        .get_as_capability::<capnp::capability::Client>()
+                        .get_synapse()
+                        .map_err(|e| Val::from(e.to_string()))?
+                        .get_invokable()
                         .map_err(|e| Val::from(e.to_string()))?;
-                    Ok(make_generic_cap(cap))
+                    Ok(make_generic_cap(cap.client))
                 })
             }),
         },
@@ -443,7 +458,7 @@ fn make_executor_cap(executor: system_capnp::executor::Client) -> Val {
                             for (j, (name, client)) in cap_pairs.into_iter().enumerate() {
                                 let mut entry = caps_builder.reborrow().get(j as u32);
                                 entry.set_name(&name);
-                                entry.init_cap().set_as_capability(client.hook);
+                                write_synapse_from_client(entry.init_synapse(), &name, client);
                             }
                         }
                     }
@@ -752,7 +767,7 @@ fn make_host_handler(
                             for (i, (name, client)) in valid_caps.into_iter().enumerate() {
                                 let mut entry = caps_builder.reborrow().get(i as u32);
                                 entry.set_name(&name);
-                                entry.init_cap().set_as_capability(client.hook);
+                                write_synapse_from_client(entry.init_synapse(), &name, client);
                             }
                         }
 
@@ -804,7 +819,7 @@ fn make_host_handler(
                             for (i, (name, client)) in valid_caps.into_iter().enumerate() {
                                 let mut entry = caps_builder.reborrow().get(i as u32);
                                 entry.set_name(&name);
-                                entry.init_cap().set_as_capability(client.hook);
+                                write_synapse_from_client(entry.init_synapse(), &name, client);
                             }
                         }
 
@@ -850,7 +865,7 @@ fn make_host_handler(
                             .get_vat_listener()
                             .map_err(|e| Val::from(e.to_string()))?;
                         let mut req = listener.serve_request();
-                        req.get().init_cap().set_as_capability(cap.hook);
+                        write_synapse_from_client(req.get().init_synapse(), "vat-service", cap);
                         req.get().set_protocol(protocol);
                         req.send()
                             .promise
@@ -1616,7 +1631,8 @@ fn get_graft_cap<T: capnp::capability::FromClientHook>(
             .to_str()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         if n == name {
-            return entry.get_cap().get_as_capability();
+            let invokable = entry.get_synapse()?.get_invokable()?;
+            return Ok(T::new(invokable.client.hook));
         }
     }
     Err(capnp::Error::failed(format!(
@@ -2360,10 +2376,11 @@ mod tests {
             let mut caps = results.get().init_caps(1);
             let mut entry = caps.reborrow().get(0);
             entry.set_name("runtime");
-            entry
-                .reborrow()
-                .init_cap()
-                .set_as_capability(self.runtime.client.hook.clone());
+            write_synapse_from_client(
+                entry.init_synapse(),
+                "runtime",
+                self.runtime.client.clone(),
+            );
             Promise::ok(())
         }
     }

@@ -29,6 +29,11 @@ mod system_capnp {
 }
 
 #[allow(dead_code)]
+mod synapse_capnp {
+    include!(concat!(env!("OUT_DIR"), "/synapse_capnp.rs"));
+}
+
+#[allow(dead_code)]
 mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
@@ -67,7 +72,8 @@ fn graft_cap_opt<T: FromClientHook>(
         let entry = caps.get(i);
         let n = entry.get_name().ok()?.to_str().ok()?;
         if n == name {
-            return entry.get_cap().get_as_capability().ok();
+            let invokable = entry.get_synapse().ok()?.get_invokable().ok()?;
+            return Some(T::new(invokable.client.hook));
         }
     }
     None

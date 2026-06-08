@@ -196,7 +196,7 @@ Full interface reference for the capabilities available to guests.
 | `stdout` | `() -> (stream: ByteStream)` | Readable stream from guest's stdout. |
 | `stderr` | `() -> (stream: ByteStream)` | Readable stream from guest's stderr. |
 | `wait` | `() -> (exitCode: Int32)` | Block until process exits. |
-| `bootstrap` | `() -> (cap: Capability)` | Get the capability exported by the guest via `system::serve()`. |
+| `bootstrap` | `() -> (synapse: Synapse)` | Get the Synapse exported by the guest via `system::serve()`. |
 
 ### ByteStream
 
@@ -222,13 +222,13 @@ Full interface reference for the capabilities available to guests.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `serve` | `(cap: Capability, protocol: Text) -> ()` | Accept connections on `/ww/0.1.0/vat/{protocol}` and bootstrap each connection with the provided capability. The protocol is a locator only. |
+| `serve` | `(synapse: Synapse, protocol: Text) -> ()` | Accept connections on `/ww/0.1.0/vat/{protocol}` and bootstrap each connection with the provided Synapse. The protocol is a locator only. |
 
 ### VatClient (capability mode)
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `dial` | `(peer: Data, protocol: Text) -> (cap: Capability)` | Open connection to peer on `/ww/0.1.0/vat/{protocol}`. Bootstrap RPC and return the remote capability. |
+| `dial` | `(peer: Data, protocol: Text) -> (synapse: Synapse)` | Open connection to peer on `/ww/0.1.0/vat/{protocol}`. Bootstrap RPC and return the remote Synapse. |
 
 ## Service Cell Registration
 
