@@ -38,8 +38,8 @@ grep -Fq 'POD_RELEASE_TREE:-/tmp/ww-release-tree-publish-$(date +%s)-$$' "$PUBLI
 grep -Fq 'k cp --retries=3' "$PUBLISH_SCRIPT" \
   || fail "release script must retry kubectl cp under slow k3s API behavior"
 
-pin_add_line="$(line_number "ipfs pin add \"\$CID\"" "$PUBLISH_SCRIPT")"
-publish_line="$(line_number "ipfs name publish --key=ww-release \"/ipfs/\$CID\"" "$PUBLISH_SCRIPT")"
+pin_add_line="$(line_number "ipfs pin add '\$CID'" "$PUBLISH_SCRIPT")"
+publish_line="$(line_number "ipfs name publish --key=ww-release '/ipfs/\$CID'" "$PUBLISH_SCRIPT")"
 pin_rm_line="$(line_number "ipfs pin rm \"\$stale\"" "$PUBLISH_SCRIPT")"
 
 [ -n "$pin_add_line" ] || fail "release script missing explicit pin add"
