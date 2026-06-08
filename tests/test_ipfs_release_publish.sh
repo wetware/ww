@@ -32,6 +32,11 @@ grep -Fq "[ ! -f \"\$state_file\" ]" "$PUBLISH_SCRIPT" \
   || fail "release script must handle first run without bulk cleanup"
 grep -Fq 'ipfs repo gc' "$PUBLISH_SCRIPT" \
   || fail "release script must run repo gc after stale unpins"
+# shellcheck disable=SC2016
+grep -Fq 'POD_RELEASE_TREE:-/tmp/ww-release-tree-publish-$(date +%s)-$$' "$PUBLISH_SCRIPT" \
+  || fail "release script must use a unique pod staging path"
+grep -Fq 'k cp --retries=3' "$PUBLISH_SCRIPT" \
+  || fail "release script must retry kubectl cp under slow k3s API behavior"
 
 pin_add_line="$(line_number "ipfs pin add \"\$CID\"" "$PUBLISH_SCRIPT")"
 publish_line="$(line_number "ipfs name publish --key=ww-release \"/ipfs/\$CID\"" "$PUBLISH_SCRIPT")"

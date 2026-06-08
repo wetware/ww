@@ -7,10 +7,11 @@ set -euo pipefail
 : "${POD:?POD is required}"
 
 REMOTE_RELEASE_TREE="${REMOTE_RELEASE_TREE:-/tmp/ww-release-tree}"
-POD_RELEASE_TREE="${POD_RELEASE_TREE:-/tmp/release-tree}"
+POD_RELEASE_TREE="${POD_RELEASE_TREE:-/tmp/ww-release-tree-publish-$(date +%s)-$$}"
 STATE_FILE="${WW_RELEASE_PIN_STATE:-/data/ipfs/ww-release-pins.txt}"
 RETAIN="${WW_RELEASE_PIN_RETAIN:-10}"
-KUBECTL_TIMEOUT="${KUBECTL_TIMEOUT:-5m}"
+KUBECTL_TIMEOUT="${KUBECTL_TIMEOUT:-10m}"
+KUBECTL_BEST_EFFORT_TIMEOUT="${KUBECTL_BEST_EFFORT_TIMEOUT:-45s}"
 
 case "$RETAIN" in
   ''|*[!0-9]*)
@@ -27,27 +28,60 @@ k() {
   kubectl --request-timeout="$KUBECTL_TIMEOUT" "$@"
 }
 
+best_effort_k() {
+  kubectl --request-timeout="$KUBECTL_BEST_EFFORT_TIMEOUT" "$@"
+}
+
 pod() {
   k exec "$POD" -- "$@"
 }
 
+log() {
+  printf 'ipfs-publish: %s\n' "$*" >&2
+}
+
 cleanup() {
-  pod rm -rf "$POD_RELEASE_TREE" >/dev/null 2>&1 || true
+  best_effort_k exec "$POD" -- rm -rf "$POD_RELEASE_TREE" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 repo_stat_size() {
-  pod sh -c 'if command -v timeout >/dev/null 2>&1; then timeout 30 ipfs repo stat --size-only; else ipfs repo stat --size-only; fi' 2>/dev/null \
+  best_effort_k exec "$POD" -- sh -c 'if command -v timeout >/dev/null 2>&1; then timeout 30 ipfs repo stat --size-only; else ipfs repo stat --size-only; fi' 2>/dev/null \
     | tail -n 1 \
     | tr -d '\r' \
     || true
 }
 
+copy_release_tree() {
+  local attempt backoff
+
+  for attempt in 1 2 3; do
+    log "copying release tree into pod staging path $POD_RELEASE_TREE (attempt $attempt)"
+    if k cp --retries=3 "$REMOTE_RELEASE_TREE" "$POD:$POD_RELEASE_TREE"; then
+      return 0
+    fi
+
+    if [ "$attempt" -lt 3 ]; then
+      backoff="$((attempt * 20))"
+      log "release tree copy failed; retrying in ${backoff}s"
+      sleep "$backoff"
+    fi
+  done
+
+  return 1
+}
+
+if [ ! -d "$REMOTE_RELEASE_TREE" ]; then
+  echo "ERROR: release tree is missing on VPS: $REMOTE_RELEASE_TREE" >&2
+  exit 1
+fi
+
+log "collecting repo stat before publish (best effort)"
 repo_stat_before="$(repo_stat_size)"
 
-pod rm -rf "$POD_RELEASE_TREE"
-k cp "$REMOTE_RELEASE_TREE" "$POD:$POD_RELEASE_TREE"
+copy_release_tree
 
+log "adding release tree to IPFS with implicit pinning disabled"
 CID="$(pod ipfs add --pin=false -rQ --cid-version=1 "$POD_RELEASE_TREE" | tail -n 1 | tr -d '\r')"
 if [ -z "$CID" ]; then
   echo "ERROR: ipfs add produced an empty CID" >&2
@@ -55,13 +89,17 @@ if [ -z "$CID" ]; then
 fi
 
 echo "CID=$CID"
+log "pinning release CID $CID"
 pod ipfs pin add "$CID"
+log "publishing IPNS ww-release to $CID"
 pod ipfs name publish --key=ww-release "/ipfs/$CID"
 
+log "announcing release CID to the DHT (best effort)"
 if ! pod sh -c "if command -v timeout >/dev/null 2>&1; then timeout 60 ipfs routing provide -r '$CID'; else ipfs routing provide -r '$CID'; fi"; then
   echo "WARNING: provide announce timed out or failed; DHT propagation may lag" >&2
 fi
 
+log "updating managed release pin state"
 state_output="$(
   k exec "$POD" -- sh -s -- "$CID" "$RETAIN" "$STATE_FILE" <<'POD_STATE_SH'
 set -eu
@@ -152,11 +190,13 @@ printf '%s\n' "$state_output"
 
 unpinned_count="$(printf '%s\n' "$state_output" | awk -F= '$1 == "UNPINNED_COUNT" { value=$2 } END { print value + 0 }')"
 if [ "$unpinned_count" -gt 0 ]; then
+  log "running IPFS repo GC after managed stale release unpins"
   if ! pod sh -c 'if command -v timeout >/dev/null 2>&1; then timeout 120 ipfs repo gc; else ipfs repo gc; fi'; then
     echo "WARNING: ipfs repo gc timed out or failed after stale release unpins" >&2
   fi
 fi
 
+log "collecting repo stat after cleanup (best effort)"
 repo_stat_after="$(repo_stat_size)"
 rm -rf "$REMOTE_RELEASE_TREE"
 
