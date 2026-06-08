@@ -60,14 +60,16 @@ copy_release_tree() {
   local attempt backoff
 
   for attempt in 1 2 3; do
-    log "copying release tree into pod staging path $POD_RELEASE_TREE (attempt $attempt)"
-    if k cp --retries=3 "$REMOTE_RELEASE_TREE" "$POD:$POD_RELEASE_TREE"; then
+    log "streaming release tree into pod staging path $POD_RELEASE_TREE (attempt $attempt)"
+    # shellcheck disable=SC2016
+    if tar -C "$REMOTE_RELEASE_TREE" -cf - . \
+      | k exec -i "$POD" -- sh -c 'dest="$1"; rm -rf "$dest"; mkdir -p "$dest"; tar -C "$dest" -xf -' sh "$POD_RELEASE_TREE"; then
       return 0
     fi
 
     if [ "$attempt" -lt 3 ]; then
       backoff="$((attempt * 20))"
-      log "release tree copy failed; retrying in ${backoff}s"
+      log "release tree stream failed; retrying in ${backoff}s"
       sleep "$backoff"
     fi
   done
