@@ -86,6 +86,9 @@ interface Executor {
   #
   # caps: optional named capabilities to inject into the child's
   # membrane graft as extras.  Forwarded from init.d `with` blocks.
+
+  cid @1 () -> (cid :Text);
+  # Return the CID of the bound WASM binary.
 }
 
 interface StreamListener {

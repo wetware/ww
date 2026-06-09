@@ -106,12 +106,29 @@ async fn dispatch_loop(
     caps: Vec<ExtraCap>,
     mut rx: mpsc::Receiver<CgiRequest>,
 ) {
+    // Fetch the cell's CID for provenance headers.
+    let cell_cid = match executor.cid_request().send().promise.await {
+        Ok(resp) => {
+            if let Ok(reader) = resp.get().unwrap().get_cid() {
+                reader.to_str().unwrap_or("unknown").to_string()
+            } else {
+                "unknown".to_string()
+            }
+        }
+        Err(e) => {
+            tracing::warn!("failed to fetch cell CID: {e}");
+            "unknown".to_string()
+        }
+    };
+
     while let Some(req) = rx.recv().await {
         let executor = executor.clone();
         let caps = caps.clone();
+        let cell_cid = cell_cid.clone();
         // Handle each request concurrently.
         tokio::task::spawn_local(async move {
-            let response = handle_one_request(&executor, &caps, &req).await;
+            let mut response = handle_one_request(&executor, &caps, &req).await;
+            response.headers.push(("X-Wetware-Cell".to_string(), cell_cid));
             let _ = req.response_tx.send(response);
         });
     }
