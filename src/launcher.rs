@@ -527,10 +527,13 @@ impl system_capnp::executor::Server for ExecutorImpl {
         _params: system_capnp::executor::CidParams,
         mut results: system_capnp::executor::CidResults,
     ) -> Promise<(), capnp::Error> {
+        const RAW_CODEC: u64 = 0x55;
+        const BLAKE3_MULTIHASH_CODE: u64 = 0x1e;
+
         let digest = blake3::hash(&self.bytecode);
-        let mh = cid::multihash::Multihash::<64>::wrap(0x1e, digest.as_bytes())
+        let mh = cid::multihash::Multihash::<64>::wrap(BLAKE3_MULTIHASH_CODE, digest.as_bytes())
             .expect("valid blake3 multihash");
-        let cid = cid::Cid::new_v1(0x55, mh); // 0x55 is raw codec
+        let cid = cid::Cid::new_v1(RAW_CODEC, mh);
         results.get().set_cid(cid.to_string());
         Promise::ok(())
     }

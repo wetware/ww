@@ -35,7 +35,6 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use tokio::sync::oneshot;
 
 use membrane::system_capnp;
-use synapse_abi::write_placeholder_synapse;
 
 /// Commands sent from vat cells to the swarm event loop.
 pub enum SwarmCommand {
@@ -432,8 +431,13 @@ impl system_capnp::process::Server for ProcessImpl {
                     "process did not export a bootstrap capability via system::serve()".into(),
                 )
             })?;
-            let _ = cap;
-            write_placeholder_synapse(results.get().init_synapse(), "process-bootstrap");
+            let synapse = crate::synapse_abi::OwnedSynapse {
+                display_name: "process-bootstrap".into(),
+                interface_id: 0,
+                schema_cid: String::new(),
+                invokable: capnp::capability::FromClientHook::new(cap.hook),
+            };
+            crate::synapse_abi::write_owned_synapse(results.get().init_synapse(), &synapse);
             Ok(())
         })
     }
