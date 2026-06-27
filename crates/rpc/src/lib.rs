@@ -647,6 +647,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::synapse_abi::write_placeholder_synapse;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     /// Helper: spin up server + client over in-memory duplex, return Host client.
