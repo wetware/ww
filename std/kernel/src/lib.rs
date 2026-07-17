@@ -727,7 +727,7 @@ fn make_host_handler(
                             [Val::Cell { wasm, caps }, Val::Str(prefix)] => ((wasm, caps), prefix),
                             [Val::Cell { .. }] => {
                                 return Err(Val::from(
-                                    "host :listen — vat cell listen was removed; use (perform runtime :load ...), (perform executor :spawn), (perform process :bootstrap), then (perform host :serve-vat cap \"service\")",
+                                    "host :listen — vat cell listen was removed; spawn the service, obtain its bootstrap capability, then publish it with (perform host :serve-vat <cap> \"service\")",
                                 ))
                             }
                             [] => {
@@ -844,7 +844,7 @@ fn make_host_handler(
                             }
                             [] | [_] => {
                                 return Err(Val::from(
-                                    "host :serve-vat — usage: (perform host :serve-vat cap \"service\")",
+                                    "host :serve-vat — usage: (perform host :serve-vat <exported-cap> \"service\")",
                                 ))
                             }
                             [other, ..] => {
@@ -871,7 +871,7 @@ fn make_host_handler(
                             .promise
                             .await
                             .map_err(|e| Val::from(e.to_string()))?;
-                        log::info!("host :serve-vat — registered vat service {protocol}");
+                        log::info!("host :serve-vat — published vat service {protocol}");
                         Val::Nil
                     }
                     "http-client" => {
@@ -1321,7 +1321,7 @@ Capabilities (via perform):
   (perform host :peers)                      Connected peers
   (perform host :listen <cell> \"/path\")     Register HTTP/WAGI cell
   (perform host :listen-stream <cell> \"p\")  Register byte-stream cell
-  (perform host :serve-vat cap \"service\")   Register vat capability
+  (perform host :serve-vat cap \"service\")   Publish existing vat capability
 
   (perform runtime :load <wasm>)             Load wasm, return executor
   (perform runtime :run <wasm> :env {})      Spawn foreground process

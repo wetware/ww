@@ -1,8 +1,9 @@
 //! VatListener capability: publish existing capabilities over Cap'n Proto RPC.
 //!
-//! The `VatListener` capability registers a caller-chosen service-name protocol
+//! The `VatListener` capability publishes a caller-chosen service-name protocol
 //! and bootstraps each incoming connection with an already-existing capability.
-//! It does not spawn cells. Publishers own the served capability's lifecycle.
+//! It does not spawn cells or per-connection handlers. Publishers own the
+//! served capability's lifecycle.
 //!
 //! The protocol name is a locator only; authority comes from the capability
 //! reference passed to `serve`.
@@ -63,7 +64,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
         tracing::info!(
             protocol = %stream_protocol,
             service = %protocol_name,
-            "registered vat service"
+            "published vat service"
         );
 
         let mut epoch_rx = self.guard.receiver.clone();

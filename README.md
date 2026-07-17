@@ -106,7 +106,9 @@ non-interactive sessions can pass `--select <index|peer-id>`.
 
 ### Boot a cell
 
-`examples/oracle/` is a working cell that serves the same data over Cap'n Proto RPC and HTTP/WAGI:
+`examples/oracle/` is a working cell with both native vat RPC and an
+HTTP/WAGI adapter. The vat path is the stateful service surface; HTTP/WAGI
+is a stateless request adapter for curl/browser infrastructure:
 
 ```bash
 ww run --http-listen 127.0.0.1:2080 --port=2025 std/kernel examples/oracle
@@ -137,9 +139,9 @@ WASM processes ("cells") run with zero ambient authority. Their stdio is wired t
 
 | Mode | stdio carries | Use case |
 |------|--------------|----------|
-| `vat` | Cap'n Proto RPC | Service mesh, capability exchange |
-| `raw` | libp2p stream bytes | Low-level protocols |
-| `http` | CGI (WAGI) | HTTP request handlers |
+| `vat` | Cap'n Proto RPC | Long-lived capability services |
+| `raw` | libp2p stream bytes | Long-lived byte/session protocols |
+| `http` | CGI (WAGI) | Stateless HTTP request adapters |
 | *(absent)* | Host RPC channel | pid0 kernel, full membrane graft |
 
 ## The shell

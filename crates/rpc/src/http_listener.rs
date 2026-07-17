@@ -4,6 +4,9 @@
 //! For each incoming request matching the path prefix, the host spawns a
 //! cell process (via the guest-provided `Executor`) with CGI env vars
 //! as environment, request body piped to stdin, and CGI response read from stdout.
+//! This is intentionally a stateless WAGI request adapter; long-lived service
+//! identity belongs on vat RPC, and long-lived HTTP-facing sessions belong on
+//! the stream/WebSocket path.
 //!
 //! Route registrations are stored in a shared `RouteRegistry` that the
 //! `WagiService` (axum HTTP server) reads on every request. Because Cap'n
