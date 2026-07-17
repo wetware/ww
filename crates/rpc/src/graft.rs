@@ -31,7 +31,7 @@ use membrane::routing_capnp;
 use membrane::system_capnp;
 
 use super::NetworkState;
-use crate::synapse_abi::{write_owned_synapse, write_placeholder_synapse, OwnedSynapse};
+use crate::synapse_abi::{write_owned_synapse, OwnedSynapse};
 
 // ---------------------------------------------------------------------------
 // EpochGuardedIdentity — host-side node identity hub
@@ -363,8 +363,13 @@ impl GraftBuilder for HostGraftBuilder {
         for (i, (name, client)) in entries.iter().enumerate() {
             let mut entry = caps_builder.reborrow().get(i as u32);
             entry.set_name(name);
-            let _ = client;
-            write_placeholder_synapse(entry.init_synapse(), *name);
+            let synapse = OwnedSynapse {
+                display_name: name.to_string(),
+                interface_id: 0,
+                schema_cid: String::new(),
+                invokable: capnp::capability::FromClientHook::new(client.clone().hook),
+            };
+            write_owned_synapse(entry.init_synapse(), &synapse);
         }
 
         let offset = entries.len();
