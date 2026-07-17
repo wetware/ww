@@ -29,8 +29,9 @@ interface VatClient {
 }
 ```
 
-`VatListener.serve` registers an already-existing Synapse. It does not spawn
-cells. Publisher lifecycle is owned by the publisher that created the capability.
+`VatListener.serve` publishes an already-existing Synapse. It does not spawn
+cells and it does not install a per-request handler. Publisher lifecycle is
+owned by the publisher that created the capability.
 
 `VatClient.dial` opens `/ww/<version>/vat/<protocol>` and returns the remote
 bootstrap Synapse.
@@ -55,3 +56,13 @@ HTTP and stream listeners remain byte adapters. They still spawn cells per
 request or stream because their job is to bridge external byte protocols into
 WASI processes. Stream cells can receive explicit capability grants just like
 HTTP cells.
+
+HTTP/WAGI is intentionally the stateless request/response adapter. Long-lived
+browser-facing sessions belong on the stream/WebSocket path, and
+Wetware-native stateful services belong on vat RPC.
+
+## Naming Guidance
+
+Use `host :serve-vat` language as "publish an existing capability" rather than
+"listen with a vat cell" or "register a vat handler." The service name is the
+routing key; the served capability is the service object.
