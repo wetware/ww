@@ -137,18 +137,18 @@ The consumer discovers the oracle provider via DHT, dials it with
 
 ```
 ORACLE NODE:                            CURL CLIENT:
-  glia/register.glia mounts cell on     curl http://localhost:2080/oracle
-  two transports (vat + http)              |
+  glia/register.glia publishes vat      curl http://localhost:2080/oracle
+  service + HTTP/WAGI adapter              |
                                            v
   HttpListener accepts     <---HTTP---  axum server
-  spawns cell (http mode)               routes by prefix
+  spawns WAGI cell per request          routes by prefix
     membrane.graft()                       |
     http_client.get(blocknative)           v
     build JSON response                 CGI response -> JSON
     write to stdout
 
                                         CONSUMER NODE:
-  VatListener serves       <--libp2p--  vat_client.dial(oracle, "oracle")
+  VatListener publishes    <--libp2p--  vat_client.dial(oracle, "oracle")
   persistent PriceOracle cap            bootstrap --> PriceOracle cap
                                         oracle.get_pairs() -> ["ETH/gas", ...]
                                         oracle.get_price("ETH/gas")
@@ -182,6 +182,20 @@ The same binary serves all modes. Detection:
   (records expire).
 - **Consumer mode**: discovers oracle providers via DHT, dials them
   with `VatClient`, queries prices. Exponential backoff (2 s to 60 s).
+
+### Transport lifecycle boundary
+
+The example intentionally keeps HTTP boring. The vat capability is the
+long-lived service object: it owns in-process cache, RPC ordering, and
+service identity. `host :serve-vat` publishes that already-exported
+capability under a service name; it does not install a per-request
+handler.
+
+The HTTP/WAGI path is a per-request adapter. `HttpListener` spawns a
+fresh CGI/WAGI cell for each matching request, so HTTP should not be
+treated as the primary stateful service runtime. For browser-facing
+long-lived sessions, use the stream/WebSocket path. For Wetware-native
+stateful services, use vat RPC.
 
 ### Schema
 
@@ -232,8 +246,8 @@ RPC. Confidence decays toward 0.0 if data goes stale.
 ```
 
 The host registration forms split by transport:
-- `:serve-vat` publishes an exported capability over named vat RPC
-- Cell + path → HttpListener (WAGI at the given prefix)
+- `:serve-vat` publishes an already-exported capability over named vat RPC
+- Cell + path -> HttpListener, which runs WAGI at the prefix per request
 
 The same binary handles both transports. It detects HTTP mode via
 the `REQUEST_METHOD` CGI env var (injected by HttpListener).

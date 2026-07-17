@@ -12,6 +12,8 @@ HTTP interop for wetware using WAGI (WebAssembly Gateway Interface), CGI
 for WASM. The host parses HTTP, injects request metadata as environment
 variables (RFC 3875), pipes the request body to stdin, and reads a
 CGI-formatted response from stdout. Fresh cell per request. Stateless.
+This is infrastructure interop, not Wetware's primary stateful service
+model.
 
 All HTTP capabilities are epoch-scoped and follow wetware's
 zero-ambient-authority model.
@@ -19,6 +21,14 @@ zero-ambient-authority model.
 ## The Spec
 
 **There is only WAGI. If 5ms startup is too slow, use WebSockets.**
+
+### Lifecycle boundary
+
+WAGI remains a per-request adapter. Do not add FastCGI, ASGI, session
+affinity, or a second stateful HTTP runtime to make WAGI behave like a
+server process. If an HTTP-facing workload needs a long-lived client
+session, use the stream/WebSocket path. If a Wetware-native workload
+needs a long-lived service identity, publish a capability with vat RPC.
 
 ### WAGI (request/response)
 
