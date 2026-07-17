@@ -259,12 +259,8 @@ pub fn match_pattern(pattern: &Pattern, value: &Val) -> Option<Bindings> {
 
             let mut bindings = Vec::new();
             for (key, pat) in pat_pairs {
-                match m.get(key) {
-                    Some(val) => {
-                        bindings.extend(match_pattern(pat, val)?);
-                    }
-                    None => return None, // Required key missing
-                }
+                let val = m.get(key)?;
+                bindings.extend(match_pattern(pat, val)?);
             }
             Some(bindings)
         }

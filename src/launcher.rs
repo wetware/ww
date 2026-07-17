@@ -531,7 +531,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
         let mh = cid::multihash::Multihash::<64>::wrap(0x1e, digest.as_bytes())
             .expect("valid blake3 multihash");
         let cid = cid::Cid::new_v1(0x55, mh); // 0x55 is raw codec
-        results.get().set_cid(&cid.to_string());
+        results.get().set_cid(cid.to_string());
         Promise::ok(())
     }
 }
