@@ -242,7 +242,7 @@ jobs:
     - name: Test WASM components
       run: make test-wasm
 
-    - uses: actions/upload-artifact@v5
+    - uses: actions/upload-artifact@v7
       with:
         name: wasm-artifacts
         path: |
@@ -300,7 +300,7 @@ jobs:
       with:
         submodules: recursive
 
-    - uses: actions/download-artifact@v5
+    - uses: actions/download-artifact@v8
       with:
         name: wasm-artifacts
 
@@ -343,7 +343,7 @@ jobs:
       if: ${{ matrix.install_musl }}
       run: file ${{ matrix.bin_path }}/ww | grep -qE "static(ally|-pie) linked"
 
-    - uses: actions/upload-artifact@v5
+    - uses: actions/upload-artifact@v7
       with:
         name: ${{ matrix.artifact }}
         path: ${{ matrix.bin_path }}/ww
@@ -365,12 +365,12 @@ jobs:
     steps:
     - uses: actions/checkout@v5
 
-    - uses: actions/download-artifact@v5
+    - uses: actions/download-artifact@v8
       with:
         name: ww-linux-musl-x86_64
         path: deploy-context
 
-    - uses: actions/download-artifact@v5
+    - uses: actions/download-artifact@v8
       with:
         name: wasm-artifacts
         path: deploy-context/wasm
@@ -487,31 +487,31 @@ jobs:
       with:
         submodules: recursive
 
-    - uses: actions/download-artifact@v5
+    - uses: actions/download-artifact@v8
       with:
         name: wasm-artifacts
         path: artifacts/wasm-artifacts
 
     # Download binary artifacts (only available when host lane ran)
-    - uses: actions/download-artifact@v5
+    - uses: actions/download-artifact@v8
       if: needs.changes.outputs.host == 'true' || github.event_name == 'workflow_dispatch'
       with:
         name: ww-linux-x86_64
         path: artifacts/ww-linux-x86_64
 
-    - uses: actions/download-artifact@v5
+    - uses: actions/download-artifact@v8
       if: needs.changes.outputs.host == 'true' || github.event_name == 'workflow_dispatch'
       with:
         name: ww-linux-aarch64
         path: artifacts/ww-linux-aarch64
 
-    - uses: actions/download-artifact@v5
+    - uses: actions/download-artifact@v8
       if: needs.changes.outputs.host == 'true' || github.event_name == 'workflow_dispatch'
       with:
         name: ww-macos-aarch64
         path: artifacts/ww-macos-aarch64
 
-    - uses: actions/download-artifact@v5
+    - uses: actions/download-artifact@v8
       if: needs.changes.outputs.host == 'true' || github.event_name == 'workflow_dispatch'
       with:
         name: ww-macos-x86_64
