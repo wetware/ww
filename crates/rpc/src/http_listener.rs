@@ -111,13 +111,19 @@ async fn dispatch_loop(
 ) {
     // Fetch the cell's CID for provenance headers.
     let cell_cid = match executor.cid_request().send().promise.await {
-        Ok(resp) => {
-            if let Ok(reader) = resp.get().unwrap().get_cid() {
-                reader.to_str().unwrap_or("unknown").to_string()
-            } else {
+        Ok(resp) => match resp.get().and_then(|reader| reader.get_cid()) {
+            Ok(reader) => match reader.to_str() {
+                Ok(cid) => cid.to_string(),
+                Err(e) => {
+                    tracing::warn!("failed to decode cell CID: {e}");
+                    "unknown".to_string()
+                }
+            },
+            Err(e) => {
+                tracing::warn!("failed to read cell CID response: {e}");
                 "unknown".to_string()
             }
-        }
+        },
         Err(e) => {
             tracing::warn!("failed to fetch cell CID: {e}");
             "unknown".to_string()
@@ -131,7 +137,9 @@ async fn dispatch_loop(
         // Handle each request concurrently.
         tokio::task::spawn_local(async move {
             let mut response = handle_one_request(&executor, &caps, &req).await;
-            response.headers.push(("X-Wetware-Cell".to_string(), cell_cid));
+            response
+                .headers
+                .push(("X-Wetware-Cell".to_string(), cell_cid));
             let _ = req.response_tx.send(response);
         });
     }
