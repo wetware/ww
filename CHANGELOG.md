@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Glia resumable-effects handler semantics are locked in with tests + docs.** Added focused tests pinning the algebraic-effects contract — abort-on-return (body after `perform` is skipped), exact-site resume inside a larger expression, one-shot resume, handler-forwarding-skips-self, fail-closed structured `Val::Effect` carrier for unhandled effects, async-native-handler resume, and the dynamic (invocation-time) handler-stack rule for closures/macros. Rewrote `doc/designs/glia-effects.md` to present these as test-backed guarantees plus explicit non-goals (no persisted stacks, no cross-peer continuations, no multi-shot) and corrected stale `with-handler` API references. No runtime behavior change.
+
+### Changed
 - **Vat and WAGI service boundaries are documented more explicitly.** Clarified that vat RPC is the long-lived stateful service surface, HTTP/WAGI is a stateless per-request adapter, and `host :serve-vat` publishes an already-exported capability rather than installing a per-request handler.
 - **Public capability boundaries now use the Synapse ABI.** Added the `synapse.capnp` capability currency and descriptor validation, changed membrane exports, process bootstrap, vat serve/dial, stdio serve, graft, and HTTP/stream forwarding to carry `Synapse`, and preserved Glia's effect-handler interception before backend capability invocation.
 - **CI IPFS release publishing now manages release pin retention.** The publish job adds release trees with implicit Kubo pinning disabled, explicitly pins the new release CID before publishing `ww-release` IPNS, tracks only CI-owned release CIDs in `/data/ipfs/ww-release-pins.txt`, retains the latest 10 releases for rollback, and prunes/gc's stale managed pins after IPNS has moved. Local Makefile publish targets now use `ipfs add --pin=false` and pin explicitly only for durable publishes.

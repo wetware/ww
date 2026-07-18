@@ -5944,6 +5944,108 @@ mod tests {
         assert_eq!(result, Ok(Val::Int(100)));
     }
 
+    // =========================================================================
+    // G1 — resumable-effects semantics lock-in
+    //
+    // These tests pin down the observable guarantees the resumable-effects
+    // model depends on. They assert existing behavior; they must not require
+    // any runtime change.
+    // =========================================================================
+
+    #[test]
+    fn abort_without_resume_skips_body_after_perform() {
+        // A handler that returns WITHOUT calling `resume` aborts the suspended
+        // body: the code *after* the `perform` never runs. We make that
+        // observable with a second, distinct effect that would only fire if
+        // execution continued past the first `perform`.
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(with-effect-handler :probe (fn [d] :probe-ran)
+               (with-effect-handler :abort (fn [d] :aborted)
+                 (do (perform :abort 0) (perform :probe 0))))",
+            &mut env,
+            &d,
+        );
+        // If the body were resumed, (perform :probe 0) would run and the result
+        // would be :probe-ran. Because the :abort handler never resumes, the
+        // do-block is discarded and we get the handler's value instead.
+        assert_eq!(result, Ok(Val::Keyword("aborted".into())));
+    }
+
+    #[test]
+    fn resume_continues_at_exact_perform_site_in_nested_expr() {
+        // `resume` returns control to the precise position of the `perform`
+        // inside a larger expression: the surrounding arithmetic sees the
+        // resumed value in place. (+ 1 (* 10 (perform :x 0))) with resume 5
+        // must evaluate as (+ 1 (* 10 5)) = 51.
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(with-effect-handler :x (fn [d resume] (resume 5)) (+ 1 (* 10 (perform :x 0))))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Int(51)));
+    }
+
+    #[test]
+    fn handler_reperform_same_effect_forwards_to_next_outer_handler() {
+        // Handler forwarding: a handler frame is popped before it runs, so a
+        // handler that re-performs the *same* effect reaches the NEXT outer
+        // handler rather than recursing into itself (which would loop forever).
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(with-effect-handler :log (fn [d] :outer)
+               (with-effect-handler :log (fn [d] (perform :log d))
+                 (perform :log 0)))",
+            &mut env,
+            &d,
+        );
+        // Inner handler catches :log, re-performs :log; because its own frame
+        // is already popped, the re-perform lands on the outer handler → :outer.
+        assert_eq!(result, Ok(Val::Keyword("outer".into())));
+    }
+
+    #[test]
+    fn async_native_handler_resumes_body() {
+        // An async native handler that calls the provided `resume` continuation
+        // must resume the suspended body with the sent value, exactly like a
+        // synchronous handler. (+ 10 (perform :inc 41)) with resume(41+1) = 52.
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set(
+            "async-resume".into(),
+            Val::AsyncNativeFn {
+                name: "async-resume".into(),
+                func: Rc::new(|args: Vec<Val>| {
+                    let data = args[0].clone();
+                    let resume = args[1].clone();
+                    Box::pin(async move {
+                        if let Val::NativeFn { func, .. } = &resume {
+                            let next = match data {
+                                Val::Int(n) => Val::Int(n + 1),
+                                other => other,
+                            };
+                            // Returns Err(Val::Resume(..)); the handler state
+                            // machine translates that into a body resume.
+                            func(&[next])
+                        } else {
+                            Err(Val::from("async-resume: bad resume".to_string()))
+                        }
+                    })
+                }),
+            },
+        );
+        let result = eval_str(
+            "(with-effect-handler :inc async-resume (+ 10 (perform :inc 41)))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Int(52)));
+    }
+
     #[test]
     fn native_fn_display() {
         let nf = Val::NativeFn {
@@ -6407,6 +6509,27 @@ mod tests {
             &d,
         );
         assert_eq!(result, Ok(Val::Keyword("handled".into())));
+    }
+
+    #[test]
+    fn unhandled_cap_effect_fails_closed_with_structured_carrier() {
+        // An unhandled capability-targeted effect must fail CLOSED and surface a
+        // structured effect carrier (Val::Effect), never a plain string. This is
+        // what lets outer callers pattern-match / unwrap the failure instead of
+        // string-scraping.
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let cap = make_test_cap("executor", 1);
+        env.set("my-cap".into(), cap);
+        let result = eval_str("(perform my-cap :run 42)", &mut env, &d);
+        match result {
+            Err(Val::Effect { effect_type, data }) => {
+                assert_eq!(effect_type, "cap:executor");
+                // The carrier retains the effect payload as structured data.
+                assert!(matches!(*data, Val::List(_)));
+            }
+            other => panic!("expected structured Val::Effect carrier, got {other:?}"),
+        }
     }
 
     #[test]
