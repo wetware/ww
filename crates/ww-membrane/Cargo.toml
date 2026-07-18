@@ -1,0 +1,16 @@
+[package]
+name = "ww-membrane"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+capnp = { workspace = true }
+
+[build-dependencies]
+capnpc = { workspace = true }
+
+[dev-dependencies]
+capnp-rpc = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "sync"] }
+tokio-util = { workspace = true, features = ["compat"] }

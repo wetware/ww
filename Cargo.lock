@@ -8211,6 +8211,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ww-membrane"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnp-rpc",
+ "capnpc",
+ "futures",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "wyz"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
