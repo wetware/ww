@@ -8,13 +8,9 @@
 **Priority:** P0
 **Depends on:** serve-only vat transport cutover
 
-## Glia lexical/isolate confinement design review
-**What:** Revisit Glia `def`, dynamic handler stacks, lexical scope, and `isolate` return semantics before tightening confinement further. Add tests for returning capabilities from `isolate`, including whether their methods remain self-contained without ambient outer handlers.
-**Why:** Serve-only publication makes "construct a narrow cap, then serve it" a core workflow. `isolate` appears to have the right general shape, but the exported-cap use case needs explicit semantics and tests before documentation promises it.
-**Context:** Run a separate office-hours/design pass. Balance E-style object-capability purity with Glia/Clojure ergonomics; avoid mixing this into vat transport. Tracking: #549.
-**Effort:** M
-**Priority:** P1
-**Depends on:** serve-only vat transport cutover
+## Reconsider a lightweight in-process isolation/attenuation primitive (ex-`isolate`)
+**What:** `isolate` was removed 2026-07 (weak isolation-vs-attenuation separation; confinement leak unfixable under dynamic effect scope). Revisit only if a concrete need arises that neither the capnp membrane (attenuation) nor a spawned cell (isolation) serves, and only with membrane-backed cap authority (a cap carries its granted authority explicitly, independent of definition-site and call-site handler stacks).
+**Priority:** P3
 
 ## AutoNAT v2: expose per-address reachability (follow-up after node-level parity)
 **What:** Extend runtime network state to expose per-address reachability outcomes from AutoNAT v2 probes, instead of only the node-level `NatReachability` enum.
