@@ -25,11 +25,6 @@ pub mod system_capnp {
     include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
 }
 
-#[allow(unused_parens, clippy::match_single_binding)]
-pub mod synapse_capnp {
-    include!(concat!(env!("OUT_DIR"), "/synapse_capnp.rs"));
-}
-
 #[allow(
     unused_parens,
     clippy::extra_unused_type_parameters,
@@ -776,8 +771,7 @@ pub fn get_graft_cap<T: capnp::capability::FromClientHook>(
             .to_str()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         if n == name {
-            let invokable = entry.get_synapse()?.get_invokable()?;
-            return Ok(T::new(invokable.client.hook));
+            return entry.get_cap().get_as_capability::<T>();
         }
     }
     Err(capnp::Error::failed(format!(

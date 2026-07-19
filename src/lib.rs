@@ -44,7 +44,6 @@ pub use membrane::routing_capnp;
 #[cfg(not(target_arch = "wasm32"))]
 pub use membrane::stem_capnp;
 #[cfg(not(target_arch = "wasm32"))]
-pub use membrane::synapse_capnp;
 #[cfg(not(target_arch = "wasm32"))]
 pub use membrane::system_capnp;
 

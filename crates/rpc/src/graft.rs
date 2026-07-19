@@ -31,7 +31,6 @@ use membrane::routing_capnp;
 use membrane::system_capnp;
 
 use super::NetworkState;
-use crate::synapse_abi::{write_owned_synapse, OwnedSynapse};
 
 // ---------------------------------------------------------------------------
 // EpochGuardedIdentity — host-side node identity hub
@@ -248,8 +247,8 @@ pub struct HostGraftBuilder {
     /// Pre-created Runtime client (singleton — same backend for every graft).
     runtime_client: system_capnp::runtime::Client,
     /// Named capabilities from init.d `with` blocks, forwarded to the child
-    /// cell's graft response as Synapse exports.
-    extras: Vec<(String, OwnedSynapse)>,
+    /// cell's graft response as `Export { name, cap }` entries.
+    extras: Vec<(String, capnp::capability::Client)>,
     /// IPFS HTTP client for Kubo API calls (e.g. IPNS resolution).
     ipfs_client: ipfs::HttpClient,
 }
@@ -288,7 +287,7 @@ impl HostGraftBuilder {
 
     /// Set named capabilities from init.d `with` block to inject into graft.
     ///
-    pub fn with_extras(mut self, extras: Vec<(String, OwnedSynapse)>) -> Self {
+    pub fn with_extras(mut self, extras: Vec<(String, capnp::capability::Client)>) -> Self {
         self.extras = extras;
         self
     }
@@ -351,10 +350,10 @@ impl GraftBuilder for HostGraftBuilder {
         }
 
         // Append init.d-scoped extras.
-        let extras_owned: Vec<(String, OwnedSynapse)> = self
+        let extras_owned: Vec<(String, capnp::capability::Client)> = self
             .extras
             .iter()
-            .map(|(name, synapse)| (name.clone(), synapse.clone()))
+            .map(|(name, client)| (name.clone(), client.clone()))
             .collect();
 
         let count = (entries.len() + extras_owned.len()) as u32;
@@ -363,20 +362,14 @@ impl GraftBuilder for HostGraftBuilder {
         for (i, (name, client)) in entries.iter().enumerate() {
             let mut entry = caps_builder.reborrow().get(i as u32);
             entry.set_name(name);
-            let synapse = OwnedSynapse {
-                display_name: name.to_string(),
-                interface_id: 0,
-                schema_cid: String::new(),
-                invokable: capnp::capability::FromClientHook::new(client.clone().hook),
-            };
-            write_owned_synapse(entry.init_synapse(), &synapse);
+            entry.init_cap().set_as_capability(client.clone().hook);
         }
 
         let offset = entries.len();
-        for (i, (name, synapse)) in extras_owned.iter().enumerate() {
+        for (i, (name, client)) in extras_owned.iter().enumerate() {
             let mut entry = caps_builder.reborrow().get((offset + i) as u32);
             entry.set_name(name);
-            write_owned_synapse(entry.init_synapse(), synapse);
+            entry.init_cap().set_as_capability(client.clone().hook);
         }
 
         Ok(())
@@ -422,7 +415,7 @@ pub fn build_membrane_rpc<R, W>(
     stream_control: libp2p_stream::Control,
     route_registry: Option<crate::dispatch::RouteRegistry>,
     runtime_client: system_capnp::runtime::Client,
-    extras: Vec<(String, OwnedSynapse)>,
+    extras: Vec<(String, capnp::capability::Client)>,
     ipfs_client: ipfs::HttpClient,
     http_dial: Vec<String>,
 ) -> (RpcSystem<Side>, GuestMembrane)

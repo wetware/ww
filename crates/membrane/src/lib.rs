@@ -11,11 +11,6 @@ pub mod system_capnp {
 }
 
 #[allow(unused_parens, clippy::match_single_binding)]
-pub mod synapse_capnp {
-    include!(concat!(env!("OUT_DIR"), "/capnp/synapse_capnp.rs"));
-}
-
-#[allow(unused_parens, clippy::match_single_binding)]
 pub mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/capnp/routing_capnp.rs"));
 }
@@ -53,7 +48,7 @@ pub mod http_capnp {
 }
 
 /// Canonical Schema.Node bytes for each grafted capability interface.
-/// These are descriptor inputs for lifted Synapses, not sidecar authority.
+/// These back the `schema`/`doc`/`help` introspection builtins, not authority.
 pub mod schema_registry {
     include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
@@ -160,13 +155,17 @@ pub mod schema_registry {
         #[test]
         fn core_cap_schema_cids_are_stable() {
             // CID snapshots guard against accidental protocol drift.
+            // Re-pinned for the Export/Synapse cutover: Host.network() and the
+            // Runtime→Executor→Process.bootstrap chain now carry bare
+            // `Capability` (was `Synapse`), so those two interfaces' canonical
+            // schema nodes changed. ROUTING/IDENTITY/HTTP_CLIENT are unchanged.
             assert_eq!(
                 HOST_CID,
-                "bafkr4ie7d2lzj7ktjj5j5jmampbskj6wqi4hssa37ccgwtvxe5euxkbday"
+                "bafkr4ic7cpeyps4vztynjvnyygid47przo5aqtkgjswb5ns4yoqiox4pnu"
             );
             assert_eq!(
                 RUNTIME_CID,
-                "bafkr4ifljlnaebne6hrnoxgzzlnuxcynbxn6hr6ebcoip455vn4sfdzoqm"
+                "bafkr4idvcyjadh3aefmdcis7ejmbi7jevfyutk7ifj7o3pi2tmfyrgcglm"
             );
             assert_eq!(
                 ROUTING_CID,

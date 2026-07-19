@@ -10,7 +10,6 @@ members = [
     "crates/rpc",
     "crates/ww-membrane",
     "crates/schema-id",
-    "crates/synapse",
     "crates/stem",
     "crates/guest/auth",
     "std/system",
@@ -103,7 +102,6 @@ stem = { path = "crates/stem" }
 cache = { package = "ww-cache", path = "crates/cache" }
 cell = { path = "crates/cell" }
 rpc = { path = "crates/rpc" }
-synapse = { path = "crates/synapse" }
 caps = { path = "std/caps" }
 blake3 = { workspace = true }
 cid = { workspace = true }

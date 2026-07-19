@@ -10,7 +10,6 @@ fn main() {
         // Tell capnpc that schema.capnp types live in the `capnp` crate.
         .crate_provides("capnp", [0xa93fc509624c72d9])
         .file(capnp_dir.join("system.capnp"))
-        .file(capnp_dir.join("synapse.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("auth.capnp"))
         .file(capnp_dir.join("membrane.capnp"))
@@ -21,9 +20,9 @@ fn main() {
         .expect("capnp compile schemas");
 
     // Extract canonical Schema.Node bytes for the capability interfaces
-    // grafted by MembraneServer. These bytes feed Synapse descriptors.
-    // Type IDs are stable across renames; see the capnp `@0x...`
-    // annotations on each interface.
+    // grafted by MembraneServer. These bytes back the `schema`/`doc`/`help`
+    // introspection builtins. Type IDs are stable across renames; see the
+    // capnp `@0x...` annotations on each interface.
     let schemas = schema_id::extract_schemas(
         &raw_request,
         &[
@@ -39,9 +38,7 @@ fn main() {
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
-    for schema in &[
-        "system", "synapse", "routing", "auth", "membrane", "stem", "http",
-    ] {
+    for schema in &["system", "routing", "auth", "membrane", "stem", "http"] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()

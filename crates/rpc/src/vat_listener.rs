@@ -19,8 +19,6 @@ use membrane::EpochGuard;
 
 use membrane::system_capnp;
 
-use crate::synapse_abi::{read_owned_synapse, BootstrapServer, OwnedSynapse};
-
 pub struct VatListenerImpl {
     stream_control: libp2p_stream::Control,
     guard: EpochGuard,
@@ -45,8 +43,9 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
         pry!(self.guard.check());
 
         let params = pry!(params.get());
-        let bootstrap_synapse: OwnedSynapse =
-            pry!(params.get_synapse().and_then(read_owned_synapse));
+        let bootstrap_cap = pry!(params
+            .get_cap()
+            .get_as_capability::<capnp::capability::Client>());
         let protocol = pry!(pry!(params.get_protocol())
             .to_str()
             .map_err(|e| capnp::Error::failed(e.to_string())));
@@ -84,14 +83,14 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                             service = %protocol_name,
                         ).entered();
                         tracing::debug!("incoming vat connection");
-                        let synapse = bootstrap_synapse.clone();
+                        let cap = bootstrap_cap.clone();
                         let protocol = protocol_name.clone();
                         tokio::task::spawn_local(async move {
                             let _handle_span = tracing::info_span!(
                                 "vat.handle",
                                 service = protocol.as_str(),
                             ).entered();
-                            if let Err(e) = handle_vat_connection_serve(synapse, stream, &protocol).await {
+                            if let Err(e) = handle_vat_connection_serve(cap, stream, &protocol).await {
                                 tracing::error!("vat service connection error: {e}");
                             }
                         });
@@ -117,15 +116,13 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
 ///
 /// Generic over stream type for testability.
 pub async fn handle_vat_connection_serve(
-    bootstrap_synapse: OwnedSynapse,
+    bootstrap_cap: capnp::capability::Client,
     stream: impl AsyncRead + AsyncWrite + 'static,
     protocol: &str,
 ) -> Result<(), capnp::Error> {
     let (reader, writer) = Box::pin(stream).split();
     let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
-    let bootstrap: membrane::synapse_capnp::bootstrap::Client =
-        capnp_rpc::new_client(BootstrapServer::new(bootstrap_synapse));
-    let peer_rpc = RpcSystem::new(Box::new(network), Some(bootstrap.client));
+    let peer_rpc = RpcSystem::new(Box::new(network), Some(bootstrap_cap));
 
     let _ = peer_rpc.await;
     tracing::debug!(protocol, "vat peer disconnected");

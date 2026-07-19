@@ -23,7 +23,6 @@ use crate::host::SwarmCommand;
 use crate::services::CompileRequest;
 use crate::system_capnp;
 use cell::proc::{Builder as ProcBuilder, FuelEstimator};
-use rpc::synapse_abi::{read_owned_synapse, OwnedSynapse};
 use rpc::{
     build_peer_rpc, graft, ByteStreamImpl, CachePolicy, NetworkState, ProcessImpl, StreamMode,
 };
@@ -359,13 +358,16 @@ impl system_capnp::executor::Server for ExecutorImpl {
 
         // Read optional Synapse caps from spawn request (forwarded from init.d
         // `with` blocks) and preserve them for the child graft response.
-        let extra_caps: Vec<(String, OwnedSynapse)> = {
+        let extra_caps: Vec<(String, capnp::capability::Client)> = {
             let mut caps_vec = Vec::new();
             if let Ok(caps_reader) = params.get_caps() {
                 for entry in caps_reader.iter() {
                     if let Ok(name) = entry.get_name().map(|n| n.to_string().unwrap_or_default()) {
-                        if let Ok(synapse) = entry.get_synapse().and_then(read_owned_synapse) {
-                            caps_vec.push((name, synapse));
+                        if let Ok(cap) = entry
+                            .get_cap()
+                            .get_as_capability::<capnp::capability::Client>()
+                        {
+                            caps_vec.push((name, cap));
                         }
                     }
                 }

@@ -110,7 +110,11 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
                 let mut caps_builder = listen_req.get().init_caps(1);
                 let mut entry = caps_builder.reborrow().get(0);
                 entry.set_name("test-extra");
-                ww::rpc::synapse_abi::write_placeholder_synapse(entry.init_synapse(), "test-extra");
+                // Any capability works here; the test asserts a non-empty caps
+                // list is accepted, not the cap's identity.
+                entry
+                    .init_cap()
+                    .set_as_capability(listener.client.clone().hook);
             }
             listen_req
                 .send()

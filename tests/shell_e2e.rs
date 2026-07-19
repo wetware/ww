@@ -92,11 +92,9 @@ async fn spawn_shell_on_pool(pool: &ExecutorPool) -> Result<shell_capnp::shell::
                         let cap = resp
                             .get()
                             .unwrap()
-                            .get_synapse()
-                            .unwrap()
-                            .get_invokable()
-                            .unwrap()
-                            .client;
+                            .get_cap()
+                            .get_as_capability::<capnp::capability::Client>()
+                            .unwrap();
                         eprintln!("  [worker] got bootstrap cap, bridging to duplex");
 
                         let (reader, writer) = tokio::io::split(cell_end);

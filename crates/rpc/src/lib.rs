@@ -12,7 +12,6 @@ pub mod keys;
 pub mod routing;
 pub mod stream_dialer;
 pub mod stream_listener;
-pub mod synapse_abi;
 pub mod vat_client;
 pub mod vat_dial;
 pub mod vat_listener;
@@ -431,13 +430,7 @@ impl system_capnp::process::Server for ProcessImpl {
                     "process did not export a bootstrap capability via system::serve()".into(),
                 )
             })?;
-            let synapse = crate::synapse_abi::OwnedSynapse {
-                display_name: "process-bootstrap".into(),
-                interface_id: 0,
-                schema_cid: String::new(),
-                invokable: capnp::capability::FromClientHook::new(cap.hook),
-            };
-            crate::synapse_abi::write_owned_synapse(results.get().init_synapse(), &synapse);
+            results.get().init_cap().set_as_capability(cap.hook);
             Ok(())
         })
     }
@@ -647,8 +640,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::synapse_abi::write_placeholder_synapse;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    /// A throwaway capability for tests that exercise protocol/validation logic
+    /// where the specific cap does not matter (Export now carries a bare cap).
+    fn placeholder_cap() -> capnp::capability::Client {
+        let (a, _b) = io::duplex(64);
+        let bs: system_capnp::byte_stream::Client =
+            capnp_rpc::new_client(ByteStreamImpl::new(a, StreamMode::WriteOnly));
+        bs.client
+    }
 
     /// Helper: spin up server + client over in-memory duplex, return Host client.
     fn setup_rpc() -> (
@@ -957,20 +958,14 @@ mod tests {
                 );
                 let process = setup_process_rpc(process_impl);
 
-                // Call bootstrap() — public shape is now Synapse.
+                // Call bootstrap() — returns the exported capability directly.
                 let resp = process.bootstrap_request().send().promise.await.unwrap();
-                let synapse = resp.get().unwrap().get_synapse().unwrap();
-                assert_eq!(
-                    synapse
-                        .get_descriptor()
-                        .unwrap()
-                        .get_display_name()
-                        .unwrap()
-                        .to_str()
-                        .unwrap(),
-                    "process-bootstrap"
-                );
-                synapse.get_invokable().unwrap();
+                // bootstrap now returns the exported capability directly.
+                resp.get()
+                    .unwrap()
+                    .get_cap()
+                    .get_as_capability::<capnp::capability::Client>()
+                    .unwrap();
             })
             .await;
     }
@@ -989,7 +984,7 @@ mod tests {
                 assert!(
                     result.is_err() || {
                         let resp = result.unwrap();
-                        // The error may come from reading a missing Synapse,
+                        // The error may come from a missing exported capability,
                         // or from the server returning an error in the response.
                         resp.get().is_err()
                     }
@@ -1019,8 +1014,11 @@ mod tests {
                 // Call bootstrap() twice — both should return working caps.
                 for _ in 0..2 {
                     let resp = process.bootstrap_request().send().promise.await.unwrap();
-                    let synapse = resp.get().unwrap().get_synapse().unwrap();
-                    synapse.get_invokable().unwrap();
+                    resp.get()
+                        .unwrap()
+                        .get_cap()
+                        .get_as_capability::<capnp::capability::Client>()
+                        .unwrap();
                 }
             })
             .await;
@@ -1060,8 +1058,11 @@ mod tests {
 
                 // Call bootstrap() immediately — the cap hasn't resolved yet.
                 let resp = process.bootstrap_request().send().promise.await.unwrap();
-                let synapse = resp.get().unwrap().get_synapse().unwrap();
-                synapse.get_invokable().unwrap();
+                resp.get()
+                    .unwrap()
+                    .get_cap()
+                    .get_as_capability::<capnp::capability::Client>()
+                    .unwrap();
             })
             .await;
     }
@@ -1199,7 +1200,7 @@ mod tests {
                 // 1. Create a Host cap (the "cell's exported cap").
                 let (host, _server, _rx) = setup_rpc();
 
-                // 2. Bridge the internal cap directly; public bootstrap now carries Synapse.
+                // 2. Bridge the internal cap directly; public bootstrap carries the cap.
                 let bootstrap_cap = host.client.clone();
 
                 // 3. Bridge: serve it over a duplex (simulates the libp2p stream bridge).
@@ -1331,7 +1332,9 @@ mod tests {
                     capnp_rpc::new_client(listener_impl);
 
                 let mut req = listener.serve_request();
-                write_placeholder_synapse(req.get().init_synapse(), "host");
+                req.get()
+                    .init_cap()
+                    .set_as_capability(placeholder_cap().hook);
                 req.get().set_protocol("");
 
                 let result = req.send().promise.await;
@@ -1402,7 +1405,9 @@ mod tests {
                 .unwrap();
 
                 let mut req = listener.serve_request();
-                write_placeholder_synapse(req.get().init_synapse(), "host");
+                req.get()
+                    .init_cap()
+                    .set_as_capability(placeholder_cap().hook);
                 req.get().set_protocol("greeter");
 
                 let result = req.send().promise.await;
@@ -1461,7 +1466,9 @@ mod tests {
 
                 // First registration should succeed.
                 let mut req1 = client1.serve_request();
-                write_placeholder_synapse(req1.get().init_synapse(), "host");
+                req1.get()
+                    .init_cap()
+                    .set_as_capability(placeholder_cap().hook);
                 req1.get().set_protocol("greeter");
                 req1.send()
                     .promise
@@ -1470,7 +1477,9 @@ mod tests {
 
                 // Second registration with the same service name should fail.
                 let mut req2 = client2.serve_request();
-                write_placeholder_synapse(req2.get().init_synapse(), "host");
+                req2.get()
+                    .init_cap()
+                    .set_as_capability(placeholder_cap().hook);
                 req2.get().set_protocol("greeter");
                 let result = req2.send().promise.await;
                 assert!(
@@ -1496,7 +1505,9 @@ mod tests {
                     capnp_rpc::new_client(listener_impl);
 
                 let mut req = listener.serve_request();
-                write_placeholder_synapse(req.get().init_synapse(), "host");
+                req.get()
+                    .init_cap()
+                    .set_as_capability(placeholder_cap().hook);
                 req.get().set_protocol("greeter");
 
                 let result = req.send().promise.await;
