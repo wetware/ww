@@ -24,6 +24,7 @@ use crate::{membrane, Allowlist, Policy, DENIED_MARKER};
 const PING: u16 = 0;
 const FORBIDDEN: u16 = 1;
 const CHILD: u16 = 2;
+const ECHO: u16 = 3;
 
 fn thing_id() -> u64 {
     thing::Client::TYPE_ID
@@ -66,6 +67,22 @@ impl thing::Server for ThingImpl {
         }));
         std::future::ready(Ok(()))
     }
+
+    /// Calls `forbidden` on the capability handed in as a parameter and echoes
+    /// the result. The backend sees whatever cap actually arrives: if a
+    /// membrane of ours was unwrapped on reentry, this call reaches a bare cap
+    /// and succeeds; if not, it hits the membrane and fails closed.
+    async fn echo(
+        self: CapRc<Self>,
+        params: thing::EchoParams,
+        mut results: thing::EchoResults,
+    ) -> Result<(), Error> {
+        let arg: thing::Client = params.get()?.get_thing()?;
+        let response = arg.forbidden_request().send().promise.await?;
+        let msg = response.get()?.get_msg()?.to_string()?;
+        results.get().set_msg(&msg);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -73,11 +90,12 @@ impl thing::Server for ThingImpl {
 // ---------------------------------------------------------------------------
 
 fn policy() -> Rc<dyn Policy> {
-    // ping + child allowed; forbidden deliberately absent.
+    // ping + child + echo allowed; forbidden deliberately absent.
     Rc::new(
         Allowlist::new()
             .allow(thing_id(), PING)
-            .allow(thing_id(), CHILD),
+            .allow(thing_id(), CHILD)
+            .allow(thing_id(), ECHO),
     )
 }
 
@@ -222,6 +240,40 @@ async fn pipelined_capability_is_rewrapped() {
             .unwrap(),
         "pong-1",
         "pipelined allowed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: dual-membrane reentry (params)
+// ---------------------------------------------------------------------------
+
+/// A membraned cap of ours, handed back in as a call parameter, must be
+/// unwrapped before it reaches the backend — restoring the bare cap the
+/// backend originally exported. Proof: `echo` calls `forbidden` on the param.
+/// `forbidden` is denied *through the membrane*, so if the backend received the
+/// still-membraned cap the call would fail closed. It succeeds with the
+/// backend's real answer, which is only possible if reentry unwrapped it.
+#[tokio::test]
+async fn membraned_param_is_unwrapped_on_reentry() {
+    let m = membraned_local_thing();
+
+    // A membraned child of ours (round-trips through the response rewrap path).
+    let response = m.child_request().send().promise.await.unwrap();
+    let child: thing::Client = response.get().unwrap().get_thing().unwrap();
+    // Sanity: the child really is membraned (forbidden denied when called direct).
+    assert_denied(
+        child.forbidden_request().send().promise.await,
+        "reentry precondition: child forbidden denied directly",
+    );
+
+    // Hand the membraned child back in as a parameter.
+    let mut req = m.echo_request();
+    req.get().set_thing(child);
+    let echoed = req.send().promise.await.unwrap();
+    assert_eq!(
+        echoed.get().unwrap().get_msg().unwrap().to_str().unwrap(),
+        "TOP SECRET",
+        "backend must see the unwrapped bare cap, so its forbidden() succeeds",
     );
 }
 

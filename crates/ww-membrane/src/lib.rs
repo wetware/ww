@@ -268,9 +268,6 @@ fn registry_insert(state: &Rc<MembraneState>) {
 
 /// If `hook` is a live membrane of ours, return its backing state (inner cap +
 /// policy). Returns `None` for any non-membrane hook.
-// Consumed by the dual-membrane reentry/unwrap path (next M3 commit); exercised
-// now by the identity tests.
-#[allow(dead_code)]
 fn membrane_state_of(hook: &dyn ClientHook) -> Option<Rc<MembraneState>> {
     if hook.get_brand() != membrane_brand() {
         return None;
@@ -325,6 +322,8 @@ impl ClientHook for MembraneHook {
         Request::new(Box::new(MembraneRequest {
             inner: inner_request.hook,
             policy: self.state.policy.clone(),
+            message: Builder::new_default(),
+            cap_table: CapTable::new(),
         }))
     }
 
@@ -408,12 +407,26 @@ impl ClientHook for MembraneHook {
 struct MembraneRequest {
     inner: Box<dyn RequestHook>,
     policy: Rc<dyn Policy>,
+    // Params are staged here so the cap table can be transformed on send.
+    message: Builder<HeapAllocator>,
+    cap_table: CapTable,
 }
 
 impl RequestHook for MembraneRequest {
     fn get(&mut self) -> any_pointer::Builder<'_> {
-        // NOTE: params pass into the membrane unwrapped (see module docs / M3).
-        self.inner.get()
+        // Stage params in our own buffer so `send` can transform their cap
+        // table: our own membraned caps that round-trip back in are unwrapped
+        // to their originals (restoring `==` identity and avoiding
+        // double-indirection); foreign caps pass through unchanged.
+        //
+        // Note: this does NOT reverse-wrap foreign inbound caps in a policy of
+        // their own — a param is authority the caller *grants* to the backend,
+        // and attenuating it with this membrane's outbound policy would be
+        // wrong. A full symmetric (two-policy) membrane is a deliberate future
+        // option, not required for the recursion/identity properties here.
+        let mut root: any_pointer::Builder = self.message.get_root().unwrap();
+        root.imbue_mut(&mut self.cap_table);
+        root
     }
 
     fn get_brand(&self) -> usize {
@@ -421,7 +434,38 @@ impl RequestHook for MembraneRequest {
     }
 
     fn send(self: Box<Self>) -> RemotePromise<any_pointer::Owned> {
-        let Self { inner, policy } = *self;
+        let Self {
+            mut inner,
+            policy,
+            message,
+            mut cap_table,
+        } = *self;
+
+        // Unwrap-on-reentry: any staged param cap that is one of our own
+        // membranes is replaced by its inner original; foreign caps are kept.
+        for slot in cap_table.iter_mut() {
+            if let Some(hook) = slot.take() {
+                *slot = Some(match membrane_state_of(&*hook) {
+                    Some(state) => state.inner.add_ref(),
+                    None => hook,
+                });
+            }
+        }
+
+        // Copy the staged params (with the transformed cap table) into the real
+        // request. On copy failure, fail the send closed.
+        let copy = (|| -> capnp::Result<()> {
+            let mut reader: any_pointer::Reader = message.get_root_as_reader()?;
+            reader.imbue(&cap_table);
+            inner.get().set_as(reader)
+        })();
+        if let Err(e) = copy {
+            return RemotePromise {
+                promise: Promise::err(e.clone()),
+                pipeline: any_pointer::Pipeline::new(Box::new(BrokenPipeline { error: e })),
+            };
+        }
+
         let RemotePromise { promise, pipeline } = inner.send();
 
         // Wrap the pipeline hook so promise-pipelined caps stay inside.
