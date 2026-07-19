@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 capnp = { workspace = true }
+futures = { workspace = true }
 
 [build-dependencies]
 capnpc = { workspace = true }
