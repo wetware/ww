@@ -8207,6 +8207,7 @@ dependencies = [
  "capnp",
  "capnp-rpc",
  "capnpc",
+ "criterion",
  "futures",
  "tokio",
  "tokio-util",
