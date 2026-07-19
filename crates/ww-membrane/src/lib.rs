@@ -23,8 +23,8 @@
 //! interior-mutable state; the membrane calls it once per invocation.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use capnp::any_pointer;
@@ -230,15 +230,74 @@ struct MembraneState {
     policy: Rc<dyn Policy>,
 }
 
+// ---------------------------------------------------------------------------
+// Membrane identity (for unwrap-on-reentry, double-wrap avoidance, collapse)
+// ---------------------------------------------------------------------------
+//
+// A capability has no `Any`, so to recognize "this hook is one of my
+// membranes" we use two coordinates:
+//   * `get_brand()` returns MEMBRANE_BRAND — the address of a data-segment
+//     `static`. capnp-rpc connection brands are `self as *const ConnectionState`
+//     (heap) and local/broken hooks use 0, so this value can never collide with
+//     a real connection brand and therefore never makes the RPC layer mistake a
+//     membraned cap for one of its own (which would tunnel through the membrane).
+//   * `get_ptr()` returns the per-membrane `Rc<MembraneState>` address, which a
+//     process-local registry maps back to the live `MembraneState`.
+//
+// Together they let [`membrane_state_of`] downcast an arbitrary hook to its
+// backing membrane without `Any`.
+
+static MEMBRANE_BRAND_ANCHOR: u8 = 0;
+
+fn membrane_brand() -> usize {
+    &MEMBRANE_BRAND_ANCHOR as *const u8 as usize
+}
+
+thread_local! {
+    static REGISTRY: RefCell<HashMap<usize, Weak<MembraneState>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn registry_insert(state: &Rc<MembraneState>) {
+    let key = Rc::as_ptr(state) as *const () as usize;
+    REGISTRY.with(|r| {
+        r.borrow_mut().insert(key, Rc::downgrade(state));
+    });
+}
+
+/// If `hook` is a live membrane of ours, return its backing state (inner cap +
+/// policy). Returns `None` for any non-membrane hook.
+// Consumed by the dual-membrane reentry/unwrap path (next M3 commit); exercised
+// now by the identity tests.
+#[allow(dead_code)]
+fn membrane_state_of(hook: &dyn ClientHook) -> Option<Rc<MembraneState>> {
+    if hook.get_brand() != membrane_brand() {
+        return None;
+    }
+    let key = hook.get_ptr();
+    REGISTRY.with(|r| r.borrow().get(&key).and_then(Weak::upgrade))
+}
+
+impl Drop for MembraneState {
+    fn drop(&mut self) {
+        // Deregister by our own address (the registry key is Rc::as_ptr, which
+        // is the address of this MembraneState).
+        let key = self as *const MembraneState as *const () as usize;
+        REGISTRY.with(|r| {
+            r.borrow_mut().remove(&key);
+        });
+    }
+}
+
 pub struct MembraneHook {
     state: Rc<MembraneState>,
 }
 
 impl MembraneHook {
     pub fn wrap(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
-        Box::new(Self {
-            state: Rc::new(MembraneState { inner, policy }),
-        })
+        let state = Rc::new(MembraneState { inner, policy });
+        registry_insert(&state);
+        Box::new(Self { state })
     }
 }
 
@@ -287,11 +346,14 @@ impl ClientHook for MembraneHook {
     }
 
     fn get_brand(&self) -> usize {
-        // MUST NOT forward the inner brand: the RPC system uses the brand to
-        // recognize its own capabilities and take shortcuts (e.g. reflecting a
-        // cap back over the connection it came from), which would tunnel
-        // straight through the membrane.
-        0
+        // Membrane-unique sentinel (see MEMBRANE_BRAND_ANCHOR): lets us
+        // recognize our own membranes for unwrap-on-reentry, and — being a
+        // data-segment address — never collides with a capnp-rpc connection
+        // brand (`self as *const ConnectionState`, always heap) or the 0 used
+        // by local/broken hooks. It therefore does NOT let the RPC layer
+        // mistake a membraned cap for one of its own and tunnel through the
+        // membrane. Must NOT forward the inner brand.
+        membrane_brand()
     }
 
     fn get_ptr(&self) -> usize {
@@ -705,5 +767,56 @@ mod tests {
         assert!(rl.check(IFACE, 0).is_err());
         std::thread::sleep(Duration::from_millis(30));
         assert!(rl.check(IFACE, 0).is_ok(), "window should have reset");
+    }
+
+    // -----------------------------------------------------------------------
+    // Membrane identity (M3 mini-spike): sentinel brand + registry
+    // -----------------------------------------------------------------------
+
+    fn dummy_hook() -> Box<dyn ClientHook> {
+        // A non-membrane hook to wrap / to test negative recognition.
+        Box::new(BrokenClient {
+            state: Rc::new(Error::failed("dummy".into())),
+        })
+    }
+
+    #[test]
+    fn membrane_brand_is_nonzero_and_stable() {
+        // Non-zero (0 is local/broken) and stable across calls.
+        assert_ne!(membrane_brand(), 0);
+        assert_eq!(membrane_brand(), membrane_brand());
+    }
+
+    #[test]
+    fn membrane_recognizes_own_wrap_but_not_others() {
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let wrapped = MembraneHook::wrap(dummy_hook(), policy);
+
+        // Our membrane advertises the sentinel brand and resolves via registry.
+        assert_eq!(wrapped.get_brand(), membrane_brand());
+        assert!(
+            membrane_state_of(&*wrapped).is_some(),
+            "a membrane must recognize its own wrap"
+        );
+
+        // A bare, non-membrane hook is not recognized.
+        let bare = dummy_hook();
+        assert!(
+            membrane_state_of(&*bare).is_none(),
+            "a non-membrane hook must not resolve to a membrane"
+        );
+    }
+
+    #[test]
+    fn membrane_deregisters_on_drop() {
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let wrapped = MembraneHook::wrap(dummy_hook(), policy);
+        let key = wrapped.get_ptr();
+        assert!(REGISTRY.with(|r| r.borrow().contains_key(&key)));
+        drop(wrapped);
+        assert!(
+            REGISTRY.with(|r| !r.borrow().contains_key(&key)),
+            "dropping the last membrane ref must deregister it"
+        );
     }
 }
