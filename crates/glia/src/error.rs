@@ -63,6 +63,8 @@ pub mod tag {
     pub const PERMISSION_DENIED: &str = "glia.error/permission-denied";
     pub const FUEL_EXHAUSTED: &str = "glia.error/fuel-exhausted";
     pub const INTERNAL: &str = "glia.error/internal";
+    pub const CONTINUATION_ABANDONED: &str = "glia.error/continuation-abandoned";
+    pub const CONTINUATION_ALREADY_RESUMED: &str = "glia.error/continuation-already-resumed";
 }
 
 // ----- Schema-key constants -----------------------------------------------
@@ -144,6 +146,15 @@ pub enum GliaError {
     /// Internal error — invariant violation. NOT a generic escape
     /// hatch; reach for a specific variant first.
     Internal { context: String, message: String },
+    /// Continuation abandoned — a handler returned without calling
+    /// `resume`, so the suspended body was discarded. Surfaces to a
+    /// suspended computation that is resumed against a dropped one-shot
+    /// channel (handler-abort path).
+    ContinuationAbandoned,
+    /// One-shot continuation reused — `resume` was called more than
+    /// once. Continuations captured by `with-effect-handler` are
+    /// one-shot; a second `resume` is a protocol violation.
+    ContinuationAlreadyResumed,
     /// User-thrown error, constructed via the `ex-info` Glia builtin.
     /// The user's `:type` becomes the canonical dispatch tag; other
     /// user fields are carried in `extras`.
@@ -170,6 +181,8 @@ impl GliaError {
             Self::PermissionDenied { .. } => tag::PERMISSION_DENIED.into(),
             Self::FuelExhausted => tag::FUEL_EXHAUSTED.into(),
             Self::Internal { .. } => tag::INTERNAL.into(),
+            Self::ContinuationAbandoned => tag::CONTINUATION_ABANDONED.into(),
+            Self::ContinuationAlreadyResumed => tag::CONTINUATION_ALREADY_RESUMED.into(),
             Self::User { type_tag, .. } => match type_tag {
                 Val::Keyword(s) | Val::Str(s) | Val::Sym(s) => s.clone(),
                 _ => String::new(),
@@ -274,6 +287,20 @@ impl From<GliaError> for Val {
                     Val::Str(format!("internal error in {context}: {message}")),
                 ));
                 pairs.push((kw(key::CONTEXT), Val::Str(context)));
+            }
+            GliaError::ContinuationAbandoned => {
+                pairs.push((
+                    kw(key::MESSAGE),
+                    Val::Str("continuation abandoned — handler returned without resuming".into()),
+                ));
+            }
+            GliaError::ContinuationAlreadyResumed => {
+                pairs.push((
+                    kw(key::MESSAGE),
+                    Val::Str(
+                        "continuation already resumed — one-shot continuation may only be resumed once".into(),
+                    ),
+                ));
             }
             GliaError::User {
                 type_tag,
@@ -405,6 +432,17 @@ pub fn internal(context: &str, message: impl Into<String>) -> Val {
         message: message.into(),
     }
     .into()
+}
+
+/// Continuation abandoned — a handler returned without resuming, so
+/// the suspended body was discarded (handler-abort cleanup path).
+pub fn continuation_abandoned() -> Val {
+    GliaError::ContinuationAbandoned.into()
+}
+
+/// One-shot continuation reused — `resume` was called more than once.
+pub fn continuation_already_resumed() -> Val {
+    GliaError::ContinuationAlreadyResumed.into()
 }
 
 /// User-thrown error (`ex-info`-style). `type_tag` should be a
@@ -630,6 +668,20 @@ mod tests {
         assert!(message(&err).unwrap().contains("unreachable variant"));
     }
 
+    #[test]
+    fn continuation_abandoned_has_correct_tag() {
+        let err = continuation_abandoned();
+        assert_eq!(type_tag(&err), Some(tag::CONTINUATION_ABANDONED));
+        assert!(message(&err).unwrap().contains("abandoned"));
+    }
+
+    #[test]
+    fn continuation_already_resumed_has_correct_tag() {
+        let err = continuation_already_resumed();
+        assert_eq!(type_tag(&err), Some(tag::CONTINUATION_ALREADY_RESUMED));
+        assert!(message(&err).unwrap().contains("one-shot"));
+    }
+
     // ----- User variant (ex-info path) -----------------------------------
 
     #[test]
@@ -816,6 +868,8 @@ mod tests {
                 context: "x".into(),
                 message: "y".into(),
             },
+            GliaError::ContinuationAbandoned,
+            GliaError::ContinuationAlreadyResumed,
             GliaError::User {
                 type_tag: Val::Keyword("x".into()),
                 message: "y".into(),

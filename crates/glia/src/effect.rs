@@ -4,6 +4,7 @@
 //! Closures/macros invoked across lexical boundaries still use the caller's
 //! current handler stack at invocation/expansion time.
 
+use crate::error;
 use crate::oneshot;
 use crate::Val;
 use std::cell::RefCell;
@@ -102,14 +103,15 @@ pub fn make_resume_fn(tx: oneshot::Sender) -> Val {
         name: "resume".into(),
         func: Rc::new(move |args: &[Val]| {
             if args.len() != 1 {
-                return Err(Val::from(format!(
-                    "resume expects exactly 1 argument, got {}",
-                    args.len()
-                )));
+                return Err(error::arity("resume", "1", args.len()));
             }
-            let tx = tx_cell.borrow_mut().take().ok_or_else(|| {
-                Val::from("resume called twice — one-shot continuation violated".to_string())
-            })?;
+            // One-shot: a second `resume` finds the sender already taken and
+            // surfaces a structured :glia.error/continuation-already-resumed
+            // carrier rather than a bare string.
+            let tx = tx_cell
+                .borrow_mut()
+                .take()
+                .ok_or_else(error::continuation_already_resumed)?;
             let val = args[0].clone();
             tx.send(val.clone());
             Err(Val::Resume(Box::new(val)))
@@ -166,6 +168,39 @@ mod tests {
                 msg.contains("twice") || msg.contains("one-shot"),
                 "expected a one-shot violation message, got: {msg}"
             );
+        } else {
+            panic!("expected NativeFn");
+        }
+    }
+
+    #[test]
+    fn make_resume_fn_second_call_is_structured_error() {
+        // The one-shot violation must be a structured
+        // :glia.error/continuation-already-resumed carrier, so callers can
+        // route on error type instead of scraping the message string.
+        let (tx, _rx) = oneshot::channel();
+        let resume = make_resume_fn(tx);
+        if let Val::NativeFn { func, .. } = &resume {
+            let _ = func(&[Val::Int(1)]); // first call — consumes the sender
+            let err = func(&[Val::Int(2)]).unwrap_err(); // second call — violation
+            assert_eq!(
+                error::type_tag(&err),
+                Some(error::tag::CONTINUATION_ALREADY_RESUMED)
+            );
+        } else {
+            panic!("expected NativeFn");
+        }
+    }
+
+    #[test]
+    fn make_resume_fn_wrong_arity_is_structured_error() {
+        // Wrong arity on resume is also a structured carrier (arity mismatch),
+        // never a plain string.
+        let (tx, _rx) = oneshot::channel();
+        let resume = make_resume_fn(tx);
+        if let Val::NativeFn { func, .. } = &resume {
+            let err = func(&[]).unwrap_err();
+            assert_eq!(error::type_tag(&err), Some(error::tag::ARITY));
         } else {
             panic!("expected NativeFn");
         }
