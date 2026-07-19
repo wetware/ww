@@ -5,12 +5,11 @@
 
 @0xa4f0c87b5de91236;
 
-using Synapse = import "synapse.capnp";
-
 struct Export @0xbb8d5590cb2f3d2e {
-  name    @0 :Text;
-  synapse @1 :Synapse.Synapse;
-  # An exported capability with its self-describing invocation surface.
+  name @0 :Text;
+  cap  @1 :Capability;
+  # An exported capability bound to a local name. Authority is carried by the
+  # capability reference itself; the name is a local binding key, not authority.
 }
 
 interface Membrane @0xdb52c25106bc2c5e {

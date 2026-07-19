@@ -8,7 +8,6 @@
 @0xbf5147b78c0e6a2f;
 
 using MembraneSchema = import "membrane.capnp";
-using Synapse = import "synapse.capnp";
 
 struct PeerInfo {
   peerId @0 :Data;       # libp2p peer ID, serialized.
@@ -136,7 +135,7 @@ interface Process {
   wait @3 () -> (exitCode :Int32);
   # Block until the process exits and return its exit code.
 
-  bootstrap @4 () -> (synapse :Synapse.Synapse);
+  bootstrap @4 () -> (cap :Capability);
   # Return the capability exported by the guest via system::serve().
   # Errors if the guest didn't export a capability.
 
@@ -145,14 +144,14 @@ interface Process {
 }
 
 interface VatListener {
-  serve @0 (synapse :Synapse.Synapse, protocol :Text) -> ();
+  serve @0 (cap :Capability, protocol :Text) -> ();
   # Accept incoming Cap'n Proto RPC connections on /ww/0.1.0/vat/{protocol}.
   # Each connection bootstraps with the provided capability. The protocol is a
   # locator only; capability authority comes from the cap, not from the name.
 }
 
 interface VatClient {
-  dial @0 (peer :Data, protocol :Text) -> (synapse :Synapse.Synapse);
+  dial @0 (peer :Data, protocol :Text) -> (cap :Capability);
   # Open a Cap'n Proto RPC connection to peer on /ww/0.1.0/vat/{protocol}.
   # Bootstraps a Cap'n Proto vat over the stream and returns the remote cap.
 }

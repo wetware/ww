@@ -3,9 +3,7 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};
-use capnp::capability::FromClientHook;
 use capnp::capability::Promise;
-use capnp::traits::HasTypeId;
 use capnp_rpc::pry;
 use serde_json::{json, Value};
 use std::process::{Child, Command, Stdio};
@@ -17,7 +15,6 @@ use atom::system_capnp;
 use atom::{EpochGuard, GraftBuilder};
 use membrane::http_capnp;
 use membrane::routing_capnp;
-use membrane::synapse_capnp;
 
 // ---------------------------------------------------------------------------
 // Stub runtime + executor + session builder for epoch-guarded capability tests
@@ -70,23 +67,6 @@ impl system_capnp::executor::Server for StubExecutor {
 /// GraftBuilder that populates graft results with a StubRuntime (Export list format).
 pub struct StubSessionBuilder;
 
-fn write_test_synapse(
-    mut builder: synapse_capnp::synapse::Builder<'_>,
-    name: &str,
-    invokable: synapse_capnp::invokable::Client,
-) {
-    let mut descriptor = builder.reborrow().init_descriptor();
-    descriptor.set_display_name(name);
-    descriptor.set_interface_id(0);
-    descriptor.set_schema_cid("");
-    descriptor.set_payload_codec(synapse_capnp::PayloadCodec::Capnp);
-    descriptor.reborrow().init_methods(0);
-    let mut invoker_ids = descriptor.reborrow().init_invoker_interface_ids(1);
-    invoker_ids.set(0, synapse_capnp::invokable::Client::TYPE_ID);
-    descriptor.init_schema_nodes(0);
-    builder.set_invokable(invokable);
-}
-
 impl GraftBuilder for StubSessionBuilder {
     fn build(
         &self,
@@ -100,8 +80,7 @@ impl GraftBuilder for StubSessionBuilder {
         let mut caps = builder.reborrow().init_caps(1);
         let mut entry = caps.reborrow().get(0);
         entry.set_name("runtime");
-        let invokable = synapse_capnp::invokable::Client::new(runtime.client.hook);
-        write_test_synapse(entry.init_synapse(), "runtime", invokable);
+        entry.init_cap().set_as_capability(runtime.client.hook);
         Ok(())
     }
 }
@@ -236,28 +215,23 @@ impl GraftBuilder for FullStubSessionBuilder {
 
         let mut e = caps.reborrow().get(0);
         e.set_name("identity");
-        let invokable = synapse_capnp::invokable::Client::new(identity.client.hook);
-        write_test_synapse(e.init_synapse(), "identity", invokable);
+        e.init_cap().set_as_capability(identity.client.hook);
 
         let mut e = caps.reborrow().get(1);
         e.set_name("host");
-        let invokable = synapse_capnp::invokable::Client::new(host.client.hook);
-        write_test_synapse(e.init_synapse(), "host", invokable);
+        e.init_cap().set_as_capability(host.client.hook);
 
         let mut e = caps.reborrow().get(2);
         e.set_name("runtime");
-        let invokable = synapse_capnp::invokable::Client::new(runtime.client.hook);
-        write_test_synapse(e.init_synapse(), "runtime", invokable);
+        e.init_cap().set_as_capability(runtime.client.hook);
 
         let mut e = caps.reborrow().get(3);
         e.set_name("routing");
-        let invokable = synapse_capnp::invokable::Client::new(routing.client.hook);
-        write_test_synapse(e.init_synapse(), "routing", invokable);
+        e.init_cap().set_as_capability(routing.client.hook);
 
         let mut e = caps.reborrow().get(4);
         e.set_name("http-client");
-        let invokable = synapse_capnp::invokable::Client::new(http_client.client.hook);
-        write_test_synapse(e.init_synapse(), "http-client", invokable);
+        e.init_cap().set_as_capability(http_client.client.hook);
 
         Ok(())
     }

@@ -21,20 +21,20 @@ names are locators, not type authority and not provenance proofs.
 
 ```capnp
 interface VatListener {
-  serve @0 (synapse :Synapse, protocol :Text) -> ();
+  serve @0 (cap :Capability, protocol :Text) -> ();
 }
 
 interface VatClient {
-  dial @0 (peer :Data, protocol :Text) -> (synapse :Synapse);
+  dial @0 (peer :Data, protocol :Text) -> (cap :Capability);
 }
 ```
 
-`VatListener.serve` publishes an already-existing Synapse. It does not spawn
+`VatListener.serve` publishes an already-existing capability. It does not spawn
 cells and it does not install a per-request handler. Publisher lifecycle is
 owned by the publisher that created the capability.
 
 `VatClient.dial` opens `/ww/<version>/vat/<protocol>` and returns the remote
-bootstrap Synapse.
+bootstrap capability.
 
 ## Non-Goals
 

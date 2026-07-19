@@ -6084,15 +6084,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "synapse"
-version = "0.1.0"
-dependencies = [
- "capnp",
- "capnp-rpc",
- "capnpc",
-]
-
-[[package]]
 name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8185,7 +8176,6 @@ dependencies = [
  "serde",
  "serde_json",
  "stem",
- "synapse",
  "tempfile",
  "tokio",
  "tokio-util",

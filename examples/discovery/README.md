@@ -32,8 +32,8 @@ hardcoded addresses.
 make discovery
 ```
 
-This compiles the WASM guest and copies the compiled schema bytes
-using the generated Synapse descriptor metadata.
+This compiles the WASM guest and generates build-time schema-byte and CID
+metadata for introspection.
 Vat publication uses the service name `greeter`.
 
 ## Running

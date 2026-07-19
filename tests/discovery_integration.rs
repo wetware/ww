@@ -97,11 +97,9 @@ async fn spawn_greeter_on_pool(
                         let cap = resp
                             .get()
                             .unwrap()
-                            .get_synapse()
-                            .unwrap()
-                            .get_invokable()
-                            .unwrap()
-                            .client;
+                            .get_cap()
+                            .get_as_capability::<capnp::capability::Client>()
+                            .unwrap();
 
                         // Bridge the bootstrap cap to the duplex stream so the
                         // test thread can use it.

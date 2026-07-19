@@ -56,9 +56,9 @@ layer is as simple as not installing the handler.
 ## Capabilities exposed to grafted agents
 
 After calling `membrane.graft()`, an agent holds references to a list
-of named `Export`s (`stem.capnp:Export`). Each entry carries the cap
-name and a Synapse. The name is the local binding key; the Synapse carries
-the descriptor and invokable capability.
+of named `Export`s (`membrane.capnp:Export`). Each entry carries the cap
+name and the capability itself. The name is the local binding key;
+authority is carried by the capability reference.
 
 | Capability | What it does |
 |------------|--------------|
@@ -67,7 +67,7 @@ the descriptor and invokable capability.
 | **runtime** | Load WASM binaries and obtain scoped Executors (with compilation caching) |
 | **routing** | Kademlia DHT: provide and find content/services |
 | **http-client** | Outbound HTTP requests, gated by `--http-dial` allowlist |
-| `with`-scoped extras | Init.d-granted caps for application-specific RPC interfaces. Each carries a Synapse descriptor so guests can introspect. |
+| `with`-scoped extras | Init.d-granted caps for application-specific RPC interfaces, bound by name in the graft. |
 
 The wire-side `StreamListener` / `StreamDialer` / `VatListener` /
 `VatClient` interfaces are reached via `host.network()` rather than
@@ -240,11 +240,13 @@ Schema definitions live in `capnp/`:
 
 - **`system.capnp`** — Host, Runtime, Executor, Process, ByteStream,
   StreamListener, StreamDialer, VatListener, VatClient, HttpListener
-- **`stem.capnp`** — Terminal, Membrane, Epoch, Signer, Identity,
-  Export
+- **`stem.capnp`** — Epoch and provenance metadata
+- **`auth.capnp`** — Terminal, Signer, Identity
+- **`membrane.capnp`** — Membrane, Export
 - **`routing.capnp`** — Kademlia DHT (provide, findProviders, hash)
 - **`http.capnp`** — HttpClient
 
-Build scripts extract canonical `Schema.Node` bytes for descriptor
-construction and schema CIDs. These bytes are descriptor inputs, not
-runtime sidecars: exported capabilities cross membranes as Synapses.
+Build scripts extract canonical `Schema.Node` bytes for the
+`schema`/`doc`/`help` introspection builtins and schema CIDs. These bytes
+are introspection inputs, not runtime sidecars: exported capabilities cross
+membranes as bare capability references in `Export { name, cap }`.

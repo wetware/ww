@@ -11,7 +11,6 @@ use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::StreamExt;
 use membrane::EpochGuard;
 
-use crate::synapse_abi::{read_owned_synapse, write_owned_synapse, OwnedSynapse};
 use membrane::system_capnp;
 
 pub struct StreamListenerImpl {
@@ -30,7 +29,7 @@ impl StreamListenerImpl {
 
 /// A captured init.d `with`-block grant. Cloned per incoming stream and
 /// re-emitted on the spawned cell's graft.
-type ExtraCap = (String, OwnedSynapse);
+type ExtraCap = (String, capnp::capability::Client);
 
 #[allow(refining_impl_trait)]
 impl system_capnp::stream_listener::Server for StreamListenerImpl {
@@ -55,8 +54,11 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
             if let Ok(caps_reader) = params.get_caps() {
                 for entry in caps_reader.iter() {
                     if let Ok(name) = entry.get_name().map(|n| n.to_string().unwrap_or_default()) {
-                        if let Ok(synapse) = entry.get_synapse().and_then(read_owned_synapse) {
-                            caps_vec.push((name, synapse));
+                        if let Ok(cap) = entry
+                            .get_cap()
+                            .get_as_capability::<capnp::capability::Client>()
+                        {
+                            caps_vec.push((name, cap));
                         }
                     }
                 }
@@ -131,10 +133,10 @@ async fn handle_connection(
     let mut spawn_req = executor.spawn_request();
     if !caps.is_empty() {
         let mut caps_builder = spawn_req.get().init_caps(caps.len() as u32);
-        for (i, (name, synapse)) in caps.iter().enumerate() {
+        for (i, (name, cap)) in caps.iter().enumerate() {
             let mut entry = caps_builder.reborrow().get(i as u32);
             entry.set_name(name);
-            write_owned_synapse(entry.init_synapse(), synapse);
+            entry.init_cap().set_as_capability(cap.clone().hook);
         }
     }
     let response = spawn_req.send().promise.await?;

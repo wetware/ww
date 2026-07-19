@@ -788,11 +788,6 @@ mod membrane_capnp {{
 }}
 
 #[allow(dead_code)]
-mod synapse_capnp {{
-    include!(concat!(env!("OUT_DIR"), "/synapse_capnp.rs"));
-}}
-
-#[allow(dead_code)]
 mod routing_capnp {{
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
 }}
@@ -820,8 +815,7 @@ fn get_graft_cap<T: capnp::capability::FromClientHook>(
         let entry = caps.get(i);
         let n = entry.get_name()?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?;
         if n == name {{
-            let invokable = entry.get_synapse()?.get_invokable()?;
-            return Ok(T::new(invokable.client.hook));
+            return entry.get_cap().get_as_capability::<T>();
         }}
     }}
     Err(capnp::Error::failed(format!(

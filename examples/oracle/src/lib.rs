@@ -31,11 +31,6 @@ mod system_capnp {
 }
 
 #[allow(dead_code)]
-mod synapse_capnp {
-    include!(concat!(env!("OUT_DIR"), "/synapse_capnp.rs"));
-}
-
-#[allow(dead_code)]
 mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
@@ -82,8 +77,7 @@ fn get_graft_cap<T: capnp::capability::FromClientHook>(
         let entry = caps.get(i);
         let n = entry.get_name()?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?;
         if n == name {
-            let invokable = entry.get_synapse()?.get_invokable()?;
-            return Ok(T::new(invokable.client.hook));
+            return entry.get_cap().get_as_capability::<T>();
         }
     }
     Err(capnp::Error::failed(format!(
@@ -435,9 +429,9 @@ async fn query_oracle(
     req.get().set_peer(peer_id);
     req.get().set_protocol(ORACLE_SERVICE);
     let resp = req.send().promise.await?;
-    let invokable = resp.get()?.get_synapse()?.get_invokable()?;
+    let dialed = resp.get()?.get_cap();
     let oracle: oracle_capnp::price_oracle::Client =
-        capnp::capability::FromClientHook::new(invokable.client.hook);
+        dialed.get_as_capability()?;
 
     // Query available pairs.
     let pairs_resp = oracle.get_pairs_request().send().promise.await?;

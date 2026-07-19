@@ -27,7 +27,6 @@ fn main() {
         // schema.capnp types live in the `capnp` crate
         .crate_provides("capnp", [0xa93fc509624c72d9])
         .file(capnp_dir.join("system.capnp"))
-        .file(capnp_dir.join("synapse.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("auth.capnp"))
         .file(capnp_dir.join("membrane.capnp"))
@@ -55,7 +54,7 @@ fn main() {
         .expect("emit schema consts");
 
     // Cargo rebuild triggers
-    for schema in &["system", "synapse", "routing", "auth", "membrane", "stem", "http"] {
+    for schema in &["system", "routing", "auth", "membrane", "stem", "http"] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()
