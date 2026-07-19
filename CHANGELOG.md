@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **`ww-membrane` crate: hook-level capability attenuation.** New workspace crate implementing a schema-agnostic capability membrane on `capnp`'s `ClientHook`: calls are filtered by `(interfaceId, ordinal)` at the hook level (unbypassable by casting — typed clients, casts, and promise pipelines all bottom out in the same wrapped hook), and capabilities in results, promise pipelines, and promise resolution are recursively re-wrapped. `Policy` is a trait with three reference implementations — `Allowlist` (stateless allow/deny), `RevocablePolicy` (revoke switch), and `RateLimit` (fixed-window counter; rate-limit-as-capability) — so one enforcement mechanism serves multiple attenuation strategies. Denials carry a stable marker plus the denied method key for structured error routing. Not yet wired into the public ABI; the Export cutover lands separately.
+
 ### Changed
 - **Glia resumable-effects handler semantics are locked in with tests + docs.** Added focused tests pinning the algebraic-effects contract — abort-on-return (body after `perform` is skipped), exact-site resume inside a larger expression, one-shot resume, handler-forwarding-skips-self, fail-closed structured `Val::Effect` carrier for unhandled effects, async-native-handler resume, and the dynamic (invocation-time) handler-stack rule for closures/macros. Rewrote `doc/designs/glia-effects.md` to present these as test-backed guarantees plus explicit non-goals (no persisted stacks, no cross-peer continuations, no multi-shot) and corrected stale `with-handler` API references. No runtime behavior change.
 
