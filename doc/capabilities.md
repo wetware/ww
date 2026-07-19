@@ -240,8 +240,9 @@ Schema definitions live in `capnp/`:
 
 - **`system.capnp`** — Host, Runtime, Executor, Process, ByteStream,
   StreamListener, StreamDialer, VatListener, VatClient, HttpListener
-- **`stem.capnp`** — Terminal, Membrane, Epoch, Signer, Identity,
-  Export
+- **`stem.capnp`** — Epoch and provenance metadata
+- **`auth.capnp`** — Terminal, Signer, Identity
+- **`membrane.capnp`** — Membrane, Export
 - **`routing.capnp`** — Kademlia DHT (provide, findProviders, hash)
 - **`http.capnp`** — HttpClient
 
