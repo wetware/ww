@@ -106,8 +106,10 @@ is given so the doc and the code stay in lockstep.
   e.g. `(+ 1 (* 10 (perform :x 0)))` resumed with `5` yields `51`.
   (`resume_continues_at_exact_perform_site_in_nested_expr`, `resume_basic`)
 - **One-shot continuations.** `resume` can be called at most once; a second call
-  is a runtime error carrying a one-shot-violation message, not a resume
-  sentinel. (`make_resume_fn_second_call_reports_oneshot_violation`,
+  is a runtime error — a structured `:glia.error/continuation-already-resumed`
+  carrier, not a resume sentinel and not a plain string — so callers route on
+  error type. (`make_resume_fn_second_call_is_structured_error`,
+  `make_resume_fn_second_call_reports_oneshot_violation`,
   `make_resume_fn_second_call_errors`)
 - **Handler forwarding skips self.** The handler frame is popped *before* the
   handler runs, so a handler that re-performs the *same* effect reaches the next
@@ -125,6 +127,37 @@ is given so the doc and the code stay in lockstep.
   one ambient at definition time.
   (`fn_invocation_uses_caller_handler_stack_not_definition_stack`,
   `macro_invocation_uses_caller_handler_stack_not_definition_stack`)
+
+### Handler-abort vs resume cleanup
+
+When a handler **resumes**, the suspended body is polled to completion: control
+returns to the exact `perform` site (see above), so any resources the body
+acquired before the `perform` are still live and its own scope exits (and runs
+whatever cleanup that scope encodes) normally.
+
+When a handler **aborts** — returns without calling `resume` — the suspended
+body is *discarded*: the `with-effect-handler` form yields the handler's value
+and the code after the `perform` never runs. Cleanup semantics of the abort
+path:
+
+- **Continuation resources are released by drop.** The suspended body future is
+  dropped, and the one-shot resume channel is dropped without a send. There is
+  no unwind-and-run-finalizers step (Glia has no `finally`/`defer`); resource
+  release rides on Rust `Drop` of whatever the abandoned future still owned.
+  Any effect the body *would* have performed after the `perform` simply does not
+  happen, so it acquires nothing further.
+- **Capabilities are unaffected by abort.** Aborting a body does not revoke or
+  close capabilities the body already holds — capability lifetime is governed by
+  the membrane/epoch model, not by continuation liveness. An abort just means the
+  post-`perform` code that might have *used* those caps never runs.
+- **Resuming a dropped continuation fails closed, structured.** If a suspended
+  computation is ever polled after its resume channel was dropped without a send
+  (the abandonment path), it surfaces a structured
+  `:glia.error/continuation-abandoned` carrier rather than a bare string, so a
+  caller can distinguish "handler abandoned me" from an ordinary value.
+  (`sender_drop_yields_structured_abandonment_error`) In normal flow an abort
+  returns the handler's value directly and the body is never re-polled, so this
+  carrier is the defensive rail rather than the common case.
 
 ### Phase transition (current state)
 `Expr::Try` / `Expr::Throw` were never required: `try`/`throw` are pure prelude macros over `perform` / `with-effect-handler`. The current shape:

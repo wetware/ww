@@ -84,11 +84,11 @@ impl Future for Receiver {
         if let Some(v) = self.slot.value.borrow_mut().take() {
             return Poll::Ready(Ok(v));
         }
-        // Check if sender was dropped without sending (abort).
+        // Check if sender was dropped without sending (abort). Surface a
+        // structured `:glia.error/continuation-abandoned` carrier so callers
+        // can route on error type rather than parsing prose.
         if !self.slot.alive.get() {
-            return Poll::Ready(Err(Val::from(
-                "continuation abandoned — handler did not resume".to_string(),
-            )));
+            return Poll::Ready(Err(crate::error::continuation_abandoned()));
         }
         // Still alive, no value yet — register waker and wait.
         *self.slot.waker.borrow_mut() = Some(cx.waker().clone());
@@ -134,6 +134,23 @@ mod tests {
         let (tx, mut rx) = channel();
         drop(tx);
         assert!(matches!(poll_rx(&mut rx), Poll::Ready(Err(_))));
+    }
+
+    #[test]
+    fn sender_drop_yields_structured_abandonment_error() {
+        // Abandonment surfaces a structured :glia.error/continuation-abandoned
+        // carrier, not a plain string — callers route on type, not prose.
+        let (tx, mut rx) = channel();
+        drop(tx);
+        match poll_rx(&mut rx) {
+            Poll::Ready(Err(err)) => {
+                assert_eq!(
+                    crate::error::type_tag(&err),
+                    Some(crate::error::tag::CONTINUATION_ABANDONED)
+                );
+            }
+            other => panic!("expected structured abandonment error, got {other:?}"),
+        }
     }
 
     #[test]
