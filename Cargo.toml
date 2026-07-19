@@ -8,6 +8,7 @@ members = [
     "crates/ipfs",
     "crates/membrane",
     "crates/rpc",
+    "crates/ww-membrane",
     "crates/schema-id",
     "crates/synapse",
     "crates/stem",
