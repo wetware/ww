@@ -153,6 +153,25 @@ mod tests {
     }
 
     #[test]
+    fn make_resume_fn_second_call_reports_oneshot_violation() {
+        // The one-shot guarantee must surface a descriptive error, not just any
+        // failure, so callers/tests can distinguish it from other resume errors.
+        let (tx, _rx) = oneshot::channel();
+        let resume = make_resume_fn(tx);
+        if let Val::NativeFn { func, .. } = &resume {
+            let _ = func(&[Val::Int(1)]); // first call — consumes the sender
+            let err = func(&[Val::Int(2)]).unwrap_err(); // second call — violation
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("twice") || msg.contains("one-shot"),
+                "expected a one-shot violation message, got: {msg}"
+            );
+        } else {
+            panic!("expected NativeFn");
+        }
+    }
+
+    #[test]
     fn make_resume_fn_wrong_arity() {
         let (tx, _rx) = oneshot::channel();
         let resume = make_resume_fn(tx);

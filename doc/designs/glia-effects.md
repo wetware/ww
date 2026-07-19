@@ -76,8 +76,8 @@ All share one structure: **interposing policy at a boundary** — the same thing
 ## Phase 2: Full Effect System (Q2)
 
 ### Language additions
-- `perform` — `(perform :effect-type data)` suspends computation. Returns value from handler's `resume`.
-- `with-handler` — `(with-handler {:effect-type handler-fn} body)` installs handlers. Handler fn receives `(data resume)`.
+- `perform` — `(perform :effect-type data)` or `(perform cap :method args...)` suspends computation. Returns the value passed to the handler's `resume`.
+- `with-effect-handler` — `(with-effect-handler TARGET handler-fn body...)` installs one handler for `TARGET` (a keyword or a cap). Handler fn receives `(data)` to abort or `(data resume)` to resume. (The map-form `with-handler` in the early examples below was never implemented; one handler per form is the real shape.)
 
 ### Capability-effect fusion
 - `(perform host :id)` lowers to `(perform :host {:method "id"})`
@@ -86,9 +86,45 @@ All share one structure: **interposing policy at a boundary** — the same thing
 - Stale epoch detected → handler re-grafts and resumes transparently
 
 ### Handler semantics
-- **One-shot continuations:** `resume` can be called at most once. Calling twice is a runtime error.
-- **Handler stack recursion:** `perform` inside a handler skips the current handler frame, dispatches to next outer handler for the same effect type.
-- **`:fail` handlers CAN resume:** default handler (via `try`) does not resume. User-installed `:fail` handlers can resume, enabling retry/recovery.
+
+The surface form is `(with-effect-handler TARGET handler-fn body...)`, where
+`TARGET` is a keyword (environmental effect) or a capability value
+(object-scoped effect, matched by instance identity). The handler fn is called
+with `(data)` to abort or `(data resume)` to optionally resume. `perform` has
+two shapes: `(perform :keyword data)` and `(perform cap :method args...)`.
+
+The following are the guarantees the resumable model rests on. Each is pinned by
+a test in `crates/glia/src/eval.rs` / `crates/glia/src/effect.rs`; the test name
+is given so the doc and the code stay in lockstep.
+
+- **Abort on return-without-resume.** A handler that returns without calling
+  `resume` discards the suspended body — the code after the `perform` never
+  runs. (`abort_without_resume_skips_body_after_perform`,
+  `abort_2arg_handler_no_resume`, `abort_1arg_handler`)
+- **Resume returns to the exact `perform` site.** `resume` continues evaluation
+  at the precise position of the `perform` inside the surrounding expression;
+  e.g. `(+ 1 (* 10 (perform :x 0)))` resumed with `5` yields `51`.
+  (`resume_continues_at_exact_perform_site_in_nested_expr`, `resume_basic`)
+- **One-shot continuations.** `resume` can be called at most once; a second call
+  is a runtime error carrying a one-shot-violation message, not a resume
+  sentinel. (`make_resume_fn_second_call_reports_oneshot_violation`,
+  `make_resume_fn_second_call_errors`)
+- **Handler forwarding skips self.** The handler frame is popped *before* the
+  handler runs, so a handler that re-performs the *same* effect reaches the next
+  outer handler rather than recursing into itself.
+  (`handler_reperform_same_effect_forwards_to_next_outer_handler`)
+- **Fail-closed with a structured carrier.** A `perform` with no matching
+  handler surfaces a structured `Val::Effect { effect_type, data }` (for caps,
+  `effect_type` is `cap:<name>`), never a plain string, so callers can match /
+  unwrap it. (`unhandled_cap_effect_fails_closed_with_structured_carrier`)
+- **Async native handlers resume.** A handler backed by an async native function
+  resumes the body identically to a synchronous one.
+  (`async_native_handler_resumes_body`, `async_native_fn_in_effect_handler`)
+- **Dynamic (invocation-time) handler stack.** A closure or macro dispatches
+  through the handler stack in force at its *invocation/expansion* site, not the
+  one ambient at definition time.
+  (`fn_invocation_uses_caller_handler_stack_not_definition_stack`,
+  `macro_invocation_uses_caller_handler_stack_not_definition_stack`)
 
 ### Phase transition (current state)
 `Expr::Try` / `Expr::Throw` were never required: `try`/`throw` are pure prelude macros over `perform` / `with-effect-handler`. The current shape:
@@ -136,12 +172,26 @@ The full implementation lives in `crates/glia/src/prelude.glia` and is loaded vi
   (run-service))
 ```
 
+## Non-goals
+
+The resumable model is deliberately bounded. It does **not** provide:
+
+- **No persisted handler stacks.** The handler stack is in-memory dynamic scope
+  for the duration of an eval; it is not serialized or checkpointed.
+- **No cross-peer continuations.** A `resume` continuation is local to the peer
+  that suspended it; continuations are not shipped across the network.
+- **No multi-shot continuations.** Continuations are one-shot — resume or abort,
+  never cloned or resumed more than once.
+
 ## Open Questions
 
-1. Should `with-handler` support a `finally` clause?
+1. Should `with-effect-handler` support a `finally` clause?
 2. Should capability effects use namespaced keywords (`:ww/host`) to avoid collision?
-3. Should `perform` without a matching handler error (fail-closed) or fall through?
-4. Continuation mechanism for Phase 2: likely `tokio::sync::oneshot` channel pair.
+
+**Resolved:** `perform` without a matching handler fails closed with a structured
+`Val::Effect` carrier (see "Handler semantics"). The Phase 2 continuation
+mechanism is a `oneshot` channel pair (`crates/glia/src/oneshot.rs`), not
+`tokio::sync::oneshot`.
 
 ## De-risk Strategy
 
