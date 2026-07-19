@@ -96,6 +96,17 @@ pub fn denied_method_key(err: &Error) -> Option<(u64, u16)> {
 /// call, fail-closed; prefer [`denied_error`] so the denial is routable.
 pub trait Policy {
     fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error>;
+
+    /// If this policy is a pure static allowlist, the set of keys it permits.
+    /// Enables collapse-on-wrap: attenuating an already-membraned cap with two
+    /// static allowlists folds into a single membrane layer whose allowlist is
+    /// the intersection, so delegation depth stays O(1) in copies rather than
+    /// growing a membrane per hop (roadmap D3/D18). Stateful policies
+    /// (revocation, rate limit) return `None` and therefore stack, because
+    /// their per-call state cannot be merged into a set.
+    fn allowlist_keys(&self) -> Option<HashSet<(u64, u16)>> {
+        None
+    }
 }
 
 /// Stateless `(interface_id, method_id)` allowlist. The first and simplest
@@ -123,6 +134,10 @@ impl Policy for Allowlist {
         } else {
             Err(denied_error(interface_id, method_id, "not on allowlist"))
         }
+    }
+
+    fn allowlist_keys(&self) -> Option<HashSet<(u64, u16)>> {
+        Some(self.allowed.clone())
     }
 }
 
@@ -293,6 +308,27 @@ pub struct MembraneHook {
 
 impl MembraneHook {
     pub fn wrap(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
+        // Collapse-on-wrap: wrapping one of our own membranes with a static
+        // allowlist, when the inner policy is also a static allowlist, folds the
+        // two into a single layer whose allowlist is the intersection. This
+        // keeps `attenuate (attenuate c ..) ..` at one membrane hop instead of
+        // nesting (roadmap D3/D18). If either side is stateful (returns `None`
+        // from `allowlist_keys`), we fall through and stack, preserving its
+        // per-call state.
+        if let Some(existing) = membrane_state_of(&*inner) {
+            if let (Some(outer_keys), Some(inner_keys)) =
+                (policy.allowlist_keys(), existing.policy.allowlist_keys())
+            {
+                let allowed = outer_keys.intersection(&inner_keys).copied().collect();
+                let collapsed: Rc<dyn Policy> = Rc::new(Allowlist { allowed });
+                let state = Rc::new(MembraneState {
+                    inner: existing.inner.add_ref(),
+                    policy: collapsed,
+                });
+                registry_insert(&state);
+                return Box::new(Self { state });
+            }
+        }
         let state = Rc::new(MembraneState { inner, policy });
         registry_insert(&state);
         Box::new(Self { state })

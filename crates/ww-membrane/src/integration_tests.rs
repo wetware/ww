@@ -19,7 +19,7 @@ use capnp_rpc::RpcSystem;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::test_thing_capnp::thing;
-use crate::{membrane, Allowlist, Policy, DENIED_MARKER};
+use crate::{membrane, membrane_state_of, Allowlist, Policy, DENIED_MARKER};
 
 const PING: u16 = 0;
 const FORBIDDEN: u16 = 1;
@@ -274,6 +274,95 @@ async fn membraned_param_is_unwrapped_on_reentry() {
         echoed.get().unwrap().get_msg().unwrap().to_str().unwrap(),
         "TOP SECRET",
         "backend must see the unwrapped bare cap, so its forbidden() succeeds",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: collapse-on-wrap (allowlist intersection, single layer)
+// ---------------------------------------------------------------------------
+
+/// Attenuating an already-membraned cap with two static allowlists must fold
+/// to ONE membrane whose allowlist is the intersection: methods only the inner
+/// or only the outer allowed are both denied, and the collapsed hook wraps the
+/// bare cap directly (no nested membrane).
+#[tokio::test]
+async fn allowlist_collapse_intersects_and_flattens() {
+    let raw: thing::Client = capnp_rpc::new_client(ThingImpl { depth: 0 });
+    // inner allows {ping, child}; outer allows {child, forbidden}.
+    let inner = membrane(
+        raw,
+        Rc::new(
+            Allowlist::new()
+                .allow(thing_id(), PING)
+                .allow(thing_id(), CHILD),
+        ) as Rc<dyn Policy>,
+    );
+    let outer = membrane(
+        inner,
+        Rc::new(
+            Allowlist::new()
+                .allow(thing_id(), CHILD)
+                .allow(thing_id(), FORBIDDEN),
+        ) as Rc<dyn Policy>,
+    );
+
+    // Intersection is {child}: allowed.
+    outer.child_request().send().promise.await.unwrap();
+    // ping was only in inner -> denied.
+    assert_denied(
+        outer.ping_request().send().promise.await,
+        "collapse: ping denied (not in outer allowlist)",
+    );
+    // forbidden was only in outer -> denied.
+    assert_denied(
+        outer.forbidden_request().send().promise.await,
+        "collapse: forbidden denied (not in inner allowlist)",
+    );
+
+    // Single layer: the collapsed membrane wraps the bare cap, not a membrane.
+    let hook = outer.client.clone().hook;
+    let state = membrane_state_of(&*hook).expect("outer is a membrane");
+    assert!(
+        membrane_state_of(&*state.inner).is_none(),
+        "collapse: inner must be the bare cap, not a nested membrane",
+    );
+}
+
+/// A stateful outer policy (rate limit) must NOT collapse: it stacks so its
+/// per-call counter survives. The inner allowlist still filters underneath.
+#[tokio::test]
+async fn stateful_policy_stacks_not_collapses() {
+    use crate::RateLimit;
+    use std::time::Duration;
+
+    let raw: thing::Client = capnp_rpc::new_client(ThingImpl { depth: 0 });
+    let inner = membrane(
+        raw,
+        Rc::new(Allowlist::new().allow(thing_id(), PING)) as Rc<dyn Policy>,
+    );
+    // Rate-limit the already-membraned cap: 1 call per long window.
+    let outer = membrane(
+        inner,
+        Rc::new(RateLimit::new(
+            Box::new(Allowlist::new().allow(thing_id(), PING)),
+            1,
+            Duration::from_secs(3600),
+        )) as Rc<dyn Policy>,
+    );
+
+    // Stacked, not collapsed: outer wraps a membrane, not the bare cap.
+    let hook = outer.client.clone().hook;
+    let state = membrane_state_of(&*hook).expect("outer is a membrane");
+    assert!(
+        membrane_state_of(&*state.inner).is_some(),
+        "stateful policy must stack: inner should still be a membrane",
+    );
+
+    // First ping passes the rate limit; second is denied by the counter.
+    expect_ping(&outer, "pong-0", "rate-limit first call").await;
+    assert_denied(
+        outer.ping_request().send().promise.await,
+        "rate-limit second call denied",
     );
 }
 
