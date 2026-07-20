@@ -193,7 +193,6 @@ mod trace_tests {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
