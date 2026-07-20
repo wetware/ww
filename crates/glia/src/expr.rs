@@ -69,6 +69,15 @@ pub enum Expr {
     /// - `(perform cap :method args...)` — cap-targeted effect (object-scoped)
     Perform { target: Box<Expr>, args: Vec<Expr> },
 
+    /// `(perform* target payload)` — apply-style perform: `payload` evaluates
+    /// to a list/vector whose elements become the perform args. This is what
+    /// lets a generic interposition handler delegate its `(method args...)`
+    /// payload onward without knowing the arity: `(perform* cap data)`.
+    PerformStar {
+        target: Box<Expr>,
+        payload: Box<Expr>,
+    },
+
     /// `(with-effect-handler target handler body...)` — install a single effect handler.
     ///
     /// Two forms:
@@ -126,6 +135,8 @@ impl Expr {
         fn free_vars_in_raw_val(value: &Val) -> BTreeSet<String> {
             match value {
                 Val::Sym(name) => BTreeSet::from([name.clone()]),
+                // Runtime-only value; carries no syntax.
+                Val::Atom(_) => BTreeSet::new(),
                 Val::List(items) | Val::Vector(items) | Val::Set(items) => {
                     let mut out = BTreeSet::new();
                     for item in items {
@@ -221,6 +232,11 @@ impl Expr {
                 out.extend(union_exprs(args));
                 out
             }
+            Expr::PerformStar { target, payload } => {
+                let mut out = target.free_vars();
+                out.extend(payload.free_vars());
+                out
+            }
             Expr::WithEffectHandler {
                 target,
                 handler,
@@ -301,7 +317,9 @@ pub fn analyze(val: &Val) -> Result<Expr, String> {
         | Val::Float(_)
         | Val::Str(_)
         | Val::Keyword(_)
-        | Val::Bytes(_) => Ok(Expr::Const(val.clone())),
+        | Val::Bytes(_)
+        // Runtime-only value (can appear via macro-produced forms).
+        | Val::Atom(_) => Ok(Expr::Const(val.clone())),
 
         // Symbol — deferred lookup
         Val::Sym(s) => Ok(Expr::Sym(s.clone())),
@@ -365,6 +383,7 @@ fn analyze_list(items: &[Val]) -> Result<Expr, String> {
         "recur" => analyze_recur(raw_args),
         "defmacro" => analyze_defmacro(raw_args),
         "perform" => analyze_perform(raw_args),
+        "perform*" => analyze_perform_star(raw_args),
         "with-effect-handler" => analyze_with_effect_handler(raw_args),
         "match" => analyze_match(raw_args),
         "unquote" => Err("unquote (~) not inside syntax-quote".into()),
@@ -636,6 +655,18 @@ fn analyze_perform(args: &[Val]) -> Result<Expr, String> {
         .map(analyze)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Expr::Perform { target, args: rest })
+}
+
+/// `(perform* target payload)` — apply-style perform; `payload` must
+/// evaluate to a list or vector of the args `perform` would take.
+fn analyze_perform_star(args: &[Val]) -> Result<Expr, String> {
+    if args.len() != 2 {
+        return Err(format!("perform*: expected 2 args, got {}", args.len()));
+    }
+    Ok(Expr::PerformStar {
+        target: Box::new(analyze(&args[0])?),
+        payload: Box::new(analyze(&args[1])?),
+    })
 }
 
 /// `(with-effect-handler target handler body...)` — unified effect handler.

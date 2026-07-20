@@ -313,27 +313,53 @@ fn parse_allow_methods(value: &Val) -> Result<BTreeSet<String>, Val> {
 }
 
 fn is_authority_free(value: &Val) -> bool {
-    match value {
-        Val::Nil
-        | Val::Bool(_)
-        | Val::Int(_)
-        | Val::Float(_)
-        | Val::Str(_)
-        | Val::Sym(_)
-        | Val::Keyword(_)
-        | Val::Bytes(_) => true,
-        Val::List(items) | Val::Vector(items) | Val::Set(items) => {
-            items.iter().all(is_authority_free)
+    // Atoms make the value graph potentially CYCLIC (`(reset! a a)` is
+    // expressible), so the traversal tracks the atoms on the current path:
+    // revisiting one is a back-edge whose contents are already under
+    // inspection — recursing again would loop forever (RefCell permits
+    // nested shared borrows, so this is a stack overflow, not a panic).
+    fn walk(value: &Val, visiting: &mut Vec<*const RefCell<Val>>) -> bool {
+        match value {
+            // An atom is only as authority-free as its current contents.
+            Val::Atom(a) => {
+                let ptr = Rc::as_ptr(a);
+                if visiting.contains(&ptr) {
+                    // Back-edge: adds no values not already being checked.
+                    return true;
+                }
+                visiting.push(ptr);
+                let result = match a.try_borrow() {
+                    Ok(inner) => walk(&inner, visiting),
+                    // Mutably borrowed elsewhere: contents unknowable —
+                    // fail closed (may hold a cap).
+                    Err(_) => false,
+                };
+                visiting.pop();
+                result
+            }
+            Val::Nil
+            | Val::Bool(_)
+            | Val::Int(_)
+            | Val::Float(_)
+            | Val::Str(_)
+            | Val::Sym(_)
+            | Val::Keyword(_)
+            | Val::Bytes(_) => true,
+            Val::List(items) | Val::Vector(items) | Val::Set(items) => {
+                items.iter().all(|v| walk(v, visiting))
+            }
+            Val::Map(m) => m
+                .iter()
+                .all(|(k, v)| walk(k, visiting) && walk(v, visiting)),
+            Val::Fn { is_cap_free, .. } | Val::Macro { is_cap_free, .. } => *is_cap_free,
+            Val::Cell { .. }
+            | Val::NativeFn { .. }
+            | Val::AsyncNativeFn { .. }
+            | Val::Cap { .. } => false,
+            Val::Recur(_) | Val::Effect { .. } | Val::Resume(_) => false,
         }
-        Val::Map(m) => m
-            .iter()
-            .all(|(k, v)| is_authority_free(k) && is_authority_free(v)),
-        Val::Fn { is_cap_free, .. } | Val::Macro { is_cap_free, .. } => *is_cap_free,
-        Val::Cell { .. } | Val::NativeFn { .. } | Val::AsyncNativeFn { .. } | Val::Cap { .. } => {
-            false
-        }
-        Val::Recur(_) | Val::Effect { .. } | Val::Resume(_) => false,
     }
+    walk(value, &mut Vec::new())
 }
 
 fn compute_cap_status(env: &Env) -> (bool, Option<String>) {
@@ -1120,6 +1146,7 @@ fn eval_builtin(name: &str, args: &[Val]) -> Option<Result<Val, Val>> {
                 Val::Map(_) => "map",
                 Val::Set(_) => "set",
                 Val::Bytes(_) => "bytes",
+                Val::Atom(_) => "atom",
                 Val::Fn { .. } => "fn",
                 Val::Recur(_) => "recur",
                 Val::Macro { .. } => "macro",
@@ -1209,6 +1236,37 @@ fn eval_builtin(name: &str, args: &[Val]) -> Option<Result<Val, Val>> {
         }
 
         // --- Other ---
+        "atom" => {
+            if args.len() != 1 {
+                return Some(Err(error::arity("atom", "1", args.len())));
+            }
+            Some(Ok(Val::Atom(Rc::new(RefCell::new(args[0].clone())))))
+        }
+
+        "deref" => {
+            if args.len() != 1 {
+                return Some(Err(error::arity("deref", "1", args.len())));
+            }
+            match &args[0] {
+                Val::Atom(a) => Some(Ok(a.borrow().clone())),
+                other => Some(Err(error::type_mismatch("deref", "atom", other))),
+            }
+        }
+
+        "reset!" => {
+            if args.len() != 2 {
+                return Some(Err(error::arity("reset!", "2", args.len())));
+            }
+            match &args[0] {
+                Val::Atom(a) => {
+                    let new_val = args[1].clone();
+                    *a.borrow_mut() = new_val.clone();
+                    Some(Ok(new_val))
+                }
+                other => Some(Err(error::type_mismatch("reset!", "atom", other))),
+            }
+        }
+
         "gensym" => {
             if !args.is_empty() {
                 return Some(Err(error::arity("gensym", "0", args.len())));
@@ -1789,6 +1847,47 @@ pub fn eval_expr<'a, D: Dispatch>(
 
                 // Stack walk: find the matching handler frame.
                 perform_dispatch(&env.handler_stack, effect_target, data_val).await
+            }
+
+            Expr::PerformStar { target, payload } => {
+                // Apply-style perform: the payload list's elements are the
+                // args `perform` would take. Lets a generic handler delegate
+                // its `(method args...)` payload without knowing the arity.
+                let target_val = eval_expr(target, env, dispatch).await?;
+                let payload_val = eval_expr(payload, env, dispatch).await?;
+                let items: Vec<Val> = match payload_val {
+                    Val::List(v) | Val::Vector(v) => v,
+                    other => {
+                        return Err(error::type_mismatch(
+                            "perform* payload",
+                            "list or vector",
+                            &other,
+                        ))
+                    }
+                };
+                match &target_val {
+                    Val::Cap { .. } => perform_cap_value(&target_val, &items, env, dispatch).await,
+                    Val::Keyword(s) => {
+                        if items.len() != 1 {
+                            return Err(error::arity(
+                                "perform* (keyword effect)",
+                                "payload of 1 element",
+                                items.len(),
+                            ));
+                        }
+                        perform_dispatch(
+                            &env.handler_stack,
+                            effect::EffectTarget::Keyword(s.clone()),
+                            items.into_iter().next().unwrap(),
+                        )
+                        .await
+                    }
+                    other => Err(error::type_mismatch(
+                        "perform* target",
+                        "keyword or cap",
+                        other,
+                    )),
+                }
             }
 
             Expr::Match { expr, clauses } => {
@@ -7134,6 +7233,268 @@ mod tests {
         if let Err(err) = &result {
             assert!(err_contains(err, "depth limit"));
         }
+    }
+
+    // -----------------------------------------------------------------
+    // perform* — apply-style perform
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn perform_star_keyword_effect() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(with-effect-handler :x (fn [d resume] (resume (+ d 1)))
+               (perform* :x [41]))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Int(42)));
+    }
+
+    #[test]
+    fn perform_star_cap_delegates_payload() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(do (defcap svc :add (fn [a b] (+ a b)))
+                 (perform* svc (list :add 2 3)))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Int(5)));
+    }
+
+    #[test]
+    fn perform_star_rejects_non_list_payload() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(perform* :x 41)", &mut env, &d);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn perform_star_in_handler_skips_self() {
+        // The load-bearing property for interposition handlers: a handler
+        // delegating via perform* must reach the cap's own behavior, not
+        // recurse into itself.
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str(
+            "(do (defcap svc :echo (fn [x] x))
+                 (with-effect-handler svc (fn [data resume] (resume (perform* svc data)))
+                   (perform svc :echo 7)))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Int(7)));
+    }
+
+    // -----------------------------------------------------------------
+    // ww/policy module (std/lib/ww/policy.glia) — the P1 handlers
+    // -----------------------------------------------------------------
+
+    const POLICY_GLIA: &str = include_str!("../../../std/lib/ww/policy.glia");
+
+    /// Load prelude + the ww/policy module source, then eval `input` in the
+    /// same env. Mirrors what `(perform import "ww/policy")` provides.
+    fn policy_eval(input: &str) -> Result<Val, Val> {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        for src in [crate::PRELUDE, POLICY_GLIA] {
+            let forms = crate::read_many(src).map_err(|e| Val::from(format!("parse: {e}")))?;
+            for form in &forms {
+                eval_blocking(form, &mut env, &d)?;
+            }
+        }
+        eval_str(input, &mut env, &d)
+    }
+
+    #[test]
+    fn policy_audit_logs_then_delegates() {
+        let result = policy_eval(
+            "(do (defcap svc :echo (fn [x] x))
+                 (def *log* (atom (list)))
+                 (let [out (with-effect-handler svc
+                             (audit svc (fn [d] (reset! *log* (concat (deref *log*) (list d)))))
+                             (perform svc :echo 7))]
+                   (list out (count (deref *log*)))))",
+        )
+        .unwrap();
+        assert_eq!(result, Val::List(vec![Val::Int(7), Val::Int(1)]));
+    }
+
+    #[test]
+    fn policy_mock_stubs_and_fails_closed() {
+        let stubbed = policy_eval(
+            "(do (defcap svc :echo (fn [x] x))
+                 (with-effect-handler svc (mock {:echo 99 :add (fn [a b] (+ a b))})
+                   (list (perform svc :echo 7) (perform svc :add 2 3))))",
+        )
+        .unwrap();
+        assert_eq!(stubbed, Val::List(vec![Val::Int(99), Val::Int(5)]));
+
+        let unstubbed = policy_eval(
+            "(do (defcap svc :echo (fn [x] x))
+                 (with-effect-handler svc (mock {:echo 99})
+                   (perform svc :other 1)))",
+        );
+        assert!(unstubbed.is_err());
+        assert!(err_contains(&unstubbed.unwrap_err(), "not stubbed"));
+    }
+
+    #[test]
+    fn policy_retry_retries_until_success() {
+        // The defcap fails twice (atom-backed counter), then succeeds;
+        // retry 3 absorbs both failures.
+        let result = policy_eval(
+            "(do (def *fails* (atom 0))
+                 (defcap svc :flaky (fn []
+                   (if (< (deref *fails*) 2)
+                     (do (reset! *fails* (+ (deref *fails*) 1))
+                         (throw (ex-info \"transient\" {:type :glia.error/internal})))
+                     :recovered)))
+                 (with-effect-handler svc (retry svc 3)
+                   (perform svc :flaky)))",
+        )
+        .unwrap();
+        assert_eq!(result, Val::Keyword("recovered".into()));
+    }
+
+    #[test]
+    fn policy_retry_exhausts_and_rethrows() {
+        let result = policy_eval(
+            "(do (defcap svc :flaky (fn []
+                   (throw (ex-info \"always down\" {:type :glia.error/internal}))))
+                 (with-effect-handler svc (retry svc 2)
+                   (perform svc :flaky)))",
+        );
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "always down"));
+    }
+
+    #[test]
+    fn policy_budget_denies_after_n() {
+        let ok = policy_eval(
+            "(do (defcap svc :echo (fn [x] x))
+                 (with-effect-handler svc (budget svc 2)
+                   (list (perform svc :echo 1) (perform svc :echo 2))))",
+        )
+        .unwrap();
+        assert_eq!(ok, Val::List(vec![Val::Int(1), Val::Int(2)]));
+
+        let over = policy_eval(
+            "(do (defcap svc :echo (fn [x] x))
+                 (with-effect-handler svc (budget svc 2)
+                   (do (perform svc :echo 1)
+                       (perform svc :echo 2)
+                       (perform svc :echo 3))))",
+        );
+        assert!(over.is_err());
+        assert!(err_contains(&over.unwrap_err(), "budget"));
+    }
+
+    #[test]
+    fn policy_attenuate_handler_is_attenuate_sugar() {
+        // With the default dispatch (no embedder reification) this exercises
+        // the local fallback path; the kernel reifies the same surface into
+        // a membrane. Allowed method works, unlisted method fails closed.
+        let allowed = policy_eval(
+            "(do (defcap svc :echo (fn [x] x) :zap (fn [] :boom))
+                 (attenuate-handler ro svc [:echo]
+                   (perform ro :echo 7)))",
+        )
+        .unwrap();
+        assert_eq!(allowed, Val::Int(7));
+
+        let denied = policy_eval(
+            "(do (defcap svc :echo (fn [x] x) :zap (fn [] :boom))
+                 (attenuate-handler ro svc [:echo]
+                   (perform ro :zap)))",
+        );
+        assert!(denied.is_err());
+        assert!(err_contains(&denied.unwrap_err(), "denied"));
+    }
+
+    /// Was the retry blocker: closures dropped macro-expansion globals
+    /// (`try` captured, `try-catches` not). Fixed by Env::capture_closure
+    /// (#572); kept as the policy-context regression alongside the capture
+    /// tests below.
+    #[test]
+    fn closure_calling_try_macro_resolves_try_catches() {
+        // Minimal, handler-independent repro.
+        assert_eq!(
+            policy_eval("(do (defn f [] (try (throw 1) (catch _ e e))) (f))"),
+            Ok(Val::Int(1)),
+        );
+    }
+
+    #[test]
+    fn def_inside_closure_does_not_mutate_caller_root() {
+        // Pinned semantics: `def` from inside a fn body writes the closure's
+        // own root, not the caller's. Cross-invocation state needs an atom.
+        assert_eq!(
+            prelude_eval("(do (def *n* 1) (defn bump [] (def *n* 9)) (bump) *n*)"),
+            Ok(Val::Int(1))
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // atoms — evaluator-local mutable cells
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn atom_deref_reset_roundtrip() {
+        assert_eq!(
+            prelude_eval("(let [a (atom 1)] (reset! a 5) (deref a))"),
+            Ok(Val::Int(5))
+        );
+    }
+
+    #[test]
+    fn atom_state_survives_across_closure_invocations() {
+        // The property budget/rate-limit handlers depend on: a captured atom
+        // is shared, not cloned, across calls.
+        assert_eq!(
+            prelude_eval(
+                "(let [a (atom 0)
+                       bump (fn [] (reset! a (+ (deref a) 1)))]
+                   (bump) (bump) (bump)
+                   (deref a))"
+            ),
+            Ok(Val::Int(3))
+        );
+    }
+
+    #[test]
+    fn self_referential_atom_does_not_hang_cap_status() {
+        // (reset! a a) makes the value graph cyclic; defining a closure over
+        // it triggers compute_cap_status -> is_authority_free, which must
+        // terminate via cycle detection (naive recursion stack-overflows:
+        // RefCell allows nested shared borrows, so it is not a borrow panic).
+        let r = prelude_eval(
+            "(let [a (atom nil)]
+               (reset! a a)
+               (let [f (fn [] a)]
+                 (f)
+                 :done))",
+        );
+        assert_eq!(r, Ok(Val::Keyword("done".into())));
+    }
+
+    #[test]
+    fn atom_equality_is_identity() {
+        assert_eq!(
+            prelude_eval("(let [a (atom 1) b (atom 1)] (list (= a a) (= a b)))"),
+            Ok(Val::List(vec![Val::Bool(true), Val::Bool(false)]))
+        );
+    }
+
+    #[test]
+    fn atom_deref_type_errors_are_structured() {
+        let r = prelude_eval("(deref 42)");
+        assert!(r.is_err());
+        assert!(err_contains(&r.unwrap_err(), "atom"));
     }
 
     // -----------------------------------------------------------------
