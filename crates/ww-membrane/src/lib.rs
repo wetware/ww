@@ -618,6 +618,12 @@ struct MembraneResults {
     cap_table: CapTable,
     policy: Rc<dyn Policy>,
     outcome: Option<oneshot::Sender<capnp::Result<()>>>,
+    /// True when the buffered payload has been copied into `inner` and not
+    /// modified since. Prevents the Drop flush from re-copying (and
+    /// re-wrapping the cap table into) an inner hook that `set_pipeline`
+    /// already flushed, while still flushing late writes: `get()` hands the
+    /// callee a builder again, so it re-arms the flag.
+    flushed: bool,
 }
 
 impl MembraneResults {
@@ -632,6 +638,7 @@ impl MembraneResults {
             cap_table: CapTable::new(),
             policy,
             outcome: Some(outcome),
+            flushed: false,
         }
     }
 
@@ -648,17 +655,20 @@ impl MembraneResults {
             })
             .collect();
         reader.imbue(&wrapped);
-        self.inner.get()?.set_as(reader)
+        self.inner.get()?.set_as(reader)?;
+        self.flushed = true;
+        Ok(())
     }
 }
 
 impl Drop for MembraneResults {
     fn drop(&mut self) {
-        // Drop is capnp's "results done" signal. Flush here, then report the
-        // outcome so a copy failure becomes the call's error (D7) rather than
-        // a silently empty result. The receiver may already be gone (caller
-        // cancelled) — send is best-effort.
-        let res = self.flush();
+        // Drop is capnp's "results done" signal. Flush here (unless the
+        // buffer was already flushed by set_pipeline and untouched since),
+        // then report the outcome so a copy failure becomes the call's error
+        // (D7) rather than a silently empty result. The receiver may already
+        // be gone (caller cancelled) — send is best-effort.
+        let res = if self.flushed { Ok(()) } else { self.flush() };
         if let Some(tx) = self.outcome.take() {
             let _ = tx.send(res);
         }
@@ -667,6 +677,9 @@ impl Drop for MembraneResults {
 
 impl ResultsHook for MembraneResults {
     fn get(&mut self) -> capnp::Result<any_pointer::Builder<'_>> {
+        // The callee may write through this builder; anything flushed so far
+        // is stale until the next flush.
+        self.flushed = false;
         let mut builder: any_pointer::Builder = self.message.get_root()?;
         builder.imbue_mut(&mut self.cap_table);
         Ok(builder)
@@ -969,6 +982,99 @@ mod tests {
                 assert!(e.to_string().contains("injected results failure"));
             }
             other => panic!("expected the flush error to be reported, got {other:?}"),
+        }
+    }
+
+    /// A results hook that counts how many times the membrane copies into it.
+    struct CountingResults {
+        message: Builder<HeapAllocator>,
+        copies: Rc<Cell<u32>>,
+    }
+
+    impl ResultsHook for CountingResults {
+        fn get(&mut self) -> capnp::Result<any_pointer::Builder<'_>> {
+            // Each flush obtains the builder exactly once to `set_as` into it.
+            self.copies.set(self.copies.get() + 1);
+            self.message.get_root()
+        }
+        fn set_pipeline(&mut self) -> capnp::Result<()> {
+            Ok(())
+        }
+        fn allow_cancellation(&self) {}
+        fn tail_call(self: Box<Self>, _r: Box<dyn RequestHook>) -> Promise<(), Error> {
+            Promise::err(Error::unimplemented("unused".into()))
+        }
+        fn direct_tail_call(
+            self: Box<Self>,
+            _r: Box<dyn RequestHook>,
+        ) -> (Promise<(), Error>, Box<dyn PipelineHook>) {
+            let e = Error::unimplemented("unused".into());
+            (
+                Promise::err(e.clone()),
+                Box::new(BrokenPipeline { error: e }),
+            )
+        }
+    }
+
+    /// set_pipeline flushes; an untouched Drop must NOT copy into the inner
+    /// hook a second time (re-copying would overwrite the root the pipeline
+    /// already resolved against and re-wrap the cap table into fresh
+    /// membranes).
+    #[test]
+    fn drop_after_set_pipeline_does_not_double_flush() {
+        let copies = Rc::new(Cell::new(0));
+        let inner = CountingResults {
+            message: Builder::new_default(),
+            copies: copies.clone(),
+        };
+        let (tx, mut rx) = oneshot::channel();
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let mut mr = MembraneResults::new(Box::new(inner), policy, tx);
+
+        mr.get().unwrap().set_as("hello").unwrap();
+        mr.set_pipeline().unwrap();
+        assert_eq!(copies.get(), 1, "set_pipeline must flush exactly once");
+
+        drop(mr);
+        assert_eq!(
+            copies.get(),
+            1,
+            "drop after an untouched set_pipeline flush must not copy again"
+        );
+        // The outcome still reports success for the call.
+        match rx.try_recv() {
+            Ok(Some(Ok(()))) => {}
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+    }
+
+    /// Writes AFTER set_pipeline are legal (set_pipeline unblocks pipelining
+    /// early); the Drop flush must deliver them rather than treating the
+    /// earlier flush as final.
+    #[test]
+    fn late_writes_after_set_pipeline_are_flushed_on_drop() {
+        let copies = Rc::new(Cell::new(0));
+        let inner = CountingResults {
+            message: Builder::new_default(),
+            copies: copies.clone(),
+        };
+        let (tx, mut rx) = oneshot::channel();
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let mut mr = MembraneResults::new(Box::new(inner), policy, tx);
+
+        mr.get().unwrap().set_as("early").unwrap();
+        mr.set_pipeline().unwrap();
+        mr.get().unwrap().set_as("late").unwrap();
+
+        drop(mr);
+        assert_eq!(
+            copies.get(),
+            2,
+            "a write after set_pipeline must be flushed at drop"
+        );
+        match rx.try_recv() {
+            Ok(Some(Ok(()))) => {}
+            other => panic!("expected Ok outcome, got {other:?}"),
         }
     }
 }
