@@ -11,6 +11,43 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 // =========================================================================
+// Effect tracing (G3) — perform-lifecycle diagnostics behind an env flag
+// =========================================================================
+
+/// True when `GLIA_TRACE_EFFECTS` is set (non-empty and not "0").
+///
+/// Gates stderr tracing of the perform lifecycle: dispatch, handler match,
+/// resume, and the handler-stack diagnostic on unhandled effects. Read once
+/// per process; intended for debugging effect-routing issues, not steady-state
+/// logging.
+pub(crate) fn trace_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("GLIA_TRACE_EFFECTS")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Human-readable one-liner for an unhandled effect: the target plus every
+/// handler frame currently on the stack (outermost first), so the reader can
+/// see exactly what WAS in scope when dispatch found no match. Pure, so it is
+/// unit-testable independent of the env flag / stderr.
+pub(crate) fn format_unhandled_diagnostic(
+    target: &EffectTarget,
+    stack: &[Rc<RefCell<HandlerContext>>],
+) -> String {
+    let frames: Vec<String> = stack
+        .iter()
+        .map(|ctx| format!("{:?}", ctx.borrow().target))
+        .collect();
+    format!(
+        "unhandled effect {target:?}; handler stack (outermost first): [{}]",
+        frames.join(", ")
+    )
+}
+
+// =========================================================================
 // Types
 // =========================================================================
 
@@ -113,6 +150,9 @@ pub fn make_resume_fn(tx: oneshot::Sender) -> Val {
                 .take()
                 .ok_or_else(error::continuation_already_resumed)?;
             let val = args[0].clone();
+            if trace_enabled() {
+                eprintln!("[glia:effect] resume <- {val}");
+            }
             tx.send(val.clone());
             Err(Val::Resume(Box::new(val)))
         }),
@@ -122,6 +162,37 @@ pub fn make_resume_fn(tx: oneshot::Sender) -> Val {
 // =========================================================================
 // Tests
 // =========================================================================
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn unhandled_diagnostic_lists_stack_frames() {
+        let mk = |t: EffectTarget| {
+            Rc::new(RefCell::new(HandlerContext {
+                slot: Rc::new(RefCell::new(EffectSlot::new())),
+                target: t,
+            }))
+        };
+        let stack = vec![
+            mk(EffectTarget::Keyword("log".into())),
+            mk(EffectTarget::Keyword("glia.exception".into())),
+        ];
+        let msg = format_unhandled_diagnostic(&EffectTarget::Keyword("net".into()), &stack);
+        assert!(msg.contains("unhandled effect"), "{msg}");
+        assert!(msg.contains("net"), "{msg}");
+        assert!(msg.contains("log"), "{msg}");
+        assert!(msg.contains("glia.exception"), "{msg}");
+    }
+
+    #[test]
+    fn unhandled_diagnostic_empty_stack() {
+        let msg = format_unhandled_diagnostic(&EffectTarget::Keyword("x".into()), &[]);
+        assert!(msg.contains("[]"), "{msg}");
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

@@ -2898,6 +2898,15 @@ async fn perform_dispatch(
             .cloned()
     };
 
+    if effect::trace_enabled() {
+        eprintln!(
+            "[glia:effect] perform {:?} (stack depth {}, matched: {})",
+            effect_target,
+            handler_stack.borrow().len(),
+            matching_ctx.is_some()
+        );
+    }
+
     match matching_ctx {
         Some(ctx) => {
             let (tx, rx) = oneshot::channel();
@@ -2905,7 +2914,18 @@ async fn perform_dispatch(
             rx.await
         }
         None => {
-            // No matching handler — propagate as unhandled effect.
+            // No matching handler — propagate as unhandled effect. Under
+            // GLIA_TRACE_EFFECTS, dump the handler stack so the reader can
+            // see what WAS in scope (G3 diagnostic).
+            if effect::trace_enabled() {
+                eprintln!(
+                    "[glia:effect] {}",
+                    effect::format_unhandled_diagnostic(
+                        &effect_target,
+                        &handler_stack.borrow()
+                    )
+                );
+            }
             let effect_type = match &effect_target {
                 effect::EffectTarget::Keyword(s) => s.clone(),
                 effect::EffectTarget::Cap { name, .. } => format!("cap:{name}"),
