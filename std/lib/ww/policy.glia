@@ -1,0 +1,81 @@
+;; ww/policy — interposition handler patterns for capabilities
+;;
+;; Usage: (def p (perform import "ww/policy"))
+;;        (with-effect-handler cap ((p :audit) cap println)
+;;          (perform cap :method args))
+;;
+;; These are LOCAL semantics: a handler interposes on (perform cap ...)
+;; inside a dynamic scope in THIS evaluator only. Authority that must
+;; survive a boundary crossing belongs in (attenuate ...), which reifies
+;; into a hook-level membrane that travels with the capability — see
+;; doc/designs/single-authority-capability-model.md. attenuate-handler
+;; below is the sugar that makes the split explicit: interpose locally
+;; with handlers, attenuate for anything leaving the cell.
+;;
+;; Handler protocol: (fn [data resume]) where data is the (:method args...)
+;; payload list and resume is the one-shot continuation. Delegation uses
+;; (perform* cap data) — the handler's own frame is already popped, so the
+;; re-perform reaches the next outer handler or the cap itself, never the
+;; delegating handler.
+
+;; --- audit -----------------------------------------------------------
+
+;; audit — pass-through that records every call before delegating.
+;; log-fn receives the raw (:method args...) payload.
+(defn audit [cap log-fn]
+  (fn [data resume]
+    (log-fn data)
+    (resume (perform* cap data))))
+
+;; --- mock ------------------------------------------------------------
+
+;; mock — answer from a canned table without touching any cap.
+;; table maps :method to either a literal reply or a function of the
+;; method args. Unstubbed methods fail closed.
+(defn mock [table]
+  (fn [data resume]
+    (let [method (first data)
+          args (rest data)]
+      (if (contains? table method)
+        (let [entry (get table method)]
+          (resume (if (= (type entry) :fn)
+                    (apply entry args)
+                    entry)))
+        (throw (ex-info "mock: method not stubbed"
+                        {:type :glia.error/permission-denied
+                         :method method}))))))
+
+;; --- retry (not yet shipped) ------------------------------------------
+;;
+;; A retry handler needs (try (perform* cap data) (catch ...)) inside the
+;; handler body, and a known engine bug currently makes that swallow the
+;; thrown effect (see the ignored test
+;; try_inside_cap_handler_catches_thrown_effect in glia's eval tests).
+;; retry lands once that dispatch bug is fixed.
+
+;; --- budget ----------------------------------------------------------
+
+;; budget — allow at most n delegated calls, then fail closed. The counter
+;; lives in an atom captured by the handler closure, so it survives across
+;; invocations (a `def` from inside a closure would not).
+(defn budget [cap n]
+  (let [used (atom 0)]
+    (fn [data resume]
+      (if (< (deref used) n)
+        (do
+          (reset! used (+ (deref used) 1))
+          (resume (perform* cap data)))
+        (throw (ex-info "budget: call budget exhausted"
+                        {:type :glia.error/permission-denied
+                         :budget n}))))))
+
+;; --- attenuate-handler -----------------------------------------------
+
+;; attenuate-handler — sugar over (attenuate ...): binds name to the
+;; attenuated cap for the extent of body. Use this (or attenuate
+;; directly) for any capability leaving the cell: unlike the handlers
+;; above, the attenuation is enforced on the capability reference itself
+;; and survives export/serve/dial.
+(defmacro attenuate-handler [name cap methods & body]
+  `(let [~name (attenuate ~cap ~methods)]
+     ~@body))
