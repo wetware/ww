@@ -77,6 +77,13 @@ a typed client. Denied methods fail closed with
   attenuation time.
 - Re-attenuation intersects: `(attenuate (attenuate c [:a :b]) [:b :c])`
   allows exactly `:b`, in a single membrane layer.
+- Attenuation confines the entire reachable graph: capabilities returned
+  by allowed methods come back wrapped in the same membrane, and the
+  attenuate surface can only name methods on the attenuated cap's own
+  interface — so transitively-reached caps (e.g. an `Executor` obtained
+  through an attenuated `runtime`) are fully confined, fail-closed.
+  Granting authority on transitive interfaces is a future surface
+  extension.
 - Caps with no compiled schema (e.g. obtained from a vat dial) cannot be
   attenuated yet — that requires the deferred schema-association design.
 - `defcap` caps (pure Glia, cell-local) keep evaluator-local allowlist

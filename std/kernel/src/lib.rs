@@ -3120,6 +3120,89 @@ mod tests {
         .await;
     }
 
+    /// Cross-boundary E2E over vat-style transport (roadmap D11): the cap
+    /// produced by `(attenuate ...)` is served as the bootstrap of a REAL
+    /// serialized capnp-rpc twoparty connection — exactly what the vat
+    /// listener does per accepted libp2p stream — and attacked from the far
+    /// side with a typed client. Nested attenuation is composed before
+    /// serving, so the intersected policy is what travels.
+    #[tokio::test]
+    async fn attenuated_cap_enforced_across_vat_style_transport() {
+        use capnp_rpc::rpc_twoparty_capnp::Side;
+        use capnp_rpc::twoparty::VatNetwork;
+        use capnp_rpc::RpcSystem;
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+        run_local(async {
+            let ctx = RefCell::new(test_session());
+            let dispatch = build_dispatch();
+            let mut env = Env::new();
+            bind_caps_in_env(&mut env, &ctx.borrow());
+
+            // Depth-2 delegation: {id, addrs} ∩ {id} = {id}.
+            let form = read("(attenuate (attenuate host [:id :addrs]) [:id])").unwrap();
+            let cap = eval(&form, &mut env, &ctx, &dispatch).await.unwrap();
+            let Val::Cap { inner, .. } = &cap else {
+                panic!("expected cap, got {cap:?}");
+            };
+            let served = extract_capnp_client(inner).expect("attenuated cap must export");
+
+            // Serve it as the bootstrap of a twoparty connection (what
+            // VatListener.serve does per accepted libp2p stream).
+            let (dialer_end, listener_end) = tokio::io::duplex(8 * 1024);
+            let (lr, lw) = tokio::io::split(listener_end);
+            let server_network = VatNetwork::new(
+                lr.compat(),
+                lw.compat_write(),
+                Side::Server,
+                Default::default(),
+            );
+            let server_rpc = RpcSystem::new(Box::new(server_network), Some(served));
+            tokio::task::spawn_local(async move {
+                let _ = server_rpc.await;
+            });
+
+            // Dial side: bootstrap and cast to the typed interface.
+            let (dr, dw) = tokio::io::split(dialer_end);
+            let dial_network = VatNetwork::new(
+                dr.compat(),
+                dw.compat_write(),
+                Side::Client,
+                Default::default(),
+            );
+            let mut dial_rpc = RpcSystem::new(Box::new(dial_network), None);
+            let remote: system_capnp::host::Client = dial_rpc.bootstrap(Side::Server);
+            tokio::task::spawn_local(async move {
+                let _ = dial_rpc.await;
+            });
+
+            // Allowed by both layers: passes through to the stub.
+            let resp = remote.id_request().send().promise.await.unwrap();
+            assert_eq!(resp.get().unwrap().get_peer_id().unwrap(), STUB_PEER_ID);
+
+            // Allowed by the inner layer only: the intersection denies it.
+            let err = match remote.addrs_request().send().promise.await {
+                Ok(_) => panic!("addrs must be denied by the intersected policy"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains(ww_membrane::DENIED_MARKER),
+                "intersected denial must cross the wire: {err}"
+            );
+
+            // Never allowed: denied, marker crosses the wire.
+            let err = match remote.peers_request().send().promise.await {
+                Ok(_) => panic!("peers must be denied by the membrane"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains(ww_membrane::DENIED_MARKER),
+                "membrane denial must cross the wire: {err}"
+            );
+        })
+        .await;
+    }
+
     /// Verify that (perform :load "path") inside wrap_with_handlers
     /// actually resolves through the effect handler → eval_load → filesystem.
     #[tokio::test]
