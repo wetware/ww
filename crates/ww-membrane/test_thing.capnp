@@ -7,4 +7,8 @@ interface Thing {
   ping      @0 () -> (msg :Text);
   forbidden @1 () -> (msg :Text);
   child     @2 () -> (thing :Thing);
+  # Takes a capability as a parameter and calls `forbidden` on it, echoing the
+  # result. Exercises reverse-direction (param) handling: a membrane of ours
+  # passed back in should be unwrapped so the backend sees the bare cap.
+  echo      @3 (thing :Thing) -> (msg :Text);
 }

@@ -13,18 +13,22 @@
 //!   * re-wraps capabilities produced by promise resolution
 //!     (`get_resolved` / `when_more_resolved`).
 //!
-//! Direction handled: caps flowing OUT of the membrane (results, pipelines,
-//! resolution). Caps flowing INTO the membrane (request params) pass through
-//! unwrapped here; the full dual membrane (reverse-wrap params, unwrap on
-//! reentry) is tracked as M3 in the single-authority roadmap.
+//! Directions handled: caps flowing OUT of the membrane (results, pipelines,
+//! resolution) are re-wrapped as above. Caps flowing INTO the membrane
+//! (request params) that are our own membranes are unwrapped to the bare
+//! backing cap on send, restoring the identity the backend originally
+//! exported; foreign caps pass through unchanged — a parameter is
+//! caller-granted authority, not something the outbound policy attenuates.
+//! (Reverse-wrapping foreign params — a fully symmetric membrane — is a
+//! deliberate non-goal for now.)
 //!
 //! [`Policy`] is a trait, so one membrane mechanism serves allowlists,
 //! revocation, rate limits, and auditing. `check` takes `&self` but may hold
 //! interior-mutable state; the membrane calls it once per invocation.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use capnp::any_pointer;
@@ -35,6 +39,7 @@ use capnp::private::capability::{
 };
 use capnp::traits::{Imbue, ImbueMut};
 use capnp::{Error, MessageSize};
+use futures::channel::oneshot;
 
 type CapTable = Vec<Option<Box<dyn ClientHook>>>;
 
@@ -95,6 +100,17 @@ pub fn denied_method_key(err: &Error) -> Option<(u64, u16)> {
 /// call, fail-closed; prefer [`denied_error`] so the denial is routable.
 pub trait Policy {
     fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error>;
+
+    /// If this policy is a pure static allowlist, the set of keys it permits.
+    /// Enables collapse-on-wrap: attenuating an already-membraned cap with two
+    /// static allowlists folds into a single membrane layer whose allowlist is
+    /// the intersection, so delegation depth stays O(1) in copies rather than
+    /// growing a membrane per hop (roadmap D3/D18). Stateful policies
+    /// (revocation, rate limit) return `None` and therefore stack, because
+    /// their per-call state cannot be merged into a set.
+    fn allowlist_keys(&self) -> Option<HashSet<(u64, u16)>> {
+        None
+    }
 }
 
 /// Stateless `(interface_id, method_id)` allowlist. The first and simplest
@@ -122,6 +138,10 @@ impl Policy for Allowlist {
         } else {
             Err(denied_error(interface_id, method_id, "not on allowlist"))
         }
+    }
+
+    fn allowlist_keys(&self) -> Option<HashSet<(u64, u16)>> {
+        Some(self.allowed.clone())
     }
 }
 
@@ -230,15 +250,92 @@ struct MembraneState {
     policy: Rc<dyn Policy>,
 }
 
+// ---------------------------------------------------------------------------
+// Membrane identity (for unwrap-on-reentry, double-wrap avoidance, collapse)
+// ---------------------------------------------------------------------------
+//
+// A capability has no `Any`, so to recognize "this hook is one of my
+// membranes" we use two coordinates:
+//   * `get_brand()` returns MEMBRANE_BRAND — the address of a data-segment
+//     `static`. capnp-rpc connection brands are `self as *const ConnectionState`
+//     (heap) and local/broken hooks use 0, so this value can never collide with
+//     a real connection brand and therefore never makes the RPC layer mistake a
+//     membraned cap for one of its own (which would tunnel through the membrane).
+//   * `get_ptr()` returns the per-membrane `Rc<MembraneState>` address, which a
+//     process-local registry maps back to the live `MembraneState`.
+//
+// Together they let [`membrane_state_of`] downcast an arbitrary hook to its
+// backing membrane without `Any`.
+
+static MEMBRANE_BRAND_ANCHOR: u8 = 0;
+
+fn membrane_brand() -> usize {
+    &MEMBRANE_BRAND_ANCHOR as *const u8 as usize
+}
+
+thread_local! {
+    static REGISTRY: RefCell<HashMap<usize, Weak<MembraneState>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn registry_insert(state: &Rc<MembraneState>) {
+    let key = Rc::as_ptr(state) as *const () as usize;
+    REGISTRY.with(|r| {
+        r.borrow_mut().insert(key, Rc::downgrade(state));
+    });
+}
+
+/// If `hook` is a live membrane of ours, return its backing state (inner cap +
+/// policy). Returns `None` for any non-membrane hook.
+fn membrane_state_of(hook: &dyn ClientHook) -> Option<Rc<MembraneState>> {
+    if hook.get_brand() != membrane_brand() {
+        return None;
+    }
+    let key = hook.get_ptr();
+    REGISTRY.with(|r| r.borrow().get(&key).and_then(Weak::upgrade))
+}
+
+impl Drop for MembraneState {
+    fn drop(&mut self) {
+        // Deregister by our own address (the registry key is Rc::as_ptr, which
+        // is the address of this MembraneState).
+        let key = self as *const MembraneState as *const () as usize;
+        REGISTRY.with(|r| {
+            r.borrow_mut().remove(&key);
+        });
+    }
+}
+
 pub struct MembraneHook {
     state: Rc<MembraneState>,
 }
 
 impl MembraneHook {
     pub fn wrap(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
-        Box::new(Self {
-            state: Rc::new(MembraneState { inner, policy }),
-        })
+        // Collapse-on-wrap: wrapping one of our own membranes with a static
+        // allowlist, when the inner policy is also a static allowlist, folds the
+        // two into a single layer whose allowlist is the intersection. This
+        // keeps `attenuate (attenuate c ..) ..` at one membrane hop instead of
+        // nesting (roadmap D3/D18). If either side is stateful (returns `None`
+        // from `allowlist_keys`), we fall through and stack, preserving its
+        // per-call state.
+        if let Some(existing) = membrane_state_of(&*inner) {
+            if let (Some(outer_keys), Some(inner_keys)) =
+                (policy.allowlist_keys(), existing.policy.allowlist_keys())
+            {
+                let allowed = outer_keys.intersection(&inner_keys).copied().collect();
+                let collapsed: Rc<dyn Policy> = Rc::new(Allowlist { allowed });
+                let state = Rc::new(MembraneState {
+                    inner: existing.inner.add_ref(),
+                    policy: collapsed,
+                });
+                registry_insert(&state);
+                return Box::new(Self { state });
+            }
+        }
+        let state = Rc::new(MembraneState { inner, policy });
+        registry_insert(&state);
+        Box::new(Self { state })
     }
 }
 
@@ -265,6 +362,8 @@ impl ClientHook for MembraneHook {
         Request::new(Box::new(MembraneRequest {
             inner: inner_request.hook,
             policy: self.state.policy.clone(),
+            message: Builder::new_default(),
+            cap_table: CapTable::new(),
         }))
     }
 
@@ -280,18 +379,38 @@ impl ClientHook for MembraneHook {
         }
         // Interpose on results so that caps placed there by the inner object
         // get membraned before they reach the caller (e.g. the RPC answer).
-        let wrapped_results = Box::new(MembraneResults::new(results, self.state.policy.clone()));
-        self.state
+        // The flush runs when the callee drops the results hook (capnp's own
+        // "results done" signal); its outcome is carried out over `rx` so a
+        // copy failure surfaces as the call's error instead of a silent empty
+        // result (roadmap D7). Drop remains the completion signal, matching
+        // capnp-rpc's local `Results`.
+        let (tx, rx) = oneshot::channel();
+        let wrapped_results =
+            Box::new(MembraneResults::new(results, self.state.policy.clone(), tx));
+        let inner = self
+            .state
             .inner
-            .call(interface_id, method_id, params, wrapped_results)
+            .call(interface_id, method_id, params, wrapped_results);
+        Promise::from_future(async move {
+            inner.await?;
+            match rx.await {
+                Ok(flush_result) => flush_result,
+                // Results hook dropped without sending (e.g. cancellation
+                // before any flush) — nothing was promised to the caller.
+                Err(oneshot::Canceled) => Ok(()),
+            }
+        })
     }
 
     fn get_brand(&self) -> usize {
-        // MUST NOT forward the inner brand: the RPC system uses the brand to
-        // recognize its own capabilities and take shortcuts (e.g. reflecting a
-        // cap back over the connection it came from), which would tunnel
-        // straight through the membrane.
-        0
+        // Membrane-unique sentinel (see MEMBRANE_BRAND_ANCHOR): lets us
+        // recognize our own membranes for unwrap-on-reentry, and — being a
+        // data-segment address — never collides with a capnp-rpc connection
+        // brand (`self as *const ConnectionState`, always heap) or the 0 used
+        // by local/broken hooks. It therefore does NOT let the RPC layer
+        // mistake a membraned cap for one of its own and tunnel through the
+        // membrane. Must NOT forward the inner brand.
+        membrane_brand()
     }
 
     fn get_ptr(&self) -> usize {
@@ -328,12 +447,26 @@ impl ClientHook for MembraneHook {
 struct MembraneRequest {
     inner: Box<dyn RequestHook>,
     policy: Rc<dyn Policy>,
+    // Params are staged here so the cap table can be transformed on send.
+    message: Builder<HeapAllocator>,
+    cap_table: CapTable,
 }
 
 impl RequestHook for MembraneRequest {
     fn get(&mut self) -> any_pointer::Builder<'_> {
-        // NOTE: params pass into the membrane unwrapped (see module docs / M3).
-        self.inner.get()
+        // Stage params in our own buffer so `send` can transform their cap
+        // table: our own membraned caps that round-trip back in are unwrapped
+        // to their originals (restoring `==` identity and avoiding
+        // double-indirection); foreign caps pass through unchanged.
+        //
+        // Note: this does NOT reverse-wrap foreign inbound caps in a policy of
+        // their own — a param is authority the caller *grants* to the backend,
+        // and attenuating it with this membrane's outbound policy would be
+        // wrong. A full symmetric (two-policy) membrane is a deliberate future
+        // option, not required for the recursion/identity properties here.
+        let mut root: any_pointer::Builder = self.message.get_root().unwrap();
+        root.imbue_mut(&mut self.cap_table);
+        root
     }
 
     fn get_brand(&self) -> usize {
@@ -341,7 +474,38 @@ impl RequestHook for MembraneRequest {
     }
 
     fn send(self: Box<Self>) -> RemotePromise<any_pointer::Owned> {
-        let Self { inner, policy } = *self;
+        let Self {
+            mut inner,
+            policy,
+            message,
+            mut cap_table,
+        } = *self;
+
+        // Unwrap-on-reentry: any staged param cap that is one of our own
+        // membranes is replaced by its inner original; foreign caps are kept.
+        for slot in cap_table.iter_mut() {
+            if let Some(hook) = slot.take() {
+                *slot = Some(match membrane_state_of(&*hook) {
+                    Some(state) => state.inner.add_ref(),
+                    None => hook,
+                });
+            }
+        }
+
+        // Copy the staged params (with the transformed cap table) into the real
+        // request. On copy failure, fail the send closed.
+        let copy = (|| -> capnp::Result<()> {
+            let mut reader: any_pointer::Reader = message.get_root_as_reader()?;
+            reader.imbue(&cap_table);
+            inner.get().set_as(reader)
+        })();
+        if let Err(e) = copy {
+            return RemotePromise {
+                promise: Promise::err(e.clone()),
+                pipeline: any_pointer::Pipeline::new(Box::new(BrokenPipeline { error: e })),
+            };
+        }
+
         let RemotePromise { promise, pipeline } = inner.send();
 
         // Wrap the pipeline hook so promise-pipelined caps stay inside.
@@ -443,28 +607,31 @@ impl PipelineHook for MembranePipeline {
 // MembraneResults: server-side (call() path) results interposition
 // ---------------------------------------------------------------------------
 
-/// Buffers results in our own message + cap table; on drop (i.e. when the
-/// callee has finished writing results), wraps every cap and copies the
-/// buffered payload into the real results hook.
-///
-/// NOTE (roadmap D7): the production membrane must flush explicitly on call
-/// completion so a copy failure surfaces as a described error; Drop cannot
-/// propagate errors. Kept as Drop here to match the proven spike; M3 replaces
-/// it with an explicit flush wrapping the returned promise.
+/// Buffers results in our own message + cap table; when the callee finishes and
+/// drops this hook (capnp's own "results done" signal), it wraps every cap and
+/// copies the buffered payload into the real results hook, then reports the copy
+/// outcome over `outcome` so `MembraneHook::call` can surface a copy failure as
+/// the call's error rather than a silent empty result (roadmap D7).
 struct MembraneResults {
     inner: Box<dyn ResultsHook>,
     message: Builder<HeapAllocator>,
     cap_table: CapTable,
     policy: Rc<dyn Policy>,
+    outcome: Option<oneshot::Sender<capnp::Result<()>>>,
 }
 
 impl MembraneResults {
-    fn new(inner: Box<dyn ResultsHook>, policy: Rc<dyn Policy>) -> Self {
+    fn new(
+        inner: Box<dyn ResultsHook>,
+        policy: Rc<dyn Policy>,
+        outcome: oneshot::Sender<capnp::Result<()>>,
+    ) -> Self {
         Self {
             inner,
             message: Builder::new_default(),
             cap_table: CapTable::new(),
             policy,
+            outcome: Some(outcome),
         }
     }
 
@@ -487,9 +654,14 @@ impl MembraneResults {
 
 impl Drop for MembraneResults {
     fn drop(&mut self) {
-        // Errors cannot propagate from Drop; the RPC layer will surface an
-        // empty/failed result if this copy fails. See D7 note above.
-        let _ = self.flush();
+        // Drop is capnp's "results done" signal. Flush here, then report the
+        // outcome so a copy failure becomes the call's error (D7) rather than
+        // a silently empty result. The receiver may already be gone (caller
+        // cancelled) — send is best-effort.
+        let res = self.flush();
+        if let Some(tx) = self.outcome.take() {
+            let _ = tx.send(res);
+        }
     }
 }
 
@@ -705,5 +877,98 @@ mod tests {
         assert!(rl.check(IFACE, 0).is_err());
         std::thread::sleep(Duration::from_millis(30));
         assert!(rl.check(IFACE, 0).is_ok(), "window should have reset");
+    }
+
+    // -----------------------------------------------------------------------
+    // Membrane identity (M3 mini-spike): sentinel brand + registry
+    // -----------------------------------------------------------------------
+
+    fn dummy_hook() -> Box<dyn ClientHook> {
+        // A non-membrane hook to wrap / to test negative recognition.
+        Box::new(BrokenClient {
+            state: Rc::new(Error::failed("dummy".into())),
+        })
+    }
+
+    #[test]
+    fn membrane_brand_is_nonzero_and_stable() {
+        // Non-zero (0 is local/broken) and stable across calls.
+        assert_ne!(membrane_brand(), 0);
+        assert_eq!(membrane_brand(), membrane_brand());
+    }
+
+    #[test]
+    fn membrane_recognizes_own_wrap_but_not_others() {
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let wrapped = MembraneHook::wrap(dummy_hook(), policy);
+
+        // Our membrane advertises the sentinel brand and resolves via registry.
+        assert_eq!(wrapped.get_brand(), membrane_brand());
+        assert!(
+            membrane_state_of(&*wrapped).is_some(),
+            "a membrane must recognize its own wrap"
+        );
+
+        // A bare, non-membrane hook is not recognized.
+        let bare = dummy_hook();
+        assert!(
+            membrane_state_of(&*bare).is_none(),
+            "a non-membrane hook must not resolve to a membrane"
+        );
+    }
+
+    #[test]
+    fn membrane_deregisters_on_drop() {
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let wrapped = MembraneHook::wrap(dummy_hook(), policy);
+        let key = wrapped.get_ptr();
+        assert!(REGISTRY.with(|r| r.borrow().contains_key(&key)));
+        drop(wrapped);
+        assert!(
+            REGISTRY.with(|r| !r.borrow().contains_key(&key)),
+            "dropping the last membrane ref must deregister it"
+        );
+    }
+
+    /// D7: a results-copy failure must be reported as the call's error, not
+    /// silently swallowed. A `ResultsHook` whose `get()` fails makes the flush
+    /// fail; the outcome channel must carry that error.
+    #[test]
+    fn flush_failure_is_reported_not_swallowed() {
+        struct FailingResults;
+        impl ResultsHook for FailingResults {
+            fn get(&mut self) -> capnp::Result<any_pointer::Builder<'_>> {
+                Err(Error::failed("injected results failure".into()))
+            }
+            fn set_pipeline(&mut self) -> capnp::Result<()> {
+                Ok(())
+            }
+            fn allow_cancellation(&self) {}
+            fn tail_call(self: Box<Self>, _r: Box<dyn RequestHook>) -> Promise<(), Error> {
+                Promise::err(Error::unimplemented("unused".into()))
+            }
+            fn direct_tail_call(
+                self: Box<Self>,
+                _r: Box<dyn RequestHook>,
+            ) -> (Promise<(), Error>, Box<dyn PipelineHook>) {
+                let e = Error::unimplemented("unused".into());
+                (
+                    Promise::err(e.clone()),
+                    Box::new(BrokenPipeline { error: e }),
+                )
+            }
+        }
+
+        let (tx, mut rx) = oneshot::channel();
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let mr = MembraneResults::new(Box::new(FailingResults), policy, tx);
+        drop(mr); // callee-done signal → flush runs → inner.get() fails
+
+        match rx.try_recv() {
+            Ok(Some(Err(e))) => {
+                assert!(e.to_string().contains("injected results failure"));
+            }
+            other => panic!("expected the flush error to be reported, got {other:?}"),
+        }
     }
 }
