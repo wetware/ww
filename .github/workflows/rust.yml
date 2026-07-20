@@ -449,6 +449,28 @@ jobs:
         chmod 600 ~/.ssh/deploy_key
         echo "$SSH_HOST_KEY" > ~/.ssh/known_hosts
 
+        # Guard: `kubectl set image` + `rollout status` both no-op-succeed
+        # on a zero-replica deployment, which made every deploy from
+        # 2026-06-08 to 2026-07-20 a vacuous success while the site served
+        # 503. A scaled-to-zero target must FAIL the deploy, loudly.
+        # Distinguish "query failed" from "scaled to zero" — set -e does
+        # not propagate out of command substitutions, so check explicitly.
+        if ! REPLICAS=$(ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" \
+          "kubectl get deployment ww-master -o jsonpath='{.spec.replicas}'"); then
+          echo "ERROR: could not query deployment/ww-master (ssh/kubectl"
+          echo "failure above) — cannot verify the deploy target. Check"
+          echo "connectivity and kubectl config on the VPS."
+          exit 1
+        fi
+        if [ -z "$REPLICAS" ] || [ "$REPLICAS" = "0" ]; then
+          echo "ERROR: deployment/ww-master has ${REPLICAS:-no} desired replicas."
+          echo "A rollout against a scaled-to-zero deployment is a no-op;"
+          echo "refusing to report success. Scale it up (kubectl scale"
+          echo "deployment/ww-master --replicas=1) or investigate why it"
+          echo "was scaled down."
+          exit 1
+        fi
+
         # `kubectl set image` rolls out the SHA-tagged image and is
         # idempotent — replaces the previous `rollout restart` against the
         # mutable :master tag, which could pull a node-cached stale image.
@@ -466,6 +488,32 @@ jobs:
           fi
         done
         echo "Deploy failed after 2 attempts"
+        exit 1
+
+    - name: Verify deployment is serving
+      run: |
+        # `rollout status` passing does not mean the daemon is reachable
+        # through the ingress. Probe until the DAEMON answers: any HTTP
+        # status except 502/503 means the request reached the wetware
+        # process. Context (2026-07-20 RCA): the deploy artifact currently
+        # ships only kernel/shell wasm with no etc/init.d route cells, so a
+        # HEALTHY daemon answers 404 on every route — 404 is a PASS here.
+        # Only the ingress itself answers 502/503 ("no available server"),
+        # which is exactly the six-week dark-deployment failure this probe
+        # exists to catch. If the artifact later ships a status cell,
+        # tighten this to expect 200 on its route.
+        for i in $(seq 1 12); do
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 \
+            https://master.wetware.run/ || echo 000)
+          echo "probe $i: HTTP $CODE"
+          case "$CODE" in
+            502|503|000) sleep 15 ;;
+            *) echo "daemon is serving (HTTP $CODE)"; exit 0 ;;
+          esac
+        done
+        echo "ERROR: master.wetware.run never answered from the wetware"
+        echo "daemon (ingress kept returning 502/503). The rollout reported"
+        echo "success but the site is not serving."
         exit 1
 
   publish:
