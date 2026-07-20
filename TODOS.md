@@ -1,12 +1,16 @@
 # TODOs
 
-## Recursive attenuation for named vat services
-**What:** Design and implement general recursive attenuation after the serve-only vat transport cutover lands. The expected shape is still "spawn/export/wrap/serve", but method-level policy, schema authority, nested attenuation composition, and dynamic caller UX need a fresh design pass.
-**Why:** Vat transport now forwards capabilities by service-name locator only. Fine-grained authority reduction belongs upstream of publication, where the publisher can wrap or attenuate the capability it serves.
-**Context:** Run a fresh office-hours workflow first, then a plan-eng-review before slicing PRs. Do not resurrect schema-CID vat routing, `VatConnection`, or vat `listen` as hidden shortcuts. Related: #526, #527, #97.
+## Recursive attenuation for named vat services — SHIPPED 2026-07
+**What:** Done via the single-authority capability model (eng review 2026-07-17; PRs #563–#568 plus the attenuate-reification PR). `(attenuate cap [:method ...])` reifies into a hook-level `ww-membrane` allowlist keyed by `(interfaceId, ordinal)`; the policy travels with the capability through export/serve-vat, nested attenuation intersects into a single membrane layer, and denials fail closed with structured errors. See `doc/designs/single-authority-capability-model.md`.
+**Remaining:** attenuating schema-less caps (e.g. dialed generic caps) is fail-closed pending the deferred schema-association design (D24); the defcap-export bridge item carries the reification invariant for pure-Glia caps.
+**Priority:** —
+
+## defcap-export bridge (GliaCapInner → capnp server)
+**What:** Let a pure-Glia `defcap` capability cross a process/vat boundary by bridging its method table to a capnp server. This is the single remaining place where the Glia/capnp capability split could re-open, so it is a committed future workstream, not a maybe. Binding invariants (from the 2026-07-17 review, D28, recorded in `doc/designs/single-authority-capability-model.md`): (1) the exported cap crosses the boundary as an ordinary capnp capability governed by the SAME hook-level membrane as every other cap — no second enforcement path; (2) `attenuate` on such a cap reifies into the membrane exactly as for grafted caps; (3) it reuses `crates/ww-membrane` — anything the crate can't express is a signal to fix the crate, not to fork a path.
+**Why:** Until built, defcap caps remain cell-local (fully usable via `perform`), which is why deferral is safe. Gate to build it: a concrete consumer needs a Glia-defined cap to cross a boundary.
 **Effort:** L
-**Priority:** P0
-**Depends on:** serve-only vat transport cutover
+**Priority:** P1
+**Depends on:** single-authority capability model (shipped 2026-07)
 
 ## Reconsider a lightweight in-process isolation/attenuation primitive (ex-`isolate`)
 **What:** `isolate` was removed 2026-07 (weak isolation-vs-attenuation separation; confinement leak unfixable under dynamic effect scope). Revisit only if a concrete need arises that neither the capnp membrane (attenuation) nor a spawned cell (isolation) serves, and only with membrane-backed cap authority (a cap carries its granted authority explicitly, independent of definition-site and call-site handler stacks).

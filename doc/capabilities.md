@@ -3,7 +3,8 @@
 Wetware is capability-secure all the way down: there is no ambient
 authority, and content access is gated by which CIDs a cell can reach.
 This document covers the capability model an agent sees after grafting,
-plus the three attenuation points that determine what the agent can do.
+the membrane mechanism that enforces attenuation, and the three
+configuration surfaces that determine what the agent can do.
 
 For the host-side architecture (cell layout, epoch pipeline, layer
 resolution), see [architecture.md](architecture.md).
@@ -33,16 +34,20 @@ implementation has a descriptor to anchor lookups against, but the
 content the guest sees behind that descriptor is scoped by `CidTree`'s
 root, not by the preopen.
 
-## Three attenuation points
+## One mechanism, three configuration surfaces
 
-Every capability a cell holds comes from one of three places. There is
-no fourth.
+There is exactly one enforcement mechanism for capability policy that
+must survive a boundary crossing: the hook-level membrane
+(`crates/ww-membrane`), which filters calls by `(interfaceId, ordinal)`
+on the capability reference itself and recursively wraps capabilities
+found in results and pipelines. Everything else is configuration —
+three surfaces that decide *which references exist where*:
 
-| Layer | What it controls | How to change it |
-|-------|------------------|------------------|
-| **Membrane graft** | RPC capabilities (`host`, `runtime`, `routing`, `identity`, `http-client`, plus `with`-block grants) | Edit the init.d `with` block; regraft |
+| Surface | What it controls | How to change it |
+|---------|------------------|------------------|
+| **Membrane graft** | Which RPC capability references enter the cell (`host`, `runtime`, `routing`, `identity`, `http-client`, plus `with`-block grants) | Edit the init.d `with` block; regraft |
 | **Root Atom binding** | The cell's root CID — the initial reachable content subgraph | Bind the cell to a different `stem::Atom`; respawn |
-| **Glia env bindings** | Which capabilities are callable inside the cell (`fs`, `routing`, `host`, …) and via what names | Edit init.d to bind/unbind names; re-eval |
+| **Glia env bindings** | Which capability references code inside the cell can name (`fs`, `routing`, `host`, …) | Edit init.d to bind/unbind names; re-eval |
 
 The membrane graft is the canonical RPC surface
 (`src/rpc/membrane.rs:HostGraftBuilder`). The root Atom binding flows
@@ -51,7 +56,39 @@ swaps atomically (`src/vfs.rs:CidTree::swap_root`), and old CIDs the
 cell had cached in memory still resolve to whatever they pointed to,
 but new walks see the new tree. The Glia env layer is where capabilities
 like `fs`, `routing`, and `host` are bound — restricting access at this
-layer is as simple as not installing the handler.
+layer is as simple as not installing the handler. But note the layering
+rule: env bindings and effect handlers are interposition *inside* the
+cell; they are never load-bearing across a boundary. See
+[designs/single-authority-capability-model.md](designs/single-authority-capability-model.md).
+
+## Attenuation: `(attenuate cap [:method ...])`
+
+Attenuating a capnp-backed capability constructs a hook-level membrane
+around it. The returned cap enforces its method allowlist at the
+capability reference itself, so the policy travels with the cap across
+boundaries — export it via a `with` block, publish it with
+`(perform host :serve-vat cap "svc")`, or hand it to another cell, and
+callers on the far side are filtered even if they cast the reference to
+a typed client. Denied methods fail closed with
+`:glia.error/permission-denied`, locally and remotely.
+
+- Method keywords are resolved against the cap's compiled schema
+  (kebab-case keyword ↔ camelCase capnp name); unknown methods fail at
+  attenuation time.
+- Re-attenuation intersects: `(attenuate (attenuate c [:a :b]) [:b :c])`
+  allows exactly `:b`, in a single membrane layer.
+- Attenuation confines the entire reachable graph: capabilities returned
+  by allowed methods come back wrapped in the same membrane, and the
+  attenuate surface can only name methods on the attenuated cap's own
+  interface — so transitively-reached caps (e.g. an `Executor` obtained
+  through an attenuated `runtime`) are fully confined, fail-closed.
+  Granting authority on transitive interfaces is a future surface
+  extension.
+- Caps with no compiled schema (e.g. obtained from a vat dial) cannot be
+  attenuated yet — that requires the deferred schema-association design.
+- `defcap` caps (pure Glia, cell-local) keep evaluator-local allowlist
+  semantics: they cannot cross a boundary, so the local check is
+  interposition within one trust domain, not boundary enforcement.
 
 ## Capabilities exposed to grafted agents
 

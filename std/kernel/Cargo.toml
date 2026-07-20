@@ -16,9 +16,12 @@ hex = "0.4"
 glia = { path = "../../crates/glia" }
 system = { path = "../system" }
 caps = { path = "../caps" }
+ww-membrane = { path = "../../crates/ww-membrane" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
 tempfile = "3"
 
 [lib]

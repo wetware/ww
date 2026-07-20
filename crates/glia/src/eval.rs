@@ -24,7 +24,9 @@ use std::rc::Rc;
 use crate::effect::{self, HandlerStack};
 use crate::error;
 use crate::expr::FnBody;
-use crate::{make_cap, oneshot, AttenuatedCapInner, FnArity, GliaCapInner, Val, ValMap};
+use crate::{
+    make_cap, oneshot, AttenuatedCapInner, FnArity, GliaCapInner, HandledCapInner, Val, ValMap,
+};
 
 /// Monotonic counter for `gensym`.
 static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -212,6 +214,26 @@ pub trait Dispatch {
         name: &'a str,
         args: &'a [Val],
     ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>>;
+
+    /// Offer the embedder the chance to reify `(attenuate cap methods)` into
+    /// real boundary enforcement before glia falls back to evaluator-local
+    /// attenuation.
+    ///
+    /// The wetware kernel overrides this for capnp-backed caps: it wraps the
+    /// underlying client hook in a `ww-membrane` allowlist so the attenuation
+    /// travels with the capability across process/vat boundaries, and returns
+    /// a [`HandledCapInner`]-backed cap. Returning `None` (the default)
+    /// means "not mine" — glia then applies the local [`AttenuatedCapInner`]
+    /// path, which is only interposition within this evaluator (sound for
+    /// caps that cannot cross a boundary, such as `defcap` caps).
+    fn reify_attenuation(
+        &self,
+        cap: &Val,
+        allow_methods: &BTreeSet<String>,
+    ) -> Option<Result<Val, Val>> {
+        let _ = (cap, allow_methods);
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2072,6 +2094,15 @@ pub fn eval_expr<'a, D: Dispatch>(
                     let allow_val = eval_expr(&args[1], env, dispatch).await?;
                     let mut allow_methods = parse_allow_methods(&allow_val)?;
 
+                    // Boundary-crossing caps first: the embedder may reify the
+                    // attenuation into real enforcement (the kernel wraps
+                    // capnp-backed caps in a hook-level membrane). `None`
+                    // means "not mine" — fall through to the evaluator-local
+                    // interposition path below.
+                    if let Some(reified) = dispatch.reify_attenuation(&cap_val, &allow_methods) {
+                        return reified;
+                    }
+
                     let (name, schema_cid, base, nested_allow): (
                         String,
                         String,
@@ -2395,6 +2426,30 @@ async fn perform_cap_value<'a, D: Dispatch>(
             Ok(value) => return Ok(value),
             Err(Val::Effect { effect_type, .. }) if effect_type == format!("cap:{name}") => {}
             Err(err) => return Err(err),
+        }
+
+        // A cap that carries its own handler: invoke it directly with the
+        // stack-handler protocol `(payload resume)`, `resume` bound to the
+        // identity continuation. The handler stack above keeps interposition
+        // priority; this is the cap's intrinsic behavior when nothing
+        // interposes.
+        if let Some(handled) = inner.downcast_ref::<HandledCapInner>() {
+            let handler = handled.handler.clone();
+            let resume = Val::NativeFn {
+                name: "resume".into(),
+                func: Rc::new(|args: &[Val]| {
+                    args.first()
+                        .cloned()
+                        .ok_or_else(|| error::arity("resume", "1", 0))
+                }),
+            };
+            return invoke_cap_method_value(
+                handler,
+                &[Val::List(payload.clone()), resume],
+                env,
+                dispatch,
+            )
+            .await;
         }
 
         if let Some(attenuated) = inner.downcast_ref::<AttenuatedCapInner>() {
@@ -6616,6 +6671,128 @@ mod tests {
         );
         assert!(denied.is_err());
         assert!(err_contains(&denied.unwrap_err(), "denied"));
+    }
+
+    /// A dispatcher that reifies every attenuation into a sentinel cap,
+    /// standing in for the kernel's membrane reification.
+    struct ReifyingDispatch;
+
+    impl Dispatch for ReifyingDispatch {
+        fn call<'a>(
+            &'a self,
+            _name: &'a str,
+            _args: &'a [Val],
+        ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+            Box::pin(core::future::ready(Ok(Val::Nil)))
+        }
+
+        fn reify_attenuation(
+            &self,
+            cap: &Val,
+            allow_methods: &BTreeSet<String>,
+        ) -> Option<Result<Val, Val>> {
+            let Val::Cap { name, .. } = cap else {
+                return Some(Err(Val::from("reify: not a cap")));
+            };
+            // Mark reification observable: rename + carry the allow set count.
+            Some(Ok(make_cap(
+                format!("{name}-reified"),
+                format!("methods-{}", allow_methods.len()),
+                Rc::new(()),
+            )))
+        }
+    }
+
+    #[test]
+    fn attenuate_offers_reification_to_dispatch_first() {
+        let mut env = Env::new();
+        let d = ReifyingDispatch;
+        let cap = make_test_cap("svc", 1);
+        env.set("svc".into(), cap);
+        let expr = crate::read("(attenuate svc [:run :write])").unwrap();
+        let result = pollster_eval(eval_toplevel(&expr, &mut env, &d)).unwrap();
+        match result {
+            Val::Cap {
+                name, schema_cid, ..
+            } => {
+                assert_eq!(name, "svc-reified", "embedder reification must win");
+                assert_eq!(schema_cid, "methods-2", "allow set must reach the embedder");
+            }
+            other => panic!("expected reified cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attenuate_default_dispatch_falls_back_to_local_interposition() {
+        // RecordingDispatch keeps the default None reify — the local
+        // AttenuatedCapInner path must be taken (covered behaviorally by
+        // attenuate_allow_and_deny; here we pin the inner representation).
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let cap = make_test_cap("svc", 1);
+        env.set("svc".into(), cap);
+        let result = eval_str("(attenuate svc [:run])", &mut env, &d).unwrap();
+        match result {
+            Val::Cap { inner, .. } => {
+                assert!(
+                    inner.downcast_ref::<AttenuatedCapInner>().is_some(),
+                    "default dispatch must produce local AttenuatedCapInner"
+                );
+            }
+            other => panic!("expected cap, got {other:?}"),
+        }
+    }
+
+    fn make_handled_cap(name: &str) -> Val {
+        // Handler follows the stack-handler protocol (payload resume): it
+        // resumes with a keyword proving the carried handler ran.
+        let handler = Val::NativeFn {
+            name: "carried-handler".into(),
+            func: Rc::new(|args: &[Val]| {
+                assert!(
+                    matches!(args.first(), Some(Val::List(_))),
+                    "handler payload must be the (:method args...) list"
+                );
+                match args.get(1) {
+                    Some(Val::NativeFn { func, .. }) => func(&[Val::Keyword("intrinsic".into())]),
+                    other => Err(Val::from(format!("expected resume fn, got {other:?}"))),
+                }
+            }),
+        };
+        make_cap(
+            name,
+            "test-cid",
+            Rc::new(HandledCapInner {
+                handler,
+                export: Rc::new(()),
+                descriptor: Vec::new(),
+            }),
+        )
+    }
+
+    #[test]
+    fn handled_cap_perform_invokes_carried_handler() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("hc".into(), make_handled_cap("hc"));
+        let result = eval_str("(perform hc :anything 1 2)", &mut env, &d);
+        assert_eq!(result, Ok(Val::Keyword("intrinsic".into())));
+    }
+
+    #[test]
+    fn handled_cap_stack_handler_interposes_first() {
+        // Dynamic-scope interposition keeps priority over the cap's own
+        // handler: with-effect-handler on the cap instance wins.
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set("hc".into(), make_handled_cap("hc"));
+        let result = eval_str(
+            "(with-effect-handler hc (fn [data resume] (resume :interposed))
+               (perform hc :anything))",
+            &mut env,
+            &d,
+        );
+        assert_eq!(result, Ok(Val::Keyword("interposed".into())));
     }
 
     #[test]
