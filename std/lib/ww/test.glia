@@ -11,13 +11,18 @@
 ;; reports. Catches dispatch on :glia.error/type.
 
 ;; --- Test registry ---
+;;
+;; Atom-backed: `def` from inside a fn body writes the closure's own root,
+;; not this module's, so the previous (def *tests* ...) registry silently
+;; registered nothing (wetware/ww#574). The atom is captured by the
+;; closures below and shared across invocations.
 
-(def *tests* (list))
+(def *tests* (atom (list)))
 
 ;; deftest — register a named test function
 ;; (deftest "my-test" (fn [] (assert= 1 1)))
 (defn deftest [test-name test-fn]
-  (def *tests* (concat *tests* (list {:name test-name :fn test-fn}))))
+  (reset! *tests* (concat (deref *tests*) (list {:name test-name :fn test-fn}))))
 
 ;; --- Assertions ---
 
@@ -65,7 +70,8 @@
 ;; run-tests — execute all registered tests, print results
 ;; Returns {:passed N :failed N :errors [...]}
 (defn run-tests []
-  (let [results
+  (let [tests (deref *tests*)
+        results
         (map
           (fn [test]
             (let [test-name (get test :name)
@@ -78,16 +84,16 @@
                     outcome)
                 (do (println (str "  FAIL  " test-name ": " (get outcome :error)))
                     outcome))))
-          *tests*)
+          tests)
         passed (count (filter (fn [r] (= (get r :status) :pass)) results))
         failed (count (filter (fn [r] (= (get r :status) :fail)) results))
         errors (filter (fn [r] (= (get r :status) :fail)) results)]
     (println "")
-    (println (str passed " passed, " failed " failed, " (count *tests*) " total"))
+    (println (str passed " passed, " failed " failed, " (count tests) " total"))
     {:passed passed
      :failed failed
      :errors (map (fn [e] {:name (get e :name) :error (get e :error)}) errors)}))
 
 ;; reset-tests — clear the test registry
 (defn reset-tests []
-  (def *tests* (list)))
+  (reset! *tests* (list)))

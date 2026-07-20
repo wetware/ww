@@ -7556,4 +7556,61 @@ mod tests {
         );
         assert_eq!(r, Ok(Val::Int(42)));
     }
+
+    // -----------------------------------------------------------------
+    // ww/test module (std/lib/ww/test.glia) — the framework must actually
+    // register and run tests (regression for wetware/ww#574: the old
+    // def-from-closure registry silently registered nothing, so run-tests
+    // always reported "0 tests, all pass").
+    // -----------------------------------------------------------------
+
+    const WWTEST_GLIA: &str = include_str!("../../../std/lib/ww/test.glia");
+
+    fn wwtest_eval(input: &str) -> Result<Val, Val> {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        for src in [crate::PRELUDE, WWTEST_GLIA] {
+            let forms = crate::read_many(src).map_err(|e| Val::from(format!("parse: {e}")))?;
+            for form in &forms {
+                eval_blocking(form, &mut env, &d)?;
+            }
+        }
+        eval_str(input, &mut env, &d)
+    }
+
+    #[test]
+    fn wwtest_deftest_actually_registers() {
+        let n = wwtest_eval(
+            "(do (deftest \"t1\" (fn [] (assert= 1 1)))
+                 (deftest \"t2\" (fn [] (assert-true true)))
+                 (count (deref *tests*)))",
+        );
+        assert_eq!(n, Ok(Val::Int(2)));
+    }
+
+    #[test]
+    fn wwtest_run_tests_executes_and_reports() {
+        // One passing, one failing test: run-tests must EXECUTE both and
+        // report accurate counts (previously always {:passed 0 :failed 0}).
+        let r = wwtest_eval(
+            "(do (deftest \"passes\" (fn [] (assert= 1 1)))
+                 (deftest \"fails\"  (fn [] (assert= 1 2)))
+                 (let [report (run-tests)]
+                   (list (get report :passed) (get report :failed))))",
+        )
+        .unwrap();
+        assert_eq!(r, Val::List(vec![Val::Int(1), Val::Int(1)]));
+    }
+
+    #[test]
+    fn wwtest_assert_throws_and_reset() {
+        let r = wwtest_eval(
+            "(do (deftest \"throws-ok\" (fn [] (assert-throws (fn [] (throw 1)))))
+                 (let [report (run-tests)
+                       _ (reset-tests)]
+                   (list (get report :passed) (count (deref *tests*)))))",
+        )
+        .unwrap();
+        assert_eq!(r, Val::List(vec![Val::Int(1), Val::Int(0)]));
+    }
 }
