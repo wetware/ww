@@ -7330,30 +7330,24 @@ mod tests {
         assert!(err_contains(&denied.unwrap_err(), "denied"));
     }
 
-    /// KNOWN BUG (found implementing ww/policy retry, 2026-07-20): a `try`
-    /// wrapped around a delegating `perform*` INSIDE a cap effect handler
-    /// swallows the thrown effect — the overall perform evaluates to nil
-    /// instead of the catch value (or the propagated error). The same throw
-    /// propagates correctly without `try` (unhandled-effect carrier), and
-    /// `try`/`catch` work correctly outside handler context. Suspected
-    /// nested-handler dispatch in the effect state machine: the exception
-    /// unwind crosses the suspended outer cap-perform slot. Blocks the
-    /// ww/policy `retry` handler. G-track follow-up.
+    /// KNOWN BUG (root-caused 2026-07-20; fixed separately, see the
+    /// closure-macro-capture PR): a closure whose body calls a macro that
+    /// expands to reference ANOTHER global returns nil. Closures capture only
+    /// their free variables (`Env::filter_to`), and free vars are computed on
+    /// the UN-expanded body — so `try` is captured but `try-catches` (which
+    /// appears only after `try` expands) is not, and the expansion can't
+    /// resolve it, falling through to `dispatch.call` (nil in tests). NOT
+    /// handler-specific: `(defn f [] (try (throw 1) (catch _ e e)))` fails at
+    /// top level too. `or` survives only because it expands to pure special
+    /// forms. This blocks ww/policy `retry` (whose handler needs `try`).
     #[test]
-    #[ignore = "engine bug: try inside cap handler swallows thrown effect"]
-    fn try_inside_cap_handler_catches_thrown_effect() {
-        let r = policy_eval(
-            "(do (defcap svc :boom (fn [] (throw (ex-info \"x\" {:type :glia.error/internal}))))
-                 (with-effect-handler svc
-                   (fn [data resume]
-                     (resume (try {:ok (perform* svc data)} (catch _ e {:err e}))))
-                   (perform svc :boom)))",
-        )
-        .unwrap();
-        match r {
-            Val::Map(m) => assert!(m.get(&Val::Keyword("err".into())).is_some()),
-            other => panic!("expected {{:err e}} from the catch, got {other:?}"),
-        }
+    #[ignore = "closure free-var capture drops macro-expansion globals (try -> try-catches); fixed in a separate PR"]
+    fn closure_calling_try_macro_resolves_try_catches() {
+        // Minimal, handler-independent repro.
+        assert_eq!(
+            policy_eval("(do (defn f [] (try (throw 1) (catch _ e e))) (f))"),
+            Ok(Val::Int(1)),
+        );
     }
 
     #[test]

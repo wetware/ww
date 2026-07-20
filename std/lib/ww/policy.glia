@@ -48,10 +48,11 @@
 ;; --- retry (not yet shipped) ------------------------------------------
 ;;
 ;; A retry handler needs (try (perform* cap data) (catch ...)) inside the
-;; handler body, and a known engine bug currently makes that swallow the
-;; thrown effect (see the ignored test
-;; try_inside_cap_handler_catches_thrown_effect in glia's eval tests).
-;; retry lands once that dispatch bug is fixed.
+;; handler body. It is blocked by a closure free-var-capture bug: a closure
+;; that calls the `try` macro cannot resolve `try-catches` (which appears
+;; only after `try` expands), so the catch silently yields nil. See the
+;; ignored test closure_calling_try_macro_resolves_try_catches in glia's
+;; eval tests. retry ships with that fix.
 
 ;; --- budget ----------------------------------------------------------
 
