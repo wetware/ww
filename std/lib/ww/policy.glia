@@ -56,9 +56,12 @@
 
 ;; --- budget ----------------------------------------------------------
 
-;; budget — allow at most n delegated calls, then fail closed. The counter
-;; lives in an atom captured by the handler closure, so it survives across
-;; invocations (a `def` from inside a closure would not).
+;; budget — allow at most n delegated calls, then fail closed. Counts
+;; ATTEMPTS, not successes: the counter is spent before delegation, so a
+;; failing call still consumes budget (otherwise a caller could probe by
+;; retrying failures for free). The counter lives in an atom captured by
+;; the handler closure, so it survives across invocations (a `def` from
+;; inside a closure would not).
 (defn budget [cap n]
   (let [used (atom 0)]
     (fn [data resume]

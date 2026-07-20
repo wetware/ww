@@ -282,29 +282,53 @@ fn parse_allow_methods(value: &Val) -> Result<BTreeSet<String>, Val> {
 }
 
 fn is_authority_free(value: &Val) -> bool {
-    match value {
-        // An atom is only as authority-free as its current contents.
-        Val::Atom(a) => is_authority_free(&a.borrow()),
-        Val::Nil
-        | Val::Bool(_)
-        | Val::Int(_)
-        | Val::Float(_)
-        | Val::Str(_)
-        | Val::Sym(_)
-        | Val::Keyword(_)
-        | Val::Bytes(_) => true,
-        Val::List(items) | Val::Vector(items) | Val::Set(items) => {
-            items.iter().all(is_authority_free)
+    // Atoms make the value graph potentially CYCLIC (`(reset! a a)` is
+    // expressible), so the traversal tracks the atoms on the current path:
+    // revisiting one is a back-edge whose contents are already under
+    // inspection — recursing again would loop forever (RefCell permits
+    // nested shared borrows, so this is a stack overflow, not a panic).
+    fn walk(value: &Val, visiting: &mut Vec<*const RefCell<Val>>) -> bool {
+        match value {
+            // An atom is only as authority-free as its current contents.
+            Val::Atom(a) => {
+                let ptr = Rc::as_ptr(a);
+                if visiting.contains(&ptr) {
+                    // Back-edge: adds no values not already being checked.
+                    return true;
+                }
+                visiting.push(ptr);
+                let result = match a.try_borrow() {
+                    Ok(inner) => walk(&inner, visiting),
+                    // Mutably borrowed elsewhere: contents unknowable —
+                    // fail closed (may hold a cap).
+                    Err(_) => false,
+                };
+                visiting.pop();
+                result
+            }
+            Val::Nil
+            | Val::Bool(_)
+            | Val::Int(_)
+            | Val::Float(_)
+            | Val::Str(_)
+            | Val::Sym(_)
+            | Val::Keyword(_)
+            | Val::Bytes(_) => true,
+            Val::List(items) | Val::Vector(items) | Val::Set(items) => {
+                items.iter().all(|v| walk(v, visiting))
+            }
+            Val::Map(m) => m
+                .iter()
+                .all(|(k, v)| walk(k, visiting) && walk(v, visiting)),
+            Val::Fn { is_cap_free, .. } | Val::Macro { is_cap_free, .. } => *is_cap_free,
+            Val::Cell { .. }
+            | Val::NativeFn { .. }
+            | Val::AsyncNativeFn { .. }
+            | Val::Cap { .. } => false,
+            Val::Recur(_) | Val::Effect { .. } | Val::Resume(_) => false,
         }
-        Val::Map(m) => m
-            .iter()
-            .all(|(k, v)| is_authority_free(k) && is_authority_free(v)),
-        Val::Fn { is_cap_free, .. } | Val::Macro { is_cap_free, .. } => *is_cap_free,
-        Val::Cell { .. } | Val::NativeFn { .. } | Val::AsyncNativeFn { .. } | Val::Cap { .. } => {
-            false
-        }
-        Val::Recur(_) | Val::Effect { .. } | Val::Resume(_) => false,
     }
+    walk(value, &mut Vec::new())
 }
 
 fn compute_cap_status(env: &Env) -> (bool, Option<String>) {
@@ -1204,8 +1228,9 @@ fn eval_builtin(name: &str, args: &[Val]) -> Option<Result<Val, Val>> {
             }
             match &args[0] {
                 Val::Atom(a) => {
-                    *a.borrow_mut() = args[1].clone();
-                    Some(Ok(args[1].clone()))
+                    let new_val = args[1].clone();
+                    *a.borrow_mut() = new_val.clone();
+                    Some(Ok(new_val))
                 }
                 other => Some(Err(error::type_mismatch("reset!", "atom", other))),
             }
@@ -7385,6 +7410,22 @@ mod tests {
             ),
             Ok(Val::Int(3))
         );
+    }
+
+    #[test]
+    fn self_referential_atom_does_not_hang_cap_status() {
+        // (reset! a a) makes the value graph cyclic; defining a closure over
+        // it triggers compute_cap_status -> is_authority_free, which must
+        // terminate via cycle detection (naive recursion stack-overflows:
+        // RefCell allows nested shared borrows, so it is not a borrow panic).
+        let r = prelude_eval(
+            "(let [a (atom nil)]
+               (reset! a a)
+               (let [f (fn [] a)]
+                 (f)
+                 :done))",
+        );
+        assert_eq!(r, Ok(Val::Keyword("done".into())));
     }
 
     #[test]
