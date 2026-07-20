@@ -13,10 +13,14 @@
 //!   * re-wraps capabilities produced by promise resolution
 //!     (`get_resolved` / `when_more_resolved`).
 //!
-//! Direction handled: caps flowing OUT of the membrane (results, pipelines,
-//! resolution). Caps flowing INTO the membrane (request params) pass through
-//! unwrapped here; the full dual membrane (reverse-wrap params, unwrap on
-//! reentry) is tracked as M3 in the single-authority roadmap.
+//! Directions handled: caps flowing OUT of the membrane (results, pipelines,
+//! resolution) are re-wrapped as above. Caps flowing INTO the membrane
+//! (request params) that are our own membranes are unwrapped to the bare
+//! backing cap on send, restoring the identity the backend originally
+//! exported; foreign caps pass through unchanged — a parameter is
+//! caller-granted authority, not something the outbound policy attenuates.
+//! (Reverse-wrapping foreign params — a fully symmetric membrane — is a
+//! deliberate non-goal for now.)
 //!
 //! [`Policy`] is a trait, so one membrane mechanism serves allowlists,
 //! revocation, rate limits, and auditing. `check` takes `&self` but may hold
