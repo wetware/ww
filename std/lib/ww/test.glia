@@ -97,3 +97,43 @@
 ;; reset-tests — clear the test registry
 (defn reset-tests []
   (reset! *tests* (list)))
+
+;; --- Capability test harness ---
+;;
+;; Helpers for testing code that performs against capabilities, without
+;; touching real backends. Install with with-effect-handler, which scopes
+;; the interposition dynamically:
+;;
+;;   (with-effect-handler svc (stub-handler {:lookup "fake"})
+;;     (code-under-test))
+;;
+;;   (let [r (recorder svc)]
+;;     (with-effect-handler svc (get r :handler)
+;;       (code-under-test))
+;;     (deref (get r :calls)))   ;; => recorded (:method args...) payloads
+
+;; stub-handler — answer from a canned table without touching any cap.
+;; Table maps :method to a literal reply or a function of the method args.
+;; Unstubbed methods fail closed.
+(defn stub-handler [table]
+  (fn [data resume]
+    (let [method (first data)
+          args (rest data)]
+      (if (contains? table method)
+        (let [entry (get table method)]
+          (resume (if (= (type entry) :fn)
+                    (apply entry args)
+                    entry)))
+        (throw (ex-info "stub: method not stubbed"
+                        {:type :glia.error/permission-denied
+                         :method method}))))))
+
+;; recorder — record every (:method args...) payload, then delegate to the
+;; cap. Returns {:handler h :calls atom}; assert against (deref calls)
+;; after the body runs (replay-style verification).
+(defn recorder [cap]
+  (let [calls (atom (list))]
+    {:calls calls
+     :handler (fn [data resume]
+                (reset! calls (concat (deref calls) (list data)))
+                (resume (perform* cap data)))}))

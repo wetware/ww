@@ -2898,6 +2898,15 @@ async fn perform_dispatch(
             .cloned()
     };
 
+    if effect::trace_enabled() {
+        eprintln!(
+            "[glia:effect] perform {:?} (stack depth {}, matched: {})",
+            effect_target,
+            handler_stack.borrow().len(),
+            matching_ctx.is_some()
+        );
+    }
+
     match matching_ctx {
         Some(ctx) => {
             let (tx, rx) = oneshot::channel();
@@ -2905,7 +2914,15 @@ async fn perform_dispatch(
             rx.await
         }
         None => {
-            // No matching handler — propagate as unhandled effect.
+            // No matching handler — propagate as unhandled effect. Under
+            // GLIA_TRACE_EFFECTS, dump the handler stack so the reader can
+            // see what WAS in scope (G3 diagnostic).
+            if effect::trace_enabled() {
+                eprintln!(
+                    "[glia:effect] {}",
+                    effect::format_unhandled_diagnostic(&effect_target, &handler_stack.borrow())
+                );
+            }
             let effect_type = match &effect_target {
                 effect::EffectTarget::Keyword(s) => s.clone(),
                 effect::EffectTarget::Cap { name, .. } => format!("cap:{name}"),
@@ -7612,5 +7629,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, Val::List(vec![Val::Int(1), Val::Int(0)]));
+    }
+
+    // -----------------------------------------------------------------
+    // ww/test capability harness (G4): stub-handler + recorder, with a
+    // replay-style record/verify example.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn wwtest_stub_handler_answers_and_fails_closed() {
+        let ok = wwtest_eval(
+            "(do (defcap svc :lookup (fn [k] :real))
+                 (with-effect-handler svc (stub-handler {:lookup \"stubbed\" :add (fn [a b] (+ a b))})
+                   (list (perform svc :lookup \"x\") (perform svc :add 2 3))))",
+        )
+        .unwrap();
+        assert_eq!(ok, Val::List(vec![Val::Str("stubbed".into()), Val::Int(5)]));
+
+        let denied = wwtest_eval(
+            "(do (defcap svc :lookup (fn [k] :real))
+                 (with-effect-handler svc (stub-handler {:lookup 1})
+                   (perform svc :other)))",
+        );
+        assert!(denied.is_err());
+        assert!(err_contains(&denied.unwrap_err(), "not stubbed"));
+    }
+
+    #[test]
+    fn wwtest_recorder_replay_style_verification() {
+        // Replay-style example: run the code under test with a recording
+        // interposer, then verify the exact call sequence AND that the
+        // delegated results were real.
+        let r = wwtest_eval(
+            "(do (defcap svc :add (fn [a b] (+ a b)) :neg (fn [x] (- 0 x)))
+                 (let [r (recorder svc)
+                       out (with-effect-handler svc (get r :handler)
+                             (list (perform svc :add 1 2) (perform svc :neg 7)))]
+                   (list out (deref (get r :calls)))))",
+        )
+        .unwrap();
+        let expected_out = Val::List(vec![Val::Int(3), Val::Int(-7)]);
+        let expected_calls = Val::List(vec![
+            Val::List(vec![Val::Keyword("add".into()), Val::Int(1), Val::Int(2)]),
+            Val::List(vec![Val::Keyword("neg".into()), Val::Int(7)]),
+        ]);
+        assert_eq!(r, Val::List(vec![expected_out, expected_calls]));
     }
 }
