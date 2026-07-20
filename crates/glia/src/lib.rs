@@ -61,11 +61,38 @@ pub struct GliaCapInner {
     pub descriptor: Vec<u8>,
 }
 
-/// Internal representation for attenuated capabilities created by `attenuate`.
+/// Internal representation for attenuated capabilities created by `attenuate`
+/// over caps that live entirely inside this evaluator (`defcap` caps).
+///
+/// This is LOCAL interposition, not boundary enforcement: such caps cannot
+/// cross a process/vat boundary (there is nothing to export), so the string
+/// allowlist here is dynamic-scope semantics inside one trust domain. Caps
+/// that CAN cross a boundary (capnp-backed) are reified by the embedder into
+/// a hook-level membrane instead — see `eval::Dispatch::reify_attenuation`
+/// and [`HandledCapInner`].
 #[derive(Clone)]
 pub struct AttenuatedCapInner {
     pub base: Val,
     pub allow_methods: BTreeSet<String>,
+    pub descriptor: Vec<u8>,
+}
+
+/// A capability that carries its own dispatch handler.
+///
+/// `perform` on such a cap first offers the call to the dynamic handler stack
+/// (interposition keeps priority), then invokes `handler` directly with
+/// `(payload resume)` — the same protocol as stack effect handlers, with
+/// `resume` bound to the identity continuation (invoked in place, one-shot by
+/// construction). The embedder builds `handler` so authority is intrinsic to
+/// the cap value rather than looked up ambiently.
+///
+/// `export` is an opaque embedder payload. The kernel stores the (membraned)
+/// `capnp::capability::Client` there so the cap can cross process/vat
+/// boundaries membrane-governed; glia itself never inspects it.
+#[derive(Clone)]
+pub struct HandledCapInner {
+    pub handler: Val,
+    pub export: Rc<dyn std::any::Any>,
     pub descriptor: Vec<u8>,
 }
 
