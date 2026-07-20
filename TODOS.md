@@ -1,12 +1,9 @@
 # TODOs
 
-## Recursive attenuation for named vat services
-**What:** Design and implement general recursive attenuation after the serve-only vat transport cutover lands. The expected shape is still "spawn/export/wrap/serve", but method-level policy, schema authority, nested attenuation composition, and dynamic caller UX need a fresh design pass.
-**Why:** Vat transport now forwards capabilities by service-name locator only. Fine-grained authority reduction belongs upstream of publication, where the publisher can wrap or attenuate the capability it serves.
-**Context:** Run a fresh office-hours workflow first, then a plan-eng-review before slicing PRs. Do not resurrect schema-CID vat routing, `VatConnection`, or vat `listen` as hidden shortcuts. Related: #526, #527, #97.
-**Effort:** L
-**Priority:** P0
-**Depends on:** serve-only vat transport cutover
+## Recursive attenuation for named vat services — SHIPPED 2026-07
+**What:** Done via the single-authority capability model (eng review 2026-07-17; PRs #563–#568 plus the attenuate-reification PR). `(attenuate cap [:method ...])` reifies into a hook-level `ww-membrane` allowlist keyed by `(interfaceId, ordinal)`; the policy travels with the capability through export/serve-vat, nested attenuation intersects into a single membrane layer, and denials fail closed with structured errors. See `doc/designs/single-authority-capability-model.md`.
+**Remaining:** attenuating schema-less caps (e.g. dialed generic caps) is fail-closed pending the deferred schema-association design (D24); the defcap-export bridge item carries the reification invariant for pure-Glia caps.
+**Priority:** —
 
 ## Reconsider a lightweight in-process isolation/attenuation primitive (ex-`isolate`)
 **What:** `isolate` was removed 2026-07 (weak isolation-vs-attenuation separation; confinement leak unfixable under dynamic effect scope). Revisit only if a concrete need arises that neither the capnp membrane (attenuation) nor a spawned cell (isolation) serves, and only with membrane-backed cap authority (a cap carries its granted authority explicitly, independent of definition-site and call-site handler stacks).
