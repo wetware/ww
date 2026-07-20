@@ -50,6 +50,8 @@ mod schema_ids {
     include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 }
 
+mod attenuate;
+
 /// Bootstrap capability: the concrete Membrane defined in membrane.capnp.
 type Membrane = membrane_capnp::membrane::Client;
 
@@ -94,7 +96,11 @@ impl membrane_capnp::membrane::Server for KernelBootstrap {
                 let src = src_caps.get(i);
                 let mut dst = dst_caps.reborrow().get(i);
                 dst.set_name(src.get_name()?);
-                dst.init_cap().set_as_capability(src.get_cap().get_as_capability::<capnp::capability::Client>()?.hook);
+                dst.init_cap().set_as_capability(
+                    src.get_cap()
+                        .get_as_capability::<capnp::capability::Client>()?
+                        .hook,
+                );
             }
 
             Ok(())
@@ -156,7 +162,6 @@ struct Session {
     cwd: String,
 }
 
-
 // ---------------------------------------------------------------------------
 // Cap extraction — get type-erased capnp Client from Val::Cap.inner
 // ---------------------------------------------------------------------------
@@ -170,6 +175,15 @@ fn extract_capnp_client(
 ) -> Option<capnp::capability::Client> {
     if let Some(c) = inner.downcast_ref::<capnp::capability::Client>() {
         return Some(c.clone());
+    }
+
+    // Membrane-attenuated caps export their membraned client, so the
+    // attenuation crosses the boundary with the capability.
+    if let Some(handled) = inner.downcast_ref::<glia::HandledCapInner>() {
+        if let Some(m) = handled.export.downcast_ref::<attenuate::MembranedCap>() {
+            return Some(m.client.clone());
+        }
+        return None;
     }
 
     macro_rules! try_downcast {
@@ -572,6 +586,14 @@ impl<'k> Dispatch for KernelDispatch<'k> {
             }
         })
     }
+
+    fn reify_attenuation(
+        &self,
+        cap: &Val,
+        allow_methods: &std::collections::BTreeSet<String>,
+    ) -> Option<Result<Val, Val>> {
+        attenuate::reify(self.ctx, cap, allow_methods)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -864,9 +886,11 @@ fn make_host_handler(
                                 schema_ids::HTTP_CLIENT_CID.to_string(),
                                 Rc::new(c.clone()),
                             ),
-                            None => return Err(Val::from(
-                                "http-client not available (node started without --http-dial)",
-                            )),
+                            None => {
+                                return Err(Val::from(
+                                    "http-client not available (node started without --http-dial)",
+                                ))
+                            }
                         }
                     }
                     _ => return Err(Val::from(format!("host: unknown method :{method}"))),
@@ -1685,6 +1709,9 @@ fn make_schema_builtin() -> Val {
                     if let Some(att) = inner.downcast_ref::<AttenuatedCapInner>() {
                         return Ok(Val::Bytes(att.descriptor.clone()));
                     }
+                    if let Some(handled) = inner.downcast_ref::<glia::HandledCapInner>() {
+                        return Ok(Val::Bytes(handled.descriptor.clone()));
+                    }
                     Err(glia::error::permission_denied(
                         &format!("schema for cap '{cap_name}' not registered"),
                         Some("schemas registered for: host, runtime, routing, identity, http"),
@@ -1708,7 +1735,9 @@ fn make_doc_builtin() -> Val {
                 "runtime" => "runtime — cell spawn + execution",
                 "routing" => "routing — DHT content routing (provide / find)",
                 "identity" => "identity — node Ed25519 signing keys",
-                "http" | "http-client" => "http-client — outbound HTTP requests (gated by --http-dial)",
+                "http" | "http-client" => {
+                    "http-client — outbound HTTP requests (gated by --http-dial)"
+                }
                 _ => {
                     if let Some(glia_cap) = inner.downcast_ref::<GliaCapInner>() {
                         return Ok(Val::Str(format!(
@@ -1720,6 +1749,12 @@ fn make_doc_builtin() -> Val {
                         return Ok(Val::Str(format!(
                             "attenuated capability — method whitelist\n  cap-name:   {cap_name}\n  schema-cid: {schema_cid}\n  methods:    {}",
                             att.allow_methods.len()
+                        )));
+                    }
+                    if let Some(m) = attenuate::membraned_cap_of(inner) {
+                        return Ok(Val::Str(format!(
+                            "membrane-attenuated capability — hook-level allowlist\n  cap-name:   {cap_name}\n  schema-cid: {schema_cid}\n  methods:    {}",
+                            m.allow.len()
                         )));
                     }
                     return Err(glia::error::permission_denied(
@@ -1757,6 +1792,11 @@ fn make_help_builtin() -> Val {
                 text.push_str(&format!(
                     "schema-bytes: {} (attenuation descriptor)\n",
                     att.descriptor.len()
+                ));
+            } else if let Some(handled) = inner.downcast_ref::<glia::HandledCapInner>() {
+                text.push_str(&format!(
+                    "schema-bytes: {} (membrane-attenuation descriptor)\n",
+                    handled.descriptor.len()
                 ));
             } else {
                 text.push_str("schema-bytes: not registered\n");
@@ -1798,143 +1838,143 @@ fn run_impl() {
     system::serve(bootstrap.client, move |membrane: Membrane| {
         let exported_membrane = Rc::clone(&exported_membrane);
         async move {
-        *exported_membrane.borrow_mut() = Some(membrane.clone());
-        let graft_resp = membrane.graft_request().send().promise.await?;
-        let results = graft_resp.get()?;
+            *exported_membrane.borrow_mut() = Some(membrane.clone());
+            let graft_resp = membrane.graft_request().send().promise.await?;
+            let results = graft_resp.get()?;
 
-        // Iterate the caps list to find capabilities by name.
-        let caps = results.get_caps()?;
+            // Iterate the caps list to find capabilities by name.
+            let caps = results.get_caps()?;
 
-        let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
-        let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
-        let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
-        let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
-        let http_client: Option<http_capnp::http_client::Client> =
-            get_graft_cap(&caps, "http-client").ok();
+            let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
+            let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
+            let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
+            let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
+            let http_client: Option<http_capnp::http_client::Client> =
+                get_graft_cap(&caps, "http-client").ok();
 
-        let ctx = RefCell::new(Session {
-            host: host.clone(),
-            runtime: runtime.clone(),
-            routing: routing.clone(),
-            identity,
-            http_client: http_client.clone(),
-            cwd: "/".to_string(),
-        });
-
-        let dispatch = build_dispatch();
-        let mut env = Env::new();
-
-        // Bind graft caps + effect handlers from the membrane response.
-        // The membrane exports a flat list of named capabilities; we iterate
-        // it, downcast each to its typed client, and bind both a Val::Cap
-        // (for collect_caps / :listen forwarding) and an effect handler
-        // (for `(perform cap :method ...)` in Glia).
-        {
-            let s = ctx.borrow();
-            for i in 0..caps.len() {
-                let entry = caps.get(i);
-                let cap_name = entry
-                    .get_name()?
-                    .to_str()
-                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-                let (schema_cid, inner, handler): (&str, Rc<dyn std::any::Any>, Val) =
-                    match cap_name {
-                        "host" => (
-                            schema_ids::HOST_CID,
-                            Rc::new(s.host.clone()),
-                            make_host_handler(
-                                s.host.clone(),
-                                s.runtime.clone(),
-                                s.http_client.clone(),
-                            ),
-                        ),
-                        "runtime" => (
-                            schema_ids::RUNTIME_CID,
-                            Rc::new(s.runtime.clone()),
-                            make_runtime_handler(s.runtime.clone()),
-                        ),
-                        "routing" => (
-                            schema_ids::ROUTING_CID,
-                            Rc::new(s.routing.clone()),
-                            make_routing_handler(s.routing.clone()),
-                        ),
-                        "identity" => {
-                            // Identity is stored in the Session but has no
-                            // Glia effect handler — skip env binding.
-                            continue;
-                        }
-                        "http-client" => {
-                            match s.http_client.clone() {
-                                Some(c) => (
-                                    schema_ids::HTTP_CLIENT_CID,
-                                    Rc::new(c),
-                                    // No standalone handler — http-client is accessed
-                                    // via (perform host :http-client).
-                                    Val::Nil,
-                                ),
-                                None => {
-                                    log::warn!("graft: host sent 'http-client' but Session has None, skipping");
-                                    continue;
-                                }
-                            }
-                        }
-                        other => {
-                            log::warn!("graft: unknown cap '{other}', skipping");
-                            continue;
-                        }
-                    };
-
-                env.set(
-                    cap_name.to_string(),
-                    make_cap(cap_name, schema_cid.to_string(), inner),
-                );
-                if !matches!(handler, Val::Nil) {
-                    env.set(format!("{cap_name}-handler"), handler);
-                }
-            }
-
-            // Introspection builtins. `(schema cap)` returns the cap's
-            // canonical Schema.Node bytes; `(doc cap)` returns a human-
-            // readable summary. Bytes come from the build-time schema
-            // registry baked into the kernel (see std/kernel/build.rs).
-            env.set("schema".to_string(), make_schema_builtin());
-            env.set("doc".to_string(), make_doc_builtin());
-            env.set("help".to_string(), make_help_builtin());
-            env.set("import".to_string(), make_import_cap());
-            env.set("import-handler".to_string(), make_import_handler());
-        }
-
-        // Load the prelude (standard macros: when, and, or, defn, cond, not).
-        {
-            let mut kd = KernelDispatch {
-                ctx: &ctx,
-                table: &dispatch,
-            };
-            glia::load_prelude(&mut env, &mut kd).await;
-        }
-
-        // Run init.d scripts first. If a foreground process blocked
-        // (e.g. `(runtime run ...)` in the script), we're done.
-        let blocked = run_initd(&mut env, &ctx, &dispatch)
-            .await
-            .unwrap_or_else(|e| {
-                log::error!("init.d: {e}");
-                false
+            let ctx = RefCell::new(Session {
+                host: host.clone(),
+                runtime: runtime.clone(),
+                routing: routing.clone(),
+                identity,
+                http_client: http_client.clone(),
+                cwd: "/".to_string(),
             });
 
-        if !blocked {
-            let is_tty = std::env::var("WW_TTY").is_ok();
-            let result = if is_tty {
-                run_shell(&mut env, ctx, &dispatch).await
-            } else {
-                run_daemon().await
-            };
+            let dispatch = build_dispatch();
+            let mut env = Env::new();
 
-            if let Err(e) = result {
-                log::error!("kernel error: {e}");
+            // Bind graft caps + effect handlers from the membrane response.
+            // The membrane exports a flat list of named capabilities; we iterate
+            // it, downcast each to its typed client, and bind both a Val::Cap
+            // (for collect_caps / :listen forwarding) and an effect handler
+            // (for `(perform cap :method ...)` in Glia).
+            {
+                let s = ctx.borrow();
+                for i in 0..caps.len() {
+                    let entry = caps.get(i);
+                    let cap_name = entry
+                        .get_name()?
+                        .to_str()
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+                    let (schema_cid, inner, handler): (&str, Rc<dyn std::any::Any>, Val) =
+                        match cap_name {
+                            "host" => (
+                                schema_ids::HOST_CID,
+                                Rc::new(s.host.clone()),
+                                make_host_handler(
+                                    s.host.clone(),
+                                    s.runtime.clone(),
+                                    s.http_client.clone(),
+                                ),
+                            ),
+                            "runtime" => (
+                                schema_ids::RUNTIME_CID,
+                                Rc::new(s.runtime.clone()),
+                                make_runtime_handler(s.runtime.clone()),
+                            ),
+                            "routing" => (
+                                schema_ids::ROUTING_CID,
+                                Rc::new(s.routing.clone()),
+                                make_routing_handler(s.routing.clone()),
+                            ),
+                            "identity" => {
+                                // Identity is stored in the Session but has no
+                                // Glia effect handler — skip env binding.
+                                continue;
+                            }
+                            "http-client" => {
+                                match s.http_client.clone() {
+                                    Some(c) => (
+                                        schema_ids::HTTP_CLIENT_CID,
+                                        Rc::new(c),
+                                        // No standalone handler — http-client is accessed
+                                        // via (perform host :http-client).
+                                        Val::Nil,
+                                    ),
+                                    None => {
+                                        log::warn!("graft: host sent 'http-client' but Session has None, skipping");
+                                        continue;
+                                    }
+                                }
+                            }
+                            other => {
+                                log::warn!("graft: unknown cap '{other}', skipping");
+                                continue;
+                            }
+                        };
+
+                    env.set(
+                        cap_name.to_string(),
+                        make_cap(cap_name, schema_cid.to_string(), inner),
+                    );
+                    if !matches!(handler, Val::Nil) {
+                        env.set(format!("{cap_name}-handler"), handler);
+                    }
+                }
+
+                // Introspection builtins. `(schema cap)` returns the cap's
+                // canonical Schema.Node bytes; `(doc cap)` returns a human-
+                // readable summary. Bytes come from the build-time schema
+                // registry baked into the kernel (see std/kernel/build.rs).
+                env.set("schema".to_string(), make_schema_builtin());
+                env.set("doc".to_string(), make_doc_builtin());
+                env.set("help".to_string(), make_help_builtin());
+                env.set("import".to_string(), make_import_cap());
+                env.set("import-handler".to_string(), make_import_handler());
             }
-        }
+
+            // Load the prelude (standard macros: when, and, or, defn, cond, not).
+            {
+                let mut kd = KernelDispatch {
+                    ctx: &ctx,
+                    table: &dispatch,
+                };
+                glia::load_prelude(&mut env, &mut kd).await;
+            }
+
+            // Run init.d scripts first. If a foreground process blocked
+            // (e.g. `(runtime run ...)` in the script), we're done.
+            let blocked = run_initd(&mut env, &ctx, &dispatch)
+                .await
+                .unwrap_or_else(|e| {
+                    log::error!("init.d: {e}");
+                    false
+                });
+
+            if !blocked {
+                let is_tty = std::env::var("WW_TTY").is_ok();
+                let result = if is_tty {
+                    run_shell(&mut env, ctx, &dispatch).await
+                } else {
+                    run_daemon().await
+                };
+
+                if let Err(e) = result {
+                    log::error!("kernel error: {e}");
+                }
+            }
 
             Ok(())
         }
@@ -2604,7 +2644,11 @@ mod tests {
                 &[test_cell(), Val::Str("my-protocol".into())],
             )
             .await;
-            assert!(result.is_ok(), "StreamListener listen failed: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "StreamListener listen failed: {:?}",
+                result.err()
+            );
         })
         .await;
     }
@@ -2618,7 +2662,11 @@ mod tests {
             let cap = make_cap("host", "test-host-cid", Rc::new(s.host.clone()));
             let result =
                 call_handler(&handler, "serve-vat", &[cap, Val::Str("greeter".into())]).await;
-            assert!(result.is_ok(), "VatListener serve failed: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "VatListener serve failed: {:?}",
+                result.err()
+            );
         })
         .await;
     }
@@ -2634,7 +2682,10 @@ mod tests {
                 .await
                 .unwrap_err();
             let msg = format!("{err}");
-            assert!(msg.contains("not backed by a Cap'n Proto client"), "got: {msg}");
+            assert!(
+                msg.contains("not backed by a Cap'n Proto client"),
+                "got: {msg}"
+            );
         })
         .await;
     }
@@ -2646,7 +2697,9 @@ mod tests {
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
             assert!(call_handler(&handler, "listen", &[]).await.is_err());
-            assert!(call_handler(&handler, "listen-stream", &[test_cell()]).await.is_err());
+            assert!(call_handler(&handler, "listen-stream", &[test_cell()])
+                .await
+                .is_err());
             assert!(call_handler(&handler, "serve-vat", &[]).await.is_err());
         })
         .await;
@@ -2709,10 +2762,7 @@ mod tests {
                             let peer_id = entries
                                 .get(&Val::Keyword("peer-id".into()))
                                 .expect("missing :peer-id key");
-                            assert_eq!(
-                                *peer_id,
-                                Val::Str(bs58::encode(b"peer-0").into_string())
-                            );
+                            assert_eq!(*peer_id, Val::Str(bs58::encode(b"peer-0").into_string()));
                         }
                         other => panic!("expected map, got {other:?}"),
                     }
@@ -2813,10 +2863,9 @@ mod tests {
         run_local(async {
             let s = test_session();
             let handler = make_routing_handler(s.routing.clone());
-            let result =
-                call_handler(&handler, "resolve", &[Val::Str("/ipns/k51qzi-test".into())])
-                    .await
-                    .unwrap();
+            let result = call_handler(&handler, "resolve", &[Val::Str("/ipns/k51qzi-test".into())])
+                .await
+                .unwrap();
             assert_eq!(result, Val::Str("/ipfs/bafyrei-test-resolved".into()));
         })
         .await;
@@ -2863,10 +2912,7 @@ mod tests {
             ),
         ];
         for (name, cid, inner, handler) in caps {
-            env.set(
-                name.to_string(),
-                make_cap(name, cid, inner),
-            );
+            env.set(name.to_string(), make_cap(name, cid, inner));
             env.set(format!("{name}-handler"), handler);
         }
         env.set("import".to_string(), make_import_cap());
@@ -2879,6 +2925,199 @@ mod tests {
                 make_cap("http-client", "test-http-cid", Rc::new(c.clone())),
             );
         }
+    }
+
+    // --- membrane-backed attenuation (M4) ---
+
+    /// Eval an expression with the full kernel wiring (dispatch table with
+    /// reify_attenuation, cap handlers installed) against the test session.
+    async fn eval_with_kernel(script: &str) -> Result<Val, Val> {
+        let ctx = RefCell::new(test_session());
+        let dispatch = build_dispatch();
+        let mut env = Env::new();
+        bind_caps_in_env(&mut env, &ctx.borrow());
+        let form = read(script).unwrap();
+        let wrapped = wrap_with_handlers(&form);
+        eval(&wrapped, &mut env, &ctx, &dispatch).await
+    }
+
+    fn assert_permission_denied(err: &Val, context: &str) {
+        let text = format!("{err}");
+        assert!(
+            text.contains("permission-denied") || text.contains("denied"),
+            "{context}: expected structured permission denial, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attenuate_reified_cap_allows_listed_method() {
+        run_local(async {
+            // The attenuated cap has a fresh cap_id, so the ambient
+            // host-handler does not match; dispatch goes through the cap's
+            // carried handler over the MEMBRANED client.
+            let result = eval_with_kernel("(let [h (attenuate host [:id])] (perform h :id))")
+                .await
+                .unwrap();
+            assert_eq!(result, Val::Str(bs58::encode(STUB_PEER_ID).into_string()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn attenuate_reified_cap_denies_unlisted_method_structured() {
+        run_local(async {
+            let err = eval_with_kernel("(let [h (attenuate host [:id])] (perform h :peers))")
+                .await
+                .unwrap_err();
+            assert_permission_denied(&err, "gate denial");
+            assert!(
+                format!("{err}").contains("attenuation policy"),
+                "denial should name the attenuation policy: {err}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn attenuate_unknown_method_fails_closed() {
+        run_local(async {
+            let err = eval_with_kernel("(attenuate host [:frobnicate])")
+                .await
+                .unwrap_err();
+            let text = format!("{err}");
+            assert!(
+                text.contains("not found"),
+                "unknown method must fail at attenuation time: {text}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn attenuate_reattenuation_intersects() {
+        run_local(async {
+            // {id, addrs} ∩ {addrs, peers} = {addrs}
+            let ok = eval_with_kernel(
+                "(let [a (attenuate host [:id :addrs])
+                       b (attenuate a [:addrs :peers])]
+                   (perform b :addrs))",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                ok,
+                Val::List(vec![Val::Str("/ip4/127.0.0.1/tcp/4001".into())])
+            );
+
+            let denied_outer = eval_with_kernel(
+                "(let [a (attenuate host [:id :addrs])
+                       b (attenuate a [:addrs :peers])]
+                   (perform b :id))",
+            )
+            .await
+            .unwrap_err();
+            assert_permission_denied(&denied_outer, "method only in inner set");
+
+            let denied_inner = eval_with_kernel(
+                "(let [a (attenuate host [:id :addrs])
+                       b (attenuate a [:addrs :peers])]
+                   (perform b :peers))",
+            )
+            .await
+            .unwrap_err();
+            assert_permission_denied(&denied_inner, "method only in outer set");
+        })
+        .await;
+    }
+
+    /// THE boundary test: the exported client of an attenuated cap is
+    /// membrane-governed — direct capnp calls (bypassing Glia entirely, as a
+    /// remote peer would after export/serve) are filtered at the hook.
+    #[tokio::test]
+    async fn attenuated_cap_export_is_membrane_governed() {
+        run_local(async {
+            let ctx = RefCell::new(test_session());
+            let dispatch = build_dispatch();
+            let mut env = Env::new();
+            bind_caps_in_env(&mut env, &ctx.borrow());
+            let form = read("(attenuate host [:id])").unwrap();
+            let cap = eval(&form, &mut env, &ctx, &dispatch).await.unwrap();
+
+            let Val::Cap { inner, .. } = &cap else {
+                panic!("expected cap, got {cap:?}");
+            };
+            let client =
+                extract_capnp_client(inner).expect("attenuated cap must export a capnp client");
+            let host: system_capnp::host::Client =
+                capnp::capability::FromClientHook::new(client.hook);
+
+            // Allowed method passes through the membrane to the stub.
+            let resp = host.id_request().send().promise.await.unwrap();
+            assert_eq!(resp.get().unwrap().get_peer_id().unwrap(), STUB_PEER_ID);
+
+            // Denied method is refused BY THE MEMBRANE (typed-client casting
+            // is exactly the bypass a remote caller would attempt).
+            let err = match host.peers_request().send().promise.await {
+                Ok(_) => panic!("peers must be denied by the membrane"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains(ww_membrane::DENIED_MARKER),
+                "denial must come from the membrane: {err}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn attenuate_schemaless_capnp_cap_fails_closed() {
+        run_local(async {
+            let ctx = RefCell::new(test_session());
+            let dispatch = build_dispatch();
+            let mut env = Env::new();
+            bind_caps_in_env(&mut env, &ctx.borrow());
+            // A generic capnp-backed cap (e.g. from vat dial) has no compiled
+            // schema — attenuation cannot resolve ordinals and must refuse
+            // rather than fall back to an unenforceable string check.
+            let generic = make_generic_cap(capnp::capability::Client::new(
+                ctx.borrow().host.clone().client.hook,
+            ));
+            env.set("gc".into(), generic);
+            let form = read("(attenuate gc [:id])").unwrap();
+            let err = eval(&form, &mut env, &ctx, &dispatch).await.unwrap_err();
+            let text = format!("{err}");
+            assert!(
+                text.contains("no compiled schema"),
+                "schema-less attenuation must fail closed: {text}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn attenuate_defcap_still_uses_local_path() {
+        run_local(async {
+            // Pure-Glia caps can't cross a boundary; attenuate falls back to
+            // evaluator-local interposition (reify returns None).
+            let result = eval_with_kernel(
+                "(do (defcap svc :hello (fn [] :hi))
+                     (let [ro (attenuate svc [:hello])]
+                       (perform ro :hello)))",
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, Val::Keyword("hi".into()));
+
+            let denied = eval_with_kernel(
+                "(do (defcap svc :hello (fn [] :hi) :bye (fn [] :cya))
+                     (let [ro (attenuate svc [:hello])]
+                       (perform ro :bye)))",
+            )
+            .await
+            .unwrap_err();
+            assert_permission_denied(&denied, "defcap local attenuation");
+        })
+        .await;
     }
 
     /// Verify that (perform :load "path") inside wrap_with_handlers
@@ -3092,8 +3331,7 @@ mod tests {
                 wasm: b"fake-wasm".to_vec(),
                 caps: vec![("http".to_string(), http_cap)],
             };
-            let result =
-                call_handler(&handler, "listen", &[cell, Val::Str("/demo".into())]).await;
+            let result = call_handler(&handler, "listen", &[cell, Val::Str("/demo".into())]).await;
             assert!(
                 result.is_ok(),
                 "cell-based listen with caps failed: {:?}",
@@ -3113,8 +3351,7 @@ mod tests {
                 wasm: b"fake-wasm".to_vec(),
                 caps: vec![],
             };
-            let result =
-                call_handler(&handler, "listen", &[cell, Val::Str("/demo".into())]).await;
+            let result = call_handler(&handler, "listen", &[cell, Val::Str("/demo".into())]).await;
             assert!(
                 result.is_ok(),
                 "cell-based listen without caps failed: {:?}",
@@ -3144,7 +3381,14 @@ mod tests {
     #[test]
     fn schema_returns_bytes_for_each_known_cap() {
         let builtin = make_schema_builtin();
-        for name in ["host", "runtime", "routing", "identity", "http", "http-client"] {
+        for name in [
+            "host",
+            "runtime",
+            "routing",
+            "identity",
+            "http",
+            "http-client",
+        ] {
             let cap = test_cap(name, "test-cid");
             let result = call_builtin(&builtin, &[cap]).unwrap_or_else(|e| {
                 panic!("schema for '{name}' returned error: {e}");
@@ -3175,10 +3419,7 @@ mod tests {
     fn schema_arity_mismatch_returns_structured_error() {
         let builtin = make_schema_builtin();
         let err = call_builtin(&builtin, &[]).unwrap_err();
-        assert_eq!(
-            glia::error::type_tag(&err),
-            Some(glia::error::tag::ARITY)
-        );
+        assert_eq!(glia::error::type_tag(&err), Some(glia::error::tag::ARITY));
     }
 
     #[test]
@@ -3304,19 +3545,12 @@ mod tests {
     #[test]
     fn unwrap_cap_arg_rejects_zero_args() {
         let err = unwrap_cap_arg("schema", &[]).unwrap_err();
-        assert_eq!(
-            glia::error::type_tag(&err),
-            Some(glia::error::tag::ARITY)
-        );
+        assert_eq!(glia::error::type_tag(&err), Some(glia::error::tag::ARITY));
     }
 
     #[test]
     fn unwrap_cap_arg_rejects_two_args() {
         let err = unwrap_cap_arg("schema", &[Val::Nil, Val::Nil]).unwrap_err();
-        assert_eq!(
-            glia::error::type_tag(&err),
-            Some(glia::error::tag::ARITY)
-        );
+        assert_eq!(glia::error::type_tag(&err), Some(glia::error::tag::ARITY));
     }
-
 }

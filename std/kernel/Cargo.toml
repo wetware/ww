@@ -16,6 +16,7 @@ hex = "0.4"
 glia = { path = "../../crates/glia" }
 system = { path = "../system" }
 caps = { path = "../caps" }
+ww-membrane = { path = "../../crates/ww-membrane" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
