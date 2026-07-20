@@ -45,14 +45,21 @@
                         {:type :glia.error/permission-denied
                          :method method}))))))
 
-;; --- retry (not yet shipped) ------------------------------------------
-;;
-;; A retry handler needs (try (perform* cap data) (catch ...)) inside the
-;; handler body. It is blocked by a closure free-var-capture bug: a closure
-;; that calls the `try` macro cannot resolve `try-catches` (which appears
-;; only after `try` expands), so the catch silently yields nil. See the
-;; ignored test closure_calling_try_macro_resolves_try_catches in glia's
-;; eval tests. retry ships with that fix.
+;; --- retry -----------------------------------------------------------
+
+;; retry — delegate to the cap; on throw, retry up to n attempts total,
+;; re-throwing the last error once attempts are exhausted. Use with
+;; idempotent methods: every attempt is a real delegated call.
+(defn retry [cap n]
+  (fn [data resume]
+    (loop [attempt 1]
+      (let [outcome (try {:ok (perform* cap data)}
+                         (catch _ e {:err e}))]
+        (if (contains? outcome :ok)
+          (resume (get outcome :ok))
+          (if (< attempt n)
+            (recur (+ attempt 1))
+            (throw (get outcome :err))))))))
 
 ;; --- budget ----------------------------------------------------------
 

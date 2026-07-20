@@ -172,6 +172,37 @@ impl Env {
         }
     }
 
+    /// Slim closure capture: the closure's free variables PLUS every macro in
+    /// scope.
+    ///
+    /// Free vars alone are unsound in the presence of eval-time macro
+    /// expansion: a body that calls `try` has free var `try` but not
+    /// `try-catches`, which `try` only references after it expands. Since
+    /// macros are resolved (and expanded) at eval time against the closure's
+    /// captured env, a dropped macro global makes the expansion fall through
+    /// to host dispatch. Macros are authority-free (`Val::Macro`, never caps),
+    /// so capturing them all does not affect `compute_cap_status`.
+    pub fn capture_closure(&self, free_vars: BTreeSet<&String>) -> Self {
+        let mut captured = Frame::new();
+        // Oldest → newest so inner scopes shadow outer ones, matching `get`.
+        for frame in &self.frames {
+            for (k, v) in frame {
+                if matches!(v, Val::Macro { .. }) {
+                    captured.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        for name in free_vars {
+            if let Some(value) = self.get(name) {
+                captured.insert(name.clone(), value.clone());
+            }
+        }
+        Self {
+            frames: vec![captured],
+            handler_stack: self.handler_stack.clone(),
+        }
+    }
+
     /// Create a new Env for function invocation.
     ///
     /// Instead of cloning the captured env (which recurses infinitely when
@@ -1686,7 +1717,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                     .iter()
                     .flat_map(|arity| arity.free_vars.iter())
                     .collect();
-                let captured_env = env.filter_to(free_vars);
+                let captured_env = env.capture_closure(free_vars);
                 let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
                 let fn_arities: Vec<FnArity> = arities
                     .iter()
@@ -7313,6 +7344,36 @@ mod tests {
     }
 
     #[test]
+    fn policy_retry_retries_until_success() {
+        // The defcap fails twice (atom-backed counter), then succeeds;
+        // retry 3 absorbs both failures.
+        let result = policy_eval(
+            "(do (def *fails* (atom 0))
+                 (defcap svc :flaky (fn []
+                   (if (< (deref *fails*) 2)
+                     (do (reset! *fails* (+ (deref *fails*) 1))
+                         (throw (ex-info \"transient\" {:type :glia.error/internal})))
+                     :recovered)))
+                 (with-effect-handler svc (retry svc 3)
+                   (perform svc :flaky)))",
+        )
+        .unwrap();
+        assert_eq!(result, Val::Keyword("recovered".into()));
+    }
+
+    #[test]
+    fn policy_retry_exhausts_and_rethrows() {
+        let result = policy_eval(
+            "(do (defcap svc :flaky (fn []
+                   (throw (ex-info \"always down\" {:type :glia.error/internal}))))
+                 (with-effect-handler svc (retry svc 2)
+                   (perform svc :flaky)))",
+        );
+        assert!(result.is_err());
+        assert!(err_contains(&result.unwrap_err(), "always down"));
+    }
+
+    #[test]
     fn policy_budget_denies_after_n() {
         let ok = policy_eval(
             "(do (defcap svc :echo (fn [x] x))
@@ -7355,18 +7416,11 @@ mod tests {
         assert!(err_contains(&denied.unwrap_err(), "denied"));
     }
 
-    /// KNOWN BUG (root-caused 2026-07-20; fixed separately, see the
-    /// closure-macro-capture PR): a closure whose body calls a macro that
-    /// expands to reference ANOTHER global returns nil. Closures capture only
-    /// their free variables (`Env::filter_to`), and free vars are computed on
-    /// the UN-expanded body — so `try` is captured but `try-catches` (which
-    /// appears only after `try` expands) is not, and the expansion can't
-    /// resolve it, falling through to `dispatch.call` (nil in tests). NOT
-    /// handler-specific: `(defn f [] (try (throw 1) (catch _ e e)))` fails at
-    /// top level too. `or` survives only because it expands to pure special
-    /// forms. This blocks ww/policy `retry` (whose handler needs `try`).
+    /// Was the retry blocker: closures dropped macro-expansion globals
+    /// (`try` captured, `try-catches` not). Fixed by Env::capture_closure
+    /// (#572); kept as the policy-context regression alongside the capture
+    /// tests below.
     #[test]
-    #[ignore = "closure free-var capture drops macro-expansion globals (try -> try-catches); fixed in a separate PR"]
     fn closure_calling_try_macro_resolves_try_catches() {
         // Minimal, handler-independent repro.
         assert_eq!(
@@ -7441,5 +7495,65 @@ mod tests {
         let r = prelude_eval("(deref 42)");
         assert!(r.is_err());
         assert!(err_contains(&r.unwrap_err(), "atom"));
+    }
+
+    // -----------------------------------------------------------------
+    // Closure capture must retain macros reachable through expansion.
+    // Regression: closures capture free vars, computed on the un-expanded
+    // body, so a macro (`try`) that expands to reference another global
+    // (`try-catches`) previously left that global uncaptured and the
+    // expansion fell through to host dispatch (nil). See capture_closure.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn closure_calling_try_resolves_expansion_globals() {
+        // Body catches: without the fix this returns nil.
+        assert_eq!(
+            prelude_eval("(do (defn f [] (try (throw 1) (catch _ e e))) (f))"),
+            Ok(Val::Int(1)),
+        );
+        // Body does not throw: success value flows through.
+        assert_eq!(
+            prelude_eval("(do (defn g [] (try 7 (catch _ e e))) (g))"),
+            Ok(Val::Int(7)),
+        );
+    }
+
+    #[test]
+    fn closure_macro_expanding_to_macro_chain() {
+        // `when-not` -> `if`/`do`; and a user macro expanding to `try`. The
+        // closure must resolve every macro reached through expansion.
+        assert_eq!(
+            prelude_eval(
+                "(do (defmacro guarded [v] (list (quote try) v (list (quote catch) (quote _) (quote e) :caught)))
+                     (defn f [] (guarded (throw 1)))
+                     (f))"
+            ),
+            Ok(Val::Keyword("caught".into())),
+        );
+    }
+
+    #[test]
+    fn nested_closures_retain_macros() {
+        // A closure returning a closure that uses `try`; the inner closure is
+        // created while the outer runs, and must still capture `try-catches`.
+        assert_eq!(
+            prelude_eval(
+                "(do (defn mk [] (fn [] (try (throw 9) (catch _ e e)))) (def inner (mk)) (inner))"
+            ),
+            Ok(Val::Int(9)),
+        );
+    }
+
+    #[test]
+    fn try_inside_effect_handler_body_catches() {
+        // The case that surfaced the bug (ww/policy retry): a `try` around a
+        // delegating perform, inside an effect handler.
+        let r = prelude_eval(
+            "(with-effect-handler :e
+               (fn [d resume] (resume (try (throw 42) (catch _ x x))))
+               (perform :e 0))",
+        );
+        assert_eq!(r, Ok(Val::Int(42)));
     }
 }
