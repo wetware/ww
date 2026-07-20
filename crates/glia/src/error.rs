@@ -537,6 +537,7 @@ pub(crate) fn val_type_name(v: &Val) -> &'static str {
         Val::Str(_) => "string",
         Val::Sym(_) => "symbol",
         Val::Keyword(_) => "keyword",
+        Val::Atom(_) => "atom",
         Val::List(_) => "list",
         Val::Vector(_) => "vector",
         Val::Map(_) => "map",

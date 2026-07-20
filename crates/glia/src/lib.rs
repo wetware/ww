@@ -187,6 +187,12 @@ pub enum Val {
     /// Opaque binary data — a runtime value, not parseable from text.
     /// Produced by evaluating expressions like `(ipfs cat "...")`.
     Bytes(Vec<u8>),
+    /// Mutable reference cell (Clojure-style atom). Single-threaded
+    /// interior mutability for evaluator-local state: closures capture the
+    /// shared cell, so handler/policy state survives across invocations —
+    /// unlike `def`, which only mutates the evaluating closure's own root.
+    /// Compared by identity, like caps.
+    Atom(std::rc::Rc<std::cell::RefCell<Val>>),
     /// A closure: one or more arities + captured environment snapshot.
     ///
     /// The env is `Rc`-shared to avoid infinite recursion when cloning closures
@@ -267,6 +273,10 @@ impl core::fmt::Debug for Val {
             Val::Str(s) => f.debug_tuple("Str").field(s).finish(),
             Val::Sym(s) => f.debug_tuple("Sym").field(s).finish(),
             Val::Keyword(s) => f.debug_tuple("Keyword").field(s).finish(),
+            Val::Atom(a) => match a.try_borrow() {
+                Ok(v) => f.debug_tuple("Atom").field(&*v).finish(),
+                Err(_) => write!(f, "Atom(<borrowed>)"),
+            },
             Val::List(v) => f.debug_tuple("List").field(v).finish(),
             Val::Vector(v) => f.debug_tuple("Vector").field(v).finish(),
             Val::Map(m) => f.debug_tuple("Map").field(m).finish(),
@@ -363,6 +373,8 @@ impl PartialEq for Val {
             (Val::Cap { cap_id: a, .. }, Val::Cap { cap_id: b, .. }) => a == b,
             // Cells are equal if wasm matches (caps are opaque).
             (Val::Cell { wasm: wa, .. }, Val::Cell { wasm: wb, .. }) => wa == wb,
+            // Atoms compare by identity: same cell, not same contents.
+            (Val::Atom(a), Val::Atom(b)) => std::rc::Rc::ptr_eq(a, b),
             // Recur, Effect, and Resume are internal sentinels — never equal.
             (Val::Recur(_), _) | (_, Val::Recur(_)) => false,
             (Val::Effect { .. }, _) | (_, Val::Effect { .. }) => false,
@@ -405,6 +417,8 @@ impl std::hash::Hash for Val {
                 (std::rc::Rc::as_ptr(func) as *const () as usize).hash(state)
             }
             Val::Cap { cap_id, .. } => cap_id.hash(state),
+            // Identity hash, consistent with identity equality.
+            Val::Atom(a) => (std::rc::Rc::as_ptr(a) as usize).hash(state),
             Val::Cell { wasm, .. } => {
                 wasm.hash(state);
             }
@@ -418,6 +432,10 @@ impl core::fmt::Display for Val {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Val::Nil => write!(f, "nil"),
+            Val::Atom(a) => match a.try_borrow() {
+                Ok(v) => write!(f, "#atom[{v}]"),
+                Err(_) => write!(f, "#atom[...]"),
+            },
             Val::Bool(b) => write!(f, "{b}"),
             Val::Int(n) => write!(f, "{n}"),
             Val::Float(n) => {
