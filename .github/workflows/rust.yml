@@ -453,8 +453,15 @@ jobs:
         # on a zero-replica deployment, which made every deploy from
         # 2026-06-08 to 2026-07-20 a vacuous success while the site served
         # 503. A scaled-to-zero target must FAIL the deploy, loudly.
-        REPLICAS=$(ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" \
-          "kubectl get deployment ww-master -o jsonpath='{.spec.replicas}'")
+        # Distinguish "query failed" from "scaled to zero" — set -e does
+        # not propagate out of command substitutions, so check explicitly.
+        if ! REPLICAS=$(ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" \
+          "kubectl get deployment ww-master -o jsonpath='{.spec.replicas}'"); then
+          echo "ERROR: could not query deployment/ww-master (ssh/kubectl"
+          echo "failure above) — cannot verify the deploy target. Check"
+          echo "connectivity and kubectl config on the VPS."
+          exit 1
+        fi
         if [ -z "$REPLICAS" ] || [ "$REPLICAS" = "0" ]; then
           echo "ERROR: deployment/ww-master has ${REPLICAS:-no} desired replicas."
           echo "A rollout against a scaled-to-zero deployment is a no-op;"
@@ -488,8 +495,13 @@ jobs:
         # `rollout status` passing does not mean the daemon is reachable
         # through the ingress. Probe until the DAEMON answers: any HTTP
         # status except 502/503 means the request reached the wetware
-        # process (404 is expected while the deploy artifact ships no
-        # init.d route cells; a bare ingress answers 502/503).
+        # process. Context (2026-07-20 RCA): the deploy artifact currently
+        # ships only kernel/shell wasm with no etc/init.d route cells, so a
+        # HEALTHY daemon answers 404 on every route — 404 is a PASS here.
+        # Only the ingress itself answers 502/503 ("no available server"),
+        # which is exactly the six-week dark-deployment failure this probe
+        # exists to catch. If the artifact later ships a status cell,
+        # tighten this to expect 200 on its route.
         for i in $(seq 1 12); do
           CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 \
             https://master.wetware.run/ || echo 000)
