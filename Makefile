@@ -6,7 +6,7 @@
 WASM_TARGET := wasm32-wasip2
 
 .PHONY: all host std kernel shell status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
-.PHONY: publish-std try-publish-std publish test-deps test test-wasm
+.PHONY: publish-std try-publish-std publish test-deps test test-wasm check-glia-effects
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
 
@@ -22,6 +22,13 @@ test-deps:
 
 test: test-deps
 	cargo test --workspace
+
+# Guard the explicit pre-alpha Glia host-effect syntax. Historical audits and
+# changelog entries intentionally retain old spellings as evidence.
+check-glia-effects:
+	@! rg -n '\(load |\(println |\(exit\)|eval_path_lookup' \
+		--glob '!doc/audits/**' --glob '!CHANGELOG.md' --glob '!target/**' \
+		--glob '!std/**/target/**' --glob '!std/system/src/lib.rs' --glob '!Makefile' .
 
 # --- Std components ----------------------------------------------------------
 

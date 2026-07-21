@@ -274,9 +274,9 @@ async fn test_shell_eval_exit_sentinel() {
             let shell = spawn_shell_on_pool(&pool).await.expect("spawn shell");
             wait_ready(&shell).await;
 
-            let (result, is_error) = eval(&shell, "(exit)").await;
-            assert!(!is_error, "(exit) should not be an error");
-            assert!(result.contains("exit"), "(exit) result: {result}");
+            let (result, is_error) = eval(&shell, "(perform :exit nil)").await;
+            assert!(!is_error, "exit effect should not be an error");
+            assert!(result.is_empty(), "exit result: {result}");
         })
         .await;
 }

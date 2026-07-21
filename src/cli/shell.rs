@@ -6,10 +6,11 @@ use capnp::capability::FromClientHook;
 use capnp_rpc::{new_client, pry};
 use caps::mcp_adapter::{self, ActionPolicy, ExprPart, ToolAction, ToolSpec};
 use caps::{
-    clear_import_cache, clear_load_backend, clear_load_cache, eval_load_async, extract_method,
-    make_import_cap, make_import_handler, set_load_backend, wrap_with_handlers, LoadBackend,
+    clear_import_cache, clear_load_backend, clear_load_cache, extract_method,
+    make_import_cap, make_import_handler, set_load_backend, LoadBackend, LoadRuntime,
 };
-use glia::eval::{self, Dispatch, Env};
+use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
+use glia::eval::{self, Dispatch, Env, EvalOutcome};
 use glia::{make_cap, Val};
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
@@ -42,7 +43,7 @@ Remote Glia shell. Available commands:
   (perform host :peers)    — connected peers
   (perform routing :resolve \"/ipns/<name>\") — IPNS resolve
   (help)                   — this message
-  (exit)                   — disconnect";
+  (perform :exit nil)      — disconnect";
 
 const SHELL_MCP_HOST_ID_EXPR: &[ExprPart] = &[ExprPart::Literal("(perform host :id)")];
 const SHELL_MCP_HOST_PEERS_EXPR: &[ExprPart] = &[ExprPart::Literal("(perform host :peers)")];
@@ -173,6 +174,7 @@ impl<'a> Dispatch for LocalShellDispatch<'a> {
 struct LocalShellRuntime {
     env: Env,
     dispatch: HashMap<&'static str, HandlerFn>,
+    load_runtime: LoadRuntime,
 }
 
 impl LocalSigner {
@@ -663,7 +665,7 @@ async fn build_local_shell_runtime(caps: GraftedShellCaps) -> LocalShellRuntime 
     );
     env.set(
         "import-handler".to_string(),
-        make_import_handler(load_runtime),
+        make_import_handler(load_runtime.clone()),
     );
 
     let dispatch = build_dispatch();
@@ -672,32 +674,18 @@ async fn build_local_shell_runtime(caps: GraftedShellCaps) -> LocalShellRuntime 
         glia::load_prelude(&mut env, &mut prelude_dispatch).await;
     }
 
-    LocalShellRuntime { env, dispatch }
+    LocalShellRuntime { env, dispatch, load_runtime }
 }
 
 fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
-    fn load_handler(
-        args: &[Val],
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + '_>> {
-        Box::pin(eval_load_async(args))
-    }
-
     fn help_handler(
         _args: &[Val],
     ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + '_>> {
         Box::pin(std::future::ready(Ok(Val::Str(HELP_TEXT.to_string()))))
     }
 
-    fn exit_handler(
-        _args: &[Val],
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + '_>> {
-        Box::pin(std::future::ready(Ok(Val::Keyword("exit".into()))))
-    }
-
     let mut table: HashMap<&'static str, HandlerFn> = HashMap::new();
-    table.insert("load", load_handler);
     table.insert("help", help_handler);
-    table.insert("exit", exit_handler);
     table
 }
 
@@ -1128,18 +1116,42 @@ async fn shell_eval_raw(
         Err(e) => return Ok(Err(glia::error::parse(None, e))),
     };
 
-    let wrapped = wrap_with_handlers(&expr, &[]);
     let dispatch = LocalShellDispatch {
         table: &runtime.dispatch,
     };
+    let load_runtime = runtime.load_runtime.clone();
+    let load = Rc::new(move |data: Val| {
+        let runtime = load_runtime.clone();
+        Box::pin(async move { Ok(HostEffectResult::Resume(runtime.load_value(data).await?)) })
+            as Pin<Box<dyn Future<Output = std::result::Result<HostEffectResult, Val>>>>
+    });
+    let stdout = Rc::new(|data: Val| {
+        Box::pin(async move {
+            let text = match data { Val::Str(s) => s, other => format!("{other}") };
+            println!("{text}");
+            Ok(HostEffectResult::Resume(Val::Nil))
+        }) as Pin<Box<dyn Future<Output = std::result::Result<HostEffectResult, Val>>>>
+    });
+    let exit = Rc::new(|_data: Val| {
+        Box::pin(async { Ok(HostEffectResult::Exit) })
+            as Pin<Box<dyn Future<Output = std::result::Result<HostEffectResult, Val>>>>
+    });
+    let effects = [
+        HostEffect { target: EffectTarget::Keyword("load".into()), handler: load },
+        HostEffect { target: EffectTarget::Keyword("stdout".into()), handler: stdout },
+        HostEffect { target: EffectTarget::Keyword("exit".into()), handler: exit },
+    ];
     let eval_result = tokio::time::timeout(
         RPC_TIMEOUT,
-        eval::eval_toplevel(&wrapped, &mut runtime.env, &dispatch),
+        eval::eval_toplevel_with_host_effects(&expr, &mut runtime.env, &dispatch, &effects),
     )
     .await
     .context("shell eval timed out")?;
 
-    Ok(eval_result)
+    Ok(eval_result.map(|outcome| match outcome {
+        EvalOutcome::Value(value) => value,
+        EvalOutcome::Exit => Val::Keyword("exit".into()),
+    }))
 }
 
 fn get_graft_cap<T: FromClientHook>(
@@ -2069,7 +2081,7 @@ mod tests {
     async fn local_runtime_routes_ipfs_loads_through_grafted_ipfs_cap() {
         let (caps, seen_paths) = test_grafted_caps();
         let mut runtime = build_local_shell_runtime(caps).await;
-        let (result, is_error) = shell_eval(&mut runtime, "(load \"/ipfs/bafy-test/path\")")
+        let (result, is_error) = shell_eval(&mut runtime, "(perform :load \"/ipfs/bafy-test/path\")")
             .await
             .unwrap();
         assert!(!is_error, "unexpected eval error: {result}");

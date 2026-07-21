@@ -131,7 +131,7 @@ const MCP_ROUTING_ACTIONS: &[ToolAction] = &[
 ];
 
 const MCP_RUNTIME_RUN_EXPR: &[ExprPart] = &[
-    ExprPart::Literal("(perform runtime :run (load "),
+    ExprPart::Literal("(perform runtime :run (perform :load "),
     ExprPart::QuotedStringField {
         field: "wasm_path",
         default: "",
@@ -931,7 +931,7 @@ mod tests {
         );
         assert_eq!(
             result,
-            Some(r#"(perform runtime :run (load "bin/app.wasm"))"#.into())
+            Some(r#"(perform runtime :run (perform :load "bin/app.wasm"))"#.into())
         );
     }
 

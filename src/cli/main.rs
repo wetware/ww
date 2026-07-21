@@ -900,9 +900,9 @@ wasip2::cli::command::export!({iface_name}Guest);
 ; a vat service under the "{name}" protocol.
 ;
 ; To run the service from the shell:
-;   (perform runtime :run (load "bin/{name}.wasm") :args ["serve"])
+;   (perform runtime :run (perform :load "bin/{name}.wasm") :args ["serve"])
 
-(def {snake_name}-wasm (load "bin/{name}.wasm"))
+(def {snake_name}-wasm (perform :load "bin/{name}.wasm"))
 (def {snake_name}-executor (perform runtime :load {snake_name}-wasm))
 (def {snake_name}-process (perform {snake_name}-executor :spawn))
 (def {snake_name}-cap (perform {snake_name}-process :bootstrap))

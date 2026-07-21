@@ -565,6 +565,14 @@ fn eval<'a>(
             ctx,
             table: dispatch,
         };
+        // Keep ordinary capability-only evaluations on the existing direct
+        // path. Besides avoiding needless frames, this preserves capnp
+        // pipelining behavior for host listeners; environmental frames are
+        // required only when the expression actually names one of their
+        // keywords.
+        if !mentions_host_effect(expr) {
+            return eval::eval_toplevel(expr, env, &kd).await;
+        }
         let load_runtime = caps::default_load_runtime();
         let load = std::rc::Rc::new(move |data: Val| {
             let runtime = load_runtime.clone();
@@ -593,6 +601,19 @@ fn eval<'a>(
             Err(error) => Err(error),
         }
     })
+}
+
+fn mentions_host_effect(value: &Val) -> bool {
+    match value {
+        Val::List(values) => {
+            matches!(values.as_slice(), [Val::Sym(head), Val::Keyword(effect), ..]
+                if head == "perform" && matches!(effect.as_str(), "load" | "stdout" | "exit"))
+                || values.iter().any(mentions_host_effect)
+        }
+        Val::Vector(values) | Val::Set(values) => values.iter().any(mentions_host_effect),
+        Val::Map(map) => map.iter().any(|(key, value)| mentions_host_effect(key) || mentions_host_effect(value)),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,17 +1277,8 @@ fn parse_initd_script(name: &str, data: &[u8]) -> Option<Vec<Val>> {
 /// Wrap a form in capability handlers. Environmental host effects are installed
 /// by the Rust evaluator driver and are never guest-visible bindings.
 ///
-/// Produces:
-/// ```glia
-/// (with-effect-handler host host-handler
-///   (with-effect-handler runtime runtime-handler
-///     (with-effect-handler routing routing-handler
-///       (with-effect-handler :load (fn [path resume] (resume (load path)))
-///         <form>))))
-/// ```
-///
-/// Cap handlers are looked up from the environment by name. Keyword effect
-/// handlers wrap builtins that use the effect protocol.
+/// Capability handlers are looked up from the environment by name. Keyword
+/// host effects are serviced by the Rust evaluator driver.
 fn wrap_with_handlers(form: &Val) -> Val {
     let caps = ["import", "routing", "runtime", "host"];
     let mut wrapped = form.clone();
