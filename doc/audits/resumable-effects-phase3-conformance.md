@@ -26,8 +26,8 @@ Subject to the accepted REPL/diagnostic exceptions below, the invariant does **n
 | Local CLI shell bare `(load path)` | **VIOLATION** | `LocalShellDispatch` routes it to `eval_load_async`; its backend reads host files or calls IPFS directly. |
 | MCP Glia evaluator bare `(load path)` | **VIOLATION** | `McpDispatch` has the same direct `eval_load_async` table entry. |
 | Kernel `(cd path)` | **ACCEPTED-EXCEPTION (proposed)** | It mutates only evaluator session state and does no filesystem operation; retaining it as shell-local state is defensible. |
-| Kernel `(exit)` | **ACCEPTED-EXCEPTION (proposed)** | It terminates the interactive kernel process directly; this is a REPL lifecycle convenience rather than program capability work. |
-| Remote/local shell `(exit)` | **ACCEPTED-EXCEPTION (proposed)** | It returns an `:exit` sentinel to the serving loop, a defensible interactive-session control operation. |
+| Kernel `(exit)` | **RESOLVED** | The historical direct lifecycle shortcut was removed; Glia now requests session termination with `(perform :exit nil)`. |
+| Remote/local shell `(exit)` | **RESOLVED** | The historical sentinel shortcut now begins at `(perform :exit nil)` and is handled by the embedding's outer loop. |
 | `(help)` in kernel/shell/MCP dispatch tables | **ACCEPTED-EXCEPTION (proposed)** | It only returns static diagnostic text and has no outside-world side effect. |
 | Standard `wrap_with_handlers` wrappers | **CONFORMANT** | Kernel and shared-caps wrappers install `:load` plus the applicable cap handlers around each evaluated user form. |
 
@@ -89,7 +89,10 @@ The dispatch sites at `crates/glia/src/eval.rs:2366`, `:2417`, `:2801`, and `:28
 
 ## Accepted exceptions proposed for maintainer decision
 
-`help` only constructs static text. `cd` only assigns `Session.cwd` (`std/kernel/src/lib.rs:554-562`) and performs no I/O. Kernel `exit` calls `std::process::exit` directly (`:505-510`), while the shell variants return an `:exit` sentinel (`std/shell/src/lib.rs:89-93`; `src/cli/shell.rs:683-690`). These are reasonable interactive-control and diagnostics exceptions, provided they remain clearly scoped to evaluator/REPL lifecycle rather than reusable application operations.
+`help` only constructs static text and `cd` only assigns local session state. The
+historical direct `exit` exception is closed: Glia code requests termination
+through `(perform :exit nil)`, while each embedding retains responsibility for
+its own outer-loop or process lifecycle.
 
 ## Method
 

@@ -111,8 +111,10 @@ Shell transport/auth is remote, but evaluation is local:
 
 `ww shell` does not call daemon-side `runtime.load(shell.wasm)`,
 `executor.spawn`, or `process.bootstrap` on connect.
-For `load`/`import`, `/ipfs|/ipns|/ipld` paths route through grafted
-`system.Ipfs` reads; non-IPFS paths use local process filesystem reads.
+For `(perform :load path)` and `import`, `/ipfs|/ipns|/ipld` paths route
+through grafted `system.Ipfs` reads; non-IPFS load paths use local process
+filesystem reads. In `--mcp` mode, `:stdout` and `:exit` are unavailable so
+JSON-RPC stdout stays protocol-only.
 
 ### Examples
 

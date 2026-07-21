@@ -37,10 +37,29 @@ key (`WW_IDENTITY` or `~/.ww/identity`).
 
 ## Path semantics
 
-- `/ipfs/...`, `/ipns/...`, `/ipld/...` loads/imports route through the grafted
-  `ipfs` capability (`system.Ipfs.read`).
-- Non-IPFS paths use the shell process local filesystem.
+- `(perform :load "/ipfs/...")`, `(perform :load "/ipns/...")`, and
+  `(perform :load "/ipld/...")` route through the grafted `ipfs` capability
+  (`system.Ipfs.read`).
+- `(perform :load path)` uses the shell process local filesystem for non-IPFS
+  paths.
 - `ww shell` never talks directly to Kubo.
+
+## Standard host effects
+
+Glia code in the shell uses explicit effects for embedding work:
+
+```clojure
+(perform :load "glia/register.glia")
+(perform :stdout value)
+(perform :exit nil)
+```
+
+The terminal embedding loads and prints normally. The local CLI shell turns
+`:exit` into a sentinel that its outer loop handles. In `ww shell --mcp`,
+`:stdout` and `:exit` fail with a typed protocol-mode-unavailable error rather
+than corrupting JSON-RPC stdout; `:load` remains subject to the configured
+loader. Effects expose the semantic interaction boundary only. Grafted
+capabilities and their membranes remain the authority boundary.
 
 ## Multi-Result Discovery
 
