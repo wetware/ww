@@ -2647,6 +2647,95 @@ pub fn eval_toplevel<'a, D: Dispatch>(
     })
 }
 
+/// Result of an embedding-owned top-level evaluation.
+#[derive(Clone, Debug)]
+pub enum EvalOutcome {
+    Value(Val),
+    Exit,
+}
+
+/// Evaluate a form with Rust-owned default keyword-effect frames.
+///
+/// The frames are dynamic but never guest-visible: they are installed before
+/// evaluation, so ordinary Glia `with-effect-handler` frames remain newer and
+/// therefore interpose first.  This mirrors the existing handler poll loop,
+/// including genuine-pending propagation, while allowing `:exit` to abort by
+/// dropping the suspended body future rather than smuggling a sentinel through
+/// guest evaluation.
+pub fn eval_toplevel_with_host_effects<'a, D: Dispatch>(
+    val: &'a Val,
+    env: &'a mut Env,
+    dispatch: &'a D,
+    host_effects: &'a [effect::HostEffect],
+) -> Pin<Box<dyn Future<Output = Result<EvalOutcome, Val>> + 'a>> {
+    Box::pin(async move {
+        let hs = env.handler_stack.clone();
+        let contexts: Vec<Rc<RefCell<effect::HandlerContext>>> = host_effects
+            .iter()
+            .map(|effect| {
+                Rc::new(RefCell::new(effect::HandlerContext {
+                    slot: Rc::new(RefCell::new(effect::EffectSlot::new())),
+                    target: effect.target.clone(),
+                }))
+            })
+            .collect();
+        hs.borrow_mut().extend(contexts.iter().cloned());
+
+        let mut body = eval_toplevel(val, env, dispatch);
+        let mut handling: Option<(
+            usize,
+            crate::oneshot::Sender,
+            Pin<Box<dyn Future<Output = Result<effect::HostEffectResult, Val>>>>,
+        )> = None;
+
+        let result = std::future::poll_fn(|cx| loop {
+            if let Some((_, _, future)) = handling.as_mut() {
+                match future.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(effect::HostEffectResult::Resume(value))) => {
+                        let (_, tx, _) = handling.take().expect("host handler state");
+                        tx.send(value);
+                        cx.waker().wake_by_ref();
+                        continue;
+                    }
+                    Poll::Ready(Ok(effect::HostEffectResult::Exit)) => {
+                        return Poll::Ready(Ok(EvalOutcome::Exit));
+                    }
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                }
+            }
+
+            match body.as_mut().poll(cx) {
+                Poll::Ready(Ok(value)) => return Poll::Ready(Ok(EvalOutcome::Value(value))),
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => {
+                    let pending = contexts.iter().enumerate().rev().find_map(|(index, ctx)| {
+                        ctx.borrow()
+                            .slot
+                            .borrow_mut()
+                            .pending
+                            .take()
+                            .map(|(_, data, tx)| (index, data, tx))
+                    });
+                    match pending {
+                        Some((index, data, tx)) => {
+                            let future = (host_effects[index].handler)(data);
+                            handling = Some((index, tx, future));
+                            continue;
+                        }
+                        None => return Poll::Pending,
+                    }
+                }
+            }
+        })
+        .await;
+
+        hs.borrow_mut()
+            .retain(|frame| !contexts.iter().any(|ctx| Rc::ptr_eq(frame, ctx)));
+        result
+    })
+}
+
 /// Evaluate a Glia expression.
 ///
 /// Resolution order:
@@ -4264,6 +4353,47 @@ mod tests {
     fn eval_str(input: &str, env: &mut Env, d: &RecordingDispatch) -> Result<Val, Val> {
         let expr = crate::read(input).map_err(|e| error::parse(None, e.to_string()))?;
         eval_blocking(&expr, env, d)
+    }
+
+    #[test]
+    fn host_effect_frame_resumes_without_guest_binding() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let form = crate::read("(perform :load \"x\")").unwrap();
+        let handler: effect::HostEffectHandler = Rc::new(|data| {
+            Box::pin(async move {
+                assert_eq!(data, Val::Str("x".into()));
+                Ok(effect::HostEffectResult::Resume(Val::Bytes(vec![1, 2])))
+            })
+        });
+        let effects = [effect::HostEffect {
+            target: effect::EffectTarget::Keyword("load".into()),
+            handler,
+        }];
+        let result = pollster_eval(eval_toplevel_with_host_effects(
+            &form, &mut env, &d, &effects,
+        ));
+        assert!(matches!(result, Ok(EvalOutcome::Value(Val::Bytes(ref b))) if b == &vec![1, 2]));
+        assert!(env.get("load-handler").is_none());
+    }
+
+    #[test]
+    fn host_effect_exit_aborts_without_guest_value() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let form = crate::read("(do (perform :exit nil) 42)").unwrap();
+        let handler: effect::HostEffectHandler =
+            Rc::new(|_| Box::pin(async { Ok(effect::HostEffectResult::Exit) }));
+        let effects = [effect::HostEffect {
+            target: effect::EffectTarget::Keyword("exit".into()),
+            handler,
+        }];
+        assert!(matches!(
+            pollster_eval(eval_toplevel_with_host_effects(
+                &form, &mut env, &d, &effects
+            )),
+            Ok(EvalOutcome::Exit)
+        ));
     }
 
     /// Check if an error Val contains a substring in its :message field or Display output.
