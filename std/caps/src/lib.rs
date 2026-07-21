@@ -74,6 +74,64 @@ pub trait LoadBackend {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Val>> + 'a>>;
 }
 
+/// Explicit load state owned by one embedding runtime.  New effect handlers
+/// receive this object directly instead of consulting process/thread globals.
+#[derive(Clone)]
+pub struct LoadRuntime {
+    root: String,
+    backend: Rc<dyn LoadBackend>,
+    cache: Rc<RefCell<HashMap<String, Vec<u8>>>>,
+}
+
+impl LoadRuntime {
+    pub fn new(root: impl Into<String>, backend: Rc<dyn LoadBackend>) -> Self {
+        Self {
+            root: root.into(),
+            backend,
+            cache: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
+
+    pub fn resolve(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            path.to_string()
+        } else if self.root.is_empty() || self.root == "/" {
+            format!("/{path}")
+        } else {
+            format!("{}/{path}", self.root.trim_end_matches('/'))
+        }
+    }
+
+    pub fn load<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+        let resolved = self.resolve(path);
+        if let Some(bytes) = self.cache.borrow().get(&resolved).cloned() {
+            return Box::pin(async move { Ok(Val::Bytes(bytes)) });
+        }
+        let backend = self.backend.clone();
+        let cache = self.cache.clone();
+        Box::pin(async move {
+            let bytes = backend.load(&resolved).await?;
+            cache.borrow_mut().insert(resolved, bytes.clone());
+            Ok(Val::Bytes(bytes))
+        })
+    }
+}
+
+/// WASI/local-filesystem backend for embeddings without grafted IPFS reads.
+pub struct FsLoadBackend;
+
+impl LoadBackend for FsLoadBackend {
+    fn load<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Val>> + 'a>> {
+        Box::pin(async move { read_default_path(path) })
+    }
+}
+
 pub fn set_load_backend(backend: Rc<dyn LoadBackend>) {
     LOAD_BACKEND.with(|slot| {
         *slot.borrow_mut() = Some(backend);
