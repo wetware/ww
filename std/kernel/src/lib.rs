@@ -497,58 +497,11 @@ type HandlerFn = for<'a> fn(
 /// ipfs, routing) are handled via cap-targeted perform + with-effect-handler.
 fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
     let mut t: HashMap<&'static str, HandlerFn> = HashMap::new();
-    t.insert("load", |a, _| Box::pin(std::future::ready(eval_load(a))));
     t.insert("cd", |a, c| Box::pin(std::future::ready(eval_cd(a, c))));
     t.insert("help", |_, _| {
         Box::pin(std::future::ready(Ok(Val::Str(HELP_TEXT.to_string()))))
     });
-    t.insert("exit", |_, _| {
-        Box::pin(std::future::ready({
-            std::process::exit(0);
-            #[allow(unreachable_code)]
-            Ok(Val::Nil)
-        }))
-    });
     t
-}
-
-/// (load "path") — read bytes from the WASI virtual filesystem.
-///
-/// Relative paths like `"bin/chess-demo.wasm"` are resolved against the WASI
-/// root (`/`), which the host preopens to the merged FHS image directory.
-/// Absolute paths are used as-is.
-///
-/// Loaded files are cached in a thread-local map so repeated loads of the
-/// same path (e.g. chess.glia loading the WASM for both :listen and :run)
-/// return a cheap clone.  This also works around an ESPIPE (os error 29)
-/// that occurs on the second `std::fs::read` in WASI P2 when the RPC
-/// connection streams have been created between reads.
-fn eval_load(args: &[Val]) -> Result<Val, Val> {
-    thread_local! {
-        static CACHE: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
-    }
-
-    let path = match args.first() {
-        Some(Val::Str(s)) => s.clone(),
-        _ => return Err("(load \"<path>\")".into()),
-    };
-    // Resolve relative to WASI root — the host mounts the merged image at `/`.
-    let resolved = if path.starts_with('/') {
-        path.clone()
-    } else {
-        format!("/{path}")
-    };
-
-    // Return cached bytes if already loaded.
-    let cached = CACHE.with(|c| c.borrow().get(&resolved).cloned());
-    if let Some(bytes) = cached {
-        return Ok(Val::Bytes(bytes));
-    }
-
-    let bytes =
-        std::fs::read(&resolved).map_err(|e| Val::from(format!("load: {resolved}: {e}")))?;
-    CACHE.with(|c| c.borrow_mut().insert(resolved, bytes.clone()));
-    Ok(Val::Bytes(bytes))
 }
 
 fn eval_cd(args: &[Val], ctx: &RefCell<Session>) -> Result<Val, Val> {
@@ -582,7 +535,7 @@ impl<'k> Dispatch for KernelDispatch<'k> {
         Box::pin(async move {
             match self.table.get(name) {
                 Some(handler) => handler(args, self.ctx).await,
-                None => eval_path_lookup(name, args, self.ctx).await,
+                None => Err(Val::from(format!("command not found: {name}"))),
             }
         })
     }
@@ -1217,6 +1170,7 @@ fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
     }
 }
 
+#[allow(dead_code)]
 async fn eval_path_lookup(cmd: &str, args: &[Val], ctx: &RefCell<Session>) -> Result<Val, Val> {
     // Convert args to strings once — used for whichever candidate we find.
     let str_args: Vec<String> = args
@@ -1344,12 +1298,9 @@ Effects:
   (perform :load \"<path>\")                   Load bytes from virtual filesystem
 
 Built-ins:
-  (load \"<path>\")                Load bytes (dispatch form)
   (cd \"<path>\")                  Change working directory
   (help)                         This message
-  (exit)                         Quit
-
-Unrecognized commands are looked up in PATH (default /bin).";
+\nUnknown commands fail with command-not-found.";
 
 // ---------------------------------------------------------------------------
 // Init.d — evaluate scripts from $WW_ROOT/etc/init.d/*.glia
