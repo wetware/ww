@@ -6,8 +6,8 @@ use capnp::capability::FromClientHook;
 use capnp_rpc::{new_client, pry};
 use caps::mcp_adapter::{self, ActionPolicy, ExprPart, ToolAction, ToolSpec};
 use caps::{
-    clear_import_cache, clear_load_backend, clear_load_cache, extract_method,
-    make_import_cap, make_import_handler, set_load_backend, LoadBackend, LoadRuntime,
+    clear_import_cache, clear_load_backend, clear_load_cache, extract_method, make_import_cap,
+    make_import_handler, set_load_backend, LoadBackend, LoadRuntime,
 };
 use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
 use glia::eval::{self, Dispatch, Env, EvalOutcome};
@@ -674,7 +674,11 @@ async fn build_local_shell_runtime(caps: GraftedShellCaps) -> LocalShellRuntime 
         glia::load_prelude(&mut env, &mut prelude_dispatch).await;
     }
 
-    LocalShellRuntime { env, dispatch, load_runtime }
+    LocalShellRuntime {
+        env,
+        dispatch,
+        load_runtime,
+    }
 }
 
 fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
@@ -1127,7 +1131,10 @@ async fn shell_eval_raw(
     });
     let stdout = Rc::new(|data: Val| {
         Box::pin(async move {
-            let text = match data { Val::Str(s) => s, other => format!("{other}") };
+            let text = match data {
+                Val::Str(s) => s,
+                other => format!("{other}"),
+            };
             println!("{text}");
             Ok(HostEffectResult::Resume(Val::Nil))
         }) as Pin<Box<dyn Future<Output = std::result::Result<HostEffectResult, Val>>>>
@@ -1137,9 +1144,18 @@ async fn shell_eval_raw(
             as Pin<Box<dyn Future<Output = std::result::Result<HostEffectResult, Val>>>>
     });
     let effects = [
-        HostEffect { target: EffectTarget::Keyword("load".into()), handler: load },
-        HostEffect { target: EffectTarget::Keyword("stdout".into()), handler: stdout },
-        HostEffect { target: EffectTarget::Keyword("exit".into()), handler: exit },
+        HostEffect {
+            target: EffectTarget::Keyword("load".into()),
+            handler: load,
+        },
+        HostEffect {
+            target: EffectTarget::Keyword("stdout".into()),
+            handler: stdout,
+        },
+        HostEffect {
+            target: EffectTarget::Keyword("exit".into()),
+            handler: exit,
+        },
     ];
     let eval_result = tokio::time::timeout(
         RPC_TIMEOUT,
@@ -2081,9 +2097,10 @@ mod tests {
     async fn local_runtime_routes_ipfs_loads_through_grafted_ipfs_cap() {
         let (caps, seen_paths) = test_grafted_caps();
         let mut runtime = build_local_shell_runtime(caps).await;
-        let (result, is_error) = shell_eval(&mut runtime, "(perform :load \"/ipfs/bafy-test/path\")")
-            .await
-            .unwrap();
+        let (result, is_error) =
+            shell_eval(&mut runtime, "(perform :load \"/ipfs/bafy-test/path\")")
+                .await
+                .unwrap();
         assert!(!is_error, "unexpected eval error: {result}");
         assert_eq!(result, "<3 bytes>");
         assert_eq!(

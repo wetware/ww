@@ -7743,14 +7743,15 @@ mod tests {
             }
         }
         let expr = crate::read(input).map_err(|e| error::parse(None, e.to_string()))?;
-        let stdout: effect::HostEffectHandler = Rc::new(|_data| {
-            Box::pin(async { Ok(effect::HostEffectResult::Resume(Val::Nil)) })
-        });
+        let stdout: effect::HostEffectHandler =
+            Rc::new(|_data| Box::pin(async { Ok(effect::HostEffectResult::Resume(Val::Nil)) }));
         let effects = [effect::HostEffect {
             target: effect::EffectTarget::Keyword("stdout".into()),
             handler: stdout,
         }];
-        match pollster_eval(eval_toplevel_with_host_effects(&expr, &mut env, &d, &effects))? {
+        match pollster_eval(eval_toplevel_with_host_effects(
+            &expr, &mut env, &d, &effects,
+        ))? {
             EvalOutcome::Value(value) => Ok(value),
             EvalOutcome::Exit => Err(Val::from("unexpected exit in ww/test")),
         }

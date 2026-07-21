@@ -127,7 +127,13 @@ impl LoadRuntime {
     ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
         let path = match data {
             Val::Str(path) | Val::Sym(path) => path,
-            other => return Box::pin(async move { Err(Val::from(format!("load: expected a path string, got {other}"))) }),
+            other => {
+                return Box::pin(async move {
+                    Err(Val::from(format!(
+                        "load: expected a path string, got {other}"
+                    )))
+                })
+            }
         };
         let runtime = self.clone();
         Box::pin(async move { runtime.load(&path).await })
