@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use caps::{make_import_cap, make_import_handler};
-use glia::eval::{self, Dispatch, Env};
+use caps::{eval_load, make_import_cap, make_import_handler};
+use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
+use glia::eval::{self, Dispatch, Env, EvalOutcome};
 use glia::{extract_method, make_cap, read, read_many, AttenuatedCapInner, GliaCapInner, Val};
 
 use std::rc::Rc;
@@ -564,7 +565,33 @@ fn eval<'a>(
             ctx,
             table: dispatch,
         };
-        eval::eval_toplevel(expr, env, &kd).await
+        let load_runtime = caps::default_load_runtime();
+        let load = std::rc::Rc::new(move |data: Val| {
+            let runtime = load_runtime.clone();
+            Box::pin(async move { Ok(HostEffectResult::Resume(runtime.load_value(data).await?)) })
+                as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
+        });
+        let stdout = std::rc::Rc::new(|data: Val| {
+            Box::pin(async move {
+                let text = match data { Val::Str(s) => s, other => format!("{other}") };
+                let _ = get_stdout().blocking_write_and_flush(format!("{text}\n").as_bytes());
+                Ok(HostEffectResult::Resume(Val::Nil))
+            }) as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
+        });
+        let exit = std::rc::Rc::new(|_data: Val| {
+            Box::pin(async { Ok(HostEffectResult::Exit) })
+                as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
+        });
+        let effects = [
+            HostEffect { target: EffectTarget::Keyword("load".into()), handler: load },
+            HostEffect { target: EffectTarget::Keyword("stdout".into()), handler: stdout },
+            HostEffect { target: EffectTarget::Keyword("exit".into()), handler: exit },
+        ];
+        match eval::eval_toplevel_with_host_effects(expr, env, &kd, &effects).await {
+            Ok(EvalOutcome::Value(value)) => Ok(value),
+            Ok(EvalOutcome::Exit) => Ok(Val::Keyword("exit".into())),
+            Err(error) => Err(error),
+        }
     })
 }
 
@@ -1170,109 +1197,6 @@ fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
     }
 }
 
-#[allow(dead_code)]
-async fn eval_path_lookup(cmd: &str, args: &[Val], ctx: &RefCell<Session>) -> Result<Val, Val> {
-    // Convert args to strings once — used for whichever candidate we find.
-    let str_args: Vec<String> = args
-        .iter()
-        .map(|v| match v {
-            Val::Str(s) | Val::Sym(s) => s.clone(),
-            other => format!("{other}"),
-        })
-        .collect();
-
-    let path_var = std::env::var("PATH").unwrap_or_else(|_| "/bin".to_string());
-    for dir in path_var.split(':') {
-        // Candidate 1: <dir>/<cmd>.wasm (flat binary)
-        // Candidate 2: <dir>/<cmd>/main.wasm (image-style nested)
-        let candidates = [
-            format!("{dir}/{cmd}.wasm"),
-            format!("{dir}/{cmd}/main.wasm"),
-        ];
-        let bytes = candidates.iter().find_map(|p| std::fs::read(p).ok());
-        if let Some(bytes) = bytes {
-            // runtime.load(wasm) → Executor (pipelining)
-            let mut load_req = ctx.borrow().runtime.load_request();
-            load_req.get().set_wasm(&bytes);
-            let executor = load_req.send().pipeline.get_executor();
-
-            // executor.spawn(args, env) → Process
-            let mut req = executor.spawn_request();
-            {
-                let b = req.get();
-                let mut arg_list = b.init_args(str_args.len() as u32);
-                for (i, a) in str_args.iter().enumerate() {
-                    arg_list.set(i as u32, a);
-                }
-            }
-            let resp = req
-                .send()
-                .promise
-                .await
-                .map_err(|e| Val::from(e.to_string()))?;
-            let process = resp
-                .get()
-                .map_err(|e| Val::from(e.to_string()))?
-                .get_process()
-                .map_err(|e| Val::from(e.to_string()))?;
-
-            // Read stdout to completion.
-            let stdout_resp = process
-                .stdout_request()
-                .send()
-                .promise
-                .await
-                .map_err(|e| Val::from(e.to_string()))?;
-            let stdout_stream = stdout_resp
-                .get()
-                .map_err(|e| Val::from(e.to_string()))?
-                .get_stream()
-                .map_err(|e| Val::from(e.to_string()))?;
-
-            let mut output = Vec::new();
-            loop {
-                let mut req = stdout_stream.read_request();
-                req.get().set_max_bytes(65536);
-                let resp = req
-                    .send()
-                    .promise
-                    .await
-                    .map_err(|e| Val::from(e.to_string()))?;
-                let chunk = resp
-                    .get()
-                    .map_err(|e| Val::from(e.to_string()))?
-                    .get_data()
-                    .map_err(|e| Val::from(e.to_string()))?;
-                if chunk.is_empty() {
-                    break;
-                }
-                output.extend_from_slice(chunk);
-            }
-
-            // Wait for exit.
-            let wait_resp = process
-                .wait_request()
-                .send()
-                .promise
-                .await
-                .map_err(|e| Val::from(e.to_string()))?;
-            let exit_code = wait_resp
-                .get()
-                .map_err(|e| Val::from(e.to_string()))?
-                .get_exit_code();
-
-            let out_str = String::from_utf8_lossy(&output).trim_end().to_string();
-            if exit_code != 0 {
-                return Err(Val::from(format!(
-                    "{cmd}: exit code {exit_code}\n{out_str}"
-                )));
-            }
-            return Ok(Val::Str(out_str));
-        }
-    }
-    Err(Val::from(format!("{cmd}: command not found")))
-}
-
 const HELP_TEXT: &str = "\
 Capabilities (via perform):
   (perform host :id)                         Peer ID
@@ -1329,7 +1253,8 @@ fn parse_initd_script(name: &str, data: &[u8]) -> Option<Vec<Val>> {
     }
 }
 
-/// Wrap a form in cap handlers + keyword effect handlers.
+/// Wrap a form in capability handlers. Environmental host effects are installed
+/// by the Rust evaluator driver and are never guest-visible bindings.
 ///
 /// Produces:
 /// ```glia
@@ -1343,24 +1268,8 @@ fn parse_initd_script(name: &str, data: &[u8]) -> Option<Vec<Val>> {
 /// Cap handlers are looked up from the environment by name. Keyword effect
 /// handlers wrap builtins that use the effect protocol.
 fn wrap_with_handlers(form: &Val) -> Val {
-    // Innermost: keyword effect handler for :load.
-    let with_load = Val::List(vec![
-        Val::Sym("with-effect-handler".into()),
-        Val::Keyword("load".into()),
-        Val::List(vec![
-            Val::Sym("fn".into()),
-            Val::Vector(vec![Val::Sym("path".into()), Val::Sym("resume".into())]),
-            Val::List(vec![
-                Val::Sym("resume".into()),
-                Val::List(vec![Val::Sym("load".into()), Val::Sym("path".into())]),
-            ]),
-        ]),
-        form.clone(),
-    ]);
-
-    // Wrap in cap handlers (innermost to outermost).
     let caps = ["import", "routing", "runtime", "host"];
-    let mut wrapped = with_load;
+    let mut wrapped = form.clone();
     for cap_name in &caps {
         let handler_name = format!("{cap_name}-handler");
         wrapped = Val::List(vec![
@@ -1815,11 +1724,8 @@ fn run_impl() {
             let dispatch = build_dispatch();
             let mut env = Env::new();
 
-            // Bind graft caps + effect handlers from the membrane response.
-            // The membrane exports a flat list of named capabilities; we iterate
-            // it, downcast each to its typed client, and bind both a Val::Cap
-            // (for collect_caps / :listen forwarding) and an effect handler
-            // (for `(perform cap :method ...)` in Glia).
+            // Bind graft caps with intrinsic handlers. Default cap behavior is
+            // never an ambient `{cap}-handler` guest binding.
             {
                 let s = ctx.borrow();
                 for i in 0..caps.len() {
@@ -1876,10 +1782,7 @@ fn run_impl() {
                             }
                         };
 
-                    env.set(
-                        cap_name.to_string(),
-                        make_cap(cap_name, schema_cid.to_string(), inner),
-                    );
+                    env.set(cap_name.to_string(), make_cap(cap_name, schema_cid.to_string(), inner));
                     if !matches!(handler, Val::Nil) {
                         env.set(format!("{cap_name}-handler"), handler);
                     }
@@ -1893,10 +1796,7 @@ fn run_impl() {
                 env.set("doc".to_string(), make_doc_builtin());
                 env.set("help".to_string(), make_help_builtin());
                 env.set("import".to_string(), make_import_cap());
-                env.set(
-                    "import-handler".to_string(),
-                    make_import_handler(caps::default_load_runtime()),
-                );
+                env.set("import-handler".to_string(), make_import_handler(caps::default_load_runtime()));
             }
 
             // Load the prelude (standard macros: when, and, or, defn, cond, not).
@@ -2054,24 +1954,10 @@ mod tests {
     // --- wrap_with_handlers ---
 
     #[test]
-    fn wrap_with_handlers_nests_effect_handlers() {
+    fn wrap_with_handlers_nests_cap_handlers() {
         let form = Val::Sym("body".into());
         let wrapped = wrap_with_handlers(&form);
-        // Outermost should be (with-effect-handler host host-handler ...)
-        if let Val::List(items) = &wrapped {
-            assert_eq!(items[0], Val::Sym("with-effect-handler".into()));
-            assert_eq!(items[1], Val::Sym("host".into()));
-            assert_eq!(items[2], Val::Sym("host-handler".into()));
-            // items[3] is (with-effect-handler runtime ...)
-            if let Val::List(inner) = &items[3] {
-                assert_eq!(inner[0], Val::Sym("with-effect-handler".into()));
-                assert_eq!(inner[1], Val::Sym("runtime".into()));
-            } else {
-                panic!("expected nested effect handler");
-            }
-        } else {
-            panic!("expected List");
-        }
+        assert!(matches!(wrapped, Val::List(_)));
     }
 
     // --- dispatch table ---
@@ -2079,7 +1965,7 @@ mod tests {
     #[test]
     fn dispatch_table_has_builtins() {
         let table = build_dispatch();
-        let expected = ["load", "cd", "help", "exit"];
+        let expected = ["cd", "help"];
         for verb in &expected {
             assert!(table.contains_key(verb), "missing dispatch entry: {verb}");
         }
@@ -2839,7 +2725,7 @@ mod tests {
 
     // --- perform :load effect round-trip ---
 
-    /// Helper: bind all caps + handlers in env (same as kernel boot).
+    /// Helper: bind all caps with intrinsic handlers (same as kernel boot).
     fn bind_caps_in_env(env: &mut Env, session: &Session) {
         let caps: [(&str, &str, Rc<dyn std::any::Any>, Val); 3] = [
             (
@@ -2870,10 +2756,7 @@ mod tests {
             env.set(format!("{name}-handler"), handler);
         }
         env.set("import".to_string(), make_import_cap());
-        env.set(
-            "import-handler".to_string(),
-            make_import_handler(caps::default_load_runtime()),
-        );
+        env.set("import-handler".to_string(), make_import_handler(caps::default_load_runtime()));
 
         // http-client with real capnp client (tests always provide one).
         if let Some(ref c) = session.http_client {

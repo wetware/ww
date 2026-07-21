@@ -21,14 +21,14 @@ use std::rc::Rc;
 
 use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
 use glia::eval::{self, Dispatch, Env, EvalOutcome};
-use glia::{make_cap, Val, ValMap};
+use glia::{make_cap, HandledCapInner, Val, ValMap};
 
 use wasip2::exports::cli::run::Guest;
 
 // Shared effect handler factories from the caps crate.
 use caps::{
     get_graft_cap, make_host_handler, make_import_handler, make_routing_handler,
-    mcp_adapter, membrane_capnp, routing_capnp, system_capnp, wrap_with_handlers, LoadRuntime,
+    mcp_adapter, membrane_capnp, routing_capnp, system_capnp, LoadRuntime,
 };
 use mcp_adapter::{ActionPolicy, ExprPart, ToolAction, ToolSpec};
 
@@ -528,7 +528,6 @@ async fn eval_expression(
 ) -> Result<String, Val> {
     let expr = glia::read(expr_text).map_err(|e| glia::error::parse(None, e))?;
 
-    let wrapped = wrap_with_handlers(&expr, &[]);
     let dispatch = McpDispatch {
         ctx,
         table: dispatch_table,
@@ -540,7 +539,7 @@ async fn eval_expression(
             Box::pin(async move { Ok(HostEffectResult::Resume(runtime.load_value(data).await?)) })
         }),
     }];
-    match eval::eval_toplevel_with_host_effects(&wrapped, env, &dispatch, &effects).await {
+    match eval::eval_toplevel_with_host_effects(&expr, env, &dispatch, &effects).await {
         Ok(EvalOutcome::Value(Val::Nil)) => Ok("nil".to_string()),
         Ok(EvalOutcome::Value(result)) => Ok(format!("{result}")),
         Ok(EvalOutcome::Exit) => Err(protocol_mode_unavailable("exit")),
@@ -775,10 +774,9 @@ fn run_impl() {
             }
 
             let load_runtime = caps::default_load_runtime();
-        // 2. Bind cap values + effect handlers into the environment.
-            //    Uses shared handler factories from the caps crate.
-            //    Each cap must be Val::Cap (not Val::Nil) so that
-            //    with-effect-handler can match on it.
+            // 2. Bind cap values with intrinsic default handlers. These are
+            //    never guest-visible `{cap}-handler` values; dynamic Glia
+            //    handlers still get first chance to interpose.
             {
                 let cap_handlers: [(&str, Val); 3] = [
                     ("host", make_host_handler(host)),
@@ -788,9 +786,12 @@ fn run_impl() {
                 for (name, handler) in cap_handlers {
                     env.set(
                         name.to_string(),
-                        make_cap(name, format!("mcp:{name}"), std::rc::Rc::new(())),
+                        make_cap(name, format!("mcp:{name}"), std::rc::Rc::new(HandledCapInner {
+                            handler,
+                            export: std::rc::Rc::new(()),
+                            descriptor: Vec::new(),
+                        })),
                     );
-                    env.set(format!("{name}-handler"), handler);
                 }
             }
 

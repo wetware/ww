@@ -798,31 +798,20 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
 
 /// Wraps a Glia form in standard capability effect handlers.
 ///
+/// Environmental host effects (`:load`, `:stdout`, `:exit`) deliberately do
+/// not appear here. Embeddings install them as Rust-owned frames around the
+/// top-level evaluator, so guest code cannot obtain a default handler value.
+///
 /// The `extra_caps` parameter allows callers to inject additional
 /// capability names that sit outside the core set.
 pub fn wrap_with_handlers(form: &Val, extra_caps: &[&str]) -> Val {
-    // Innermost: :load effect handler
-    let with_load = Val::List(vec![
-        Val::Sym("with-effect-handler".into()),
-        Val::Keyword("load".into()),
-        Val::List(vec![
-            Val::Sym("fn".into()),
-            Val::Vector(vec![Val::Sym("path".into()), Val::Sym("resume".into())]),
-            Val::List(vec![
-                Val::Sym("resume".into()),
-                Val::List(vec![Val::Sym("load".into()), Val::Sym("path".into())]),
-            ]),
-        ]),
-        form.clone(),
-    ]);
-
     // Wrap in cap handlers (innermost to outermost)
     // Core caps first, then any extras
     let mut caps: Vec<&str> = vec!["import", "routing", "host"];
     for extra in extra_caps {
         caps.insert(0, extra);
     }
-    let mut wrapped = with_load;
+    let mut wrapped = form.clone();
     for cap_name in &caps {
         let handler_name = format!("{cap_name}-handler");
         wrapped = Val::List(vec![

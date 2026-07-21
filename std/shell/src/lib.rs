@@ -18,14 +18,14 @@ use capnp_rpc::pry;
 
 use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
 use glia::eval::{self, Dispatch, Env, EvalOutcome};
-use glia::{make_cap, Val};
+use glia::{make_cap, HandledCapInner, Val};
 
 use wasip2::exports::cli::run::Guest;
 
 // Shared effect handler factories.
 use caps::{
     get_graft_cap, make_host_handler, make_import_handler, make_routing_handler,
-    membrane_capnp, routing_capnp, system_capnp, wrap_with_handlers, LoadRuntime,
+    membrane_capnp, routing_capnp, system_capnp, LoadRuntime,
 };
 
 // Shell-specific generated Cap'n Proto modules.
@@ -196,7 +196,6 @@ impl shell_capnp::shell::Server for ShellImpl {
             // Capability handlers still use the standard dynamic wrappers.
             // Environmental host effects are Rust-owned frames: no guest-visible
             // handler value can be captured or invoked directly.
-            let wrapped = wrap_with_handlers(&expr, &[]);
             let dispatch = ShellDispatch {
                 ctx: &*self.ctx,
                 table: &self.dispatch,
@@ -204,7 +203,7 @@ impl shell_capnp::shell::Server for ShellImpl {
             let output = Rc::new(RefCell::new(String::new()));
             let effects = host_effects(self.load_runtime.clone(), output.clone());
             match eval::eval_toplevel_with_host_effects(
-                &wrapped,
+                &expr,
                 &mut self.env.borrow_mut(),
                 &dispatch,
                 &effects,
@@ -297,7 +296,8 @@ fn run_impl() {
             s.initialized = true;
         }
 
-        // 2. Bind cap values + effect handlers into the environment.
+        // 2. Bind capabilities with intrinsic default handlers.  The handler
+        // is carried by the cap, not exposed as `{cap}-handler` in Env.
         {
             let mut env = env.borrow_mut();
             let caps: [(&str, Val); 3] = [
@@ -308,9 +308,12 @@ fn run_impl() {
             for (name, handler) in caps {
                 env.set(
                     name.to_string(),
-                    make_cap(name, format!("shell:{name}"), std::rc::Rc::new(())),
+                    make_cap(name, format!("shell:{name}"), std::rc::Rc::new(HandledCapInner {
+                        handler,
+                        export: std::rc::Rc::new(()),
+                        descriptor: Vec::new(),
+                    })),
                 );
-                env.set(format!("{name}-handler"), handler);
             }
         }
 
