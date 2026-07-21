@@ -4396,6 +4396,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn guest_handler_interposes_before_host_effect_frame() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let form = crate::read(
+            "(with-effect-handler :stdout (fn [value resume] (resume :guest)) (perform :stdout \"x\"))",
+        )
+        .unwrap();
+        let handler: effect::HostEffectHandler = Rc::new(|_| {
+            Box::pin(async {
+                Ok(effect::HostEffectResult::Resume(Val::Keyword(
+                    "host".into(),
+                )))
+            })
+        });
+        let effects = [effect::HostEffect {
+            target: effect::EffectTarget::Keyword("stdout".into()),
+            handler,
+        }];
+        assert!(matches!(
+            pollster_eval(eval_toplevel_with_host_effects(&form, &mut env, &d, &effects)),
+            Ok(EvalOutcome::Value(Val::Keyword(ref value))) if value == "guest"
+        ));
+    }
+
     /// Check if an error Val contains a substring in its :message field or Display output.
     fn err_contains(err: &Val, needle: &str) -> bool {
         // Check :message field in map
