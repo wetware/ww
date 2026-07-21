@@ -118,6 +118,20 @@ impl LoadRuntime {
             Ok(Val::Bytes(bytes))
         })
     }
+
+    /// Handle the data payload of `(perform :load path)` without exposing a
+    /// guest-callable `load` primitive.
+    pub fn load_value<'a>(
+        &'a self,
+        data: Val,
+    ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+        let path = match data {
+            Val::Str(path) | Val::Sym(path) => path,
+            other => return Box::pin(async move { Err(Val::from(format!("load: expected a path string, got {other}"))) }),
+        };
+        let runtime = self.clone();
+        Box::pin(async move { runtime.load(&path).await })
+    }
 }
 
 pub fn default_load_runtime() -> LoadRuntime {
