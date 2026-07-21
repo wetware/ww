@@ -5653,7 +5653,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn stdlib_map_basic() {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
