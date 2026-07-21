@@ -1,4 +1,4 @@
 ; Demo snippet: register snap HTTP handler.
-(def snap-hello (cell (load "bin/snap-hello-rs.wasm")))
+(def snap-hello (cell (perform :load "bin/snap-hello-rs.wasm")))
 
 (perform host :listen snap-hello "/snaps/hello")

@@ -1,2 +1,2 @@
 ; Demo snippet: register raw stream echo handler.
-(perform host :listen-stream (cell (load "bin/echo.wasm")) "echo")
+(perform host :listen-stream (cell (perform :load "bin/echo.wasm")) "echo")

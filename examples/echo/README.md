@@ -58,7 +58,7 @@ If multiple local nodes are running, use `ww shell --select <index|peer-id>`.
 From the Glia prompt:
 
 ```clojure
-/ > (load "glia/register.glia")
+/ > (perform :load "glia/register.glia")
 ```
 
 This registers protocol `"echo"` with `StreamListener`. Each incoming
@@ -94,7 +94,7 @@ output.
 ```clojure
 ; Register the echo cell as a raw stream handler.
 ; StreamListener spawns a cell per connection.
-(perform host :listen-stream (cell (load "bin/echo.wasm")) "echo")
+(perform host :listen-stream (cell (perform :load "bin/echo.wasm")) "echo")
 ```
 
 `etc/init.d/echo.glia` is now a deployment-only hook. Keep

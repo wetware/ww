@@ -69,8 +69,8 @@ If prompted, select the matching host for each port.
 From each Glia prompt:
 
 ```clojure
-/ > (load "glia/register.glia")
-/ > (load "glia/serve.glia")
+/ > (perform :load "glia/register.glia")
+/ > (perform :load "glia/serve.glia")
 ```
 
 Both nodes bootstrap into the DHT, exchange provider records,
@@ -153,7 +153,7 @@ interface ChessEngine {
 `glia/register.glia`:
 
 ```clojure
-(def chess-wasm (load "bin/chess-demo.wasm"))
+(def chess-wasm (perform :load "bin/chess-demo.wasm"))
 (def chess-executor (perform runtime :load chess-wasm))
 (def chess-process (perform chess-executor :spawn))
 (def chess-cap (perform chess-process :bootstrap))
@@ -164,7 +164,7 @@ interface ChessEngine {
 `glia/serve.glia`:
 
 ```clojure
-(perform runtime :run (load "bin/chess-demo.wasm") "serve")
+(perform runtime :run (perform :load "bin/chess-demo.wasm") "serve")
 ```
 
 `etc/init.d/chess.glia` is now a deployment-only hook. Keep

@@ -73,8 +73,8 @@ If prompted, select the matching host for each port.
 From each Glia prompt:
 
 ```clojure
-/ > (load "glia/register.glia")
-/ > (load "glia/serve.glia")
+/ > (perform :load "glia/register.glia")
+/ > (perform :load "glia/serve.glia")
 ```
 
 Expected output on Agent B:
@@ -135,7 +135,7 @@ The same binary serves both roles:
 `glia/register.glia`:
 
 ```clojure
-(def discovery-wasm (load "bin/discovery.wasm"))
+(def discovery-wasm (perform :load "bin/discovery.wasm"))
 (def discovery-executor (perform runtime :load discovery-wasm))
 (def discovery-process (perform discovery-executor :spawn))
 (def discovery-cap (perform discovery-process :bootstrap))
@@ -146,7 +146,7 @@ The same binary serves both roles:
 `glia/serve.glia`:
 
 ```clojure
-(perform runtime :run (load "bin/discovery.wasm") "serve")
+(perform runtime :run (perform :load "bin/discovery.wasm") "serve")
 ```
 
 `etc/init.d/discovery.glia` is now a deployment-only hook. Keep

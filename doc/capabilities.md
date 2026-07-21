@@ -120,7 +120,7 @@ membrane. Content access flows through the WASI virtual filesystem,
 which the host backs with `CidTree`.
 
 Use regular guest file I/O against filesystem paths:
-- `(load "path")` for bytes in Glia
+- `(perform :load "path")` for bytes in Glia
 - `(perform import "module")` for module loading
 - direct guest reads via WASI-aware code under `/ipfs/<cid>/...` and
   `/ipns/<name>/...`

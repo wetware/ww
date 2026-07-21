@@ -2,5 +2,5 @@
 ;
 ; Demos are shell-forward by default.
 ; Load snippets from examples/chess/glia/ in ww shell:
-;   (load "glia/register.glia")
-;   (load "glia/serve.glia")
+;   (perform :load "glia/register.glia")
+;   (perform :load "glia/serve.glia")

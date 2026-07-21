@@ -1,2 +1,2 @@
 ; Demo snippet: start discovery + game loop.
-(perform runtime :run (load "bin/chess-demo.wasm") "serve")
+(perform runtime :run (perform :load "bin/chess-demo.wasm") "serve")
