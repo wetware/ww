@@ -13,6 +13,13 @@ FROM gcr.io/distroless/static-debian12
 COPY ww /usr/local/bin/ww
 COPY wetware/ /usr/share/wetware/
 
+# Precompiled .cwasm artifacts (kernel + shell), baked by CI with the same ww
+# binary that runs here. The k8s manifest sets WW_CWASM_DIR=/cwasm so boot
+# deserializes these instead of Cranelift-compiling from scratch. A cache
+# miss/mismatch falls back to a fresh compile, so this dir is purely an
+# optimization — safe to be stale or empty.
+COPY cwasm/ /cwasm/
+
 USER 1000:1000
 EXPOSE 2025 2026 2080
 
