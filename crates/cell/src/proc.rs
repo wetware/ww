@@ -6,7 +6,7 @@ use wasmtime::component::{
     types::ComponentItem, Component, Linker, Resource, ResourceTable, ResourceType,
 };
 use wasmtime::StoreContextMut;
-use wasmtime::{CallHook, Config as WasmConfig, Engine, Store};
+use wasmtime::{CallHook, Engine, Store};
 use wasmtime_wasi::cli::{AsyncStdinStream, AsyncStdoutStream};
 use wasmtime_wasi::p2::add_to_linker_async;
 use wasmtime_wasi::p2::bindings::{Command as WasiCliCommand, CommandPre as WasiCliCommandPre};
@@ -497,10 +497,7 @@ impl Proc {
         let engine = if let Some(engine) = engine {
             engine
         } else {
-            let mut wasm_config = WasmConfig::new();
-            wasm_config.consume_fuel(true);
-            wasm_config.epoch_interruption(true);
-            Arc::new(Engine::new(&wasm_config)?)
+            Arc::new(Engine::new(&crate::engine::wasm_engine_config())?)
         };
         let mut linker = Linker::new(&engine);
         add_to_linker_async(&mut linker)?;

@@ -14,7 +14,7 @@ use libp2p::kad;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
 use tokio::sync::{mpsc, oneshot};
-use wasmtime::{Config as WasmConfig, Engine};
+use wasmtime::Engine;
 
 use rpc::{NatReachability, NetworkState, PeerInfo};
 
@@ -1290,9 +1290,7 @@ impl WasmtimeHost {
     pub fn new() -> Result<Self> {
         // No epoch_interruption here — WasmtimeHost is used by integration
         // tests, not by the ExecutorPool which has its own Engine + tick task.
-        let mut config = WasmConfig::new();
-        config.consume_fuel(true);
-        let engine = Engine::new(&config)?;
+        let engine = Engine::new(&cell::engine::wasm_engine_config())?;
         Ok(Self {
             engine: Arc::new(engine),
         })
