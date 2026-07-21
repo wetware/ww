@@ -1219,22 +1219,6 @@ fn eval_builtin(name: &str, args: &[Val]) -> Option<Result<Val, Val>> {
                 ))),
             }
         }
-        "println" => {
-            let mut buf = String::new();
-            for (i, arg) in args.iter().enumerate() {
-                if i > 0 {
-                    buf.push(' ');
-                }
-                match arg {
-                    Val::Str(s) => buf.push_str(s),
-                    other => buf.push_str(&format!("{other}")),
-                };
-            }
-            #[cfg(not(test))]
-            std::println!("{buf}");
-            Some(Ok(Val::Nil))
-        }
-
         // --- Other ---
         "atom" => {
             if args.len() != 1 {
@@ -5669,12 +5653,6 @@ mod tests {
     }
 
     #[test]
-    fn stdlib_println_returns_nil() {
-        let mut env = Env::new();
-        let d = RecordingDispatch::new();
-        assert_eq!(eval_str(r#"(println "test")"#, &mut env, &d), Ok(Val::Nil));
-    }
-
     #[test]
     fn stdlib_map_basic() {
         let mut env = Env::new();
