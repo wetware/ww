@@ -637,7 +637,12 @@ async fn build_local_shell_runtime(caps: GraftedShellCaps) -> LocalShellRuntime 
     clear_load_backend();
     clear_load_cache();
     clear_import_cache();
-    set_load_backend(Rc::new(ShellLoadBackend { ipfs }));
+    let load_backend = Rc::new(ShellLoadBackend { ipfs });
+    set_load_backend(load_backend.clone());
+    let load_runtime = caps::LoadRuntime::new(
+        std::env::var("WW_ROOT").unwrap_or_else(|_| "/".into()),
+        load_backend,
+    );
 
     let mut env = Env::new();
 
@@ -658,7 +663,7 @@ async fn build_local_shell_runtime(caps: GraftedShellCaps) -> LocalShellRuntime 
     );
     env.set(
         "import-handler".to_string(),
-        make_import_handler(caps::default_load_runtime()),
+        make_import_handler(load_runtime),
     );
 
     let dispatch = build_dispatch();
