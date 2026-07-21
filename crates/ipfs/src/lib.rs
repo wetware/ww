@@ -26,6 +26,11 @@ impl HttpClient {
         }
     }
 
+    /// The Kubo HTTP API base URL, for diagnostics/logging.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     async fn cat_response(&self, path: &str) -> Result<reqwest::Response> {
         let url = format!("{}/api/v0/cat?arg={}", self.base_url, path);
         let response = self

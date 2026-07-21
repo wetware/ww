@@ -517,6 +517,102 @@ fn parse_kubo_bootstrap(info: &ipfs::KuboInfo) -> Option<host::KuboBootstrapInfo
     Some(host::KuboBootstrapInfo { peer_id, addr })
 }
 
+/// Environment override for the kubo-readiness wait deadline, in seconds.
+/// `0` means wait indefinitely (the production posture — see
+/// [`wait_for_kubo_ready`]).
+const KUBO_WAIT_MAX_SECS_ENV: &str = "WW_KUBO_WAIT_MAX_SECS";
+
+/// Default kubo-readiness deadline when [`KUBO_WAIT_MAX_SECS_ENV`] is unset.
+/// Generous enough to cover a kubo sidecar coming up alongside `ww`, short
+/// enough that a dev running `ww run` without kubo gets a clear error rather
+/// than an indefinite hang. Deploys set the env to `0` for unbounded waiting.
+const KUBO_WAIT_DEFAULT_SECS: u64 = 120;
+
+/// Block until the local kubo node answers `/api/v0/id`, polling with capped
+/// exponential backoff.
+///
+/// The boot-critical FHS resolve (`resolve_mounts_virtual`) hard-depends on
+/// kubo: an `add_dir`/`files_cp` against an unreachable node fails, and until
+/// now that error propagated straight out of `ww run`, exiting the process. In
+/// Kubernetes that is a CrashLoopBackOff, and because every boot recompiles all
+/// wasm from scratch, a restart loop reads as *sustained* CPU — the signature
+/// that tripped the provider Fair-Use throttle. Waiting in place instead of
+/// exiting turns a hot restart loop into a nearly-idle poll (one HTTP GET per
+/// backoff interval), so a transient kubo outage no longer burns CPU.
+///
+/// Returns `Ok(())` once kubo is reachable. With a non-zero deadline it returns
+/// an error after the deadline (dev fail-fast); with `WW_KUBO_WAIT_MAX_SECS=0`
+/// it never gives up (the production "never exit" posture).
+async fn wait_for_kubo_ready(client: &ipfs::HttpClient) -> Result<()> {
+    let max_secs = std::env::var(KUBO_WAIT_MAX_SECS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(KUBO_WAIT_DEFAULT_SECS);
+    wait_for_kubo_ready_with(client, max_secs).await
+}
+
+/// Core of [`wait_for_kubo_ready`] with an explicit deadline (`max_secs`; `0` =
+/// unbounded), split out so tests can drive it without touching process env.
+async fn wait_for_kubo_ready_with(client: &ipfs::HttpClient, max_secs: u64) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let deadline = (max_secs > 0).then(|| Instant::now() + Duration::from_secs(max_secs));
+
+    // Fast path: usually kubo is already up.
+    if client.kubo_info().await.is_ok() {
+        return Ok(());
+    }
+
+    let mut backoff = Duration::from_millis(500);
+    let backoff_cap = Duration::from_secs(15);
+    let started = Instant::now();
+    let mut attempt: u64 = 0;
+
+    loop {
+        attempt += 1;
+        match client.kubo_info().await {
+            Ok(_) => {
+                tracing::info!(
+                    attempt,
+                    waited_secs = started.elapsed().as_secs(),
+                    "kubo reachable; proceeding with boot"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                let waited = started.elapsed();
+                // Escalate to warn after the first few misses so a genuinely
+                // stuck dependency is visible in logs, while a normal
+                // startup race stays quiet.
+                if attempt <= 3 {
+                    tracing::debug!(attempt, error = %e, "kubo not ready; waiting");
+                } else {
+                    tracing::warn!(
+                        attempt,
+                        waited_secs = waited.as_secs(),
+                        error = %e,
+                        "kubo still not ready; retrying (staying alive rather than crash-looping)"
+                    );
+                }
+
+                if let Some(deadline) = deadline {
+                    if Instant::now() + backoff >= deadline {
+                        anyhow::bail!(
+                            "kubo not reachable after {}s at {}; set {}=0 to wait indefinitely",
+                            waited.as_secs(),
+                            client.base_url(),
+                            KUBO_WAIT_MAX_SECS_ENV
+                        );
+                    }
+                }
+
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(backoff_cap);
+            }
+        }
+    }
+}
+
 /// Parse a hex-encoded contract address (with or without 0x prefix) into 20 bytes.
 fn parse_contract_address(s: &str) -> Result<[u8; 20]> {
     let hex_str = s.strip_prefix("0x").unwrap_or(s);
@@ -1333,6 +1429,13 @@ wasip2::cli::command::export!({iface_name}Guest);
         // Resolve mounts into a merged root CID + local overrides. No
         // tempdir materialization — guest filesystem reads are lazy via
         // CidTree, backed by the IPFS DAG.
+        //
+        // This resolve hard-depends on kubo (add_dir/files_cp). Wait for kubo
+        // to become reachable instead of exiting on a transient outage — an
+        // exit here is a CrashLoopBackOff, and every boot recompiles all wasm,
+        // so a restart loop is a sustained-CPU throttle signature. See
+        // `wait_for_kubo_ready`.
+        wait_for_kubo_ready(&ipfs_client).await?;
         tracing::debug!("resolving mounts (virtual)...");
         let (root_cid, local_overrides) =
             image::resolve_mounts_virtual(&all_mounts, &ipfs_client).await?;
@@ -2577,6 +2680,30 @@ fn to_pascal_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wait_for_kubo_ready_times_out_against_unreachable_node() {
+        // Point at a closed port; a finite deadline must surface an error
+        // (dev fail-fast) rather than hanging, and the message must name the
+        // env escape hatch.
+        let client = ipfs::HttpClient::new("http://127.0.0.1:1".to_string());
+        let start = std::time::Instant::now();
+        let err = wait_for_kubo_ready_with(&client, 1)
+            .await
+            .expect_err("unreachable kubo with a 1s deadline must error");
+        // Bounded: the deadline is 1s and backoff is capped, so this returns
+        // quickly rather than looping forever.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "wait should honor the deadline, took {:?}",
+            start.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(KUBO_WAIT_MAX_SECS_ENV),
+            "error should point at the unbounded-wait env override: {msg}"
+        );
+    }
 
     #[test]
     fn test_resolve_identity_missing_path_errors_by_default() {
