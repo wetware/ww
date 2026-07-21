@@ -17,14 +17,14 @@ use capnp::capability::Promise;
 use capnp_rpc::pry;
 
 use glia::eval::{self, Dispatch, Env};
-use glia::{Val, make_cap};
+use glia::{make_cap, Val};
 
 use wasip2::exports::cli::run::Guest;
 
 // Shared effect handler factories.
 use caps::{
-    eval_load_async, get_graft_cap, make_host_handler, make_import_handler,
-    make_routing_handler, membrane_capnp, routing_capnp, system_capnp, wrap_with_handlers,
+    eval_load_async, get_graft_cap, make_host_handler, make_import_handler, make_routing_handler,
+    membrane_capnp, routing_capnp, system_capnp, wrap_with_handlers,
 };
 
 // Shell-specific generated Cap'n Proto modules.
@@ -121,6 +121,8 @@ impl shell_capnp::shell::Server for ShellImpl {
         params: shell_capnp::shell::EvalParams,
         mut results: shell_capnp::shell::EvalResults,
     ) -> Promise<(), capnp::Error> {
+        results.get().set_output("");
+        results.get().set_exit_requested(false);
         let text = match pry!(params.get()).get_text() {
             Ok(t) => match t.to_str() {
                 Ok(s) => s.to_string(),
@@ -175,8 +177,9 @@ impl shell_capnp::shell::Server for ShellImpl {
                     results.get().set_is_error(false);
                 }
                 Ok(Val::Keyword(ref k)) if k == "exit" => {
-                    results.get().set_result("exit");
+                    results.get().set_result("");
                     results.get().set_is_error(false);
+                    results.get().set_exit_requested(true);
                 }
                 Ok(result) => {
                     results.get().set_result(&format!("{result}"));
