@@ -1157,9 +1157,13 @@ async fn shell_eval_raw(
             handler: exit,
         },
     ];
+    // Capability effects remain mediated by the standard `std/caps` wrappers;
+    // the keyword host effects above are evaluator-owned frames and therefore
+    // never become guest-visible handler values.
+    let wrapped = caps::wrap_with_handlers(&expr, &[]);
     let eval_result = tokio::time::timeout(
         RPC_TIMEOUT,
-        eval::eval_toplevel_with_host_effects(&expr, &mut runtime.env, &dispatch, &effects),
+        eval::eval_toplevel_with_host_effects(&wrapped, &mut runtime.env, &dispatch, &effects),
     )
     .await
     .context("shell eval timed out")?;

@@ -2686,18 +2686,14 @@ pub fn eval_toplevel_with_host_effects<'a, D: Dispatch>(
         };
 
         let mut body = eval_toplevel(val, env, dispatch);
-        let mut handling: Option<(
-            usize,
-            crate::oneshot::Sender,
-            Pin<Box<dyn Future<Output = Result<effect::HostEffectResult, Val>>>>,
-        )> = None;
+        let mut handling: Option<(crate::oneshot::Sender, effect::HostEffectFuture)> = None;
 
         let result = std::future::poll_fn(|cx| loop {
-            if let Some((_, _, future)) = handling.as_mut() {
+            if let Some((_, future)) = handling.as_mut() {
                 match future.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(effect::HostEffectResult::Resume(value))) => {
-                        let (_, tx, _) = handling.take().expect("host handler state");
+                        let (tx, _) = handling.take().expect("host handler state");
                         tx.send(value);
                         cx.waker().wake_by_ref();
                         continue;
@@ -2724,7 +2720,7 @@ pub fn eval_toplevel_with_host_effects<'a, D: Dispatch>(
                     match pending {
                         Some((index, data, tx)) => {
                             let future = (host_effects[index].handler)(data);
-                            handling = Some((index, tx, future));
+                            handling = Some((tx, future));
                             continue;
                         }
                         None => return Poll::Pending,

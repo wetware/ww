@@ -129,10 +129,12 @@ pub enum HostEffectResult {
     Exit,
 }
 
+/// Future returned by an embedding-owned host-effect handler.
+pub type HostEffectFuture = Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>;
+
 /// Async callback used by an embedding-owned default effect frame.  These
 /// callbacks never enter the Glia environment and must not re-enter `perform`.
-pub type HostEffectHandler =
-    Rc<dyn Fn(Val) -> Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>>;
+pub type HostEffectHandler = Rc<dyn Fn(Val) -> HostEffectFuture>;
 
 /// One Rust-owned default effect frame installed around a top-level eval.
 #[derive(Clone)]
