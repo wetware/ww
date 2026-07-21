@@ -120,6 +120,13 @@ impl LoadRuntime {
     }
 }
 
+pub fn default_load_runtime() -> LoadRuntime {
+    LoadRuntime::new(
+        std::env::var("WW_ROOT").unwrap_or_else(|_| "/".into()),
+        Rc::new(FsLoadBackend),
+    )
+}
+
 /// WASI/local-filesystem backend for embeddings without grafted IPFS reads.
 pub struct FsLoadBackend;
 
@@ -272,10 +279,11 @@ fn resolve_import_path(path: &str) -> String {
 ///
 /// The caller binds the returned map: `(def core (perform import "core"))`.
 /// Access members via the map: `(core :help)`.
-pub fn make_import_handler() -> Val {
+pub fn make_import_handler(load_runtime: LoadRuntime) -> Val {
     Val::AsyncNativeFn {
         name: "import-handler".into(),
         func: Rc::new(move |args: Vec<Val>| {
+            let load_runtime = load_runtime.clone();
             Box::pin(async move {
                 // Effect data for `(perform import "core")`:
                 // args[0] = data list, args[1] = resume continuation.
@@ -317,7 +325,7 @@ pub fn make_import_handler() -> Val {
                 }
 
                 // Load the file via eval_load
-                let bytes_val = eval_load_async(&[Val::Str(resolved.clone())]).await?;
+                let bytes_val = load_runtime.load(&resolved).await?;
                 let content = match &bytes_val {
                     Val::Bytes(b) => std::str::from_utf8(b)
                         .map_err(|e| {
@@ -889,7 +897,7 @@ mod tests {
         });
 
         // Build the handler and call it with cached data
-        let handler = make_import_handler();
+        let handler = make_import_handler(default_load_runtime());
         match &handler {
             Val::AsyncNativeFn { func, .. } => {
                 // Simulate: (perform import "core")
@@ -957,7 +965,7 @@ mod tests {
         });
 
         // Call handler twice — both should return the same cached map
-        let handler = make_import_handler();
+        let handler = make_import_handler(default_load_runtime());
         let func = match &handler {
             Val::AsyncNativeFn { func, .. } => func.clone(),
             _ => panic!("expected AsyncNativeFn"),
@@ -998,7 +1006,7 @@ mod tests {
     fn import_missing_file_returns_error() {
         clear_import_cache();
 
-        let handler = make_import_handler();
+        let handler = make_import_handler(default_load_runtime());
         let func = match &handler {
             Val::AsyncNativeFn { func, .. } => func.clone(),
             _ => panic!("expected AsyncNativeFn"),

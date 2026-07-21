@@ -758,7 +758,7 @@ fn run_impl() {
                 let cap_handlers: [(&str, Val); 3] = [
                     ("host", make_host_handler(host)),
                     ("routing", make_routing_handler(routing)),
-                    ("import", make_import_handler()),
+                    ("import", make_import_handler(caps::default_load_runtime())),
                 ];
                 for (name, handler) in cap_handlers {
                     env.set(

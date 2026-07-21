@@ -1942,7 +1942,10 @@ fn run_impl() {
                 env.set("doc".to_string(), make_doc_builtin());
                 env.set("help".to_string(), make_help_builtin());
                 env.set("import".to_string(), make_import_cap());
-                env.set("import-handler".to_string(), make_import_handler());
+                env.set(
+                    "import-handler".to_string(),
+                    make_import_handler(caps::default_load_runtime()),
+                );
             }
 
             // Load the prelude (standard macros: when, and, or, defn, cond, not).
@@ -2916,7 +2919,10 @@ mod tests {
             env.set(format!("{name}-handler"), handler);
         }
         env.set("import".to_string(), make_import_cap());
-        env.set("import-handler".to_string(), make_import_handler());
+        env.set(
+            "import-handler".to_string(),
+            make_import_handler(caps::default_load_runtime()),
+        );
 
         // http-client with real capnp client (tests always provide one).
         if let Some(ref c) = session.http_client {

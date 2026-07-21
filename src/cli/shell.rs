@@ -656,7 +656,10 @@ async fn build_local_shell_runtime(caps: GraftedShellCaps) -> LocalShellRuntime 
         "routing-handler".to_string(),
         make_routing_handler_local(routing),
     );
-    env.set("import-handler".to_string(), make_import_handler());
+    env.set(
+        "import-handler".to_string(),
+        make_import_handler(caps::default_load_runtime()),
+    );
 
     let dispatch = build_dispatch();
     {
