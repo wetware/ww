@@ -185,11 +185,8 @@ impl ExecutorPool {
         // Create a shared Engine with fuel + epoch support.  All cells on
         // all workers share this Engine so Engine::increment_epoch() reaches
         // every Store's epoch_deadline_callback.
-        let mut wasm_config = wasmtime::Config::new();
-        wasm_config.consume_fuel(true);
-        wasm_config.epoch_interruption(true);
         let engine = Arc::new(
-            Engine::new(&wasm_config)
+            Engine::new(&cell::engine::wasm_engine_config())
                 .map_err(|e| anyhow::anyhow!("failed to create shared wasmtime engine: {e}"))?,
         );
 

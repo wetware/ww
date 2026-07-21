@@ -6,6 +6,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+pub mod engine;
 pub mod epoch;
 pub mod fs_intercept;
 pub mod image;

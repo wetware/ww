@@ -31,4 +31,5 @@ cache = { package = "ww-cache", path = "../cache" }
 ipfs = { path = "../ipfs" }
 
 [dev-dependencies]
+wat = "1"
 tempfile = { workspace = true }
