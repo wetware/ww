@@ -19,15 +19,16 @@ use std::io::Write;
 use std::pin::Pin;
 use std::rc::Rc;
 
-use glia::eval::{self, Dispatch, Env};
-use glia::{make_cap, Val};
+use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
+use glia::eval::{self, Dispatch, Env, EvalOutcome};
+use glia::{make_cap, Val, ValMap};
 
 use wasip2::exports::cli::run::Guest;
 
 // Shared effect handler factories from the caps crate.
 use caps::{
-    eval_load_async, get_graft_cap, make_host_handler, make_import_handler, make_routing_handler,
-    mcp_adapter, membrane_capnp, routing_capnp, system_capnp, wrap_with_handlers,
+    get_graft_cap, make_host_handler, make_import_handler, make_routing_handler,
+    mcp_adapter, membrane_capnp, routing_capnp, system_capnp, wrap_with_handlers, LoadRuntime,
 };
 use mcp_adapter::{ActionPolicy, ExprPart, ToolAction, ToolSpec};
 
@@ -497,7 +498,6 @@ impl<'s> Dispatch for McpDispatch<'s> {
 
 fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
     let mut t: HashMap<&'static str, HandlerFn> = HashMap::new();
-    t.insert("load", |a, _| Box::pin(eval_load_async(a)));
     t.insert("help", |_, _| {
         Box::pin(std::future::ready(Ok(Val::Str(HELP_TEXT.to_string()))))
     });
@@ -524,6 +524,7 @@ async fn eval_expression(
     env: &mut Env,
     ctx: &RefCell<McpSession>,
     dispatch_table: &HashMap<&'static str, HandlerFn>,
+    load_runtime: LoadRuntime,
 ) -> Result<String, Val> {
     let expr = glia::read(expr_text).map_err(|e| glia::error::parse(None, e))?;
 
@@ -532,11 +533,33 @@ async fn eval_expression(
         ctx,
         table: dispatch_table,
     };
-    match eval::eval_toplevel(&wrapped, env, &dispatch).await {
-        Ok(Val::Nil) => Ok("nil".to_string()),
-        Ok(result) => Ok(format!("{result}")),
+    let effects = vec![HostEffect {
+        target: EffectTarget::Keyword("load".into()),
+        handler: Rc::new(move |data: Val| {
+            let runtime = load_runtime.clone();
+            Box::pin(async move { Ok(HostEffectResult::Resume(runtime.load_value(data).await?)) })
+        }),
+    }];
+    match eval::eval_toplevel_with_host_effects(&wrapped, env, &dispatch, &effects).await {
+        Ok(EvalOutcome::Value(Val::Nil)) => Ok("nil".to_string()),
+        Ok(EvalOutcome::Value(result)) => Ok(format!("{result}")),
+        Ok(EvalOutcome::Exit) => Err(protocol_mode_unavailable("exit")),
+        Err(Val::Effect { effect_type, .. }) if effect_type == "stdout" || effect_type == "exit" => {
+            Err(protocol_mode_unavailable(&effect_type))
+        }
         Err(e) => Err(e),
     }
+}
+
+fn protocol_mode_unavailable(effect: &str) -> Val {
+    glia::error::user(
+        Val::Keyword("glia.error/protocol-mode-unavailable".into()),
+        format!(":{effect} is unavailable in MCP protocol mode"),
+        ValMap::from_pairs(vec![
+            (Val::Keyword("mode".into()), Val::Keyword("mcp".into())),
+            (Val::Keyword("effect".into()), Val::Keyword(effect.into())),
+        ]),
+    )
 }
 
 /// Handle a single JSON-RPC request and write the response to stdout.
@@ -549,6 +572,7 @@ async fn handle_request(
     dispatch_table: &HashMap<&'static str, HandlerFn>,
     tools_list: &serde_json::Value,
     cap_names: &[String],
+    load_runtime: LoadRuntime,
 ) -> bool {
     let req: JsonRpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
@@ -592,7 +616,7 @@ async fn handle_request(
                 if expression.is_empty() {
                     write_tool_error(&id, "empty expression", &serde_json::Value::Null);
                 } else {
-                    match eval_expression(expression, env, ctx, dispatch_table).await {
+                    match eval_expression(expression, env, ctx, dispatch_table, load_runtime.clone()).await {
                         Ok(result) => write_tool_result(&id, &result),
                         Err(err) => {
                             let text = mcp_adapter::val_to_mcp_error_text(&err);
@@ -606,7 +630,7 @@ async fn handle_request(
             {
                 // Per-cap tool: translate to Glia expression and eval.
                 match tool_call_to_glia(tool_name, &arguments) {
-                    Some(expr) => match eval_expression(&expr, env, ctx, dispatch_table).await {
+                    Some(expr) => match eval_expression(&expr, env, ctx, dispatch_table, load_runtime.clone()).await {
                         Ok(result) => write_tool_result(&id, &result),
                         Err(err) => {
                             let action = arguments
@@ -750,7 +774,8 @@ fn run_impl() {
                 s.routing = Some(routing.clone());
             }
 
-            // 2. Bind cap values + effect handlers into the environment.
+            let load_runtime = caps::default_load_runtime();
+        // 2. Bind cap values + effect handlers into the environment.
             //    Uses shared handler factories from the caps crate.
             //    Each cap must be Val::Cap (not Val::Nil) so that
             //    with-effect-handler can match on it.
@@ -758,7 +783,7 @@ fn run_impl() {
                 let cap_handlers: [(&str, Val); 3] = [
                     ("host", make_host_handler(host)),
                     ("routing", make_routing_handler(routing)),
-                    ("import", make_import_handler(caps::default_load_runtime())),
+                    ("import", make_import_handler(load_runtime.clone())),
                 ];
                 for (name, handler) in cap_handlers {
                     env.set(
@@ -818,6 +843,7 @@ fn run_impl() {
                             &dispatch_table,
                             &tools_list,
                             &cap_names,
+                            load_runtime.clone(),
                         )
                         .await;
                         if !cont {
