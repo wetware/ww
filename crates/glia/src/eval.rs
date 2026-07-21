@@ -2654,6 +2654,22 @@ pub enum EvalOutcome {
     Exit,
 }
 
+/// Removes embedding-owned frames even when the enclosing evaluation future is
+/// cancelled.  Guest frames manage their own lifetime in `with-effect-handler`;
+/// these frames have no guest future to perform that cleanup for us.
+struct HostFrameGuard {
+    stack: HandlerStack,
+    contexts: Vec<Rc<RefCell<effect::HandlerContext>>>,
+}
+
+impl Drop for HostFrameGuard {
+    fn drop(&mut self) {
+        self.stack
+            .borrow_mut()
+            .retain(|frame| !self.contexts.iter().any(|ctx| Rc::ptr_eq(frame, ctx)));
+    }
+}
+
 /// Evaluate a form with Rust-owned default keyword-effect frames.
 ///
 /// The frames are dynamic but never guest-visible: they are installed before
@@ -2680,6 +2696,10 @@ pub fn eval_toplevel_with_host_effects<'a, D: Dispatch>(
             })
             .collect();
         hs.borrow_mut().extend(contexts.iter().cloned());
+        let _guard = HostFrameGuard {
+            stack: hs,
+            contexts: contexts.clone(),
+        };
 
         let mut body = eval_toplevel(val, env, dispatch);
         let mut handling: Option<(
@@ -2730,8 +2750,6 @@ pub fn eval_toplevel_with_host_effects<'a, D: Dispatch>(
         })
         .await;
 
-        hs.borrow_mut()
-            .retain(|frame| !contexts.iter().any(|ctx| Rc::ptr_eq(frame, ctx)));
         result
     })
 }
