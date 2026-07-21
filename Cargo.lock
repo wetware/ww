@@ -1393,6 +1393,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "atom",
+ "blake3",
  "cap-std",
  "cid",
  "dirs",

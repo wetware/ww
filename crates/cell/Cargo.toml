@@ -20,6 +20,7 @@ rand = { workspace = true }
 dirs = { workspace = true }
 cap-std = "3.4"
 wasmtime = { workspace = true, features = ["call-hook"] }
+blake3 = { workspace = true }
 wasmtime-wasi = "45.0.0"
 wasmtime-wasi-io = "45.0.0"
 
