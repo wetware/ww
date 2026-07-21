@@ -20,6 +20,7 @@ rand = { workspace = true }
 dirs = { workspace = true }
 cap-std = "3.4"
 wasmtime = { workspace = true, features = ["call-hook"] }
+blake3 = { workspace = true }
 wasmtime-wasi = "45.0.0"
 wasmtime-wasi-io = "45.0.0"
 
@@ -31,4 +32,5 @@ cache = { package = "ww-cache", path = "../cache" }
 ipfs = { path = "../ipfs" }
 
 [dev-dependencies]
+wat = "1"
 tempfile = { workspace = true }

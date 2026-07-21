@@ -99,6 +99,30 @@ enum Commands {
         path: PathBuf,
     },
 
+    /// Precompile wasm components into `.cwasm` artifacts.
+    ///
+    /// Booting compiles every component from scratch (Cranelift), so a restart
+    /// loop is a sustained-CPU signature. Baking `.cwasm` into the deploy image
+    /// and pointing WW_CWASM_DIR at it lets boot `deserialize` instead —
+    /// ~1400× cheaper per component. Artifacts are named `<blake3(wasm)>.cwasm`
+    /// so the runtime finds them by the same key its compile cache uses.
+    ///
+    /// The engine config here is identical to the runtime's; an artifact that
+    /// later fails to load (version/ISA skew) degrades to a fresh compile, not
+    /// a crash. Compile on the same platform family as the deploy target.
+    ///
+    /// Example:
+    ///   ww compile std/kernel.wasm std/shell.wasm --out-dir dist/cwasm
+    Compile {
+        /// Wasm component file(s) to precompile.
+        #[arg(value_name = "WASM", required = true)]
+        inputs: Vec<PathBuf>,
+
+        /// Directory to write `.cwasm` artifacts into (created if absent).
+        #[arg(long = "out-dir", value_name = "DIR")]
+        out_dir: PathBuf,
+    },
+
     /// Run a wetware environment.
     ///
     /// Every positional argument is a mount source mounted at `/` (image layer).
@@ -165,8 +189,14 @@ enum Commands {
 
         /// Number of executor worker threads for cell scheduling.
         /// Each worker runs its own single-threaded tokio runtime.
-        /// 0 = auto-detect (one per CPU core).
-        #[arg(long, default_value = "0")]
+        /// 0 = auto-detect (one per CPU core). NOTE: auto-detect reads the
+        /// node's core count, NOT the cgroup CPU quota, so under a k8s CPU
+        /// limit it over-subscribes during the compile-heavy boot window
+        /// (measured self-contention). Pin this to match the CPU budget on
+        /// constrained hosts; WW_EXECUTOR_THREADS sets it from the environment
+        /// (parity with WW_COMPILE_WORKERS) so the deploy manifest can carry it
+        /// next to the CPU limit.
+        #[arg(long, default_value = "0", env = "WW_EXECUTOR_THREADS")]
         executor_threads: usize,
 
         /// Enable the WAGI HTTP server on the given address.
@@ -603,6 +633,7 @@ impl Commands {
         match self {
             Commands::Init { name } => Self::init(name).await,
             Commands::Build { path } => Self::build(path).await,
+            Commands::Compile { inputs, out_dir } => Self::compile(inputs, out_dir).await,
             Commands::Run {
                 mounts: mount_args,
                 listen,
@@ -1025,6 +1056,32 @@ wasip2::cli::command::export!({iface_name}Guest);
     }
 
     /// Build a guest project, placing artifacts in bin/
+    /// Precompile wasm components to `.cwasm` artifacts in `out_dir`.
+    ///
+    /// Uses the shared runtime engine config so the runtime's `deserialize`
+    /// path accepts the output. Every input must compile; a bad wasm is a hard
+    /// error (CI must not silently ship a partial artifact set).
+    async fn compile(inputs: Vec<PathBuf>, out_dir: PathBuf) -> Result<()> {
+        let engine = ww::cell::engine::wasm_engine().map_err(|e| {
+            anyhow::anyhow!("failed to create wasmtime engine for compilation: {e}")
+        })?;
+
+        for input in &inputs {
+            let wasm = std::fs::read(input)
+                .with_context(|| format!("failed to read wasm input: {}", input.display()))?;
+            let path = ww::cell::cwasm::compile_to_dir(&engine, &wasm, &out_dir)
+                .map_err(|e| anyhow::anyhow!("failed to precompile {}: {e}", input.display()))?;
+            println!("{} -> {}", input.display(), path.display());
+        }
+
+        println!(
+            "Precompiled {} component(s) into {}",
+            inputs.len(),
+            out_dir.display()
+        );
+        Ok(())
+    }
+
     async fn build(path: PathBuf) -> Result<()> {
         let cargo_toml = path.join("Cargo.toml");
 

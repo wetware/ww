@@ -395,6 +395,32 @@ jobs:
         # Shell layer: WASM.
         cp wasm/std/shell/bin/shell.wasm    wetware/shell/bin/shell.wasm
 
+        # Precompile the kernel + shell wasm into .cwasm artifacts baked at
+        # /cwasm (WW_CWASM_DIR in the k8s manifest). Booting deserializes these
+        # instead of Cranelift-compiling from scratch — ~1400x cheaper per
+        # component, removing the compile-on-every-boot cost that turns a
+        # CrashLoopBackOff into a sustained-CPU FUP-throttle signature.
+        #
+        # This is the SAME ww binary that runs in the image, so its wasmtime
+        # version + engine config match the runtime's, and the runtime finds
+        # these artifacts by blake3(wasm). On any miss or ISA mismatch the
+        # runtime falls back to a fresh compile, so a bad/absent artifact only
+        # forgoes the speedup — it never breaks a boot. (Reliable hits on the
+        # deploy host require the CI runner and deploy host to share x86_64 ISA
+        # features, since wasmtime bakes an exact config/ISA compatibility hash;
+        # a conservative pinned-ISA config is the follow-up that guarantees it.)
+        ./ww compile \
+          wetware/kernel/bin/main.wasm \
+          wetware/shell/bin/shell.wasm \
+          --out-dir cwasm
+
+        # Fail loudly if the two expected artifacts weren't produced (a silent
+        # empty dir would mask a broken bake as a permanent cache-miss = no
+        # speedup, no error).
+        produced=$(find cwasm -name '*.cwasm' | wc -l)
+        test "$produced" -eq 2 || { echo "expected 2 .cwasm, got $produced"; exit 1; }
+        ls -la cwasm
+
         cp ../Containerfile.deploy Containerfile
 
     - name: Set up Docker Buildx
