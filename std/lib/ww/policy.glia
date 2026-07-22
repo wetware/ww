@@ -1,7 +1,7 @@
 ;; ww/policy — interposition handler patterns for capabilities
 ;;
 ;; Usage: (def p (perform import "ww/policy"))
-;;        (with-effect-handler cap ((p :audit) cap println)
+;;        (with-effect-handler cap ((p :audit) cap (fn [data] (perform :stdout data)))
 ;;          (perform cap :method args))
 ;;
 ;; These are LOCAL semantics: a handler interposes on (perform cap ...)

@@ -1,5 +1,10 @@
 # Resumable-effects Phase 3 conformance audit
 
+> Historical pre-migration snapshot. This document records the violations that
+> motivated Phase 3; its present-tense inventory is not a statement of the
+> current implementation. See `doc/designs/glia-effects.md` for the adopted
+> post-migration contract and `CHANGELOG.md` for the migration record.
+
 ## Executive summary
 
 This audit covers local Glia interposition only; capability authority remains enforced at the Cap'n Proto hook membrane layer.

@@ -29,10 +29,10 @@ boundary and which methods they may call. A local handler can interpose on an
 effect only inside its evaluator; it cannot add rights to a membrane-wrapped
 capability or carry a policy across a process boundary.
 
-The evaluator represents embedding-installed handlers as
-`HostEffectHandler`. That value may be installed by `with-effect-handler`, but
-it is deliberately not callable through ordinary function invocation or
-`apply`. This keeps host work reachable only through the suspended `perform`
+The evaluator represents embedding-installed handlers as Rust-only
+`HostEffectHandler` callbacks. They are not Glia values, are never bound in a
+guest `Env`, and cannot be installed, invoked, or passed to `apply` by guest
+code. This keeps host work reachable only through the suspended `perform`
 path. Normal native functions remain available for trusted pure intrinsics and
 continuations. Any future purity inference is conservative: a value is treated
 as effectful unless the evaluator can prove otherwise.
@@ -157,10 +157,10 @@ is given so the doc and the code stay in lockstep.
 - **Async native handlers resume.** A handler backed by an async native function
   resumes the body identically to a synchronous one.
   (`async_native_handler_resumes_body`, `async_native_fn_in_effect_handler`)
-- **Host handlers are installable but non-callable.** An embedding-installed
-  `HostEffectHandler` is accepted only in the handler position of
-  `with-effect-handler`; direct invocation and every `apply` path reject it.
-  This prevents a function-shaped escape hatch around `perform`.
+- **Host handlers are Rust-owned and guest-unreachable.** An embedding installs
+  `HostEffectHandler` frames around evaluation; the callback is not a Glia
+  value and no guest `with-effect-handler` or `apply` path can obtain it. This
+  prevents a function-shaped escape hatch around `perform`.
 - **Dynamic (invocation-time) handler stack.** A closure or macro dispatches
   through the handler stack in force at its *invocation/expansion* site, not the
   one ambient at definition time.

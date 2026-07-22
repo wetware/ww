@@ -1948,6 +1948,10 @@ pub fn eval_expr<'a, D: Dispatch>(
                     target: effect_target,
                 }));
                 hs.borrow_mut().push(ctx.clone());
+                let _guard = HandlerFrameGuard {
+                    stack: hs.clone(),
+                    context: ctx.clone(),
+                };
 
                 // Create body future.
                 let mut body_fut = {
@@ -2107,15 +2111,6 @@ pub fn eval_expr<'a, D: Dispatch>(
                     }
                 })
                 .await;
-
-                // Pop our handler context (if still on the stack).
-                let mut stack = hs.borrow_mut();
-                if let Some(last) = stack.last() {
-                    if Rc::ptr_eq(last, &ctx) {
-                        stack.pop();
-                    }
-                }
-                drop(stack);
 
                 result
             }
@@ -2639,8 +2634,8 @@ pub enum EvalOutcome {
 }
 
 /// Removes embedding-owned frames even when the enclosing evaluation future is
-/// cancelled.  Guest frames manage their own lifetime in `with-effect-handler`;
-/// these frames have no guest future to perform that cleanup for us.
+/// cancelled. Guest `with-effect-handler` frames use `HandlerFrameGuard` for
+/// the same cancellation-safe cleanup.
 struct HostFrameGuard {
     stack: HandlerStack,
     contexts: Vec<Rc<RefCell<effect::HandlerContext>>>,
@@ -2651,6 +2646,22 @@ impl Drop for HostFrameGuard {
         self.stack
             .borrow_mut()
             .retain(|frame| !self.contexts.iter().any(|ctx| Rc::ptr_eq(frame, ctx)));
+    }
+}
+
+/// Removes a guest-owned handler frame if evaluation exits through an error,
+/// an embedding abort, or cancellation before `with-effect-handler` reaches
+/// its ordinary cleanup path.
+struct HandlerFrameGuard {
+    stack: HandlerStack,
+    context: Rc<RefCell<effect::HandlerContext>>,
+}
+
+impl Drop for HandlerFrameGuard {
+    fn drop(&mut self) {
+        self.stack
+            .borrow_mut()
+            .retain(|frame| !Rc::ptr_eq(frame, &self.context));
     }
 }
 
@@ -4392,6 +4403,58 @@ mod tests {
             )),
             Ok(EvalOutcome::Exit)
         ));
+    }
+
+    #[test]
+    fn host_effect_abort_cleans_guest_handler_frames() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let form = crate::read(
+            "(with-effect-handler :outer (fn [value resume] (resume value)) (perform :load \"x\"))",
+        )
+        .unwrap();
+        let handler: effect::HostEffectHandler =
+            Rc::new(|_| Box::pin(async { Err(Val::from("load failed")) }));
+        let effects = [effect::HostEffect {
+            target: effect::EffectTarget::Keyword("load".into()),
+            handler,
+        }];
+
+        assert!(pollster_eval(eval_toplevel_with_host_effects(
+            &form, &mut env, &d, &effects
+        ))
+        .is_err());
+        assert!(
+            env.handler_stack.borrow().is_empty(),
+            "host-effect abort must not leak guest handler frames"
+        );
+    }
+
+    #[test]
+    fn host_effect_exit_cleans_guest_handler_frames() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let form = crate::read(
+            "(with-effect-handler :outer (fn [value resume] (resume value)) (perform :exit nil))",
+        )
+        .unwrap();
+        let handler: effect::HostEffectHandler =
+            Rc::new(|_| Box::pin(async { Ok(effect::HostEffectResult::Exit) }));
+        let effects = [effect::HostEffect {
+            target: effect::EffectTarget::Keyword("exit".into()),
+            handler,
+        }];
+
+        assert!(matches!(
+            pollster_eval(eval_toplevel_with_host_effects(
+                &form, &mut env, &d, &effects
+            )),
+            Ok(EvalOutcome::Exit)
+        ));
+        assert!(
+            env.handler_stack.borrow().is_empty(),
+            "host-effect exit must not leak guest handler frames"
+        );
     }
 
     #[test]

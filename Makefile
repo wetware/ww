@@ -26,9 +26,11 @@ test: test-deps
 # Guard the explicit pre-alpha Glia host-effect syntax. Historical audits and
 # changelog entries intentionally retain old spellings as evidence.
 check-glia-effects:
-	@! rg -n '\(load |\(println |\(exit\)|eval_path_lookup' \
-		--glob '!doc/audits/**' --glob '!CHANGELOG.md' --glob '!target/**' \
+	@! rg -n --hidden '\((load|println|exit)([[:space:]]|\))|eval_path_lookup' \
+		--glob '!.git/**' --glob '!doc/audits/**' --glob '!CHANGELOG.md' --glob '!target/**' \
 		--glob '!std/**/target/**' --glob '!std/system/src/lib.rs' --glob '!Makefile' .
+	@! rg -n --hidden 'Val::Keyword\(("exit"|\x27exit\x27)' \
+		--glob '!.git/**' --glob '!target/**' --glob '!std/**/target/**' .
 
 # --- Std components ----------------------------------------------------------
 

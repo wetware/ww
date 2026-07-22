@@ -21,7 +21,7 @@ use std::rc::Rc;
 
 use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
 use glia::eval::{self, Dispatch, Env, EvalOutcome};
-use glia::{make_cap, HandledCapInner, Val, ValMap};
+use glia::{make_cap, HandledCapInner, Val};
 
 use wasip2::exports::cli::run::Guest;
 
@@ -542,23 +542,12 @@ async fn eval_expression(
     match eval::eval_toplevel_with_host_effects(&expr, env, &dispatch, &effects).await {
         Ok(EvalOutcome::Value(Val::Nil)) => Ok("nil".to_string()),
         Ok(EvalOutcome::Value(result)) => Ok(format!("{result}")),
-        Ok(EvalOutcome::Exit) => Err(protocol_mode_unavailable("exit")),
+        Ok(EvalOutcome::Exit) => Err(mcp_adapter::protocol_mode_unavailable("exit")),
         Err(Val::Effect { effect_type, .. }) if effect_type == "stdout" || effect_type == "exit" => {
-            Err(protocol_mode_unavailable(&effect_type))
+            Err(mcp_adapter::protocol_mode_unavailable(&effect_type))
         }
         Err(e) => Err(e),
     }
-}
-
-fn protocol_mode_unavailable(effect: &str) -> Val {
-    glia::error::user(
-        Val::Keyword("glia.error/protocol-mode-unavailable".into()),
-        format!(":{effect} is unavailable in MCP protocol mode"),
-        ValMap::from_pairs(vec![
-            (Val::Keyword("mode".into()), Val::Keyword("mcp".into())),
-            (Val::Keyword("effect".into()), Val::Keyword(effect.into())),
-        ]),
-    )
 }
 
 /// Handle a single JSON-RPC request and write the response to stdout.
