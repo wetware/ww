@@ -1288,8 +1288,10 @@ pub struct WasmtimeHost {
 
 impl WasmtimeHost {
     pub fn new() -> Result<Self> {
-        // No epoch_interruption here — WasmtimeHost is used by integration
-        // tests, not by the ExecutorPool which has its own Engine + tick task.
+        // Uses the canonical engine config (which enables epoch_interruption).
+        // WasmtimeHost serves integration tests, not the ExecutorPool; with no
+        // tick task the epoch never advances, so interruption is inert here —
+        // but the config must match the runtime's for .cwasm compatibility.
         let engine = Engine::new(&cell::engine::wasm_engine_config())?;
         Ok(Self {
             engine: Arc::new(engine),
