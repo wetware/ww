@@ -211,7 +211,6 @@ jobs:
         make shell
 
     - name: Run host workspace tests (hot cache from build job)
-      if: ${{ always() }}
       run: cargo test --workspace
 
     - name: Run standalone standard-library tests

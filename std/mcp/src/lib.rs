@@ -542,6 +542,9 @@ async fn eval_expression(
     match eval::eval_toplevel_with_host_effects(&expr, env, &dispatch, &effects).await {
         Ok(EvalOutcome::Value(Val::Nil)) => Ok("nil".to_string()),
         Ok(EvalOutcome::Value(result)) => Ok(format!("{result}")),
+        // The current MCP frame list deliberately omits :exit; keep this
+        // defensive branch so adding one cannot accidentally turn process
+        // control into a successful JSON-RPC result.
         Ok(EvalOutcome::Exit) => Err(mcp_adapter::protocol_mode_unavailable("exit")),
         Err(Val::Effect { effect_type, .. }) if effect_type == "stdout" || effect_type == "exit" => {
             Err(mcp_adapter::protocol_mode_unavailable(&effect_type))
@@ -862,6 +865,40 @@ mod tests {
 
     fn args(json: serde_json::Value) -> serde_json::Value {
         json
+    }
+
+    #[test]
+    fn eval_rejects_protocol_owned_effects() {
+        let mut env = Env::new();
+        let session = RefCell::new(McpSession {
+            host: None,
+            routing: None,
+        });
+        let dispatch = build_dispatch();
+
+        for (expression, effect) in [
+            ("(perform :stdout \"protocol corruption\")", "stdout"),
+            ("(perform :exit nil)", "exit"),
+        ] {
+            let err = futures::executor::block_on(eval_expression(
+                expression,
+                &mut env,
+                &session,
+                &dispatch,
+                caps::default_load_runtime(),
+            ))
+            .expect_err("protocol-owned effects must be rejected");
+            assert_eq!(
+                glia::error::type_tag(&err),
+                Some("glia.error/protocol-mode-unavailable")
+            );
+            assert_eq!(
+                mcp_adapter::val_to_mcp_error_data(&err)
+                    .get("effect")
+                    .and_then(|value| value.as_str()),
+                Some(effect)
+            );
+        }
     }
 
     #[test]
