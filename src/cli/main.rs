@@ -217,8 +217,7 @@ enum Commands {
         runtime_cache_policy: String,
 
         /// Local HTTP admin endpoint. Serves GET /healthz, GET /metrics,
-        /// GET /host/id, and GET /host/addrs. Defaults to localhost only;
-        /// pass `--with-http-admin off` to disable it.
+        /// GET /host/id, and GET /host/addrs. Defaults to localhost only.
         #[arg(
             long,
             value_name = "ADDR",
@@ -226,6 +225,10 @@ enum Commands {
             env = "WW_HTTP_ADMIN"
         )]
         with_http_admin: String,
+
+        /// Disable the local HTTP admin endpoint.
+        #[arg(long, env = "WW_HTTP_ADMIN_DISABLED")]
+        http_admin_disabled: bool,
 
         /// IPFS HTTP API endpoint
         #[arg(long, default_value = "http://localhost:5001", env = "IPFS_API")]
@@ -655,6 +658,7 @@ impl Commands {
                 http_dial,
                 runtime_cache_policy,
                 with_http_admin,
+                http_admin_disabled,
                 ipfs_url,
             } => {
                 let mounts = ww::cell::mount::parse_args(&mount_args)?;
@@ -688,7 +692,7 @@ impl Commands {
                     http_listen,
                     http_dial,
                     runtime_cache_policy,
-                    (with_http_admin != "off").then_some(with_http_admin),
+                    (!http_admin_disabled).then_some(with_http_admin),
                     ipfs_url,
                 )
                 .await
@@ -2692,6 +2696,23 @@ fn to_pascal_case(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn run_admin_disabled_flag_is_explicit() {
+        let cli =
+            Cli::try_parse_from(["ww", "run", "--http-admin-disabled"]).expect("parse run command");
+        match cli.command {
+            Commands::Run {
+                with_http_admin,
+                http_admin_disabled,
+                ..
+            } => {
+                assert_eq!(with_http_admin, "127.0.0.1:2026");
+                assert!(http_admin_disabled);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
     #[tokio::test]
     async fn wait_for_kubo_ready_times_out_against_unreachable_node() {
         // Point at a closed port; a finite deadline must surface an error
@@ -2817,7 +2838,8 @@ mod tests {
             http_listen: None,
             http_dial: Vec::new(),
             runtime_cache_policy: "shared".to_string(),
-            with_http_admin: "off".to_string(),
+            with_http_admin: "127.0.0.1:2026".to_string(),
+            http_admin_disabled: true,
             ipfs_url: "http://localhost:5001".to_string(),
         };
 

@@ -44,7 +44,8 @@ Layers stack with per-file union; later layers win.
 | `--insecure-ephemeral` | off | Allow ephemeral identity fallback if identity file is missing (insecure; for quick trial runs). |
 | `--http-listen <ADDR>` | none | Enable WAGI HTTP server (e.g. `127.0.0.1:2080`) |
 | `--http-dial <HOST>` | none | Allow outbound HTTP to host. Repeatable. Supports exact hosts, `*.example.com`, or `*`. Without this flag, no http-client capability is granted. |
-| `--with-http-admin <ADDR>` | `127.0.0.1:2026` | Local HTTP admin endpoint (`/healthz`, `/metrics`, `/host/id`, `/host/addrs`); set `off` to disable. Also reads `WW_HTTP_ADMIN`. |
+| `--with-http-admin <ADDR>` | `127.0.0.1:2026` | Local HTTP admin endpoint (`/healthz`, `/metrics`, `/host/id`, `/host/addrs`). Also reads `WW_HTTP_ADMIN`. |
+| `--http-admin-disabled` | off | Disable the local HTTP admin endpoint. Also reads `WW_HTTP_ADMIN_DISABLED`. |
 | `--wasm-debug` | off | Enable WASM debug info for guest processes |
 | `--executor-threads <N>` | `0` | Executor worker threads (0 = auto-detect, one per CPU core) |
 | `--runtime-cache-policy` | `shared` | `shared`: same WASM bytes share Executor. `isolated`: always fresh. |
