@@ -99,6 +99,30 @@ enum Commands {
         path: PathBuf,
     },
 
+    /// Precompile wasm components into `.cwasm` artifacts.
+    ///
+    /// Booting compiles every component from scratch (Cranelift), so a restart
+    /// loop is a sustained-CPU signature. Baking `.cwasm` into the deploy image
+    /// and pointing WW_CWASM_DIR at it lets boot `deserialize` instead —
+    /// ~1400× cheaper per component. Artifacts are named `<blake3(wasm)>.cwasm`
+    /// so the runtime finds them by the same key its compile cache uses.
+    ///
+    /// The engine config here is identical to the runtime's; an artifact that
+    /// later fails to load (version/ISA skew) degrades to a fresh compile, not
+    /// a crash. Compile on the same platform family as the deploy target.
+    ///
+    /// Example:
+    ///   ww compile std/kernel.wasm std/shell.wasm --out-dir dist/cwasm
+    Compile {
+        /// Wasm component file(s) to precompile.
+        #[arg(value_name = "WASM", required = true)]
+        inputs: Vec<PathBuf>,
+
+        /// Directory to write `.cwasm` artifacts into (created if absent).
+        #[arg(long = "out-dir", value_name = "DIR")]
+        out_dir: PathBuf,
+    },
+
     /// Run a wetware environment.
     ///
     /// Every positional argument is a mount source mounted at `/` (image layer).
@@ -165,8 +189,14 @@ enum Commands {
 
         /// Number of executor worker threads for cell scheduling.
         /// Each worker runs its own single-threaded tokio runtime.
-        /// 0 = auto-detect (one per CPU core).
-        #[arg(long, default_value = "0")]
+        /// 0 = auto-detect (one per CPU core). NOTE: auto-detect reads the
+        /// node's core count, NOT the cgroup CPU quota, so under a k8s CPU
+        /// limit it over-subscribes during the compile-heavy boot window
+        /// (measured self-contention). Pin this to match the CPU budget on
+        /// constrained hosts; WW_EXECUTOR_THREADS sets it from the environment
+        /// (parity with WW_COMPILE_WORKERS) so the deploy manifest can carry it
+        /// next to the CPU limit.
+        #[arg(long, default_value = "0", env = "WW_EXECUTOR_THREADS")]
         executor_threads: usize,
 
         /// Enable the WAGI HTTP server on the given address.
@@ -487,6 +517,102 @@ fn parse_kubo_bootstrap(info: &ipfs::KuboInfo) -> Option<host::KuboBootstrapInfo
     Some(host::KuboBootstrapInfo { peer_id, addr })
 }
 
+/// Environment override for the kubo-readiness wait deadline, in seconds.
+/// `0` means wait indefinitely (the production posture — see
+/// [`wait_for_kubo_ready`]).
+const KUBO_WAIT_MAX_SECS_ENV: &str = "WW_KUBO_WAIT_MAX_SECS";
+
+/// Default kubo-readiness deadline when [`KUBO_WAIT_MAX_SECS_ENV`] is unset.
+/// Generous enough to cover a kubo sidecar coming up alongside `ww`, short
+/// enough that a dev running `ww run` without kubo gets a clear error rather
+/// than an indefinite hang. Deploys set the env to `0` for unbounded waiting.
+const KUBO_WAIT_DEFAULT_SECS: u64 = 120;
+
+/// Block until the local kubo node answers `/api/v0/id`, polling with capped
+/// exponential backoff.
+///
+/// The boot-critical FHS resolve (`resolve_mounts_virtual`) hard-depends on
+/// kubo: an `add_dir`/`files_cp` against an unreachable node fails, and until
+/// now that error propagated straight out of `ww run`, exiting the process. In
+/// Kubernetes that is a CrashLoopBackOff, and because every boot recompiles all
+/// wasm from scratch, a restart loop reads as *sustained* CPU — the signature
+/// that tripped the provider Fair-Use throttle. Waiting in place instead of
+/// exiting turns a hot restart loop into a nearly-idle poll (one HTTP GET per
+/// backoff interval), so a transient kubo outage no longer burns CPU.
+///
+/// Returns `Ok(())` once kubo is reachable. With a non-zero deadline it returns
+/// an error after the deadline (dev fail-fast); with `WW_KUBO_WAIT_MAX_SECS=0`
+/// it never gives up (the production "never exit" posture).
+async fn wait_for_kubo_ready(client: &ipfs::HttpClient) -> Result<()> {
+    let max_secs = std::env::var(KUBO_WAIT_MAX_SECS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(KUBO_WAIT_DEFAULT_SECS);
+    wait_for_kubo_ready_with(client, max_secs).await
+}
+
+/// Core of [`wait_for_kubo_ready`] with an explicit deadline (`max_secs`; `0` =
+/// unbounded), split out so tests can drive it without touching process env.
+async fn wait_for_kubo_ready_with(client: &ipfs::HttpClient, max_secs: u64) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let deadline = (max_secs > 0).then(|| Instant::now() + Duration::from_secs(max_secs));
+
+    // Fast path: usually kubo is already up.
+    if client.kubo_info().await.is_ok() {
+        return Ok(());
+    }
+
+    let mut backoff = Duration::from_millis(500);
+    let backoff_cap = Duration::from_secs(15);
+    let started = Instant::now();
+    let mut attempt: u64 = 0;
+
+    loop {
+        attempt += 1;
+        match client.kubo_info().await {
+            Ok(_) => {
+                tracing::info!(
+                    attempt,
+                    waited_secs = started.elapsed().as_secs(),
+                    "kubo reachable; proceeding with boot"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                let waited = started.elapsed();
+                // Escalate to warn after the first few misses so a genuinely
+                // stuck dependency is visible in logs, while a normal
+                // startup race stays quiet.
+                if attempt <= 3 {
+                    tracing::debug!(attempt, error = %e, "kubo not ready; waiting");
+                } else {
+                    tracing::warn!(
+                        attempt,
+                        waited_secs = waited.as_secs(),
+                        error = %e,
+                        "kubo still not ready; retrying (staying alive rather than crash-looping)"
+                    );
+                }
+
+                if let Some(deadline) = deadline {
+                    if Instant::now() + backoff >= deadline {
+                        anyhow::bail!(
+                            "kubo not reachable after {}s at {}; set {}=0 to wait indefinitely",
+                            waited.as_secs(),
+                            client.base_url(),
+                            KUBO_WAIT_MAX_SECS_ENV
+                        );
+                    }
+                }
+
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(backoff_cap);
+            }
+        }
+    }
+}
+
 /// Parse a hex-encoded contract address (with or without 0x prefix) into 20 bytes.
 fn parse_contract_address(s: &str) -> Result<[u8; 20]> {
     let hex_str = s.strip_prefix("0x").unwrap_or(s);
@@ -507,6 +633,7 @@ impl Commands {
         match self {
             Commands::Init { name } => Self::init(name).await,
             Commands::Build { path } => Self::build(path).await,
+            Commands::Compile { inputs, out_dir } => Self::compile(inputs, out_dir).await,
             Commands::Run {
                 mounts: mount_args,
                 listen,
@@ -929,6 +1056,32 @@ wasip2::cli::command::export!({iface_name}Guest);
     }
 
     /// Build a guest project, placing artifacts in bin/
+    /// Precompile wasm components to `.cwasm` artifacts in `out_dir`.
+    ///
+    /// Uses the shared runtime engine config so the runtime's `deserialize`
+    /// path accepts the output. Every input must compile; a bad wasm is a hard
+    /// error (CI must not silently ship a partial artifact set).
+    async fn compile(inputs: Vec<PathBuf>, out_dir: PathBuf) -> Result<()> {
+        let engine = ww::cell::engine::wasm_engine().map_err(|e| {
+            anyhow::anyhow!("failed to create wasmtime engine for compilation: {e}")
+        })?;
+
+        for input in &inputs {
+            let wasm = std::fs::read(input)
+                .with_context(|| format!("failed to read wasm input: {}", input.display()))?;
+            let path = ww::cell::cwasm::compile_to_dir(&engine, &wasm, &out_dir)
+                .map_err(|e| anyhow::anyhow!("failed to precompile {}: {e}", input.display()))?;
+            println!("{} -> {}", input.display(), path.display());
+        }
+
+        println!(
+            "Precompiled {} component(s) into {}",
+            inputs.len(),
+            out_dir.display()
+        );
+        Ok(())
+    }
+
     async fn build(path: PathBuf) -> Result<()> {
         let cargo_toml = path.join("Cargo.toml");
 
@@ -1276,6 +1429,13 @@ wasip2::cli::command::export!({iface_name}Guest);
         // Resolve mounts into a merged root CID + local overrides. No
         // tempdir materialization — guest filesystem reads are lazy via
         // CidTree, backed by the IPFS DAG.
+        //
+        // This resolve hard-depends on kubo (add_dir/files_cp). Wait for kubo
+        // to become reachable instead of exiting on a transient outage — an
+        // exit here is a CrashLoopBackOff, and every boot recompiles all wasm,
+        // so a restart loop is a sustained-CPU throttle signature. See
+        // `wait_for_kubo_ready`.
+        wait_for_kubo_ready(&ipfs_client).await?;
         tracing::debug!("resolving mounts (virtual)...");
         let (root_cid, local_overrides) =
             image::resolve_mounts_virtual(&all_mounts, &ipfs_client).await?;
@@ -2520,6 +2680,30 @@ fn to_pascal_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wait_for_kubo_ready_times_out_against_unreachable_node() {
+        // Point at a closed port; a finite deadline must surface an error
+        // (dev fail-fast) rather than hanging, and the message must name the
+        // env escape hatch.
+        let client = ipfs::HttpClient::new("http://127.0.0.1:1".to_string());
+        let start = std::time::Instant::now();
+        let err = wait_for_kubo_ready_with(&client, 1)
+            .await
+            .expect_err("unreachable kubo with a 1s deadline must error");
+        // Bounded: the deadline is 1s and backoff is capped, so this returns
+        // quickly rather than looping forever.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "wait should honor the deadline, took {:?}",
+            start.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(KUBO_WAIT_MAX_SECS_ENV),
+            "error should point at the unbounded-wait env override: {msg}"
+        );
+    }
 
     #[test]
     fn test_resolve_identity_missing_path_errors_by_default() {
