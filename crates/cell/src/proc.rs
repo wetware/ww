@@ -650,7 +650,7 @@ impl Proc {
 
         // Instantiate it as a normal component. When no precompiled component
         // was handed in (pid0 and any spawn without a compile service), go
-        // through the baked `.cwasm` cache: WW_CWASM_DIR hit = deserialize
+        // through the host-local `.cwasm` cache: WW_CWASM_DIR hit = deserialize
         // (~1400x cheaper); miss or mismatch = fresh compile, same as before.
         // This is the boot-dominant compile path, so bypassing the cache here
         // forfeits the precompile win exactly where it matters (#587).

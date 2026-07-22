@@ -99,17 +99,19 @@ enum Commands {
         path: PathBuf,
     },
 
-    /// Precompile wasm components into `.cwasm` artifacts.
+    /// Precompile wasm components into a local `.cwasm` cache.
     ///
     /// Booting compiles every component from scratch (Cranelift), so a restart
-    /// loop is a sustained-CPU signature. Baking `.cwasm` into the deploy image
-    /// and pointing WW_CWASM_DIR at it lets boot `deserialize` instead —
-    /// ~1400× cheaper per component. Artifacts are named `<blake3(wasm)>.cwasm`
-    /// so the runtime finds them by the same key its compile cache uses.
+    /// loop is a sustained-CPU signature. Pointing `WW_CWASM_DIR` at a writable
+    /// local directory lets boot deserialize a compatible cached component
+    /// instead — ~1400× cheaper per component. Cache misses are compiled and
+    /// warmed automatically, so this command is optional. Artifacts are named
+    /// `<blake3(wasm)>.cwasm` below a Wasmtime compatibility directory.
     ///
     /// The engine config here is identical to the runtime's; an artifact that
     /// later fails to load (version/ISA skew) degrades to a fresh compile, not
-    /// a crash. Compile on the same platform family as the deploy target.
+    /// a crash. Native artifacts are therefore never shared across machines
+    /// with different architectures or engine configurations.
     ///
     /// Example:
     ///   ww compile std/kernel.wasm std/shell.wasm --out-dir dist/cwasm

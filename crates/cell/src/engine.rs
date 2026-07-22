@@ -1,13 +1,13 @@
 //! Single source of truth for the wasmtime engine configuration.
 //!
-//! Precompiled `.cwasm` artifacts (produced by `ww compile`, baked into the
-//! deploy image, and loaded via `Component::deserialize` at boot) are only
+//! Precompiled `.cwasm` artifacts (optionally produced by `ww compile` or
+//! warmed locally at boot, then loaded via `Component::deserialize`) are only
 //! loadable by an `Engine` built with the *identical* `Config` — engine
 //! settings, wasmtime version, and target ISA must all match, or
 //! deserialization fails. Historically this config was duplicated across
 //! `src/services.rs`, `crates/cell/src/proc.rs`, and `src/host.rs` with
 //! drift (some paths omitted `epoch_interruption`), which would silently
-//! invalidate baked artifacts. Everything now goes through
+//! invalidate cached artifacts. Everything now goes through
 //! [`wasm_engine_config`] so that drift is impossible by construction.
 
 use wasmtime::{Config, Engine};
@@ -17,8 +17,9 @@ use wasmtime::{Config, Engine};
 /// Every `Engine` that runs a guest — the ExecutorPool, per-cell `Proc`, the
 /// integration-test host — and every path that *produces* a `.cwasm`
 /// (`ww compile`) MUST build its engine from this. Keep it deterministic:
-/// no host-CPU-feature auto-detection knobs that would make an artifact
-/// compiled on one machine unloadable on another.
+/// precompiled artifacts are selected using this engine's compatibility
+/// fingerprint, so artifacts made by another architecture or configuration
+/// cannot be mistaken for a local cache hit.
 pub fn wasm_engine_config() -> Config {
     let mut config = Config::new();
     // Fuel: cooperative preemption for guests (Trap::OutOfFuel).
@@ -27,6 +28,7 @@ pub fn wasm_engine_config() -> Config {
     // reach every Store's epoch_deadline_callback. Enabled everywhere so a
     // .cwasm compiled here is loadable by the pool's engine.
     config.epoch_interruption(true);
+
     config
 }
 
@@ -42,10 +44,10 @@ mod tests {
     use super::*;
     use wasmtime::component::Component;
 
-    /// The load-bearing invariant for slice-1 precompilation: a component
+    /// The load-bearing invariant for local precompilation: a component
     /// serialized by an engine from `wasm_engine_config` deserializes cleanly
-    /// in a *fresh* engine from the same config. If this breaks, baked .cwasm
-    /// won't load at boot.
+    /// in a *fresh* engine from the same config. If this breaks, cached .cwasm
+    /// won't load from the local cache at boot.
     #[test]
     fn cwasm_round_trips_across_fresh_engines() {
         // Minimal valid component.

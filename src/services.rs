@@ -644,9 +644,9 @@ impl Service for CompilationService {
             > = HashMap::new();
 
             let worker_count = compile_worker_count();
-            // Baked `.cwasm` directory (shared, read-only). Resolved once so a
-            // mid-run env change can't split the pool. `None` on dev boxes
-            // where WW_CWASM_DIR is unset — every compile then hits Cranelift.
+            // Host-local writable `.cwasm` cache. Resolved once so a mid-run
+            // env change can't split the pool. `None` on dev boxes where
+            // WW_CWASM_DIR is unset — every compile then hits Cranelift.
             let cwasm_dir: Option<Arc<PathBuf>> = cell::cwasm::cache_dir().map(Arc::new);
             tracing::info!(
                 workers = worker_count,
@@ -683,8 +683,8 @@ impl Service for CompilationService {
                             };
 
                             let start = std::time::Instant::now();
-                            // Prefer a baked `.cwasm`; falls back to a fresh
-                            // Cranelift compile on any miss or mismatch.
+                            // Prefer a compatible cached `.cwasm`; falls back
+                            // to a fresh Cranelift compile on any miss or mismatch.
                             let result = cell::cwasm::load_or_compile(
                                 &job.engine,
                                 &job.bytecode,

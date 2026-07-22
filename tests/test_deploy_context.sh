@@ -27,14 +27,7 @@ grep -Fq 'cp ../std/status/etc/init.d/05-status.glia wetware/kernel/etc/init.d/'
 
 status_wasm_line="$(line_number 'cp wasm/std/status/bin/status.wasm wetware/kernel/bin/status.wasm')"
 status_init_line="$(line_number 'cp ../std/status/etc/init.d/05-status.glia wetware/kernel/etc/init.d/')"
-compile_line="$(line_number './ww compile')"
-
 [ -n "$status_wasm_line" ] || fail "deploy context is missing the status WASM copy"
 [ -n "$status_init_line" ] || fail "deploy context is missing the status init-script copy"
-[ -n "$compile_line" ] || fail "deploy context is missing its precompile step"
-[ "$status_wasm_line" -lt "$compile_line" ] \
-  || fail "status WASM must be staged before precompilation"
-[ "$status_init_line" -lt "$compile_line" ] \
-  || fail "status init script must be staged before precompilation"
 
 echo "PASS: deploy context packages the status route"
