@@ -205,11 +205,20 @@ jobs:
       with:
         key: build-test
 
-    - name: Build WASI example binaries
-      run: make -C examples/echo
+    - name: Build WASI test fixtures
+      run: |
+        make -C examples/echo
+        make shell
 
     - name: Run host workspace tests (hot cache from build job)
       run: cargo test --workspace
+
+    - name: Run standalone standard-library tests
+      run: |
+        cargo test --manifest-path std/caps/Cargo.toml
+        cargo test --manifest-path std/kernel/Cargo.toml
+        cargo test --manifest-path std/shell/Cargo.toml
+        cargo test --manifest-path std/mcp/Cargo.toml
 
   # === Master-only: fan out after checks pass ===
 

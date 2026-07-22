@@ -75,7 +75,12 @@ fn resolve_method_keys(
     schema: &[u8],
     allow: &BTreeSet<String>,
 ) -> Result<(u64, Vec<(String, u16)>), Val> {
-    let segments = [schema];
+    // Schemas are embedded as byte slices, whose link-time alignment is not
+    // guaranteed to meet Cap'n Proto's eight-byte segment requirement. Copy
+    // them into Cap'n Proto's aligned Word storage before creating a reader.
+    let mut words = capnp::Word::allocate_zeroed_vec(schema.len().div_ceil(8));
+    capnp::Word::words_to_bytes_mut(&mut words)[..schema.len()].copy_from_slice(schema);
+    let segments = [&capnp::Word::words_to_bytes(&words)[..schema.len()]];
     let segment_array = capnp::message::SegmentArray::new(&segments);
     let reader = capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
     let node: capnp::schema_capnp::node::Reader = reader
@@ -305,4 +310,21 @@ pub fn reify(
             descriptor,
         }),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_method_keys_accepts_unaligned_schema_bytes() {
+        let schema = schema_bytes_for_cap("host").expect("host schema");
+        let mut unaligned = vec![0_u8; schema.len() + 1];
+        unaligned[1..].copy_from_slice(schema);
+        let allow = BTreeSet::from(["id".to_string()]);
+
+        let (_, methods) = resolve_method_keys(&unaligned[1..], &allow)
+            .expect("an aligned copy must make schema parsing independent of source alignment");
+        assert_eq!(methods, vec![("id".to_string(), 0)]);
+    }
 }

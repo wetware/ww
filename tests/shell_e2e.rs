@@ -145,8 +145,16 @@ async fn spawn_shell_on_pool(pool: &ExecutorPool) -> Result<shell_capnp::shell::
     Ok(shell)
 }
 
-/// Helper: eval a Glia expression via the Shell RPC.
-async fn eval(shell: &shell_capnp::shell::Client, text: &str) -> (String, bool) {
+struct EvalResponse {
+    result: String,
+    is_error: bool,
+    output: String,
+    exit_requested: bool,
+}
+
+/// Evaluate a Glia expression via the Shell RPC, preserving all protocol
+/// fields rather than reducing the response to the legacy result/error pair.
+async fn eval_response(shell: &shell_capnp::shell::Client, text: &str) -> EvalResponse {
     let mut req = shell.eval_request();
     req.get().set_text(text);
     let resp = tokio::time::timeout(std::time::Duration::from_secs(15), req.send().promise)
@@ -154,14 +162,30 @@ async fn eval(shell: &shell_capnp::shell::Client, text: &str) -> (String, bool) 
         .expect("eval timed out")
         .expect("eval RPC failed");
     let result: shell_capnp::shell::eval_results::Reader<'_> = resp.get().unwrap();
-    let text = result
+    let result_text = result
         .get_result()
         .unwrap()
         .to_str()
         .unwrap_or("(invalid UTF-8)")
         .to_string();
-    let is_error = result.get_is_error();
-    (text, is_error)
+    let output = result
+        .get_output()
+        .unwrap()
+        .to_str()
+        .unwrap_or("(invalid UTF-8)")
+        .to_string();
+    EvalResponse {
+        result: result_text,
+        is_error: result.get_is_error(),
+        output,
+        exit_requested: result.get_exit_requested(),
+    }
+}
+
+/// Compatibility helper for ordinary result/error assertions.
+async fn eval(shell: &shell_capnp::shell::Client, text: &str) -> (String, bool) {
+    let response = eval_response(shell, text).await;
+    (response.result, response.is_error)
 }
 
 /// Wait for shell to be ready by polling with eval("nil").
@@ -274,9 +298,36 @@ async fn test_shell_eval_exit_sentinel() {
             let shell = spawn_shell_on_pool(&pool).await.expect("spawn shell");
             wait_ready(&shell).await;
 
-            let (result, is_error) = eval(&shell, "(perform :exit nil)").await;
-            assert!(!is_error, "exit effect should not be an error");
-            assert!(result.is_empty(), "exit result: {result}");
+            let response = eval_response(&shell, "(perform :exit nil)").await;
+            assert!(!response.is_error, "exit effect should not be an error");
+            assert!(
+                response.result.is_empty(),
+                "exit result: {}",
+                response.result
+            );
+            assert!(response.exit_requested, "exit must reach the RPC client");
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_shell_eval_stdout_is_returned_in_output_field() {
+    if !shell_wasm_exists() {
+        eprintln!("SKIP: shell WASM not built (run `make shell`)");
+        return;
+    }
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_shutdown_tx, shutdown_rx) = watch::channel(());
+            let pool = ExecutorPool::new(1, shutdown_rx);
+            let shell = spawn_shell_on_pool(&pool).await.expect("spawn shell");
+            wait_ready(&shell).await;
+
+            let response = eval_response(&shell, "(perform :stdout \"hello\")").await;
+            assert!(!response.is_error, "stdout effect should not be an error");
+            assert_eq!(response.output, "hello\n");
+            assert!(!response.exit_requested);
         })
         .await;
 }

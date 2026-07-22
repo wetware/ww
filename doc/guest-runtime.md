@@ -113,10 +113,10 @@ Glia's effect system bridges evaluation and Cap'n Proto RPC.
 - **`HandlerContext`** — one frame on the handler stack: a slot and a
   target.  Each `with-effect-handler` pushes one.
 
-- **`HostEffectHandler`** — an embedding-installed async handler value. It is
-  valid only in `with-effect-handler`; it is not an ordinary callable value and
-  `apply` rejects it. This preserves `perform` as the evaluator's sole route
-  into application-visible host work.
+- **`HostEffectHandler`** — an embedding-owned async callback installed as a
+  Rust handler frame. It is never a guest Glia value, so guest code cannot
+  install it, invoke it, or pass it to `apply`. This preserves `perform` as the
+  evaluator's sole route into application-visible host work.
 
 - **`HandlerStack`** — `Rc<RefCell<Vec<Rc<RefCell<HandlerContext>>>>>`.
   Dynamic scope, not lexical.  Walked newest-first by `perform`.
@@ -148,7 +148,7 @@ The same dispatch applies to standard environmental effects:
 `(perform :load path)`, `(perform :stdout value)`, and `(perform :exit nil)`.
 Their concrete handlers belong to the embedding. Kernel and terminal handlers
 load files, write terminal output, and end the process; the local shell returns
-an exit sentinel to its outer loop; MCP rejects stdout and exit so its JSON-RPC
+an embedding-only exit outcome to its outer loop; MCP rejects stdout and exit so its JSON-RPC
 transport remains valid. These are semantic routing choices, not capability
 authority checks: WASI sandbox/preopen policy and membrane configuration remain
 the enforcement mechanisms for non-Glia guests and RPC capabilities.

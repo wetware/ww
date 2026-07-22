@@ -1318,8 +1318,8 @@ fn wrap_with_handlers(form: &Val) -> Val {
 
 /// Scan `$WW_ROOT/etc/init.d/*.glia` via the WASI virtual filesystem,
 /// parse and evaluate each file as a glia script. Returns true if any
-/// expression blocked
-/// (i.e. a foreground process ran to completion via `(runtime run ...)`).
+/// expression blocks (i.e. a foreground process ran to completion via
+/// `(runtime run ...)`) or requests session exit with `(perform :exit nil)`.
 async fn run_initd(
     env: &mut Env,
     ctx: &RefCell<Session>,
@@ -2079,6 +2079,7 @@ mod tests {
             r.set_stream_dialer(capnp_rpc::new_client(TestStreamDialer));
             r.set_vat_listener(capnp_rpc::new_client(TestVatListener));
             r.set_vat_client(capnp_rpc::new_client(TestVatClient));
+            r.set_http_listener(capnp_rpc::new_client(TestHttpListener));
             Promise::ok(())
         }
     }
@@ -2224,6 +2225,28 @@ mod tests {
             }
             if !params.has_protocol() {
                 return Promise::err(capnp::Error::failed("protocol not set".into()));
+            }
+            Promise::ok(())
+        }
+    }
+
+    // --- Stub HttpListener: asserts executor and route prefix are present ---
+
+    struct TestHttpListener;
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::http_listener::Server for TestHttpListener {
+        fn listen(
+            self: capnp::capability::Rc<Self>,
+            params: system_capnp::http_listener::ListenParams,
+            _results: system_capnp::http_listener::ListenResults,
+        ) -> Promise<(), capnp::Error> {
+            let params = capnp_rpc::pry!(params.get());
+            if !params.has_executor() {
+                return Promise::err(capnp::Error::failed("executor not set".into()));
+            }
+            if params.get_prefix().is_err() {
+                return Promise::err(capnp::Error::failed("prefix not set".into()));
             }
             Promise::ok(())
         }
