@@ -518,28 +518,20 @@ jobs:
 
     - name: Verify deployment is serving
       run: |
-        # `rollout status` passing does not mean the daemon is reachable
-        # through the ingress. Probe until the DAEMON answers: any HTTP
-        # status except 502/503 means the request reached the wetware
-        # process. Context (2026-07-20 RCA): the deploy artifact currently
-        # ships only kernel/shell wasm with no etc/init.d route cells, so a
-        # HEALTHY daemon answers 404 on every route — 404 is a PASS here.
-        # Only the ingress itself answers 502/503 ("no available server"),
-        # which is exactly the six-week dark-deployment failure this probe
-        # exists to catch. If the artifact later ships a status cell,
-        # tighten this to expect 200 on its route.
+        # `rollout status` passing does not mean the daemon, its init.d
+        # route cells, and the ingress are all reachable. `/status` is
+        # provided by the mounted status cell, so a 200 proves the full path.
         for i in $(seq 1 12); do
           CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 \
-            https://master.wetware.run/ || echo 000)
+            https://master.wetware.run/status || echo 000)
           echo "probe $i: HTTP $CODE"
           case "$CODE" in
-            502|503|000) sleep 15 ;;
-            *) echo "daemon is serving (HTTP $CODE)"; exit 0 ;;
+            200) echo "status cell is serving"; exit 0 ;;
+            *) sleep 15 ;;
           esac
         done
-        echo "ERROR: master.wetware.run never answered from the wetware"
-        echo "daemon (ingress kept returning 502/503). The rollout reported"
-        echo "success but the site is not serving."
+        echo "ERROR: master.wetware.run/status never returned HTTP 200"
+        echo "The rollout reported success but the full serving path is unhealthy."
         exit 1
 
   publish:
