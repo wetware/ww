@@ -78,8 +78,9 @@ jobs:
     - name: Check IPFS release publish scripts
       run: |
         bash tests/test_ipfs_release_publish.sh
+        bash tests/test_deploy_context.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh
+          shellcheck scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_deploy_context.sh
         fi
 
   clippy:
@@ -398,11 +399,14 @@ jobs:
         # The daemon mounts both as separate root layers; the shell layer
         # provides bin/shell.wasm. Shell is a daemon built-in, not an
         # init.d-registered vat.
-        mkdir -p wetware/kernel/bin
+        mkdir -p wetware/kernel/bin wetware/kernel/etc/init.d
         mkdir -p wetware/shell/bin
 
-        # Kernel layer: bin/main.wasm is required at the merged root.
+        # Kernel layer: the pid0 entrypoint and its status route both live
+        # at the merged root. The init script registers /status at boot.
         cp wasm/std/kernel/bin/main.wasm wetware/kernel/bin/main.wasm
+        cp wasm/std/status/bin/status.wasm wetware/kernel/bin/status.wasm
+        cp ../std/status/etc/init.d/05-status.glia wetware/kernel/etc/init.d/
 
         # Shell layer: WASM.
         cp wasm/std/shell/bin/shell.wasm    wetware/shell/bin/shell.wasm
