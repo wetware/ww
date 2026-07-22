@@ -55,11 +55,15 @@ pub fn load_or_compile(
         let path = dir.join(artifact_name(wasm));
         match std::fs::read(&path) {
             Ok(bytes) => {
-                // SAFETY: `bytes` is our own artifact (produced by `ww compile`
-                // from a config-identical engine) named by the wasm hash — not
-                // attacker-controlled. `deserialize` validates the wasmtime
-                // header and the host's ISA features, returning `Err` on any
-                // mismatch, which we handle below by recompiling.
+                // SAFETY: `deserialize` executes native code from `bytes` and
+                // is UB-capable on *maliciously crafted* input (header/ISA
+                // validation rejects accidental corruption, not a crafted
+                // artifact). The load-bearing invariant is therefore that
+                // WW_CWASM_DIR is WRITE-TRUSTED: only `ww compile` (CI, baked
+                // read-only into the image) may produce files there. Anyone
+                // with write access to the dir gets native code execution.
+                // Deploys must keep it read-only; never point WW_CWASM_DIR at
+                // a guest-writable or shared-tmp location.
                 match unsafe { Component::deserialize(engine, &bytes) } {
                     Ok(component) => {
                         tracing::info!(?path, "loaded precompiled component");
@@ -106,6 +110,17 @@ mod tests {
     }
 
     #[test]
+    fn cache_dir_reflects_env() {
+        // No other test reads WW_CWASM_DIR via cache_dir() (they pass dirs
+        // explicitly), so mutating the process env here doesn't race them.
+        std::env::remove_var(CWASM_DIR_ENV);
+        assert_eq!(cache_dir(), None);
+        std::env::set_var(CWASM_DIR_ENV, "/cwasm");
+        assert_eq!(cache_dir().as_deref(), Some(std::path::Path::new("/cwasm")));
+        std::env::remove_var(CWASM_DIR_ENV);
+    }
+
+    #[test]
     fn artifact_name_is_stable_and_wasm_keyed() {
         let a = sample_wasm();
         assert_eq!(artifact_name(&a), artifact_name(&a));
@@ -143,6 +158,24 @@ mod tests {
         // Non-existent dir → fallback compile, no error.
         let missing = std::env::temp_dir().join("ww-cwasm-does-not-exist-xyz");
         let _c = load_or_compile(&engine, &wasm, Some(&missing)).expect("fallback compile");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_artifact_falls_back_to_compile() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ww-cwasm-noperm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wasm = sample_wasm();
+        let path = dir.join(artifact_name(&wasm));
+        std::fs::write(&path, b"whatever").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let engine = wasm_engine().expect("engine");
+        // Read fails with EACCES (not NotFound) — must degrade to compile.
+        let _c = load_or_compile(&engine, &wasm, Some(&dir)).expect("fallback on unreadable");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
