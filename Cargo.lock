@@ -1335,8 +1335,7 @@ dependencies = [
 [[package]]
 name = "capnp-rpc"
 version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3c74c337e87f75f3174ffb3513738ab0acc631c04f64cc33b867c60f84771da"
+source = "git+https://github.com/wetware/capnproto-rust?branch=ww%2Fimport-fix-0.25-consume#c6eecf42da63296e5bf628251935cf5af09d80be"
 dependencies = [
  "capnp",
  "capnp-futures",
@@ -2077,7 +2076,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
