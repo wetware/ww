@@ -216,11 +216,16 @@ enum Commands {
         #[arg(long, default_value = "shared", env = "WW_RUNTIME_CACHE_POLICY")]
         runtime_cache_policy: String,
 
-        /// Enable the HTTP admin endpoint on the given address.
-        /// Serves GET /metrics, GET /host/id, GET /host/addrs.
-        /// Example: --with-http-admin 127.0.0.1:2026
-        #[arg(long, value_name = "ADDR")]
-        with_http_admin: Option<String>,
+        /// Local HTTP admin endpoint. Serves GET /healthz, GET /metrics,
+        /// GET /host/id, and GET /host/addrs. Defaults to localhost only;
+        /// pass `--with-http-admin off` to disable it.
+        #[arg(
+            long,
+            value_name = "ADDR",
+            default_value = "127.0.0.1:2026",
+            env = "WW_HTTP_ADMIN"
+        )]
+        with_http_admin: String,
 
         /// IPFS HTTP API endpoint
         #[arg(long, default_value = "http://localhost:5001", env = "IPFS_API")]
@@ -683,7 +688,7 @@ impl Commands {
                     http_listen,
                     http_dial,
                     runtime_cache_policy,
-                    with_http_admin,
+                    (with_http_admin != "off").then_some(with_http_admin),
                     ipfs_url,
                 )
                 .await
@@ -2806,7 +2811,7 @@ mod tests {
             http_listen: None,
             http_dial: Vec::new(),
             runtime_cache_policy: "shared".to_string(),
-            with_http_admin: None,
+            with_http_admin: "off".to_string(),
             ipfs_url: "http://localhost:5001".to_string(),
         };
 

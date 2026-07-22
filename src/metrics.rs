@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
-use axum::{extract::State, response::IntoResponse, routing::get, Router};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use tokio::sync::watch;
 
 // ---------------------------------------------------------------------------
@@ -294,6 +294,11 @@ async fn metrics_handler(State(state): State<AdminState>) -> impl IntoResponse {
     )
 }
 
+/// `GET /healthz` — confirms that the localhost control plane is serving.
+async fn healthz_handler() -> impl IntoResponse {
+    (StatusCode::OK, "ok\n")
+}
+
 // ---------------------------------------------------------------------------
 // Host introspection handlers
 // ---------------------------------------------------------------------------
@@ -378,6 +383,7 @@ impl crate::services::Service for AdminService {
             };
 
             let app = Router::new()
+                .route("/healthz", get(healthz_handler))
                 .route("/metrics", get(metrics_handler))
                 .route("/host/id", get(host_id_handler))
                 .route("/host/addrs", get(host_addrs_handler))
