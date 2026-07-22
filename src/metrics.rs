@@ -1,6 +1,6 @@
 //! Admin HTTP server for node introspection.
 //!
-//! Serves Prometheus metrics at `GET /metrics` and host identity/address/NAT
+//! Serves a health check at `GET /healthz`, Prometheus metrics at `GET /metrics`, and host identity/address/NAT
 //! information at `GET /host/id`, `GET /host/addrs`, and `GET /host/nat`.
 //!
 //! Fuel metrics (`ww_cell_fuel_remaining`, `ww_cell_fuel_consumed_total`)
@@ -8,7 +8,6 @@
 //! metrics.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
@@ -356,7 +355,9 @@ async fn host_nat_handler(State(state): State<AdminState>) -> impl IntoResponse 
 /// A [`crate::services::Service`] that serves admin HTTP endpoints:
 /// Prometheus metrics, host identity, and listen addresses.
 pub struct AdminService {
-    pub listen_addr: SocketAddr,
+    /// Already-bound listener. Binding occurs during host startup so a
+    /// configured control-plane endpoint is guaranteed to be available.
+    pub listener: std::net::TcpListener,
     pub peer_id: String,
     pub network_state: rpc::NetworkState,
     pub fuel_registry: FuelRegistry,
@@ -390,7 +391,7 @@ impl crate::services::Service for AdminService {
                 .route("/host/nat", get(host_nat_handler))
                 .with_state(state);
 
-            let listener = tokio::net::TcpListener::bind(self.listen_addr).await?;
+            let listener = tokio::net::TcpListener::from_std(self.listener)?;
             let local_addr = listener.local_addr()?;
             tracing::info!(%local_addr, "Admin server listening");
 
@@ -423,6 +424,16 @@ mod tests {
             cache_metrics: new_cache_metrics(),
             stream_metrics: new_stream_metrics(),
         }
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_probe_contract() {
+        let response = healthz_handler().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("healthz response body");
+        assert_eq!(&body[..], b"ok\n");
     }
 
     #[test]

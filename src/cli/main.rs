@@ -1623,8 +1623,9 @@ wasip2::cli::command::export!({iface_name}Guest);
             None
         };
 
-        // HTTP admin thread (only when --with-http-admin is provided).
-        // Serves metrics at GET /metrics, host info at GET /host/id and /host/addrs.
+        // Bind the control-plane listener before spawning its service. This
+        // makes an unavailable admin port a startup error rather than a
+        // silently failed background thread.
         let fuel_registry = ww::metrics::new_fuel_registry();
         let rpc_metrics = ww::metrics::new_rpc_metrics();
         let cache_metrics = ww::metrics::new_cache_metrics();
@@ -1633,6 +1634,11 @@ wasip2::cli::command::export!({iface_name}Guest);
             let listen_addr: std::net::SocketAddr = addr
                 .parse()
                 .context("invalid --with-http-admin address (expected host:port)")?;
+            let listener = std::net::TcpListener::bind(listen_addr)
+                .with_context(|| format!("failed to bind --with-http-admin at {listen_addr}"))?;
+            listener
+                .set_nonblocking(true)
+                .context("failed to configure --with-http-admin listener")?;
             let snapshot = network_state.snapshot().await;
             let peer_id = libp2p::PeerId::from_bytes(&snapshot.local_peer_id)
                 .context("invalid peer ID in network state")?
@@ -1640,7 +1646,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             supervisor.try_spawn(
                 "admin",
                 ww::metrics::AdminService {
-                    listen_addr,
+                    listener,
                     peer_id,
                     network_state: network_state.clone(),
                     fuel_registry: fuel_registry.clone(),
