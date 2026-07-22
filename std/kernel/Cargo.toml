@@ -30,3 +30,12 @@ crate-type = ["cdylib"]
 [build-dependencies]
 capnpc = "0.25.3"
 schema-id = { path = "../../crates/schema-id" }
+
+# capnp-rpc 0.25.1 + import-wrapper-reuse fix (wetware/ww#586): re-importing an
+# already-held capability created a duplicate wrapper Client whose later drop
+# poisoned the RPC downcast map, panicking the kernel's event loop on the next
+# send of that cap (status-cell route registration). Drop this patch once the
+# fix is released upstream (PR pending on capnproto/capnproto-rust; the ww/ branch adds crates.io
+# dep resolution so the git patch does not drag in a second capnp).
+[patch.crates-io]
+capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", branch = "ww/import-fix-0.25-consume" }
