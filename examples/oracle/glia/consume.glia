@@ -1,2 +1,2 @@
 ; Demo snippet: discover providers and query prices.
-(perform runtime :run (load "bin/oracle.wasm") "consume")
+(perform runtime :run (perform :load "bin/oracle.wasm") "consume")

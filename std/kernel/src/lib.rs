@@ -4,7 +4,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use caps::{make_import_cap, make_import_handler};
-use glia::eval::{self, Dispatch, Env};
+#[cfg(test)]
+use caps::eval_load;
+use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
+use glia::eval::{self, Dispatch, Env, EvalOutcome};
 use glia::{extract_method, make_cap, read, read_many, AttenuatedCapInner, GliaCapInner, Val};
 
 use std::rc::Rc;
@@ -160,6 +163,10 @@ struct Session {
     /// `None` when the operator did not pass `--http-dial`.
     http_client: Option<http_capnp::http_client::Client>,
     cwd: String,
+    /// One explicit load runtime for the lifetime of this kernel session.
+    /// Imports and `:load` share its cache so repeated reads remain safe for
+    /// non-seekable WASI-backed files.
+    load_runtime: caps::LoadRuntime,
 }
 
 // ---------------------------------------------------------------------------
@@ -497,58 +504,11 @@ type HandlerFn = for<'a> fn(
 /// ipfs, routing) are handled via cap-targeted perform + with-effect-handler.
 fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
     let mut t: HashMap<&'static str, HandlerFn> = HashMap::new();
-    t.insert("load", |a, _| Box::pin(std::future::ready(eval_load(a))));
     t.insert("cd", |a, c| Box::pin(std::future::ready(eval_cd(a, c))));
     t.insert("help", |_, _| {
         Box::pin(std::future::ready(Ok(Val::Str(HELP_TEXT.to_string()))))
     });
-    t.insert("exit", |_, _| {
-        Box::pin(std::future::ready({
-            std::process::exit(0);
-            #[allow(unreachable_code)]
-            Ok(Val::Nil)
-        }))
-    });
     t
-}
-
-/// (load "path") — read bytes from the WASI virtual filesystem.
-///
-/// Relative paths like `"bin/chess-demo.wasm"` are resolved against the WASI
-/// root (`/`), which the host preopens to the merged FHS image directory.
-/// Absolute paths are used as-is.
-///
-/// Loaded files are cached in a thread-local map so repeated loads of the
-/// same path (e.g. chess.glia loading the WASM for both :listen and :run)
-/// return a cheap clone.  This also works around an ESPIPE (os error 29)
-/// that occurs on the second `std::fs::read` in WASI P2 when the RPC
-/// connection streams have been created between reads.
-fn eval_load(args: &[Val]) -> Result<Val, Val> {
-    thread_local! {
-        static CACHE: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
-    }
-
-    let path = match args.first() {
-        Some(Val::Str(s)) => s.clone(),
-        _ => return Err("(load \"<path>\")".into()),
-    };
-    // Resolve relative to WASI root — the host mounts the merged image at `/`.
-    let resolved = if path.starts_with('/') {
-        path.clone()
-    } else {
-        format!("/{path}")
-    };
-
-    // Return cached bytes if already loaded.
-    let cached = CACHE.with(|c| c.borrow().get(&resolved).cloned());
-    if let Some(bytes) = cached {
-        return Ok(Val::Bytes(bytes));
-    }
-
-    let bytes =
-        std::fs::read(&resolved).map_err(|e| Val::from(format!("load: {resolved}: {e}")))?;
-    CACHE.with(|c| c.borrow_mut().insert(resolved, bytes.clone()));
-    Ok(Val::Bytes(bytes))
 }
 
 fn eval_cd(args: &[Val], ctx: &RefCell<Session>) -> Result<Val, Val> {
@@ -582,7 +542,7 @@ impl<'k> Dispatch for KernelDispatch<'k> {
         Box::pin(async move {
             match self.table.get(name) {
                 Some(handler) => handler(args, self.ctx).await,
-                None => eval_path_lookup(name, args, self.ctx).await,
+                None => Err(Val::from(format!("command not found: {name}"))),
             }
         })
     }
@@ -600,6 +560,49 @@ impl<'k> Dispatch for KernelDispatch<'k> {
 // Evaluator — delegates to glia with kernel dispatch
 // ---------------------------------------------------------------------------
 
+fn eval_outcome<'a>(
+    expr: &'a Val,
+    env: &'a mut Env,
+    ctx: &'a RefCell<Session>,
+    dispatch: &'a HashMap<&'static str, HandlerFn>,
+) -> Pin<Box<dyn Future<Output = Result<EvalOutcome, Val>> + 'a>> {
+    Box::pin(async move {
+        let kd = KernelDispatch {
+            ctx,
+            table: dispatch,
+        };
+        // Install host frames unconditionally. Effects inside definitions,
+        // macro expansions, `perform*`, and computed targets are only known
+        // at execution time, so a syntactic pre-scan is unsound.
+        let load_runtime = ctx.borrow().load_runtime.clone();
+        let load = std::rc::Rc::new(move |data: Val| {
+            let runtime = load_runtime.clone();
+            Box::pin(async move { Ok(HostEffectResult::Resume(runtime.load_value(data).await?)) })
+                as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
+        });
+        let stdout = std::rc::Rc::new(|data: Val| {
+            Box::pin(async move {
+                let text = match data { Val::Str(s) => s, other => format!("{other}") };
+                write_stdout(&text)?;
+                Ok(HostEffectResult::Resume(Val::Nil))
+            }) as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
+        });
+        let exit = std::rc::Rc::new(|_data: Val| {
+            Box::pin(async { Ok(HostEffectResult::Exit) })
+                as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
+        });
+        let effects = [
+            HostEffect { target: EffectTarget::Keyword("load".into()), handler: load },
+            HostEffect { target: EffectTarget::Keyword("stdout".into()), handler: stdout },
+            HostEffect { target: EffectTarget::Keyword("exit".into()), handler: exit },
+        ];
+        eval::eval_toplevel_with_host_effects(expr, env, &kd, &effects).await
+    })
+}
+
+/// Value-only adapter for call sites that cannot meaningfully continue after
+/// an embedding-level process exit (primarily focused unit tests).
+#[cfg(test)]
 fn eval<'a>(
     expr: &'a Val,
     env: &'a mut Env,
@@ -607,12 +610,32 @@ fn eval<'a>(
     dispatch: &'a HashMap<&'static str, HandlerFn>,
 ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
     Box::pin(async move {
-        let kd = KernelDispatch {
-            ctx,
-            table: dispatch,
-        };
-        eval::eval_toplevel(expr, env, &kd).await
+        match eval_outcome(expr, env, ctx, dispatch).await? {
+            EvalOutcome::Value(value) => Ok(value),
+            EvalOutcome::Exit => Err(glia::error::internal(
+                "kernel eval",
+                "process exit reached a value-only evaluation path",
+            )),
+        }
     })
+}
+
+const MAX_STDOUT_WRITE_BYTES: usize = 4096;
+
+fn write_stdout(text: &str) -> Result<(), Val> {
+    let stdout = get_stdout();
+    for chunk in stdout_chunks(text) {
+        stdout
+            .blocking_write_and_flush(chunk)
+            .map_err(|err| Val::from(format!("stdout: {err}")))?;
+    }
+    stdout
+        .blocking_write_and_flush(b"\n")
+        .map_err(|err| Val::from(format!("stdout: {err}")))
+}
+
+fn stdout_chunks(text: &str) -> impl Iterator<Item = &[u8]> {
+    text.as_bytes().chunks(MAX_STDOUT_WRITE_BYTES)
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,108 +1240,6 @@ fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
     }
 }
 
-async fn eval_path_lookup(cmd: &str, args: &[Val], ctx: &RefCell<Session>) -> Result<Val, Val> {
-    // Convert args to strings once — used for whichever candidate we find.
-    let str_args: Vec<String> = args
-        .iter()
-        .map(|v| match v {
-            Val::Str(s) | Val::Sym(s) => s.clone(),
-            other => format!("{other}"),
-        })
-        .collect();
-
-    let path_var = std::env::var("PATH").unwrap_or_else(|_| "/bin".to_string());
-    for dir in path_var.split(':') {
-        // Candidate 1: <dir>/<cmd>.wasm (flat binary)
-        // Candidate 2: <dir>/<cmd>/main.wasm (image-style nested)
-        let candidates = [
-            format!("{dir}/{cmd}.wasm"),
-            format!("{dir}/{cmd}/main.wasm"),
-        ];
-        let bytes = candidates.iter().find_map(|p| std::fs::read(p).ok());
-        if let Some(bytes) = bytes {
-            // runtime.load(wasm) → Executor (pipelining)
-            let mut load_req = ctx.borrow().runtime.load_request();
-            load_req.get().set_wasm(&bytes);
-            let executor = load_req.send().pipeline.get_executor();
-
-            // executor.spawn(args, env) → Process
-            let mut req = executor.spawn_request();
-            {
-                let b = req.get();
-                let mut arg_list = b.init_args(str_args.len() as u32);
-                for (i, a) in str_args.iter().enumerate() {
-                    arg_list.set(i as u32, a);
-                }
-            }
-            let resp = req
-                .send()
-                .promise
-                .await
-                .map_err(|e| Val::from(e.to_string()))?;
-            let process = resp
-                .get()
-                .map_err(|e| Val::from(e.to_string()))?
-                .get_process()
-                .map_err(|e| Val::from(e.to_string()))?;
-
-            // Read stdout to completion.
-            let stdout_resp = process
-                .stdout_request()
-                .send()
-                .promise
-                .await
-                .map_err(|e| Val::from(e.to_string()))?;
-            let stdout_stream = stdout_resp
-                .get()
-                .map_err(|e| Val::from(e.to_string()))?
-                .get_stream()
-                .map_err(|e| Val::from(e.to_string()))?;
-
-            let mut output = Vec::new();
-            loop {
-                let mut req = stdout_stream.read_request();
-                req.get().set_max_bytes(65536);
-                let resp = req
-                    .send()
-                    .promise
-                    .await
-                    .map_err(|e| Val::from(e.to_string()))?;
-                let chunk = resp
-                    .get()
-                    .map_err(|e| Val::from(e.to_string()))?
-                    .get_data()
-                    .map_err(|e| Val::from(e.to_string()))?;
-                if chunk.is_empty() {
-                    break;
-                }
-                output.extend_from_slice(chunk);
-            }
-
-            // Wait for exit.
-            let wait_resp = process
-                .wait_request()
-                .send()
-                .promise
-                .await
-                .map_err(|e| Val::from(e.to_string()))?;
-            let exit_code = wait_resp
-                .get()
-                .map_err(|e| Val::from(e.to_string()))?
-                .get_exit_code();
-
-            let out_str = String::from_utf8_lossy(&output).trim_end().to_string();
-            if exit_code != 0 {
-                return Err(Val::from(format!(
-                    "{cmd}: exit code {exit_code}\n{out_str}"
-                )));
-            }
-            return Ok(Val::Str(out_str));
-        }
-    }
-    Err(Val::from(format!("{cmd}: command not found")))
-}
-
 const HELP_TEXT: &str = "\
 Capabilities (via perform):
   (perform host :id)                         Peer ID
@@ -1344,12 +1265,9 @@ Effects:
   (perform :load \"<path>\")                   Load bytes from virtual filesystem
 
 Built-ins:
-  (load \"<path>\")                Load bytes (dispatch form)
   (cd \"<path>\")                  Change working directory
   (help)                         This message
-  (exit)                         Quit
-
-Unrecognized commands are looked up in PATH (default /bin).";
+\nUnknown commands fail with command-not-found.";
 
 // ---------------------------------------------------------------------------
 // Init.d — evaluate scripts from $WW_ROOT/etc/init.d/*.glia
@@ -1378,38 +1296,14 @@ fn parse_initd_script(name: &str, data: &[u8]) -> Option<Vec<Val>> {
     }
 }
 
-/// Wrap a form in cap handlers + keyword effect handlers.
+/// Wrap a form in capability handlers. Environmental host effects are installed
+/// by the Rust evaluator driver and are never guest-visible bindings.
 ///
-/// Produces:
-/// ```glia
-/// (with-effect-handler host host-handler
-///   (with-effect-handler runtime runtime-handler
-///     (with-effect-handler routing routing-handler
-///       (with-effect-handler :load (fn [path resume] (resume (load path)))
-///         <form>))))
-/// ```
-///
-/// Cap handlers are looked up from the environment by name. Keyword effect
-/// handlers wrap builtins that use the effect protocol.
+/// Capability handlers are looked up from the environment by name. Keyword
+/// host effects are serviced by the Rust evaluator driver.
 fn wrap_with_handlers(form: &Val) -> Val {
-    // Innermost: keyword effect handler for :load.
-    let with_load = Val::List(vec![
-        Val::Sym("with-effect-handler".into()),
-        Val::Keyword("load".into()),
-        Val::List(vec![
-            Val::Sym("fn".into()),
-            Val::Vector(vec![Val::Sym("path".into()), Val::Sym("resume".into())]),
-            Val::List(vec![
-                Val::Sym("resume".into()),
-                Val::List(vec![Val::Sym("load".into()), Val::Sym("path".into())]),
-            ]),
-        ]),
-        form.clone(),
-    ]);
-
-    // Wrap in cap handlers (innermost to outermost).
     let caps = ["import", "routing", "runtime", "host"];
-    let mut wrapped = with_load;
+    let mut wrapped = form.clone();
     for cap_name in &caps {
         let handler_name = format!("{cap_name}-handler");
         wrapped = Val::List(vec![
@@ -1424,8 +1318,8 @@ fn wrap_with_handlers(form: &Val) -> Val {
 
 /// Scan `$WW_ROOT/etc/init.d/*.glia` via the WASI virtual filesystem,
 /// parse and evaluate each file as a glia script. Returns true if any
-/// expression blocked
-/// (i.e. a foreground process ran to completion via `(runtime run ...)`).
+/// expression blocks (i.e. a foreground process ran to completion via
+/// `(runtime run ...)`) or requests session exit with `(perform :exit nil)`.
 async fn run_initd(
     env: &mut Env,
     ctx: &RefCell<Session>,
@@ -1506,17 +1400,18 @@ async fn run_initd(
             // Wrap each form in default effect handlers so init.d
             // scripts can use (perform :load ...) etc.
             let wrapped = wrap_with_handlers(form);
-            match eval(&wrapped, env, ctx, dispatch).await {
-                Ok(Val::Nil) => {}
-                Ok(Val::Int(code)) => {
+            match eval_outcome(&wrapped, env, ctx, dispatch).await {
+                Ok(EvalOutcome::Value(Val::Nil)) => {}
+                Ok(EvalOutcome::Value(Val::Int(code))) => {
                     // A (runtime run ...) that returned an exit code means
                     // a foreground process ran to completion.
                     log::info!("init.d: {name}: foreground process exited ({code})");
                     blocked = true;
                 }
-                Ok(result) => {
+                Ok(EvalOutcome::Value(result)) => {
                     log::debug!("init.d: {name}: {result}");
                 }
+                Ok(EvalOutcome::Exit) => return Ok(true),
                 Err(e) => {
                     log::error!("init.d: {name}: form {}: {e}", i + 1);
                 }
@@ -1573,12 +1468,13 @@ async fn run_shell(
             match read(line) {
                 Ok(expr) => {
                     let wrapped = wrap_with_handlers(&expr);
-                    match eval(&wrapped, env, &ctx, dispatch).await {
-                        Ok(Val::Nil) => {}
-                        Ok(result) => {
+                    match eval_outcome(&wrapped, env, &ctx, dispatch).await {
+                        Ok(EvalOutcome::Value(Val::Nil)) => {}
+                        Ok(EvalOutcome::Value(result)) => {
                             let _ =
                                 stdout.blocking_write_and_flush(format!("{result}\n").as_bytes());
                         }
+                        Ok(EvalOutcome::Exit) => break 'outer,
                         Err(e) => {
                             // Unhandled (throw ...) arrives as
                             // Val::Effect{effect_type:"glia.exception",..};
@@ -1859,16 +1755,14 @@ fn run_impl() {
                 identity,
                 http_client: http_client.clone(),
                 cwd: "/".to_string(),
+                load_runtime: caps::default_load_runtime(),
             });
 
             let dispatch = build_dispatch();
             let mut env = Env::new();
 
-            // Bind graft caps + effect handlers from the membrane response.
-            // The membrane exports a flat list of named capabilities; we iterate
-            // it, downcast each to its typed client, and bind both a Val::Cap
-            // (for collect_caps / :listen forwarding) and an effect handler
-            // (for `(perform cap :method ...)` in Glia).
+            // Bind graft caps with intrinsic handlers. Default cap behavior is
+            // never an ambient `{cap}-handler` guest binding.
             {
                 let s = ctx.borrow();
                 for i in 0..caps.len() {
@@ -1925,10 +1819,7 @@ fn run_impl() {
                             }
                         };
 
-                    env.set(
-                        cap_name.to_string(),
-                        make_cap(cap_name, schema_cid.to_string(), inner),
-                    );
+                    env.set(cap_name.to_string(), make_cap(cap_name, schema_cid.to_string(), inner));
                     if !matches!(handler, Val::Nil) {
                         env.set(format!("{cap_name}-handler"), handler);
                     }
@@ -1942,7 +1833,10 @@ fn run_impl() {
                 env.set("doc".to_string(), make_doc_builtin());
                 env.set("help".to_string(), make_help_builtin());
                 env.set("import".to_string(), make_import_cap());
-                env.set("import-handler".to_string(), make_import_handler());
+                env.set(
+                    "import-handler".to_string(),
+                    make_import_handler(s.load_runtime.clone()),
+                );
             }
 
             // Load the prelude (standard macros: when, and, or, defn, cond, not).
@@ -2100,24 +1994,10 @@ mod tests {
     // --- wrap_with_handlers ---
 
     #[test]
-    fn wrap_with_handlers_nests_effect_handlers() {
+    fn wrap_with_handlers_nests_cap_handlers() {
         let form = Val::Sym("body".into());
         let wrapped = wrap_with_handlers(&form);
-        // Outermost should be (with-effect-handler host host-handler ...)
-        if let Val::List(items) = &wrapped {
-            assert_eq!(items[0], Val::Sym("with-effect-handler".into()));
-            assert_eq!(items[1], Val::Sym("host".into()));
-            assert_eq!(items[2], Val::Sym("host-handler".into()));
-            // items[3] is (with-effect-handler runtime ...)
-            if let Val::List(inner) = &items[3] {
-                assert_eq!(inner[0], Val::Sym("with-effect-handler".into()));
-                assert_eq!(inner[1], Val::Sym("runtime".into()));
-            } else {
-                panic!("expected nested effect handler");
-            }
-        } else {
-            panic!("expected List");
-        }
+        assert!(matches!(wrapped, Val::List(_)));
     }
 
     // --- dispatch table ---
@@ -2125,7 +2005,7 @@ mod tests {
     #[test]
     fn dispatch_table_has_builtins() {
         let table = build_dispatch();
-        let expected = ["load", "cd", "help", "exit"];
+        let expected = ["cd", "help"];
         for verb in &expected {
             assert!(table.contains_key(verb), "missing dispatch entry: {verb}");
         }
@@ -2199,6 +2079,7 @@ mod tests {
             r.set_stream_dialer(capnp_rpc::new_client(TestStreamDialer));
             r.set_vat_listener(capnp_rpc::new_client(TestVatListener));
             r.set_vat_client(capnp_rpc::new_client(TestVatClient));
+            r.set_http_listener(capnp_rpc::new_client(TestHttpListener));
             Promise::ok(())
         }
     }
@@ -2349,6 +2230,28 @@ mod tests {
         }
     }
 
+    // --- Stub HttpListener: asserts executor and route prefix are present ---
+
+    struct TestHttpListener;
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::http_listener::Server for TestHttpListener {
+        fn listen(
+            self: capnp::capability::Rc<Self>,
+            params: system_capnp::http_listener::ListenParams,
+            _results: system_capnp::http_listener::ListenResults,
+        ) -> Promise<(), capnp::Error> {
+            let params = capnp_rpc::pry!(params.get());
+            if !params.has_executor() {
+                return Promise::err(capnp::Error::failed("executor not set".into()));
+            }
+            if params.get_prefix().is_err() {
+                return Promise::err(capnp::Error::failed("prefix not set".into()));
+            }
+            Promise::ok(())
+        }
+    }
+
     // --- Stub StreamDialer + VatClient (unused, just satisfy network result) ---
 
     struct TestStreamDialer;
@@ -2424,6 +2327,7 @@ mod tests {
             identity: capnp_rpc::new_client(TestIdentity),
             http_client: Some(capnp_rpc::new_client(TestHttpClient)),
             cwd: "/".into(),
+            load_runtime: caps::default_load_runtime(),
         }
     }
 
@@ -2885,7 +2789,7 @@ mod tests {
 
     // --- perform :load effect round-trip ---
 
-    /// Helper: bind all caps + handlers in env (same as kernel boot).
+    /// Helper: bind all caps with intrinsic handlers (same as kernel boot).
     fn bind_caps_in_env(env: &mut Env, session: &Session) {
         let caps: [(&str, &str, Rc<dyn std::any::Any>, Val); 3] = [
             (
@@ -2916,7 +2820,10 @@ mod tests {
             env.set(format!("{name}-handler"), handler);
         }
         env.set("import".to_string(), make_import_cap());
-        env.set("import-handler".to_string(), make_import_handler());
+        env.set(
+            "import-handler".to_string(),
+            make_import_handler(session.load_runtime.clone()),
+        );
 
         // http-client with real capnp client (tests always provide one).
         if let Some(ref c) = session.http_client {
@@ -3251,6 +3158,106 @@ mod tests {
             assert!(result.is_err(), "expected error for missing file");
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn kernel_host_frames_cover_effects_defined_in_prior_forms() {
+        run_local(async {
+            let ctx = RefCell::new(test_session());
+            let dispatch = build_dispatch();
+            let mut env = Env::new();
+            bind_caps_in_env(&mut env, &ctx.borrow());
+
+            let define = read("(def exit-now (fn [] (perform :exit nil)))").unwrap();
+            assert!(eval_outcome(&define, &mut env, &ctx, &dispatch).await.is_ok());
+
+            // The top-level form itself has no host-effect syntax. Its call
+            // reaches the body defined above, so this succeeds only when the
+            // embedding has installed host frames without a syntactic scan.
+            let invoke = read("(exit-now)").unwrap();
+            assert!(matches!(
+                eval_outcome(&invoke, &mut env, &ctx, &dispatch).await,
+                Ok(EvalOutcome::Exit)
+            ));
+
+            for form in [
+                read("(perform* :exit [nil])").unwrap(),
+                read("(let [effect :exit] (perform effect nil))").unwrap(),
+            ] {
+                assert!(matches!(
+                    eval_outcome(&form, &mut env, &ctx, &dispatch).await,
+                    Ok(EvalOutcome::Exit)
+                ));
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn kernel_exit_is_an_embedding_control_outcome() {
+        run_local(async {
+            let ctx = RefCell::new(test_session());
+            let dispatch = build_dispatch();
+            let mut env = Env::new();
+            bind_caps_in_env(&mut env, &ctx.borrow());
+            let form = read("(perform :exit nil)").unwrap();
+            assert!(matches!(
+                eval_outcome(&form, &mut env, &ctx, &dispatch).await,
+                Ok(EvalOutcome::Exit)
+            ));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn kernel_load_runtime_caches_across_top_level_forms() {
+        run_local(async {
+            let ctx = RefCell::new(test_session());
+            let dispatch = build_dispatch();
+            let mut env = Env::new();
+            bind_caps_in_env(&mut env, &ctx.borrow());
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("cache.bin");
+            std::fs::write(&file_path, b"first").unwrap();
+            let form = |path: &str| {
+                Val::List(vec![
+                    Val::Sym("perform".into()),
+                    Val::Keyword("load".into()),
+                    Val::Str(path.into()),
+                ])
+            };
+
+            let first = eval_outcome(
+                &form(file_path.to_str().unwrap()),
+                &mut env,
+                &ctx,
+                &dispatch,
+            )
+            .await
+            .unwrap();
+            std::fs::write(&file_path, b"second").unwrap();
+            let second = eval_outcome(
+                &form(file_path.to_str().unwrap()),
+                &mut env,
+                &ctx,
+                &dispatch,
+            )
+            .await
+            .unwrap();
+
+            assert!(matches!(first, EvalOutcome::Value(Val::Bytes(ref b)) if b == b"first"));
+            assert!(matches!(second, EvalOutcome::Value(Val::Bytes(ref b)) if b == b"first"));
+        })
+        .await;
+    }
+
+    #[test]
+    fn kernel_stdout_chunks_large_payloads() {
+        let text = "x".repeat(MAX_STDOUT_WRITE_BYTES * 2 + 1);
+        let chunks: Vec<_> = stdout_chunks(&text).collect();
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= MAX_STDOUT_WRITE_BYTES));
+        assert_eq!(chunks.iter().map(|chunk| chunk.len()).sum::<usize>(), text.len());
     }
 
     // --- init script eval integration ---

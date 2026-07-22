@@ -120,14 +120,16 @@ membrane. Content access flows through the WASI virtual filesystem,
 which the host backs with `CidTree`.
 
 Use regular guest file I/O against filesystem paths:
-- `(load "path")` for bytes in Glia
+- `(perform :load "path")` for bytes in Glia
 - `(perform import "module")` for module loading
 - direct guest reads via WASI-aware code under `/ipfs/<cid>/...` and
   `/ipns/<name>/...`
 
-There is no `perform fs` read surface. Keeping a separate `perform`
-filesystem API created dual-path semantics; reads now go only through
-WASI path I/O.
+There is no `perform fs` capability. `:load` is a named Glia effect whose
+embedding handler performs the read; it makes the language-level host boundary
+explicit without becoming an authority grant. The WASI virtual filesystem and
+its reachable CID tree still govern guest path I/O, while the membrane governs
+RPC capability authority.
 
 ### Content mutation (explicit capability API)
 
@@ -270,6 +272,12 @@ backed by accurate descriptions derived from `Schema.Node` bytes),
 calls `eval` with a Glia expression, and gets back either a result or
 a structured error it can route on. Restrict the agent's capabilities
 by editing the env it sees, not by adding ACLs to MCP itself.
+
+MCP mode preserves JSON-RPC stdout: `(perform :stdout value)` and
+`(perform :exit nil)` are rejected with the typed
+`:glia.error/protocol-mode-unavailable` error instead of writing or exiting.
+`(perform :load path)` remains available when the embedding supplies an
+appropriate loader.
 
 ## Cap'n Proto schemas
 

@@ -1,2 +1,2 @@
 ; Demo snippet: start oracle DHT provide loop.
-(perform runtime :run (load "bin/oracle.wasm") "serve")
+(perform runtime :run (perform :load "bin/oracle.wasm") "serve")

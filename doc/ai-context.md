@@ -50,6 +50,13 @@ Key abstractions:
   layers override earlier ones.
 - **Cap'n Proto RPC**: bidirectional -- both host and guest can serve
   and consume capabilities.
+- **Glia host effects**: application-visible host interaction begins with
+  `perform`: `(perform :load path)`, `(perform :stdout value)`,
+  `(perform :exit nil)`, or `(perform cap :method ...)`. This is an
+  evaluator-semantic boundary, not an authority grant. The membrane remains
+  the authority boundary; WASI guest access remains governed by sandbox and
+  preopen configuration. In MCP mode `:stdout` and `:exit` fail with a typed
+  protocol-mode-unavailable error so JSON-RPC stdout stays clean.
 
 AI integration -- drivetrain, not engine:
 Wetware doesn't embed an LLM.  The LLM connects *to* a Wetware

@@ -519,8 +519,11 @@ node and gets a capability-secured shell:
 - **MCP mode** (`ww shell --mcp`): the shell process serves MCP on
   stdin/stdout over the standard shell dial/login/graft path. `eval` is
   the universal primitive; per-cap sugar tools (`host`, `routing`, ...)
-  translate to internal Glia expressions. The membrane provides the
-  safety boundary — AI agents can only do what their capabilities allow.
+  translate to internal Glia expressions. Glia host interaction begins with
+  `perform` (`:load`, `:stdout`, `:exit`, or a capability method), while the
+  membrane provides the authority boundary — AI agents can only do what their
+  capabilities allow. MCP rejects `:stdout` and `:exit` with typed errors to
+  keep JSON-RPC stdout clean.
 
 - **Structured errors and introspection.** Errors are values
   (`Result<Val, Val>`) with namespaced `:glia.error/*` keys

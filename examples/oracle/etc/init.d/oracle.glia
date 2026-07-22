@@ -2,6 +2,6 @@
 ;;
 ;; Demos are shell-forward by default.
 ;; Load snippets from examples/oracle/glia/ in ww shell:
-;;   (load "glia/register.glia")
-;;   (load "glia/serve.glia")
-;;   (load "glia/consume.glia")
+;;   (perform :load "glia/register.glia")
+;;   (perform :load "glia/serve.glia")
+;;   (perform :load "glia/consume.glia")

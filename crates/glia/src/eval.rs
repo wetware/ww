@@ -1219,22 +1219,6 @@ fn eval_builtin(name: &str, args: &[Val]) -> Option<Result<Val, Val>> {
                 ))),
             }
         }
-        "println" => {
-            let mut buf = String::new();
-            for (i, arg) in args.iter().enumerate() {
-                if i > 0 {
-                    buf.push(' ');
-                }
-                match arg {
-                    Val::Str(s) => buf.push_str(s),
-                    other => buf.push_str(&format!("{other}")),
-                };
-            }
-            #[cfg(not(test))]
-            std::println!("{buf}");
-            Some(Ok(Val::Nil))
-        }
-
         // --- Other ---
         "atom" => {
             if args.len() != 1 {
@@ -1964,6 +1948,10 @@ pub fn eval_expr<'a, D: Dispatch>(
                     target: effect_target,
                 }));
                 hs.borrow_mut().push(ctx.clone());
+                let _guard = HandlerFrameGuard {
+                    stack: hs.clone(),
+                    context: ctx.clone(),
+                };
 
                 // Create body future.
                 let mut body_fut = {
@@ -2123,15 +2111,6 @@ pub fn eval_expr<'a, D: Dispatch>(
                     }
                 })
                 .await;
-
-                // Pop our handler context (if still on the stack).
-                let mut stack = hs.borrow_mut();
-                if let Some(last) = stack.last() {
-                    if Rc::ptr_eq(last, &ctx) {
-                        stack.pop();
-                    }
-                }
-                drop(stack);
 
                 result
             }
@@ -2644,6 +2623,125 @@ pub fn eval_toplevel<'a, D: Dispatch>(
             Val::Recur(_) => Err(error::internal("recur", "not in tail position")),
             other => Ok(other),
         }
+    })
+}
+
+/// Result of an embedding-owned top-level evaluation.
+#[derive(Clone, Debug)]
+pub enum EvalOutcome {
+    Value(Val),
+    Exit,
+}
+
+/// Removes embedding-owned frames even when the enclosing evaluation future is
+/// cancelled. Guest `with-effect-handler` frames use `HandlerFrameGuard` for
+/// the same cancellation-safe cleanup.
+struct HostFrameGuard {
+    stack: HandlerStack,
+    contexts: Vec<Rc<RefCell<effect::HandlerContext>>>,
+}
+
+impl Drop for HostFrameGuard {
+    fn drop(&mut self) {
+        self.stack
+            .borrow_mut()
+            .retain(|frame| !self.contexts.iter().any(|ctx| Rc::ptr_eq(frame, ctx)));
+    }
+}
+
+/// Removes a guest-owned handler frame if evaluation exits through an error,
+/// an embedding abort, or cancellation before `with-effect-handler` reaches
+/// its ordinary cleanup path.
+struct HandlerFrameGuard {
+    stack: HandlerStack,
+    context: Rc<RefCell<effect::HandlerContext>>,
+}
+
+impl Drop for HandlerFrameGuard {
+    fn drop(&mut self) {
+        self.stack
+            .borrow_mut()
+            .retain(|frame| !Rc::ptr_eq(frame, &self.context));
+    }
+}
+
+/// Evaluate a form with Rust-owned default keyword-effect frames.
+///
+/// The frames are dynamic but never guest-visible: they are installed before
+/// evaluation, so ordinary Glia `with-effect-handler` frames remain newer and
+/// therefore interpose first.  This mirrors the existing handler poll loop,
+/// including genuine-pending propagation, while allowing `:exit` to abort by
+/// dropping the suspended body future rather than smuggling a sentinel through
+/// guest evaluation.
+pub fn eval_toplevel_with_host_effects<'a, D: Dispatch>(
+    val: &'a Val,
+    env: &'a mut Env,
+    dispatch: &'a D,
+    host_effects: &'a [effect::HostEffect],
+) -> Pin<Box<dyn Future<Output = Result<EvalOutcome, Val>> + 'a>> {
+    Box::pin(async move {
+        let hs = env.handler_stack.clone();
+        let contexts: Vec<Rc<RefCell<effect::HandlerContext>>> = host_effects
+            .iter()
+            .map(|effect| {
+                Rc::new(RefCell::new(effect::HandlerContext {
+                    slot: Rc::new(RefCell::new(effect::EffectSlot::new())),
+                    target: effect.target.clone(),
+                }))
+            })
+            .collect();
+        hs.borrow_mut().extend(contexts.iter().cloned());
+        let _guard = HostFrameGuard {
+            stack: hs,
+            contexts: contexts.clone(),
+        };
+
+        let mut body = eval_toplevel(val, env, dispatch);
+        let mut handling: Option<(crate::oneshot::Sender, effect::HostEffectFuture)> = None;
+
+        let result = std::future::poll_fn(|cx| loop {
+            if let Some((_, future)) = handling.as_mut() {
+                match future.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(effect::HostEffectResult::Resume(value))) => {
+                        let (tx, _) = handling.take().expect("host handler state");
+                        tx.send(value);
+                        cx.waker().wake_by_ref();
+                        continue;
+                    }
+                    Poll::Ready(Ok(effect::HostEffectResult::Exit)) => {
+                        return Poll::Ready(Ok(EvalOutcome::Exit));
+                    }
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                }
+            }
+
+            match body.as_mut().poll(cx) {
+                Poll::Ready(Ok(value)) => return Poll::Ready(Ok(EvalOutcome::Value(value))),
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => {
+                    let pending = contexts.iter().enumerate().rev().find_map(|(index, ctx)| {
+                        ctx.borrow()
+                            .slot
+                            .borrow_mut()
+                            .pending
+                            .take()
+                            .map(|(_, data, tx)| (index, data, tx))
+                    });
+                    match pending {
+                        Some((index, data, tx)) => {
+                            let future = (host_effects[index].handler)(data);
+                            handling = Some((tx, future));
+                            continue;
+                        }
+                        None => return Poll::Pending,
+                    }
+                }
+            }
+        })
+        .await;
+
+        result
     })
 }
 
@@ -4266,6 +4364,124 @@ mod tests {
         eval_blocking(&expr, env, d)
     }
 
+    #[test]
+    fn host_effect_frame_resumes_without_guest_binding() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let form = crate::read("(perform :load \"x\")").unwrap();
+        let handler: effect::HostEffectHandler = Rc::new(|data| {
+            Box::pin(async move {
+                assert_eq!(data, Val::Str("x".into()));
+                Ok(effect::HostEffectResult::Resume(Val::Bytes(vec![1, 2])))
+            })
+        });
+        let effects = [effect::HostEffect {
+            target: effect::EffectTarget::Keyword("load".into()),
+            handler,
+        }];
+        let result = pollster_eval(eval_toplevel_with_host_effects(
+            &form, &mut env, &d, &effects,
+        ));
+        assert!(matches!(result, Ok(EvalOutcome::Value(Val::Bytes(ref b))) if b == &vec![1, 2]));
+        assert!(env.get("load-handler").is_none());
+    }
+
+    #[test]
+    fn host_effect_exit_aborts_without_guest_value() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let form = crate::read("(do (perform :exit nil) 42)").unwrap();
+        let handler: effect::HostEffectHandler =
+            Rc::new(|_| Box::pin(async { Ok(effect::HostEffectResult::Exit) }));
+        let effects = [effect::HostEffect {
+            target: effect::EffectTarget::Keyword("exit".into()),
+            handler,
+        }];
+        assert!(matches!(
+            pollster_eval(eval_toplevel_with_host_effects(
+                &form, &mut env, &d, &effects
+            )),
+            Ok(EvalOutcome::Exit)
+        ));
+    }
+
+    #[test]
+    fn host_effect_abort_cleans_guest_handler_frames() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let form = crate::read(
+            "(with-effect-handler :outer (fn [value resume] (resume value)) (perform :load \"x\"))",
+        )
+        .unwrap();
+        let handler: effect::HostEffectHandler =
+            Rc::new(|_| Box::pin(async { Err(Val::from("load failed")) }));
+        let effects = [effect::HostEffect {
+            target: effect::EffectTarget::Keyword("load".into()),
+            handler,
+        }];
+
+        assert!(pollster_eval(eval_toplevel_with_host_effects(
+            &form, &mut env, &d, &effects
+        ))
+        .is_err());
+        assert!(
+            env.handler_stack.borrow().is_empty(),
+            "host-effect abort must not leak guest handler frames"
+        );
+    }
+
+    #[test]
+    fn host_effect_exit_cleans_guest_handler_frames() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let form = crate::read(
+            "(with-effect-handler :outer (fn [value resume] (resume value)) (perform :exit nil))",
+        )
+        .unwrap();
+        let handler: effect::HostEffectHandler =
+            Rc::new(|_| Box::pin(async { Ok(effect::HostEffectResult::Exit) }));
+        let effects = [effect::HostEffect {
+            target: effect::EffectTarget::Keyword("exit".into()),
+            handler,
+        }];
+
+        assert!(matches!(
+            pollster_eval(eval_toplevel_with_host_effects(
+                &form, &mut env, &d, &effects
+            )),
+            Ok(EvalOutcome::Exit)
+        ));
+        assert!(
+            env.handler_stack.borrow().is_empty(),
+            "host-effect exit must not leak guest handler frames"
+        );
+    }
+
+    #[test]
+    fn guest_handler_interposes_before_host_effect_frame() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let form = crate::read(
+            "(with-effect-handler :stdout (fn [value resume] (resume :guest)) (perform :stdout \"x\"))",
+        )
+        .unwrap();
+        let handler: effect::HostEffectHandler = Rc::new(|_| {
+            Box::pin(async {
+                Ok(effect::HostEffectResult::Resume(Val::Keyword(
+                    "host".into(),
+                )))
+            })
+        });
+        let effects = [effect::HostEffect {
+            target: effect::EffectTarget::Keyword("stdout".into()),
+            handler,
+        }];
+        assert!(matches!(
+            pollster_eval(eval_toplevel_with_host_effects(&form, &mut env, &d, &effects)),
+            Ok(EvalOutcome::Value(Val::Keyword(ref value))) if value == "guest"
+        ));
+    }
+
     /// Check if an error Val contains a substring in its :message field or Display output.
     fn err_contains(err: &Val, needle: &str) -> bool {
         // Check :message field in map
@@ -5493,13 +5709,6 @@ mod tests {
             eval_str("(name 'bar)", &mut env, &d),
             Ok(Val::Str("bar".into()))
         );
-    }
-
-    #[test]
-    fn stdlib_println_returns_nil() {
-        let mut env = Env::new();
-        let d = RecordingDispatch::new();
-        assert_eq!(eval_str(r#"(println "test")"#, &mut env, &d), Ok(Val::Nil));
     }
 
     #[test]
@@ -7592,7 +7801,19 @@ mod tests {
                 eval_blocking(form, &mut env, &d)?;
             }
         }
-        eval_str(input, &mut env, &d)
+        let expr = crate::read(input).map_err(|e| error::parse(None, e.to_string()))?;
+        let stdout: effect::HostEffectHandler =
+            Rc::new(|_data| Box::pin(async { Ok(effect::HostEffectResult::Resume(Val::Nil)) }));
+        let effects = [effect::HostEffect {
+            target: effect::EffectTarget::Keyword("stdout".into()),
+            handler: stdout,
+        }];
+        match pollster_eval(eval_toplevel_with_host_effects(
+            &expr, &mut env, &d, &effects,
+        ))? {
+            EvalOutcome::Value(value) => Ok(value),
+            EvalOutcome::Exit => Err(Val::from("unexpected exit in ww/test")),
+        }
     }
 
     #[test]

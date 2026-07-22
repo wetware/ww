@@ -72,6 +72,9 @@ jobs:
     - name: cargo fmt --all -- --check
       run: cargo fmt --all -- --check
 
+    - name: Check Glia host-effect migration
+      run: make check-glia-effects
+
     - name: Check IPFS release publish scripts
       run: |
         bash tests/test_ipfs_release_publish.sh
@@ -202,11 +205,20 @@ jobs:
       with:
         key: build-test
 
-    - name: Build WASI example binaries
-      run: make -C examples/echo
+    - name: Build WASI test fixtures
+      run: |
+        make -C examples/echo
+        make shell
 
     - name: Run host workspace tests (hot cache from build job)
       run: cargo test --workspace
+
+    - name: Run standalone standard-library tests
+      if: ${{ always() }}
+      run: |
+        cargo test --manifest-path std/caps/Cargo.toml
+        cargo test --manifest-path std/kernel/Cargo.toml
+        cargo test --manifest-path std/mcp/Cargo.toml
 
   # === Master-only: fan out after checks pass ===
 
@@ -635,7 +647,7 @@ jobs:
         # Each subtree mirrors the kernel/shell `<name>/{etc/init.d,bin}/`
         # convention so init.d glia files end up at the merged tree's
         # /etc/init.d/ where the kernel discovers them
-        # (std/kernel/src/lib.rs:1148-1188), and `(load "bin/<name>.wasm")`
+        # (std/kernel/src/lib.rs:1148-1188), and `(perform :load "bin/<name>.wasm")`
         # resolves relative to the merged tree root.
         for example_dir in artifacts/wasm-artifacts/examples/*/bin; do
           if [ -d "$example_dir" ]; then

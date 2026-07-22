@@ -64,8 +64,8 @@ If multiple local nodes are running, use `ww shell --select <index|peer-id>`.
 From the Glia prompt:
 
 ```clojure
-/ > (load "glia/register.glia")
-/ > (load "glia/serve.glia")
+/ > (perform :load "glia/register.glia")
+/ > (perform :load "glia/serve.glia")
 ```
 
 ### Step 4: Query via curl
@@ -117,8 +117,8 @@ If prompted, select the host for the `--port=2026` node.
 Then in Glia:
 
 ```clojure
-/ > (load "glia/register.glia")
-/ > (load "glia/consume.glia")
+/ > (perform :load "glia/register.glia")
+/ > (perform :load "glia/consume.glia")
 ```
 
 The consumer discovers the oracle provider via DHT, dials it with
@@ -222,7 +222,7 @@ RPC. Confidence decays toward 0.0 if data goes stale.
 `glia/register.glia`:
 
 ```clojure
-(def oracle-wasm (load "bin/oracle.wasm"))
+(def oracle-wasm (perform :load "bin/oracle.wasm"))
 (def oracle-http (cell oracle-wasm))
 
 (def oracle-executor (perform runtime :load oracle-wasm))
@@ -236,13 +236,13 @@ RPC. Confidence decays toward 0.0 if data goes stale.
 `glia/serve.glia`:
 
 ```clojure
-(perform runtime :run (load "bin/oracle.wasm") "serve")
+(perform runtime :run (perform :load "bin/oracle.wasm") "serve")
 ```
 
 `glia/consume.glia`:
 
 ```clojure
-(perform runtime :run (load "bin/oracle.wasm") "consume")
+(perform runtime :run (perform :load "bin/oracle.wasm") "consume")
 ```
 
 The host registration forms split by transport:

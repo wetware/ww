@@ -6,10 +6,11 @@ use capnp::capability::FromClientHook;
 use capnp_rpc::{new_client, pry};
 use caps::mcp_adapter::{self, ActionPolicy, ExprPart, ToolAction, ToolSpec};
 use caps::{
-    clear_import_cache, clear_load_backend, clear_load_cache, eval_load_async, extract_method,
-    make_import_cap, make_import_handler, set_load_backend, wrap_with_handlers, LoadBackend,
+    clear_import_cache, extract_method, make_import_cap, make_import_handler, LoadBackend,
+    LoadRuntime,
 };
-use glia::eval::{self, Dispatch, Env};
+use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
+use glia::eval::{self, Dispatch, Env, EvalOutcome};
 use glia::{make_cap, Val};
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
@@ -42,7 +43,7 @@ Remote Glia shell. Available commands:
   (perform host :peers)    — connected peers
   (perform routing :resolve \"/ipns/<name>\") — IPNS resolve
   (help)                   — this message
-  (exit)                   — disconnect";
+  (perform :exit nil)      — disconnect";
 
 const SHELL_MCP_HOST_ID_EXPR: &[ExprPart] = &[ExprPart::Literal("(perform host :id)")];
 const SHELL_MCP_HOST_PEERS_EXPR: &[ExprPart] = &[ExprPart::Literal("(perform host :peers)")];
@@ -173,6 +174,19 @@ impl<'a> Dispatch for LocalShellDispatch<'a> {
 struct LocalShellRuntime {
     env: Env,
     dispatch: HashMap<&'static str, HandlerFn>,
+    load_runtime: LoadRuntime,
+}
+
+#[derive(Clone, Copy)]
+enum ShellEffectMode {
+    Interactive,
+    Mcp,
+}
+
+enum ShellEvalResult {
+    Value(String),
+    Error(String),
+    Exit,
 }
 
 impl LocalSigner {
@@ -469,9 +483,19 @@ async fn run_mcp_stdio(runtime: &mut LocalShellRuntime) -> Result<()> {
                     continue;
                 };
 
-                match shell_eval_raw(runtime, &expression).await? {
-                    Ok(Val::Nil) => write_mcp_tool_result(&id, "nil"),
-                    Ok(value) => write_mcp_tool_result(&id, &format!("{value}")),
+                match shell_eval_raw(runtime, &expression, ShellEffectMode::Mcp).await? {
+                    Ok(EvalOutcome::Value(Val::Nil)) => write_mcp_tool_result(&id, "nil"),
+                    Ok(EvalOutcome::Value(value)) => {
+                        write_mcp_tool_result(&id, &format!("{value}"))
+                    }
+                    Ok(EvalOutcome::Exit) => {
+                        let err = mcp_adapter::protocol_mode_unavailable("exit");
+                        write_mcp_tool_error(
+                            &id,
+                            &mcp_adapter::val_to_mcp_error_text(&err),
+                            &mcp_adapter::val_to_mcp_error_data(&err),
+                        );
+                    }
                     Err(err) => {
                         let text = mcp_adapter::val_to_mcp_error_text(&err);
                         let data = mcp_adapter::val_to_mcp_error_data(&err);
@@ -608,11 +632,10 @@ async fn run_repl(runtime: &mut LocalShellRuntime) -> Result<()> {
                 }
                 let _ = rl.add_history_entry(input);
 
-                let (result, is_error) = shell_eval(runtime, input).await?;
-                if is_error {
-                    eprintln!("{result}");
-                } else {
-                    println!("{result}");
+                match shell_eval(runtime, input).await? {
+                    ShellEvalResult::Value(result) => println!("{result}"),
+                    ShellEvalResult::Error(result) => eprintln!("{result}"),
+                    ShellEvalResult::Exit => break,
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -634,10 +657,12 @@ async fn build_local_shell_runtime(caps: GraftedShellCaps) -> LocalShellRuntime 
         ipfs,
     } = caps;
 
-    clear_load_backend();
-    clear_load_cache();
     clear_import_cache();
-    set_load_backend(Rc::new(ShellLoadBackend { ipfs }));
+    let load_backend = Rc::new(ShellLoadBackend { ipfs });
+    let load_runtime = caps::LoadRuntime::new(
+        std::env::var("WW_ROOT").unwrap_or_else(|_| "/".into()),
+        load_backend,
+    );
 
     let mut env = Env::new();
 
@@ -656,7 +681,10 @@ async fn build_local_shell_runtime(caps: GraftedShellCaps) -> LocalShellRuntime 
         "routing-handler".to_string(),
         make_routing_handler_local(routing),
     );
-    env.set("import-handler".to_string(), make_import_handler());
+    env.set(
+        "import-handler".to_string(),
+        make_import_handler(load_runtime.clone()),
+    );
 
     let dispatch = build_dispatch();
     {
@@ -664,32 +692,22 @@ async fn build_local_shell_runtime(caps: GraftedShellCaps) -> LocalShellRuntime 
         glia::load_prelude(&mut env, &mut prelude_dispatch).await;
     }
 
-    LocalShellRuntime { env, dispatch }
+    LocalShellRuntime {
+        env,
+        dispatch,
+        load_runtime,
+    }
 }
 
 fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
-    fn load_handler(
-        args: &[Val],
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + '_>> {
-        Box::pin(eval_load_async(args))
-    }
-
     fn help_handler(
         _args: &[Val],
     ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + '_>> {
         Box::pin(std::future::ready(Ok(Val::Str(HELP_TEXT.to_string()))))
     }
 
-    fn exit_handler(
-        _args: &[Val],
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + '_>> {
-        Box::pin(std::future::ready(Ok(Val::Keyword("exit".into()))))
-    }
-
     let mut table: HashMap<&'static str, HandlerFn> = HashMap::new();
-    table.insert("load", load_handler);
     table.insert("help", help_handler);
-    table.insert("exit", exit_handler);
     table
 }
 
@@ -1074,25 +1092,11 @@ fn make_routing_handler_local(routing: ww::routing_capnp::routing::Client) -> Va
     }
 }
 
-async fn shell_eval(runtime: &mut LocalShellRuntime, text: &str) -> Result<(String, bool)> {
-    let eval_result = shell_eval_value(runtime, text).await?;
-
-    match eval_result {
-        Ok(value) => Ok((value, false)),
-        Err(value) => Ok((value, true)),
-    }
-}
-
-async fn shell_eval_value(
-    runtime: &mut LocalShellRuntime,
-    text: &str,
-) -> Result<std::result::Result<String, String>> {
-    let eval_result = shell_eval_raw(runtime, text).await?;
-
-    match eval_result {
-        Ok(Val::Nil) => Ok(Ok(String::new())),
-        Ok(Val::Keyword(ref k)) if k == "exit" => Ok(Ok("exit".to_string())),
-        Ok(result) => Ok(Ok(format!("{result}"))),
+async fn shell_eval(runtime: &mut LocalShellRuntime, text: &str) -> Result<ShellEvalResult> {
+    match shell_eval_raw(runtime, text, ShellEffectMode::Interactive).await? {
+        Ok(EvalOutcome::Value(Val::Nil)) => Ok(ShellEvalResult::Value(String::new())),
+        Ok(EvalOutcome::Value(result)) => Ok(ShellEvalResult::Value(format!("{result}"))),
+        Ok(EvalOutcome::Exit) => Ok(ShellEvalResult::Exit),
         Err(err) => {
             let inner = glia::error::unwrap_thrown(&err).unwrap_or(&err);
             let msg = glia::error::message(inner)
@@ -1102,7 +1106,7 @@ async fn shell_eval_value(
                 Some(tag) => format!("[{tag}] {msg}"),
                 None => msg,
             };
-            Ok(Err(formatted))
+            Ok(ShellEvalResult::Error(formatted))
         }
     }
 }
@@ -1110,9 +1114,10 @@ async fn shell_eval_value(
 async fn shell_eval_raw(
     runtime: &mut LocalShellRuntime,
     text: &str,
-) -> Result<std::result::Result<Val, Val>> {
+    mode: ShellEffectMode,
+) -> Result<std::result::Result<EvalOutcome, Val>> {
     if text.trim().is_empty() {
-        return Ok(Ok(Val::Nil));
+        return Ok(Ok(EvalOutcome::Value(Val::Nil)));
     }
 
     let expr = match glia::read(text) {
@@ -1120,13 +1125,59 @@ async fn shell_eval_raw(
         Err(e) => return Ok(Err(glia::error::parse(None, e))),
     };
 
-    let wrapped = wrap_with_handlers(&expr, &[]);
     let dispatch = LocalShellDispatch {
         table: &runtime.dispatch,
     };
+    let load_runtime = runtime.load_runtime.clone();
+    let load = Rc::new(move |data: Val| {
+        let runtime = load_runtime.clone();
+        Box::pin(async move { Ok(HostEffectResult::Resume(runtime.load_value(data).await?)) })
+            as Pin<Box<dyn Future<Output = std::result::Result<HostEffectResult, Val>>>>
+    });
+    let stdout = Rc::new(move |data: Val| match mode {
+        ShellEffectMode::Interactive => Box::pin(async move {
+            let text = match data {
+                Val::Str(s) => s,
+                other => format!("{other}"),
+            };
+            println!("{text}");
+            Ok(HostEffectResult::Resume(Val::Nil))
+        })
+            as Pin<Box<dyn Future<Output = std::result::Result<HostEffectResult, Val>>>>,
+        ShellEffectMode::Mcp => {
+            Box::pin(async { Err(mcp_adapter::protocol_mode_unavailable("stdout")) })
+                as Pin<Box<dyn Future<Output = std::result::Result<HostEffectResult, Val>>>>
+        }
+    });
+    let exit = Rc::new(move |_data: Val| match mode {
+        ShellEffectMode::Interactive => Box::pin(async { Ok(HostEffectResult::Exit) })
+            as Pin<Box<dyn Future<Output = std::result::Result<HostEffectResult, Val>>>>,
+        ShellEffectMode::Mcp => {
+            Box::pin(async { Err(mcp_adapter::protocol_mode_unavailable("exit")) })
+                as Pin<Box<dyn Future<Output = std::result::Result<HostEffectResult, Val>>>>
+        }
+    });
+    let effects = [
+        HostEffect {
+            target: EffectTarget::Keyword("load".into()),
+            handler: load,
+        },
+        HostEffect {
+            target: EffectTarget::Keyword("stdout".into()),
+            handler: stdout,
+        },
+        HostEffect {
+            target: EffectTarget::Keyword("exit".into()),
+            handler: exit,
+        },
+    ];
+    // Capability effects remain mediated by the standard `std/caps` wrappers;
+    // the keyword host effects above are evaluator-owned frames and therefore
+    // never become guest-visible handler values.
+    let wrapped = caps::wrap_with_handlers(&expr, &[]);
     let eval_result = tokio::time::timeout(
         RPC_TIMEOUT,
-        eval::eval_toplevel(&wrapped, &mut runtime.env, &dispatch),
+        eval::eval_toplevel_with_host_effects(&wrapped, &mut runtime.env, &dispatch, &effects),
     )
     .await
     .context("shell eval timed out")?;
@@ -2040,9 +2091,11 @@ mod tests {
     async fn local_runtime_initializes_without_runtime_cap_and_evals_arithmetic() {
         let (caps, _seen_paths) = test_grafted_caps();
         let mut runtime = build_local_shell_runtime(caps).await;
-        let (result, is_error) = shell_eval(&mut runtime, "(+ 1 2)").await.unwrap();
-        assert!(!is_error, "unexpected eval error: {result}");
-        assert_eq!(result, "3");
+        match shell_eval(&mut runtime, "(+ 1 2)").await.unwrap() {
+            ShellEvalResult::Value(result) => assert_eq!(result, "3"),
+            ShellEvalResult::Error(err) => panic!("unexpected eval error: {err}"),
+            ShellEvalResult::Exit => panic!("unexpected exit"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2050,26 +2103,72 @@ mod tests {
         use base58::ToBase58;
         let (caps, _seen_paths) = test_grafted_caps();
         let mut runtime = build_local_shell_runtime(caps).await;
-        let (result, is_error) = shell_eval(&mut runtime, "(perform host :id)")
+        match shell_eval(&mut runtime, "(perform host :id)")
             .await
-            .unwrap();
-        assert!(!is_error, "unexpected eval error: {result}");
-        assert_eq!(result, format!("\"{}\"", TEST_PEER_ID_BYTES.to_base58()));
+            .unwrap()
+        {
+            ShellEvalResult::Value(result) => {
+                assert_eq!(result, format!("\"{}\"", TEST_PEER_ID_BYTES.to_base58()));
+            }
+            ShellEvalResult::Error(err) => panic!("unexpected eval error: {err}"),
+            ShellEvalResult::Exit => panic!("unexpected exit"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn local_runtime_routes_ipfs_loads_through_grafted_ipfs_cap() {
         let (caps, seen_paths) = test_grafted_caps();
         let mut runtime = build_local_shell_runtime(caps).await;
-        let (result, is_error) = shell_eval(&mut runtime, "(load \"/ipfs/bafy-test/path\")")
+        match shell_eval(&mut runtime, "(perform :load \"/ipfs/bafy-test/path\")")
             .await
-            .unwrap();
-        assert!(!is_error, "unexpected eval error: {result}");
-        assert_eq!(result, "<3 bytes>");
+            .unwrap()
+        {
+            ShellEvalResult::Value(result) => assert_eq!(result, "<3 bytes>"),
+            ShellEvalResult::Error(err) => panic!("unexpected eval error: {err}"),
+            ShellEvalResult::Exit => panic!("unexpected exit"),
+        }
         assert_eq!(
             seen_paths.borrow().as_slice(),
             &["/ipfs/bafy-test/path".to_string()]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_repl_exit_is_a_control_outcome() {
+        let (caps, _seen_paths) = test_grafted_caps();
+        let mut runtime = build_local_shell_runtime(caps).await;
+        assert!(matches!(
+            shell_eval(&mut runtime, "(perform :exit nil)")
+                .await
+                .unwrap(),
+            ShellEvalResult::Exit
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_mode_rejects_stdout_and_exit_with_typed_errors() {
+        let (caps, _seen_paths) = test_grafted_caps();
+        let mut runtime = build_local_shell_runtime(caps).await;
+
+        for (expr, effect) in [
+            ("(perform :stdout \"protocol corruption\")", "stdout"),
+            ("(perform :exit nil)", "exit"),
+        ] {
+            let err = shell_eval_raw(&mut runtime, expr, ShellEffectMode::Mcp)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                glia::error::type_tag(&err),
+                Some("glia.error/protocol-mode-unavailable")
+            );
+            assert_eq!(
+                mcp_adapter::val_to_mcp_error_data(&err)
+                    .get("effect")
+                    .and_then(|value| value.as_str()),
+                Some(effect)
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2149,9 +2248,11 @@ mod tests {
                     .await
                     .expect("dial/login/graft");
                 let mut runtime = build_local_shell_runtime(caps).await;
-                let (result, is_error) = shell_eval(&mut runtime, "(+ 1 2)").await.unwrap();
-                assert!(!is_error, "unexpected eval error: {result}");
-                assert_eq!(result, "3");
+                match shell_eval(&mut runtime, "(+ 1 2)").await.unwrap() {
+                    ShellEvalResult::Value(result) => assert_eq!(result, "3"),
+                    ShellEvalResult::Error(err) => panic!("unexpected eval error: {err}"),
+                    ShellEvalResult::Exit => panic!("unexpected exit"),
+                }
 
                 host_task.abort();
                 terminal_task.abort();

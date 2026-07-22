@@ -74,6 +74,91 @@ pub trait LoadBackend {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Val>> + 'a>>;
 }
 
+/// Explicit load state owned by one embedding runtime.  New effect handlers
+/// receive this object directly instead of consulting process/thread globals.
+#[derive(Clone)]
+pub struct LoadRuntime {
+    root: String,
+    backend: Rc<dyn LoadBackend>,
+    cache: Rc<RefCell<HashMap<String, Vec<u8>>>>,
+}
+
+impl LoadRuntime {
+    pub fn new(root: impl Into<String>, backend: Rc<dyn LoadBackend>) -> Self {
+        Self {
+            root: root.into(),
+            backend,
+            cache: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
+
+    pub fn resolve(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            path.to_string()
+        } else if self.root.is_empty() || self.root == "/" {
+            format!("/{path}")
+        } else {
+            format!("{}/{path}", self.root.trim_end_matches('/'))
+        }
+    }
+
+    pub fn load<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+        let resolved = self.resolve(path);
+        if let Some(bytes) = self.cache.borrow().get(&resolved).cloned() {
+            return Box::pin(async move { Ok(Val::Bytes(bytes)) });
+        }
+        let backend = self.backend.clone();
+        let cache = self.cache.clone();
+        Box::pin(async move {
+            let bytes = backend.load(&resolved).await?;
+            cache.borrow_mut().insert(resolved, bytes.clone());
+            Ok(Val::Bytes(bytes))
+        })
+    }
+
+    /// Handle the data payload of `(perform :load path)` without exposing a
+    /// guest-callable `load` primitive.
+    pub fn load_value<'a>(
+        &'a self,
+        data: Val,
+    ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+        let path = match data {
+            Val::Str(path) | Val::Sym(path) => path,
+            other => {
+                return Box::pin(async move {
+                    Err(Val::from(format!(
+                        "load: expected a path string, got {other}"
+                    )))
+                })
+            }
+        };
+        let runtime = self.clone();
+        Box::pin(async move { runtime.load(&path).await })
+    }
+}
+
+pub fn default_load_runtime() -> LoadRuntime {
+    LoadRuntime::new(
+        std::env::var("WW_ROOT").unwrap_or_else(|_| "/".into()),
+        Rc::new(FsLoadBackend),
+    )
+}
+
+/// WASI/local-filesystem backend for embeddings without grafted IPFS reads.
+pub struct FsLoadBackend;
+
+impl LoadBackend for FsLoadBackend {
+    fn load<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Val>> + 'a>> {
+        Box::pin(async move { read_default_path(path) })
+    }
+}
+
 pub fn set_load_backend(backend: Rc<dyn LoadBackend>) {
     LOAD_BACKEND.with(|slot| {
         *slot.borrow_mut() = Some(backend);
@@ -214,10 +299,11 @@ fn resolve_import_path(path: &str) -> String {
 ///
 /// The caller binds the returned map: `(def core (perform import "core"))`.
 /// Access members via the map: `(core :help)`.
-pub fn make_import_handler() -> Val {
+pub fn make_import_handler(load_runtime: LoadRuntime) -> Val {
     Val::AsyncNativeFn {
         name: "import-handler".into(),
         func: Rc::new(move |args: Vec<Val>| {
+            let load_runtime = load_runtime.clone();
             Box::pin(async move {
                 // Effect data for `(perform import "core")`:
                 // args[0] = data list, args[1] = resume continuation.
@@ -259,7 +345,7 @@ pub fn make_import_handler() -> Val {
                 }
 
                 // Load the file via eval_load
-                let bytes_val = eval_load_async(&[Val::Str(resolved.clone())]).await?;
+                let bytes_val = load_runtime.load(&resolved).await?;
                 let content = match &bytes_val {
                     Val::Bytes(b) => std::str::from_utf8(b)
                         .map_err(|e| {
@@ -718,31 +804,20 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
 
 /// Wraps a Glia form in standard capability effect handlers.
 ///
+/// Environmental host effects (`:load`, `:stdout`, `:exit`) deliberately do
+/// not appear here. Embeddings install them as Rust-owned frames around the
+/// top-level evaluator, so guest code cannot obtain a default handler value.
+///
 /// The `extra_caps` parameter allows callers to inject additional
 /// capability names that sit outside the core set.
 pub fn wrap_with_handlers(form: &Val, extra_caps: &[&str]) -> Val {
-    // Innermost: :load effect handler
-    let with_load = Val::List(vec![
-        Val::Sym("with-effect-handler".into()),
-        Val::Keyword("load".into()),
-        Val::List(vec![
-            Val::Sym("fn".into()),
-            Val::Vector(vec![Val::Sym("path".into()), Val::Sym("resume".into())]),
-            Val::List(vec![
-                Val::Sym("resume".into()),
-                Val::List(vec![Val::Sym("load".into()), Val::Sym("path".into())]),
-            ]),
-        ]),
-        form.clone(),
-    ]);
-
     // Wrap in cap handlers (innermost to outermost)
     // Core caps first, then any extras
     let mut caps: Vec<&str> = vec!["import", "routing", "host"];
     for extra in extra_caps {
         caps.insert(0, extra);
     }
-    let mut wrapped = with_load;
+    let mut wrapped = form.clone();
     for cap_name in &caps {
         let handler_name = format!("{cap_name}-handler");
         wrapped = Val::List(vec![
@@ -831,7 +906,7 @@ mod tests {
         });
 
         // Build the handler and call it with cached data
-        let handler = make_import_handler();
+        let handler = make_import_handler(default_load_runtime());
         match &handler {
             Val::AsyncNativeFn { func, .. } => {
                 // Simulate: (perform import "core")
@@ -899,7 +974,7 @@ mod tests {
         });
 
         // Call handler twice — both should return the same cached map
-        let handler = make_import_handler();
+        let handler = make_import_handler(default_load_runtime());
         let func = match &handler {
             Val::AsyncNativeFn { func, .. } => func.clone(),
             _ => panic!("expected AsyncNativeFn"),
@@ -940,7 +1015,7 @@ mod tests {
     fn import_missing_file_returns_error() {
         clear_import_cache();
 
-        let handler = make_import_handler();
+        let handler = make_import_handler(default_load_runtime());
         let func = match &handler {
             Val::AsyncNativeFn { func, .. } => func.clone(),
             _ => panic!("expected AsyncNativeFn"),

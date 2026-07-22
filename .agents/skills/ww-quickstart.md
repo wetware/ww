@@ -37,7 +37,7 @@ shell.
 (perform host :id)              ;; your peer identity
 (perform host :peers)           ;; connected peers
 (perform host :addrs)           ;; listen addresses — round-trip RPC through the Membrane
-(exit)                          ;; done
+(perform :exit nil)             ;; end the Glia session
 ```
 
 ⚗️ **That's it.**  You just booted a p2p capability-secured OS:

@@ -95,7 +95,7 @@
          (let [~sym ~g] ~@body)))))
 
 ;; doto — evaluate x, perform side effects, return x
-;; (doto (list 1 2 3) println) => prints and returns (1 2 3)
+;; (doto (list 1 2 3) (fn [value] (perform :stdout value))) => writes and returns (1 2 3)
 (defmacro doto [x & forms]
   (let [g (gensym)]
     `(let [~g ~x]

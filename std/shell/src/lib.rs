@@ -16,15 +16,16 @@ use std::rc::Rc;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 
-use glia::eval::{self, Dispatch, Env};
-use glia::{Val, make_cap};
+use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
+use glia::eval::{self, Dispatch, Env, EvalOutcome};
+use glia::{make_cap, HandledCapInner, Val};
 
 use wasip2::exports::cli::run::Guest;
 
 // Shared effect handler factories.
 use caps::{
-    eval_load_async, get_graft_cap, make_host_handler, make_import_handler,
-    make_routing_handler, membrane_capnp, routing_capnp, system_capnp, wrap_with_handlers,
+    get_graft_cap, make_host_handler, make_import_handler, make_routing_handler,
+    membrane_capnp, routing_capnp, system_capnp, LoadRuntime,
 };
 
 // Shell-specific generated Cap'n Proto modules.
@@ -82,14 +83,8 @@ impl<'s> Dispatch for ShellDispatch<'s> {
 
 fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
     let mut t: HashMap<&'static str, HandlerFn> = HashMap::new();
-    t.insert("load", |a, _| Box::pin(eval_load_async(a)));
     t.insert("help", |_, _| {
         Box::pin(std::future::ready(Ok(Val::Str(HELP_TEXT.to_string()))))
-    });
-    // Shell-specific exit: returns a sentinel keyword instead of process::exit.
-    // The serve loop catches this and exits cleanly.
-    t.insert("exit", |_, _| {
-        Box::pin(std::future::ready(Ok(Val::Keyword("exit".into()))))
     });
     t
 }
@@ -101,7 +96,39 @@ Remote Glia shell. Available commands:
   (perform host :peers)    — connected peers
   (perform routing :find \"name\") — DHT lookup
   (help)                   — this message
-  (exit)                   — disconnect";
+  (perform :load \"path\")  — load bytes
+  (perform :stdout value)  — write output
+  (perform :exit nil)      — disconnect";
+
+/// Default environmental effects are Rust-owned frames, never values placed
+/// in the guest environment.  Guest `with-effect-handler` frames remain
+/// dynamically innermost and may intentionally interpose.
+fn host_effects(load_runtime: LoadRuntime, output: Rc<RefCell<String>>) -> Vec<HostEffect> {
+    let load = Rc::new(move |data: Val| {
+        let runtime = load_runtime.clone();
+        Box::pin(async move { Ok(HostEffectResult::Resume(runtime.load_value(data).await?)) })
+            as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
+    });
+    let stdout = Rc::new(move |data: Val| {
+        let output = output.clone();
+        Box::pin(async move {
+            let text = match data { Val::Str(s) => s, other => format!("{other}") };
+            let mut sink = output.borrow_mut();
+            sink.push_str(&text);
+            sink.push('\n');
+            Ok(HostEffectResult::Resume(Val::Nil))
+        }) as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
+    });
+    let exit = Rc::new(|_data: Val| {
+        Box::pin(async { Ok(HostEffectResult::Exit) })
+            as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
+    });
+    vec![
+        HostEffect { target: EffectTarget::Keyword("load".into()), handler: load },
+        HostEffect { target: EffectTarget::Keyword("stdout".into()), handler: stdout },
+        HostEffect { target: EffectTarget::Keyword("exit".into()), handler: exit },
+    ]
+}
 
 // ---------------------------------------------------------------------------
 // Shell server — Cap'n Proto interface implementation
@@ -112,6 +139,7 @@ struct ShellImpl {
     ctx: Rc<RefCell<ShellSession>>,
     dispatch: HashMap<&'static str, HandlerFn>,
     ready: Rc<std::cell::Cell<bool>>,
+    load_runtime: LoadRuntime,
 }
 
 #[allow(refining_impl_trait)]
@@ -121,6 +149,8 @@ impl shell_capnp::shell::Server for ShellImpl {
         params: shell_capnp::shell::EvalParams,
         mut results: shell_capnp::shell::EvalResults,
     ) -> Promise<(), capnp::Error> {
+        results.get().set_output("");
+        results.get().set_exit_requested(false);
         let text = match pry!(params.get()).get_text() {
             Ok(t) => match t.to_str() {
                 Ok(s) => s.to_string(),
@@ -163,22 +193,31 @@ impl shell_capnp::shell::Server for ShellImpl {
                 }
             };
 
-            // Wrap in effect handlers and evaluate
-            let wrapped = wrap_with_handlers(&expr, &[]);
+            // Capability handlers still use the standard dynamic wrappers.
+            // Environmental host effects are Rust-owned frames: no guest-visible
+            // handler value can be captured or invoked directly.
             let dispatch = ShellDispatch {
                 ctx: &*self.ctx,
                 table: &self.dispatch,
             };
-            match eval::eval_toplevel(&wrapped, &mut self.env.borrow_mut(), &dispatch).await {
-                Ok(Val::Nil) => {
+            let output = Rc::new(RefCell::new(String::new()));
+            let effects = host_effects(self.load_runtime.clone(), output.clone());
+            match eval::eval_toplevel_with_host_effects(
+                &expr,
+                &mut self.env.borrow_mut(),
+                &dispatch,
+                &effects,
+            ).await {
+                Ok(EvalOutcome::Exit) => {
+                    results.get().set_result("");
+                    results.get().set_is_error(false);
+                    results.get().set_exit_requested(true);
+                }
+                Ok(EvalOutcome::Value(Val::Nil)) => {
                     results.get().set_result("");
                     results.get().set_is_error(false);
                 }
-                Ok(Val::Keyword(ref k)) if k == "exit" => {
-                    results.get().set_result("exit");
-                    results.get().set_is_error(false);
-                }
-                Ok(result) => {
+                Ok(EvalOutcome::Value(result)) => {
                     results.get().set_result(&format!("{result}"));
                     results.get().set_is_error(false);
                 }
@@ -199,6 +238,7 @@ impl shell_capnp::shell::Server for ShellImpl {
                     results.get().set_is_error(true);
                 }
             }
+            results.get().set_output(&*output.borrow());
             Ok(())
         })
     }
@@ -228,11 +268,13 @@ fn run_impl() {
     }));
     let ready = Rc::new(std::cell::Cell::new(false));
 
+    let load_runtime = caps::default_load_runtime();
     let shell_impl = ShellImpl {
         env: Rc::clone(&env),
         ctx: Rc::clone(&ctx),
         dispatch: build_dispatch(),
         ready: Rc::clone(&ready),
+        load_runtime: load_runtime.clone(),
     };
     let client: shell_capnp::shell::Client = capnp_rpc::new_client(shell_impl);
 
@@ -254,20 +296,24 @@ fn run_impl() {
             s.initialized = true;
         }
 
-        // 2. Bind cap values + effect handlers into the environment.
+        // 2. Bind capabilities with intrinsic default handlers.  The handler
+        // is carried by the cap, not exposed as `{cap}-handler` in Env.
         {
             let mut env = env.borrow_mut();
             let caps: [(&str, Val); 3] = [
                 ("host", make_host_handler(host)),
                 ("routing", make_routing_handler(routing)),
-                ("import", make_import_handler()),
+                ("import", make_import_handler(load_runtime)),
             ];
             for (name, handler) in caps {
                 env.set(
                     name.to_string(),
-                    make_cap(name, format!("shell:{name}"), std::rc::Rc::new(())),
+                    make_cap(name, format!("shell:{name}"), std::rc::Rc::new(HandledCapInner {
+                        handler,
+                        export: std::rc::Rc::new(()),
+                        descriptor: Vec::new(),
+                    })),
                 );
-                env.set(format!("{name}-handler"), handler);
             }
         }
 

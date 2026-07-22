@@ -4,7 +4,20 @@
 //! table. This module owns the security-sensitive string escaping, action
 //! validation, expression rendering, and Glia error/JSON serialization.
 
-use glia::Val;
+use glia::{Val, ValMap};
+
+/// Structured error returned when a Glia host effect is unavailable in an MCP
+/// embedding because the protocol owns stdout or process lifetime.
+pub fn protocol_mode_unavailable(effect: &str) -> Val {
+    glia::error::user(
+        Val::Keyword("glia.error/protocol-mode-unavailable".into()),
+        format!(":{effect} is unavailable in MCP protocol mode"),
+        ValMap::from_pairs(vec![
+            (Val::Keyword("mode".into()), Val::Keyword("mcp".into())),
+            (Val::Keyword("effect".into()), Val::Keyword(effect.into())),
+        ]),
+    )
+}
 
 /// One known MCP tool and its allowed action templates.
 pub struct ToolSpec {
@@ -298,6 +311,18 @@ mod tests {
     fn has_tool_checks_supplied_table() {
         assert!(has_tool(TOOL_SPECS, "host"));
         assert!(!has_tool(TOOL_SPECS, "routing"));
+    }
+
+    #[test]
+    fn protocol_mode_unavailable_is_structured() {
+        let err = protocol_mode_unavailable("stdout");
+        assert_eq!(
+            glia::error::type_tag(&err),
+            Some("glia.error/protocol-mode-unavailable")
+        );
+        let data = val_to_mcp_error_data(&err);
+        assert_eq!(data.get("mode").and_then(|v| v.as_str()), Some("mcp"));
+        assert_eq!(data.get("effect").and_then(|v| v.as_str()), Some("stdout"));
     }
 
     fn unbound_err() -> Val {

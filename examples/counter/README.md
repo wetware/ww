@@ -52,7 +52,7 @@ If multiple local nodes are running, use `ww shell --select <index|peer-id>`.
 From the Glia prompt:
 
 ```clojure
-/ > (load "glia/register.glia")
+/ > (perform :load "glia/register.glia")
 ```
 
 ### Step 4: Test with curl
@@ -146,7 +146,7 @@ well-specified binary protocol for this job.
 ```clojure
 ; Register the counter cell as an HTTP handler at /counter.
 ; HttpListener spawns a cell per request and pipes FastCGI.
-(def counter (cell (load "bin/counter.wasm")))
+(def counter (cell (perform :load "bin/counter.wasm")))
 
 (perform host :listen counter "/counter")
 ```

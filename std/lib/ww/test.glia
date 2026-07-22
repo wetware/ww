@@ -80,16 +80,16 @@
                   outcome (try (do (test-fn) {:status :pass :name test-name})
                                (catch _ e {:status :fail :name test-name :error e}))]
               (if (= (get outcome :status) :pass)
-                (do (println (str "  PASS  " test-name))
+                (do (perform :stdout (str "  PASS  " test-name))
                     outcome)
-                (do (println (str "  FAIL  " test-name ": " (get outcome :error)))
+                (do (perform :stdout (str "  FAIL  " test-name ": " (get outcome :error)))
                     outcome))))
           tests)
         passed (count (filter (fn [r] (= (get r :status) :pass)) results))
         failed (count (filter (fn [r] (= (get r :status) :fail)) results))
         errors (filter (fn [r] (= (get r :status) :fail)) results)]
-    (println "")
-    (println (str passed " passed, " failed " failed, " (count tests) " total"))
+    (perform :stdout "")
+    (perform :stdout (str passed " passed, " failed " failed, " (count tests) " total"))
     {:passed passed
      :failed failed
      :errors (map (fn [e] {:name (get e :name) :error (get e :error)}) errors)}))

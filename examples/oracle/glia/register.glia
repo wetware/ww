@@ -1,5 +1,5 @@
 ; Demo snippet: register oracle on RPC + HTTP transports.
-(def oracle-wasm (load "bin/oracle.wasm"))
+(def oracle-wasm (perform :load "bin/oracle.wasm"))
 (def oracle-http (cell oracle-wasm))
 
 (def oracle-executor (perform runtime :load oracle-wasm))

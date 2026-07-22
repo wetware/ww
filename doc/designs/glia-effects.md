@@ -8,6 +8,41 @@ Glia's error handling and effect system, implemented in two phases:
 
 The design follows **Approach C (Capability-Effect Fusion):** standard Unison-style algebraic effects where the Membrane is the outermost effect handler. Every capability call is a `perform`. The handler stack mirrors the capability chain.
 
+### Host interaction is explicit; authority is separate
+
+`perform` is Glia's **semantic host-interaction boundary**. Application-visible
+work that leaves Glia must begin with `perform`, including loading source or
+WASM bytes, user-visible output, and ending an interactive session. The
+standard spellings are:
+
+```clojure
+(perform :load "path")       ; bytes from the embedding's loader
+(perform :stdout value)       ; one formatted value and a newline
+(perform :exit nil)           ; request that this embedding end the session
+(perform capability :method args...)
+```
+
+Effects make those operations visible to local handlers, tests, replay, and
+auditing. They do **not** grant or attenuate authority. The capability membrane
+remains the security boundary: it decides which capability references cross a
+boundary and which methods they may call. A local handler can interpose on an
+effect only inside its evaluator; it cannot add rights to a membrane-wrapped
+capability or carry a policy across a process boundary.
+
+The evaluator represents embedding-installed handlers as Rust-only
+`HostEffectHandler` callbacks. They are not Glia values, are never bound in a
+guest `Env`, and cannot be installed, invoked, or passed to `apply` by guest
+code. This keeps host work reachable only through the suspended `perform`
+path. Normal native functions remain available for trusted pure intrinsics and
+continuations. Any future purity inference is conservative: a value is treated
+as effectful unless the evaluator can prove otherwise.
+
+This is a Glia language invariant, not a replacement for the WASI sandbox.
+Non-Glia WASI guest access remains governed by the guest sandbox, its preopens,
+and membrane configuration. For example, a WASI guest may read an allowed path
+through the virtual filesystem; that guest operation is not a Glia `perform`
+and is outside this particular semantic rule.
+
 ## Motivation
 
 ### Errors vs Faults (Hickey's distinction)
@@ -62,9 +97,9 @@ All share one structure: **interposing policy at a boundary** — the same thing
 ;; => {:err {:type :arithmetic :message "division by zero"}}
 
 (try-let [id (perform host :id)]
-  (println "connected:" id)
+  (perform :stdout id)
   (catch e
-    (println "failed:" (:type e))))
+    (perform :stdout (:type e))))
 
 (throw (ex-info "peer unreachable" {:type :network :peer "QmFoo"}))
 
@@ -122,6 +157,10 @@ is given so the doc and the code stay in lockstep.
 - **Async native handlers resume.** A handler backed by an async native function
   resumes the body identically to a synchronous one.
   (`async_native_handler_resumes_body`, `async_native_fn_in_effect_handler`)
+- **Host handlers are Rust-owned and guest-unreachable.** An embedding installs
+  `HostEffectHandler` frames around evaluation; the callback is not a Glia
+  value and no guest `with-effect-handler` or `apply` path can obtain it. This
+  prevents a function-shaped escape hatch around `perform`.
 - **Dynamic (invocation-time) handler stack.** A closure or macro dispatches
   through the handler stack in force at its *invocation/expansion* site, not the
   one ambient at definition time.

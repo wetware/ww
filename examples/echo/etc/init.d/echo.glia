@@ -2,4 +2,4 @@
 ;
 ; Demos are shell-forward by default.
 ; Load snippets from examples/echo/glia/ in ww shell:
-;   (load "glia/register.glia")
+;   (perform :load "glia/register.glia")

@@ -7,6 +7,8 @@
 use crate::error;
 use crate::oneshot;
 use crate::Val;
+use core::future::Future;
+use core::pin::Pin;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -113,6 +115,32 @@ pub struct HandlerContext {
     pub slot: Rc<RefCell<EffectSlot>>,
     /// What this handler handles — keyword or cap target.
     pub target: EffectTarget,
+}
+
+/// Result produced by a Rust-owned default effect handler.
+///
+/// This is deliberately not a Glia value: an embedding may resume the
+/// suspended computation, or abort the top-level evaluation (used by
+/// `:exit`), but guest code can neither construct nor catch the control
+/// outcome.
+#[derive(Clone, Debug)]
+pub enum HostEffectResult {
+    Resume(Val),
+    Exit,
+}
+
+/// Future returned by an embedding-owned host-effect handler.
+pub type HostEffectFuture = Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>;
+
+/// Async callback used by an embedding-owned default effect frame.  These
+/// callbacks never enter the Glia environment and must not re-enter `perform`.
+pub type HostEffectHandler = Rc<dyn Fn(Val) -> HostEffectFuture>;
+
+/// One Rust-owned default effect frame installed around a top-level eval.
+#[derive(Clone)]
+pub struct HostEffect {
+    pub target: EffectTarget,
+    pub handler: HostEffectHandler,
 }
 
 /// The dynamic handler stack — shared across all eval calls in a session.

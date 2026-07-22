@@ -11,4 +11,4 @@
 ;; author can wrap with `(with [(host (perform host :http-client))] ...)`
 ;; — the HttpListener caps propagation landed in #429 makes this real.
 
-(perform host :listen (cell (load "bin/status.wasm")) "/status")
+(perform host :listen (cell (perform :load "bin/status.wasm")) "/status")
