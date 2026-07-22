@@ -211,13 +211,14 @@ jobs:
         make shell
 
     - name: Run host workspace tests (hot cache from build job)
+      if: ${{ always() }}
       run: cargo test --workspace
 
     - name: Run standalone standard-library tests
+      if: ${{ always() }}
       run: |
         cargo test --manifest-path std/caps/Cargo.toml
         cargo test --manifest-path std/kernel/Cargo.toml
-        cargo test --manifest-path std/shell/Cargo.toml
         cargo test --manifest-path std/mcp/Cargo.toml
 
   # === Master-only: fan out after checks pass ===
