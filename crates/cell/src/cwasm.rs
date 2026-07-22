@@ -106,6 +106,17 @@ mod tests {
     }
 
     #[test]
+    fn cache_dir_reflects_env() {
+        // No other test reads WW_CWASM_DIR via cache_dir() (they pass dirs
+        // explicitly), so mutating the process env here doesn't race them.
+        std::env::remove_var(CWASM_DIR_ENV);
+        assert_eq!(cache_dir(), None);
+        std::env::set_var(CWASM_DIR_ENV, "/cwasm");
+        assert_eq!(cache_dir().as_deref(), Some(std::path::Path::new("/cwasm")));
+        std::env::remove_var(CWASM_DIR_ENV);
+    }
+
+    #[test]
     fn artifact_name_is_stable_and_wasm_keyed() {
         let a = sample_wasm();
         assert_eq!(artifact_name(&a), artifact_name(&a));
