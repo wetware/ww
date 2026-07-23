@@ -12,10 +12,10 @@ Source: https://github.com/wetware/ww
 ww run .                          # boot node from current dir
 ww run /ipfs/QmHash               # boot from IPFS CID
 ww run . --mcp                    # run as MCP server (stdin/stdout)
-ww run . --port 2025              # libp2p swarm port (default 2025)
+ww run . --listen /ip4/0.0.0.0/tcp/2025  # libp2p swarm listener
 ww run . --http-listen 0.0.0.0:2080   # WAGI HTTP endpoint
 ww run . --http-dial api.example.com # allow outbound HTTP to host
-ww run . --with-http-admin :2026  # admin endpoint (metrics, /host/id, /host/addrs)
+ww run . --with-http-admin 127.0.0.1:2026  # admin endpoint (default; use off to disable)
 ww run . --identity ~/.ww/identity    # Ed25519 key
 ww run . --stem 0xAddr --rpc-url http://... --ws-url ws://...
                                   # on-chain epoch pipeline
@@ -83,7 +83,7 @@ the cell an MCP server on stdin/stdout.
 | Port | Service |
 |------|---------|
 | 2025 | libp2p swarm |
-| 2026 | HTTP admin (metrics, peer ID, listen addrs) |
+| 2026 | Local HTTP admin (`/healthz`, metrics, peer ID, listen addrs); use `--with-http-admin off` to disable |
 | 2080 | HTTP/WAGI |
 
 ## Develop → deploy

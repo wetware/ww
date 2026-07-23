@@ -66,6 +66,13 @@ fn embedded_loader() -> EmbeddedLoader {
     loader
 }
 
+/// Return the configured local admin listener, or `None` for the explicit
+/// opt-out sentinel. Keep this normalization separate from socket parsing so
+/// CLI and environment input share one tested disable path.
+fn admin_listen_addr(value: String) -> Option<String> {
+    (!value.trim().eq_ignore_ascii_case("off")).then_some(value)
+}
+
 #[derive(Parser)]
 #[command(name = "ww")]
 #[command(about = "Agentic OS for autonomous programs that coordinate across trust boundaries.")]
@@ -216,11 +223,16 @@ enum Commands {
         #[arg(long, default_value = "shared", env = "WW_RUNTIME_CACHE_POLICY")]
         runtime_cache_policy: String,
 
-        /// Enable the HTTP admin endpoint on the given address.
-        /// Serves GET /metrics, GET /host/id, GET /host/addrs.
-        /// Example: --with-http-admin 127.0.0.1:2026
-        #[arg(long, value_name = "ADDR")]
-        with_http_admin: Option<String>,
+        /// Local HTTP admin endpoint. Serves GET /healthz, GET /metrics,
+        /// GET /host/id, and GET /host/addrs. Defaults to localhost only;
+        /// pass `--with-http-admin off` to disable it.
+        #[arg(
+            long,
+            value_name = "ADDR",
+            default_value = "127.0.0.1:2026",
+            env = "WW_HTTP_ADMIN"
+        )]
+        with_http_admin: String,
 
         /// IPFS HTTP API endpoint
         #[arg(long, default_value = "http://localhost:5001", env = "IPFS_API")]
@@ -683,7 +695,7 @@ impl Commands {
                     http_listen,
                     http_dial,
                     runtime_cache_policy,
-                    with_http_admin,
+                    admin_listen_addr(with_http_admin),
                     ipfs_url,
                 )
                 .await
@@ -1618,8 +1630,9 @@ wasip2::cli::command::export!({iface_name}Guest);
             None
         };
 
-        // HTTP admin thread (only when --with-http-admin is provided).
-        // Serves metrics at GET /metrics, host info at GET /host/id and /host/addrs.
+        // Bind the control-plane listener before spawning its service. This
+        // makes an unavailable admin port a startup error rather than a
+        // silently failed background thread.
         let fuel_registry = ww::metrics::new_fuel_registry();
         let rpc_metrics = ww::metrics::new_rpc_metrics();
         let cache_metrics = ww::metrics::new_cache_metrics();
@@ -1628,6 +1641,11 @@ wasip2::cli::command::export!({iface_name}Guest);
             let listen_addr: std::net::SocketAddr = addr
                 .parse()
                 .context("invalid --with-http-admin address (expected host:port)")?;
+            let listener = std::net::TcpListener::bind(listen_addr)
+                .with_context(|| format!("failed to bind --with-http-admin at {listen_addr}"))?;
+            listener
+                .set_nonblocking(true)
+                .context("failed to configure --with-http-admin listener")?;
             let snapshot = network_state.snapshot().await;
             let peer_id = libp2p::PeerId::from_bytes(&snapshot.local_peer_id)
                 .context("invalid peer ID in network state")?
@@ -1635,7 +1653,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             supervisor.try_spawn(
                 "admin",
                 ww::metrics::AdminService {
-                    listen_addr,
+                    listener,
                     peer_id,
                     network_state: network_state.clone(),
                     fuel_registry: fuel_registry.clone(),
@@ -2806,7 +2824,7 @@ mod tests {
             http_listen: None,
             http_dial: Vec::new(),
             runtime_cache_policy: "shared".to_string(),
-            with_http_admin: None,
+            with_http_admin: "off".to_string(),
             ipfs_url: "http://localhost:5001".to_string(),
         };
 
@@ -2824,6 +2842,31 @@ mod tests {
             msg.contains("/etc/identity"),
             "error should include offending target path: {msg}"
         );
+    }
+
+    fn parse_run_admin_addr(args: &[&str]) -> String {
+        match Cli::try_parse_from(args)
+            .expect("parse run command")
+            .command
+        {
+            Commands::Run {
+                with_http_admin, ..
+            } => with_http_admin,
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_admin_defaults_to_localhost() {
+        assert_eq!(parse_run_admin_addr(&["ww", "run"]), "127.0.0.1:2026");
+    }
+
+    #[test]
+    fn run_admin_off_disables_case_insensitively() {
+        for value in ["off", "OFF", " Off "] {
+            let configured = parse_run_admin_addr(&["ww", "run", "--with-http-admin", value]);
+            assert_eq!(admin_listen_addr(configured), None, "{value}");
+        }
     }
 
     #[test]
