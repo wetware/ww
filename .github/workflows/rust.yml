@@ -512,10 +512,15 @@ jobs:
         chmod 600 ~/.ssh/deploy_key
         echo "${{ secrets.DEPLOY_SSH_HOST_KEY }}" > ~/.ssh/known_hosts
 
-        # Get IPFS pod name
-        POD=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl --request-timeout=30s get pod -l app=ipfs-daemon -o jsonpath='{.items[0].metadata.name}'")
-        if [ -z "$POD" ]; then
-          echo "ERROR: failed to discover IPFS daemon pod"
+        # Select a non-terminating Ready pod. Kubernetes can retain an evicted
+        # pod record beside its healthy replacement, and a terminating pod can
+        # remain Running/Ready briefly; a bare label selector may pick either.
+        select_ready_ipfs_pod() {
+          $SSH_CMD ${{ secrets.VPS_SSH }} "kubectl --request-timeout=30s get pod -l app=ipfs-daemon --field-selector=status.phase=Running -o json | jq -r '.items | map(select(.metadata.deletionTimestamp | not) | select(any(.status.conditions[]?; .type == \"Ready\" and .status == \"True\"))) | .[0].metadata.name // empty'"
+        }
+
+        if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
+          echo "ERROR: failed to discover a non-terminating Ready IPFS daemon pod"
           exit 1
         fi
         echo "IPFS pod: $POD"
@@ -588,20 +593,54 @@ jobs:
           cp artifacts/ww-macos-x86_64/ww    "$STAGE/bin/ww/macos/x86_64/ww"
         else
           echo "Host unchanged — fetching previous binaries from IPNS"
-          # Fail loudly: a partial republish would silently regress users.
-          PREV=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs name resolve /ipns/\$(kubectl exec $POD -- ipfs key list -l | grep ww-release | awk '{print \$1}')")
-          if [ -z "$PREV" ]; then
-            echo "ERROR: could not resolve previous IPNS — refusing to publish a partial tree"
+          # Fetch into staging files and replace the release tree only once
+          # every platform is present. A pod may turn over while this branch
+          # runs, so each bounded attempt selects a fresh healthy daemon.
+          fetch_previous_binaries() {
+            local attempt platform prev fetched
+            for attempt in 1 2 3; do
+              if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
+                echo "Previous-release fetch attempt $attempt could not find a non-terminating Ready IPFS daemon pod"
+              elif ! prev=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs name resolve /ipns/\$(kubectl exec $POD -- ipfs key list -l | grep ww-release | awk '{print \$1}')"); then
+                echo "Previous-release fetch attempt $attempt could not resolve the IPNS release through $POD"
+              elif [ -z "$prev" ]; then
+                echo "Previous-release fetch attempt $attempt resolved an empty IPNS release through $POD"
+              else
+                fetched=true
+                for platform in linux/x86_64 linux/aarch64 macos/aarch64 macos/x86_64; do
+                  rm -f "$STAGE/bin/ww/$platform/ww.next"
+                  if ! $SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs cat $prev/bin/ww/$platform/ww" > "$STAGE/bin/ww/$platform/ww.next"; then
+                    echo "Previous-release fetch attempt $attempt failed for $platform from $prev through $POD"
+                    fetched=false
+                    break
+                  fi
+                  chmod +x "$STAGE/bin/ww/$platform/ww.next"
+                done
+                if [ "$fetched" = true ]; then
+                  for platform in linux/x86_64 linux/aarch64 macos/aarch64 macos/x86_64; do
+                    mv "$STAGE/bin/ww/$platform/ww.next" "$STAGE/bin/ww/$platform/ww"
+                  done
+                  echo "Fetched previous binaries from $prev through $POD"
+                  return 0
+                fi
+              fi
+
+              for platform in linux/x86_64 linux/aarch64 macos/aarch64 macos/x86_64; do
+                rm -f "$STAGE/bin/ww/$platform/ww.next"
+              done
+              if [ "$attempt" -lt 3 ]; then
+                backoff=$((attempt * 20))
+                echo "Previous-release fetch attempt $attempt failed; retrying in ${backoff}s..."
+                sleep "$backoff"
+              fi
+            done
+            return 1
+          }
+
+          if ! fetch_previous_binaries; then
+            echo "ERROR: could not fetch every previous-release binary — refusing to publish a partial tree"
             exit 1
           fi
-          for platform in linux/x86_64 linux/aarch64 macos/aarch64 macos/x86_64; do
-            if ! $SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs cat $PREV/bin/ww/$platform/ww" > "$STAGE/bin/ww/$platform/ww"; then
-              echo "ERROR: failed to fetch $platform binary from previous release $PREV"
-              exit 1
-            fi
-            chmod +x "$STAGE/bin/ww/$platform/ww"
-          done
-          echo "Fetched previous binaries from $PREV"
         fi
 
         # Sanity check: every platform binary must exist and be non-empty.
@@ -647,13 +686,20 @@ jobs:
         rsync -a -e "$SSH_CMD" scripts/ipfs_publish_release.sh ${{ secrets.VPS_SSH }}:/tmp/ww-ipfs-publish-release.sh
         for attempt in 1 2 3; do
           echo "Publish attempt $attempt..."
-          if timeout 12m $SSH_CMD ${{ secrets.VPS_SSH }} "
-            set -e
-            chmod +x /tmp/ww-ipfs-publish-release.sh
-            POD='$POD' WW_RELEASE_PIN_RETAIN=10 /tmp/ww-ipfs-publish-release.sh
-          " | tee /tmp/ipfs-publish-output.txt; then
-            published=true
-            break
+          # Re-select immediately before publish: staging can take long enough
+          # for a healthy daemon pod to be replaced between attempts.
+          if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
+            echo "Publish attempt $attempt could not find a non-terminating Ready IPFS daemon pod"
+          else
+            echo "Publishing through IPFS pod: $POD"
+            if timeout 12m $SSH_CMD ${{ secrets.VPS_SSH }} "
+              set -e
+              chmod +x /tmp/ww-ipfs-publish-release.sh
+              POD='$POD' WW_RELEASE_PIN_RETAIN=10 /tmp/ww-ipfs-publish-release.sh
+            " | tee /tmp/ipfs-publish-output.txt; then
+              published=true
+              break
+            fi
           fi
 
           if [ "$attempt" -lt 3 ]; then

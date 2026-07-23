@@ -66,7 +66,37 @@ grep -Fq 'needs: [changes, test, build-binaries, build-wasm, release_image]' "$W
   || fail "IPFS publication must wait for the image build, not a deployment"
 grep -Fq 'name: Publish to IPFS' "$WORKFLOW" \
   || fail "workflow must retain IPFS publication"
-grep -Fq 'get pod -l app=ipfs-daemon' "$WORKFLOW" \
-  || fail "retained VPS transport must target the IPFS publisher, not ww-master"
+grep -Fq 'get pod -l app=ipfs-daemon --field-selector=status.phase=Running -o json | jq -r' "$WORKFLOW" \
+  || fail "IPFS publisher must consider only Running daemon pods"
+grep -Fq 'select(.metadata.deletionTimestamp | not)' "$WORKFLOW" \
+  || fail "IPFS publisher must exclude terminating daemon pods"
+grep -Fq 'any(.status.conditions[]?; .type == \"Ready\" and .status == \"True\")' "$WORKFLOW" \
+  || fail "IPFS publisher must select a Ready daemon pod"
+retry_loop="$({
+  awk '
+    /for attempt in 1 2 3; do/ { in_loop = 1 }
+    in_loop { print }
+    in_loop && /^        done$/ { exit }
+  ' "$WORKFLOW"
+})"
+pod_selection="POD=\"\$(select_ready_ipfs_pod)\""
+grep -Fq "$pod_selection" <<<"$retry_loop" \
+  || fail "IPFS publisher must reselect a Ready daemon pod for each retry"
+publish_retry_selection="$({
+  awk '
+    /Re-select immediately before publish/ { capture = 1 }
+    capture { print }
+    capture && /else/ { exit }
+  ' "$WORKFLOW"
+})"
+grep -Fq "$pod_selection" <<<"$publish_retry_selection" \
+  || fail "IPFS publisher must reselect a Ready daemon pod before each publish retry"
+grep -Fq 'fetch_previous_binaries()' "$WORKFLOW" \
+  || fail "IPFS publisher must retry prior-release binary staging"
+grep -Fq 'if ! fetch_previous_binaries; then' "$WORKFLOW" \
+  || fail "IPFS publisher must fail closed when prior-release staging cannot complete"
+staged_binary="\"\$STAGE/bin/ww/\$platform/ww.next\""
+grep -Fq "$staged_binary" "$WORKFLOW" \
+  || fail "IPFS publisher must stage prior-release binaries atomically"
 
 echo "PASS: ww release workflow builds images without directly deploying ww-master"
