@@ -81,6 +81,15 @@ retry_loop="$({
 })"
 grep -Fq 'POD="$(select_ready_ipfs_pod)"' <<<"$retry_loop" \
   || fail "IPFS publisher must reselect a Ready daemon pod for each retry"
+publish_retry_selection="$({
+  awk '
+    /Re-select immediately before publish/ { capture = 1 }
+    capture { print }
+    capture && /else/ { exit }
+  ' "$WORKFLOW"
+})"
+grep -Fq 'POD="$(select_ready_ipfs_pod)"' <<<"$publish_retry_selection" \
+  || fail "IPFS publisher must reselect a Ready daemon pod before each publish retry"
 grep -Fq 'fetch_previous_binaries()' "$WORKFLOW" \
   || fail "IPFS publisher must retry prior-release binary staging"
 grep -Fq 'if ! fetch_previous_binaries; then' "$WORKFLOW" \
