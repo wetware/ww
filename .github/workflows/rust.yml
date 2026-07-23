@@ -7,7 +7,7 @@ on:
     branches: [ "master", "staging" ]
   workflow_dispatch: {}
 
-# Serialize release-producing runs per ref so deploy + IPNS publish from
+# Serialize release-producing runs per ref so image + IPNS publication from
 # different commits cannot interleave. Queue rather than cancel: every
 # master commit must reach IPNS in commit order.
 concurrency:
@@ -79,8 +79,9 @@ jobs:
       run: |
         bash tests/test_ipfs_release_publish.sh
         bash tests/test_deploy_context.sh
+        bash tests/test_release_workflow.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_deploy_context.sh
+          shellcheck scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_deploy_context.sh tests/test_release_workflow.sh
         fi
 
   clippy:
@@ -362,8 +363,8 @@ jobs:
         path: ${{ matrix.bin_path }}/ww
         retention-days: 1
 
-  deploy:
-    name: Deploy to master.wetware.run
+  release_image:
+    name: Build and publish ww-master image
     if: >-
       github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && github.ref == 'refs/heads/master'
@@ -439,7 +440,7 @@ jobs:
       run: |
         # docker/build-push-action returns when the manifest is pushed, but
         # GHCR's read replicas can lag behind. Confirm the SHA tag is
-        # inspectable before we ask k8s to pull it.
+        # inspectable before an operator promotes its immutable digest.
         echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
         for i in 1 2 3 4 5; do
           if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
@@ -452,85 +453,12 @@ jobs:
         echo "ERROR: image $IMAGE never appeared in GHCR"
         exit 1
 
-    - name: Deploy to VPS
-      env:
-        SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-        SSH_HOST_KEY: ${{ secrets.DEPLOY_SSH_HOST_KEY }}
-        VPS_HOST: 77.90.2.37
-        VPS_USER: lthibault
-        IMAGE: ghcr.io/wetware/ww:master-${{ github.sha }}
-      run: |
-        mkdir -p ~/.ssh
-        echo "$SSH_KEY" > ~/.ssh/deploy_key
-        chmod 600 ~/.ssh/deploy_key
-        echo "$SSH_HOST_KEY" > ~/.ssh/known_hosts
-
-        # Guard: `kubectl set image` + `rollout status` both no-op-succeed
-        # on a zero-replica deployment, which made every deploy from
-        # 2026-06-08 to 2026-07-20 a vacuous success while the site served
-        # 503. A scaled-to-zero target must FAIL the deploy, loudly.
-        # Distinguish "query failed" from "scaled to zero" — set -e does
-        # not propagate out of command substitutions, so check explicitly.
-        if ! REPLICAS=$(ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" \
-          "kubectl get deployment ww-master -o jsonpath='{.spec.replicas}'"); then
-          echo "ERROR: could not query deployment/ww-master (ssh/kubectl"
-          echo "failure above) — cannot verify the deploy target. Check"
-          echo "connectivity and kubectl config on the VPS."
-          exit 1
-        fi
-        if [ -z "$REPLICAS" ] || [ "$REPLICAS" = "0" ]; then
-          echo "ERROR: deployment/ww-master has ${REPLICAS:-no} desired replicas."
-          echo "A rollout against a scaled-to-zero deployment is a no-op;"
-          echo "refusing to report success. Scale it up (kubectl scale"
-          echo "deployment/ww-master --replicas=1) or investigate why it"
-          echo "was scaled down."
-          exit 1
-        fi
-
-        # `kubectl set image` rolls out the SHA-tagged image and is
-        # idempotent — replaces the previous `rollout restart` against the
-        # mutable :master tag, which could pull a node-cached stale image.
-        for attempt in 1 2; do
-          echo "Deploy attempt $attempt..."
-          if ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" \
-            "kubectl set image deployment/ww-master '*=$IMAGE' && \
-             kubectl rollout status deployment/ww-master --timeout=120s"; then
-            echo "Deploy succeeded on attempt $attempt"
-            exit 0
-          fi
-          if [ "$attempt" -lt 2 ]; then
-            echo "Deploy failed, retrying in 30s..."
-            sleep 30
-          fi
-        done
-        echo "Deploy failed after 2 attempts"
-        exit 1
-
-    - name: Verify deployment is serving
-      run: |
-        # `rollout status` passing does not mean the daemon, its init.d
-        # route cells, and the ingress are all reachable. `/status` is
-        # provided by the mounted status cell, so a 200 proves the full path.
-        for i in $(seq 1 12); do
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 \
-            https://master.wetware.run/status || echo 000)
-          echo "probe $i: HTTP $CODE"
-          case "$CODE" in
-            200) echo "status cell is serving"; exit 0 ;;
-            *) sleep 15 ;;
-          esac
-        done
-        echo "ERROR: master.wetware.run/status never returned HTTP 200"
-        echo "The rollout reported success but the full serving path is unhealthy."
-        exit 1
-
   publish:
     name: Publish to IPFS
-    needs: [changes, test, build-binaries, build-wasm, deploy]
+    needs: [changes, test, build-binaries, build-wasm, release_image]
     # Run even if build-binaries was skipped (std-only change).
-    # `deploy` is in `needs` so installer-facing IPNS only flips after the
-    # VPS is serving the new code; on non-master refs deploy is skipped,
-    # which the !failure() && !cancelled() guard below tolerates.
+    # IPFS publication is independent of manual infrastructure promotion for
+    # this POC. The published release may therefore lead or lag production.
     if: >-
       !failure() && !cancelled()
       && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'
