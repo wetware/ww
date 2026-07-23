@@ -89,8 +89,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - **IPFS release publishing ignores stale daemon pods.** The CI publisher now
   selects a non-terminating, Ready IPFS daemon pod before staging or executing
-  a release publish, and reselects one for each retry, rather than attempting
-  `kubectl exec` against the first label-matched pod record.
+  a release publish, and reselects one for each staging or publish retry,
+  rather than attempting `kubectl exec` against the first label-matched pod
+  record.
 - **Production `/status` route is packaged with the deploy image.** The deploy
   context now includes both the status WASM and its init.d registration script
   in the kernel layer, so the post-rollout health check exercises a registered

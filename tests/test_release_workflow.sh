@@ -81,5 +81,11 @@ retry_loop="$({
 })"
 grep -Fq 'POD="$(select_ready_ipfs_pod)"' <<<"$retry_loop" \
   || fail "IPFS publisher must reselect a Ready daemon pod for each retry"
+grep -Fq 'fetch_previous_binaries()' "$WORKFLOW" \
+  || fail "IPFS publisher must retry prior-release binary staging"
+grep -Fq 'if ! fetch_previous_binaries; then' "$WORKFLOW" \
+  || fail "IPFS publisher must fail closed when prior-release staging cannot complete"
+grep -Fq '"$STAGE/bin/ww/$platform/ww.next"' "$WORKFLOW" \
+  || fail "IPFS publisher must stage prior-release binaries atomically"
 
 echo "PASS: ww release workflow builds images without directly deploying ww-master"
