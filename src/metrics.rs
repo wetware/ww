@@ -13,6 +13,8 @@ use std::sync::{Arc, RwLock};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use tokio::sync::watch;
 
+use crate::cell::engine::{WasmtimeCacheMetrics, WasmtimeCacheSnapshot, WasmtimeCacheState};
+
 // ---------------------------------------------------------------------------
 // Per-cell fuel snapshot
 // ---------------------------------------------------------------------------
@@ -174,6 +176,7 @@ struct AdminState {
     rpc_metrics: RpcMetricsRegistry,
     cache_metrics: CacheMetricsRegistry,
     stream_metrics: StreamMetricsRegistry,
+    wasmtime_cache_metrics: WasmtimeCacheMetrics,
 }
 
 /// Render all metrics in Prometheus text exposition format.
@@ -258,6 +261,8 @@ fn render_metrics(state: &AdminState) -> String {
         out.push_str(&format!("ww_cache_entries {}\n", cache.entries));
     }
 
+    render_wasmtime_cache_metrics(&mut out, &state.wasmtime_cache_metrics.snapshot());
+
     // ---- Stream metrics ----
 
     out.push_str(
@@ -279,6 +284,40 @@ fn render_metrics(state: &AdminState) -> String {
     }
 
     out
+}
+
+fn render_wasmtime_cache_metrics(out: &mut String, snapshot: &WasmtimeCacheSnapshot) {
+    out.push_str("# HELP ww_wasmtime_cache_state Wasmtime compilation cache state (one active state has value 1).\n");
+    out.push_str("# TYPE ww_wasmtime_cache_state gauge\n");
+    for state in [
+        WasmtimeCacheState::Enabled,
+        WasmtimeCacheState::Disabled,
+        WasmtimeCacheState::Fallback,
+    ] {
+        let value = u8::from(snapshot.state == state);
+        out.push_str(&format!(
+            "ww_wasmtime_cache_state{{state=\"{}\"}} {value}\n",
+            state.as_str()
+        ));
+    }
+
+    out.push_str(
+        "# HELP ww_wasmtime_cache_hits_total Successful Wasmtime compilation cache loads.\n",
+    );
+    out.push_str("# TYPE ww_wasmtime_cache_hits_total counter\n");
+    out.push_str("# HELP ww_wasmtime_cache_stores_total Successful Wasmtime compilation cache stores; this is not a lookup-miss count.\n");
+    out.push_str("# TYPE ww_wasmtime_cache_stores_total counter\n");
+    out.push_str("# HELP ww_wasmtime_component_compilations_total Calls to ww's canonical Component::from_binary path; persistent-cache hits are included.\n");
+    out.push_str("# TYPE ww_wasmtime_component_compilations_total counter\n");
+    out.push_str(&format!("ww_wasmtime_cache_hits_total {}\n", snapshot.hits));
+    out.push_str(&format!(
+        "ww_wasmtime_cache_stores_total {}\n",
+        snapshot.stores
+    ));
+    out.push_str(&format!(
+        "ww_wasmtime_component_compilations_total {}\n",
+        snapshot.component_compilations
+    ));
 }
 
 /// `GET /metrics` handler.
@@ -364,6 +403,7 @@ pub struct AdminService {
     pub rpc_metrics: RpcMetricsRegistry,
     pub cache_metrics: CacheMetricsRegistry,
     pub stream_metrics: StreamMetricsRegistry,
+    pub wasmtime_cache_metrics: WasmtimeCacheMetrics,
 }
 
 impl crate::services::Service for AdminService {
@@ -381,6 +421,7 @@ impl crate::services::Service for AdminService {
                 rpc_metrics: self.rpc_metrics,
                 cache_metrics: self.cache_metrics,
                 stream_metrics: self.stream_metrics,
+                wasmtime_cache_metrics: self.wasmtime_cache_metrics,
             };
 
             let app = Router::new()
@@ -423,6 +464,7 @@ mod tests {
             rpc_metrics: new_rpc_metrics(),
             cache_metrics: new_cache_metrics(),
             stream_metrics: new_stream_metrics(),
+            wasmtime_cache_metrics: crate::cell::engine::wasmtime_cache_metrics(),
         }
     }
 
@@ -526,6 +568,26 @@ mod tests {
         assert!(output.contains("ww_cache_evictions_total 3"));
         assert!(output.contains("ww_cache_weight_bytes 1048576"));
         assert!(output.contains("ww_cache_entries 100"));
+    }
+
+    #[test]
+    fn renders_wasmtime_cache_metrics() {
+        let mut output = String::new();
+        render_wasmtime_cache_metrics(
+            &mut output,
+            &WasmtimeCacheSnapshot {
+                state: WasmtimeCacheState::Enabled,
+                hits: 42,
+                stores: 7,
+                component_compilations: 49,
+            },
+        );
+        assert!(output.contains("ww_wasmtime_cache_state{state=\"enabled\"} 1"));
+        assert!(output.contains("ww_wasmtime_cache_state{state=\"fallback\"} 0"));
+        assert!(output.contains("ww_wasmtime_cache_hits_total 42"));
+        assert!(output.contains("ww_wasmtime_cache_stores_total 7"));
+        assert!(output.contains("ww_wasmtime_component_compilations_total 49"));
+        assert!(output.contains("stores; this is not a lookup-miss count"));
     }
 
     #[test]

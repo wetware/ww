@@ -86,6 +86,8 @@ ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 | `WW_CELL_MODE` | host | Cell transport mode: `vat`, `raw`, `http`, or absent (kernel) |
 | `IPFS_API` | user | Default IPFS HTTP API endpoint |
 | `WW_HTTP_ADMIN` | user | Admin listener address, or `off` to disable it |
+| `WW_CWASM_DIR` | operator | Optional directory for Wasmtime's native compilation cache. Wasmtime owns artifact compatibility; an unavailable directory falls back to uncached compilation. |
+| `WW_CWASM_CACHE_MAX_BYTES` | operator | Wasmtime cache cleanup threshold in bytes (default: `335544320`). This is a soft limit, so leave filesystem headroom. |
 | `RUST_LOG` | user | Host-side tracing verbosity |
 
 ## ww shell

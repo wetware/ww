@@ -116,10 +116,7 @@ impl RuntimeImpl {
 }
 
 fn build_wasmtime_engine() -> Arc<wasmtime::Engine> {
-    Arc::new(
-        wasmtime::Engine::new(&cell::engine::wasm_engine_config())
-            .expect("failed to create wasmtime engine"),
-    )
+    Arc::new(cell::engine::wasm_engine().expect("failed to create wasmtime engine"))
 }
 
 async fn compile_with_service(
