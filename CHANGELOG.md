@@ -87,10 +87,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`ww shell` "AI agents:" startup hint.** The line `AI agents:  ipfs cat /ipns/releases.wetware.run/.agents/prompt.md` is gone from `src/cli/shell.rs`. The hint pointed at a host-shell command (`ipfs cat`) that's awkward to surface from inside a Glia REPL (the user can't paste it), and the obvious Glia-form rewrite — `(perform fs :read-str "/ipns/…")` — fails today because the WASI fs interceptor (`crates/cell/src/fs_intercept.rs:481-520`) only recognizes `ipfs/<CID>/…` paths (`parse_ipfs_path` at line 72 strips the `ipfs/` prefix; there's no `ipns/` sibling). `/ipfs/<CID>/…` reads through the cap *do* work — `open_ipfs` lazily materializes content from the pinset cache — so a hint pointing at a stable CID would work today; what's missing is IPNS resolution at the intercept layer (or a sibling cap method that calls Kubo `name/resolve` first, then routes through the existing pinset path). Restoring a pasteable Glia-form hint is the natural reward for that follow-up.
 
 ### Fixed
-- **IPFS release publishing ignores stale evicted pods.** The CI publisher now
-  selects a Running IPFS daemon pod and waits for that exact pod to become
-  Ready before staging or executing a release publish, rather than attempting
-  `kubectl exec` against the first label-matched pod record.
+- **IPFS release publishing ignores stale daemon pods.** The CI publisher now
+  selects a non-terminating, Ready IPFS daemon pod before staging or executing
+  a release publish, rather than attempting `kubectl exec` against the first
+  label-matched pod record.
 - **Production `/status` route is packaged with the deploy image.** The deploy
   context now includes both the status WASM and its init.d registration script
   in the kernel layer, so the post-rollout health check exercises a registered
