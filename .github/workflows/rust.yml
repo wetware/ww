@@ -541,8 +541,11 @@ jobs:
         # Select a non-terminating Ready pod. Kubernetes can retain an evicted
         # pod record beside its healthy replacement, and a terminating pod can
         # remain Running/Ready briefly; a bare label selector may pick either.
-        POD=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl --request-timeout=30s get pod -l app=ipfs-daemon --field-selector=status.phase=Running -o json | jq -r '.items | map(select(.metadata.deletionTimestamp | not) | select(any(.status.conditions[]?; .type == \"Ready\" and .status == \"True\"))) | .[0].metadata.name // empty'")
-        if [ -z "$POD" ]; then
+        select_ready_ipfs_pod() {
+          $SSH_CMD ${{ secrets.VPS_SSH }} "kubectl --request-timeout=30s get pod -l app=ipfs-daemon --field-selector=status.phase=Running -o json | jq -r '.items | map(select(.metadata.deletionTimestamp | not) | select(any(.status.conditions[]?; .type == \"Ready\" and .status == \"True\"))) | .[0].metadata.name // empty'"
+        }
+
+        if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
           echo "ERROR: failed to discover a non-terminating Ready IPFS daemon pod"
           exit 1
         fi
@@ -675,13 +678,20 @@ jobs:
         rsync -a -e "$SSH_CMD" scripts/ipfs_publish_release.sh ${{ secrets.VPS_SSH }}:/tmp/ww-ipfs-publish-release.sh
         for attempt in 1 2 3; do
           echo "Publish attempt $attempt..."
-          if timeout 12m $SSH_CMD ${{ secrets.VPS_SSH }} "
-            set -e
-            chmod +x /tmp/ww-ipfs-publish-release.sh
-            POD='$POD' WW_RELEASE_PIN_RETAIN=10 /tmp/ww-ipfs-publish-release.sh
-          " | tee /tmp/ipfs-publish-output.txt; then
-            published=true
-            break
+          # Re-select immediately before publish: staging can take long enough
+          # for a healthy daemon pod to be replaced between attempts.
+          if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
+            echo "Publish attempt $attempt could not find a non-terminating Ready IPFS daemon pod"
+          else
+            echo "Publishing through IPFS pod: $POD"
+            if timeout 12m $SSH_CMD ${{ secrets.VPS_SSH }} "
+              set -e
+              chmod +x /tmp/ww-ipfs-publish-release.sh
+              POD='$POD' WW_RELEASE_PIN_RETAIN=10 /tmp/ww-ipfs-publish-release.sh
+            " | tee /tmp/ipfs-publish-output.txt; then
+              published=true
+              break
+            fi
           fi
 
           if [ "$attempt" -lt 3 ]; then

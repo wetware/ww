@@ -72,5 +72,14 @@ grep -Fq 'select(.metadata.deletionTimestamp | not)' "$WORKFLOW" \
   || fail "IPFS publisher must exclude terminating daemon pods"
 grep -Fq 'any(.status.conditions[]?; .type == \"Ready\" and .status == \"True\")' "$WORKFLOW" \
   || fail "IPFS publisher must select a Ready daemon pod"
+retry_loop="$({
+  awk '
+    /for attempt in 1 2 3; do/ { in_loop = 1 }
+    in_loop { print }
+    in_loop && /^        done$/ { exit }
+  ' "$WORKFLOW"
+})"
+grep -Fq 'POD="$(select_ready_ipfs_pod)"' <<<"$retry_loop" \
+  || fail "IPFS publisher must reselect a Ready daemon pod for each retry"
 
 echo "PASS: ww release workflow builds images without directly deploying ww-master"
