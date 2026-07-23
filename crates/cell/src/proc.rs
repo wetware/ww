@@ -497,7 +497,7 @@ impl Proc {
         let engine = if let Some(engine) = engine {
             engine
         } else {
-            Arc::new(Engine::new(&crate::engine::wasm_engine_config())?)
+            Arc::new(crate::engine::wasm_engine()?)
         };
         let mut linker = Linker::new(&engine);
         add_to_linker_async(&mut linker)?;
@@ -648,22 +648,15 @@ impl Proc {
             Ok(())
         });
 
-        // Instantiate it as a normal component. When no precompiled component
-        // was handed in (pid0 and any spawn without a compile service), go
-        // through the baked `.cwasm` cache: WW_CWASM_DIR hit = deserialize
-        // (~1400x cheaper); miss or mismatch = fresh compile, same as before.
-        // This is the boot-dominant compile path, so bypassing the cache here
-        // forfeits the precompile win exactly where it matters (#587).
+        // Instantiate it as a normal component. The canonical engine has
+        // Wasmtime's optional persistent cache configured, so this path stays
+        // portable while reusing host-local compiled code when available.
         let component = if let Some(component) = component {
             tracing::debug!("Using precompiled guest component");
             component
         } else {
             let start = std::time::Instant::now();
-            let compiled = crate::cwasm::load_or_compile(
-                &engine,
-                &bytecode,
-                crate::cwasm::cache_dir().as_deref(),
-            )?;
+            let compiled = crate::engine::compile_component(&engine, &bytecode)?;
             tracing::debug!(
                 elapsed_ms = start.elapsed().as_millis(),
                 "Guest component ready"
