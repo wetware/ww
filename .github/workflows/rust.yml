@@ -79,8 +79,11 @@ jobs:
       run: |
         bash tests/test_ipfs_release_publish.sh
         bash tests/test_deploy_context.sh
+        bash tests/test_deploy_capacity_check.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_deploy_context.sh
+          shellcheck scripts/ipfs_publish_release.sh scripts/check_deploy_capacity.sh \
+            tests/test_ipfs_release_publish.sh tests/test_deploy_context.sh \
+            tests/test_deploy_capacity_check.sh
         fi
 
   clippy:
@@ -510,6 +513,33 @@ jobs:
           echo "refusing to report success. Scale it up (kubectl scale"
           echo "deployment/ww-master --replicas=1) or investigate why it"
           echo "was scaled down."
+          exit 1
+        fi
+
+        # `ww-master` uses Recreate. Starting a rollout while a node is under
+        # DiskPressure can evict the old pod and leave its replacement blocked
+        # by the NoSchedule taint. Check every candidate node's kubelet view
+        # of root/image filesystem capacity before mutating the Deployment.
+        capacity_ok=false
+        for attempt in 1 2; do
+          echo "Capacity check attempt $attempt..."
+          if capacity_output=$(ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" \
+            'MIN_FREE_BYTES=10737418240 MIN_FREE_PERCENT=25 bash -s' \
+            < scripts/check_deploy_capacity.sh); then
+            printf '%s\n' "$capacity_output"
+            if grep -Fxq "rollout capacity check passed" <<<"$capacity_output"; then
+              capacity_ok=true
+              break
+            fi
+            echo "ERROR: capacity check did not emit its completion sentinel."
+          fi
+          if [ "$attempt" -lt 2 ]; then
+            echo "Capacity check failed, retrying in 10s..."
+            sleep 10
+          fi
+        done
+        if [ "$capacity_ok" != true ]; then
+          echo "ERROR: refusing rollout until node disk pressure is cleared and capacity is restored."
           exit 1
         fi
 
