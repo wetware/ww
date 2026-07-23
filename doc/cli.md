@@ -44,7 +44,7 @@ Layers stack with per-file union; later layers win.
 | `--insecure-ephemeral` | off | Allow ephemeral identity fallback if identity file is missing (insecure; for quick trial runs). |
 | `--http-listen <ADDR>` | none | Enable WAGI HTTP server (e.g. `127.0.0.1:2080`) |
 | `--http-dial <HOST>` | none | Allow outbound HTTP to host. Repeatable. Supports exact hosts, `*.example.com`, or `*`. Without this flag, no http-client capability is granted. |
-| `--with-http-admin <ADDR>` | `127.0.0.1:2026` | Local HTTP admin endpoint (`/healthz`, `/metrics`, `/host/id`, `/host/addrs`); set `off` to disable. Also reads `WW_HTTP_ADMIN`. |
+| `--with-http-admin <ADDR>` | `127.0.0.1:2026` | Local HTTP admin endpoint (`/healthz`, `/metrics`, `/host/id`, `/host/addrs`); set `off` to disable (case-insensitive). Also reads `WW_HTTP_ADMIN`. A non-loopback address exposes unauthenticated host diagnostics. |
 | `--wasm-debug` | off | Enable WASM debug info for guest processes |
 | `--executor-threads <N>` | `0` | Executor worker threads (0 = auto-detect, one per CPU core) |
 | `--runtime-cache-policy` | `shared` | `shared`: same WASM bytes share Executor. `isolated`: always fresh. |
@@ -64,8 +64,8 @@ ww run .
 # HTTP endpoint with outbound access
 ww run . --http-listen 0.0.0.0:2080 --http-dial api.example.com
 
-# Admin metrics + custom port
-ww run . --port 3030 --with-http-admin :2026
+# Admin metrics on a custom local port
+ww run . --with-http-admin 127.0.0.1:3030
 
 # Explicit identity path + image layers
 ww run --identity ~/.ww/identity images/app /ipfs/QmDataLayer
@@ -85,6 +85,7 @@ ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 | `WW_TTY` | host | Set to `1` when stdin is a terminal (triggers interactive shell mode) |
 | `WW_CELL_MODE` | host | Cell transport mode: `vat`, `raw`, `http`, or absent (kernel) |
 | `IPFS_API` | user | Default IPFS HTTP API endpoint |
+| `WW_HTTP_ADMIN` | user | Admin listener address, or `off` to disable it |
 | `RUST_LOG` | user | Host-side tracing verbosity |
 
 ## ww shell

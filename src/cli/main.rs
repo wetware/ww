@@ -66,6 +66,13 @@ fn embedded_loader() -> EmbeddedLoader {
     loader
 }
 
+/// Return the configured local admin listener, or `None` for the explicit
+/// opt-out sentinel. Keep this normalization separate from socket parsing so
+/// CLI and environment input share one tested disable path.
+fn admin_listen_addr(value: String) -> Option<String> {
+    (!value.trim().eq_ignore_ascii_case("off")).then_some(value)
+}
+
 #[derive(Parser)]
 #[command(name = "ww")]
 #[command(about = "Agentic OS for autonomous programs that coordinate across trust boundaries.")]
@@ -688,7 +695,7 @@ impl Commands {
                     http_listen,
                     http_dial,
                     runtime_cache_policy,
-                    (with_http_admin != "off").then_some(with_http_admin),
+                    admin_listen_addr(with_http_admin),
                     ipfs_url,
                 )
                 .await
@@ -2835,6 +2842,31 @@ mod tests {
             msg.contains("/etc/identity"),
             "error should include offending target path: {msg}"
         );
+    }
+
+    fn parse_run_admin_addr(args: &[&str]) -> String {
+        match Cli::try_parse_from(args)
+            .expect("parse run command")
+            .command
+        {
+            Commands::Run {
+                with_http_admin, ..
+            } => with_http_admin,
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_admin_defaults_to_localhost() {
+        assert_eq!(parse_run_admin_addr(&["ww", "run"]), "127.0.0.1:2026");
+    }
+
+    #[test]
+    fn run_admin_off_disables_case_insensitively() {
+        for value in ["off", "OFF", " Off "] {
+            let configured = parse_run_admin_addr(&["ww", "run", "--with-http-admin", value]);
+            assert_eq!(admin_listen_addr(configured), None, "{value}");
+        }
     }
 
     #[test]

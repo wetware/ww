@@ -151,7 +151,7 @@ See [doc/shell.md](doc/shell.md) for the full syntax and capability reference.
 | Port | Service |
 |------|---------|
 | 2025 | libp2p swarm |
-| 2026 | HTTP admin (metrics, peer ID, listen addrs) |
+| 2026 | Local HTTP admin (`/healthz`, metrics, peer ID, listen addrs); disable with `--with-http-admin off` |
 | 2080 | HTTP/WAGI |
 
 ## Publishing a cell

@@ -23,10 +23,10 @@ demo: all
 	@echo "=== Price Oracle Demo ==="
 	@echo ""
 	@echo "Run the oracle service (terminal 1):"
-	@echo "  cargo run -- run --port 2025 crates/kernel examples/oracle"
+	@echo "  cargo run -- run --listen /ip4/127.0.0.1/tcp/2025 --with-http-admin off crates/kernel examples/oracle"
 	@echo ""
 	@echo "Run a consumer (terminal 2):"
-	@echo "  WW_CONSUMER=1 cargo run -- run --port 2026 crates/kernel examples/oracle"
+	@echo "  WW_CONSUMER=1 cargo run -- run --listen /ip4/127.0.0.1/tcp/2026 --with-http-admin off crates/kernel examples/oracle"
 	@echo ""
 
 clean:
