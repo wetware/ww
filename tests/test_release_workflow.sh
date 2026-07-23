@@ -79,7 +79,8 @@ retry_loop="$({
     in_loop && /^        done$/ { exit }
   ' "$WORKFLOW"
 })"
-grep -Fq 'POD="$(select_ready_ipfs_pod)"' <<<"$retry_loop" \
+pod_selection='POD="$(select_ready_ipfs_pod)"'
+grep -Fq "$pod_selection" <<<"$retry_loop" \
   || fail "IPFS publisher must reselect a Ready daemon pod for each retry"
 publish_retry_selection="$({
   awk '
@@ -88,13 +89,14 @@ publish_retry_selection="$({
     capture && /else/ { exit }
   ' "$WORKFLOW"
 })"
-grep -Fq 'POD="$(select_ready_ipfs_pod)"' <<<"$publish_retry_selection" \
+grep -Fq "$pod_selection" <<<"$publish_retry_selection" \
   || fail "IPFS publisher must reselect a Ready daemon pod before each publish retry"
 grep -Fq 'fetch_previous_binaries()' "$WORKFLOW" \
   || fail "IPFS publisher must retry prior-release binary staging"
 grep -Fq 'if ! fetch_previous_binaries; then' "$WORKFLOW" \
   || fail "IPFS publisher must fail closed when prior-release staging cannot complete"
-grep -Fq '"$STAGE/bin/ww/$platform/ww.next"' "$WORKFLOW" \
+staged_binary='"$STAGE/bin/ww/$platform/ww.next"'
+grep -Fq "$staged_binary" "$WORKFLOW" \
   || fail "IPFS publisher must stage prior-release binaries atomically"
 
 echo "PASS: ww release workflow builds images without directly deploying ww-master"
