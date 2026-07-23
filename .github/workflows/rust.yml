@@ -538,10 +538,16 @@ jobs:
         chmod 600 ~/.ssh/deploy_key
         echo "${{ secrets.DEPLOY_SSH_HOST_KEY }}" > ~/.ssh/known_hosts
 
-        # Get IPFS pod name
-        POD=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl --request-timeout=30s get pod -l app=ipfs-daemon -o jsonpath='{.items[0].metadata.name}'")
+        # Select a Running pod before waiting for readiness.  Kubernetes can
+        # retain an evicted pod record beside its healthy replacement; a bare
+        # label selector may return that non-executable record first.
+        POD=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl --request-timeout=30s get pod -l app=ipfs-daemon --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}'")
         if [ -z "$POD" ]; then
-          echo "ERROR: failed to discover IPFS daemon pod"
+          echo "ERROR: failed to discover a Running IPFS daemon pod"
+          exit 1
+        fi
+        if ! $SSH_CMD ${{ secrets.VPS_SSH }} "kubectl --request-timeout=30s wait --for=condition=Ready pod/$POD --timeout=60s"; then
+          echo "ERROR: IPFS daemon pod $POD did not become Ready"
           exit 1
         fi
         echo "IPFS pod: $POD"

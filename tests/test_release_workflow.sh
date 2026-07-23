@@ -66,7 +66,9 @@ grep -Fq 'needs: [changes, test, build-binaries, build-wasm, release_image]' "$W
   || fail "IPFS publication must wait for the image build, not a deployment"
 grep -Fq 'name: Publish to IPFS' "$WORKFLOW" \
   || fail "workflow must retain IPFS publication"
-grep -Fq 'get pod -l app=ipfs-daemon' "$WORKFLOW" \
-  || fail "retained VPS transport must target the IPFS publisher, not ww-master"
+grep -Fq 'get pod -l app=ipfs-daemon --field-selector=status.phase=Running' "$WORKFLOW" \
+  || fail "IPFS publisher must avoid stale non-Running pod records"
+grep -Fq 'wait --for=condition=Ready pod/$POD --timeout=60s' "$WORKFLOW" \
+  || fail "IPFS publisher must wait for its selected pod to become Ready"
 
 echo "PASS: ww release workflow builds images without directly deploying ww-master"
