@@ -44,6 +44,14 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 **Priority:** P2
 **Depends on:** lthibault/ipns-mount-fix branch landed + ww-master deploy verified working
 
+## Revisit automated release promotion after the manual-promotion POC
+**What:** Consider bot-created promotion PRs, artifact attestations, a restricted deploy identity, drift detection, and deliberate auto-merge/rollback criteria only after the manual POC has generated real operational signal.
+**Why:** The POC intentionally favors a small, legible manual digest promotion and Git revert for a personal VPS. The automation would add credentials and failure modes without current product value.
+**Context:** Start from `~/.gstack/projects/wetware-ww/lthibault-gitops-release-promotion-design-20260723.md`, especially "Final Scope Reset: Manual Promotion POC" and "Future Hardening." Do not describe the POC as a security boundary: ww retains its existing VPS/IPFS credential, and IPNS may lead or lag the manually deployed digest. Reassess after a successful promotion/revert plus users, collaborators, multiple services/clusters, or a real drift/security incident.
+**Effort:** M
+**Priority:** P3
+**Depends on:** Manual promotion POC complete
+
 ## Snap v1 — JFS verify + POST + viewer-aware (separate follow-up branch)
 **What:** The deferred half of the Farcaster Snap protocol. Parse `X-Snap-Payload` header, JFS-verify the Ed25519 signature over canonical JSON, extract viewer FID, render personalized response (`Hello, @{handle}`). Add POST handler for button presses (`submit` action), 5s timeout per spec. JFS verification lives at the listener level so future Glia handlers (separate effort) inherit verified-FID context for free.
 **Why:** v0 POC says "Hello, @stranger" to everyone. v1 makes the snap viewer-aware, which is required for any non-trivial use case (counters, forms, anything interactive). Originally promoted to "Phase 1.5 in same PR" then demoted back to a follow-up after user re-anchored: "Overall priority is to ship a proof of concept that snaps can be hosted on ww."
