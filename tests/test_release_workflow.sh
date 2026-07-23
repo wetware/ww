@@ -59,7 +59,7 @@ grep -Fq 'push: true' <<<"$release_job" \
   || fail "image-release job must push the published image"
 grep -Fq 'ghcr.io/wetware/ww:master' <<<"$release_job" \
   || fail "image-release job must retain the master image tag"
-grep -Fq 'ghcr.io/wetware/ww:master-${{ github.sha }}' <<<"$release_job" \
+grep -Fq "ghcr.io/wetware/ww:master-\${{ github.sha }}" <<<"$release_job" \
   || fail "image-release job must retain the commit-addressable image tag"
 
 grep -Fq 'needs: [changes, test, build-binaries, build-wasm, release_image]' "$WORKFLOW" \
