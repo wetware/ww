@@ -59,9 +59,15 @@ mod http_capnp {
 }
 
 #[allow(dead_code)]
-mod chess_capnp {
+pub mod chess_capnp {
     include!(concat!(env!("OUT_DIR"), "/chess_capnp.rs"));
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod chess_authority;
+
+#[cfg(not(target_arch = "wasm32"))]
+authority::impl_terminal_session_pipeline!(chess_capnp::chess_engine::Client);
 
 // Build-time schema constants: CHESS_ENGINE_SCHEMA (&[u8]) and CHESS_ENGINE_CID (&str).
 // Vat publication uses the service name below; the schema CID is metadata.

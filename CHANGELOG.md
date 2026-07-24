@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Rust-native Chess identity-to-authority proof policy.** The Chess example
+  now exposes a host-side `ChessAuthorization` policy mapping verified Terminal
+  signing keys to typed Reader or Player method profiles. Every successful
+  login creates a new membrane boundary over the same underlying game, guarded
+  by both the current runtime epoch and a key-scoped targeted-revocation handle.
+  The in-process two-party RPC proof shows an unknown key receives no session,
+  Reader can observe but not move, Player can move, Reader observes Player's
+  shared state change, targeted Reader revocation leaves Player operational,
+  and an epoch advance expires an established Player session. Proof calls have
+  explicit application-owned deadlines.
 - **Bounded inbound RPC admission and Terminal login deadlines.** Inbound raw
   Cap'n Proto, Terminal, vat, and stream serving paths now acquire an RAII
   connection permit before spawning per-connection work, rejecting excess

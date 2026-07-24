@@ -1467,11 +1467,15 @@ dependencies = [
 name = "chess"
 version = "0.1.0"
 dependencies = [
+ "auth",
  "capnp",
  "capnp-rpc",
  "capnpc",
+ "ed25519-dalek",
  "futures",
  "hex",
+ "libp2p-core",
+ "libp2p-identity",
  "log",
  "rand 0.9.4",
  "schema-id",
@@ -1481,6 +1485,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "wasip2",
+ "wetware-authority",
  "wetware-membrane",
 ]
 
