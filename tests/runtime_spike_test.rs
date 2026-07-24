@@ -5,13 +5,9 @@
 //!
 //! Spike 1: Fuel + LocalSet interleaving
 //! Spike 2: Cap'n Proto RPC on shared LocalSet
-//! Spike 3: WASM compilation off the executor thread
 //!
 //! Requires pre-built echo WASM at examples/echo/bin/echo.wasm.
 //! Build: make echo
-
-use std::sync::Arc;
-use std::time::Instant;
 
 use tokio::sync::mpsc;
 
@@ -200,91 +196,6 @@ async fn spike2_two_rpc_systems_on_shared_localset() {
             assert!(wait_b.is_ok(), "cell B should still be reachable via RPC");
         })
         .await;
-}
-
-// =========================================================================
-// Spike 3: WASM compilation off the executor thread
-// =========================================================================
-//
-// Measures Component::from_binary compilation time and validates that
-// compilation can happen on a dedicated thread, with only the compiled
-// Component (or pre-instantiated module) sent back to the executor.
-//
-// This doesn't require a running cell — just wasmtime compilation.
-
-#[tokio::test]
-async fn spike3_wasm_compilation_off_thread() {
-    let wasm = match load_echo_wasm() {
-        Some(w) => w,
-        None => {
-            eprintln!("SKIP: echo WASM not built (run `make echo`)");
-            return;
-        }
-    };
-
-    // Measure inline compilation time (current approach).
-    let mut config = wasmtime::Config::new();
-    config.consume_fuel(true);
-    let engine = Arc::new(wasmtime::Engine::new(&config).unwrap());
-
-    let inline_start = Instant::now();
-    let _component = wasmtime::component::Component::from_binary(&engine, &wasm).unwrap();
-    let inline_duration = inline_start.elapsed();
-    eprintln!(
-        "spike3: inline compilation took {:?} (this blocks the executor thread)",
-        inline_duration
-    );
-
-    // Validate off-thread compilation: compile on a background thread,
-    // send the serialized module back via oneshot.
-    let engine2 = engine.clone();
-    let wasm2 = wasm.clone();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-
-    let offthread_start = Instant::now();
-    std::thread::spawn(move || {
-        let component = wasmtime::component::Component::from_binary(&engine2, &wasm2).unwrap();
-        // Serialize the compiled component so it can be deserialized on
-        // the executor thread without re-compiling.
-        let serialized = component.serialize().unwrap();
-        let _ = tx.send(serialized);
-    });
-
-    let serialized = rx.await.expect("compilation thread panicked");
-    let offthread_duration = offthread_start.elapsed();
-    eprintln!(
-        "spike3: off-thread compile + serialize took {:?}",
-        offthread_duration
-    );
-
-    // Deserialize on the "executor thread" (this thread).
-    let deser_start = Instant::now();
-    // SAFETY: We just serialized this component from the same engine
-    // configuration. In production, we'd validate the engine config matches.
-    let _deserialized =
-        unsafe { wasmtime::component::Component::deserialize(&engine, &serialized) }.unwrap();
-    let deser_duration = deser_start.elapsed();
-    eprintln!(
-        "spike3: deserialize on executor thread took {:?} (this is what cells would pay)",
-        deser_duration
-    );
-
-    // The key assertion: deserialization should be much faster than compilation.
-    // Compilation is O(WASM size), deserialization is O(native code size) with
-    // just mmap. For a typical cell, expect 10-100x speedup.
-    assert!(
-        deser_duration < inline_duration,
-        "deserialize ({:?}) should be faster than compile ({:?})",
-        deser_duration,
-        inline_duration,
-    );
-
-    eprintln!(
-        "spike3: speedup = {:.1}x (compile {:?} vs deserialize {:?})",
-        inline_duration.as_secs_f64() / deser_duration.as_secs_f64().max(0.000001),
-        inline_duration,
-        deser_duration,
-    );
 }
 
 // =========================================================================

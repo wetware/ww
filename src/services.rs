@@ -15,7 +15,6 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -187,7 +186,7 @@ impl ExecutorPool {
         // all workers share this Engine so Engine::increment_epoch() reaches
         // every Store's epoch_deadline_callback.
         let engine = Arc::new(
-            Engine::new(&cell::engine::wasm_engine_config())
+            cell::engine::wasm_engine()
                 .map_err(|e| anyhow::anyhow!("failed to create shared wasmtime engine: {e}"))?,
         );
 
@@ -619,8 +618,8 @@ fn compile_worker_count() -> usize {
     }
 }
 
-/// Dedicated compilation thread that offloads CPU-heavy `Component::from_binary`
-/// away from executor worker threads.
+/// Dedicated component-load thread that offloads cache misses in
+/// `Component::from_binary` away from executor worker threads.
 ///
 /// Caches compiled components by `(wasm_blake3, engine identity)` and deduplicates
 /// concurrent compiles of the same key.
@@ -644,15 +643,7 @@ impl Service for CompilationService {
             > = HashMap::new();
 
             let worker_count = compile_worker_count();
-            // Baked `.cwasm` directory (shared, read-only). Resolved once so a
-            // mid-run env change can't split the pool. `None` on dev boxes
-            // where WW_CWASM_DIR is unset — every compile then hits Cranelift.
-            let cwasm_dir: Option<Arc<PathBuf>> = cell::cwasm::cache_dir().map(Arc::new);
-            tracing::info!(
-                workers = worker_count,
-                cwasm_dir = ?cwasm_dir.as_deref(),
-                "starting compile worker pool"
-            );
+            tracing::info!(workers = worker_count, "starting compile worker pool");
 
             let (job_tx, job_rx) = std::sync::mpsc::channel::<CompileJob>();
             let job_rx = Arc::new(Mutex::new(job_rx));
@@ -662,7 +653,6 @@ impl Service for CompilationService {
             for idx in 0..worker_count {
                 let job_rx = Arc::clone(&job_rx);
                 let outcome_tx = outcome_tx.clone();
-                let cwasm_dir = cwasm_dir.clone();
                 match std::thread::Builder::new()
                     .name(format!("compiler-worker-{idx}"))
                     .spawn(move || {
@@ -683,20 +673,14 @@ impl Service for CompilationService {
                             };
 
                             let start = std::time::Instant::now();
-                            // Prefer a baked `.cwasm`; falls back to a fresh
-                            // Cranelift compile on any miss or mismatch.
-                            let result = cell::cwasm::load_or_compile(
-                                &job.engine,
-                                &job.bytecode,
-                                cwasm_dir.as_deref().map(|p| p.as_path()),
-                            )
-                            .map_err(|e| e.to_string());
+                            let result = cell::engine::compile_component(&job.engine, &job.bytecode)
+                                .map_err(|e| e.to_string());
                             if let Ok(ref _component) = result {
                                 tracing::info!(
                                     ?job.key.wasm_hash,
                                     engine_id = job.key.engine_id,
                                     elapsed_ms = start.elapsed().as_millis(),
-                                    "compiled component"
+                                    "loaded component through Wasmtime cache"
                                 );
                             }
 

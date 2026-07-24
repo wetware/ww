@@ -106,30 +106,6 @@ enum Commands {
         path: PathBuf,
     },
 
-    /// Precompile wasm components into `.cwasm` artifacts.
-    ///
-    /// Booting compiles every component from scratch (Cranelift), so a restart
-    /// loop is a sustained-CPU signature. Baking `.cwasm` into the deploy image
-    /// and pointing WW_CWASM_DIR at it lets boot `deserialize` instead —
-    /// ~1400× cheaper per component. Artifacts are named `<blake3(wasm)>.cwasm`
-    /// so the runtime finds them by the same key its compile cache uses.
-    ///
-    /// The engine config here is identical to the runtime's; an artifact that
-    /// later fails to load (version/ISA skew) degrades to a fresh compile, not
-    /// a crash. Compile on the same platform family as the deploy target.
-    ///
-    /// Example:
-    ///   ww compile std/kernel.wasm std/shell.wasm --out-dir dist/cwasm
-    Compile {
-        /// Wasm component file(s) to precompile.
-        #[arg(value_name = "WASM", required = true)]
-        inputs: Vec<PathBuf>,
-
-        /// Directory to write `.cwasm` artifacts into (created if absent).
-        #[arg(long = "out-dir", value_name = "DIR")]
-        out_dir: PathBuf,
-    },
-
     /// Run a wetware environment.
     ///
     /// Every positional argument is a mount source mounted at `/` (image layer).
@@ -645,7 +621,6 @@ impl Commands {
         match self {
             Commands::Init { name } => Self::init(name).await,
             Commands::Build { path } => Self::build(path).await,
-            Commands::Compile { inputs, out_dir } => Self::compile(inputs, out_dir).await,
             Commands::Run {
                 mounts: mount_args,
                 listen,
@@ -1064,33 +1039,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         println!("  2. Implement the server in src/lib.rs");
         println!("  3. ww build {name}");
         println!("  4. ww run std/kernel {name}");
-        Ok(())
-    }
-
-    /// Build a guest project, placing artifacts in bin/
-    /// Precompile wasm components to `.cwasm` artifacts in `out_dir`.
-    ///
-    /// Uses the shared runtime engine config so the runtime's `deserialize`
-    /// path accepts the output. Every input must compile; a bad wasm is a hard
-    /// error (CI must not silently ship a partial artifact set).
-    async fn compile(inputs: Vec<PathBuf>, out_dir: PathBuf) -> Result<()> {
-        let engine = ww::cell::engine::wasm_engine().map_err(|e| {
-            anyhow::anyhow!("failed to create wasmtime engine for compilation: {e}")
-        })?;
-
-        for input in &inputs {
-            let wasm = std::fs::read(input)
-                .with_context(|| format!("failed to read wasm input: {}", input.display()))?;
-            let path = ww::cell::cwasm::compile_to_dir(&engine, &wasm, &out_dir)
-                .map_err(|e| anyhow::anyhow!("failed to precompile {}: {e}", input.display()))?;
-            println!("{} -> {}", input.display(), path.display());
-        }
-
-        println!(
-            "Precompiled {} component(s) into {}",
-            inputs.len(),
-            out_dir.display()
-        );
         Ok(())
     }
 
@@ -1637,6 +1585,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         let rpc_metrics = ww::metrics::new_rpc_metrics();
         let cache_metrics = ww::metrics::new_cache_metrics();
         let stream_metrics = ww::metrics::new_stream_metrics();
+        let wasmtime_cache_metrics = ww::cell::engine::wasmtime_cache_metrics();
         if let Some(ref addr) = with_http_admin {
             let listen_addr: std::net::SocketAddr = addr
                 .parse()
@@ -1660,6 +1609,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                     rpc_metrics: rpc_metrics.clone(),
                     cache_metrics: cache_metrics.clone(),
                     stream_metrics: stream_metrics.clone(),
+                    wasmtime_cache_metrics: wasmtime_cache_metrics.clone(),
                 },
             )?;
         }

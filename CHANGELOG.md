@@ -63,7 +63,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   admin endpoint on `127.0.0.1:2026` by default, including `GET /healthz` for
   future distroless exec probes. Override the bind address with
   `--with-http-admin`; pass `off` to disable it.
-- **`ww compile` + baked `.cwasm` boot cache (reliability slice 1).** New `ww compile <WASM>... --out-dir <DIR>` subcommand serializes wasm components to `<blake3(wasm)>.cwasm` artifacts. At boot the compile service loads a baked artifact from `WW_CWASM_DIR` (deserialize, ~1400× cheaper than a fresh Cranelift compile) keyed by the same blake3 the runtime cache uses, and falls back to a fresh compile on any miss or mismatch (absent, unreadable, version/ISA skew, truncation) so a stale or wrong artifact degrades to compile-on-boot rather than failing a boot. CI bakes kernel+shell `.cwasm` into the deploy image at `/cwasm`. The wasmtime engine config is centralized in one place (`cell::engine`) so producer and runtime configs cannot drift. `--executor-threads` gains a `WW_EXECUTOR_THREADS` env (auto-detect reads node cores, not the cgroup quota, so it over-subscribes under a k8s CPU limit during the compile-heavy boot window). Removes ~46% of per-boot CPU — the compile-on-every-boot cost that turned a CrashLoopBackOff into a sustained-CPU throttle signature.
+- **Wasmtime-managed persistent compilation cache (reliability slice 1 correction).** `ww` now delegates component-cache format, compatibility, and cleanup to Wasmtime. `WW_CWASM_DIR` selects an optional host-local cache directory and `WW_CWASM_CACHE_MAX_BYTES` sets its soft cleanup threshold (default 320 MiB). The process shares one cache policy across all canonical engines; invalid or unwritable cache configuration logs a warning and compiles uncached instead of blocking boot. Removed `ww compile`, custom `.cwasm` serialization/deserialization, and CI-produced native artifacts from the image. The local metrics endpoint reports cache state, successful loads and stores, and component compilation counts.
 - **Effect tracing + capability test harness (roadmap G3/G4).** `GLIA_TRACE_EFFECTS=1` traces the perform lifecycle to stderr (dispatch target + stack depth + match, resume values, and a handler-stack dump on unhandled effects) for debugging effect routing. `ww/test` gains a capability harness: `stub-handler` (canned replies scoped via `with-effect-handler`, unstubbed methods fail closed) and `recorder` (records `(:method args...)` payloads into an atom, then delegates — replay-style record/verify testing).
 - **`ww/policy` stdlib module: interposition handler patterns (P1).** New Glia module with policy-pattern effect handlers — `audit` (log + delegate), `mock` (canned replies, unstubbed methods fail closed), `budget` (at most n delegated calls, then structured denial), and `attenuate-handler` (sugar over `(attenuate ...)`, the explicit bridge from local interposition to membrane-enforced boundary authority). Enabled by two new glia primitives: `(perform* target payload)` — apply-style perform so a generic handler can delegate its `(:method args...)` payload without knowing the arity — and Clojure-style atoms (`atom`/`deref`/`reset!`), identity-compared evaluator-local mutable cells (a pinned-semantics test documents that `def` inside a closure cannot provide cross-invocation state). `retry` (delegate, re-attempt on throw up to n times) ships too, enabled by the closure macro-capture fix — the "try inside a handler yields nil" failure that originally blocked it.
 - **`wetware-membrane` crate: hook-level capability attenuation.** New workspace crate implementing a schema-agnostic capability membrane on `capnp`'s `ClientHook`: calls are filtered by `(interfaceId, ordinal)` at the hook level (unbypassable by casting — typed clients, casts, and promise pipelines all bottom out in the same wrapped hook), and capabilities in results, promise pipelines, and promise resolution are recursively re-wrapped. `Policy` is a trait with three reference implementations — `Allowlist` (stateless allow/deny), `RevocablePolicy` (revoke switch), and `RateLimit` (fixed-window counter; rate-limit-as-capability) — so one enforcement mechanism serves multiple attenuation strategies. Denials carry a stable marker plus the denied method key for structured error routing. Not yet wired into the public ABI; the Export cutover lands separately.
@@ -98,6 +98,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `crates/authority`), while the hook-level call-filtering crate is now
   `wetware-membrane` (`membrane`, `crates/membrane`). This is a mechanical,
   pre-alpha package/import rename with no runtime or wire behavior change.
+- **Removed the dormant `std/mcp` WASM adapter.** `ww shell --mcp` has been
+  the sole shipping MCP runtime since the process-local cutover; the unused
+  guest crate, its standalone build files, and its CI-only test invocation are
+  now gone. Shared MCP/Glia adapter helpers remain in `std/caps` for the live
+  process-local implementation.
+- **ww-master promotion is now manual.** CI still builds and publishes the
+  immutable ww image plus the IPFS release tree, but no longer mutates the
+  production Deployment. Operators promote a digest through the infra
+  Kustomize declaration, which records the running image in Git and makes
+  rollback a normal Git revert. IPNS publication may temporarily lead or lag
+  the manually promoted production image during this personal-POC phase.
 - **Glia host interaction is now effect-gated (pre-alpha breaking change).**
   Standard host operations are explicit `(perform :load path)`, `(perform
   :stdout value)`, and `(perform :exit nil)` effects owned by the embedding;
@@ -160,6 +171,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`ww shell` "AI agents:" startup hint.** The line `AI agents:  ipfs cat /ipns/releases.wetware.run/.agents/prompt.md` is gone from `src/cli/shell.rs`. The hint pointed at a host-shell command (`ipfs cat`) that's awkward to surface from inside a Glia REPL (the user can't paste it), and the obvious Glia-form rewrite — `(perform fs :read-str "/ipns/…")` — fails today because the WASI fs interceptor (`crates/cell/src/fs_intercept.rs:481-520`) only recognizes `ipfs/<CID>/…` paths (`parse_ipfs_path` at line 72 strips the `ipfs/` prefix; there's no `ipns/` sibling). `/ipfs/<CID>/…` reads through the cap *do* work — `open_ipfs` lazily materializes content from the pinset cache — so a hint pointing at a stable CID would work today; what's missing is IPNS resolution at the intercept layer (or a sibling cap method that calls Kubo `name/resolve` first, then routes through the existing pinset path). Restoring a pasteable Glia-form hint is the natural reward for that follow-up.
 
 ### Fixed
+- **Installer-facing IPNS releases can no longer roll back to older Git
+  revisions through CI.** Release trees now carry their full master commit SHA,
+  CI retains up to GitHub's 100-run concurrency limit, and the publisher checks
+  Git ancestry before moving `ww-release`. Equal revisions are a no-op; stale,
+  divergent, malformed, and non-master revisions fail closed. The remote
+  publisher also rechecks the previously observed CID immediately before
+  updating IPNS, so pointer changes during staging or retry fail closed.
+- **IPFS release publishing ignores stale daemon pods.** The CI publisher now
+  selects a non-terminating, Ready IPFS daemon pod before staging or executing
+  a release publish, and reselects one for each staging or publish retry,
+  rather than attempting `kubectl exec` against the first label-matched pod
+  record.
 - **Production `/status` route is packaged with the deploy image.** The deploy
   context now includes both the status WASM and its init.d registration script
   in the kernel layer, so the post-rollout health check exercises a registered

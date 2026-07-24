@@ -41,16 +41,29 @@ grep -Fq 'tar -C "$REMOTE_RELEASE_TREE" -cf - .' "$PUBLISH_SCRIPT" \
 # shellcheck disable=SC2016
 grep -Fq 'k exec -i "$POD"' "$PUBLISH_SCRIPT" \
   || fail "release script must unpack the release tree through kubectl exec stdin"
+grep -Fq 'WW_RELEASE_EXPECTED_CURRENT is required' "$PUBLISH_SCRIPT" \
+  || fail "release script must require the previously observed IPNS release"
+# shellcheck disable=SC2016
+grep -Fq 'current_release="$(resolve_ww_release' "$PUBLISH_SCRIPT" \
+  || fail "release script must re-resolve IPNS immediately before publishing"
+# shellcheck disable=SC2016
+grep -Fq 'current_release" != "$EXPECTED_CURRENT' "$PUBLISH_SCRIPT" \
+  || fail "release script must fail when the IPNS compare-and-set precondition changes"
 
 pin_add_line="$(line_number "ipfs pin add '\$CID'" "$PUBLISH_SCRIPT")"
+# shellcheck disable=SC2016
+cas_line="$(line_number 'current_release="$(resolve_ww_release' "$PUBLISH_SCRIPT")"
 publish_line="$(line_number "ipfs name publish --key=ww-release '/ipfs/\$CID'" "$PUBLISH_SCRIPT")"
 pin_rm_line="$(line_number "ipfs pin rm \"\$stale\"" "$PUBLISH_SCRIPT")"
 
 [ -n "$pin_add_line" ] || fail "release script missing explicit pin add"
+[ -n "$cas_line" ] || fail "release script missing IPNS compare-and-set check"
 [ -n "$publish_line" ] || fail "release script missing IPNS publish"
 [ -n "$pin_rm_line" ] || fail "release script missing stale pin removal"
 [ "$pin_add_line" -lt "$publish_line" ] \
   || fail "release script must pin the new CID before publishing IPNS"
+[ "$cas_line" -lt "$publish_line" ] \
+  || fail "release script must re-check the current IPNS release before publishing"
 [ "$publish_line" -lt "$pin_rm_line" ] \
   || fail "release script must not remove stale pins before IPNS publish succeeds"
 
@@ -66,6 +79,27 @@ grep -Fq 'Repo size before' "$WORKFLOW" \
   || fail "workflow summary must include repo stat before publish"
 grep -Fq 'Repo size after' "$WORKFLOW" \
   || fail "workflow summary must include repo stat after cleanup"
+grep -Fq 'queue: max' "$WORKFLOW" \
+  || fail "release concurrency must retain every pending master run"
+publish_job="$({
+  awk '
+    /^  publish:/ { in_job = 1; print; next }
+    in_job && /^  [[:alnum:]_-]+:/ { exit }
+    in_job { print }
+  ' "$WORKFLOW"
+})"
+grep -Fq 'fetch-depth: 0' <<<"$publish_job" \
+  || fail "release ancestry checks require full Git history"
+grep -Fq 'scripts/check_release_ancestry.sh' "$WORKFLOW" \
+  || fail "workflow must enforce Git ancestry before publishing IPNS"
+# shellcheck disable=SC2016
+grep -Fq 'echo "${{ github.sha }}" > "$STAGE/REVISION"' "$WORKFLOW" \
+  || fail "published release trees must record their Git revision"
+grep -Fq "WW_RELEASE_EXPECTED_CURRENT='\$CURRENT_RELEASE'" "$WORKFLOW" \
+  || fail "workflow must pass the observed IPNS release into the remote compare-and-set check"
+exact_key_matches="$(grep -Fc "awk '\\\$2 == \\\"ww-release\\\" { print \\\$1; exit }'" "$WORKFLOW")"
+[ "$exact_key_matches" -eq 2 ] \
+  || fail "workflow must select the ww-release key exactly in both read paths"
 
 grep -Fq 'ipfs add --pin=false -r --cid-version=1 -Q' "$MAKEFILE" \
   || fail "publish-std must disable implicit ipfs add pinning"

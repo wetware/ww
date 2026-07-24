@@ -76,7 +76,7 @@ impl EmbeddedLoader {
     /// Register an embedded WASM blob under the given path suffix.
     ///
     /// The path should be the FHS-relative path within the image,
-    /// e.g. `"kernel/bin/main.wasm"` or `"mcp/bin/main.wasm"`.
+    /// e.g. `"kernel/bin/main.wasm"` or `"status/bin/status.wasm"`.
     pub fn insert(mut self, suffix: &'static str, bytes: &'static [u8]) -> Self {
         self.entries.insert(suffix, bytes);
         self
