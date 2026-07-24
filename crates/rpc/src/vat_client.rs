@@ -9,12 +9,12 @@
 
 use std::time::Duration;
 
+use authority::EpochGuard;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use libp2p::PeerId;
-use membrane::EpochGuard;
 
-use membrane::system_capnp;
+use authority::system_capnp;
 
 /// Timeout for establishing the libp2p stream to a remote peer.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);

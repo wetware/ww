@@ -41,6 +41,7 @@ fn main() {
             ("VAT_LISTENER", 0xd64b_e194_6f81_a365),
             ("VAT_CLIENT", 0xa08a_8e8f_90a8_2679),
             ("IDENTITY", 0xa7c2_00e5_b472_6d89),
+            ("AUTHORITY", 0xd119_09df_3e52_3d41),
             ("HTTP_CLIENT", 0xf00a_15d0_9fb8_f360),
         ],
     )

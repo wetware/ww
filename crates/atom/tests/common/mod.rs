@@ -13,8 +13,8 @@ use tokio::time::sleep;
 use atom::auth_capnp;
 use atom::system_capnp;
 use atom::{EpochGuard, GraftBuilder};
-use membrane::http_capnp;
-use membrane::routing_capnp;
+use authority::http_capnp;
+use authority::routing_capnp;
 
 // ---------------------------------------------------------------------------
 // Stub runtime + executor + session builder for epoch-guarded capability tests

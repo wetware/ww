@@ -184,7 +184,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::{build_peer_rpc, NetworkState, SwarmCommand};
-    use membrane::system_capnp;
+    use authority::system_capnp;
     use tokio::io;
     use tokio::sync::mpsc;
     use tokio_util::compat::TokioAsyncWriteCompatExt;

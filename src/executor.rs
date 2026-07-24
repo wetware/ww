@@ -1,12 +1,14 @@
 use anyhow::{anyhow, Context, Result};
+use authority::{Epoch, Provenance};
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
 use ed25519_dalek::SigningKey;
 use futures::FutureExt;
 use libp2p::StreamProtocol;
-use membrane::{Epoch, Provenance};
+use std::future::Future;
 use std::io::IsTerminal;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{stderr, stdout, AsyncWriteExt};
@@ -22,6 +24,12 @@ use rpc::graft::GuestMembrane;
 use rpc::NetworkState;
 
 const CAPNP_PROTOCOL: StreamProtocol = StreamProtocol::new("/ww/0.1.0");
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalPreAuthOutcome {
+    Authenticated,
+    ConnectionClosed,
+    LoginTimedOut,
+}
 
 /// Builder for constructing a [`Cell`].
 ///
@@ -750,10 +758,27 @@ async fn accept_capnp_streams(mut control: libp2p_stream::Control, membrane: Gue
         }
     };
     tracing::info!(protocol = %CAPNP_PROTOCOL, "Accepting capnp streams");
+    let budget = rpc::inbound_connection_budget();
     use futures::StreamExt;
-    while let Some((_peer_id, stream)) = incoming.next().await {
+    while let Some((peer_id, stream)) = incoming.next().await {
+        let permit = match budget.try_acquire() {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(
+                    %peer_id,
+                    capacity = error.capacity,
+                    active = budget.active(),
+                    "rejecting raw Cap'n Proto connection: connection budget exhausted"
+                );
+                drop(stream);
+                continue;
+            }
+        };
         let m = membrane.clone();
-        tokio::task::spawn_local(serve_one_capnp_stream(stream, m));
+        tokio::task::spawn_local(async move {
+            let _permit = permit;
+            serve_one_capnp_stream(stream, m).await;
+        });
     }
 }
 
@@ -787,17 +812,35 @@ async fn accept_terminal_streams(
     };
     let vk = signing_key.verifying_key();
     tracing::info!(protocol = %CAPNP_PROTOCOL, "Accepting Terminal-gated streams");
+    let budget = rpc::inbound_connection_budget();
     use futures::StreamExt;
     while let Some((peer_id, stream)) = incoming.next().await {
         tracing::debug!(%peer_id, "Terminal stream accepted");
+        let permit = match budget.try_acquire() {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(
+                    %peer_id,
+                    capacity = error.capacity,
+                    active = budget.active(),
+                    "rejecting Terminal connection: connection budget exhausted"
+                );
+                drop(stream);
+                continue;
+            }
+        };
         let m = membrane.clone();
         let erx = epoch_rx.clone();
-        tokio::task::spawn_local(serve_one_terminal_stream(stream, m, vk, erx));
+        tokio::task::spawn_local(async move {
+            let _permit = permit;
+            serve_one_terminal_stream(stream, m, vk, erx).await;
+        });
     }
 }
 
 /// Serve a single libp2p stream behind a Terminal auth gate.  The remote peer
-/// bootstraps a `Terminal<membrane::Owned>` and must `login(signer)` to receive
+/// bootstraps a `Terminal<membrane_capnp::membrane::Owned>` and must
+/// `login(signer)` to receive
 /// the underlying membrane.
 async fn serve_one_terminal_stream(
     stream: libp2p::Stream,
@@ -805,27 +848,93 @@ async fn serve_one_terminal_stream(
     vk: ed25519_dalek::VerifyingKey,
     epoch_rx: watch::Receiver<Epoch>,
 ) {
+    use authority::TerminalServer;
     use futures::AsyncReadExt;
-    use membrane::TerminalServer;
 
+    let (granted_tx, granted_rx) = tokio::sync::oneshot::channel();
     let terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
         vk,
         membrane,
         auth::SigningDomain::terminal_membrane(),
         epoch_rx,
-    );
+    )
+    .with_grant_notifier(granted_tx);
     let terminal_client: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
         capnp_rpc::new_client(terminal);
 
     let (reader, writer) = Box::pin(stream).split();
     let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
     let rpc_system = RpcSystem::new(Box::new(network), Some(terminal_client.client));
-    let _ = rpc_system.await;
+    tokio::pin!(rpc_system);
+
+    let deadline = tokio::time::sleep(rpc::terminal_login_timeout());
+    match supervise_terminal_login(rpc_system.as_mut(), granted_rx, deadline).await {
+        TerminalPreAuthOutcome::Authenticated => {
+            let _ = rpc_system.await;
+        }
+        TerminalPreAuthOutcome::ConnectionClosed => {}
+        TerminalPreAuthOutcome::LoginTimedOut => {
+            tracing::warn!("closing Terminal connection: login deadline expired");
+        }
+    }
+}
+
+async fn supervise_terminal_login<Rpc, Deadline>(
+    mut rpc_system: Pin<&mut Rpc>,
+    granted_rx: tokio::sync::oneshot::Receiver<()>,
+    deadline: Deadline,
+) -> TerminalPreAuthOutcome
+where
+    Rpc: Future,
+    Deadline: Future<Output = ()>,
+{
+    tokio::pin!(deadline);
+    tokio::select! {
+        biased;
+        _ = &mut deadline => TerminalPreAuthOutcome::LoginTimedOut,
+        result = granted_rx => {
+            if result.is_ok() {
+                TerminalPreAuthOutcome::Authenticated
+            } else {
+                TerminalPreAuthOutcome::ConnectionClosed
+            }
+        }
+        _ = rpc_system.as_mut() => TerminalPreAuthOutcome::ConnectionClosed,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_login_supervision_is_deterministic() {
+        let (granted_tx, granted_rx) = tokio::sync::oneshot::channel();
+        let rpc = std::future::pending::<()>();
+        tokio::pin!(rpc);
+        assert_eq!(
+            supervise_terminal_login(rpc.as_mut(), granted_rx, std::future::ready(())).await,
+            TerminalPreAuthOutcome::LoginTimedOut
+        );
+        drop(granted_tx);
+
+        let (granted_tx, granted_rx) = tokio::sync::oneshot::channel();
+        granted_tx.send(()).unwrap();
+        let rpc = std::future::pending::<()>();
+        tokio::pin!(rpc);
+        assert_eq!(
+            supervise_terminal_login(rpc.as_mut(), granted_rx, std::future::pending()).await,
+            TerminalPreAuthOutcome::Authenticated
+        );
+
+        let (_granted_tx, granted_rx) = tokio::sync::oneshot::channel();
+        let rpc = std::future::ready(());
+        tokio::pin!(rpc);
+        assert_eq!(
+            supervise_terminal_login(rpc.as_mut(), granted_rx, std::future::pending()).await,
+            TerminalPreAuthOutcome::ConnectionClosed
+        );
+    }
 
     /// T1 (Item 1b cleanup, regression test): `Cell::spawn_with_streams`
     /// must reject construction without a CidTree. The pre-#416 host-

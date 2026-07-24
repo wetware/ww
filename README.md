@@ -4,7 +4,14 @@
 
 Wetware lets you safely run code you didn't write, don't trust, and cannot see: third-party MCP servers, code your LLM produced at runtime, tools other agents handed you across the swarm. It's a decentralized operating system for multi-tool agent swarms.
 
-Cells are WASM processes that run with zero ambient authority. Their only access to the world is the membrane they were grafted, a typed bundle of capabilities served over Cap'n Proto RPC. When a cell calls another cell, the caller chooses which capabilities to hand over; fine-grained recursive attenuation is a follow-up design area, not a hidden default. Each call carries only the capabilities you handed it; the trust boundary is the membrane, not the audit. There is no scheduler, no central trust authority, no shared state. Cells coordinate through content-addressed data in IPFS, and over libp2p streams.
+Cells are WASM processes that run with zero ambient authority. Their only
+access to the world is through explicitly granted, typed Cap'n Proto
+capabilities. Those references can be attenuated to a method allowlist; the
+restriction travels with the reference across local and libp2p RPC boundaries
+and recursively confines capabilities returned through it. Argument- and
+resource-level filtering remain separate, application-level designs. Least
+privilege is enforced by the runtime, not delegated to a prompt or to the
+model running inside the cell.
 
 ## Try it in 60 seconds
 
@@ -51,11 +58,11 @@ Here is the capability surface in action, directly in the Wetware shell (Glia):
 
 ## Features
 
-- **Explicit capability grafts.** Each cell starts with a typed bundle of capabilities and nothing else. Parent cells choose which capabilities to hand down; recursive per-method attenuation is being redesigned before we document it as a runtime guarantee.
+- **Explicit capability grafts.** Each cell starts with a typed bundle of capabilities and nothing else. Parent cells choose which capabilities to hand down; method-level restrictions are enforced on the capability reference and on capabilities reached through it.
 - **Composable membranes.** Tool A calls tool B which calls tool C, each link carrying an explicit capability set. The membrane is the boundary at every hop. See [examples/oracle/](examples/oracle/) for the runnable version.
 - **Content-addressed code.** Cells are identified by CID. The binary that ran is the binary you pinned; no swap-under-the-rug between generation and execution.
 - **WASM cell scale.** ~10ms spawn, KB-scale binaries, language-agnostic via `wasm32-wasip2`. Per-call sandboxing is only feasible because cells are cheap; microVM cold-start is too slow for that.
-- **P2P capability sharing.** A cell can export a typed capability to a cell on a peer's machine over libp2p. The membrane is the boundary, not the host.
+- **P2P capability sharing.** A cell can export a typed capability to a peer over libp2p. Service names locate a stream; they do not authorize its caller. A deployer can publish a `Terminal` that authenticates a login identity and issues only the method authority selected for that identity.
 - **MCP integration.** `ww perform install` wires the node into Claude Code as an MCP server. The same capability surface you can hit with `curl` is reachable from an LLM through the grafted membrane. See [.agents/prompt.md](.agents/prompt.md).
 - **Glia shell.** A Clojure-inspired language where capabilities are first-class values and every side effect (capability calls, exceptions, I/O) is gated by an effect system. The same shell serves humans (REPL) and LLMs (over MCP).
 

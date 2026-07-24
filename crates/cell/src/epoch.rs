@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use membrane::Epoch;
+use authority::Epoch;
 use stem::StemEvent;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -111,7 +111,7 @@ pub async fn handle_epoch_advance(
 // ── Legacy entry point (Atom-specific) ──────────────────────────────
 
 use atom::{AtomIndexer, FinalizerBuilder, IndexerConfig};
-use membrane::Provenance;
+use authority::Provenance;
 
 /// Run the Atom-specific epoch pipeline (legacy entry point).
 ///
@@ -211,7 +211,7 @@ pub async fn run_epoch_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use membrane::Provenance;
+    use authority::Provenance;
     use std::collections::HashMap;
 
     fn test_stem_event(seq: u64) -> StemEvent {

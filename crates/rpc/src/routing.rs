@@ -16,10 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
-use membrane::EpochGuard;
+use authority::EpochGuard;
 
 use crate::SwarmCommand;
-use membrane::routing_capnp;
+use authority::routing_capnp;
 
 /// Convert a CID string to Kademlia record key bytes (multihash).
 ///
@@ -569,10 +569,10 @@ mod tests {
     use super::*;
     use crate::PeerInfo;
     use crate::SwarmCommand;
+    use authority::{Epoch, Provenance};
     use capnp_rpc::rpc_twoparty_capnp::Side;
     use capnp_rpc::twoparty::VatNetwork;
     use capnp_rpc::RpcSystem;
-    use membrane::{Epoch, Provenance};
     use tokio::io;
     use tokio::sync::watch;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};

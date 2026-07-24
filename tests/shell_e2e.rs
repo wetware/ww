@@ -40,13 +40,13 @@ async fn spawn_shell_on_pool(pool: &ExecutorPool) -> Result<shell_capnp::shell::
                 // Create runtime on the worker thread (capnp clients are !Send).
                 let network_state = NetworkState::new();
                 let (swarm_tx, _swarm_rx) = mpsc::channel(16);
-                let epoch = membrane::Epoch {
+                let epoch = authority::Epoch {
                     seq: 1,
                     head: vec![],
-                    provenance: membrane::Provenance::Block(0),
+                    provenance: authority::Provenance::Block(0),
                 };
                 let (_epoch_tx, epoch_rx) = watch::channel(epoch);
-                let guard = membrane::EpochGuard {
+                let guard = authority::EpochGuard {
                     issued_seq: 1,
                     receiver: epoch_rx.clone(),
                 };

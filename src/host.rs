@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::core::connection::ConnectedPoint;
 use libp2p::kad;
+use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
 use tokio::sync::{mpsc, oneshot};
@@ -809,10 +810,8 @@ impl Libp2pHost {
                                 let _ = reply.send(Ok(()));
                                 continue;
                             }
-                            for addr in &addrs {
-                                self.swarm.add_peer_address(peer_id, addr.clone());
-                            }
-                            match self.swarm.dial(peer_id) {
+                            let dial = DialOpts::peer_id(peer_id).addresses(addrs).build();
+                            match self.swarm.dial(dial) {
                                 Ok(()) => {
                                     pending_connects.entry(peer_id).or_default().push(reply);
                                 }

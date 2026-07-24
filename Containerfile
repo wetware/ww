@@ -43,6 +43,7 @@ COPY crates/atom/Cargo.toml crates/atom/Cargo.toml
 COPY crates/cache/Cargo.toml crates/cache/Cargo.toml
 COPY crates/stem/Cargo.toml crates/stem/Cargo.toml
 COPY crates/glia/Cargo.toml crates/glia/build.rs crates/glia/
+COPY crates/authority/Cargo.toml crates/authority/build.rs crates/authority/
 COPY crates/membrane/Cargo.toml crates/membrane/build.rs crates/membrane/
 COPY crates/guest/auth/Cargo.toml crates/guest/auth/Cargo.toml
 COPY std/shell/Cargo.toml std/shell/Cargo.toml
@@ -57,6 +58,7 @@ RUN mkdir -p src/cli && echo 'fn main() {}' > src/cli/main.rs \
     && mkdir -p crates/cache/src && echo '' > crates/cache/src/lib.rs \
     && mkdir -p crates/stem/src && echo '' > crates/stem/src/lib.rs \
     && mkdir -p crates/glia/src && echo '' > crates/glia/src/lib.rs \
+    && mkdir -p crates/authority/src && echo '' > crates/authority/src/lib.rs \
     && mkdir -p crates/membrane/src && echo '' > crates/membrane/src/lib.rs \
     && mkdir -p crates/guest/auth/src && echo '' > crates/guest/auth/src/lib.rs \
     && mkdir -p std/shell/src && echo 'fn main() {}' > std/shell/src/main.rs \

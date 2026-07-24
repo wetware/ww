@@ -11,11 +11,11 @@ use atom::membrane_capnp;
 use atom::system_capnp;
 use atom::{AtomIndexer, Epoch, IndexerConfig, MembraneServer, TerminalServer};
 use auth::SigningDomain;
+use authority::http_capnp;
+use authority::routing_capnp;
 use capnp_rpc::new_client;
 use common::{deploy_atom, set_head, spawn_anvil, FullStubSessionBuilder, StubSessionBuilder};
 use ed25519_dalek::SigningKey;
-use membrane::http_capnp;
-use membrane::routing_capnp;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,7 +91,7 @@ fn observed_to_epoch(ev: &atom::HeadUpdatedObserved) -> Epoch {
     Epoch {
         seq: ev.seq,
         head: ev.cid.clone(),
-        provenance: membrane::Provenance::Block(ev.block_number),
+        provenance: authority::Provenance::Block(ev.block_number),
     }
 }
 
@@ -181,7 +181,7 @@ async fn test_membrane_graft_runtime_against_anvil() {
     let epoch2 = Epoch {
         seq: first_ev.seq + 1,
         head: b"next_head".to_vec(),
-        provenance: membrane::Provenance::Block(first_ev.block_number + 1),
+        provenance: authority::Provenance::Block(first_ev.block_number + 1),
     };
 
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -195,11 +195,12 @@ async fn test_membrane_graft_runtime_against_anvil() {
     let mut login_req = terminal.login_request();
     login_req.get().set_signer(signer_client);
     let login_resp = login_req.send().promise.await.expect("login RPC");
-    let membrane = login_resp
-        .get()
-        .expect("login results")
-        .get_session()
-        .expect("session");
+    let login_result = login_resp.get().expect("login results");
+    assert_eq!(
+        login_result.get_status().expect("known status"),
+        auth_capnp::LoginStatus::Granted
+    );
+    let membrane = login_result.get_session().expect("session");
 
     let graft_rpc_response = membrane
         .graft_request()
@@ -237,7 +238,7 @@ async fn test_membrane_graft_no_auth() {
     let epoch = Epoch {
         seq: 1,
         head: b"head1".to_vec(),
-        provenance: membrane::Provenance::Block(100),
+        provenance: authority::Provenance::Block(100),
     };
 
     let (_tx, rx) = watch::channel(epoch);
@@ -270,12 +271,12 @@ async fn test_membrane_stale_epoch_then_recovery_no_chain() {
     let epoch1 = Epoch {
         seq: 1,
         head: b"head1".to_vec(),
-        provenance: membrane::Provenance::Block(100),
+        provenance: authority::Provenance::Block(100),
     };
     let epoch2 = Epoch {
         seq: 2,
         head: b"head2".to_vec(),
-        provenance: membrane::Provenance::Block(101),
+        provenance: authority::Provenance::Block(101),
     };
 
     let (tx, rx) = watch::channel(epoch1.clone());
@@ -336,7 +337,7 @@ async fn test_terminal_wrong_key_rejected() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
-        provenance: membrane::Provenance::Block(100),
+        provenance: authority::Provenance::Block(100),
     };
 
     // Terminal expects key A, signer holds key B.
@@ -351,19 +352,13 @@ async fn test_terminal_wrong_key_rejected() {
     let mut login_req = terminal.login_request();
     login_req.get().set_signer(signer_client);
 
-    match login_req.send().promise.await {
-        Ok(resp) => match resp.get() {
-            Ok(_) => panic!("login should fail with wrong key"),
-            Err(e) => assert!(
-                e.to_string().contains("login auth failed"),
-                "error should mention login auth failure, got: {e}"
-            ),
-        },
-        Err(e) => assert!(
-            e.to_string().contains("login auth failed"),
-            "error should mention login auth failure, got: {e}"
-        ),
-    }
+    let response = login_req.send().promise.await.expect("typed login outcome");
+    let result = response.get().expect("login results");
+    assert_eq!(
+        result.get_status().expect("known status"),
+        auth_capnp::LoginStatus::Denied
+    );
+    assert!(result.get_session().is_err());
 }
 
 /// Terminal login without signer should fail.
@@ -372,7 +367,7 @@ async fn test_terminal_missing_signer_rejected() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
-        provenance: membrane::Provenance::Block(100),
+        provenance: authority::Provenance::Block(100),
     };
 
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -383,19 +378,13 @@ async fn test_terminal_missing_signer_rejected() {
 
     // Call login without setting signer.
     let login_req = terminal.login_request();
-    match login_req.send().promise.await {
-        Ok(resp) => match resp.get() {
-            Ok(_) => panic!("login should fail without signer"),
-            Err(e) => assert!(
-                e.to_string().contains("missing signer"),
-                "error should mention missing signer, got: {e}"
-            ),
-        },
-        Err(e) => assert!(
-            e.to_string().contains("missing signer"),
-            "error should mention missing signer, got: {e}"
-        ),
-    }
+    let response = login_req.send().promise.await.expect("typed login outcome");
+    let result = response.get().expect("login results");
+    assert_eq!(
+        result.get_status().expect("known status"),
+        auth_capnp::LoginStatus::InvalidRequest
+    );
+    assert!(result.get_session().is_err());
 }
 
 /// Helper: create a Membrane client with all 5 capabilities populated.
@@ -409,7 +398,7 @@ async fn test_graft_returns_all_five_capabilities() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
-        provenance: membrane::Provenance::Block(100),
+        provenance: authority::Provenance::Block(100),
     };
 
     let (_tx, rx) = watch::channel(epoch);
@@ -461,7 +450,7 @@ async fn test_terminal_over_stream_pair() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
-        provenance: membrane::Provenance::Block(100),
+        provenance: authority::Provenance::Block(100),
     };
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
     let vk = sk.verifying_key();
@@ -514,11 +503,13 @@ async fn test_terminal_over_stream_pair() {
                 .expect("login timed out")
                 .expect("login RPC");
 
-            let remote_membrane: membrane_capnp::membrane::Client = login_resp
-                .get()
-                .expect("login results")
-                .get_session()
-                .expect("session");
+            let login_result = login_resp.get().expect("login results");
+            assert_eq!(
+                login_result.get_status().expect("known status"),
+                auth_capnp::LoginStatus::Granted
+            );
+            let remote_membrane: membrane_capnp::membrane::Client =
+                login_result.get_session().expect("session");
 
             let graft_resp = timeout(
                 Duration::from_secs(5),
@@ -554,7 +545,7 @@ async fn test_terminal_over_stream_wrong_key_rejected() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
-        provenance: membrane::Provenance::Block(100),
+        provenance: authority::Provenance::Block(100),
     };
     let host_sk = SigningKey::generate(&mut rand::rngs::OsRng);
     let host_vk = host_sk.verifying_key();
@@ -603,21 +594,16 @@ async fn test_terminal_over_stream_wrong_key_rejected() {
             let mut login_req = remote_terminal.login_request();
             login_req.get().set_signer(signer_client);
 
-            let result = timeout(Duration::from_secs(5), login_req.send().promise).await;
-            match result {
-                Ok(Ok(resp)) => match resp.get() {
-                    Ok(_) => panic!("login should fail with wrong key"),
-                    Err(e) => assert!(
-                        e.to_string().contains("login auth failed"),
-                        "expected login auth failure error, got: {e}"
-                    ),
-                },
-                Ok(Err(e)) => assert!(
-                    e.to_string().contains("login auth failed"),
-                    "expected login auth failure error, got: {e}"
-                ),
-                Err(_) => panic!("login timed out — expected auth failure"),
-            }
+            let response = timeout(Duration::from_secs(5), login_req.send().promise)
+                .await
+                .expect("login timed out")
+                .expect("typed login outcome");
+            let result = response.get().expect("login results");
+            assert_eq!(
+                result.get_status().expect("known status"),
+                auth_capnp::LoginStatus::Denied
+            );
+            assert!(result.get_session().is_err());
         })
         .await;
 }
@@ -644,7 +630,7 @@ async fn test_terminal_malformed_signature_rejected() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
-        provenance: membrane::Provenance::Block(100),
+        provenance: authority::Provenance::Block(100),
     };
 
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -657,19 +643,13 @@ async fn test_terminal_malformed_signature_rejected() {
     let mut login_req = terminal.login_request();
     login_req.get().set_signer(signer_client);
 
-    match login_req.send().promise.await {
-        Ok(resp) => match resp.get() {
-            Ok(_) => panic!("login should fail with malformed signature"),
-            Err(e) => assert!(
-                e.to_string().contains("invalid signed envelope"),
-                "error should mention invalid signed envelope, got: {e}"
-            ),
-        },
-        Err(e) => assert!(
-            e.to_string().contains("invalid signed envelope"),
-            "error should mention invalid signed envelope, got: {e}"
-        ),
-    }
+    let response = login_req.send().promise.await.expect("typed login outcome");
+    let result = response.get().expect("login results");
+    assert_eq!(
+        result.get_status().expect("known status"),
+        auth_capnp::LoginStatus::InvalidProof
+    );
+    assert!(result.get_session().is_err());
 }
 
 /// Terminal login should fail after epoch advances (epoch-bound signature is stale).
@@ -678,7 +658,7 @@ async fn test_terminal_login_fails_after_epoch_advance() {
     let epoch1 = Epoch {
         seq: 1,
         head: b"head1".to_vec(),
-        provenance: membrane::Provenance::Block(100),
+        provenance: authority::Provenance::Block(100),
     };
 
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -700,7 +680,7 @@ async fn test_terminal_login_fails_after_epoch_advance() {
     tx.send(Epoch {
         seq: 2,
         head: b"head2".to_vec(),
-        provenance: membrane::Provenance::Block(101),
+        provenance: authority::Provenance::Block(101),
     })
     .unwrap();
 

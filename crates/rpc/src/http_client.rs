@@ -4,11 +4,11 @@
 //! checking the epoch guard and validating the URL host against an allowlist
 //! before forwarding the request via `reqwest`.
 
+use authority::EpochGuard;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
-use membrane::EpochGuard;
 
-use membrane::http_capnp;
+use authority::http_capnp;
 
 const MAX_REDIRECTS: usize = 10;
 
@@ -264,7 +264,7 @@ impl http_capnp::http_client::Server for EpochGuardedHttpProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use membrane::epoch::{Epoch, Provenance};
+    use authority::epoch::{Epoch, Provenance};
     use std::error::Error;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
