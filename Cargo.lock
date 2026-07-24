@@ -1467,6 +1467,7 @@ dependencies = [
 name = "chess"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "auth",
  "capnp",
  "capnp-rpc",
@@ -1476,6 +1477,7 @@ dependencies = [
  "hex",
  "libp2p-core",
  "libp2p-identity",
+ "libp2p-stream",
  "log",
  "rand 0.9.4",
  "schema-id",
@@ -1487,6 +1489,7 @@ dependencies = [
  "wasip2",
  "wetware-authority",
  "wetware-membrane",
+ "ww",
 ]
 
 [[package]]

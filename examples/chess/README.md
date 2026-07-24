@@ -8,8 +8,9 @@ Two-node cross-network chess over libp2p RPC capabilities.
 - `VatListener.serve` for persistent capability export
 - `VatClient` for typed RPC dialing
 - Service-name DHT discovery via `routing.provide()` / `findProviders()`
-- IPFS replay log publishing
 - Dual-mode binary: cell mode (RPC server) + service mode (discovery loop)
+- A Rust-native authority proof in which one authenticated Reader and Player
+  receive different method authority over the same remote game
 
 ## Prerequisites
 
@@ -31,6 +32,32 @@ make chess
 This compiles the WASM guest and generates build-time schema-byte and CID
 metadata for introspection.
 Vat publication uses the service name `chess`.
+
+## Authority proof
+
+The reproducible security artifact uses two real Wetware libp2p hosts and
+direct-dials a `Terminal<ChessEngine>`:
+
+```sh
+cargo test -p chess direct_libp2p_terminal_enforces_chess_authority
+```
+
+It proves:
+
+- an unknown signing key receives no session;
+- a Reader may call `getState` but is denied `applyMove`;
+- a Player may call both methods, and the Reader observes the same changed
+  game state;
+- revoking the Reader invalidates its existing session without affecting the
+  Player;
+- advancing the epoch invalidates the Player's existing session;
+- an unregistered libp2p protocol is rejected; and
+- a peer that accepts a stream but never answers the first method is stopped
+  by a named, application-owned deadline.
+
+The node is deliberately not treated as a principal. Multiple login keys can
+flow through one libp2p peer and receive independent authority. This is a
+method-level proof; it does not claim per-argument or per-resource filtering.
 
 ## Running
 
@@ -107,16 +134,18 @@ explicitly from `glia/register.glia`.
 ```
              ww shell loads glia/register.glia
                            |
+       trusted config attaches policy, then
                (perform host :serve-vat ...)
                            |
-                  persistent ChessEngine cap
+                persistent Terminal<ChessEngine>
 ```
 
 Two execution modes, selected by runtime inputs:
 
 - **Cell mode** (no args): spawned by Glia before publication.
   Creates a `ChessEngineImpl` and exports it via `system::serve()`.
-  `host :serve-vat` publishes that exported capability under `chess`.
+  The guest exports a bare capability. Trusted publication configuration may
+  attach recipient policy before `host :serve-vat` publishes it.
 - **Service mode** (default): long-running discovery loop. Provides
   the service-name routing key on the DHT, discovers peers via
   `routing.find_providers()`, dials them with `VatClient` to get
@@ -128,7 +157,8 @@ Two execution modes, selected by runtime inputs:
 The vat protocol is the normal service name `chess`. The DHT key is
 `routing.hash("chess")`, so the Routing API still receives a CID-shaped
 key without making schema identity the locator. Schema bytes are
-compiled at build time for tooling/introspection.
+compiled at build time for tooling/introspection. Neither the service name nor
+the libp2p peer ID authorizes a recipient.
 
 ### Schema
 
@@ -175,7 +205,13 @@ default demo flow.
 
 ```sh
 cargo test -p chess --lib
+cargo test -p chess direct_libp2p_terminal_enforces_chess_authority
 ```
+
+The manual `glia/register.glia` random-game flow still publishes the bare
+Chess capability for demo compatibility. It is not the authority proof and
+must not be described as recipient-gated until deployer recipient keys are
+supplied and `authority :guard` is used at that publication site.
 
 ## See also
 

@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Real libp2p Chess authority evidence.** A synchronized direct-dial test
+  now runs two Wetware hosts and proves unknown-login denial, Reader/Player
+  method differentiation over one shared ChessEngine, targeted revocation,
+  epoch expiry, wrong-protocol rejection, and an application-owned timeout
+  for a non-responsive first method call.
 - **Explicit deployer-controlled Terminal construction.** Epoch-scoped kernel
   sessions now receive an `authority` capability whose verb-first
   `:guard` operation takes a bare capability plus a pure recipient-policy map
@@ -64,6 +69,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`wetware-membrane` crate: hook-level capability attenuation.** New workspace crate implementing a schema-agnostic capability membrane on `capnp`'s `ClientHook`: calls are filtered by `(interfaceId, ordinal)` at the hook level (unbypassable by casting — typed clients, casts, and promise pipelines all bottom out in the same wrapped hook), and capabilities in results, promise pipelines, and promise resolution are recursively re-wrapped. `Policy` is a trait with three reference implementations — `Allowlist` (stateless allow/deny), `RevocablePolicy` (revoke switch), and `RateLimit` (fixed-window counter; rate-limit-as-capability) — so one enforcement mechanism serves multiple attenuation strategies. Denials carry a stable marker plus the denied method key for structured error routing. Not yet wired into the public ABI; the Export cutover lands separately.
 - **`(attenuate ...)` on capnp-backed caps now reifies into a hook-level membrane.** Glia's `Dispatch` trait gains a `reify_attenuation` hook and a `HandledCapInner` cap representation (a cap that carries its own dispatch handler plus an opaque export payload). The kernel implements the hook: method keywords are resolved against the cap's compiled canonical schema (kebab-case → camelCase; ordinal = position in the interface's method list; unknown names fail closed at attenuation time), and the underlying client hook is wrapped in a `wetware-membrane` allowlist keyed by `(interfaceId, ordinal)`. The attenuation is therefore enforced at the capability itself and travels with it across boundaries: `extract_capnp_client` returns the membraned client, so `:listen` caps forwarding and `host :serve-vat` publish the restricted cap, and typed-client casting on the receiving side stays filtered. Local `perform` routes through the kernel's typed handler rebuilt over the membraned client, gated by the same allowlist, producing structured `:glia.error/permission-denied` (with interface id + method@ordinal keys) both locally and for membrane denials. Re-attenuation intersects allowlists and collapses to a single membrane layer. Caps without a compiled schema (e.g. dialed generic caps) fail closed pending the deferred schema-association design; pure-Glia `defcap` caps keep the evaluator-local attenuation path (they cannot cross a boundary, so that path is interposition within one trust domain, not a second enforcement mechanism).
 - **`wetware-membrane`: production membrane recursion (identity, flush, reentry, collapse, bench).** The membrane now preserves capability identity across round-trips and folds stacked attenuations. A data-segment sentinel `get_brand` plus a `get_ptr`-keyed registry lets it recognise its own membranes without `Any` (and without colliding with capnp-rpc connection brands, so caps can't tunnel through the filter). A call parameter that is one of our own membranes is unwrapped to the bare backing cap before reaching the backend, restoring the identity the backend exported (foreign params pass through). Results-copy failures mid-answer now surface as the call's error via an explicit flush outcome instead of a silent empty result. Attenuating an already-membraned cap collapses to a single layer when both policies are static allowlists (intersection of key sets via the new `Policy::allowlist_keys`); stateful policies stack so their per-call state survives. Adds `benches/membrane.rs`: per-call overhead is sub-microsecond and constant per hop (ping +~357 ns, cap-returning child +~437 ns), so upstream capnp cap-table work stays deferred.
+
+### Fixed
+- **Direct-address swarm connections.** `SwarmCommand::Connect` now passes its
+  explicit address list to libp2p `DialOpts`; dialing only by peer ID discarded
+  that caller-supplied route and failed with `no addresses for peer`.
 
 ### Changed
 - **Membrane reentry is scoped to an explicit boundary lineage.** A request

@@ -23,13 +23,16 @@ tokio = { workspace = true, features = ["sync", "time"] }
 crate-type = ["cdylib"]
 
 [dev-dependencies]
+anyhow     = { workspace = true }
 auth       = { path = "../../crates/guest/auth" }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 libp2p-core = { workspace = true }
 libp2p-identity = { version = "0.2", features = ["ed25519"] }
+libp2p-stream = { workspace = true }
 serde_json = { workspace = true }
 tokio      = { workspace = true, features = ["rt", "macros", "io-util"] }
 tokio-util = { workspace = true, features = ["compat"] }
+ww         = { path = "../.." }
 
 [build-dependencies]
 capnpc = { workspace = true }

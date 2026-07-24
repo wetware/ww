@@ -3,6 +3,12 @@
 //! This library provides cell execution capabilities using Wasmtime, supporting
 //! per-stream instantiation with duplex pipe communication.
 
+/// Runtime package version embedded at build time.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Git revision embedded by the Glia build, including `+dirty` when applicable.
+pub const GIT_COMMIT: &str = glia::GIT_COMMIT;
+
 // Host-only modules (not available for WASM guests)
 #[cfg(not(target_arch = "wasm32"))]
 pub use cell;

@@ -30,7 +30,8 @@ varint(payload_len) payload
 ```
 
 Well-known domains:
-- `ww-terminal-membrane` — Terminal login guarding a Membrane capability.
+- `ww-terminal-membrane` — stable wire domain for Terminal login; a successful
+  login may now return any typed, policy-constructed session.
 - `ww-membrane-graft` — Legacy direct graft signing (pre-Terminal). This wire
   identifier remains stable across Rust crate renames.
 
@@ -65,10 +66,11 @@ Client                          Terminal                    Signer
   │                  verify signature + domain                │
   │                  verify payload == nonce || epoch_seq      │
   │                  verify epoch hasn't advanced              │
-  │                  policy.check(verifying_key)              │
+  │                  AuthPolicy.authorize(identity, template) │
+  │                  build fresh attenuated session           │
   │                                │                          │
   │<───────────────────────────────┤                          │
-  │  session (Membrane)            │                          │
+  │  LoginStatus + session          │                          │
 ```
 
 ### Why both values are needed
@@ -84,15 +86,16 @@ Client                          Terminal                    Signer
 ### Race condition handling
 
 The Terminal verifies that `epoch_rx.borrow().seq` still matches the
-challenge's epoch_seq after the signer responds. If the epoch advanced
-between challenge issuance and response verification, the login fails
-with `"epoch advanced during authentication"`. This closes the TOCTOU
-window where a signature could be verified against a stale epoch.
+challenge's epoch sequence after the signer responds and again after the
+asynchronous policy future completes. It commits the completed `SessionGrant`
+only while the epoch is still current. Expected authentication/policy
+rejections return a typed `LoginStatus` with no session; transport, malformed
+protocol, and internal failures remain RPC errors.
 
 ## Layer 3: Epoch guards on capabilities
 
-Every capability returned by `Membrane.graft()` is wrapped with an
-`EpochGuard` that captures the epoch sequence at issuance time. Every RPC
+Every epoch-scoped graft capability and policy-issued session is wrapped with
+an `EpochGuard` that captures the epoch sequence at issuance time. Every RPC
 call checks the guard before proceeding:
 
 ```rust
@@ -112,6 +115,10 @@ bound to the new epoch.
 
 This is the runtime backstop. Even if Layers 1 and 2 were somehow bypassed,
 a capability issued under epoch N cannot be used during epoch N+1.
+
+Targeted `RevocationGuard`s can also invalidate one recipient or policy
+decision inside an epoch. They compose with `EpochGuard`; they do not replace
+Atom as the global epoch source.
 
 ## Layer 4: On-chain finality (Stem contract)
 

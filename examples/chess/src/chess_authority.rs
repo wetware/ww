@@ -157,8 +157,10 @@ mod tests {
     use capnp_rpc::twoparty::VatNetwork;
     use capnp_rpc::RpcSystem;
     use ed25519_dalek::SigningKey;
+    use futures::StreamExt;
     use membrane::{call_failure_code, CallFailureCode};
     use tokio::io;
+    use tokio::sync::{mpsc, oneshot};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     use super::*;
@@ -308,6 +310,56 @@ mod tests {
         }
     }
 
+    async fn start_libp2p_host(
+        seed: u8,
+    ) -> (
+        libp2p_identity::PeerId,
+        ww::rpc::NetworkState,
+        libp2p_stream::Control,
+        mpsc::Sender<ww::rpc::SwarmCommand>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        let keypair = ww::keys::to_libp2p(&signing_key).expect("convert host key");
+        let listen_addr = "/ip4/127.0.0.1/tcp/0".parse().expect("listen address");
+        let host = ww::host::Libp2pHost::new(vec![listen_addr], keypair, None, Vec::new())
+            .expect("start libp2p host");
+        let peer_id = host.local_peer_id();
+        let stream_control = host.stream_control();
+        let network_state = ww::rpc::NetworkState::from_peer_id(peer_id.to_bytes());
+        let host_state = network_state.clone();
+        let (swarm_tx, swarm_rx) = mpsc::channel(4);
+        let task = tokio::task::spawn_local(async move { host.run(host_state, swarm_rx).await });
+        (peer_id, network_state, stream_control, swarm_tx, task)
+    }
+
+    async fn connect_hosts(
+        client_commands: &mpsc::Sender<ww::rpc::SwarmCommand>,
+        server_peer: libp2p_identity::PeerId,
+        server_state: &ww::rpc::NetworkState,
+    ) {
+        let raw_addr =
+            tokio::time::timeout(OPERATION_DEADLINE, server_state.wait_for_listen_addr())
+                .await
+                .expect("server listen-address publication timed out");
+        let server_addr = libp2p_core::Multiaddr::try_from(raw_addr)
+            .expect("server listen address should decode");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        client_commands
+            .send(ww::rpc::SwarmCommand::Connect {
+                peer_id: server_peer,
+                addrs: vec![server_addr],
+                reply: reply_tx,
+            })
+            .await
+            .expect("client host command loop");
+        tokio::time::timeout(OPERATION_DEADLINE, reply_rx)
+            .await
+            .expect("direct libp2p connection timed out")
+            .expect("connection reply")
+            .expect("direct libp2p connection");
+    }
+
     #[tokio::test]
     async fn terminal_issues_distinct_authority_over_one_shared_game() {
         let local = tokio::task::LocalSet::new();
@@ -396,6 +448,186 @@ mod tests {
                 get_state(&replacement.expect("replacement Reader session"))
                     .await
                     .expect("fresh session under new epoch works");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn direct_libp2p_terminal_enforces_chess_authority() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                eprintln!(
+                    "wetware Chess authority proof: runtime={} git={}",
+                    ww::VERSION,
+                    ww::GIT_COMMIT
+                );
+                let reader_key = SigningKey::from_bytes(&[11; 32]);
+                let player_key = SigningKey::from_bytes(&[12; 32]);
+                let unknown_key = SigningKey::from_bytes(&[13; 32]);
+                let (epoch_tx, epoch_rx) = watch::channel(epoch(1));
+
+                let policy = ChessAuthorization::with_profiles(
+                    epoch_rx.clone(),
+                    [
+                        (reader_key.verifying_key().to_bytes(), ChessProfile::Reader),
+                        (player_key.verifying_key().to_bytes(), ChessProfile::Player),
+                    ],
+                );
+                let policy_handle = policy.clone();
+                let shared_game: chess_capnp::chess_engine::Client =
+                    capnp_rpc::new_client(ChessEngineImpl::new());
+                let terminal: auth_capnp::terminal::Client<chess_capnp::chess_engine::Owned> =
+                    capnp_rpc::new_client(TerminalServer::with_policy(
+                        Box::new(policy),
+                        shared_game,
+                        SigningDomain::terminal_membrane(),
+                        epoch_rx,
+                    ));
+
+                let (server_peer, server_state, mut server_streams, _server_commands, server_host) =
+                    start_libp2p_host(21).await;
+                let (_client_peer, client_state, mut client_streams, client_commands, client_host) =
+                    start_libp2p_host(22).await;
+
+                tokio::time::timeout(OPERATION_DEADLINE, client_state.wait_for_listen_addr())
+                    .await
+                    .expect("client listen-address publication timed out");
+
+                let protocol_name = "chess-authority-proof";
+                let protocol = ww::rpc::vat_protocol(protocol_name).expect("valid protocol");
+                let mut incoming = server_streams
+                    .accept(protocol.clone())
+                    .expect("register Chess proof protocol");
+                let terminal_client = terminal.client.clone();
+                let server_rpc = tokio::task::spawn_local(async move {
+                    let (_peer, stream) = incoming.next().await.expect("incoming Chess stream");
+                    ww::rpc::vat_listener::handle_vat_connection_serve(
+                        terminal_client,
+                        stream,
+                        protocol_name,
+                    )
+                    .await
+                });
+
+                connect_hosts(&client_commands, server_peer, &server_state).await;
+
+                let wrong_protocol =
+                    ww::rpc::vat_protocol("chess-authority-proof-missing").expect("valid protocol");
+                let wrong_protocol_error = tokio::time::timeout(
+                    OPERATION_DEADLINE,
+                    client_streams.open_stream(server_peer, wrong_protocol),
+                )
+                .await
+                .expect("wrong-protocol negotiation timed out")
+                .expect_err("unregistered protocol must be rejected");
+                assert!(
+                    !wrong_protocol_error.to_string().is_empty(),
+                    "wrong-protocol rejection should carry a diagnostic"
+                );
+
+                let stream = tokio::time::timeout(
+                    OPERATION_DEADLINE,
+                    client_streams.open_stream(server_peer, protocol),
+                )
+                .await
+                .expect("opening Chess protocol stream timed out")
+                .expect("open Chess protocol stream");
+                let remote = ww::rpc::vat_dial::connect::<
+                    _,
+                    auth_capnp::terminal::Client<chess_capnp::chess_engine::Owned>,
+                >(stream);
+
+                let (unknown_status, unknown) = login(&remote.bootstrap, &unknown_key).await;
+                assert_eq!(unknown_status, auth_capnp::LoginStatus::Denied);
+                assert!(unknown.is_none(), "unknown signer receives no session");
+
+                let (reader_status, reader) = login(&remote.bootstrap, &reader_key).await;
+                let (player_status, player) = login(&remote.bootstrap, &player_key).await;
+                assert_eq!(reader_status, auth_capnp::LoginStatus::Granted);
+                assert_eq!(player_status, auth_capnp::LoginStatus::Granted);
+                let reader = reader.expect("Reader session");
+                let player = player.expect("Player session");
+
+                get_state(&reader).await.expect("Reader may observe");
+                let denied = apply_move(&reader, "e2e4")
+                    .await
+                    .expect_err("Reader must not move over libp2p");
+                assert_eq!(
+                    call_failure_code(&denied),
+                    Some(CallFailureCode::PermissionDenied)
+                );
+                apply_move(&player, "e2e4")
+                    .await
+                    .expect("Player may move over libp2p");
+                assert!(get_state(&reader)
+                    .await
+                    .expect("Reader observes shared remote game")
+                    .contains("4P3"));
+
+                assert!(policy_handle.revoke(&reader_key.verifying_key().to_bytes()));
+                let revoked = get_state(&reader)
+                    .await
+                    .expect_err("existing remote Reader session must be revoked");
+                assert_eq!(
+                    call_failure_code(&revoked),
+                    Some(CallFailureCode::TargetRevoked)
+                );
+                get_state(&player)
+                    .await
+                    .expect("Reader revocation must not affect remote Player");
+
+                epoch_tx.send(epoch(2)).expect("advance epoch");
+                let stale = get_state(&player)
+                    .await
+                    .expect_err("established remote Player session must expire");
+                assert_eq!(call_failure_code(&stale), Some(CallFailureCode::StaleEpoch));
+
+                let stalled_protocol_name = "chess-authority-proof-stalled";
+                let stalled_protocol =
+                    ww::rpc::vat_protocol(stalled_protocol_name).expect("valid protocol");
+                let mut stalled_incoming = server_streams
+                    .accept(stalled_protocol.clone())
+                    .expect("register stalled Chess protocol");
+                let (accepted_tx, accepted_rx) = oneshot::channel();
+                let stalled_server = tokio::task::spawn_local(async move {
+                    let (_peer, _stream) = stalled_incoming
+                        .next()
+                        .await
+                        .expect("incoming stalled Chess stream");
+                    let _ = accepted_tx.send(());
+                    std::future::pending::<()>().await;
+                });
+                let stalled_stream = tokio::time::timeout(
+                    OPERATION_DEADLINE,
+                    client_streams.open_stream(server_peer, stalled_protocol),
+                )
+                .await
+                .expect("opening stalled protocol stream timed out")
+                .expect("open stalled protocol stream");
+                tokio::time::timeout(OPERATION_DEADLINE, accepted_rx)
+                    .await
+                    .expect("stalled server acceptance timed out")
+                    .expect("stalled server acceptance signal");
+                let stalled = ww::rpc::vat_dial::connect::<_, chess_capnp::chess_engine::Client>(
+                    stalled_stream,
+                );
+                let stalled_error = get_state(&stalled.bootstrap)
+                    .await
+                    .expect_err("non-responsive first method call must time out");
+                assert!(
+                    stalled_error
+                        .to_string()
+                        .contains("chess proof getState timed out"),
+                    "timeout should be application-owned and named: {stalled_error}"
+                );
+
+                stalled.abort();
+                stalled_server.abort();
+                remote.abort();
+                server_rpc.abort();
+                server_host.abort();
+                client_host.abort();
             })
             .await;
     }

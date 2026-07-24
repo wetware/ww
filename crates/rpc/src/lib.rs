@@ -31,7 +31,7 @@ use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use authority::EpochGuard;
@@ -154,6 +154,7 @@ pub enum NatReachability {
 #[derive(Clone, Debug)]
 pub struct NetworkState {
     inner: Arc<RwLock<NetworkSnapshot>>,
+    listen_addr_notify: Arc<Notify>,
 }
 
 impl Default for NetworkState {
@@ -182,6 +183,7 @@ impl NetworkState {
         };
         Self {
             inner: Arc::new(RwLock::new(snapshot)),
+            listen_addr_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -198,6 +200,25 @@ impl NetworkState {
         let mut guard = self.inner.write().await;
         if !guard.listen_addrs.contains(&addr) {
             guard.listen_addrs.push(addr);
+            drop(guard);
+            self.listen_addr_notify.notify_waiters();
+        }
+    }
+
+    /// Wait until the host publishes its first bound listen address.
+    ///
+    /// Callers should own the deadline around this future. Registering the
+    /// notification before checking state avoids missing an address event
+    /// between the read and the await.
+    pub async fn wait_for_listen_addr(&self) -> Vec<u8> {
+        loop {
+            let notified = self.listen_addr_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(addr) = self.inner.read().await.listen_addrs.first().cloned() {
+                return addr;
+            }
+            notified.await;
         }
     }
 
@@ -768,6 +789,22 @@ mod tests {
         let snap = state.snapshot().await;
         assert_eq!(snap.listen_addrs.len(), 1);
         assert_eq!(snap.listen_addrs[0], vec![30, 40]);
+    }
+
+    #[tokio::test]
+    async fn test_network_state_waits_for_listen_addr_without_polling() {
+        let state = NetworkState::from_peer_id(vec![1]);
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move { waiter_state.wait_for_listen_addr().await });
+
+        state.add_listen_addr(vec![10, 20]).await;
+
+        let addr = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("listen-address waiter timed out")
+            .expect("listen-address waiter task");
+        assert_eq!(addr, vec![10, 20]);
+        assert_eq!(state.wait_for_listen_addr().await, vec![10, 20]);
     }
 
     #[tokio::test]
