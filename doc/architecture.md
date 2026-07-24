@@ -191,11 +191,12 @@ serve capabilities. Both sides can hold references to the other's objects.
 
 ### Network: host to remote peers
 
-The host can take whatever capability it bootstrapped from the guest and
-serve it over a libp2p stream protocol. `VatListener` publishes exactly the
-bootstrap capability it receives; it does not infer authorization from the
-service name or remote peer ID. Trusted pid0 configuration must attach policy
-first when the publication needs an authentication gate.
+The host can take whatever capability it bootstrapped from the guest and serve
+it over a libp2p stream protocol. Authenticated `VatListener` publication takes
+the capability plus an explicit deployer policy and creates one Terminal per
+stream. It does not infer authorization from the service name or remote peer
+ID. `serveRaw` publishes the bootstrap capability directly when the deployer
+explicitly chooses an ungated service.
 
 ```
 Node A                                     Node B
@@ -217,15 +218,25 @@ membrane, or construct a `Terminal` that issues identity-specific authority.
 1. Host hands pid0 a Membrane reference
 2. pid0 calls graft(), receives capabilities (identity, host, runtime, routing, httpClient)
 3. pid0 obtains a bare application capability from a child
-4. trusted pid0 configuration attaches an explicit policy with `authority :guard`
-5. pid0 passes the resulting Terminal to unchanged `host :serve-vat`
-6. a remote login identity receives only the session authority selected by policy
+4. trusted pid0 configuration publishes it with `host :serve-vat ... :auth policy`
+5. VatListener constructs a fresh, single-use Terminal for each libp2p stream
+6. a verified login identity receives only the session authority selected by policy
 ```
 
 This is how trusted pid0 configuration controls publication. The guest
 service exports a bare capability; it does not choose who may receive it.
 The host supplies enforcement primitives and transport, while the deployer
-selects policy explicitly at the publication site.
+selects policy explicitly at the publication site. The libp2p peer ID is
+transport identity, not the authenticated principal: multiple principals may
+flow through one node on separate streams. `host :serve-raw-vat` is the
+conspicuous unauthenticated escape hatch for services that deliberately do
+not need recipient authentication.
+
+Authenticated VAT admission has a per-service connection budget and closes
+streams that do not complete Terminal login before the configured deadline.
+This bounds per-connection resource use; it is not Sybil-resistant
+availability or a fairness guarantee. The budget is intentionally not an
+account authorization rule, and per-peer/per-principal quotas are deferred.
 
 ## Configuration
 

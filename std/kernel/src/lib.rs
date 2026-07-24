@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use caps::{make_import_cap, make_import_handler};
 #[cfg(test)]
 use caps::eval_load;
+use caps::{make_import_cap, make_import_handler};
 use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
 use glia::eval::{self, Dispatch, Env, EvalOutcome};
 use glia::{extract_method, make_cap, read, read_many, AttenuatedCapInner, GliaCapInner, Val};
@@ -591,7 +591,10 @@ fn eval_outcome<'a>(
         });
         let stdout = std::rc::Rc::new(|data: Val| {
             Box::pin(async move {
-                let text = match data { Val::Str(s) => s, other => format!("{other}") };
+                let text = match data {
+                    Val::Str(s) => s,
+                    other => format!("{other}"),
+                };
                 write_stdout(&text)?;
                 Ok(HostEffectResult::Resume(Val::Nil))
             }) as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
@@ -601,9 +604,18 @@ fn eval_outcome<'a>(
                 as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
         });
         let effects = [
-            HostEffect { target: EffectTarget::Keyword("load".into()), handler: load },
-            HostEffect { target: EffectTarget::Keyword("stdout".into()), handler: stdout },
-            HostEffect { target: EffectTarget::Keyword("exit".into()), handler: exit },
+            HostEffect {
+                target: EffectTarget::Keyword("load".into()),
+                handler: load,
+            },
+            HostEffect {
+                target: EffectTarget::Keyword("stdout".into()),
+                handler: stdout,
+            },
+            HostEffect {
+                target: EffectTarget::Keyword("exit".into()),
+                handler: exit,
+            },
         ];
         eval::eval_toplevel_with_host_effects(expr, env, &kd, &effects).await
     })
@@ -740,44 +752,40 @@ fn write_authority_policy(
     value: &Val,
 ) -> Result<(), Val> {
     let Val::Map(policy) = value else {
-        return Err(glia::error::type_mismatch(
-            "authority :guard policy",
-            "map",
-            value,
-        ));
+        return Err(glia::error::type_mismatch("authority policy", "map", value));
     };
     let profiles = policy_field(policy, "profiles")
-        .ok_or_else(|| Val::from("authority :guard policy — missing :profiles"))?;
-    let profiles = policy_sequence(profiles, "authority :guard :profiles")?;
+        .ok_or_else(|| Val::from("authority policy — missing :profiles"))?;
+    let profiles = policy_sequence(profiles, "authority policy :profiles")?;
     let mut profile_builders = builder.reborrow().init_profiles(profiles.len() as u32);
     for (index, profile) in profiles.iter().enumerate() {
         let Val::Map(profile) = profile else {
             return Err(glia::error::type_mismatch(
-                "authority :guard profile",
+                "authority policy profile",
                 "map",
                 profile,
             ));
         };
         let name = policy_name(
             policy_field(profile, "name")
-                .ok_or_else(|| Val::from("authority :guard profile — missing :name"))?,
-            "authority :guard profile :name",
+                .ok_or_else(|| Val::from("authority policy profile — missing :name"))?,
+            "authority policy profile :name",
         )?;
         let methods = policy_field(profile, "methods")
-            .ok_or_else(|| Val::from("authority :guard profile — missing :methods"))?;
-        let methods = policy_sequence(methods, "authority :guard profile :methods")?;
+            .ok_or_else(|| Val::from("authority policy profile — missing :methods"))?;
+        let methods = policy_sequence(methods, "authority policy profile :methods")?;
         let mut profile_builder = profile_builders.reborrow().get(index as u32);
         profile_builder.set_name(&name);
         let mut method_builders = profile_builder.init_methods(methods.len() as u32);
         for (method_index, method) in methods.iter().enumerate() {
-            let method = policy_sequence(method, "authority :guard method")?;
+            let method = policy_sequence(method, "authority policy method")?;
             if method.len() != 2 {
                 return Err(Val::from(
-                    "authority :guard method — expected [interface-id ordinal]",
+                    "authority policy method — expected [interface-id ordinal]",
                 ));
             }
-            let interface_id = policy_u64(&method[0], "authority :guard interface-id")?;
-            let ordinal = policy_u16(&method[1], "authority :guard ordinal")?;
+            let interface_id = policy_u64(&method[0], "authority policy interface-id")?;
+            let ordinal = policy_u16(&method[1], "authority policy ordinal")?;
             let mut method_builder = method_builders.reborrow().get(method_index as u32);
             method_builder.set_interface_id(interface_id);
             method_builder.set_ordinal(ordinal);
@@ -785,27 +793,26 @@ fn write_authority_policy(
     }
 
     let recipients = policy_field(policy, "recipients")
-        .ok_or_else(|| Val::from("authority :guard policy — missing :recipients"))?;
-    let recipients = policy_sequence(recipients, "authority :guard :recipients")?;
+        .ok_or_else(|| Val::from("authority policy — missing :recipients"))?;
+    let recipients = policy_sequence(recipients, "authority policy :recipients")?;
     let mut recipient_builders = builder.init_recipients(recipients.len() as u32);
     for (index, recipient) in recipients.iter().enumerate() {
         let Val::Map(recipient) = recipient else {
             return Err(glia::error::type_mismatch(
-                "authority :guard recipient",
+                "authority policy recipient",
                 "map",
                 recipient,
             ));
         };
         let key = policy_key(
-            policy_field(recipient, "verifying-key").ok_or_else(|| {
-                Val::from("authority :guard recipient — missing :verifying-key")
-            })?,
-            "authority :guard recipient :verifying-key",
+            policy_field(recipient, "verifying-key")
+                .ok_or_else(|| Val::from("authority policy recipient — missing :verifying-key"))?,
+            "authority policy recipient :verifying-key",
         )?;
         let profile = policy_name(
             policy_field(recipient, "profile")
-                .ok_or_else(|| Val::from("authority :guard recipient — missing :profile"))?,
-            "authority :guard recipient :profile",
+                .ok_or_else(|| Val::from("authority policy recipient — missing :profile"))?,
+            "authority policy recipient :profile",
         )?;
         let mut recipient_builder = recipient_builders.reborrow().get(index as u32);
         recipient_builder.set_verifying_key(&key);
@@ -856,11 +863,7 @@ fn make_authority_handler(authority: auth_capnp::authority::Client) -> Val {
                             .map_err(|error| Val::from(error.to_string()))?;
                         make_generic_cap(terminal.client)
                     }
-                    _ => {
-                        return Err(Val::from(format!(
-                            "authority: unknown method :{method}"
-                        )))
-                    }
+                    _ => return Err(Val::from(format!("authority: unknown method :{method}"))),
                 };
                 call_resume(resume, result)
             })
@@ -964,7 +967,7 @@ fn make_host_handler(
                             [Val::Cell { wasm, caps }, Val::Str(prefix)] => ((wasm, caps), prefix),
                             [Val::Cell { .. }] => {
                                 return Err(Val::from(
-                                    "host :listen — vat cell listen was removed; spawn the service, obtain its bootstrap capability, then publish it with (perform host :serve-vat <cap> \"service\")",
+                                    "host :listen — vat cell listen was removed; spawn the service, obtain its bootstrap capability, then publish it with (perform host :serve-vat <cap> \"service\" :auth <policy>)",
                                 ))
                             }
                             [] => {
@@ -1070,24 +1073,24 @@ fn make_host_handler(
                         Val::Nil
                     }
                     "serve-vat" => {
-                        let (cap, protocol) = match rest {
-                            [Val::Cap { inner, .. }, Val::Str(protocol)] => {
+                        let (cap, protocol, policy) = match rest {
+                            [
+                                Val::Cap { inner, .. },
+                                Val::Str(protocol),
+                                Val::Keyword(auth),
+                                policy,
+                            ] if auth == "auth" => {
                                 let cap = extract_capnp_client(inner).ok_or_else(|| {
                                     Val::from(
                                         "host :serve-vat — cap is not backed by a Cap'n Proto client",
                                     )
                                 })?;
-                                (cap, protocol)
+                                (cap, protocol, policy)
                             }
-                            [] | [_] => {
+                            _ => {
                                 return Err(Val::from(
-                                    "host :serve-vat — usage: (perform host :serve-vat <exported-cap> \"service\")",
+                                    "host :serve-vat — usage: (perform host :serve-vat <exported-cap> \"service\" :auth <policy-map>)",
                                 ))
-                            }
-                            [other, ..] => {
-                                return Err(Val::from(format!(
-                                    "host :serve-vat — expected cap and protocol string, got {other}"
-                                )))
                             }
                         };
 
@@ -1101,14 +1104,56 @@ fn make_host_handler(
                         let listener = network
                             .get_vat_listener()
                             .map_err(|e| Val::from(e.to_string()))?;
-                        let mut req = listener.serve_request();
+                        let mut req = listener.serve_authenticated_request();
+                        write_cap(req.get().init_cap(), cap);
+                        req.get().set_protocol(protocol);
+                        write_authority_policy(req.get().init_policy(), policy)?;
+                        req.send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        log::info!(
+                            "host :serve-vat — published authenticated vat service {protocol}"
+                        );
+                        Val::Nil
+                    }
+                    "serve-raw-vat" => {
+                        let (cap, protocol) = match rest {
+                            [Val::Cap { inner, .. }, Val::Str(protocol)] => {
+                                let cap = extract_capnp_client(inner).ok_or_else(|| {
+                                    Val::from(
+                                        "host :serve-raw-vat — cap is not backed by a Cap'n Proto client",
+                                    )
+                                })?;
+                                (cap, protocol)
+                            }
+                            _ => {
+                                return Err(Val::from(
+                                    "host :serve-raw-vat — usage: (perform host :serve-raw-vat <exported-cap> \"service\")",
+                                ))
+                            }
+                        };
+
+                        let network_resp = host
+                            .network_request()
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let network = network_resp.get().map_err(|e| Val::from(e.to_string()))?;
+                        let listener = network
+                            .get_vat_listener()
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let mut req = listener.serve_raw_request();
                         write_cap(req.get().init_cap(), cap);
                         req.get().set_protocol(protocol);
                         req.send()
                             .promise
                             .await
                             .map_err(|e| Val::from(e.to_string()))?;
-                        log::info!("host :serve-vat — published vat service {protocol}");
+                        log::warn!(
+                            "host :serve-raw-vat — published ungated vat service {protocol}"
+                        );
                         Val::Nil
                     }
                     "http-client" => {
@@ -1458,7 +1503,9 @@ Capabilities (via perform):
   (perform host :peers)                      Connected peers
   (perform host :listen <cell> \"/path\")     Register HTTP/WAGI cell
   (perform host :listen-stream <cell> \"p\")  Register byte-stream cell
-  (perform host :serve-vat cap \"service\")   Publish existing vat capability
+  (perform host :serve-vat cap \"service\" :auth policy)
+                                               Publish authenticated vat service
+  (perform host :serve-raw-vat cap \"service\") Publish ungated vat capability
   (perform authority :guard cap policy)      Attach recipient policy, return Terminal
 
   (perform runtime :load <wasm>)             Load wasm, return executor
@@ -2038,7 +2085,10 @@ fn run_impl() {
                             }
                         };
 
-                    env.set(cap_name.to_string(), make_cap(cap_name, schema_cid.to_string(), inner));
+                    env.set(
+                        cap_name.to_string(),
+                        make_cap(cap_name, schema_cid.to_string(), inner),
+                    );
                     if !matches!(handler, Val::Nil) {
                         env.set(format!("{cap_name}-handler"), handler);
                     }
@@ -2411,10 +2461,10 @@ mod tests {
 
     #[allow(refining_impl_trait)]
     impl system_capnp::vat_listener::Server for TestVatListener {
-        fn serve(
+        fn serve_raw(
             self: capnp::capability::Rc<Self>,
-            params: system_capnp::vat_listener::ServeParams,
-            _results: system_capnp::vat_listener::ServeResults,
+            params: system_capnp::vat_listener::ServeRawParams,
+            _results: system_capnp::vat_listener::ServeRawResults,
         ) -> Promise<(), capnp::Error> {
             let params = capnp_rpc::pry!(params.get());
             if !params.has_cap() {
@@ -2422,6 +2472,24 @@ mod tests {
             }
             if !params.has_protocol() {
                 return Promise::err(capnp::Error::failed("protocol not set".into()));
+            }
+            Promise::ok(())
+        }
+
+        fn serve_authenticated(
+            self: capnp::capability::Rc<Self>,
+            params: system_capnp::vat_listener::ServeAuthenticatedParams,
+            _results: system_capnp::vat_listener::ServeAuthenticatedResults,
+        ) -> Promise<(), capnp::Error> {
+            let params = capnp_rpc::pry!(params.get());
+            if !params.has_cap() {
+                return Promise::err(capnp::Error::failed("cap not set".into()));
+            }
+            if !params.has_protocol() {
+                return Promise::err(capnp::Error::failed("protocol not set".into()));
+            }
+            if !params.has_policy() {
+                return Promise::err(capnp::Error::failed("policy not set".into()));
             }
             Promise::ok(())
         }
@@ -2722,9 +2790,8 @@ mod tests {
         .await;
     }
 
-    #[test]
-    fn authority_policy_literal_serializes_without_service_name() {
-        let policy = Val::Map(glia::ValMap::from_pairs(vec![
+    fn test_authority_policy() -> Val {
+        Val::Map(glia::ValMap::from_pairs(vec![
             (
                 Val::Keyword("profiles".into()),
                 Val::Vector(vec![Val::Map(glia::ValMap::from_pairs(vec![
@@ -2751,8 +2818,12 @@ mod tests {
                     ),
                 ]))]),
             ),
-        ]));
+        ]))
+    }
 
+    #[test]
+    fn authority_policy_literal_serializes_without_service_name() {
+        let policy = test_authority_policy();
         let mut message = capnp::message::Builder::new_default();
         let builder = message.init_root::<auth_capnp::authority_policy::Builder>();
         write_authority_policy(builder, &policy).expect("valid authority policy");
@@ -2761,19 +2832,13 @@ mod tests {
             .expect("policy reader");
         let profiles = policy.get_profiles().expect("profiles");
         let profile = profiles.get(0);
-        assert_eq!(
-            profile.get_name().unwrap().to_str().unwrap(),
-            "reader"
-        );
+        assert_eq!(profile.get_name().unwrap().to_str().unwrap(), "reader");
         let method = profile.get_methods().unwrap().get(0);
         assert_eq!(method.get_interface_id(), 0xd0ac_8299_df07_9c61);
         assert_eq!(method.get_ordinal(), 0);
         let recipient = policy.get_recipients().unwrap().get(0);
         assert_eq!(recipient.get_verifying_key().unwrap(), &[7; 32]);
-        assert_eq!(
-            recipient.get_profile().unwrap().to_str().unwrap(),
-            "reader"
-        );
+        assert_eq!(recipient.get_profile().unwrap().to_str().unwrap(), "reader");
     }
 
     // --- host listen / serve tests ---
@@ -2835,14 +2900,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_host_serve_vat_cap_succeeds() {
+    async fn test_host_serve_raw_vat_cap_succeeds() {
         run_local(async {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
             let cap = make_cap("host", "test-host-cid", Rc::new(s.host.clone()));
-            let result =
-                call_handler(&handler, "serve-vat", &[cap, Val::Str("greeter".into())]).await;
+            let result = call_handler(
+                &handler,
+                "serve-raw-vat",
+                &[cap, Val::Str("greeter".into())],
+            )
+            .await;
             assert!(
                 result.is_ok(),
                 "VatListener serve failed: {:?}",
@@ -2853,15 +2922,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_host_serve_vat_non_capnp_cap_errors() {
+    async fn test_host_serve_vat_requires_and_forwards_auth_policy() {
+        run_local(async {
+            let s = test_session();
+            let handler =
+                make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
+            let cap = make_cap("host", "test-host-cid", Rc::new(s.host.clone()));
+            let result = call_handler(
+                &handler,
+                "serve-vat",
+                &[
+                    cap,
+                    Val::Str("greeter".into()),
+                    Val::Keyword("auth".into()),
+                    test_authority_policy(),
+                ],
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "authenticated VatListener serve failed: {:?}",
+                result.err()
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_host_serve_raw_vat_non_capnp_cap_errors() {
         run_local(async {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
             let cap = make_cap("not-capnp", "test-cid", Rc::new(42i32));
-            let err = call_handler(&handler, "serve-vat", &[cap, Val::Str("greeter".into())])
-                .await
-                .unwrap_err();
+            let err = call_handler(
+                &handler,
+                "serve-raw-vat",
+                &[cap, Val::Str("greeter".into())],
+            )
+            .await
+            .unwrap_err();
             let msg = format!("{err}");
             assert!(
                 msg.contains("not backed by a Cap'n Proto client"),
@@ -2882,6 +2982,7 @@ mod tests {
                 .await
                 .is_err());
             assert!(call_handler(&handler, "serve-vat", &[]).await.is_err());
+            assert!(call_handler(&handler, "serve-raw-vat", &[]).await.is_err());
         })
         .await;
     }
@@ -3446,7 +3547,9 @@ mod tests {
             bind_caps_in_env(&mut env, &ctx.borrow());
 
             let define = read("(def exit-now (fn [] (perform :exit nil)))").unwrap();
-            assert!(eval_outcome(&define, &mut env, &ctx, &dispatch).await.is_ok());
+            assert!(eval_outcome(&define, &mut env, &ctx, &dispatch)
+                .await
+                .is_ok());
 
             // The top-level form itself has no host-effect syntax. Its call
             // reaches the body defined above, so this succeeds only when the
@@ -3533,8 +3636,13 @@ mod tests {
         let text = "x".repeat(MAX_STDOUT_WRITE_BYTES * 2 + 1);
         let chunks: Vec<_> = stdout_chunks(&text).collect();
         assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|chunk| chunk.len() <= MAX_STDOUT_WRITE_BYTES));
-        assert_eq!(chunks.iter().map(|chunk| chunk.len()).sum::<usize>(), text.len());
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= MAX_STDOUT_WRITE_BYTES));
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+            text.len()
+        );
     }
 
     // --- init script eval integration ---

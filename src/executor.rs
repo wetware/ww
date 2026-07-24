@@ -24,8 +24,6 @@ use rpc::graft::GuestMembrane;
 use rpc::NetworkState;
 
 const CAPNP_PROTOCOL: StreamProtocol = StreamProtocol::new("/ww/0.1.0");
-const DEFAULT_TERMINAL_LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalPreAuthOutcome {
     Authenticated,
@@ -744,7 +742,7 @@ async fn accept_capnp_streams(mut control: libp2p_stream::Control, membrane: Gue
         }
     };
     tracing::info!(protocol = %CAPNP_PROTOCOL, "Accepting capnp streams");
-    let budget = inbound_connection_budget();
+    let budget = rpc::inbound_connection_budget();
     use futures::StreamExt;
     while let Some((peer_id, stream)) = incoming.next().await {
         let permit = match budget.try_acquire() {
@@ -798,7 +796,7 @@ async fn accept_terminal_streams(
     };
     let vk = signing_key.verifying_key();
     tracing::info!(protocol = %CAPNP_PROTOCOL, "Accepting Terminal-gated streams");
-    let budget = inbound_connection_budget();
+    let budget = rpc::inbound_connection_budget();
     use futures::StreamExt;
     while let Some((peer_id, stream)) = incoming.next().await {
         tracing::debug!(%peer_id, "Terminal stream accepted");
@@ -853,7 +851,7 @@ async fn serve_one_terminal_stream(
     let rpc_system = RpcSystem::new(Box::new(network), Some(terminal_client.client));
     tokio::pin!(rpc_system);
 
-    let deadline = tokio::time::sleep(terminal_login_timeout());
+    let deadline = tokio::time::sleep(rpc::terminal_login_timeout());
     match supervise_terminal_login(rpc_system.as_mut(), granted_rx, deadline).await {
         TerminalPreAuthOutcome::Authenticated => {
             let _ = rpc_system.await;
@@ -889,66 +887,9 @@ where
     }
 }
 
-fn inbound_connection_budget() -> rpc::ConnectionBudget {
-    let configured = std::env::var("WW_MAX_INBOUND_RPC_CONNECTIONS").ok();
-    let capacity = parse_inbound_connection_limit(configured.as_deref());
-    rpc::ConnectionBudget::new(capacity).expect("validated non-zero connection limit")
-}
-
-fn terminal_login_timeout() -> Duration {
-    let configured = std::env::var("WW_TERMINAL_LOGIN_TIMEOUT_SECS").ok();
-    parse_terminal_login_timeout(configured.as_deref())
-}
-
-fn parse_inbound_connection_limit(raw: Option<&str>) -> usize {
-    raw.and_then(|value| value.parse::<usize>().ok())
-        .filter(|capacity| *capacity > 0)
-        .unwrap_or(rpc::DEFAULT_MAX_INBOUND_CONNECTIONS)
-}
-
-fn parse_terminal_login_timeout(raw: Option<&str>) -> Duration {
-    raw.and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_TERMINAL_LOGIN_TIMEOUT)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn inbound_connection_limit_defaults_and_accepts_configuration() {
-        assert_eq!(
-            parse_inbound_connection_limit(None),
-            rpc::DEFAULT_MAX_INBOUND_CONNECTIONS
-        );
-        assert_eq!(parse_inbound_connection_limit(Some("7")), 7);
-        assert_eq!(
-            parse_inbound_connection_limit(Some("0")),
-            rpc::DEFAULT_MAX_INBOUND_CONNECTIONS
-        );
-        assert_eq!(
-            parse_inbound_connection_limit(Some("invalid")),
-            rpc::DEFAULT_MAX_INBOUND_CONNECTIONS
-        );
-    }
-
-    #[test]
-    fn terminal_login_timeout_defaults_and_accepts_configuration() {
-        assert_eq!(
-            parse_terminal_login_timeout(None),
-            DEFAULT_TERMINAL_LOGIN_TIMEOUT
-        );
-        assert_eq!(
-            parse_terminal_login_timeout(Some("3")),
-            Duration::from_secs(3)
-        );
-        assert_eq!(
-            parse_terminal_login_timeout(Some("0")),
-            DEFAULT_TERMINAL_LOGIN_TIMEOUT
-        );
-    }
 
     #[tokio::test]
     async fn terminal_login_supervision_is_deterministic() {

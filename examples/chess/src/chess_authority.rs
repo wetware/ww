@@ -151,8 +151,8 @@ mod tests {
     use std::time::Duration;
 
     use auth::SigningDomain;
-    use authority::{auth_capnp, Provenance, TerminalServer};
-    use capnp::capability::Promise;
+    use authority::{auth_capnp, EpochGuard, Provenance, TerminalServer};
+    use capnp::capability::{FromClientHook, Promise};
     use capnp_rpc::rpc_twoparty_capnp::Side;
     use capnp_rpc::twoparty::VatNetwork;
     use capnp_rpc::RpcSystem;
@@ -270,6 +270,72 @@ mod tests {
                 .expect("granted login has Chess session")
         });
         (status, session)
+    }
+
+    async fn login_opaque(
+        terminal: &auth_capnp::terminal::Client<auth_capnp::opaque_session::Owned>,
+        key: &SigningKey,
+    ) -> (
+        auth_capnp::LoginStatus,
+        Option<chess_capnp::chess_engine::Client>,
+    ) {
+        let signer: auth_capnp::signer::Client =
+            capnp_rpc::new_client(TestSigner::from_ed25519(key));
+        let mut request = terminal.login_request();
+        request.get().set_signer(signer);
+        let response = tokio::time::timeout(OPERATION_DEADLINE, request.send().promise)
+            .await
+            .expect("Terminal login timed out")
+            .expect("Terminal login transport");
+        let result = response.get().expect("Terminal login result");
+        let status = result.get_status().expect("known login status");
+        let session = result.has_session().then(|| {
+            let opaque = result
+                .get_session()
+                .expect("granted login has an opaque session");
+            FromClientHook::new(opaque.client.hook)
+        });
+        (status, session)
+    }
+
+    fn write_chess_policy(
+        mut policy: auth_capnp::authority_policy::Builder<'_>,
+        reader_key: &SigningKey,
+        player_key: &SigningKey,
+    ) {
+        let reader = MethodProfile::<chess_capnp::chess_engine::Client>::new()
+            .allow_method(chess_capnp::chess_engine::Client::get_state_request)
+            .expect("capture getState");
+        let player = MethodProfile::<chess_capnp::chess_engine::Client>::new()
+            .allow_method(chess_capnp::chess_engine::Client::get_state_request)
+            .expect("capture getState")
+            .allow_method(chess_capnp::chess_engine::Client::apply_move_request)
+            .expect("capture applyMove");
+
+        let profiles = [("reader", reader), ("player", player)];
+        let mut profile_builders = policy.reborrow().init_profiles(profiles.len() as u32);
+        for (index, (name, profile)) in profiles.iter().enumerate() {
+            let keys = profile.method_keys();
+            let mut builder = profile_builders.reborrow().get(index as u32);
+            builder.set_name(name);
+            let mut methods = builder.reborrow().init_methods(keys.len() as u32);
+            for (method_index, method) in keys.into_iter().enumerate() {
+                let mut method_builder = methods.reborrow().get(method_index as u32);
+                method_builder.set_interface_id(method.interface_id);
+                method_builder.set_ordinal(method.method_id);
+            }
+        }
+
+        let recipients = [
+            (reader_key.verifying_key().to_bytes(), "reader"),
+            (player_key.verifying_key().to_bytes(), "player"),
+        ];
+        let mut recipient_builders = policy.init_recipients(recipients.len() as u32);
+        for (index, (key, profile)) in recipients.iter().enumerate() {
+            let mut builder = recipient_builders.reborrow().get(index as u32);
+            builder.set_verifying_key(key);
+            builder.set_profile(profile);
+        }
     }
 
     async fn get_state(client: &chess_capnp::chess_engine::Client) -> Result<String, capnp::Error> {
@@ -467,25 +533,10 @@ mod tests {
                 let unknown_key = SigningKey::from_bytes(&[13; 32]);
                 let (epoch_tx, epoch_rx) = watch::channel(epoch(1));
 
-                let policy = ChessAuthorization::with_profiles(
-                    epoch_rx.clone(),
-                    [
-                        (reader_key.verifying_key().to_bytes(), ChessProfile::Reader),
-                        (player_key.verifying_key().to_bytes(), ChessProfile::Player),
-                    ],
-                );
-                let policy_handle = policy.clone();
                 let shared_game: chess_capnp::chess_engine::Client =
                     capnp_rpc::new_client(ChessEngineImpl::new());
-                let terminal: auth_capnp::terminal::Client<chess_capnp::chess_engine::Owned> =
-                    capnp_rpc::new_client(TerminalServer::with_policy(
-                        Box::new(policy),
-                        shared_game,
-                        SigningDomain::terminal_membrane(),
-                        epoch_rx,
-                    ));
 
-                let (server_peer, server_state, mut server_streams, _server_commands, server_host) =
+                let (server_peer, server_state, server_streams, _server_commands, server_host) =
                     start_libp2p_host(21).await;
                 let (_client_peer, client_state, mut client_streams, client_commands, client_host) =
                     start_libp2p_host(22).await;
@@ -496,21 +547,71 @@ mod tests {
 
                 let protocol_name = "chess-authority-proof";
                 let protocol = ww::rpc::vat_protocol(protocol_name).expect("valid protocol");
-                let mut incoming = server_streams
-                    .accept(protocol.clone())
-                    .expect("register Chess proof protocol");
-                let terminal_client = terminal.client.clone();
-                let server_rpc = tokio::task::spawn_local(async move {
-                    let (_peer, stream) = incoming.next().await.expect("incoming Chess stream");
-                    ww::rpc::vat_listener::handle_vat_connection_serve(
-                        terminal_client,
-                        stream,
-                        protocol_name,
-                    )
+                let guard = EpochGuard {
+                    issued_seq: epoch_rx.borrow().seq,
+                    receiver: epoch_rx.clone(),
+                };
+                let service_budget = ww::rpc::ConnectionBudget::new(8).expect("connection budget");
+                let login_deadline = Duration::from_millis(500);
+                let listener =
+                    ww::rpc::vat_listener::VatListenerImpl::new(server_streams.clone(), guard)
+                        .with_budget(service_budget.clone())
+                        .with_login_timeout(login_deadline);
+                let listener: authority::system_capnp::vat_listener::Client =
+                    capnp_rpc::new_client(listener);
+                let mut publication = listener.serve_authenticated_request();
+                publication
+                    .get()
+                    .init_cap()
+                    .set_as_capability(shared_game.client.clone().hook);
+                publication.get().set_protocol(protocol_name);
+                write_chess_policy(publication.get().init_policy(), &reader_key, &player_key);
+                publication
+                    .send()
+                    .promise
                     .await
-                });
+                    .expect("publish authenticated Chess service");
 
                 connect_hosts(&client_commands, server_peer, &server_state).await;
+
+                let idle_stream = tokio::time::timeout(
+                    OPERATION_DEADLINE,
+                    client_streams.open_stream(server_peer, protocol.clone()),
+                )
+                .await
+                .expect("opening idle pre-auth stream timed out")
+                .expect("open idle pre-auth stream");
+                let idle_remote = ww::rpc::vat_dial::connect::<
+                    _,
+                    auth_capnp::terminal::Client<auth_capnp::opaque_session::Owned>,
+                >(idle_stream);
+                tokio::time::timeout(OPERATION_DEADLINE, async {
+                    while service_budget.active() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("authenticated listener did not admit idle stream");
+                tokio::time::timeout(OPERATION_DEADLINE, async {
+                    while service_budget.active() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("pre-auth deadline did not release connection budget");
+                let expired_signer: auth_capnp::signer::Client =
+                    capnp_rpc::new_client(TestSigner::from_ed25519(&reader_key));
+                let mut expired_login = idle_remote.bootstrap.login_request();
+                expired_login.get().set_signer(expired_signer);
+                let expired =
+                    tokio::time::timeout(OPERATION_DEADLINE, expired_login.send().promise)
+                        .await
+                        .expect("expired stream login did not terminate");
+                assert!(
+                    expired.is_err(),
+                    "pre-auth deadline must close an unauthenticated stream"
+                );
+                idle_remote.abort();
 
                 let wrong_protocol =
                     ww::rpc::vat_protocol("chess-authority-proof-missing").expect("valid protocol");
@@ -526,28 +627,63 @@ mod tests {
                     "wrong-protocol rejection should carry a diagnostic"
                 );
 
-                let stream = tokio::time::timeout(
+                let unknown_stream = tokio::time::timeout(
                     OPERATION_DEADLINE,
-                    client_streams.open_stream(server_peer, protocol),
+                    client_streams.open_stream(server_peer, protocol.clone()),
                 )
                 .await
                 .expect("opening Chess protocol stream timed out")
                 .expect("open Chess protocol stream");
-                let remote = ww::rpc::vat_dial::connect::<
+                let unknown_remote = ww::rpc::vat_dial::connect::<
                     _,
-                    auth_capnp::terminal::Client<chess_capnp::chess_engine::Owned>,
-                >(stream);
+                    auth_capnp::terminal::Client<auth_capnp::opaque_session::Owned>,
+                >(unknown_stream);
 
-                let (unknown_status, unknown) = login(&remote.bootstrap, &unknown_key).await;
+                let (unknown_status, unknown) =
+                    login_opaque(&unknown_remote.bootstrap, &unknown_key).await;
                 assert_eq!(unknown_status, auth_capnp::LoginStatus::Denied);
                 assert!(unknown.is_none(), "unknown signer receives no session");
+                unknown_remote.abort();
 
-                let (reader_status, reader) = login(&remote.bootstrap, &reader_key).await;
-                let (player_status, player) = login(&remote.bootstrap, &player_key).await;
+                let reader_stream = tokio::time::timeout(
+                    OPERATION_DEADLINE,
+                    client_streams.open_stream(server_peer, protocol.clone()),
+                )
+                .await
+                .expect("opening Reader stream timed out")
+                .expect("open Reader stream");
+                let reader_remote = ww::rpc::vat_dial::connect::<
+                    _,
+                    auth_capnp::terminal::Client<auth_capnp::opaque_session::Owned>,
+                >(reader_stream);
+                let (reader_status, reader) =
+                    login_opaque(&reader_remote.bootstrap, &reader_key).await;
+
+                let player_stream = tokio::time::timeout(
+                    OPERATION_DEADLINE,
+                    client_streams.open_stream(server_peer, protocol),
+                )
+                .await
+                .expect("opening Player stream timed out")
+                .expect("open Player stream");
+                let player_remote = ww::rpc::vat_dial::connect::<
+                    _,
+                    auth_capnp::terminal::Client<auth_capnp::opaque_session::Owned>,
+                >(player_stream);
+                let (player_status, player) =
+                    login_opaque(&player_remote.bootstrap, &player_key).await;
                 assert_eq!(reader_status, auth_capnp::LoginStatus::Granted);
                 assert_eq!(player_status, auth_capnp::LoginStatus::Granted);
                 let reader = reader.expect("Reader session");
                 let player = player.expect("Player session");
+
+                let (second_status, second_session) =
+                    login_opaque(&reader_remote.bootstrap, &player_key).await;
+                assert_eq!(second_status, auth_capnp::LoginStatus::Denied);
+                assert!(
+                    second_session.is_none(),
+                    "one stream must not switch principals after admission"
+                );
 
                 get_state(&reader).await.expect("Reader may observe");
                 let denied = apply_move(&reader, "e2e4")
@@ -565,19 +701,14 @@ mod tests {
                     .expect("Reader observes shared remote game")
                     .contains("4P3"));
 
-                assert!(policy_handle.revoke(&reader_key.verifying_key().to_bytes()));
-                let revoked = get_state(&reader)
-                    .await
-                    .expect_err("existing remote Reader session must be revoked");
-                assert_eq!(
-                    call_failure_code(&revoked),
-                    Some(CallFailureCode::TargetRevoked)
-                );
-                get_state(&player)
-                    .await
-                    .expect("Reader revocation must not affect remote Player");
-
                 epoch_tx.send(epoch(2)).expect("advance epoch");
+                let stale_reader = get_state(&reader)
+                    .await
+                    .expect_err("established remote Reader session must expire");
+                assert_eq!(
+                    call_failure_code(&stale_reader),
+                    Some(CallFailureCode::StaleEpoch)
+                );
                 let stale = get_state(&player)
                     .await
                     .expect_err("established remote Player session must expire");
@@ -586,7 +717,8 @@ mod tests {
                 let stalled_protocol_name = "chess-authority-proof-stalled";
                 let stalled_protocol =
                     ww::rpc::vat_protocol(stalled_protocol_name).expect("valid protocol");
-                let mut stalled_incoming = server_streams
+                let mut stalled_control = server_streams.clone();
+                let mut stalled_incoming = stalled_control
                     .accept(stalled_protocol.clone())
                     .expect("register stalled Chess protocol");
                 let (accepted_tx, accepted_rx) = oneshot::channel();
@@ -624,8 +756,8 @@ mod tests {
 
                 stalled.abort();
                 stalled_server.abort();
-                remote.abort();
-                server_rpc.abort();
+                reader_remote.abort();
+                player_remote.abort();
                 server_host.abort();
                 client_host.abort();
             })

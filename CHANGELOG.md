@@ -8,17 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - **Real libp2p Chess authority evidence.** A synchronized direct-dial test
-  now runs two Wetware hosts and proves unknown-login denial, Reader/Player
-  method differentiation over one shared ChessEngine, targeted revocation,
-  epoch expiry, wrong-protocol rejection, and an application-owned timeout
-  for a non-responsive first method call.
+  now runs two Wetware hosts through the production authenticated VatListener
+  path and proves pre-auth deadline enforcement, connection-budget release,
+  unknown-login denial, one successful principal per stream, Reader/Player
+  method differentiation over one shared ChessEngine, epoch expiry,
+  wrong-protocol rejection, and an application-owned timeout for a
+  non-responsive first method call. The complementary in-process proof covers
+  targeted revocation without an epoch advance.
+- **Authenticated VAT publication by default.** Trusted FHS configuration now
+  calls `host :serve-vat cap "service" :auth policy`; VatListener compiles the
+  policy once and constructs a fresh single-use Terminal for every inbound
+  libp2p stream. Each stream has an independent challenge, login deadline,
+  authenticated principal, and issued session. Service names and transport
+  peer IDs do not authorize recipients. Bare publication remains available
+  only through the explicit `host :serve-raw-vat` escape hatch.
 - **Explicit deployer-controlled Terminal construction.** Epoch-scoped kernel
-  sessions now receive an `authority` capability whose verb-first
-  `:guard` operation takes a bare capability plus a pure recipient-policy map
-  and returns a type-erased `Terminal` suitable for the unchanged
-  `host :serve-vat` path. The host validates named method profiles, 32-byte
-  signing keys, duplicate recipients, and profile references, then constructs
-  a fresh method/epoch/revocation-guarded membrane per successful login.
+  sessions retain the lower-level `authority :guard` constructor for callers
+  that need a Terminal as a first-class capability. The host validates named
+  method profiles, 32-byte signing keys, duplicate recipients, and profile
+  references, then constructs a fresh method/epoch/revocation-guarded membrane
+  per successful login.
   Service names and libp2p peer IDs are absent from the policy API. The wire
   policy accepts compiled method coordinates for trusted FHS configuration;
   Rust configuration should prefer typed `MethodProfile::allow_method`
@@ -39,8 +48,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   connection permit before spawning per-connection work, rejecting excess
   streams once the configurable budget is full and releasing capacity on
   completion or task cancellation. Each listener defaults to 64 concurrent
-  connections; the daemon's raw and Terminal listeners can be configured with
-  `WW_MAX_INBOUND_RPC_CONNECTIONS`, while embedded listeners can receive a
+  connections. Daemon, named VAT, and stream listeners read
+  `WW_MAX_INBOUND_RPC_CONNECTIONS`; embedded listeners may instead receive a
   shared or service-specific `ConnectionBudget`. Terminal-gated connections
   must complete one successful login within 10 seconds by default (configurable
   via `WW_TERMINAL_LOGIN_TIMEOUT_SECS`); the connection deadline is distinct

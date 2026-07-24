@@ -2,10 +2,12 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const DEFAULT_MAX_INBOUND_CONNECTIONS: usize = 64;
+pub const DEFAULT_TERMINAL_LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct ConnectionBudget {
@@ -79,6 +81,32 @@ impl fmt::Display for ConnectionLimitReached {
 
 impl std::error::Error for ConnectionLimitReached {}
 
+/// Build the operator-configured inbound connection budget.
+pub fn inbound_connection_budget() -> ConnectionBudget {
+    let configured = std::env::var("WW_MAX_INBOUND_RPC_CONNECTIONS").ok();
+    let capacity = parse_inbound_connection_limit(configured.as_deref());
+    ConnectionBudget::new(capacity).expect("validated non-zero connection limit")
+}
+
+/// Read the operator-configured deadline for completing Terminal login.
+pub fn terminal_login_timeout() -> Duration {
+    let configured = std::env::var("WW_TERMINAL_LOGIN_TIMEOUT_SECS").ok();
+    parse_terminal_login_timeout(configured.as_deref())
+}
+
+pub fn parse_inbound_connection_limit(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.parse::<usize>().ok())
+        .filter(|capacity| *capacity > 0)
+        .unwrap_or(DEFAULT_MAX_INBOUND_CONNECTIONS)
+}
+
+pub fn parse_terminal_login_timeout(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_TERMINAL_LOGIN_TIMEOUT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +145,31 @@ mod tests {
         assert!(budget.try_acquire().is_err());
         drop(permit);
         assert!(budget.try_acquire().is_ok());
+    }
+
+    #[test]
+    fn configured_limits_accept_valid_values_and_reject_zero() {
+        assert_eq!(
+            parse_inbound_connection_limit(None),
+            DEFAULT_MAX_INBOUND_CONNECTIONS
+        );
+        assert_eq!(parse_inbound_connection_limit(Some("7")), 7);
+        assert_eq!(
+            parse_inbound_connection_limit(Some("0")),
+            DEFAULT_MAX_INBOUND_CONNECTIONS
+        );
+        assert_eq!(
+            parse_terminal_login_timeout(None),
+            DEFAULT_TERMINAL_LOGIN_TIMEOUT
+        );
+        assert_eq!(
+            parse_terminal_login_timeout(Some("3")),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            parse_terminal_login_timeout(Some("0")),
+            DEFAULT_TERMINAL_LOGIN_TIMEOUT
+        );
     }
 
     #[tokio::test]

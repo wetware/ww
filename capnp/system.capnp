@@ -8,6 +8,7 @@
 @0xbf5147b78c0e6a2f;
 
 using MembraneSchema = import "membrane.capnp";
+using AuthSchema = import "auth.capnp";
 
 struct PeerInfo {
   peerId @0 :Data;       # libp2p peer ID, serialized.
@@ -144,10 +145,20 @@ interface Process {
 }
 
 interface VatListener {
-  serve @0 (cap :Capability, protocol :Text) -> ();
+  serveRaw @0 (cap :Capability, protocol :Text) -> ();
   # Accept incoming Cap'n Proto RPC connections on /ww/0.1.0/vat/{protocol}.
   # Each connection bootstraps with the provided capability. The protocol is a
   # locator only; capability authority comes from the cap, not from the name.
+  # This is an explicit raw escape hatch and performs no recipient authentication.
+
+  serveAuthenticated @1 (
+    cap :Capability,
+    protocol :Text,
+    policy :AuthSchema.AuthorityPolicy
+  ) -> ();
+  # Accept authenticated Cap'n Proto RPC connections. Each inbound libp2p
+  # stream receives a fresh, single-use Terminal. The stream remains admitted
+  # only after login succeeds before the configured pre-authentication deadline.
 }
 
 interface VatClient {

@@ -39,6 +39,20 @@ pub struct KeyMethodAuthorization {
 }
 
 impl KeyMethodAuthorization {
+    /// Compile the wire policy used by trusted publication configuration.
+    pub fn from_policy(
+        epoch_rx: watch::Receiver<Epoch>,
+        policy: auth_capnp::authority_policy::Reader<'_>,
+    ) -> Result<Self, PolicyCompileError> {
+        let bindings = compile_policy(policy)?;
+        Ok(Self::new(
+            epoch_rx,
+            bindings
+                .into_iter()
+                .map(|(key, (profile_name, methods))| (key, profile_name, methods)),
+        ))
+    }
+
     pub fn new(
         epoch_rx: watch::Receiver<Epoch>,
         bindings: impl IntoIterator<Item = ([u8; 32], String, HashSet<MethodKey>)>,
@@ -245,15 +259,11 @@ impl auth_capnp::authority::Server for AuthorityServer {
         let params = pry!(params.get());
         let session = pry!(params.get_session());
         let policy = pry!(params.get_policy());
-        let bindings = pry!(compile_policy(policy).map_err(|error| {
-            capnp::Error::failed(format!("invalid authority policy: {error}"))
-        }));
-        let authorization = KeyMethodAuthorization::new(
+        let authorization = pry!(KeyMethodAuthorization::from_policy(
             self.guard.receiver.clone(),
-            bindings
-                .into_iter()
-                .map(|(key, (profile_name, methods))| (key, profile_name, methods)),
-        );
+            policy
+        )
+        .map_err(|error| { capnp::Error::failed(format!("invalid authority policy: {error}")) }));
         let terminal: auth_capnp::terminal::Client<auth_capnp::opaque_session::Owned> =
             capnp_rpc::new_client(TerminalServer::with_policy(
                 Box::new(authorization),

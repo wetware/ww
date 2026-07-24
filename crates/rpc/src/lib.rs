@@ -18,8 +18,9 @@ pub mod vat_dial;
 pub mod vat_listener;
 
 pub use connection_budget::{
-    ConnectionBudget, ConnectionLimitReached, ConnectionPermit, InvalidConnectionLimit,
-    DEFAULT_MAX_INBOUND_CONNECTIONS,
+    inbound_connection_budget, parse_inbound_connection_limit, parse_terminal_login_timeout,
+    terminal_login_timeout, ConnectionBudget, ConnectionLimitReached, ConnectionPermit,
+    InvalidConnectionLimit, DEFAULT_MAX_INBOUND_CONNECTIONS, DEFAULT_TERMINAL_LOGIN_TIMEOUT,
 };
 pub mod wagi;
 
@@ -1374,7 +1375,7 @@ mod tests {
                 let listener: system_capnp::vat_listener::Client =
                     capnp_rpc::new_client(listener_impl);
 
-                let mut req = listener.serve_request();
+                let mut req = listener.serve_raw_request();
                 req.get()
                     .init_cap()
                     .set_as_capability(placeholder_cap().hook);
@@ -1447,7 +1448,7 @@ mod tests {
                 })
                 .unwrap();
 
-                let mut req = listener.serve_request();
+                let mut req = listener.serve_raw_request();
                 req.get()
                     .init_cap()
                     .set_as_capability(placeholder_cap().hook);
@@ -1508,7 +1509,7 @@ mod tests {
                 let client2: system_capnp::vat_listener::Client = capnp_rpc::new_client(listener2);
 
                 // First registration should succeed.
-                let mut req1 = client1.serve_request();
+                let mut req1 = client1.serve_raw_request();
                 req1.get()
                     .init_cap()
                     .set_as_capability(placeholder_cap().hook);
@@ -1519,7 +1520,7 @@ mod tests {
                     .expect("first serve should succeed");
 
                 // Second registration with the same service name should fail.
-                let mut req2 = client2.serve_request();
+                let mut req2 = client2.serve_raw_request();
                 req2.get()
                     .init_cap()
                     .set_as_capability(placeholder_cap().hook);
@@ -1547,7 +1548,7 @@ mod tests {
                 let listener: system_capnp::vat_listener::Client =
                     capnp_rpc::new_client(listener_impl);
 
-                let mut req = listener.serve_request();
+                let mut req = listener.serve_raw_request();
                 req.get()
                     .init_cap()
                     .set_as_capability(placeholder_cap().hook);

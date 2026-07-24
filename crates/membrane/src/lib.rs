@@ -312,6 +312,22 @@ where
             allowed: self.allowed,
         }
     }
+
+    /// Return the typed method coordinates captured for this profile.
+    ///
+    /// This is primarily for trusted configuration code that must serialize a
+    /// profile into Wetware's `AuthorityPolicy` wire format. The coordinates
+    /// still come from generated request constructors rather than handwritten
+    /// ordinals, and are sorted for deterministic serialization.
+    pub fn method_keys(&self) -> Vec<MethodKey> {
+        let mut methods = self
+            .allowed
+            .iter()
+            .map(|(interface_id, method_id)| MethodKey::new(*interface_id, *method_id))
+            .collect::<Vec<_>>();
+        methods.sort_unstable_by_key(|method| (method.interface_id, method.method_id));
+        methods
+    }
 }
 
 impl<C> Default for MethodProfile<C>
@@ -902,8 +918,32 @@ impl RequestHook for MembraneRequest {
     }
 
     fn send_streaming(self: Box<Self>) -> Promise<(), Error> {
+        let Self {
+            mut inner,
+            lineage,
+            message,
+            mut cap_table,
+            ..
+        } = *self;
+
+        // Streaming calls still carry parameters. Apply the same staged-message
+        // copy and same-lineage unwrapping as `send()` before dispatching.
+        for slot in cap_table.iter_mut() {
+            if let Some(hook) = slot.take() {
+                *slot = Some(unwrap_same_lineage(hook, &lineage));
+            }
+        }
+        let copy = (|| -> capnp::Result<()> {
+            let mut reader: any_pointer::Reader = message.get_root_as_reader()?;
+            reader.imbue(&cap_table);
+            inner.get().set_as(reader)
+        })();
+        if let Err(error) = copy {
+            return Promise::err(error);
+        }
+
         // Streaming methods return no caps; policy was checked in new_call().
-        self.inner.send_streaming()
+        inner.send_streaming()
     }
 
     fn tail_send(self: Box<Self>) -> Option<(u32, Promise<(), Error>, Box<dyn PipelineHook>)> {
@@ -1246,8 +1286,16 @@ mod tests {
             .allow_method(thing::Client::ping_request)
             .unwrap()
             .allow_method(thing::Client::child_request)
-            .unwrap()
-            .build();
+            .unwrap();
+
+        assert_eq!(
+            profile.method_keys(),
+            vec![
+                MethodKey::new(thing::Client::TYPE_ID, 0),
+                MethodKey::new(thing::Client::TYPE_ID, 2),
+            ]
+        );
+        let profile = profile.build();
 
         assert!(profile.check(thing::Client::TYPE_ID, 0).is_ok());
         assert!(profile.check(thing::Client::TYPE_ID, 2).is_ok());

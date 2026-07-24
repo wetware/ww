@@ -211,17 +211,17 @@ pub mod schema_registry {
         #[test]
         fn core_cap_schema_cids_are_stable() {
             // CID snapshots guard against accidental protocol drift.
-            // Re-pinned for the Export/Synapse cutover: Host.network() and the
-            // Runtime→Executor→Process.bootstrap chain now carry bare
-            // `Capability` (was `Synapse`), so those two interfaces' canonical
-            // schema nodes changed. ROUTING/IDENTITY/HTTP_CLIENT are unchanged.
+            // Re-pinned for the authenticated VAT publication cutover:
+            // Host.network() transitively exposes VatListener's explicit
+            // serveRaw/serveAuthenticated methods. The interface IDs remain
+            // pinned; this snapshot records the intentional schema change.
             assert_eq!(
                 HOST_CID,
-                "bafkr4ic7cpeyps4vztynjvnyygid47przo5aqtkgjswb5ns4yoqiox4pnu"
+                "bafkr4ie7d2lzj7ktjj5j5jmampbskj6wqi4hssa37ccgwtvxe5euxkbday"
             );
             assert_eq!(
                 RUNTIME_CID,
-                "bafkr4idvcyjadh3aefmdcis7ejmbi7jevfyutk7ifj7o3pi2tmfyrgcglm"
+                "bafkr4ifljlnaebne6hrnoxgzzlnuxcynbxn6hr6ebcoip455vn4sfdzoqm"
             );
             assert_eq!(
                 ROUTING_CID,

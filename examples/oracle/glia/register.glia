@@ -1,4 +1,4 @@
-; Demo snippet: register oracle on RPC + HTTP transports.
+; Explicitly ungated RPC demo plus the HTTP adapter.
 (def oracle-wasm (perform :load "bin/oracle.wasm"))
 (def oracle-http (cell oracle-wasm))
 
@@ -6,5 +6,5 @@
 (def oracle-process (perform oracle-executor :spawn))
 (def oracle-cap (perform oracle-process :bootstrap))
 
-(perform host :serve-vat oracle-cap "oracle")
+(perform host :serve-raw-vat oracle-cap "oracle")
 (perform host :listen oracle-http "/oracle")

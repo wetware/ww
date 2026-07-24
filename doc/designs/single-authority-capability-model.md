@@ -99,7 +99,8 @@ invocation lands, each deserving its own design pass:
      as remote callers. Its export payload is the membraned
      `capnp::capability::Client`, which `extract_capnp_client` returns,
      so every boundary path (`:listen` cap forwarding, `host
-     :serve-vat`) publishes the restricted cap.
+     :serve-raw-vat`, or an authenticated VAT session template) preserves the
+     restricted cap.
   Re-attenuation intersects allowlists and collapses to a single
   membrane layer at the hook. Membrane overhead is sub-microsecond and
   constant per layer (`crates/membrane/benches/membrane.rs`).

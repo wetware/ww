@@ -5,6 +5,7 @@
 //! spike; adapted to the `Policy` trait API. The real-cap end-to-end path is
 //! additionally covered by the M1a spike in `crates/rpc`.
 
+use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
 
@@ -18,7 +19,7 @@ use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::test_thing_capnp::thing;
+use crate::test_thing_capnp::{stream_thing, thing};
 use crate::{attenuate, membrane, membrane_state_of, Allowlist, Policy, DENIED_MARKER};
 
 const PING: u16 = 0;
@@ -36,6 +37,31 @@ fn thing_id() -> u64 {
 
 struct ThingImpl {
     depth: u32,
+}
+
+struct StreamThingImpl {
+    messages: Rc<RefCell<Vec<String>>>,
+}
+
+impl stream_thing::Server for StreamThingImpl {
+    fn notify(
+        self: CapRc<Self>,
+        params: stream_thing::NotifyParams,
+    ) -> impl Future<Output = Result<(), Error>> + 'static {
+        let message = params
+            .get()
+            .and_then(|params| params.get_msg())
+            .and_then(|message| {
+                message
+                    .to_string()
+                    .map_err(|error| Error::failed(error.to_string()))
+            });
+        let messages = Rc::clone(&self.messages);
+        async move {
+            messages.borrow_mut().push(message?);
+            Ok(())
+        }
+    }
 }
 
 impl thing::Server for ThingImpl {
@@ -133,6 +159,24 @@ async fn expect_ping(client: &thing::Client, expected: &str, context: &str) {
 async fn allowed_method_succeeds_through_membrane() {
     let m = membraned_local_thing();
     expect_ping(&m, "pong-0", "in-process allowed").await;
+}
+
+#[tokio::test]
+async fn streaming_method_forwards_staged_parameters() {
+    let messages = Rc::new(RefCell::new(Vec::new()));
+    let raw: stream_thing::Client = capnp_rpc::new_client(StreamThingImpl {
+        messages: Rc::clone(&messages),
+    });
+    let client = membrane(
+        raw,
+        Rc::new(Allowlist::new().allow(stream_thing::Client::TYPE_ID, 0)) as Rc<dyn Policy>,
+    );
+
+    let mut request = client.notify_request();
+    request.get().set_msg("streaming payload");
+    request.send().await.unwrap();
+
+    assert_eq!(messages.borrow().as_slice(), ["streaming payload"]);
 }
 
 #[tokio::test]

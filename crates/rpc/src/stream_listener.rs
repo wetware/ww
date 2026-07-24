@@ -11,7 +11,7 @@ use capnp_rpc::pry;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::StreamExt;
 
-use crate::ConnectionBudget;
+use crate::{inbound_connection_budget, ConnectionBudget};
 use authority::system_capnp;
 
 pub struct StreamListenerImpl {
@@ -25,7 +25,7 @@ impl StreamListenerImpl {
         Self {
             stream_control,
             guard,
-            budget: ConnectionBudget::default(),
+            budget: inbound_connection_budget(),
         }
     }
 

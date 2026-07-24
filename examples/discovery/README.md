@@ -9,7 +9,7 @@ hardcoded addresses.
 ## What it demonstrates
 
 - **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- named vat RPC
-- `VatListener.serve` for persistent capability export
+- Explicit `VatListener.serveRaw` for this ungated discovery fixture
 - `VatClient` for typed RPC dialing
 - Service-name DHT discovery via `routing.provide()` / `findProviders()`
 - Dual-mode binary: cell mode (RPC server) + service mode (discovery loop)
@@ -124,7 +124,8 @@ The same binary serves both roles:
 
 - **Cell mode** (no args): spawned by Glia before publication.
   Creates a `GreeterImpl` and exports it via `system::serve()`.
-  `host :serve-vat` publishes that exported capability under `greeter`.
+  `host :serve-raw-vat` explicitly publishes that exported capability under
+  `greeter` without recipient authentication.
 - **Service mode** (default): long-running discovery loop. Provides
   the service-name routing key on the DHT, discovers peers via
   `routing.find_providers()`, dials them with `VatClient`, and calls
@@ -140,7 +141,7 @@ The same binary serves both roles:
 (def discovery-process (perform discovery-executor :spawn))
 (def discovery-cap (perform discovery-process :bootstrap))
 
-(perform host :serve-vat discovery-cap "greeter")
+(perform host :serve-raw-vat discovery-cap "greeter")
 ```
 
 `glia/serve.glia`:

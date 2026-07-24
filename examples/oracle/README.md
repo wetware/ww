@@ -148,7 +148,7 @@ ORACLE NODE:                            CURL CLIENT:
     write to stdout
 
                                         CONSUMER NODE:
-  VatListener publishes    <--libp2p--  vat_client.dial(oracle, "oracle")
+  VatListener serves raw   <--libp2p--  vat_client.dial(oracle, "oracle")
   persistent PriceOracle cap            bootstrap --> PriceOracle cap
                                         oracle.get_pairs() -> ["ETH/gas", ...]
                                         oracle.get_price("ETH/gas")
@@ -171,8 +171,8 @@ The same binary serves all modes. Detection:
 - **Vat cell mode** (no args): spawned by Glia before publication.
   Creates a `PriceOracleImpl`, grafts to obtain `HttpClient`, fetches
   prices from Blocknative, and exports the oracle as the bootstrap
-  capability. `host :serve-vat` publishes that capability under
-  `oracle`.
+  capability. This compatibility demo uses `host :serve-raw-vat` to publish
+  that capability under `oracle` without recipient authentication.
 - **WAGI cell mode** (`WW_CELL_MODE=http`): spawned by `HttpListener`
   per HTTP request. Grafts the membrane over `wetware:streams`
   (side-channel), fetches prices via `HttpClient`, writes a JSON
@@ -187,9 +187,10 @@ The same binary serves all modes. Detection:
 
 The example intentionally keeps HTTP boring. The vat capability is the
 long-lived service object: it owns in-process cache, RPC ordering, and
-service identity. `host :serve-vat` publishes that already-exported
-capability under a service name; it does not install a per-request
-handler.
+service identity. `host :serve-raw-vat` publishes that already-exported
+capability under a service name without recipient authentication; it does not
+install a per-request handler. Production recipient-gated services should use
+`host :serve-vat ... :auth policy`.
 
 The HTTP/WAGI path is a per-request adapter. `HttpListener` spawns a
 fresh CGI/WAGI cell for each matching request, so HTTP should not be
@@ -229,7 +230,7 @@ RPC. Confidence decays toward 0.0 if data goes stale.
 (def oracle-process (perform oracle-executor :spawn))
 (def oracle-cap (perform oracle-process :bootstrap))
 
-(perform host :serve-vat oracle-cap "oracle")
+(perform host :serve-raw-vat oracle-cap "oracle")
 (perform host :listen oracle-http "/oracle")
 ```
 
@@ -246,7 +247,8 @@ RPC. Confidence decays toward 0.0 if data goes stale.
 ```
 
 The host registration forms split by transport:
-- `:serve-vat` publishes an already-exported capability over named vat RPC
+- `:serve-vat ... :auth policy` publishes through a per-stream Terminal
+- `:serve-raw-vat` explicitly publishes an ungated capability over named vat RPC
 - Cell + path -> HttpListener, which runs WAGI at the prefix per request
 
 The same binary handles both transports. It detects HTTP mode via

@@ -48,7 +48,7 @@ references exist where*:
 | Surface | What it controls | How to change it |
 |---------|------------------|------------------|
 | **Membrane graft** | Which RPC capability references enter the cell (`host`, `runtime`, `routing`, `identity`, `http-client`, plus `with`-block grants) | Edit the init.d `with` block; regraft |
-| **Terminal authority policy** | Which verified login identity receives which method profile over one application capability | Attach an explicit policy with `authority :guard` before publication |
+| **Terminal authority policy** | Which verified login identity receives which method profile over one application capability | Publish with `host :serve-vat ... :auth policy`; the listener creates one Terminal per stream |
 | **Root Atom binding** | The cell's root CID — the initial reachable content subgraph | Bind the cell to a different `stem::Atom`; respawn |
 | **Glia env bindings** | Which capability references code inside the cell can name (`fs`, `routing`, `host`, …) | Edit init.d to bind/unbind names; re-eval |
 
@@ -69,8 +69,9 @@ cell; they are never load-bearing across a boundary. See
 Attenuating a capnp-backed capability constructs a hook-level membrane
 around it. The returned cap enforces its method allowlist at the
 capability reference itself, so the policy travels with the cap across
-boundaries — export it via a `with` block, publish it with
-`(perform host :serve-vat cap "svc")`, or hand it to another cell, and
+boundaries — export it via a `with` block, publish it explicitly with
+`(perform host :serve-raw-vat cap "svc")`, use it as the session template
+for authenticated `host :serve-vat`, or hand it to another cell, and
 callers on the far side are filtered even if they cast the reference to
 a typed client. Denied methods fail closed with
 `:glia.error/permission-denied`, locally and remotely.

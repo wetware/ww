@@ -5,7 +5,7 @@ Two-node cross-network chess over libp2p RPC capabilities.
 ## What it demonstrates
 
 - **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- named vat RPC
-- `VatListener.serve` for persistent capability export
+- `VatListener.serveAuthenticated` for per-stream Terminal-gated export
 - `VatClient` for typed RPC dialing
 - Service-name DHT discovery via `routing.provide()` / `findProviders()`
 - Dual-mode binary: cell mode (RPC server) + service mode (discovery loop)
@@ -36,7 +36,7 @@ Vat publication uses the service name `chess`.
 ## Authority proof
 
 The reproducible security artifact uses two real Wetware libp2p hosts and
-direct-dials a `Terminal<ChessEngine>`:
+publishes through the production `VatListener.serveAuthenticated` path:
 
 ```sh
 cargo test -p chess direct_libp2p_terminal_enforces_chess_authority
@@ -45,6 +45,10 @@ cargo test -p chess direct_libp2p_terminal_enforces_chess_authority
 It proves:
 
 - an unknown signing key receives no session;
+- an idle unauthenticated stream is closed at the login deadline and releases
+  its connection-budget permit;
+- each stream receives a single-use Terminal and cannot switch principals
+  after admission;
 - a Reader may call `getState` but is denied `applyMove`;
 - a Player may call both methods, and the Reader observes the same changed
   game state;
@@ -134,10 +138,10 @@ explicitly from `glia/register.glia`.
 ```
              ww shell loads glia/register.glia
                            |
-       trusted config attaches policy, then
-               (perform host :serve-vat ...)
+       explicit legacy compatibility path
+           (perform host :serve-raw-vat ...)
                            |
-                persistent Terminal<ChessEngine>
+                    bare ChessEngine
 ```
 
 Two execution modes, selected by runtime inputs:
@@ -145,7 +149,8 @@ Two execution modes, selected by runtime inputs:
 - **Cell mode** (no args): spawned by Glia before publication.
   Creates a `ChessEngineImpl` and exports it via `system::serve()`.
   The guest exports a bare capability. Trusted publication configuration may
-  attach recipient policy before `host :serve-vat` publishes it.
+  publish it with `host :serve-vat ... :auth policy`. The manual random-game
+  compatibility flow below deliberately uses `host :serve-raw-vat`.
 - **Service mode** (default): long-running discovery loop. Provides
   the service-name routing key on the DHT, discovers peers via
   `routing.find_providers()`, dials them with `VatClient` to get
@@ -188,7 +193,7 @@ interface ChessEngine {
 (def chess-process (perform chess-executor :spawn))
 (def chess-cap (perform chess-process :bootstrap))
 
-(perform host :serve-vat chess-cap "chess")
+(perform host :serve-raw-vat chess-cap "chess")
 ```
 
 `glia/serve.glia`:
@@ -208,10 +213,11 @@ cargo test -p chess --lib
 cargo test -p chess direct_libp2p_terminal_enforces_chess_authority
 ```
 
-The manual `glia/register.glia` random-game flow still publishes the bare
-Chess capability for demo compatibility. It is not the authority proof and
-must not be described as recipient-gated until deployer recipient keys are
-supplied and `authority :guard` is used at that publication site.
+The manual `glia/register.glia` random-game flow explicitly publishes the bare
+Chess capability with `serve-raw-vat` for compatibility. It is not the
+authority proof and must not be described as recipient-gated. The security
+artifact above supplies deployer recipient keys and exercises the production
+authenticated listener path.
 
 ## See also
 

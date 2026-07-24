@@ -217,10 +217,11 @@ transport. The host never writes bytes. All RPC I/O goes through the WIT
 data_streams side-channel.
 
 Vat publication is publisher-owned: the publisher spawns a cell, imports its
-bootstrap capability with `Process.bootstrap`, and passes that capability to
-`VatListener.serve`. `handle_vat_connection_serve` in
-`crates/rpc/src/vat_listener.rs` only bridges one incoming libp2p stream to the
-already-served capability; it does not own or spawn the publishing cell.
+bootstrap capability with `Process.bootstrap`, and passes that capability plus
+an explicit auth policy to `VatListener.serveAuthenticated`. The listener owns
+one Terminal and login deadline per stream, but it does not own or spawn the
+publishing cell. `handle_vat_connection_serve` is retained for the explicit
+raw-serving path.
 
 ## Executor pool and M:N scheduling
 

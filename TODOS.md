@@ -154,12 +154,28 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 **RESOLVED:** Stream and vat protocols now use distinct prefixes:
 `/ww/0.1.0/stream/{name}` vs `/ww/0.1.0/vat/{name}`.
 
-## Connection rate limiting for VatListener
-**What:** Every incoming connection in `VatListenerImpl` starts a Cap'n Proto RPC session to the served capability with no concurrency limit. A malicious peer (or many peers) can flood connections, causing unbounded session and stream work.
-**Why:** Serve-only vat transport no longer spawns a WASI cell per connection, but each connection still holds an RPC system, stream, tasks, and references to the served capability.
-**Context:** Add a semaphore or max-connections limit to the accept loop. Consider making the limit configurable via `serve()` params or a sensible default (e.g. 64 concurrent connections per protocol).
-**Effort:** S
-**Priority:** P2
+## ~~Connection rate limiting for VatListener~~ ✅
+**RESOLVED:** Named raw and authenticated VAT serving now share the
+operator-configured `ConnectionBudget`. Authenticated streams must complete
+Terminal login before `WW_TERMINAL_LOGIN_TIMEOUT_SECS` or the listener closes
+the stream and releases its permit. This bounds per-connection resource use;
+per-peer/per-principal quotas and Sybil-resistant fairness remain deferred.
+
+## Authenticated VAT policy-management handle
+**What:** Return or provision an operator capability that can update recipient
+bindings and trigger key-scoped `RevocationGuard`s for a running authenticated
+VAT service.
+**Why:** `serve-vat ... :auth policy` compiles the deployer's initial policy and
+enforces epoch expiry, but the public serving call does not yet expose
+`KeyMethodAuthorization::revoke` or binding replacement. Operators currently
+need an epoch advance to invalidate authority through this generic path.
+**Context:** Keep the publication API direct; do not reintroduce a
+deployer-visible `AuthenticatedVatService` wrapper merely to obtain the handle.
+The management capability should be explicit, separately attenuable, and
+usable by trusted FHS configuration or a future Warrant/ICME adapter.
+**Effort:** M
+**Priority:** P1
+**Depends on:** authenticated per-stream VAT serving
 
 ## ~~Bootstrap timeout in handle_vat_connection~~ ✅
 **RESOLVED:** `handle_vat_connection()` now wraps `bootstrap_request()` in a 10s `tokio::time::timeout`. Produces a clear error referencing `system::serve()`.

@@ -1011,7 +1011,9 @@ wasip2::cli::command::export!({iface_name}Guest);
             r#"; {name} init.d script — evaluated by the kernel at boot.
 ;
 ; Starts one cell, obtains its exported capability, and publishes it as
-; a vat service under the "{name}" protocol.
+; an explicitly ungated vat service under the "{name}" protocol.
+; Replace serve-raw-vat with serve-vat plus a deployer auth policy before
+; exposing authority that requires recipient authentication.
 ;
 ; To run the service from the shell:
 ;   (perform runtime :run (perform :load "bin/{name}.wasm") :args ["serve"])
@@ -1021,7 +1023,7 @@ wasip2::cli::command::export!({iface_name}Guest);
 (def {snake_name}-process (perform {snake_name}-executor :spawn))
 (def {snake_name}-cap (perform {snake_name}-process :bootstrap))
 
-(perform host :serve-vat {snake_name}-cap "{name}")
+(perform host :serve-raw-vat {snake_name}-cap "{name}")
 "#,
             snake_name = name.replace('-', "_"),
         );

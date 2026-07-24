@@ -23,7 +23,9 @@ interface Identity @0xa7c200e5b4726d89 {
 }
 
 enum LoginStatus @0xb8b4d9a87c2e6f31 {
-  granted           @0;
+  # Keep the wire default fail-closed. Older peers decode granted @8 as an
+  # unknown value; newer peers decode an omitted/legacy @0 as uninitialized.
+  uninitialized     @0;
   denied            @1;
   invalidRequest    @2;
   invalidProof      @3;
@@ -31,6 +33,7 @@ enum LoginStatus @0xb8b4d9a87c2e6f31 {
   backendUnavailable @5;
   timedOut          @6;
   overloaded        @7;
+  granted           @8;
 }
 
 interface Terminal @0xeae8840b2a898ba9 (Session) {

@@ -17,7 +17,7 @@ use capnp::Error;
 use capnp_rpc::pry;
 use ed25519_dalek::VerifyingKey;
 use libp2p_core::SignedEnvelope;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -25,6 +25,8 @@ use tokio::sync::{oneshot, watch};
 
 /// Default upper bound for authorization backend work during a login.
 pub const DEFAULT_POLICY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default upper bound for the caller-controlled signing round trip.
+pub const DEFAULT_PROOF_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// An identity whose challenge proof has already been verified by Terminal.
 #[derive(Clone, Debug)]
@@ -250,8 +252,11 @@ pub struct TerminalServer<Session: capnp::traits::Owned> {
     template: SessionTemplate<Session>,
     domain: SigningDomain,
     epoch_rx: watch::Receiver<Epoch>,
+    proof_timeout: Duration,
     policy_timeout: Duration,
     grant_notifier: RefCell<Option<oneshot::Sender<()>>>,
+    single_use: bool,
+    granted: Cell<bool>,
 }
 
 impl<Session> TerminalServer<Session>
@@ -307,9 +312,27 @@ where
             template: SessionTemplate::new(session),
             domain,
             epoch_rx,
+            proof_timeout: DEFAULT_PROOF_TIMEOUT,
             policy_timeout,
             grant_notifier: RefCell::new(None),
+            single_use: false,
+            granted: Cell::new(false),
         }
+    }
+
+    /// Bound the caller-controlled signing round trip.
+    pub fn with_proof_timeout(mut self, timeout: Duration) -> Self {
+        self.proof_timeout = timeout;
+        self
+    }
+
+    /// Allow at most one successful login.
+    ///
+    /// Authenticated VAT serving uses one single-use Terminal per inbound
+    /// libp2p stream so a connection cannot switch principals after admission.
+    pub fn single_use(mut self) -> Self {
+        self.single_use = true;
+        self
     }
 
     /// Notify a connection supervisor after the first successfully committed login.
@@ -342,6 +365,15 @@ where
         params: auth_capnp::terminal::LoginParams<Session>,
         mut results: auth_capnp::terminal::LoginResults<Session>,
     ) -> Promise<(), Error> {
+        if self.single_use && self.granted.get() {
+            set_login_outcome(
+                &mut results,
+                auth_capnp::LoginStatus::Denied,
+                "Terminal has already issued its session",
+            );
+            return Promise::ok(());
+        }
+
         let signer: auth_capnp::signer::Client = match params.get().and_then(|p| p.get_signer()) {
             Ok(signer) => signer,
             Err(_) => {
@@ -368,7 +400,18 @@ where
         sign_req.get().set_epoch_seq(epoch_seq);
 
         Promise::from_future(async move {
-            let sign_resp = sign_req.send().promise.await?;
+            let sign_resp =
+                match tokio::time::timeout(self.proof_timeout, sign_req.send().promise).await {
+                    Ok(response) => response?,
+                    Err(_) => {
+                        set_login_outcome(
+                            &mut results,
+                            auth_capnp::LoginStatus::TimedOut,
+                            "signing proof timed out",
+                        );
+                        return Ok(());
+                    }
+                };
             let sig_bytes = sign_resp.get()?.get_sig()?;
 
             // Decode the libp2p SignedEnvelope (RFC 0002).
@@ -471,7 +514,21 @@ where
                 return Ok(());
             }
 
-            grant.commit(&mut results)?;
+            if self.single_use && self.granted.replace(true) {
+                set_login_outcome(
+                    &mut results,
+                    auth_capnp::LoginStatus::Denied,
+                    "Terminal has already issued its session",
+                );
+                return Ok(());
+            }
+
+            if let Err(error) = grant.commit(&mut results) {
+                if self.single_use {
+                    self.granted.set(false);
+                }
+                return Err(error);
+            }
             if let Some(notifier) = self.grant_notifier.borrow_mut().take() {
                 let _ = notifier.send(());
             }
@@ -487,7 +544,6 @@ mod tests {
     use crate::test_session_capnp::{leaf, structured_session};
     use capnp::capability::Rc as CapRc;
     use ed25519_dalek::SigningKey;
-    use std::cell::Cell;
     use std::rc::Rc;
 
     fn test_epoch(seq: u64) -> Epoch {
@@ -577,6 +633,19 @@ mod tests {
         }
     }
 
+    struct HangingSigner;
+
+    #[allow(refining_impl_trait)]
+    impl auth_capnp::signer::Server for HangingSigner {
+        fn sign(
+            self: capnp::capability::Rc<Self>,
+            _params: auth_capnp::signer::SignParams,
+            _results: auth_capnp::signer::SignResults,
+        ) -> Promise<(), Error> {
+            Promise::from_future(std::future::pending())
+        }
+    }
+
     fn terminal_with_epoch(
         vk: VerifyingKey,
         epoch: Epoch,
@@ -653,6 +722,92 @@ mod tests {
                     auth_capnp::LoginStatus::Granted
                 );
                 result.get_session().expect("granted session");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn signer_round_trip_timeout_is_typed_and_sessionless() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let key = SigningKey::generate(&mut rand::rngs::OsRng);
+                let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
+                let membrane = crate::membrane::membrane_client(epoch_rx.clone());
+                let terminal = TerminalServer::new(
+                    key.verifying_key(),
+                    membrane,
+                    SigningDomain::terminal_membrane(),
+                    epoch_rx,
+                )
+                .with_proof_timeout(Duration::from_millis(1));
+                let terminal: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+                    capnp_rpc::new_client(terminal);
+                let signer: auth_capnp::signer::Client = capnp_rpc::new_client(HangingSigner);
+                let mut request = terminal.login_request();
+                request.get().set_signer(signer);
+
+                let response = request.send().promise.await.expect("typed timeout");
+                let result = response.get().expect("login results");
+                assert_eq!(
+                    result.get_status().expect("known status"),
+                    auth_capnp::LoginStatus::TimedOut
+                );
+                assert!(result.get_session().is_err());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn single_use_terminal_issues_at_most_one_session() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let key = SigningKey::generate(&mut rand::rngs::OsRng);
+                let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
+                let membrane = crate::membrane::membrane_client(epoch_rx.clone());
+                let terminal = TerminalServer::new(
+                    key.verifying_key(),
+                    membrane,
+                    SigningDomain::terminal_membrane(),
+                    epoch_rx,
+                )
+                .single_use();
+                let terminal: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+                    capnp_rpc::new_client(terminal);
+
+                let first_signer: auth_capnp::signer::Client =
+                    capnp_rpc::new_client(TestSigner::from_ed25519(&key));
+                let mut first = terminal.login_request();
+                first.get().set_signer(first_signer);
+                let first = first.send().promise.await.expect("first login");
+                assert_eq!(
+                    first
+                        .get()
+                        .expect("first login results")
+                        .get_status()
+                        .expect("known status"),
+                    auth_capnp::LoginStatus::Granted
+                );
+
+                let second_signer: auth_capnp::signer::Client =
+                    capnp_rpc::new_client(TestSigner::from_ed25519(&key));
+                let mut second = terminal.login_request();
+                second.get().set_signer(second_signer);
+                let second = second.send().promise.await.expect("typed denial");
+                assert_eq!(
+                    second
+                        .get()
+                        .expect("second login results")
+                        .get_status()
+                        .expect("known status"),
+                    auth_capnp::LoginStatus::Denied
+                );
+                assert!(second
+                    .get()
+                    .expect("second login results")
+                    .get_session()
+                    .is_err());
             })
             .await;
     }
