@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Typed Rust method profiles for capability attenuation.**
+  `membrane::MethodProfile::<Client>::allow_method(Client::method_request)`
+  records the interface ID and ordinal emitted by generated Cap'n Proto request
+  constructors, eliminating hand-written ordinals from trusted Rust
+  configuration. Selectors must construct exactly one request and fail closed
+  otherwise. This is a configuration-safety feature, not a security boundary
+  against malicious profile-building code.
 - **Local admin health endpoint.** `ww run` now starts its localhost-only
   admin endpoint on `127.0.0.1:2026` by default, including `GET /healthz` for
   future distroless exec probes. Override the bind address with

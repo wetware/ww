@@ -12,3 +12,18 @@ interface Thing {
   # passed back in should be unwrapped so the backend sees the bare cap.
   echo      @3 (thing :Thing) -> (msg :Text);
 }
+
+# Feasibility fixtures for typed method capture. These are intentionally
+# test-only: they exercise the two generated request shapes and prove that an
+# inherited method retains the interface ID of the interface that declared it.
+interface StreamThing {
+  notify @0 (msg :Text) -> stream;
+}
+
+interface BaseThing {
+  base @0 ();
+}
+
+interface DerivedThing extends(BaseThing) {
+  derived @0 ();
+}

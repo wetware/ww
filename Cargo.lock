@@ -1481,6 +1481,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "wasip2",
+ "wetware-membrane",
 ]
 
 [[package]]

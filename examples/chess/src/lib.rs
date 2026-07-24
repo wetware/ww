@@ -612,6 +612,29 @@ wasip2::cli::command::export!(ChessGuest);
 mod tests {
     use super::*;
     use chess_capnp::chess_engine::GameStatus;
+    use membrane::{MethodProfile, Policy};
+
+    #[test]
+    fn test_typed_method_profile_uses_generated_chess_client() {
+        use capnp::traits::HasTypeId;
+
+        let reader = MethodProfile::<chess_capnp::chess_engine::Client>::new()
+            .allow_method(chess_capnp::chess_engine::Client::get_state_request)
+            .unwrap()
+            .build();
+        let player = MethodProfile::<chess_capnp::chess_engine::Client>::new()
+            .allow_method(chess_capnp::chess_engine::Client::get_state_request)
+            .unwrap()
+            .allow_method(chess_capnp::chess_engine::Client::apply_move_request)
+            .unwrap()
+            .build();
+        let interface_id = chess_capnp::chess_engine::Client::TYPE_ID;
+
+        assert!(reader.check(interface_id, 0).is_ok());
+        assert!(reader.check(interface_id, 1).is_err());
+        assert!(player.check(interface_id, 0).is_ok());
+        assert!(player.check(interface_id, 1).is_ok());
+    }
 
     #[test]
     fn test_initial_fen() {

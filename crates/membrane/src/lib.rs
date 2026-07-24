@@ -28,6 +28,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::marker::PhantomData;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
@@ -129,6 +131,188 @@ impl Allowlist {
     pub fn allow(mut self, interface_id: u64, method_id: u16) -> Self {
         self.allowed.insert((interface_id, method_id));
         self
+    }
+}
+
+/// The coordinate Cap'n Proto places on the wire for a capability method.
+///
+/// An interface ID alone is insufficient because method ordinals are scoped
+/// to the interface that declares them.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MethodKey {
+    pub interface_id: u64,
+    pub method_id: u16,
+}
+
+impl MethodKey {
+    pub const fn new(interface_id: u64, method_id: u16) -> Self {
+        Self {
+            interface_id,
+            method_id,
+        }
+    }
+}
+
+/// Why a typed method selector could not be reduced to one [`MethodKey`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MethodCaptureError {
+    /// The selector never constructed a Cap'n Proto request.
+    NoMethod,
+    /// A selector must identify one method, not assemble a compound operation.
+    MultipleMethods { count: usize },
+}
+
+impl fmt::Display for MethodCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoMethod => write!(f, "method selector did not construct a request"),
+            Self::MultipleMethods { count } => {
+                write!(
+                    f,
+                    "method selector constructed {count} requests; expected one"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MethodCaptureError {}
+
+/// Builds a static allowlist from generated, typed Cap'n Proto request methods.
+///
+/// `allow_method(Client::foo_request)` invokes the request constructor once
+/// against a recording client. The request is never sent; only the generated
+/// `(interface_id, method_id)` passed to `ClientHook::new_call` is retained.
+/// This avoids hand-written ordinals while leaving the call-time policy as the
+/// same schema-agnostic [`Allowlist`].
+///
+/// # Trust boundary
+///
+/// The typed selector prevents accidental use of a method from the wrong
+/// generated client and avoids hand-written ordinal mistakes. It is not a
+/// security boundary against hostile Rust configuration code: Rust cannot
+/// prove that the callable is literally an unmodified generated method rather
+/// than a compatible wrapper. The recorder fails closed unless the callable
+/// constructs exactly one request, but code authorized to build a profile
+/// must still be trusted to select the intended method.
+pub struct MethodProfile<C> {
+    allowed: HashSet<(u64, u16)>,
+    client: PhantomData<fn() -> C>,
+}
+
+impl<C> MethodProfile<C>
+where
+    C: capnp::capability::FromClientHook,
+{
+    pub fn new() -> Self {
+        Self {
+            allowed: HashSet::new(),
+            client: PhantomData,
+        }
+    }
+
+    pub fn allow_method<F, Output>(mut self, method: F) -> Result<Self, MethodCaptureError>
+    where
+        F: FnOnce(&C) -> Output,
+    {
+        let recorder = MethodRecorder::new();
+        let client = C::new(Box::new(recorder.clone()));
+        drop(method(&client));
+
+        let key = recorder.one_method()?;
+        self.allowed.insert((key.interface_id, key.method_id));
+        Ok(self)
+    }
+
+    pub fn build(self) -> Allowlist {
+        Allowlist {
+            allowed: self.allowed,
+        }
+    }
+}
+
+impl<C> Default for MethodProfile<C>
+where
+    C: capnp::capability::FromClientHook,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone)]
+struct MethodRecorder {
+    methods: Rc<RefCell<Vec<MethodKey>>>,
+}
+
+impl MethodRecorder {
+    fn new() -> Self {
+        Self {
+            methods: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    fn one_method(&self) -> Result<MethodKey, MethodCaptureError> {
+        let methods = self.methods.borrow();
+        match methods.as_slice() {
+            [] => Err(MethodCaptureError::NoMethod),
+            [key] => Ok(*key),
+            _ => Err(MethodCaptureError::MultipleMethods {
+                count: methods.len(),
+            }),
+        }
+    }
+}
+
+impl ClientHook for MethodRecorder {
+    fn add_ref(&self) -> Box<dyn ClientHook> {
+        Box::new(self.clone())
+    }
+
+    fn new_call(
+        &self,
+        interface_id: u64,
+        method_id: u16,
+        _size_hint: Option<MessageSize>,
+    ) -> Request<any_pointer::Owned, any_pointer::Owned> {
+        self.methods
+            .borrow_mut()
+            .push(MethodKey::new(interface_id, method_id));
+        Request::new(Box::new(BrokenRequest::new(Error::failed(
+            "method-capture request cannot be sent".into(),
+        ))))
+    }
+
+    fn call(
+        &self,
+        _interface_id: u64,
+        _method_id: u16,
+        _params: Box<dyn ParamsHook>,
+        _results: Box<dyn ResultsHook>,
+    ) -> Promise<(), Error> {
+        Promise::err(Error::failed(
+            "method-capture client cannot make calls".into(),
+        ))
+    }
+
+    fn get_brand(&self) -> usize {
+        0
+    }
+
+    fn get_ptr(&self) -> usize {
+        Rc::as_ptr(&self.methods) as *const () as usize
+    }
+
+    fn get_resolved(&self) -> Option<Box<dyn ClientHook>> {
+        None
+    }
+
+    fn when_more_resolved(&self) -> Option<Promise<Box<dyn ClientHook>, Error>> {
+        None
+    }
+
+    fn when_resolved(&self) -> Promise<(), Error> {
+        Promise::ok(())
     }
 }
 
@@ -832,6 +1016,9 @@ impl ClientHook for BrokenClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capnp::traits::HasTypeId;
+
+    use crate::test_thing_capnp::{base_thing, derived_thing, stream_thing, thing};
 
     const IFACE: u64 = 0xdead_beef;
 
@@ -841,6 +1028,65 @@ mod tests {
         assert!(p.check(IFACE, 0).is_ok());
         let denied = p.check(IFACE, 1).unwrap_err();
         assert!(denied.to_string().contains(DENIED_MARKER));
+    }
+
+    #[test]
+    fn typed_profile_captures_generated_request_methods() {
+        let profile = MethodProfile::<thing::Client>::new()
+            .allow_method(thing::Client::ping_request)
+            .unwrap()
+            .allow_method(thing::Client::child_request)
+            .unwrap()
+            .build();
+
+        assert!(profile.check(thing::Client::TYPE_ID, 0).is_ok());
+        assert!(profile.check(thing::Client::TYPE_ID, 2).is_ok());
+        assert!(profile.check(thing::Client::TYPE_ID, 1).is_err());
+    }
+
+    #[test]
+    fn typed_profile_captures_streaming_request_methods() {
+        let profile = MethodProfile::<stream_thing::Client>::new()
+            .allow_method(stream_thing::Client::notify_request)
+            .unwrap()
+            .build();
+
+        assert!(profile.check(stream_thing::Client::TYPE_ID, 0).is_ok());
+    }
+
+    #[test]
+    fn typed_profile_preserves_declaring_interface_for_inheritance() {
+        let base = MethodProfile::<base_thing::Client>::new()
+            .allow_method(base_thing::Client::base_request)
+            .unwrap()
+            .build();
+        let derived = MethodProfile::<derived_thing::Client>::new()
+            .allow_method(derived_thing::Client::derived_request)
+            .unwrap()
+            .build();
+
+        assert!(base.check(base_thing::Client::TYPE_ID, 0).is_ok());
+        assert!(base.check(derived_thing::Client::TYPE_ID, 0).is_err());
+        assert!(derived.check(derived_thing::Client::TYPE_ID, 0).is_ok());
+        assert!(derived.check(base_thing::Client::TYPE_ID, 0).is_err());
+    }
+
+    #[test]
+    fn typed_profile_fails_closed_when_selector_constructs_no_method() {
+        let result = MethodProfile::<thing::Client>::new().allow_method(|_| ());
+        assert!(matches!(result, Err(MethodCaptureError::NoMethod)));
+    }
+
+    #[test]
+    fn typed_profile_fails_closed_when_selector_constructs_multiple_methods() {
+        let result = MethodProfile::<thing::Client>::new().allow_method(|client| {
+            drop(client.ping_request());
+            client.child_request()
+        });
+        assert!(matches!(
+            result,
+            Err(MethodCaptureError::MultipleMethods { count: 2 })
+        ));
     }
 
     #[test]
