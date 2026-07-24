@@ -333,6 +333,9 @@ impl GraftBuilder for HostGraftBuilder {
         entries.push(("host", host.client));
         entries.push(("runtime", self.runtime_client.clone().client));
         entries.push(("routing", routing.client));
+        let authority: auth_capnp::authority::Client =
+            capnp_rpc::new_client(authority::AuthorityServer::new(guard.clone()));
+        entries.push(("authority", authority.client));
         let ipfs_cap: system_capnp::ipfs::Client = capnp_rpc::new_client(EpochGuardedIpfs {
             guard: guard.clone(),
             ipfs_client: self.ipfs_client.clone(),

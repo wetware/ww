@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Explicit deployer-controlled Terminal construction.** Epoch-scoped kernel
+  sessions now receive an `authority` capability whose verb-first
+  `:guard` operation takes a bare capability plus a pure recipient-policy map
+  and returns a type-erased `Terminal` suitable for the unchanged
+  `host :serve-vat` path. The host validates named method profiles, 32-byte
+  signing keys, duplicate recipients, and profile references, then constructs
+  a fresh method/epoch/revocation-guarded membrane per successful login.
+  Service names and libp2p peer IDs are absent from the policy API. The wire
+  policy accepts compiled method coordinates for trusted FHS configuration;
+  Rust configuration should prefer typed `MethodProfile::allow_method`
+  selectors, which remain a configuration-safety aid rather than a boundary
+  against malicious deployer code.
 - **Rust-native Chess identity-to-authority proof policy.** The Chess example
   now exposes a host-side `ChessAuthorization` policy mapping verified Terminal
   signing keys to typed Reader or Player method profiles. Every successful

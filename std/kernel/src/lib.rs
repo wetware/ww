@@ -27,7 +27,11 @@ mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
 
-#[allow(dead_code, clippy::extra_unused_type_parameters)]
+#[allow(
+    dead_code,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
 mod auth_capnp {
     include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
 }
@@ -158,6 +162,8 @@ struct Session {
     /// capability reference is passed.
     #[allow(dead_code)]
     identity: auth_capnp::identity::Client,
+    /// Trusted constructor for attaching recipient policy before publication.
+    authority: auth_capnp::authority::Client,
     /// Outbound HTTP capability for WASM guests.
     ///
     /// Domain-scoped proxy — the host checks URL host against an allowlist.
@@ -206,6 +212,7 @@ fn extract_capnp_client(
     try_downcast!(system_capnp::runtime::Client);
     try_downcast!(routing_capnp::routing::Client);
     try_downcast!(auth_capnp::identity::Client);
+    try_downcast!(auth_capnp::authority::Client);
     try_downcast!(http_capnp::http_client::Client);
     try_downcast!(system_capnp::executor::Client);
     None
@@ -656,6 +663,208 @@ fn call_resume(resume: &Val, val: Val) -> Result<Val, Val> {
     match resume {
         Val::NativeFn { func, .. } => func(&[val]),
         _ => Err(Val::from("cap handler: invalid resume function")),
+    }
+}
+
+fn policy_field<'a>(map: &'a glia::ValMap, name: &str) -> Option<&'a Val> {
+    map.get(&Val::Keyword(name.into()))
+        .or_else(|| map.get(&Val::Str(name.into())))
+        .or_else(|| map.get(&Val::Sym(name.into())))
+}
+
+fn policy_sequence<'a>(value: &'a Val, context: &str) -> Result<&'a [Val], Val> {
+    match value {
+        Val::List(items) | Val::Vector(items) => Ok(items),
+        other => Err(glia::error::type_mismatch(context, "list or vector", other)),
+    }
+}
+
+fn policy_name(value: &Val, context: &str) -> Result<String, Val> {
+    match value {
+        Val::Str(name) | Val::Sym(name) | Val::Keyword(name) if !name.is_empty() => {
+            Ok(name.clone())
+        }
+        other => Err(glia::error::type_mismatch(
+            context,
+            "non-empty string, symbol, or keyword",
+            other,
+        )),
+    }
+}
+
+fn policy_u64(value: &Val, context: &str) -> Result<u64, Val> {
+    match value {
+        Val::Int(number) if *number >= 0 => Ok(*number as u64),
+        Val::Str(number) => {
+            let number = number.strip_prefix("0x").unwrap_or(number);
+            u64::from_str_radix(number, 16)
+                .map_err(|_| Val::from(format!("{context} — invalid hexadecimal UInt64")))
+        }
+        other => Err(glia::error::type_mismatch(
+            context,
+            "non-negative integer or hexadecimal string",
+            other,
+        )),
+    }
+}
+
+fn policy_u16(value: &Val, context: &str) -> Result<u16, Val> {
+    let number = policy_u64(value, context)?;
+    u16::try_from(number).map_err(|_| Val::from(format!("{context} — ordinal exceeds UInt16")))
+}
+
+fn policy_key(value: &Val, context: &str) -> Result<Vec<u8>, Val> {
+    let bytes = match value {
+        Val::Bytes(bytes) => bytes.clone(),
+        Val::Str(encoded) => hex::decode(encoded)
+            .map_err(|_| Val::from(format!("{context} — invalid hexadecimal key")))?,
+        other => {
+            return Err(glia::error::type_mismatch(
+                context,
+                "32-byte value or hexadecimal string",
+                other,
+            ))
+        }
+    };
+    if bytes.len() != 32 {
+        return Err(Val::from(format!(
+            "{context} — verifying key must be 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn write_authority_policy(
+    mut builder: auth_capnp::authority_policy::Builder<'_>,
+    value: &Val,
+) -> Result<(), Val> {
+    let Val::Map(policy) = value else {
+        return Err(glia::error::type_mismatch(
+            "authority :guard policy",
+            "map",
+            value,
+        ));
+    };
+    let profiles = policy_field(policy, "profiles")
+        .ok_or_else(|| Val::from("authority :guard policy — missing :profiles"))?;
+    let profiles = policy_sequence(profiles, "authority :guard :profiles")?;
+    let mut profile_builders = builder.reborrow().init_profiles(profiles.len() as u32);
+    for (index, profile) in profiles.iter().enumerate() {
+        let Val::Map(profile) = profile else {
+            return Err(glia::error::type_mismatch(
+                "authority :guard profile",
+                "map",
+                profile,
+            ));
+        };
+        let name = policy_name(
+            policy_field(profile, "name")
+                .ok_or_else(|| Val::from("authority :guard profile — missing :name"))?,
+            "authority :guard profile :name",
+        )?;
+        let methods = policy_field(profile, "methods")
+            .ok_or_else(|| Val::from("authority :guard profile — missing :methods"))?;
+        let methods = policy_sequence(methods, "authority :guard profile :methods")?;
+        let mut profile_builder = profile_builders.reborrow().get(index as u32);
+        profile_builder.set_name(&name);
+        let mut method_builders = profile_builder.init_methods(methods.len() as u32);
+        for (method_index, method) in methods.iter().enumerate() {
+            let method = policy_sequence(method, "authority :guard method")?;
+            if method.len() != 2 {
+                return Err(Val::from(
+                    "authority :guard method — expected [interface-id ordinal]",
+                ));
+            }
+            let interface_id = policy_u64(&method[0], "authority :guard interface-id")?;
+            let ordinal = policy_u16(&method[1], "authority :guard ordinal")?;
+            let mut method_builder = method_builders.reborrow().get(method_index as u32);
+            method_builder.set_interface_id(interface_id);
+            method_builder.set_ordinal(ordinal);
+        }
+    }
+
+    let recipients = policy_field(policy, "recipients")
+        .ok_or_else(|| Val::from("authority :guard policy — missing :recipients"))?;
+    let recipients = policy_sequence(recipients, "authority :guard :recipients")?;
+    let mut recipient_builders = builder.init_recipients(recipients.len() as u32);
+    for (index, recipient) in recipients.iter().enumerate() {
+        let Val::Map(recipient) = recipient else {
+            return Err(glia::error::type_mismatch(
+                "authority :guard recipient",
+                "map",
+                recipient,
+            ));
+        };
+        let key = policy_key(
+            policy_field(recipient, "verifying-key").ok_or_else(|| {
+                Val::from("authority :guard recipient — missing :verifying-key")
+            })?,
+            "authority :guard recipient :verifying-key",
+        )?;
+        let profile = policy_name(
+            policy_field(recipient, "profile")
+                .ok_or_else(|| Val::from("authority :guard recipient — missing :profile"))?,
+            "authority :guard recipient :profile",
+        )?;
+        let mut recipient_builder = recipient_builders.reborrow().get(index as u32);
+        recipient_builder.set_verifying_key(&key);
+        recipient_builder.set_profile(&profile);
+    }
+    Ok(())
+}
+
+fn make_authority_handler(authority: auth_capnp::authority::Client) -> Val {
+    Val::AsyncNativeFn {
+        name: "authority-handler".into(),
+        func: Rc::new(move |args: Vec<Val>| {
+            let authority = authority.clone();
+            Box::pin(async move {
+                let (method, rest) = extract_method(&args[0])?;
+                let resume = &args[1];
+                let result = match method {
+                    "guard" => {
+                        let (session, policy) = match rest {
+                            [Val::Cap { inner, .. }, policy] => {
+                                let session = extract_capnp_client(inner).ok_or_else(|| {
+                                    Val::from(
+                                        "authority :guard — session is not backed by a Cap'n Proto client",
+                                    )
+                                })?;
+                                (session, policy)
+                            }
+                            _ => {
+                                return Err(Val::from(
+                                    "authority :guard — usage: (perform authority :guard <cap> <policy-map>)",
+                                ))
+                            }
+                        };
+                        let mut request = authority.guard_request();
+                        request
+                            .get()
+                            .set_session(auth_capnp::opaque_session::Client { client: session });
+                        write_authority_policy(request.get().init_policy(), policy)?;
+                        let response = request
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|error| Val::from(error.to_string()))?;
+                        let terminal = response
+                            .get()
+                            .map_err(|error| Val::from(error.to_string()))?
+                            .get_terminal()
+                            .map_err(|error| Val::from(error.to_string()))?;
+                        make_generic_cap(terminal.client)
+                    }
+                    _ => {
+                        return Err(Val::from(format!(
+                            "authority: unknown method :{method}"
+                        )))
+                    }
+                };
+                call_resume(resume, result)
+            })
+        }),
     }
 }
 
@@ -1250,6 +1459,7 @@ Capabilities (via perform):
   (perform host :listen <cell> \"/path\")     Register HTTP/WAGI cell
   (perform host :listen-stream <cell> \"p\")  Register byte-stream cell
   (perform host :serve-vat cap \"service\")   Publish existing vat capability
+  (perform authority :guard cap policy)      Attach recipient policy, return Terminal
 
   (perform runtime :load <wasm>)             Load wasm, return executor
   (perform runtime :run <wasm> :env {})      Spawn foreground process
@@ -1747,6 +1957,7 @@ fn run_impl() {
             let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
             let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
             let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
+            let authority: auth_capnp::authority::Client = get_graft_cap(&caps, "authority")?;
             let http_client: Option<http_capnp::http_client::Client> =
                 get_graft_cap(&caps, "http-client").ok();
 
@@ -1755,6 +1966,7 @@ fn run_impl() {
                 runtime: runtime.clone(),
                 routing: routing.clone(),
                 identity,
+                authority: authority.clone(),
                 http_client: http_client.clone(),
                 cwd: "/".to_string(),
                 load_runtime: caps::default_load_runtime(),
@@ -1800,6 +2012,11 @@ fn run_impl() {
                                 // Glia effect handler — skip env binding.
                                 continue;
                             }
+                            "authority" => (
+                                schema_ids::AUTHORITY_CID,
+                                Rc::new(s.authority.clone()),
+                                make_authority_handler(s.authority.clone()),
+                            ),
                             "http-client" => {
                                 match s.http_client.clone() {
                                     Some(c) => (
@@ -2285,6 +2502,9 @@ mod tests {
         }
     }
 
+    struct TestAuthority;
+    impl auth_capnp::authority::Server for TestAuthority {}
+
     // --- Stub Membrane: returns fixed graft caps ---
 
     struct TestMembrane {
@@ -2327,6 +2547,7 @@ mod tests {
             runtime: capnp_rpc::new_client(TestRuntime),
             routing: capnp_rpc::new_client(TestRouting),
             identity: capnp_rpc::new_client(TestIdentity),
+            authority: capnp_rpc::new_client(TestAuthority),
             http_client: Some(capnp_rpc::new_client(TestHttpClient)),
             cwd: "/".into(),
             load_runtime: caps::default_load_runtime(),
@@ -2499,6 +2720,60 @@ mod tests {
             assert!(msg.contains("unknown method"), "got: {msg}");
         })
         .await;
+    }
+
+    #[test]
+    fn authority_policy_literal_serializes_without_service_name() {
+        let policy = Val::Map(glia::ValMap::from_pairs(vec![
+            (
+                Val::Keyword("profiles".into()),
+                Val::Vector(vec![Val::Map(glia::ValMap::from_pairs(vec![
+                    (Val::Keyword("name".into()), Val::Keyword("reader".into())),
+                    (
+                        Val::Keyword("methods".into()),
+                        Val::Vector(vec![Val::Vector(vec![
+                            Val::Str("0xd0ac8299df079c61".into()),
+                            Val::Int(0),
+                        ])]),
+                    ),
+                ]))]),
+            ),
+            (
+                Val::Keyword("recipients".into()),
+                Val::Vector(vec![Val::Map(glia::ValMap::from_pairs(vec![
+                    (
+                        Val::Keyword("verifying-key".into()),
+                        Val::Str(hex::encode([7; 32])),
+                    ),
+                    (
+                        Val::Keyword("profile".into()),
+                        Val::Keyword("reader".into()),
+                    ),
+                ]))]),
+            ),
+        ]));
+
+        let mut message = capnp::message::Builder::new_default();
+        let builder = message.init_root::<auth_capnp::authority_policy::Builder>();
+        write_authority_policy(builder, &policy).expect("valid authority policy");
+        let policy = message
+            .get_root_as_reader::<auth_capnp::authority_policy::Reader>()
+            .expect("policy reader");
+        let profiles = policy.get_profiles().expect("profiles");
+        let profile = profiles.get(0);
+        assert_eq!(
+            profile.get_name().unwrap().to_str().unwrap(),
+            "reader"
+        );
+        let method = profile.get_methods().unwrap().get(0);
+        assert_eq!(method.get_interface_id(), 0xd0ac_8299_df07_9c61);
+        assert_eq!(method.get_ordinal(), 0);
+        let recipient = policy.get_recipients().unwrap().get(0);
+        assert_eq!(recipient.get_verifying_key().unwrap(), &[7; 32]);
+        assert_eq!(
+            recipient.get_profile().unwrap().to_str().unwrap(),
+            "reader"
+        );
     }
 
     // --- host listen / serve tests ---

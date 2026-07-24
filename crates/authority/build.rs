@@ -31,6 +31,7 @@ fn main() {
             ("RUNTIME", 0x8738_4748_df10_173c),
             ("ROUTING", 0xc033_44a7_b0a3_17be),
             ("IDENTITY", 0xa7c2_00e5_b472_6d89),
+            ("AUTHORITY", 0xd119_09df_3e52_3d41),
             ("HTTP_CLIENT", 0xf00a_15d0_9fb8_f360),
         ],
     )

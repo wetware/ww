@@ -48,3 +48,39 @@ interface Terminal @0xeae8840b2a898ba9 (Session) {
   # Having a Terminal reference does NOT grant access -- the caller must prove
   # identity by signing the challenge with the expected key.
 }
+
+# Type-erased capability session used by the trusted Authority constructor.
+# A caller may cast the returned capability to the application interface it
+# already knows; this interface adds no methods or authority of its own.
+interface OpaqueSession @0xc11f8355d7fce6bb {}
+
+struct AllowedMethod {
+  interfaceId @0 :UInt64;
+  ordinal @1 :UInt16;
+  # Low-level compiled coordinate. Trusted Rust configuration should prefer
+  # MethodProfile::allow_method generated request selectors; this wire form is
+  # the checked constructor boundary, not protection from hostile deployer code.
+}
+
+struct MethodProfile {
+  name @0 :Text;
+  methods @1 :List(AllowedMethod);
+}
+
+struct RecipientProfile {
+  verifyingKey @0 :Data;
+  profile @1 :Text;
+}
+
+struct AuthorityPolicy {
+  profiles @0 :List(MethodProfile);
+  recipients @1 :List(RecipientProfile);
+}
+
+interface Authority @0xd11909df3e523d41 {
+  guard @0 (session :OpaqueSession, policy :AuthorityPolicy)
+      -> (terminal :Terminal(OpaqueSession));
+  # Explicitly attach the supplied recipient policy to one capability and
+  # return a Terminal that constructs a fresh attenuated session per login.
+  # Service names and libp2p peer IDs do not participate in authorization.
+}

@@ -66,6 +66,7 @@ macro_rules! impl_terminal_session_pipeline {
 }
 
 impl_terminal_session_pipeline!(membrane_capnp::membrane::Client);
+impl_terminal_session_pipeline!(auth_capnp::opaque_session::Client);
 
 #[cfg(test)]
 #[allow(clippy::all, dead_code, unreachable_pub)]
@@ -93,6 +94,7 @@ pub mod schema_registry {
             "runtime" => Some(RUNTIME_SCHEMA),
             "routing" => Some(ROUTING_SCHEMA),
             "identity" => Some(IDENTITY_SCHEMA),
+            "authority" => Some(AUTHORITY_SCHEMA),
             "http-client" => Some(HTTP_CLIENT_SCHEMA),
             _ => None,
         }
@@ -105,7 +107,14 @@ pub mod schema_registry {
 
         #[test]
         fn each_core_cap_has_non_empty_bytes() {
-            for name in ["host", "runtime", "routing", "identity", "http-client"] {
+            for name in [
+                "host",
+                "runtime",
+                "routing",
+                "identity",
+                "authority",
+                "http-client",
+            ] {
                 let bytes = schema_by_name(name)
                     .unwrap_or_else(|| panic!("missing schema for cap '{name}'"));
                 assert!(!bytes.is_empty(), "schema for '{name}' is empty");
@@ -120,7 +129,14 @@ pub mod schema_registry {
 
         #[test]
         fn bytes_are_word_aligned() {
-            for name in ["host", "runtime", "routing", "identity", "http-client"] {
+            for name in [
+                "host",
+                "runtime",
+                "routing",
+                "identity",
+                "authority",
+                "http-client",
+            ] {
                 let bytes = schema_by_name(name).expect("schema present");
                 assert_eq!(
                     bytes.len() % 8,
@@ -175,6 +191,14 @@ pub mod schema_registry {
                 0xeae8_840b_2a89_8ba9
             );
             assert_eq!(
+                <crate::auth_capnp::opaque_session::Client as HasTypeId>::TYPE_ID,
+                0xc11f_8355_d7fc_e6bb
+            );
+            assert_eq!(
+                <crate::auth_capnp::authority::Client as HasTypeId>::TYPE_ID,
+                0xd119_09df_3e52_3d41
+            );
+            assert_eq!(
                 <crate::membrane_capnp::export::Reader<'static> as HasTypeId>::TYPE_ID,
                 0xbb8d_5590_cb2f_3d2e
             );
@@ -216,10 +240,12 @@ pub mod schema_registry {
 }
 
 pub mod epoch;
+pub mod issuer;
 pub mod membrane;
 pub mod terminal;
 
 pub use epoch::{Epoch, EpochGuard, Provenance};
+pub use issuer::{AuthorityServer, KeyMethodAuthorization, PolicyCompileError};
 pub use membrane::{membrane_client, GraftBuilder, MembraneServer, NoExtension};
 pub use terminal::{
     AllowAllPolicy, AuthPolicy, AuthenticatedIdentity, AuthorizationError, FixedSessionPolicy,

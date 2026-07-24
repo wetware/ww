@@ -38,7 +38,11 @@ mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
 
-#[allow(dead_code, clippy::extra_unused_type_parameters)]
+#[allow(
+    dead_code,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
 mod auth_capnp {
     include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
 }
