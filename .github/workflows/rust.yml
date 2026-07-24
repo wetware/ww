@@ -8,11 +8,13 @@ on:
   workflow_dispatch: {}
 
 # Serialize release-producing runs per ref so image + IPNS publication from
-# different commits cannot interleave. Queue rather than cancel: every
-# master commit must reach IPNS in commit order.
+# different commits cannot interleave. Retain every pending run; the IPNS
+# ancestry guard below independently prevents an older run from rolling back
+# a newer published master revision.
 concurrency:
   group: ww-release-${{ github.ref }}
   cancel-in-progress: false
+  queue: max
 
 env:
   CARGO_TERM_COLOR: always
@@ -78,10 +80,12 @@ jobs:
     - name: Check IPFS release publish scripts
       run: |
         bash tests/test_ipfs_release_publish.sh
+        bash tests/test_ipfs_release_publish_runtime.sh
+        bash tests/test_release_ancestry.sh
         bash tests/test_deploy_context.sh
         bash tests/test_release_workflow.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_deploy_context.sh tests/test_release_workflow.sh
+          shellcheck scripts/check_release_ancestry.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_release_workflow.sh
         fi
 
   clippy:
@@ -469,6 +473,7 @@ jobs:
     - uses: actions/checkout@v5
       with:
         submodules: recursive
+        fetch-depth: 0
 
     - uses: actions/download-artifact@v8
       with:
@@ -524,6 +529,70 @@ jobs:
         fi
         echo "IPFS pod: $POD"
 
+        # Resolve the currently published release and read its Git provenance.
+        # A missing REVISION is allowed only for the one-time migration from
+        # legacy release trees; resolution/listing/read failures fail closed.
+        read_current_release_state() {
+          local attempt backoff links release revision
+          for attempt in 1 2 3; do
+            if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
+              echo "Release freshness attempt $attempt could not find a Ready IPFS daemon pod" >&2
+            elif ! release=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs name resolve /ipns/\$(kubectl exec $POD -- ipfs key list -l | awk '\$2 == \"ww-release\" { print \$1; exit }')"); then
+              echo "Release freshness attempt $attempt could not resolve ww-release IPNS" >&2
+            elif [[ ! "$release" =~ ^/ipfs/[A-Za-z0-9]+$ ]]; then
+              echo "Release freshness attempt $attempt returned an invalid path: $release" >&2
+            elif ! links=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs ls '$release'"); then
+              echo "Release freshness attempt $attempt could not list $release" >&2
+            elif grep -Eq '[[:space:]]REVISION$' <<<"$links"; then
+              if revision=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs cat '$release/REVISION'"); then
+                revision="$(printf '%s' "$revision" | tr -d '\r\n')"
+                printf '%s|%s\n' "$release" "$revision"
+                return 0
+              fi
+              echo "Release freshness attempt $attempt could not read $release/REVISION" >&2
+            else
+              echo "Current release $release predates Git provenance; allowing one migration publish" >&2
+              printf '%s|\n' "$release"
+              return 0
+            fi
+
+            if [ "$attempt" -lt 3 ]; then
+              backoff=$((attempt * 20))
+              echo "Release freshness attempt $attempt failed; retrying in ${backoff}s..." >&2
+              sleep "$backoff"
+            fi
+          done
+          return 1
+        }
+
+        if ! CURRENT_STATE="$(read_current_release_state)"; then
+          echo "ERROR: could not establish current IPNS release provenance"
+          exit 1
+        fi
+        CURRENT_RELEASE="${CURRENT_STATE%%|*}"
+        CURRENT_REVISION="${CURRENT_STATE#*|}"
+
+        if ! FRESHNESS_ACTION="$(scripts/check_release_ancestry.sh "${{ github.sha }}" "$CURRENT_REVISION")"; then
+          echo "ERROR: refusing to move IPNS to a stale, divergent, or non-master revision"
+          exit 1
+        fi
+        case "$FRESHNESS_ACTION" in
+          publish) ;;
+          skip)
+            echo "IPNS already publishes Git revision ${{ github.sha }}; nothing to do"
+            {
+              echo "PUBLISH_ACTION=skipped"
+              echo "CID=${CURRENT_RELEASE#/ipfs/}"
+              echo "RELEASE_REVISION=${{ github.sha }}"
+            } >> "$GITHUB_ENV"
+            exit 0
+            ;;
+          *)
+            echo "ERROR: release ancestry check returned an unknown action: $FRESHNESS_ACTION"
+            exit 1
+            ;;
+        esac
+
         # Assemble clean release tree (artifacts only, no source code)
         STAGE=/tmp/release-tree
         mkdir -p "$STAGE/bin/ww/linux/x86_64" "$STAGE/bin/ww/linux/aarch64"
@@ -532,6 +601,7 @@ jobs:
 
         # VERSION
         grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/' > "$STAGE/VERSION"
+        echo "${{ github.sha }}" > "$STAGE/REVISION"
 
         # Changelog
         cp CHANGELOG.md "$STAGE/"
@@ -600,7 +670,7 @@ jobs:
             for attempt in 1 2 3; do
               if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
                 echo "Previous-release fetch attempt $attempt could not find a non-terminating Ready IPFS daemon pod"
-              elif ! prev=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs name resolve /ipns/\$(kubectl exec $POD -- ipfs key list -l | grep ww-release | awk '{print \$1}')"); then
+              elif ! prev=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs name resolve /ipns/\$(kubectl exec $POD -- ipfs key list -l | awk '\$2 == \"ww-release\" { print \$1; exit }')"); then
                 echo "Previous-release fetch attempt $attempt could not resolve the IPNS release through $POD"
               elif [ -z "$prev" ]; then
                 echo "Previous-release fetch attempt $attempt resolved an empty IPNS release through $POD"
@@ -694,7 +764,7 @@ jobs:
             if timeout 12m $SSH_CMD ${{ secrets.VPS_SSH }} "
               set -e
               chmod +x /tmp/ww-ipfs-publish-release.sh
-              POD='$POD' WW_RELEASE_PIN_RETAIN=10 /tmp/ww-ipfs-publish-release.sh
+              POD='$POD' WW_RELEASE_EXPECTED_CURRENT='$CURRENT_RELEASE' WW_RELEASE_PIN_RETAIN=10 /tmp/ww-ipfs-publish-release.sh
             " | tee /tmp/ipfs-publish-output.txt; then
               published=true
               break
@@ -724,7 +794,10 @@ jobs:
         fi
         echo "Release CID: $CID"
         {
+          echo "PUBLISH_ACTION=published"
           echo "CID=$CID"
+          echo "RELEASE_REVISION=${{ github.sha }}"
+          echo "IPNS_UPDATED=$(extract_publish_field IPNS_UPDATED)"
           echo "RETAINED_COUNT=$(extract_publish_field RETAINED_COUNT)"
           echo "UNPINNED_COUNT=$(extract_publish_field UNPINNED_COUNT)"
           echo "UNPINNED_CIDS=$(extract_publish_field UNPINNED_CIDS)"
@@ -735,10 +808,22 @@ jobs:
 
     - name: Record CID
       run: |
+        if [ "${{ env.PUBLISH_ACTION }}" = "skipped" ]; then
+          {
+            echo "## IPFS Publish"
+            echo "- Action: skipped; this Git revision is already current"
+            echo "- Git revision: \`${{ env.RELEASE_REVISION }}\`"
+            echo "- CID: \`${{ env.CID }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
         {
           echo "## IPFS Publish"
+          echo "- Action: published"
+          echo "- Git revision: \`${{ env.RELEASE_REVISION }}\`"
           echo "- CID: \`${{ env.CID }}\`"
           echo "- IPNS: \`/ipns/${{ secrets.IPNS_KEY_ID }}\`"
+          echo "- IPNS pointer updated: \`${{ env.IPNS_UPDATED }}\`"
           echo "- Retained release CIDs: \`${{ env.RETAINED_COUNT }}\`"
           echo "- Stale release CIDs unpinned: \`${{ env.UNPINNED_COUNT }}\`"
           echo "- Unpinned CIDs: \`${{ env.UNPINNED_CIDS }}\`"
