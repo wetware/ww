@@ -1,7 +1,7 @@
 # Single-Authority Capability Model
 
 Status: ADOPTED (2026-07). Implemented across #563 (isolate removal),
-#564 (`ww-membrane` crate), #566 (`Export { name, cap }` ABI cutover),
+#564 (`wetware-membrane` crate), #566 (`Export { name, cap }` ABI cutover),
 #568 (production membrane recursion), and the `(attenuate ...)`
 reification PR. Supersedes the `Invokable`-as-currency portions of
 `uniform-ww-capability-abi.md`; introspection, method-identity, and
@@ -19,7 +19,7 @@ a second enforcement layer. The public ABI carries no Glia types.
    hold after a capability crosses a boundary (membrane graft, vat
    dial/serve, process bootstrap, stdio serve) is a membrane wrapper on
    the capability reference itself: a `ClientHook` proxy
-   (`crates/ww-membrane`) that filters on `(interfaceId, ordinal)`,
+   (`crates/membrane`) that filters on `(interfaceId, ordinal)`,
    fails closed on unknown or denied methods, and recursively wraps
    capabilities in results, promise pipelines, and promise resolution.
    Casting is safe because filtering happens below the type layer.
@@ -90,7 +90,7 @@ invocation lands, each deserving its own design pass:
      `schema.Node` (kebab-case keyword → camelCase capnp name; ordinal =
      position in the interface's method list). Unknown names fail closed
      at attenuation time.
-  2. The client hook is wrapped in a `ww-membrane` `Allowlist` keyed by
+  2. The client hook is wrapped in a `wetware-membrane` `Allowlist` keyed by
      `(interfaceId, ordinal)`.
   3. The result is a `glia::HandledCapInner` cap: its carried handler is
      the kernel's typed adapter rebuilt over the MEMBRANED client and
@@ -99,10 +99,11 @@ invocation lands, each deserving its own design pass:
      as remote callers. Its export payload is the membraned
      `capnp::capability::Client`, which `extract_capnp_client` returns,
      so every boundary path (`:listen` cap forwarding, `host
-     :serve-vat`) publishes the restricted cap.
+     :serve-raw-vat`, or an authenticated VAT session template) preserves the
+     restricted cap.
   Re-attenuation intersects allowlists and collapses to a single
   membrane layer at the hook. Membrane overhead is sub-microsecond and
-  constant per layer (`crates/ww-membrane/benches/membrane.rs`).
+  constant per layer (`crates/membrane/benches/membrane.rs`).
 
 - **capnp-backed caps without a compiled schema** (e.g. a generic cap
   obtained from a vat dial) fail closed: ordinals cannot be resolved,
@@ -131,7 +132,7 @@ attenuated caps). When the deferred defcap-export bridge
    cap — no second enforcement path, no per-interface filtered proxies;
 2. reify `attenuate` on such caps into the membrane exactly as for
    grafted caps;
-3. reuse `crates/ww-membrane`; anything the crate cannot express is a
+3. reuse `crates/membrane`; anything the crate cannot express is a
    signal to fix the crate, not to fork a path.
 
 ## One Mechanism, Three Configuration Surfaces

@@ -17,10 +17,11 @@ through on-chain epoch boundaries.
 `boot/main.wasm` from the result, and spawns the agent with epoch-scoped
 capabilities served over in-memory Cap'n Proto RPC.
 
-The host is deliberately simple. It merges layers, loads a binary, and
-hands it capabilities. Everything else — peer discovery, service management,
-access control — is the agent's job. The host is the sandbox; the agent
-is the policy engine.
+The host is deliberately small. It merges layers, loads a binary, and
+enforces the sandbox and capability boundary. Trusted deployer configuration
+in pid0 decides which authority to grant and which guarded capability to
+publish. The untrusted model or guest may request actions, but it is not
+responsible for enforcing its own least privilege.
 
 ## No ambient authority
 
@@ -34,8 +35,10 @@ allows. A Wetware agent has none of that. Its WASI sandbox provides stdio
 That's it. The agent's only connection to the outside world is the `Membrane`
 the host hands it at boot — and it calls `graft()` to obtain actual
 capabilities. (Having a Membrane reference IS authorization — ocap model.
-Authentication, if needed, is handled by wrapping the Membrane in a
-`Terminal(Membrane)` challenge-response layer.)
+Authentication, if needed, is handled by wrapping the capability in a
+`Terminal(Session)` challenge-response layer. `Terminal` is a session
+constructor: after verifying the signing key, its asynchronous `AuthPolicy`
+may consult backend policy and returns a fresh, possibly attenuated session.)
 
 ```
 Traditional process:        Wetware guest:
@@ -144,6 +147,7 @@ capabilities as a `List(Export)` of named capabilities:
 - **Runtime** — load WASM binaries, obtain scoped Executors (with compilation caching)
 - **Routing** — Kademlia DHT (provide, findProviders)
 - **Identity** — host-side Ed25519 signing (private key never enters WASM)
+- **Authority** — attach an explicit recipient/method policy to one capability and construct a `Terminal`
 - **HttpClient** — outbound HTTP requests (domain-scoped via `--http-dial`)
 - **StreamListener / StreamDialer** — open and accept libp2p byte streams
 - **VatListener / VatClient** — serve and consume Cap'n Proto RPC over the network
@@ -152,9 +156,12 @@ All capabilities are epoch-guarded: they become stale when the on-chain
 head advances. The guest must re-graft to obtain fresh capabilities.
 
 Having a Membrane reference IS authorization (ocap model). `graft()` is
-parameterless -- no signer needed. To gate access for remote peers, wrap
-the Membrane in `Terminal(Membrane)`, which requires challenge-response
-authentication before handing out the Membrane reference.
+parameterless -- no signer needed. To gate a capability for remote callers,
+trusted configuration uses `authority :guard` with an explicit recipient
+policy, then publishes the resulting `Terminal`. `Terminal` verifies a
+per-login signing identity and constructs the selected session. A libp2p peer
+ID identifies a transport node; it is not assumed to identify the account or
+tenant authenticating through that node.
 
 ```
 Host                             pid0
@@ -162,7 +169,7 @@ Host                             pid0
 create Membrane
   with GraftBuilder
     Host, Runtime, Routing,
-    Identity, HttpClient,
+    Identity, Authority, HttpClient,
     StreamListener, StreamDialer,
     VatListener, VatClient
 serve via RpcSystem ----------> membrane.graft() -> List(Export { name, cap })
@@ -184,10 +191,12 @@ serve capabilities. Both sides can hold references to the other's objects.
 
 ### Network: host to remote peers
 
-The host can take whatever capability it bootstrapped from the guest and
-serve it over a libp2p stream protocol. Remote peers get a Cap'n Proto
-client stub pointing at the guest's exported capability, proxied through
-the host.
+The host can take whatever capability it bootstrapped from the guest and serve
+it over a libp2p stream protocol. Authenticated `VatListener` publication takes
+the capability plus an explicit deployer policy and creates one Terminal per
+stream. It does not infer authorization from the service name or remote peer
+ID. `serveRaw` publishes the bootstrap capability directly when the deployer
+explicitly chooses an ungated service.
 
 ```
 Node A                                     Node B
@@ -202,21 +211,36 @@ pid0 exports Membrane ──> host             host ──> pid0 imports Membran
 ### The Membrane pattern
 
 pid0 receives a `Membrane` from the host, calls `graft()`, and obtains
-capabilities. It can then wrap, filter, or extend those capabilities into
-a new **Membrane**: an object that controls what the outside world can do.
+capabilities. It can wrap, filter, or extend those capabilities into a new
+membrane, or construct a `Terminal` that issues identity-specific authority.
 
 ```
 1. Host hands pid0 a Membrane reference
 2. pid0 calls graft(), receives capabilities (identity, host, runtime, routing, httpClient)
-3. pid0 can wrap or filter capabilities into a new Membrane
-4. pid0 exports that Membrane back to the host (optionally wrapped in Terminal)
-5. Host serves the exported capability on a libp2p stream protocol
-6. Remote peers authenticate via Terminal (if present), then interact with the Membrane
+3. pid0 obtains a bare application capability from a child
+4. trusted pid0 configuration publishes it with `host :serve-vat ... :auth policy`
+5. VatListener constructs a fresh, single-use Terminal for each libp2p stream
+6. a verified login identity receives only the session authority selected by policy
 ```
 
-This is how pid0 controls access. The host doesn't decide what remote
-peers can do — pid0 does, by choosing what to export. The host is just
-the transport.
+This is how trusted pid0 configuration controls publication. The guest
+service exports a bare capability; it does not choose who may receive it.
+The host supplies enforcement primitives and transport, while the deployer
+selects policy explicitly at the publication site. The libp2p peer ID is
+transport identity, not the authenticated principal: multiple principals may
+flow through one node on separate streams. `host :serve-raw-vat` is the
+conspicuous unauthenticated escape hatch for services that deliberately do
+not need recipient authentication.
+
+Authenticated VAT admission closes streams that do not complete Terminal
+login before the configured deadline. Services published through one
+`VatListener` share that listener's connection budget by default, so a busy
+service can consume admission capacity that another service would otherwise
+use. Embedded callers may construct separate listeners or inject
+service-specific budgets. This bounds per-connection resource use; it is not
+Sybil-resistant availability or a fairness guarantee. The budget is
+intentionally not an account authorization rule, and per-peer/per-principal
+quotas are deferred.
 
 ## Configuration
 

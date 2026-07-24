@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use membrane::Provenance;
+use authority::Provenance;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use atom::{AtomIndexer, FinalizerBuilder, IndexerConfig};
-use membrane::Epoch;
+use authority::Epoch;
 
 use crate::{StemEvent, StemSource};
 

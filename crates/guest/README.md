@@ -5,4 +5,4 @@ Zero-dependency (or near-zero) crates intended for use from WASM guests
 host-only deps.
 
 Host-side RPC servers that consume these primitives live elsewhere
-(e.g. `crates/membrane`).
+(e.g. `crates/authority`).

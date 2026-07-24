@@ -31,5 +31,5 @@ atom = { path = "../atom" }
 auth = { path = "../guest/auth" }
 cache = { package = "ww-cache", path = "../cache" }
 ipfs = { path = "../ipfs" }
-membrane = { path = "../membrane" }
+authority = { package = "wetware-authority", path = "../authority" }
 stem = { path = "../stem" }

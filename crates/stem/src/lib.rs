@@ -28,7 +28,7 @@ pub mod ipns;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use membrane::{Epoch, Provenance};
+use authority::{Epoch, Provenance};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -68,7 +68,7 @@ pub trait StemSource: Send + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use membrane::Provenance;
+    use authority::Provenance;
 
     /// A trivial StemSource that sends one epoch and exits.
     struct OneShotSource {

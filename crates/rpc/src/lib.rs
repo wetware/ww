@@ -4,6 +4,7 @@
 //! streams (no TCP listener). See [`build_peer_rpc`] for the entry point.
 #![cfg(not(target_arch = "wasm32"))]
 
+pub mod connection_budget;
 pub mod dispatch;
 pub mod graft;
 pub mod http_client;
@@ -15,6 +16,12 @@ pub mod stream_listener;
 pub mod vat_client;
 pub mod vat_dial;
 pub mod vat_listener;
+
+pub use connection_budget::{
+    inbound_connection_budget, parse_inbound_connection_limit, parse_terminal_login_timeout,
+    terminal_login_timeout, ConnectionBudget, ConnectionLimitReached, ConnectionPermit,
+    InvalidConnectionLimit, DEFAULT_MAX_INBOUND_CONNECTIONS, DEFAULT_TERMINAL_LOGIN_TIMEOUT,
+};
 pub mod wagi;
 
 use std::sync::Arc;
@@ -25,15 +32,15 @@ use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use membrane::EpochGuard;
+use authority::EpochGuard;
 
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use tokio::sync::oneshot;
 
-use membrane::system_capnp;
+use authority::system_capnp;
 
 /// Commands sent from vat cells to the swarm event loop.
 pub enum SwarmCommand {
@@ -91,7 +98,7 @@ pub fn stream_protocol(protocol: &str) -> Result<StreamProtocol, capnp::Error> {
 /// Re-canonicalize a `Schema.Node` reader into raw single-segment bytes.
 ///
 /// Mirrors `crates/schema-id::canonicalize_node` and the build-time
-/// emission path so the bytes match what `crates/membrane`'s
+/// emission path so the bytes match what `crates/authority`'s
 /// `schema_registry` exposes for core caps. Returns `None` if the message
 /// produces an unexpected (non-single) segment count, which would indicate
 /// a malformed input.
@@ -148,6 +155,7 @@ pub enum NatReachability {
 #[derive(Clone, Debug)]
 pub struct NetworkState {
     inner: Arc<RwLock<NetworkSnapshot>>,
+    listen_addr_notify: Arc<Notify>,
 }
 
 impl Default for NetworkState {
@@ -176,6 +184,7 @@ impl NetworkState {
         };
         Self {
             inner: Arc::new(RwLock::new(snapshot)),
+            listen_addr_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -192,6 +201,25 @@ impl NetworkState {
         let mut guard = self.inner.write().await;
         if !guard.listen_addrs.contains(&addr) {
             guard.listen_addrs.push(addr);
+            drop(guard);
+            self.listen_addr_notify.notify_waiters();
+        }
+    }
+
+    /// Wait until the host publishes its first bound listen address.
+    ///
+    /// Callers should own the deadline around this future. Registering the
+    /// notification before checking state avoids missing an address event
+    /// between the read and the await.
+    pub async fn wait_for_listen_addr(&self) -> Vec<u8> {
+        loop {
+            let notified = self.listen_addr_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(addr) = self.inner.read().await.listen_addrs.first().cloned() {
+                return addr;
+            }
+            notified.await;
         }
     }
 
@@ -765,6 +793,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_network_state_waits_for_listen_addr_without_polling() {
+        let state = NetworkState::from_peer_id(vec![1]);
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move { waiter_state.wait_for_listen_addr().await });
+
+        state.add_listen_addr(vec![10, 20]).await;
+
+        let addr = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("listen-address waiter timed out")
+            .expect("listen-address waiter task");
+        assert_eq!(addr, vec![10, 20]);
+        assert_eq!(state.wait_for_listen_addr().await, vec![10, 20]);
+    }
+
+    #[tokio::test]
     async fn test_network_state_set_known_peers() {
         let state = NetworkState::from_peer_id(vec![1]);
 
@@ -1299,11 +1343,11 @@ mod tests {
     // =========================================================================
 
     /// Helper: create an EpochGuard and its sender for test manipulation.
-    fn test_epoch_guard(seq: u64) -> (tokio::sync::watch::Sender<membrane::Epoch>, EpochGuard) {
-        let epoch = membrane::Epoch {
+    fn test_epoch_guard(seq: u64) -> (tokio::sync::watch::Sender<authority::Epoch>, EpochGuard) {
+        let epoch = authority::Epoch {
             seq,
             head: vec![],
-            provenance: membrane::Provenance::Block(0),
+            provenance: authority::Provenance::Block(0),
         };
         let (tx, rx) = tokio::sync::watch::channel(epoch);
         let guard = EpochGuard {
@@ -1331,7 +1375,7 @@ mod tests {
                 let listener: system_capnp::vat_listener::Client =
                     capnp_rpc::new_client(listener_impl);
 
-                let mut req = listener.serve_request();
+                let mut req = listener.serve_raw_request();
                 req.get()
                     .init_cap()
                     .set_as_capability(placeholder_cap().hook);
@@ -1397,14 +1441,14 @@ mod tests {
                     capnp_rpc::new_client(listener_impl);
 
                 // Advance epoch to make guard stale.
-                tx.send(membrane::Epoch {
+                tx.send(authority::Epoch {
                     seq: 2,
                     head: vec![],
-                    provenance: membrane::Provenance::Block(0),
+                    provenance: authority::Provenance::Block(0),
                 })
                 .unwrap();
 
-                let mut req = listener.serve_request();
+                let mut req = listener.serve_raw_request();
                 req.get()
                     .init_cap()
                     .set_as_capability(placeholder_cap().hook);
@@ -1426,10 +1470,10 @@ mod tests {
                 let dialer: system_capnp::vat_client::Client = capnp_rpc::new_client(dialer_impl);
 
                 // Advance epoch to make guard stale.
-                tx.send(membrane::Epoch {
+                tx.send(authority::Epoch {
                     seq: 2,
                     head: vec![],
-                    provenance: membrane::Provenance::Block(0),
+                    provenance: authority::Provenance::Block(0),
                 })
                 .unwrap();
 
@@ -1465,7 +1509,7 @@ mod tests {
                 let client2: system_capnp::vat_listener::Client = capnp_rpc::new_client(listener2);
 
                 // First registration should succeed.
-                let mut req1 = client1.serve_request();
+                let mut req1 = client1.serve_raw_request();
                 req1.get()
                     .init_cap()
                     .set_as_capability(placeholder_cap().hook);
@@ -1476,7 +1520,7 @@ mod tests {
                     .expect("first serve should succeed");
 
                 // Second registration with the same service name should fail.
-                let mut req2 = client2.serve_request();
+                let mut req2 = client2.serve_raw_request();
                 req2.get()
                     .init_cap()
                     .set_as_capability(placeholder_cap().hook);
@@ -1504,7 +1548,7 @@ mod tests {
                 let listener: system_capnp::vat_listener::Client =
                     capnp_rpc::new_client(listener_impl);
 
-                let mut req = listener.serve_request();
+                let mut req = listener.serve_raw_request();
                 req.get()
                     .init_cap()
                     .set_as_capability(placeholder_cap().hook);

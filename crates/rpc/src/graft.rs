@@ -5,12 +5,13 @@
 //! result fields. All capabilities fail with `staleEpoch` when the epoch
 //! advances.
 //!
-//! The `membrane` crate owns the Membrane server and epoch machinery.
+//! The `authority` crate owns the Membrane server and epoch machinery.
 //! This module provides the `GraftBuilder` impl that injects wetware-specific
 //! capabilities into the graft response, plus the epoch-guarded identity wrapper.
 
 use std::sync::Arc;
 
+use authority::{auth_capnp, membrane_capnp, Epoch, EpochGuard, GraftBuilder, MembraneServer};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -19,16 +20,15 @@ use capnp_rpc::RpcSystem;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use libp2p::identity::Keypair;
 use libp2p_core::SignedEnvelope;
-use membrane::{auth_capnp, membrane_capnp, Epoch, EpochGuard, GraftBuilder, MembraneServer};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::{ByteStreamImpl, StreamMode, SwarmCommand};
 use auth::SigningDomain;
-use membrane::http_capnp;
-use membrane::routing_capnp;
-use membrane::system_capnp;
+use authority::http_capnp;
+use authority::routing_capnp;
+use authority::system_capnp;
 
 use super::NetworkState;
 
@@ -333,6 +333,9 @@ impl GraftBuilder for HostGraftBuilder {
         entries.push(("host", host.client));
         entries.push(("runtime", self.runtime_client.clone().client));
         entries.push(("routing", routing.client));
+        let authority: auth_capnp::authority::Client =
+            capnp_rpc::new_client(authority::AuthorityServer::new(guard.clone()));
+        entries.push(("authority", authority.client));
         let ipfs_cap: system_capnp::ipfs::Client = capnp_rpc::new_client(EpochGuardedIpfs {
             guard: guard.clone(),
             ipfs_client: self.ipfs_client.clone(),
@@ -388,7 +391,7 @@ impl GraftBuilder for HostGraftBuilder {
 /// When a guest calls `runtime::serve(my_membrane, ...)`, the host
 /// captures it here. The host can then re-serve it to external peers,
 /// allowing the guest to attenuate or enrich the capability surface it exposes.
-pub type GuestMembrane = membrane::membrane_capnp::membrane::Client;
+pub type GuestMembrane = authority::membrane_capnp::membrane::Client;
 
 /// Build an RPC system that bootstraps a `Membrane` instead of a bare `Host`.
 ///
@@ -460,8 +463,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use authority::{Epoch, Provenance};
     use ed25519_dalek::Signer;
-    use membrane::{Epoch, Provenance};
 
     /// Generate a random Ed25519 signing key (compatible with the rand version
     /// used by the root crate, which may differ from ed25519_dalek's rand_core).

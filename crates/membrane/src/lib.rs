@@ -1,192 +1,1632 @@
-//! Epoch-scoped capability primitives over Cap'n Proto RPC.
+//! A schema-agnostic capability membrane built on
+//! `capnp::private::capability::ClientHook`.
 //!
-//! - **Epoch** -- a monotonic sequence number anchored to on-chain state
-//! - **EpochGuard** -- checks whether a capability's epoch is still current
-//! - **MembraneServer** -- server that issues epoch-scoped sessions via `graft()`
-//! - **SessionBuilder** -- trait for injecting domain-specific capabilities into sessions
+//! Enforcement lives at the hook level, so a membraned capability cannot be
+//! bypassed by casting the client to another type: every typed client, cast,
+//! or promise pipeline bottoms out in `ClientHook::new_call`/`call` on the
+//! same wrapped hook. The membrane:
+//!   * denies calls not permitted by its [`Policy`], at the hook level;
+//!   * re-wraps capabilities found in call *results* so everything reached
+//!     through a membraned cap is itself membraned (recursive preservation);
+//!   * re-wraps promise-pipelined capabilities (otherwise pipelining would be
+//!     a membrane escape hatch);
+//!   * re-wraps capabilities produced by promise resolution
+//!     (`get_resolved` / `when_more_resolved`).
+//!
+//! Directions handled: caps flowing OUT of the membrane (results, pipelines,
+//! resolution) are re-wrapped as above. Caps flowing INTO the membrane
+//! (request params) are unwrapped only when they share the receiving
+//! membrane's boundary lineage, restoring the identity that backend originally
+//! exported. Caps from another session or tenant boundary remain wrapped — a
+//! process-global registry match is never sufficient authority to strip them.
+//! Other foreign caps pass through unchanged because a parameter is
+//! caller-granted authority, not something the outbound policy attenuates.
+//! (Reverse-wrapping foreign params — a fully symmetric membrane — is a
+//! deliberate non-goal for now.)
+//!
+//! [`Policy`] is a trait, so one membrane mechanism serves allowlists,
+//! revocation, rate limits, and auditing. `check` takes `&self` but may hold
+//! interior-mutable state; the membrane calls it once per invocation.
 
-#[allow(unused_parens, clippy::match_single_binding)]
-pub mod system_capnp {
-    include!(concat!(env!("OUT_DIR"), "/capnp/system_capnp.rs"));
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::marker::PhantomData;
+use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
+
+use capnp::any_pointer;
+use capnp::capability::{Promise, RemotePromise, Request, Response};
+use capnp::message::{Builder, HeapAllocator};
+use capnp::private::capability::{
+    ClientHook, ParamsHook, PipelineHook, PipelineOp, RequestHook, ResponseHook, ResultsHook,
+};
+use capnp::traits::{Imbue, ImbueMut};
+use capnp::{Error, MessageSize};
+use futures::channel::oneshot;
+
+type CapTable = Vec<Option<Box<dyn ClientHook>>>;
+
+// Toy `Thing` interface for the crate's own integration tests (cast-bypass,
+// recursive rewrap, pipelining, twoparty RPC). Test-only; compiled by build.rs.
+#[cfg(test)]
+#[allow(clippy::all, dead_code, unreachable_pub)]
+mod test_thing_capnp {
+    include!(concat!(env!("OUT_DIR"), "/test_thing_capnp.rs"));
 }
 
-#[allow(unused_parens, clippy::match_single_binding)]
-pub mod routing_capnp {
-    include!(concat!(env!("OUT_DIR"), "/capnp/routing_capnp.rs"));
+#[cfg(test)]
+mod integration_tests;
+
+// ---------------------------------------------------------------------------
+// Denial errors
+// ---------------------------------------------------------------------------
+
+/// Stable prefix marking an error as a membrane policy denial. Glia maps such
+/// errors to `:glia.error/permission-denied` (roadmap D9); the marker plus the
+/// `(interface_id, ordinal)` it carries let the mapping route without parsing
+/// human-readable prose. The legacy namespace is a compatibility identifier,
+/// not the Rust crate name.
+pub const DENIED_MARKER: &str = "ww-membrane/permission-denied";
+/// Stable marker for a capability revoked without advancing the global epoch.
+pub const REVOKED_MARKER: &str = "wetware/call-guard/target-revoked";
+/// Stable marker for a capability issued under an epoch that is no longer current.
+pub const STALE_EPOCH_MARKER: &str = "wetware/call-guard/staleEpoch";
+
+/// Stable machine-readable class for call-time authority failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallFailureCode {
+    PermissionDenied,
+    TargetRevoked,
+    StaleEpoch,
 }
 
-#[allow(
-    unused_parens,
-    clippy::extra_unused_type_parameters,
-    clippy::match_single_binding
-)]
-pub mod stem_capnp {
-    include!(concat!(env!("OUT_DIR"), "/capnp/stem_capnp.rs"));
+/// Construct a fail-closed denial error carrying the method key.
+pub fn denied_error(interface_id: u64, method_id: u16, reason: &str) -> Error {
+    Error::failed(format!(
+        "{DENIED_MARKER} interface={interface_id:#x} ordinal={method_id}: {reason}"
+    ))
 }
 
-#[allow(
-    unused_parens,
-    clippy::extra_unused_type_parameters,
-    clippy::match_single_binding
-)]
-pub mod auth_capnp {
-    include!(concat!(env!("OUT_DIR"), "/capnp/auth_capnp.rs"));
+/// If `err` is a membrane denial, return the denied `(interface_id, ordinal)`.
+///
+/// Diagnostic helper for callers that want to route on denials; the marker is
+/// the stable contract, the parse is best-effort.
+pub fn denied_method_key(err: &Error) -> Option<(u64, u16)> {
+    let s = err.to_string();
+    let rest = s.split_once(DENIED_MARKER)?.1;
+    let iface = rest.split("interface=").nth(1)?.split_whitespace().next()?;
+    let ordinal = rest.split("ordinal=").nth(1)?;
+    let ordinal = ordinal.split([' ', ':']).next()?;
+    let iface = iface.strip_prefix("0x").unwrap_or(iface);
+    Some((
+        u64::from_str_radix(iface, 16).ok()?,
+        ordinal.parse::<u16>().ok()?,
+    ))
 }
 
-#[allow(
-    unused_parens,
-    clippy::extra_unused_type_parameters,
-    clippy::match_single_binding
-)]
-pub mod membrane_capnp {
-    include!(concat!(env!("OUT_DIR"), "/capnp/membrane_capnp.rs"));
+/// Construct a targeted-revocation failure.
+pub fn revoked_error(detail: &str) -> Error {
+    Error::failed(format!("{REVOKED_MARKER}: {detail}"))
 }
 
-#[allow(unused_parens, clippy::match_single_binding)]
-pub mod http_capnp {
-    include!(concat!(env!("OUT_DIR"), "/capnp/http_capnp.rs"));
+/// Construct an epoch-expiry failure.
+pub fn stale_epoch_error(detail: &str) -> Error {
+    Error::failed(format!("{STALE_EPOCH_MARKER}: {detail}"))
 }
 
-/// Canonical Schema.Node bytes for each grafted capability interface.
-/// These back the `schema`/`doc`/`help` introspection builtins, not authority.
-pub mod schema_registry {
-    include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
-
-    /// Resolve canonical Schema.Node bytes by the canonical cap name used
-    /// in the membrane graft loop (e.g. "host", "runtime", "routing",
-    /// "identity", "http-client").
-    pub fn schema_by_name(name: &str) -> Option<&'static [u8]> {
-        match name {
-            "host" => Some(HOST_SCHEMA),
-            "runtime" => Some(RUNTIME_SCHEMA),
-            "routing" => Some(ROUTING_SCHEMA),
-            "identity" => Some(IDENTITY_SCHEMA),
-            "http-client" => Some(HTTP_CLIENT_SCHEMA),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use capnp::traits::HasTypeId;
-
-        #[test]
-        fn each_core_cap_has_non_empty_bytes() {
-            for name in ["host", "runtime", "routing", "identity", "http-client"] {
-                let bytes = schema_by_name(name)
-                    .unwrap_or_else(|| panic!("missing schema for cap '{name}'"));
-                assert!(!bytes.is_empty(), "schema for '{name}' is empty");
-            }
-        }
-
-        #[test]
-        fn unknown_cap_returns_none() {
-            assert!(schema_by_name("nonexistent").is_none());
-            assert!(schema_by_name("").is_none());
-        }
-
-        #[test]
-        fn bytes_are_word_aligned() {
-            for name in ["host", "runtime", "routing", "identity", "http-client"] {
-                let bytes = schema_by_name(name).expect("schema present");
-                assert_eq!(
-                    bytes.len() % 8,
-                    0,
-                    "canonical schema for '{name}' must be word-aligned (got {} bytes)",
-                    bytes.len()
-                );
-            }
-        }
-
-        #[test]
-        fn bytes_parse_as_schema_node() {
-            for name in ["host", "runtime", "routing", "identity", "http-client"] {
-                let bytes = schema_by_name(name).expect("schema present");
-                // Capnp segments require 8-byte alignment; the static byte
-                // slice is only byte-aligned, so copy into a Word buffer.
-                let word_count = bytes.len().div_ceil(8);
-                let mut words: Vec<capnp::Word> =
-                    vec![capnp::word(0, 0, 0, 0, 0, 0, 0, 0); word_count];
-                capnp::Word::words_to_bytes_mut(&mut words)[..bytes.len()].copy_from_slice(bytes);
-                let aligned = capnp::Word::words_to_bytes(&words);
-                let segments: &[&[u8]] = &[aligned];
-                let segment_array = capnp::message::SegmentArray::new(segments);
-                let reader = capnp::message::Reader::new(
-                    segment_array,
-                    capnp::message::ReaderOptions::new(),
-                );
-                let node: capnp::schema_capnp::node::Reader =
-                    reader.get_root().expect("root is a node");
-                let which = node.which().expect("node has Which");
-                assert!(
-                    matches!(which, capnp::schema_capnp::node::Which::Interface(_)),
-                    "schema for '{name}' is not an interface node"
-                );
-            }
-        }
-
-        #[test]
-        fn split_schema_type_ids_are_pinned_for_wire_compat() {
-            // These IDs were historically defined in stem.capnp and are now
-            // split across auth.capnp and membrane.capnp. Keep them pinned.
-            assert_eq!(
-                <crate::auth_capnp::signer::Client as HasTypeId>::TYPE_ID,
-                0xafaf_af94_68b6_a274
-            );
-            assert_eq!(
-                <crate::auth_capnp::identity::Client as HasTypeId>::TYPE_ID,
-                0xa7c2_00e5_b472_6d89
-            );
-            assert_eq!(
-                <crate::auth_capnp::terminal::Client<capnp::any_pointer::Owned> as HasTypeId>::TYPE_ID,
-                0xeae8_840b_2a89_8ba9
-            );
-            assert_eq!(
-                <crate::membrane_capnp::export::Reader<'static> as HasTypeId>::TYPE_ID,
-                0xbb8d_5590_cb2f_3d2e
-            );
-            assert_eq!(
-                <crate::membrane_capnp::membrane::Client as HasTypeId>::TYPE_ID,
-                0xdb52_c251_06bc_2c5e
-            );
-        }
-
-        #[test]
-        fn core_cap_schema_cids_are_stable() {
-            // CID snapshots guard against accidental protocol drift.
-            // Re-pinned for the Export/Synapse cutover: Host.network() and the
-            // Runtime→Executor→Process.bootstrap chain now carry bare
-            // `Capability` (was `Synapse`), so those two interfaces' canonical
-            // schema nodes changed. ROUTING/IDENTITY/HTTP_CLIENT are unchanged.
-            assert_eq!(
-                HOST_CID,
-                "bafkr4ic7cpeyps4vztynjvnyygid47przo5aqtkgjswb5ns4yoqiox4pnu"
-            );
-            assert_eq!(
-                RUNTIME_CID,
-                "bafkr4idvcyjadh3aefmdcis7ejmbi7jevfyutk7ifj7o3pi2tmfyrgcglm"
-            );
-            assert_eq!(
-                ROUTING_CID,
-                "bafkr4ids5ycfp6wd4ta5nf6e7deg625pyiur6ee53u63t47dsfoiwv5zsy"
-            );
-            assert_eq!(
-                IDENTITY_CID,
-                "bafkr4iakqlclxvdrgqk63shamitujssfmdnkzroyr5fw7wxjwcyhrqtpjy"
-            );
-            assert_eq!(
-                HTTP_CLIENT_CID,
-                "bafkr4ibch3gln5hzay6uivfxkwb5gsqphlkxn75rh3gb6fj2viznd33ari"
-            );
-        }
+/// Parse a stable call-time failure class without inspecting diagnostic prose.
+pub fn call_failure_code(err: &Error) -> Option<CallFailureCode> {
+    let message = err.to_string();
+    if message.contains(DENIED_MARKER) {
+        Some(CallFailureCode::PermissionDenied)
+    } else if message.contains(REVOKED_MARKER) {
+        Some(CallFailureCode::TargetRevoked)
+    } else if message.contains(STALE_EPOCH_MARKER) {
+        Some(CallFailureCode::StaleEpoch)
+    } else {
+        None
     }
 }
 
-pub mod epoch;
-pub mod membrane;
-pub mod terminal;
+// ---------------------------------------------------------------------------
+// Policy
+// ---------------------------------------------------------------------------
 
-pub use epoch::{Epoch, EpochGuard, Provenance};
-pub use membrane::{membrane_client, GraftBuilder, MembraneServer, NoExtension};
-pub use terminal::{AllowAllPolicy, AuthPolicy, TerminalServer, VerifyingKeyPolicy};
+/// Synchronous call-validity check shared by epoch and targeted revocation.
+///
+/// Guards answer whether an already-issued capability remains valid. They do
+/// not select methods; compose them with a [`Policy`] through
+/// [`GuardedPolicy`].
+pub trait CallGuard {
+    fn check(&self) -> Result<(), Error>;
+}
+
+/// Attenuation policy: consulted on every call the membrane guards.
+///
+/// `check` takes `&self` but implementations may hold interior-mutable state
+/// (a revoked flag, a rate-limit counter) — the membrane calls `check` once
+/// per invocation, so stateful policies observe every call. `Err` denies the
+/// call, fail-closed; prefer [`denied_error`] so the denial is routable.
+pub trait Policy {
+    fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error>;
+
+    /// If this policy is a pure static allowlist, the set of keys it permits.
+    /// Enables collapse-on-wrap: attenuating an already-membraned cap with two
+    /// static allowlists folds into a single membrane layer whose allowlist is
+    /// the intersection, so delegation depth stays O(1) in copies rather than
+    /// growing a membrane per hop (roadmap D3/D18). Stateful policies
+    /// (revocation, rate limit) return `None` and therefore stack, because
+    /// their per-call state cannot be merged into a set.
+    fn allowlist_keys(&self) -> Option<HashSet<(u64, u16)>> {
+        None
+    }
+}
+
+/// Applies one or more call-validity guards before a method policy.
+///
+/// Guarded policies are deliberately not collapsed into static allowlists:
+/// doing so would discard their live epoch or revocation state.
+pub struct GuardedPolicy {
+    inner: Box<dyn Policy>,
+    guards: Vec<Rc<dyn CallGuard>>,
+}
+
+impl GuardedPolicy {
+    pub fn new(inner: Box<dyn Policy>) -> Self {
+        Self {
+            inner,
+            guards: Vec::new(),
+        }
+    }
+
+    pub fn with_guard(mut self, guard: Rc<dyn CallGuard>) -> Self {
+        self.guards.push(guard);
+        self
+    }
+
+    pub fn push_guard(&mut self, guard: Rc<dyn CallGuard>) {
+        self.guards.push(guard);
+    }
+}
+
+impl Policy for GuardedPolicy {
+    fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error> {
+        for guard in &self.guards {
+            guard.check()?;
+        }
+        self.inner.check(interface_id, method_id)
+    }
+}
+
+/// Stateless `(interface_id, method_id)` allowlist. The first and simplest
+/// [`Policy`]; unknown or unlisted methods fail closed.
+#[derive(Default)]
+pub struct Allowlist {
+    allowed: HashSet<(u64, u16)>,
+}
+
+impl Allowlist {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn allow(mut self, interface_id: u64, method_id: u16) -> Self {
+        self.allowed.insert((interface_id, method_id));
+        self
+    }
+}
+
+/// The coordinate Cap'n Proto places on the wire for a capability method.
+///
+/// An interface ID alone is insufficient because method ordinals are scoped
+/// to the interface that declares them.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MethodKey {
+    pub interface_id: u64,
+    pub method_id: u16,
+}
+
+impl MethodKey {
+    pub const fn new(interface_id: u64, method_id: u16) -> Self {
+        Self {
+            interface_id,
+            method_id,
+        }
+    }
+}
+
+/// Why a typed method selector could not be reduced to one [`MethodKey`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MethodCaptureError {
+    /// The selector never constructed a Cap'n Proto request.
+    NoMethod,
+    /// A selector must identify one method, not assemble a compound operation.
+    MultipleMethods { count: usize },
+}
+
+impl fmt::Display for MethodCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoMethod => write!(f, "method selector did not construct a request"),
+            Self::MultipleMethods { count } => {
+                write!(
+                    f,
+                    "method selector constructed {count} requests; expected one"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MethodCaptureError {}
+
+/// Builds a static allowlist from generated, typed Cap'n Proto request methods.
+///
+/// `allow_method(Client::foo_request)` invokes the request constructor once
+/// against a recording client. The request is never sent; only the generated
+/// `(interface_id, method_id)` passed to `ClientHook::new_call` is retained.
+/// This avoids hand-written ordinals while leaving the call-time policy as the
+/// same schema-agnostic [`Allowlist`].
+///
+/// # Trust boundary
+///
+/// The typed selector prevents accidental use of a method from the wrong
+/// generated client and avoids hand-written ordinal mistakes. It is not a
+/// security boundary against hostile Rust configuration code: Rust cannot
+/// prove that the callable is literally an unmodified generated method rather
+/// than a compatible wrapper. The recorder fails closed unless the callable
+/// constructs exactly one request, but code authorized to build a profile
+/// must still be trusted to select the intended method.
+pub struct MethodProfile<C> {
+    allowed: HashSet<(u64, u16)>,
+    client: PhantomData<fn() -> C>,
+}
+
+impl<C> MethodProfile<C>
+where
+    C: capnp::capability::FromClientHook,
+{
+    pub fn new() -> Self {
+        Self {
+            allowed: HashSet::new(),
+            client: PhantomData,
+        }
+    }
+
+    pub fn allow_method<F, Output>(mut self, method: F) -> Result<Self, MethodCaptureError>
+    where
+        F: FnOnce(&C) -> Output,
+    {
+        let recorder = MethodRecorder::new();
+        let client = C::new(Box::new(recorder.clone()));
+        drop(method(&client));
+
+        let key = recorder.one_method()?;
+        self.allowed.insert((key.interface_id, key.method_id));
+        Ok(self)
+    }
+
+    pub fn build(self) -> Allowlist {
+        Allowlist {
+            allowed: self.allowed,
+        }
+    }
+
+    /// Return the typed method coordinates captured for this profile.
+    ///
+    /// This is primarily for trusted configuration code that must serialize a
+    /// profile into Wetware's `AuthorityPolicy` wire format. The coordinates
+    /// still come from generated request constructors rather than handwritten
+    /// ordinals, and are sorted for deterministic serialization.
+    pub fn method_keys(&self) -> Vec<MethodKey> {
+        let mut methods = self
+            .allowed
+            .iter()
+            .map(|(interface_id, method_id)| MethodKey::new(*interface_id, *method_id))
+            .collect::<Vec<_>>();
+        methods.sort_unstable_by_key(|method| (method.interface_id, method.method_id));
+        methods
+    }
+}
+
+impl<C> Default for MethodProfile<C>
+where
+    C: capnp::capability::FromClientHook,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone)]
+struct MethodRecorder {
+    methods: Rc<RefCell<Vec<MethodKey>>>,
+}
+
+impl MethodRecorder {
+    fn new() -> Self {
+        Self {
+            methods: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    fn one_method(&self) -> Result<MethodKey, MethodCaptureError> {
+        let methods = self.methods.borrow();
+        match methods.as_slice() {
+            [] => Err(MethodCaptureError::NoMethod),
+            [key] => Ok(*key),
+            _ => Err(MethodCaptureError::MultipleMethods {
+                count: methods.len(),
+            }),
+        }
+    }
+}
+
+impl ClientHook for MethodRecorder {
+    fn add_ref(&self) -> Box<dyn ClientHook> {
+        Box::new(self.clone())
+    }
+
+    fn new_call(
+        &self,
+        interface_id: u64,
+        method_id: u16,
+        _size_hint: Option<MessageSize>,
+    ) -> Request<any_pointer::Owned, any_pointer::Owned> {
+        self.methods
+            .borrow_mut()
+            .push(MethodKey::new(interface_id, method_id));
+        Request::new(Box::new(BrokenRequest::new(Error::failed(
+            "method-capture request cannot be sent".into(),
+        ))))
+    }
+
+    fn call(
+        &self,
+        _interface_id: u64,
+        _method_id: u16,
+        _params: Box<dyn ParamsHook>,
+        _results: Box<dyn ResultsHook>,
+    ) -> Promise<(), Error> {
+        Promise::err(Error::failed(
+            "method-capture client cannot make calls".into(),
+        ))
+    }
+
+    fn get_brand(&self) -> usize {
+        0
+    }
+
+    fn get_ptr(&self) -> usize {
+        Rc::as_ptr(&self.methods) as *const () as usize
+    }
+
+    fn get_resolved(&self) -> Option<Box<dyn ClientHook>> {
+        None
+    }
+
+    fn when_more_resolved(&self) -> Option<Promise<Box<dyn ClientHook>, Error>> {
+        None
+    }
+
+    fn when_resolved(&self) -> Promise<(), Error> {
+        Promise::ok(())
+    }
+}
+
+impl Policy for Allowlist {
+    fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error> {
+        if self.allowed.contains(&(interface_id, method_id)) {
+            Ok(())
+        } else {
+            Err(denied_error(interface_id, method_id, "not on allowlist"))
+        }
+    }
+
+    fn allowlist_keys(&self) -> Option<HashSet<(u64, u16)>> {
+        Some(self.allowed.clone())
+    }
+}
+
+/// Call-validity guard for revoking one issued authority without an epoch change.
+pub struct RevocationGuard {
+    revoked: Cell<bool>,
+}
+
+impl RevocationGuard {
+    pub fn new() -> Rc<Self> {
+        Rc::new(Self {
+            revoked: Cell::new(false),
+        })
+    }
+
+    pub fn revoke(&self) {
+        self.revoked.set(true);
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.get()
+    }
+}
+
+impl CallGuard for RevocationGuard {
+    fn check(&self) -> Result<(), Error> {
+        if self.revoked.get() {
+            Err(revoked_error("capability revoked"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Compatibility policy that applies a [`RevocationGuard`] before another policy.
+///
+/// Dropping a granted capability's authority without killing the holder is the
+/// classic membrane use; call [`RevocablePolicy::revoke`] and every subsequent
+/// call fails closed.
+///
+/// Hold the `Rc<RevocablePolicy>` on the granter side and hand a
+/// `Rc<dyn Policy>` clone to [`membrane`]; both point at the same revoke flag.
+pub struct RevocablePolicy {
+    inner: Box<dyn Policy>,
+    guard: Rc<RevocationGuard>,
+}
+
+impl RevocablePolicy {
+    pub fn new(inner: Box<dyn Policy>) -> Rc<Self> {
+        Rc::new(Self {
+            inner,
+            guard: RevocationGuard::new(),
+        })
+    }
+
+    pub fn revoke(&self) {
+        self.guard.revoke();
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        self.guard.is_revoked()
+    }
+
+    pub fn guard(&self) -> Rc<RevocationGuard> {
+        Rc::clone(&self.guard)
+    }
+}
+
+impl Policy for RevocablePolicy {
+    fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error> {
+        self.guard.check()?;
+        self.inner.check(interface_id, method_id)
+    }
+}
+
+/// Wraps another policy with a fixed-window rate limit. Rate-limit-as-
+/// capability: the limit is intrinsic to the reference and travels with it
+/// across boundaries, rather than being an endpoint policy check (roadmap
+/// D29). Stateful — it counts calls, so it never collapses with another
+/// membrane (roadmap D18); it stacks.
+pub struct RateLimit {
+    inner: Box<dyn Policy>,
+    max_per_window: u32,
+    window: Duration,
+    state: RefCell<RateWindow>,
+}
+
+struct RateWindow {
+    count: u32,
+    started: Instant,
+}
+
+impl RateLimit {
+    pub fn new(inner: Box<dyn Policy>, max_per_window: u32, window: Duration) -> Self {
+        Self {
+            inner,
+            max_per_window,
+            window,
+            state: RefCell::new(RateWindow {
+                count: 0,
+                started: Instant::now(),
+            }),
+        }
+    }
+}
+
+impl Policy for RateLimit {
+    fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error> {
+        // Composition: the call must also satisfy the wrapped policy.
+        self.inner.check(interface_id, method_id)?;
+
+        let mut w = self.state.borrow_mut();
+        if w.started.elapsed() >= self.window {
+            w.count = 0;
+            w.started = Instant::now();
+        }
+        if w.count >= self.max_per_window {
+            return Err(denied_error(interface_id, method_id, "rate limit exceeded"));
+        }
+        w.count += 1;
+        Ok(())
+    }
+}
+
+/// Wrap an untyped client hook in a membrane governed by `policy`.
+pub fn membrane_hook(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
+    MembraneHook::new_boundary(inner, policy)
+}
+
+/// Wrap a typed client in a membrane governed by `policy`.
+pub fn membrane<C: capnp::capability::FromClientHook>(client: C, policy: Rc<dyn Policy>) -> C {
+    C::new(membrane_hook(client.into_client_hook(), policy))
+}
+
+/// Attenuate an untyped hook while preserving an existing boundary lineage.
+///
+/// Use this when narrowing authority already issued by the same boundary. Use
+/// [`membrane_hook`] when constructing an independent session or tenant
+/// boundary.
+pub fn attenuate_hook(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
+    MembraneHook::attenuate(inner, policy)
+}
+
+/// Attenuate a typed capability within its existing boundary lineage.
+pub fn attenuate<C: capnp::capability::FromClientHook>(client: C, policy: Rc<dyn Policy>) -> C {
+    C::new(attenuate_hook(client.into_client_hook(), policy))
+}
+
+// ---------------------------------------------------------------------------
+// MembraneHook: the ClientHook wrapper
+// ---------------------------------------------------------------------------
+
+struct BoundaryLineage;
+
+struct MembraneState {
+    inner: Box<dyn ClientHook>,
+    policy: Rc<dyn Policy>,
+    lineage: Rc<BoundaryLineage>,
+}
+
+// ---------------------------------------------------------------------------
+// Membrane identity (for unwrap-on-reentry, double-wrap avoidance, collapse)
+// ---------------------------------------------------------------------------
+//
+// A capability has no `Any`, so to recognize "this hook is one of my
+// membranes" we use two coordinates:
+//   * `get_brand()` returns MEMBRANE_BRAND — the address of a data-segment
+//     `static`. capnp-rpc connection brands are `self as *const ConnectionState`
+//     (heap) and local/broken hooks use 0, so this value can never collide with
+//     a real connection brand and therefore never makes the RPC layer mistake a
+//     membraned cap for one of its own (which would tunnel through the membrane).
+//   * `get_ptr()` returns the per-membrane `Rc<MembraneState>` address, which a
+//     process-local registry maps back to the live `MembraneState`.
+//
+// Together they let [`membrane_state_of`] downcast an arbitrary hook to its
+// backing membrane without `Any`.
+
+static MEMBRANE_BRAND_ANCHOR: u8 = 0;
+
+fn membrane_brand() -> usize {
+    &MEMBRANE_BRAND_ANCHOR as *const u8 as usize
+}
+
+thread_local! {
+    static REGISTRY: RefCell<HashMap<usize, Weak<MembraneState>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn registry_insert(state: &Rc<MembraneState>) {
+    let key = Rc::as_ptr(state) as *const () as usize;
+    REGISTRY.with(|r| {
+        r.borrow_mut().insert(key, Rc::downgrade(state));
+    });
+}
+
+/// If `hook` is a live membrane of ours, return its backing state (inner cap +
+/// policy). Returns `None` for any non-membrane hook.
+fn membrane_state_of(hook: &dyn ClientHook) -> Option<Rc<MembraneState>> {
+    if hook.get_brand() != membrane_brand() {
+        return None;
+    }
+    let key = hook.get_ptr();
+    REGISTRY.with(|r| r.borrow().get(&key).and_then(Weak::upgrade))
+}
+
+fn unwrap_same_lineage(
+    mut hook: Box<dyn ClientHook>,
+    lineage: &Rc<BoundaryLineage>,
+) -> Box<dyn ClientHook> {
+    loop {
+        let Some(state) = membrane_state_of(&*hook) else {
+            return hook;
+        };
+        if !Rc::ptr_eq(&state.lineage, lineage) {
+            return hook;
+        }
+        hook = state.inner.add_ref();
+    }
+}
+
+impl Drop for MembraneState {
+    fn drop(&mut self) {
+        // Deregister by our own address (the registry key is Rc::as_ptr, which
+        // is the address of this MembraneState).
+        let key = self as *const MembraneState as *const () as usize;
+        REGISTRY.with(|r| {
+            r.borrow_mut().remove(&key);
+        });
+    }
+}
+
+pub struct MembraneHook {
+    state: Rc<MembraneState>,
+}
+
+impl MembraneHook {
+    fn new_boundary(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
+        Self::wrap_with_lineage(inner, policy, Rc::new(BoundaryLineage), false)
+    }
+
+    fn attenuate(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
+        let lineage = membrane_state_of(&*inner)
+            .map(|state| Rc::clone(&state.lineage))
+            .unwrap_or_else(|| Rc::new(BoundaryLineage));
+        Self::wrap_with_lineage(inner, policy, lineage, true)
+    }
+
+    fn wrap_recursive(
+        inner: Box<dyn ClientHook>,
+        policy: Rc<dyn Policy>,
+        lineage: Rc<BoundaryLineage>,
+    ) -> Box<dyn ClientHook> {
+        Self::wrap_with_lineage(inner, policy, lineage, true)
+    }
+
+    fn wrap_with_lineage(
+        inner: Box<dyn ClientHook>,
+        policy: Rc<dyn Policy>,
+        lineage: Rc<BoundaryLineage>,
+        may_collapse: bool,
+    ) -> Box<dyn ClientHook> {
+        // Collapse-on-wrap: wrapping one of our own membranes with a static
+        // allowlist, when the inner policy is also a static allowlist, folds the
+        // two into a single layer whose allowlist is the intersection. This
+        // keeps `attenuate (attenuate c ..) ..` at one membrane hop instead of
+        // nesting (roadmap D3/D18). If either side is stateful (returns `None`
+        // from `allowlist_keys`), we fall through and stack, preserving its
+        // per-call state. Independent boundary lineages never collapse.
+        if may_collapse {
+            if let Some(existing) = membrane_state_of(&*inner) {
+                if Rc::ptr_eq(&existing.lineage, &lineage) {
+                    if let (Some(outer_keys), Some(inner_keys)) =
+                        (policy.allowlist_keys(), existing.policy.allowlist_keys())
+                    {
+                        let allowed = outer_keys.intersection(&inner_keys).copied().collect();
+                        let collapsed: Rc<dyn Policy> = Rc::new(Allowlist { allowed });
+                        let state = Rc::new(MembraneState {
+                            inner: existing.inner.add_ref(),
+                            policy: collapsed,
+                            lineage,
+                        });
+                        registry_insert(&state);
+                        return Box::new(Self { state });
+                    }
+                }
+            }
+        }
+        let state = Rc::new(MembraneState {
+            inner,
+            policy,
+            lineage,
+        });
+        registry_insert(&state);
+        Box::new(Self { state })
+    }
+}
+
+impl ClientHook for MembraneHook {
+    fn add_ref(&self) -> Box<dyn ClientHook> {
+        Box::new(Self {
+            state: self.state.clone(),
+        })
+    }
+
+    fn new_call(
+        &self,
+        interface_id: u64,
+        method_id: u16,
+        size_hint: Option<MessageSize>,
+    ) -> Request<any_pointer::Owned, any_pointer::Owned> {
+        if let Err(e) = self.state.policy.check(interface_id, method_id) {
+            return Request::new(Box::new(BrokenRequest::new(e)));
+        }
+        let inner_request = self
+            .state
+            .inner
+            .new_call(interface_id, method_id, size_hint);
+        Request::new(Box::new(MembraneRequest {
+            inner: inner_request.hook,
+            policy: self.state.policy.clone(),
+            lineage: Rc::clone(&self.state.lineage),
+            message: Builder::new_default(),
+            cap_table: CapTable::new(),
+        }))
+    }
+
+    fn call(
+        &self,
+        interface_id: u64,
+        method_id: u16,
+        params: Box<dyn ParamsHook>,
+        results: Box<dyn ResultsHook>,
+    ) -> Promise<(), Error> {
+        if let Err(e) = self.state.policy.check(interface_id, method_id) {
+            return Promise::err(e);
+        }
+        // Interpose on results so that caps placed there by the inner object
+        // get membraned before they reach the caller (e.g. the RPC answer).
+        // The flush runs when the callee drops the results hook (capnp's own
+        // "results done" signal); its outcome is carried out over `rx` so a
+        // copy failure surfaces as the call's error instead of a silent empty
+        // result (roadmap D7). Drop remains the completion signal, matching
+        // capnp-rpc's local `Results`.
+        let (tx, rx) = oneshot::channel();
+        let wrapped_results = Box::new(MembraneResults::new(
+            results,
+            self.state.policy.clone(),
+            Rc::clone(&self.state.lineage),
+            tx,
+        ));
+        let inner = self
+            .state
+            .inner
+            .call(interface_id, method_id, params, wrapped_results);
+        Promise::from_future(async move {
+            inner.await?;
+            match rx.await {
+                Ok(flush_result) => flush_result,
+                // Results hook dropped without sending (e.g. cancellation
+                // before any flush) — nothing was promised to the caller.
+                Err(oneshot::Canceled) => Ok(()),
+            }
+        })
+    }
+
+    fn get_brand(&self) -> usize {
+        // Membrane-unique sentinel (see MEMBRANE_BRAND_ANCHOR): lets us
+        // recognize our own membranes for unwrap-on-reentry, and — being a
+        // data-segment address — never collides with a capnp-rpc connection
+        // brand (`self as *const ConnectionState`, always heap) or the 0 used
+        // by local/broken hooks. It therefore does NOT let the RPC layer
+        // mistake a membraned cap for one of its own and tunnel through the
+        // membrane. Must NOT forward the inner brand.
+        membrane_brand()
+    }
+
+    fn get_ptr(&self) -> usize {
+        // MUST NOT forward the inner pointer: `get_ptr` keys export tables and
+        // CapabilityServerSet lookups; forwarding would let the membraned cap
+        // alias its unwrapped sibling.
+        Rc::as_ptr(&self.state) as *const () as usize
+    }
+
+    fn get_resolved(&self) -> Option<Box<dyn ClientHook>> {
+        self.state.inner.get_resolved().map(|h| {
+            Self::wrap_recursive(h, self.state.policy.clone(), Rc::clone(&self.state.lineage))
+        })
+    }
+
+    fn when_more_resolved(&self) -> Option<Promise<Box<dyn ClientHook>, Error>> {
+        let policy = self.state.policy.clone();
+        let lineage = Rc::clone(&self.state.lineage);
+        self.state.inner.when_more_resolved().map(|p| {
+            Promise::from_future(async move { Ok(Self::wrap_recursive(p.await?, policy, lineage)) })
+        })
+    }
+
+    fn when_resolved(&self) -> Promise<(), Error> {
+        self.state.inner.when_resolved()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MembraneRequest: wraps RequestHook so responses + pipelines are re-wrapped
+// ---------------------------------------------------------------------------
+
+struct MembraneRequest {
+    inner: Box<dyn RequestHook>,
+    policy: Rc<dyn Policy>,
+    lineage: Rc<BoundaryLineage>,
+    // Params are staged here so the cap table can be transformed on send.
+    message: Builder<HeapAllocator>,
+    cap_table: CapTable,
+}
+
+impl RequestHook for MembraneRequest {
+    fn get(&mut self) -> any_pointer::Builder<'_> {
+        // Stage params in our own buffer so `send` can transform their cap
+        // table: same-lineage membraned caps that round-trip back in are
+        // unwrapped to their originals (restoring `==` identity and avoiding
+        // double-indirection); foreign-boundary caps remain wrapped.
+        //
+        // Note: this does NOT reverse-wrap foreign inbound caps in a policy of
+        // their own — a param is authority the caller *grants* to the backend,
+        // and attenuating it with this membrane's outbound policy would be
+        // wrong. A full symmetric (two-policy) membrane is a deliberate future
+        // option, not required for the recursion/identity properties here.
+        let mut root: any_pointer::Builder = self.message.get_root().unwrap();
+        root.imbue_mut(&mut self.cap_table);
+        root
+    }
+
+    fn get_brand(&self) -> usize {
+        0
+    }
+
+    fn send(self: Box<Self>) -> RemotePromise<any_pointer::Owned> {
+        let Self {
+            mut inner,
+            policy,
+            lineage,
+            message,
+            mut cap_table,
+        } = *self;
+
+        // Unwrap-on-reentry: peel only membrane layers created by this request's
+        // boundary lineage. A foreign session/tenant boundary remains intact.
+        for slot in cap_table.iter_mut() {
+            if let Some(hook) = slot.take() {
+                *slot = Some(unwrap_same_lineage(hook, &lineage));
+            }
+        }
+
+        // Copy the staged params (with the transformed cap table) into the real
+        // request. On copy failure, fail the send closed.
+        let copy = (|| -> capnp::Result<()> {
+            let mut reader: any_pointer::Reader = message.get_root_as_reader()?;
+            reader.imbue(&cap_table);
+            inner.get().set_as(reader)
+        })();
+        if let Err(e) = copy {
+            return RemotePromise {
+                promise: Promise::err(e.clone()),
+                pipeline: any_pointer::Pipeline::new(Box::new(BrokenPipeline { error: e })),
+            };
+        }
+
+        let RemotePromise { promise, pipeline } = inner.send();
+
+        // Wrap the pipeline hook so promise-pipelined caps stay inside.
+        let pipeline_policy = policy.clone();
+        let pipeline_lineage = Rc::clone(&lineage);
+        let wrapped_pipeline: Box<dyn PipelineHook> = Box::new(MembranePipeline {
+            inner: pipeline.hook,
+            policy: pipeline_policy,
+            lineage: pipeline_lineage,
+        });
+
+        // Wrap the response so caps in the results stay inside.
+        let wrapped_promise = Promise::from_future(async move {
+            let response = promise.await?;
+            let membraned = MembraneResponse::rewrap(response.hook, policy, lineage)?;
+            Ok(Response::new(Box::new(membraned)))
+        });
+
+        RemotePromise {
+            promise: wrapped_promise,
+            pipeline: any_pointer::Pipeline::new(wrapped_pipeline),
+        }
+    }
+
+    fn send_streaming(self: Box<Self>) -> Promise<(), Error> {
+        let Self {
+            mut inner,
+            lineage,
+            message,
+            mut cap_table,
+            ..
+        } = *self;
+
+        // Streaming calls still carry parameters. Apply the same staged-message
+        // copy and same-lineage unwrapping as `send()` before dispatching.
+        for slot in cap_table.iter_mut() {
+            if let Some(hook) = slot.take() {
+                *slot = Some(unwrap_same_lineage(hook, &lineage));
+            }
+        }
+        let copy = (|| -> capnp::Result<()> {
+            let mut reader: any_pointer::Reader = message.get_root_as_reader()?;
+            reader.imbue(&cap_table);
+            inner.get().set_as(reader)
+        })();
+        if let Err(error) = copy {
+            return Promise::err(error);
+        }
+
+        // Streaming methods return no caps; policy was checked in new_call().
+        inner.send_streaming()
+    }
+
+    fn tail_send(self: Box<Self>) -> Option<(u32, Promise<(), Error>, Box<dyn PipelineHook>)> {
+        // Tail calls would let results bypass the membrane; refuse.
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MembraneResponse: deep-copies the response and wraps its cap table
+// ---------------------------------------------------------------------------
+
+struct MembraneResponse {
+    message: Builder<HeapAllocator>,
+    cap_table: CapTable,
+}
+
+impl MembraneResponse {
+    /// Copy the inner response into a fresh message whose cap table we own,
+    /// then wrap every capability in that table.
+    ///
+    /// The deep copy is the price of doing this with public APIs only: the
+    /// inner response's cap table is private to its hook, but `set_as` on an
+    /// imbued `any_pointer::Builder` re-materializes the caps into our table.
+    /// Cost O(response size); roadmap D13 tracks the benchmark + tripwire.
+    fn rewrap(
+        inner: Box<dyn ResponseHook>,
+        policy: Rc<dyn Policy>,
+        lineage: Rc<BoundaryLineage>,
+    ) -> capnp::Result<Self> {
+        let mut message = Builder::new_default();
+        let mut cap_table = CapTable::new();
+        {
+            let mut root: any_pointer::Builder = message.init_root();
+            root.imbue_mut(&mut cap_table);
+            root.set_as(inner.get()?)?;
+        }
+        for slot in cap_table.iter_mut() {
+            if let Some(hook) = slot.take() {
+                *slot = Some(MembraneHook::wrap_recursive(
+                    hook,
+                    policy.clone(),
+                    Rc::clone(&lineage),
+                ));
+            }
+        }
+        Ok(Self { message, cap_table })
+    }
+}
+
+impl ResponseHook for MembraneResponse {
+    fn get(&self) -> capnp::Result<any_pointer::Reader<'_>> {
+        let mut reader: any_pointer::Reader = self.message.get_root_as_reader()?;
+        reader.imbue(&self.cap_table);
+        Ok(reader)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MembranePipeline: wraps PipelineHook so pipelined caps are membraned
+// ---------------------------------------------------------------------------
+
+struct MembranePipeline {
+    inner: Box<dyn PipelineHook>,
+    policy: Rc<dyn Policy>,
+    lineage: Rc<BoundaryLineage>,
+}
+
+impl PipelineHook for MembranePipeline {
+    fn add_ref(&self) -> Box<dyn PipelineHook> {
+        Box::new(Self {
+            inner: self.inner.add_ref(),
+            policy: self.policy.clone(),
+            lineage: Rc::clone(&self.lineage),
+        })
+    }
+
+    fn get_pipelined_cap(&self, ops: &[PipelineOp]) -> Box<dyn ClientHook> {
+        MembraneHook::wrap_recursive(
+            self.inner.get_pipelined_cap(ops),
+            self.policy.clone(),
+            Rc::clone(&self.lineage),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MembraneResults: server-side (call() path) results interposition
+// ---------------------------------------------------------------------------
+
+/// Buffers results in our own message + cap table; when the callee finishes and
+/// drops this hook (capnp's own "results done" signal), it wraps every cap and
+/// copies the buffered payload into the real results hook, then reports the copy
+/// outcome over `outcome` so `MembraneHook::call` can surface a copy failure as
+/// the call's error rather than a silent empty result (roadmap D7).
+struct MembraneResults {
+    inner: Box<dyn ResultsHook>,
+    message: Builder<HeapAllocator>,
+    cap_table: CapTable,
+    policy: Rc<dyn Policy>,
+    lineage: Rc<BoundaryLineage>,
+    outcome: Option<oneshot::Sender<capnp::Result<()>>>,
+    /// True when the buffered payload has been copied into `inner` and not
+    /// modified since. Prevents the Drop flush from re-copying (and
+    /// re-wrapping the cap table into) an inner hook that `set_pipeline`
+    /// already flushed, while still flushing late writes: `get()` hands the
+    /// callee a builder again, so it re-arms the flag.
+    flushed: bool,
+}
+
+impl MembraneResults {
+    fn new(
+        inner: Box<dyn ResultsHook>,
+        policy: Rc<dyn Policy>,
+        lineage: Rc<BoundaryLineage>,
+        outcome: oneshot::Sender<capnp::Result<()>>,
+    ) -> Self {
+        Self {
+            inner,
+            message: Builder::new_default(),
+            cap_table: CapTable::new(),
+            policy,
+            lineage,
+            outcome: Some(outcome),
+            flushed: false,
+        }
+    }
+
+    fn flush(&mut self) -> capnp::Result<()> {
+        let mut reader: any_pointer::Reader = self.message.get_root_as_reader()?;
+        // Imbue a membrane-wrapped view of our cap table for the copy, so the
+        // real results hook captures wrapped caps.
+        let wrapped: CapTable = self
+            .cap_table
+            .iter()
+            .map(|slot| {
+                slot.as_ref().map(|h| {
+                    MembraneHook::wrap_recursive(
+                        h.add_ref(),
+                        self.policy.clone(),
+                        Rc::clone(&self.lineage),
+                    )
+                })
+            })
+            .collect();
+        reader.imbue(&wrapped);
+        self.inner.get()?.set_as(reader)?;
+        self.flushed = true;
+        Ok(())
+    }
+}
+
+impl Drop for MembraneResults {
+    fn drop(&mut self) {
+        // Drop is capnp's "results done" signal. Flush here (unless the
+        // buffer was already flushed by set_pipeline and untouched since),
+        // then report the outcome so a copy failure becomes the call's error
+        // (D7) rather than a silently empty result. The receiver may already
+        // be gone (caller cancelled) — send is best-effort.
+        let res = if self.flushed { Ok(()) } else { self.flush() };
+        if let Some(tx) = self.outcome.take() {
+            let _ = tx.send(res);
+        }
+    }
+}
+
+impl ResultsHook for MembraneResults {
+    fn get(&mut self) -> capnp::Result<any_pointer::Builder<'_>> {
+        // The callee may write through this builder; anything flushed so far
+        // is stale until the next flush.
+        self.flushed = false;
+        let mut builder: any_pointer::Builder = self.message.get_root()?;
+        builder.imbue_mut(&mut self.cap_table);
+        Ok(builder)
+    }
+
+    fn set_pipeline(&mut self) -> capnp::Result<()> {
+        self.flush()?;
+        self.inner.set_pipeline()
+    }
+
+    fn allow_cancellation(&self) {
+        self.inner.allow_cancellation()
+    }
+
+    fn tail_call(self: Box<Self>, _request: Box<dyn RequestHook>) -> Promise<(), Error> {
+        Promise::err(Error::unimplemented(
+            "membrane: tail_call not supported".into(),
+        ))
+    }
+
+    fn direct_tail_call(
+        self: Box<Self>,
+        _request: Box<dyn RequestHook>,
+    ) -> (Promise<(), Error>, Box<dyn PipelineHook>) {
+        let e = Error::unimplemented("membrane: direct_tail_call not supported".into());
+        (
+            Promise::err(e.clone()),
+            Box::new(BrokenPipeline { error: e }),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broken client/request/pipeline (capnp-rpc's `broken` module is pub(crate),
+// so we carry our own minimal copies for the deny path).
+//
+// Provenance: mirrors capnp-rpc broken.rs @ 0.25.1. Upstream draft PR
+// capnproto/capnproto-rust#671 exposes a public `new_broken_cap` constructor;
+// once released, this block is deleted in favor of it (roadmap D8).
+// ---------------------------------------------------------------------------
+
+struct BrokenRequest {
+    error: Error,
+    message: Builder<HeapAllocator>,
+    cap_table: CapTable,
+}
+
+impl BrokenRequest {
+    fn new(error: Error) -> Self {
+        Self {
+            error,
+            message: Builder::new_default(),
+            cap_table: CapTable::new(),
+        }
+    }
+}
+
+impl RequestHook for BrokenRequest {
+    fn get(&mut self) -> any_pointer::Builder<'_> {
+        let mut result: any_pointer::Builder = self.message.get_root().unwrap();
+        result.imbue_mut(&mut self.cap_table);
+        result
+    }
+    fn get_brand(&self) -> usize {
+        0
+    }
+    fn send(self: Box<Self>) -> RemotePromise<any_pointer::Owned> {
+        RemotePromise {
+            promise: Promise::err(self.error.clone()),
+            pipeline: any_pointer::Pipeline::new(Box::new(BrokenPipeline { error: self.error })),
+        }
+    }
+    fn send_streaming(self: Box<Self>) -> Promise<(), Error> {
+        Promise::err(self.error)
+    }
+    fn tail_send(self: Box<Self>) -> Option<(u32, Promise<(), Error>, Box<dyn PipelineHook>)> {
+        None
+    }
+}
+
+struct BrokenPipeline {
+    error: Error,
+}
+
+impl PipelineHook for BrokenPipeline {
+    fn add_ref(&self) -> Box<dyn PipelineHook> {
+        Box::new(Self {
+            error: self.error.clone(),
+        })
+    }
+    fn get_pipelined_cap(&self, _ops: &[PipelineOp]) -> Box<dyn ClientHook> {
+        Box::new(BrokenClient {
+            state: Rc::new(self.error.clone()),
+        })
+    }
+}
+
+struct BrokenClient {
+    state: Rc<Error>,
+}
+
+impl ClientHook for BrokenClient {
+    fn add_ref(&self) -> Box<dyn ClientHook> {
+        Box::new(Self {
+            state: self.state.clone(),
+        })
+    }
+    fn new_call(
+        &self,
+        _interface_id: u64,
+        _method_id: u16,
+        _size_hint: Option<MessageSize>,
+    ) -> Request<any_pointer::Owned, any_pointer::Owned> {
+        Request::new(Box::new(BrokenRequest::new((*self.state).clone())))
+    }
+    fn call(
+        &self,
+        _interface_id: u64,
+        _method_id: u16,
+        _params: Box<dyn ParamsHook>,
+        _results: Box<dyn ResultsHook>,
+    ) -> Promise<(), Error> {
+        Promise::err((*self.state).clone())
+    }
+    fn get_brand(&self) -> usize {
+        0
+    }
+    fn get_ptr(&self) -> usize {
+        Rc::as_ptr(&self.state) as *const () as usize
+    }
+    fn get_resolved(&self) -> Option<Box<dyn ClientHook>> {
+        None
+    }
+    fn when_more_resolved(&self) -> Option<Promise<Box<dyn ClientHook>, Error>> {
+        None
+    }
+    fn when_resolved(&self) -> Promise<(), Error> {
+        Promise::err((*self.state).clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Policy unit tests (schema-free). Membrane integration tests (cast-bypass,
+// pipelines, resolution) against a toy schema are ported separately as the
+// next M1 commit; the real-cap end-to-end path is already proven by the M1a
+// spike in crates/rpc.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use capnp::traits::HasTypeId;
+
+    use crate::test_thing_capnp::{base_thing, derived_thing, stream_thing, thing};
+
+    const IFACE: u64 = 0xdead_beef;
+
+    #[test]
+    fn allowlist_allows_listed_denies_rest() {
+        let p = Allowlist::new().allow(IFACE, 0);
+        assert!(p.check(IFACE, 0).is_ok());
+        let denied = p.check(IFACE, 1).unwrap_err();
+        assert!(denied.to_string().contains(DENIED_MARKER));
+    }
+
+    #[test]
+    fn typed_profile_captures_generated_request_methods() {
+        let profile = MethodProfile::<thing::Client>::new()
+            .allow_method(thing::Client::ping_request)
+            .unwrap()
+            .allow_method(thing::Client::child_request)
+            .unwrap();
+
+        assert_eq!(
+            profile.method_keys(),
+            vec![
+                MethodKey::new(thing::Client::TYPE_ID, 0),
+                MethodKey::new(thing::Client::TYPE_ID, 2),
+            ]
+        );
+        let profile = profile.build();
+
+        assert!(profile.check(thing::Client::TYPE_ID, 0).is_ok());
+        assert!(profile.check(thing::Client::TYPE_ID, 2).is_ok());
+        assert!(profile.check(thing::Client::TYPE_ID, 1).is_err());
+    }
+
+    #[test]
+    fn typed_profile_captures_streaming_request_methods() {
+        let profile = MethodProfile::<stream_thing::Client>::new()
+            .allow_method(stream_thing::Client::notify_request)
+            .unwrap()
+            .build();
+
+        assert!(profile.check(stream_thing::Client::TYPE_ID, 0).is_ok());
+    }
+
+    #[test]
+    fn typed_profile_preserves_declaring_interface_for_inheritance() {
+        let base = MethodProfile::<base_thing::Client>::new()
+            .allow_method(base_thing::Client::base_request)
+            .unwrap()
+            .build();
+        let derived = MethodProfile::<derived_thing::Client>::new()
+            .allow_method(derived_thing::Client::derived_request)
+            .unwrap()
+            .build();
+
+        assert!(base.check(base_thing::Client::TYPE_ID, 0).is_ok());
+        assert!(base.check(derived_thing::Client::TYPE_ID, 0).is_err());
+        assert!(derived.check(derived_thing::Client::TYPE_ID, 0).is_ok());
+        assert!(derived.check(base_thing::Client::TYPE_ID, 0).is_err());
+    }
+
+    #[test]
+    fn typed_profile_fails_closed_when_selector_constructs_no_method() {
+        let result = MethodProfile::<thing::Client>::new().allow_method(|_| ());
+        assert!(matches!(result, Err(MethodCaptureError::NoMethod)));
+    }
+
+    #[test]
+    fn typed_profile_fails_closed_when_selector_constructs_multiple_methods() {
+        let result = MethodProfile::<thing::Client>::new().allow_method(|client| {
+            drop(client.ping_request());
+            client.child_request()
+        });
+        assert!(matches!(
+            result,
+            Err(MethodCaptureError::MultipleMethods { count: 2 })
+        ));
+    }
+
+    #[test]
+    fn denial_error_roundtrips_method_key() {
+        let e = denied_error(IFACE, 7, "nope");
+        assert_eq!(denied_method_key(&e), Some((IFACE, 7)));
+        // A non-denial error yields None.
+        assert_eq!(denied_method_key(&Error::failed("unrelated".into())), None);
+    }
+
+    #[test]
+    fn revocable_denies_after_revoke() {
+        let base = Box::new(Allowlist::new().allow(IFACE, 0));
+        let rev = RevocablePolicy::new(base);
+        assert!(rev.check(IFACE, 0).is_ok());
+        rev.revoke();
+        let denied = rev.check(IFACE, 0).unwrap_err();
+        assert_eq!(
+            call_failure_code(&denied),
+            Some(CallFailureCode::TargetRevoked)
+        );
+        assert!(rev.is_revoked());
+    }
+
+    #[test]
+    fn guarded_policy_composes_revocation_and_method_authority() {
+        let revocation = RevocationGuard::new();
+        let policy = GuardedPolicy::new(Box::new(Allowlist::new().allow(IFACE, 0)))
+            .with_guard(revocation.clone());
+
+        assert!(policy.check(IFACE, 0).is_ok());
+        assert_eq!(
+            call_failure_code(&policy.check(IFACE, 1).unwrap_err()),
+            Some(CallFailureCode::PermissionDenied)
+        );
+
+        revocation.revoke();
+        assert_eq!(
+            call_failure_code(&policy.check(IFACE, 0).unwrap_err()),
+            Some(CallFailureCode::TargetRevoked)
+        );
+    }
+
+    #[test]
+    fn call_failure_codes_do_not_parse_diagnostic_prose() {
+        assert_eq!(
+            call_failure_code(&denied_error(IFACE, 0, "arbitrary detail")),
+            Some(CallFailureCode::PermissionDenied)
+        );
+        assert_eq!(
+            call_failure_code(&revoked_error("arbitrary detail")),
+            Some(CallFailureCode::TargetRevoked)
+        );
+        assert_eq!(
+            call_failure_code(&stale_epoch_error("arbitrary detail")),
+            Some(CallFailureCode::StaleEpoch)
+        );
+        assert_eq!(
+            call_failure_code(&Error::failed("staleEpoch prose only".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn rate_limit_denies_after_n_calls() {
+        // Flagship "rate-limit-as-capability" demo, at the policy layer (D29).
+        // A generous window so timing never flakes the count assertion.
+        let base = Box::new(Allowlist::new().allow(IFACE, 0));
+        let rl = RateLimit::new(base, 3, Duration::from_secs(3600));
+        assert!(rl.check(IFACE, 0).is_ok()); // 1
+        assert!(rl.check(IFACE, 0).is_ok()); // 2
+        assert!(rl.check(IFACE, 0).is_ok()); // 3
+        let denied = rl.check(IFACE, 0).unwrap_err(); // 4 -> denied
+        assert!(denied.to_string().contains(DENIED_MARKER));
+    }
+
+    #[test]
+    fn rate_limit_still_enforces_inner_policy() {
+        let base = Box::new(Allowlist::new().allow(IFACE, 0));
+        let rl = RateLimit::new(base, 100, Duration::from_secs(3600));
+        // Method 1 is not on the inner allowlist -> denied regardless of rate.
+        assert!(rl.check(IFACE, 1).is_err());
+    }
+
+    #[test]
+    fn rate_limit_window_resets() {
+        let base = Box::new(Allowlist::new().allow(IFACE, 0));
+        let rl = RateLimit::new(base, 1, Duration::from_millis(20));
+        assert!(rl.check(IFACE, 0).is_ok());
+        assert!(rl.check(IFACE, 0).is_err());
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(rl.check(IFACE, 0).is_ok(), "window should have reset");
+    }
+
+    // -----------------------------------------------------------------------
+    // Membrane identity (M3 mini-spike): sentinel brand + registry
+    // -----------------------------------------------------------------------
+
+    fn dummy_hook() -> Box<dyn ClientHook> {
+        // A non-membrane hook to wrap / to test negative recognition.
+        Box::new(BrokenClient {
+            state: Rc::new(Error::failed("dummy".into())),
+        })
+    }
+
+    #[test]
+    fn membrane_brand_is_nonzero_and_stable() {
+        // Non-zero (0 is local/broken) and stable across calls.
+        assert_ne!(membrane_brand(), 0);
+        assert_eq!(membrane_brand(), membrane_brand());
+    }
+
+    #[test]
+    fn membrane_recognizes_own_wrap_but_not_others() {
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let wrapped = MembraneHook::new_boundary(dummy_hook(), policy);
+
+        // Our membrane advertises the sentinel brand and resolves via registry.
+        assert_eq!(wrapped.get_brand(), membrane_brand());
+        assert!(
+            membrane_state_of(&*wrapped).is_some(),
+            "a membrane must recognize its own wrap"
+        );
+
+        // A bare, non-membrane hook is not recognized.
+        let bare = dummy_hook();
+        assert!(
+            membrane_state_of(&*bare).is_none(),
+            "a non-membrane hook must not resolve to a membrane"
+        );
+    }
+
+    #[test]
+    fn membrane_deregisters_on_drop() {
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let wrapped = MembraneHook::new_boundary(dummy_hook(), policy);
+        let key = wrapped.get_ptr();
+        assert!(REGISTRY.with(|r| r.borrow().contains_key(&key)));
+        drop(wrapped);
+        assert!(
+            REGISTRY.with(|r| !r.borrow().contains_key(&key)),
+            "dropping the last membrane ref must deregister it"
+        );
+    }
+
+    /// D7: a results-copy failure must be reported as the call's error, not
+    /// silently swallowed. A `ResultsHook` whose `get()` fails makes the flush
+    /// fail; the outcome channel must carry that error.
+    #[test]
+    fn flush_failure_is_reported_not_swallowed() {
+        struct FailingResults;
+        impl ResultsHook for FailingResults {
+            fn get(&mut self) -> capnp::Result<any_pointer::Builder<'_>> {
+                Err(Error::failed("injected results failure".into()))
+            }
+            fn set_pipeline(&mut self) -> capnp::Result<()> {
+                Ok(())
+            }
+            fn allow_cancellation(&self) {}
+            fn tail_call(self: Box<Self>, _r: Box<dyn RequestHook>) -> Promise<(), Error> {
+                Promise::err(Error::unimplemented("unused".into()))
+            }
+            fn direct_tail_call(
+                self: Box<Self>,
+                _r: Box<dyn RequestHook>,
+            ) -> (Promise<(), Error>, Box<dyn PipelineHook>) {
+                let e = Error::unimplemented("unused".into());
+                (
+                    Promise::err(e.clone()),
+                    Box::new(BrokenPipeline { error: e }),
+                )
+            }
+        }
+
+        let (tx, mut rx) = oneshot::channel();
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let mr = MembraneResults::new(
+            Box::new(FailingResults),
+            policy,
+            Rc::new(BoundaryLineage),
+            tx,
+        );
+        drop(mr); // callee-done signal → flush runs → inner.get() fails
+
+        match rx.try_recv() {
+            Ok(Some(Err(e))) => {
+                assert!(e.to_string().contains("injected results failure"));
+            }
+            other => panic!("expected the flush error to be reported, got {other:?}"),
+        }
+    }
+
+    /// A results hook that counts how many times the membrane copies into it.
+    struct CountingResults {
+        message: Builder<HeapAllocator>,
+        copies: Rc<Cell<u32>>,
+    }
+
+    impl ResultsHook for CountingResults {
+        fn get(&mut self) -> capnp::Result<any_pointer::Builder<'_>> {
+            // Each flush obtains the builder exactly once to `set_as` into it.
+            self.copies.set(self.copies.get() + 1);
+            self.message.get_root()
+        }
+        fn set_pipeline(&mut self) -> capnp::Result<()> {
+            Ok(())
+        }
+        fn allow_cancellation(&self) {}
+        fn tail_call(self: Box<Self>, _r: Box<dyn RequestHook>) -> Promise<(), Error> {
+            Promise::err(Error::unimplemented("unused".into()))
+        }
+        fn direct_tail_call(
+            self: Box<Self>,
+            _r: Box<dyn RequestHook>,
+        ) -> (Promise<(), Error>, Box<dyn PipelineHook>) {
+            let e = Error::unimplemented("unused".into());
+            (
+                Promise::err(e.clone()),
+                Box::new(BrokenPipeline { error: e }),
+            )
+        }
+    }
+
+    /// set_pipeline flushes; an untouched Drop must NOT copy into the inner
+    /// hook a second time (re-copying would overwrite the root the pipeline
+    /// already resolved against and re-wrap the cap table into fresh
+    /// membranes).
+    #[test]
+    fn drop_after_set_pipeline_does_not_double_flush() {
+        let copies = Rc::new(Cell::new(0));
+        let inner = CountingResults {
+            message: Builder::new_default(),
+            copies: copies.clone(),
+        };
+        let (tx, mut rx) = oneshot::channel();
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let mut mr = MembraneResults::new(Box::new(inner), policy, Rc::new(BoundaryLineage), tx);
+
+        mr.get().unwrap().set_as("hello").unwrap();
+        mr.set_pipeline().unwrap();
+        assert_eq!(copies.get(), 1, "set_pipeline must flush exactly once");
+
+        drop(mr);
+        assert_eq!(
+            copies.get(),
+            1,
+            "drop after an untouched set_pipeline flush must not copy again"
+        );
+        // The outcome still reports success for the call.
+        match rx.try_recv() {
+            Ok(Some(Ok(()))) => {}
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+    }
+
+    /// Writes AFTER set_pipeline are legal (set_pipeline unblocks pipelining
+    /// early); the Drop flush must deliver them rather than treating the
+    /// earlier flush as final.
+    #[test]
+    fn late_writes_after_set_pipeline_are_flushed_on_drop() {
+        let copies = Rc::new(Cell::new(0));
+        let inner = CountingResults {
+            message: Builder::new_default(),
+            copies: copies.clone(),
+        };
+        let (tx, mut rx) = oneshot::channel();
+        let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
+        let mut mr = MembraneResults::new(Box::new(inner), policy, Rc::new(BoundaryLineage), tx);
+
+        mr.get().unwrap().set_as("early").unwrap();
+        mr.set_pipeline().unwrap();
+        mr.get().unwrap().set_as("late").unwrap();
+
+        drop(mr);
+        assert_eq!(
+            copies.get(),
+            2,
+            "a write after set_pipeline must be flushed at drop"
+        );
+        match rx.try_recv() {
+            Ok(Some(Ok(()))) => {}
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+    }
+}

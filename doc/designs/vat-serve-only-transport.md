@@ -9,19 +9,26 @@ The native vat publication flow is:
 ```text
 spawn isolated cell
   -> get exported capability
-  -> optionally wrap or attenuate it
-  -> serve that capability
+  -> select recipient policy
+  -> serve authenticated capability sessions
 ```
 
 This keeps the capability boundary explicit. The cell provides isolation; the
-exported capability is the object that gets forwarded over the network. Protocol
-names are locators, not type authority and not provenance proofs.
+exported capability is the shared application object behind per-stream authority
+sessions. Protocol names are locators, not type authority and not provenance
+proofs. Services that intentionally need no recipient authentication use the
+separately named raw path.
 
 ## Public Interfaces
 
 ```capnp
 interface VatListener {
-  serve @0 (cap :Capability, protocol :Text) -> ();
+  serveRaw @0 (cap :Capability, protocol :Text) -> ();
+  serveAuthenticated @1 (
+    cap :Capability,
+    protocol :Text,
+    policy :AuthSchema.AuthorityPolicy
+  ) -> ();
 }
 
 interface VatClient {
@@ -29,9 +36,10 @@ interface VatClient {
 }
 ```
 
-`VatListener.serve` publishes an already-existing capability. It does not spawn
-cells and it does not install a per-request handler. Publisher lifecycle is
-owned by the publisher that created the capability.
+`VatListener.serveAuthenticated` compiles the deployer policy and creates a
+fresh single-use Terminal for each stream. It does not spawn cells or duplicate
+the application object. `VatListener.serveRaw` directly publishes an
+already-existing capability as an explicit ungated escape hatch.
 
 `VatClient.dial` opens `/ww/<version>/vat/<protocol>` and returns the remote
 bootstrap capability.
@@ -63,6 +71,13 @@ Wetware-native stateful services belong on vat RPC.
 
 ## Naming Guidance
 
-Use `host :serve-vat` language as "publish an existing capability" rather than
-"listen with a vat cell" or "register a vat handler." The service name is the
-routing key; the served capability is the service object.
+Use `host :serve-vat` language as "publish an authenticated capability
+service" rather than "listen with a vat cell" or "register a vat handler."
+The caller supplies the application capability, service name, and auth policy;
+VatListener creates one single-use Terminal per inbound stream. The service
+name is only a routing key, and the libp2p peer ID is not the authenticated
+principal.
+
+Use `host :serve-raw-vat` only when unauthenticated publication is intentional.
+Its name is deliberately conspicuous because it exposes the supplied
+capability directly to every peer that negotiates the protocol.

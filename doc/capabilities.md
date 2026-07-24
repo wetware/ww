@@ -3,7 +3,7 @@
 Wetware is capability-secure all the way down: there is no ambient
 authority, and content access is gated by which CIDs a cell can reach.
 This document covers the capability model an agent sees after grafting,
-the membrane mechanism that enforces attenuation, and the three
+the membrane mechanism that enforces attenuation, and the four
 configuration surfaces that determine what the agent can do.
 
 For the host-side architecture (cell layout, epoch pipeline, layer
@@ -34,23 +34,26 @@ implementation has a descriptor to anchor lookups against, but the
 content the guest sees behind that descriptor is scoped by `CidTree`'s
 root, not by the preopen.
 
-## One mechanism, three configuration surfaces
+## One enforcement substrate, four configuration surfaces
 
 There is exactly one enforcement mechanism for capability policy that
 must survive a boundary crossing: the hook-level membrane
-(`crates/ww-membrane`), which filters calls by `(interfaceId, ordinal)`
+(`crates/membrane`), which filters calls by `(interfaceId, ordinal)`
 on the capability reference itself and recursively wraps capabilities
-found in results and pipelines. Everything else is configuration —
-three surfaces that decide *which references exist where*:
+found in results and pipelines. `CallGuard`s compose lifecycle decisions
+such as epoch expiry and targeted revocation with that method policy.
+Everything else is configuration — four surfaces that decide *which
+references exist where*:
 
 | Surface | What it controls | How to change it |
 |---------|------------------|------------------|
 | **Membrane graft** | Which RPC capability references enter the cell (`host`, `runtime`, `routing`, `identity`, `http-client`, plus `with`-block grants) | Edit the init.d `with` block; regraft |
+| **Terminal authority policy** | Which verified login identity receives which method profile over one application capability | Publish with `host :serve-vat ... :auth policy`; the listener creates one Terminal per stream |
 | **Root Atom binding** | The cell's root CID — the initial reachable content subgraph | Bind the cell to a different `stem::Atom`; respawn |
 | **Glia env bindings** | Which capability references code inside the cell can name (`fs`, `routing`, `host`, …) | Edit init.d to bind/unbind names; re-eval |
 
 The membrane graft is the canonical RPC surface
-(`src/rpc/membrane.rs:HostGraftBuilder`). The root Atom binding flows
+(`crates/rpc/src/graft.rs:HostGraftBuilder`). The root Atom binding flows
 through `stem::Atom` — when the Atom's value changes, `CidTree`'s root
 swaps atomically (`src/vfs.rs:CidTree::swap_root`), and old CIDs the
 cell had cached in memory still resolve to whatever they pointed to,
@@ -66,8 +69,9 @@ cell; they are never load-bearing across a boundary. See
 Attenuating a capnp-backed capability constructs a hook-level membrane
 around it. The returned cap enforces its method allowlist at the
 capability reference itself, so the policy travels with the cap across
-boundaries — export it via a `with` block, publish it with
-`(perform host :serve-vat cap "svc")`, or hand it to another cell, and
+boundaries — export it via a `with` block, publish it explicitly with
+`(perform host :serve-raw-vat cap "svc")`, use it as the session template
+for authenticated `host :serve-vat`, or hand it to another cell, and
 callers on the far side are filtered even if they cast the reference to
 a typed client. Denied methods fail closed with
 `:glia.error/permission-denied`, locally and remotely.
@@ -86,6 +90,11 @@ a typed client. Denied methods fail closed with
   extension.
 - Caps with no compiled schema (e.g. obtained from a vat dial) cannot be
   attenuated yet — that requires the deferred schema-association design.
+- Trusted FHS configuration can construct a policy-bound `Terminal` from
+  compiled `(interfaceId, ordinal)` coordinates. Rust integrations should
+  prefer typed `MethodProfile::allow_method` selectors. Typed capture prevents
+  accidental ordinal mistakes; it is not a security boundary against
+  malicious deployer code.
 - `defcap` caps (pure Glia, cell-local) keep evaluator-local allowlist
   semantics: they cannot cross a boundary, so the local check is
   interposition within one trust domain, not boundary enforcement.
@@ -100,6 +109,7 @@ authority is carried by the capability reference.
 | Capability | What it does |
 |------------|--------------|
 | **identity** | Host-side Ed25519 signing (private key never enters WASM) |
+| **authority** | Construct a policy-bound `Terminal` over one explicit capability |
 | **host** | Peer identity, listen addresses, connected peers, network access |
 | **runtime** | Load WASM binaries and obtain scoped Executors (with compilation caching) |
 | **routing** | Kademlia DHT: provide and find content/services |
@@ -159,8 +169,8 @@ resolution in this mode.
 
 1. Agent calls `membrane.graft()` to receive epoch-scoped capabilities
 2. Having a Membrane reference IS authorization (ocap model)
-3. To gate access for remote peers, wrap the Membrane in a
-   `Terminal(Membrane)` challenge-response auth layer
+3. To gate a remotely published capability, trusted configuration attaches
+   an explicit policy and publishes the resulting `Terminal(Session)`
 4. When the on-chain epoch advances, all capabilities are revoked
 5. Agents re-graft, picking up the new state automatically
 
@@ -169,16 +179,23 @@ resolution in this mode.
 You cannot un-hand a CID. This is classical ocap semantics — once a
 cell knows a CID, it can fetch the content. Revocation works two ways:
 
-- **Epoch advance.** `EpochGuard` (`crates/membrane/src/epoch.rs`)
+- **Epoch advance.** `EpochGuard` (`crates/authority/src/epoch.rs`)
   invalidates every RPC capability bound to the old epoch. Method
   calls fail with `staleEpoch`. The cell must re-graft.
+- **Targeted recipient revocation.** A per-recipient `RevocationGuard`
+  invalidates already-issued RPC sessions for that policy decision without
+  advancing the global epoch. Removing the policy binding also denies new
+  logins. The guard mechanism is implemented, but generic `serve-vat`
+  publication does not yet return a deployer-facing management capability
+  that can trigger key-scoped revocation or replace bindings. Until that
+  pre-alpha API lands, generic published services use epoch advance for
+  operator-triggered invalidation.
 - **Kill and respawn under a different root Atom.** New cell, new root
   CID, fresh CID graph. The old cell's content knowledge is gone with
   the old process.
 
-For RPC caps you can also wrap with a revocable proxy and drop the
-proxy's reference. That's a runtime construct, not a property of
-the membrane.
+Both lifecycle checks use the same call-guard substrate as method policy.
+Atom remains the source and coordinator of global epoch lifecycle.
 
 ## Structured errors
 
@@ -286,7 +303,7 @@ Schema definitions live in `capnp/`:
 - **`system.capnp`** — Host, Runtime, Executor, Process, ByteStream,
   StreamListener, StreamDialer, VatListener, VatClient, HttpListener
 - **`stem.capnp`** — Epoch and provenance metadata
-- **`auth.capnp`** — Terminal, Signer, Identity
+- **`auth.capnp`** — Terminal, Signer, Identity, Authority policy constructor
 - **`membrane.capnp`** — Membrane, Export
 - **`routing.capnp`** — Kademlia DHT (provide, findProviders, hash)
 - **`http.capnp`** — HttpClient

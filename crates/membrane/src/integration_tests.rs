@@ -5,6 +5,7 @@
 //! spike; adapted to the `Policy` trait API. The real-cap end-to-end path is
 //! additionally covered by the M1a spike in `crates/rpc`.
 
+use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
 
@@ -18,8 +19,8 @@ use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::test_thing_capnp::thing;
-use crate::{membrane, membrane_state_of, Allowlist, Policy, DENIED_MARKER};
+use crate::test_thing_capnp::{stream_thing, thing};
+use crate::{attenuate, membrane, membrane_state_of, Allowlist, Policy, DENIED_MARKER};
 
 const PING: u16 = 0;
 const FORBIDDEN: u16 = 1;
@@ -36,6 +37,31 @@ fn thing_id() -> u64 {
 
 struct ThingImpl {
     depth: u32,
+}
+
+struct StreamThingImpl {
+    messages: Rc<RefCell<Vec<String>>>,
+}
+
+impl stream_thing::Server for StreamThingImpl {
+    fn notify(
+        self: CapRc<Self>,
+        params: stream_thing::NotifyParams,
+    ) -> impl Future<Output = Result<(), Error>> + 'static {
+        let message = params
+            .get()
+            .and_then(|params| params.get_msg())
+            .and_then(|message| {
+                message
+                    .to_string()
+                    .map_err(|error| Error::failed(error.to_string()))
+            });
+        let messages = Rc::clone(&self.messages);
+        async move {
+            messages.borrow_mut().push(message?);
+            Ok(())
+        }
+    }
 }
 
 impl thing::Server for ThingImpl {
@@ -133,6 +159,24 @@ async fn expect_ping(client: &thing::Client, expected: &str, context: &str) {
 async fn allowed_method_succeeds_through_membrane() {
     let m = membraned_local_thing();
     expect_ping(&m, "pong-0", "in-process allowed").await;
+}
+
+#[tokio::test]
+async fn streaming_method_forwards_staged_parameters() {
+    let messages = Rc::new(RefCell::new(Vec::new()));
+    let raw: stream_thing::Client = capnp_rpc::new_client(StreamThingImpl {
+        messages: Rc::clone(&messages),
+    });
+    let client = membrane(
+        raw,
+        Rc::new(Allowlist::new().allow(stream_thing::Client::TYPE_ID, 0)) as Rc<dyn Policy>,
+    );
+
+    let mut request = client.notify_request();
+    request.get().set_msg("streaming payload");
+    request.send().await.unwrap();
+
+    assert_eq!(messages.borrow().as_slice(), ["streaming payload"]);
 }
 
 #[tokio::test]
@@ -277,6 +321,27 @@ async fn membraned_param_is_unwrapped_on_reentry() {
     );
 }
 
+/// A capability protected by boundary A must remain protected when passed as a
+/// parameter through independent boundary B. The process-global registry must
+/// not authorize B to strip A's membrane.
+#[tokio::test]
+async fn foreign_boundary_param_remains_membraned() {
+    let boundary_a = membraned_local_thing();
+
+    let raw_b: thing::Client = capnp_rpc::new_client(ThingImpl { depth: 100 });
+    let boundary_b = membrane(
+        raw_b,
+        Rc::new(Allowlist::new().allow(thing_id(), ECHO)) as Rc<dyn Policy>,
+    );
+
+    let mut request = boundary_b.echo_request();
+    request.get().set_thing(boundary_a);
+    assert_denied(
+        request.send().promise.await,
+        "foreign boundary must not unwrap another boundary's capability",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Stage 4: collapse-on-wrap (allowlist intersection, single layer)
 // ---------------------------------------------------------------------------
@@ -297,7 +362,7 @@ async fn allowlist_collapse_intersects_and_flattens() {
                 .allow(thing_id(), CHILD),
         ) as Rc<dyn Policy>,
     );
-    let outer = membrane(
+    let outer = attenuate(
         inner,
         Rc::new(
             Allowlist::new()
@@ -328,6 +393,44 @@ async fn allowlist_collapse_intersects_and_flattens() {
     );
 }
 
+#[tokio::test]
+async fn independent_boundary_does_not_collapse_foreign_lineage() {
+    let raw: thing::Client = capnp_rpc::new_client(ThingImpl { depth: 0 });
+    let boundary_a = membrane(
+        raw,
+        Rc::new(
+            Allowlist::new()
+                .allow(thing_id(), PING)
+                .allow(thing_id(), CHILD),
+        ) as Rc<dyn Policy>,
+    );
+    let boundary_b = membrane(
+        boundary_a,
+        Rc::new(
+            Allowlist::new()
+                .allow(thing_id(), CHILD)
+                .allow(thing_id(), FORBIDDEN),
+        ) as Rc<dyn Policy>,
+    );
+
+    let state_b = membrane_state_of(&*boundary_b.client.clone().hook).expect("boundary B membrane");
+    let state_a = membrane_state_of(&*state_b.inner).expect("boundary A remains nested");
+    assert!(
+        !Rc::ptr_eq(&state_a.lineage, &state_b.lineage),
+        "independent membranes must receive distinct boundary lineages"
+    );
+
+    boundary_b.child_request().send().promise.await.unwrap();
+    assert_denied(
+        boundary_b.ping_request().send().promise.await,
+        "boundary B still enforces its own policy",
+    );
+    assert_denied(
+        boundary_b.forbidden_request().send().promise.await,
+        "boundary A remains enforced under boundary B",
+    );
+}
+
 /// A stateful outer policy (rate limit) must NOT collapse: it stacks so its
 /// per-call counter survives. The inner allowlist still filters underneath.
 #[tokio::test]
@@ -341,7 +444,7 @@ async fn stateful_policy_stacks_not_collapses() {
         Rc::new(Allowlist::new().allow(thing_id(), PING)) as Rc<dyn Policy>,
     );
     // Rate-limit the already-membraned cap: 1 call per long window.
-    let outer = membrane(
+    let outer = attenuate(
         inner,
         Rc::new(RateLimit::new(
             Box::new(Allowlist::new().allow(thing_id(), PING)),
@@ -490,6 +593,30 @@ async fn rpc_server_side_membrane() {
                     .to_str()
                     .unwrap(),
                 "pong-1"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn rpc_foreign_boundary_param_remains_membraned() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let remote_a = setup_rpc(capnp_rpc::new_client(ThingImpl { depth: 0 }));
+            let boundary_a = membrane(remote_a, policy());
+
+            let remote_b = setup_rpc(capnp_rpc::new_client(ThingImpl { depth: 100 }));
+            let boundary_b = membrane(
+                remote_b,
+                Rc::new(Allowlist::new().allow(thing_id(), ECHO)) as Rc<dyn Policy>,
+            );
+
+            let mut request = boundary_b.echo_request();
+            request.get().set_thing(boundary_a);
+            assert_denied(
+                request.send().promise.await,
+                "RPC foreign boundary must remain guarded",
             );
         })
         .await;

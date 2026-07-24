@@ -4,7 +4,7 @@
 > Public capability boundaries now carry a bare capability reference in
 > `Export { name, cap }` (and `Process.bootstrap`/vat serve/dial carry a bare
 > `Capability`), with attenuation provided by the hook-level membrane
-> (`crates/ww-membrane`). See `doc/designs/single-authority-capability-model.md`.
+> (`crates/membrane`). See `doc/designs/single-authority-capability-model.md`.
 > This document is retained for historical context only.
 
 WW uses `Synapse` as the single public capability currency at membrane and vat

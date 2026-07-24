@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use caps::{make_import_cap, make_import_handler};
 #[cfg(test)]
 use caps::eval_load;
+use caps::{make_import_cap, make_import_handler};
 use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
 use glia::eval::{self, Dispatch, Env, EvalOutcome};
 use glia::{extract_method, make_cap, read, read_many, AttenuatedCapInner, GliaCapInner, Val};
@@ -27,7 +27,11 @@ mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
 
-#[allow(dead_code, clippy::extra_unused_type_parameters)]
+#[allow(
+    dead_code,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
 mod auth_capnp {
     include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
 }
@@ -152,10 +156,14 @@ struct Session {
     /// Host-side node identity hub for this session.
     ///
     /// Call `identity.signer("ww-membrane-graft")` (or another known domain) to
-    /// obtain a domain-scoped [`auth_capnp::signer::Client`].  The identity secret
-    /// never crosses the host–guest boundary; only this capability reference is passed.
+    /// obtain a domain-scoped [`auth_capnp::signer::Client`]. The legacy domain
+    /// is a stable wire identifier, independent of Rust crate naming. The
+    /// identity secret never crosses the host–guest boundary; only this
+    /// capability reference is passed.
     #[allow(dead_code)]
     identity: auth_capnp::identity::Client,
+    /// Trusted constructor for attaching recipient policy before publication.
+    authority: auth_capnp::authority::Client,
     /// Outbound HTTP capability for WASM guests.
     ///
     /// Domain-scoped proxy — the host checks URL host against an allowlist.
@@ -204,6 +212,7 @@ fn extract_capnp_client(
     try_downcast!(system_capnp::runtime::Client);
     try_downcast!(routing_capnp::routing::Client);
     try_downcast!(auth_capnp::identity::Client);
+    try_downcast!(auth_capnp::authority::Client);
     try_downcast!(http_capnp::http_client::Client);
     try_downcast!(system_capnp::executor::Client);
     None
@@ -582,7 +591,10 @@ fn eval_outcome<'a>(
         });
         let stdout = std::rc::Rc::new(|data: Val| {
             Box::pin(async move {
-                let text = match data { Val::Str(s) => s, other => format!("{other}") };
+                let text = match data {
+                    Val::Str(s) => s,
+                    other => format!("{other}"),
+                };
                 write_stdout(&text)?;
                 Ok(HostEffectResult::Resume(Val::Nil))
             }) as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
@@ -592,9 +604,18 @@ fn eval_outcome<'a>(
                 as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
         });
         let effects = [
-            HostEffect { target: EffectTarget::Keyword("load".into()), handler: load },
-            HostEffect { target: EffectTarget::Keyword("stdout".into()), handler: stdout },
-            HostEffect { target: EffectTarget::Keyword("exit".into()), handler: exit },
+            HostEffect {
+                target: EffectTarget::Keyword("load".into()),
+                handler: load,
+            },
+            HostEffect {
+                target: EffectTarget::Keyword("stdout".into()),
+                handler: stdout,
+            },
+            HostEffect {
+                target: EffectTarget::Keyword("exit".into()),
+                handler: exit,
+            },
         ];
         eval::eval_toplevel_with_host_effects(expr, env, &kd, &effects).await
     })
@@ -654,6 +675,199 @@ fn call_resume(resume: &Val, val: Val) -> Result<Val, Val> {
     match resume {
         Val::NativeFn { func, .. } => func(&[val]),
         _ => Err(Val::from("cap handler: invalid resume function")),
+    }
+}
+
+fn policy_field<'a>(map: &'a glia::ValMap, name: &str) -> Option<&'a Val> {
+    map.get(&Val::Keyword(name.into()))
+        .or_else(|| map.get(&Val::Str(name.into())))
+        .or_else(|| map.get(&Val::Sym(name.into())))
+}
+
+fn policy_sequence<'a>(value: &'a Val, context: &str) -> Result<&'a [Val], Val> {
+    match value {
+        Val::List(items) | Val::Vector(items) => Ok(items),
+        other => Err(glia::error::type_mismatch(context, "list or vector", other)),
+    }
+}
+
+fn policy_name(value: &Val, context: &str) -> Result<String, Val> {
+    match value {
+        Val::Str(name) | Val::Sym(name) | Val::Keyword(name) if !name.is_empty() => {
+            Ok(name.clone())
+        }
+        other => Err(glia::error::type_mismatch(
+            context,
+            "non-empty string, symbol, or keyword",
+            other,
+        )),
+    }
+}
+
+fn policy_u64(value: &Val, context: &str) -> Result<u64, Val> {
+    match value {
+        Val::Int(number) if *number >= 0 => Ok(*number as u64),
+        Val::Str(number) => {
+            let number = number.strip_prefix("0x").unwrap_or(number);
+            u64::from_str_radix(number, 16)
+                .map_err(|_| Val::from(format!("{context} — invalid hexadecimal UInt64")))
+        }
+        other => Err(glia::error::type_mismatch(
+            context,
+            "non-negative integer or hexadecimal string",
+            other,
+        )),
+    }
+}
+
+fn policy_u16(value: &Val, context: &str) -> Result<u16, Val> {
+    let number = policy_u64(value, context)?;
+    u16::try_from(number).map_err(|_| Val::from(format!("{context} — ordinal exceeds UInt16")))
+}
+
+fn policy_key(value: &Val, context: &str) -> Result<Vec<u8>, Val> {
+    let bytes = match value {
+        Val::Bytes(bytes) => bytes.clone(),
+        Val::Str(encoded) => hex::decode(encoded)
+            .map_err(|_| Val::from(format!("{context} — invalid hexadecimal key")))?,
+        other => {
+            return Err(glia::error::type_mismatch(
+                context,
+                "32-byte value or hexadecimal string",
+                other,
+            ))
+        }
+    };
+    if bytes.len() != 32 {
+        return Err(Val::from(format!(
+            "{context} — verifying key must be 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn write_authority_policy(
+    mut builder: auth_capnp::authority_policy::Builder<'_>,
+    value: &Val,
+) -> Result<(), Val> {
+    let Val::Map(policy) = value else {
+        return Err(glia::error::type_mismatch("authority policy", "map", value));
+    };
+    let profiles = policy_field(policy, "profiles")
+        .ok_or_else(|| Val::from("authority policy — missing :profiles"))?;
+    let profiles = policy_sequence(profiles, "authority policy :profiles")?;
+    let mut profile_builders = builder.reborrow().init_profiles(profiles.len() as u32);
+    for (index, profile) in profiles.iter().enumerate() {
+        let Val::Map(profile) = profile else {
+            return Err(glia::error::type_mismatch(
+                "authority policy profile",
+                "map",
+                profile,
+            ));
+        };
+        let name = policy_name(
+            policy_field(profile, "name")
+                .ok_or_else(|| Val::from("authority policy profile — missing :name"))?,
+            "authority policy profile :name",
+        )?;
+        let methods = policy_field(profile, "methods")
+            .ok_or_else(|| Val::from("authority policy profile — missing :methods"))?;
+        let methods = policy_sequence(methods, "authority policy profile :methods")?;
+        let mut profile_builder = profile_builders.reborrow().get(index as u32);
+        profile_builder.set_name(&name);
+        let mut method_builders = profile_builder.init_methods(methods.len() as u32);
+        for (method_index, method) in methods.iter().enumerate() {
+            let method = policy_sequence(method, "authority policy method")?;
+            if method.len() != 2 {
+                return Err(Val::from(
+                    "authority policy method — expected [interface-id ordinal]",
+                ));
+            }
+            let interface_id = policy_u64(&method[0], "authority policy interface-id")?;
+            let ordinal = policy_u16(&method[1], "authority policy ordinal")?;
+            let mut method_builder = method_builders.reborrow().get(method_index as u32);
+            method_builder.set_interface_id(interface_id);
+            method_builder.set_ordinal(ordinal);
+        }
+    }
+
+    let recipients = policy_field(policy, "recipients")
+        .ok_or_else(|| Val::from("authority policy — missing :recipients"))?;
+    let recipients = policy_sequence(recipients, "authority policy :recipients")?;
+    let mut recipient_builders = builder.init_recipients(recipients.len() as u32);
+    for (index, recipient) in recipients.iter().enumerate() {
+        let Val::Map(recipient) = recipient else {
+            return Err(glia::error::type_mismatch(
+                "authority policy recipient",
+                "map",
+                recipient,
+            ));
+        };
+        let key = policy_key(
+            policy_field(recipient, "verifying-key")
+                .ok_or_else(|| Val::from("authority policy recipient — missing :verifying-key"))?,
+            "authority policy recipient :verifying-key",
+        )?;
+        let profile = policy_name(
+            policy_field(recipient, "profile")
+                .ok_or_else(|| Val::from("authority policy recipient — missing :profile"))?,
+            "authority policy recipient :profile",
+        )?;
+        let mut recipient_builder = recipient_builders.reborrow().get(index as u32);
+        recipient_builder.set_verifying_key(&key);
+        recipient_builder.set_profile(&profile);
+    }
+    Ok(())
+}
+
+fn make_authority_handler(authority: auth_capnp::authority::Client) -> Val {
+    Val::AsyncNativeFn {
+        name: "authority-handler".into(),
+        func: Rc::new(move |args: Vec<Val>| {
+            let authority = authority.clone();
+            Box::pin(async move {
+                let (method, rest) = extract_method(&args[0])?;
+                let resume = &args[1];
+                let result = match method {
+                    "guard" => {
+                        let (session, policy) = match rest {
+                            [Val::Cap { inner, .. }, policy] => {
+                                let session = extract_capnp_client(inner).ok_or_else(|| {
+                                    Val::from(
+                                        "authority :guard — session is not backed by a Cap'n Proto client",
+                                    )
+                                })?;
+                                (session, policy)
+                            }
+                            _ => {
+                                return Err(Val::from(
+                                    "authority :guard — usage: (perform authority :guard <cap> <policy-map>)",
+                                ))
+                            }
+                        };
+                        let mut request = authority.guard_request();
+                        request
+                            .get()
+                            .set_session(auth_capnp::opaque_session::Client { client: session });
+                        write_authority_policy(request.get().init_policy(), policy)?;
+                        let response = request
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|error| Val::from(error.to_string()))?;
+                        let terminal = response
+                            .get()
+                            .map_err(|error| Val::from(error.to_string()))?
+                            .get_terminal()
+                            .map_err(|error| Val::from(error.to_string()))?;
+                        make_generic_cap(terminal.client)
+                    }
+                    _ => return Err(Val::from(format!("authority: unknown method :{method}"))),
+                };
+                call_resume(resume, result)
+            })
+        }),
     }
 }
 
@@ -753,7 +967,7 @@ fn make_host_handler(
                             [Val::Cell { wasm, caps }, Val::Str(prefix)] => ((wasm, caps), prefix),
                             [Val::Cell { .. }] => {
                                 return Err(Val::from(
-                                    "host :listen — vat cell listen was removed; spawn the service, obtain its bootstrap capability, then publish it with (perform host :serve-vat <cap> \"service\")",
+                                    "host :listen — vat cell listen was removed; spawn the service, obtain its bootstrap capability, then publish it with (perform host :serve-vat <cap> \"service\" :auth <policy>)",
                                 ))
                             }
                             [] => {
@@ -859,24 +1073,24 @@ fn make_host_handler(
                         Val::Nil
                     }
                     "serve-vat" => {
-                        let (cap, protocol) = match rest {
-                            [Val::Cap { inner, .. }, Val::Str(protocol)] => {
+                        let (cap, protocol, policy) = match rest {
+                            [
+                                Val::Cap { inner, .. },
+                                Val::Str(protocol),
+                                Val::Keyword(auth),
+                                policy,
+                            ] if auth == "auth" => {
                                 let cap = extract_capnp_client(inner).ok_or_else(|| {
                                     Val::from(
                                         "host :serve-vat — cap is not backed by a Cap'n Proto client",
                                     )
                                 })?;
-                                (cap, protocol)
+                                (cap, protocol, policy)
                             }
-                            [] | [_] => {
+                            _ => {
                                 return Err(Val::from(
-                                    "host :serve-vat — usage: (perform host :serve-vat <exported-cap> \"service\")",
+                                    "host :serve-vat — usage: (perform host :serve-vat <exported-cap> \"service\" :auth <policy-map>)",
                                 ))
-                            }
-                            [other, ..] => {
-                                return Err(Val::from(format!(
-                                    "host :serve-vat — expected cap and protocol string, got {other}"
-                                )))
                             }
                         };
 
@@ -890,14 +1104,56 @@ fn make_host_handler(
                         let listener = network
                             .get_vat_listener()
                             .map_err(|e| Val::from(e.to_string()))?;
-                        let mut req = listener.serve_request();
+                        let mut req = listener.serve_authenticated_request();
+                        write_cap(req.get().init_cap(), cap);
+                        req.get().set_protocol(protocol);
+                        write_authority_policy(req.get().init_policy(), policy)?;
+                        req.send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        log::info!(
+                            "host :serve-vat — published authenticated vat service {protocol}"
+                        );
+                        Val::Nil
+                    }
+                    "serve-raw-vat" => {
+                        let (cap, protocol) = match rest {
+                            [Val::Cap { inner, .. }, Val::Str(protocol)] => {
+                                let cap = extract_capnp_client(inner).ok_or_else(|| {
+                                    Val::from(
+                                        "host :serve-raw-vat — cap is not backed by a Cap'n Proto client",
+                                    )
+                                })?;
+                                (cap, protocol)
+                            }
+                            _ => {
+                                return Err(Val::from(
+                                    "host :serve-raw-vat — usage: (perform host :serve-raw-vat <exported-cap> \"service\")",
+                                ))
+                            }
+                        };
+
+                        let network_resp = host
+                            .network_request()
+                            .send()
+                            .promise
+                            .await
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let network = network_resp.get().map_err(|e| Val::from(e.to_string()))?;
+                        let listener = network
+                            .get_vat_listener()
+                            .map_err(|e| Val::from(e.to_string()))?;
+                        let mut req = listener.serve_raw_request();
                         write_cap(req.get().init_cap(), cap);
                         req.get().set_protocol(protocol);
                         req.send()
                             .promise
                             .await
                             .map_err(|e| Val::from(e.to_string()))?;
-                        log::info!("host :serve-vat — published vat service {protocol}");
+                        log::warn!(
+                            "host :serve-raw-vat — published ungated vat service {protocol}"
+                        );
                         Val::Nil
                     }
                     "http-client" => {
@@ -1247,7 +1503,10 @@ Capabilities (via perform):
   (perform host :peers)                      Connected peers
   (perform host :listen <cell> \"/path\")     Register HTTP/WAGI cell
   (perform host :listen-stream <cell> \"p\")  Register byte-stream cell
-  (perform host :serve-vat cap \"service\")   Publish existing vat capability
+  (perform host :serve-vat cap \"service\" :auth policy)
+                                               Publish authenticated vat service
+  (perform host :serve-raw-vat cap \"service\") Publish ungated vat capability
+  (perform authority :guard cap policy)      Attach recipient policy, return Terminal
 
   (perform runtime :load <wasm>)             Load wasm, return executor
   (perform runtime :run <wasm> :env {})      Spawn foreground process
@@ -1751,6 +2010,7 @@ fn run_impl() {
             let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
             let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
             let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
+            let authority: auth_capnp::authority::Client = get_graft_cap(&caps, "authority")?;
             let http_client: Option<http_capnp::http_client::Client> =
                 get_graft_cap(&caps, "http-client").ok();
 
@@ -1759,6 +2019,7 @@ fn run_impl() {
                 runtime: runtime.clone(),
                 routing: routing.clone(),
                 identity,
+                authority: authority.clone(),
                 http_client: http_client.clone(),
                 cwd: "/".to_string(),
                 load_runtime: caps::default_load_runtime(),
@@ -1804,6 +2065,11 @@ fn run_impl() {
                                 // Glia effect handler — skip env binding.
                                 continue;
                             }
+                            "authority" => (
+                                schema_ids::AUTHORITY_CID,
+                                Rc::new(s.authority.clone()),
+                                make_authority_handler(s.authority.clone()),
+                            ),
                             "http-client" => {
                                 match s.http_client.clone() {
                                     Some(c) => (
@@ -1825,7 +2091,10 @@ fn run_impl() {
                             }
                         };
 
-                    env.set(cap_name.to_string(), make_cap(cap_name, schema_cid.to_string(), inner));
+                    env.set(
+                        cap_name.to_string(),
+                        make_cap(cap_name, schema_cid.to_string(), inner),
+                    );
                     if !matches!(handler, Val::Nil) {
                         env.set(format!("{cap_name}-handler"), handler);
                     }
@@ -2206,10 +2475,10 @@ mod tests {
 
     #[allow(refining_impl_trait)]
     impl system_capnp::vat_listener::Server for TestVatListener {
-        fn serve(
+        fn serve_raw(
             self: capnp::capability::Rc<Self>,
-            params: system_capnp::vat_listener::ServeParams,
-            _results: system_capnp::vat_listener::ServeResults,
+            params: system_capnp::vat_listener::ServeRawParams,
+            _results: system_capnp::vat_listener::ServeRawResults,
         ) -> Promise<(), capnp::Error> {
             let params = capnp_rpc::pry!(params.get());
             if !params.has_cap() {
@@ -2217,6 +2486,24 @@ mod tests {
             }
             if !params.has_protocol() {
                 return Promise::err(capnp::Error::failed("protocol not set".into()));
+            }
+            Promise::ok(())
+        }
+
+        fn serve_authenticated(
+            self: capnp::capability::Rc<Self>,
+            params: system_capnp::vat_listener::ServeAuthenticatedParams,
+            _results: system_capnp::vat_listener::ServeAuthenticatedResults,
+        ) -> Promise<(), capnp::Error> {
+            let params = capnp_rpc::pry!(params.get());
+            if !params.has_cap() {
+                return Promise::err(capnp::Error::failed("cap not set".into()));
+            }
+            if !params.has_protocol() {
+                return Promise::err(capnp::Error::failed("protocol not set".into()));
+            }
+            if !params.has_policy() {
+                return Promise::err(capnp::Error::failed("policy not set".into()));
             }
             Promise::ok(())
         }
@@ -2297,6 +2584,9 @@ mod tests {
         }
     }
 
+    struct TestAuthority;
+    impl auth_capnp::authority::Server for TestAuthority {}
+
     // --- Stub Membrane: returns fixed graft caps ---
 
     struct TestMembrane {
@@ -2339,6 +2629,7 @@ mod tests {
             runtime: capnp_rpc::new_client(TestRuntime),
             routing: capnp_rpc::new_client(TestRouting),
             identity: capnp_rpc::new_client(TestIdentity),
+            authority: capnp_rpc::new_client(TestAuthority),
             http_client: Some(capnp_rpc::new_client(TestHttpClient)),
             cwd: "/".into(),
             load_runtime: caps::default_load_runtime(),
@@ -2532,6 +2823,57 @@ mod tests {
         .await;
     }
 
+    fn test_authority_policy() -> Val {
+        Val::Map(glia::ValMap::from_pairs(vec![
+            (
+                Val::Keyword("profiles".into()),
+                Val::Vector(vec![Val::Map(glia::ValMap::from_pairs(vec![
+                    (Val::Keyword("name".into()), Val::Keyword("reader".into())),
+                    (
+                        Val::Keyword("methods".into()),
+                        Val::Vector(vec![Val::Vector(vec![
+                            Val::Str("0xd0ac8299df079c61".into()),
+                            Val::Int(0),
+                        ])]),
+                    ),
+                ]))]),
+            ),
+            (
+                Val::Keyword("recipients".into()),
+                Val::Vector(vec![Val::Map(glia::ValMap::from_pairs(vec![
+                    (
+                        Val::Keyword("verifying-key".into()),
+                        Val::Str(hex::encode([7; 32])),
+                    ),
+                    (
+                        Val::Keyword("profile".into()),
+                        Val::Keyword("reader".into()),
+                    ),
+                ]))]),
+            ),
+        ]))
+    }
+
+    #[test]
+    fn authority_policy_literal_serializes_without_service_name() {
+        let policy = test_authority_policy();
+        let mut message = capnp::message::Builder::new_default();
+        let builder = message.init_root::<auth_capnp::authority_policy::Builder>();
+        write_authority_policy(builder, &policy).expect("valid authority policy");
+        let policy = message
+            .get_root_as_reader::<auth_capnp::authority_policy::Reader>()
+            .expect("policy reader");
+        let profiles = policy.get_profiles().expect("profiles");
+        let profile = profiles.get(0);
+        assert_eq!(profile.get_name().unwrap().to_str().unwrap(), "reader");
+        let method = profile.get_methods().unwrap().get(0);
+        assert_eq!(method.get_interface_id(), 0xd0ac_8299_df07_9c61);
+        assert_eq!(method.get_ordinal(), 0);
+        let recipient = policy.get_recipients().unwrap().get(0);
+        assert_eq!(recipient.get_verifying_key().unwrap(), &[7; 32]);
+        assert_eq!(recipient.get_profile().unwrap().to_str().unwrap(), "reader");
+    }
+
     // --- host listen / serve tests ---
 
     fn test_cell() -> Val {
@@ -2591,14 +2933,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_host_serve_vat_cap_succeeds() {
+    async fn test_host_serve_raw_vat_cap_succeeds() {
         run_local(async {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
             let cap = make_cap("host", "test-host-cid", Rc::new(s.host.clone()));
-            let result =
-                call_handler(&handler, "serve-vat", &[cap, Val::Str("greeter".into())]).await;
+            let result = call_handler(
+                &handler,
+                "serve-raw-vat",
+                &[cap, Val::Str("greeter".into())],
+            )
+            .await;
             assert!(
                 result.is_ok(),
                 "VatListener serve failed: {:?}",
@@ -2609,15 +2955,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_host_serve_vat_non_capnp_cap_errors() {
+    async fn test_host_serve_vat_requires_and_forwards_auth_policy() {
+        run_local(async {
+            let s = test_session();
+            let handler =
+                make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
+            let cap = make_cap("host", "test-host-cid", Rc::new(s.host.clone()));
+            let result = call_handler(
+                &handler,
+                "serve-vat",
+                &[
+                    cap,
+                    Val::Str("greeter".into()),
+                    Val::Keyword("auth".into()),
+                    test_authority_policy(),
+                ],
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "authenticated VatListener serve failed: {:?}",
+                result.err()
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_host_serve_raw_vat_non_capnp_cap_errors() {
         run_local(async {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
             let cap = make_cap("not-capnp", "test-cid", Rc::new(42i32));
-            let err = call_handler(&handler, "serve-vat", &[cap, Val::Str("greeter".into())])
-                .await
-                .unwrap_err();
+            let err = call_handler(
+                &handler,
+                "serve-raw-vat",
+                &[cap, Val::Str("greeter".into())],
+            )
+            .await
+            .unwrap_err();
             let msg = format!("{err}");
             assert!(
                 msg.contains("not backed by a Cap'n Proto client"),
@@ -2638,6 +3015,7 @@ mod tests {
                 .await
                 .is_err());
             assert!(call_handler(&handler, "serve-vat", &[]).await.is_err());
+            assert!(call_handler(&handler, "serve-raw-vat", &[]).await.is_err());
         })
         .await;
     }
@@ -3002,7 +3380,7 @@ mod tests {
                 Err(e) => e,
             };
             assert!(
-                err.to_string().contains(ww_membrane::DENIED_MARKER),
+                err.to_string().contains(membrane::DENIED_MARKER),
                 "denial must come from the membrane: {err}"
             );
         })
@@ -3126,7 +3504,7 @@ mod tests {
                 Err(e) => e,
             };
             assert!(
-                err.to_string().contains(ww_membrane::DENIED_MARKER),
+                err.to_string().contains(membrane::DENIED_MARKER),
                 "intersected denial must cross the wire: {err}"
             );
 
@@ -3136,7 +3514,7 @@ mod tests {
                 Err(e) => e,
             };
             assert!(
-                err.to_string().contains(ww_membrane::DENIED_MARKER),
+                err.to_string().contains(membrane::DENIED_MARKER),
                 "membrane denial must cross the wire: {err}"
             );
         })
@@ -3202,7 +3580,9 @@ mod tests {
             bind_caps_in_env(&mut env, &ctx.borrow());
 
             let define = read("(def exit-now (fn [] (perform :exit nil)))").unwrap();
-            assert!(eval_outcome(&define, &mut env, &ctx, &dispatch).await.is_ok());
+            assert!(eval_outcome(&define, &mut env, &ctx, &dispatch)
+                .await
+                .is_ok());
 
             // The top-level form itself has no host-effect syntax. Its call
             // reaches the body defined above, so this succeeds only when the
@@ -3289,8 +3669,13 @@ mod tests {
         let text = "x".repeat(MAX_STDOUT_WRITE_BYTES * 2 + 1);
         let chunks: Vec<_> = stdout_chunks(&text).collect();
         assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|chunk| chunk.len() <= MAX_STDOUT_WRITE_BYTES));
-        assert_eq!(chunks.iter().map(|chunk| chunk.len()).sum::<usize>(), text.len());
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= MAX_STDOUT_WRITE_BYTES));
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+            text.len()
+        );
     }
 
     // --- init script eval integration ---

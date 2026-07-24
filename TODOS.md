@@ -1,12 +1,12 @@
 # TODOs
 
 ## Recursive attenuation for named vat services — SHIPPED 2026-07
-**What:** Done via the single-authority capability model (eng review 2026-07-17; PRs #563–#568 plus the attenuate-reification PR). `(attenuate cap [:method ...])` reifies into a hook-level `ww-membrane` allowlist keyed by `(interfaceId, ordinal)`; the policy travels with the capability through export/serve-vat, nested attenuation intersects into a single membrane layer, and denials fail closed with structured errors. See `doc/designs/single-authority-capability-model.md`.
+**What:** Done via the single-authority capability model (eng review 2026-07-17; PRs #563–#568 plus the attenuate-reification PR). `(attenuate cap [:method ...])` reifies into a hook-level `wetware-membrane` allowlist keyed by `(interfaceId, ordinal)`; the policy travels with the capability through export/serve-vat, nested attenuation intersects into a single membrane layer, and denials fail closed with structured errors. See `doc/designs/single-authority-capability-model.md`.
 **Remaining:** attenuating schema-less caps (e.g. dialed generic caps) is fail-closed pending the deferred schema-association design (D24); the defcap-export bridge item carries the reification invariant for pure-Glia caps.
 **Priority:** —
 
 ## defcap-export bridge (GliaCapInner → capnp server)
-**What:** Let a pure-Glia `defcap` capability cross a process/vat boundary by bridging its method table to a capnp server. This is the single remaining place where the Glia/capnp capability split could re-open, so it is a committed future workstream, not a maybe. Binding invariants (from the 2026-07-17 review, D28, recorded in `doc/designs/single-authority-capability-model.md`): (1) the exported cap crosses the boundary as an ordinary capnp capability governed by the SAME hook-level membrane as every other cap — no second enforcement path; (2) `attenuate` on such a cap reifies into the membrane exactly as for grafted caps; (3) it reuses `crates/ww-membrane` — anything the crate can't express is a signal to fix the crate, not to fork a path.
+**What:** Let a pure-Glia `defcap` capability cross a process/vat boundary by bridging its method table to a capnp server. This is the single remaining place where the Glia/capnp capability split could re-open, so it is a committed future workstream, not a maybe. Binding invariants (from the 2026-07-17 review, D28, recorded in `doc/designs/single-authority-capability-model.md`): (1) the exported cap crosses the boundary as an ordinary capnp capability governed by the SAME hook-level membrane as every other cap — no second enforcement path; (2) `attenuate` on such a cap reifies into the membrane exactly as for grafted caps; (3) it reuses `crates/membrane` — anything the crate can't express is a signal to fix the crate, not to fork a path.
 **Why:** Until built, defcap caps remain cell-local (fully usable via `perform`), which is why deferral is safe. Gate to build it: a concrete consumer needs a Glia-defined cap to cross a boundary.
 **Effort:** L
 **Priority:** P1
@@ -146,12 +146,28 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 **RESOLVED:** Stream and vat protocols now use distinct prefixes:
 `/ww/0.1.0/stream/{name}` vs `/ww/0.1.0/vat/{name}`.
 
-## Connection rate limiting for VatListener
-**What:** Every incoming connection in `VatListenerImpl` starts a Cap'n Proto RPC session to the served capability with no concurrency limit. A malicious peer (or many peers) can flood connections, causing unbounded session and stream work.
-**Why:** Serve-only vat transport no longer spawns a WASI cell per connection, but each connection still holds an RPC system, stream, tasks, and references to the served capability.
-**Context:** Add a semaphore or max-connections limit to the accept loop. Consider making the limit configurable via `serve()` params or a sensible default (e.g. 64 concurrent connections per protocol).
-**Effort:** S
-**Priority:** P2
+## ~~Connection rate limiting for VatListener~~ ✅
+**RESOLVED:** Named raw and authenticated VAT serving now share the
+operator-configured `ConnectionBudget`. Authenticated streams must complete
+Terminal login before `WW_TERMINAL_LOGIN_TIMEOUT_SECS` or the listener closes
+the stream and releases its permit. This bounds per-connection resource use;
+per-peer/per-principal quotas and Sybil-resistant fairness remain deferred.
+
+## Authenticated VAT policy-management handle
+**What:** Return or provision an operator capability that can update recipient
+bindings and trigger key-scoped `RevocationGuard`s for a running authenticated
+VAT service.
+**Why:** `serve-vat ... :auth policy` compiles the deployer's initial policy and
+enforces epoch expiry, but the public serving call does not yet expose
+`KeyMethodAuthorization::revoke` or binding replacement. Operators currently
+need an epoch advance to invalidate authority through this generic path.
+**Context:** Keep the publication API direct; do not reintroduce a
+deployer-visible `AuthenticatedVatService` wrapper merely to obtain the handle.
+The management capability should be explicit, separately attenuable, and
+usable by trusted FHS configuration or a future Warrant/ICME adapter.
+**Effort:** M
+**Priority:** P1
+**Depends on:** authenticated per-stream VAT serving
 
 ## ~~Bootstrap timeout in handle_vat_connection~~ ✅
 **RESOLVED:** `handle_vat_connection()` now wraps `bootstrap_request()` in a 10s `tokio::time::timeout`. Produces a clear error referencing `system::serve()`.
@@ -227,7 +243,7 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 ## Cap'n Proto schema-boundary refactor (stem/auth/membrane/system) (#509)
 **What:** Refactor schema ownership so epoch/provenance types stay in `stem.capnp`, auth/session types move to `auth.capnp`, membrane transport types (`Membrane`, `Export`) move to `membrane.capnp`, and core host/runtime/listener contracts remain in `system.capnp`.
 **Why:** `stem.capnp` currently mixes unrelated concerns and `system.capnp` imports `stem.Export` for core spawn/listener surfaces, which obscures ownership boundaries and complicates protocol evolution.
-**Context:** This is a staged-compat migration, not a redesign. Keep authority semantics unchanged (`Terminal(Membrane)` and no new ambient privileges), preserve runtime behavior, and plan explicit compatibility for schema type IDs. Vat addresses are service-name locators and should not be coupled back to schema CIDs. Must audit all capnp build scripts and generated-module consumers (`crates/membrane`, `std/kernel`, `std/caps`, `std/status`, examples, CLI template scaffolding) plus Synapse descriptor introspection paths.
+**Context:** This is a staged-compat migration, not a redesign. Keep authority semantics unchanged (`Terminal(Membrane)` and no new ambient privileges), preserve runtime behavior, and plan explicit compatibility for schema type IDs. Vat addresses are service-name locators and should not be coupled back to schema CIDs. Must audit all capnp build scripts and generated-module consumers (`crates/authority`, `std/kernel`, `std/caps`, `std/status`, examples, CLI template scaffolding) plus Synapse descriptor introspection paths.
 **Effort:** L
 **Priority:** P2
 **Depends on:** issue #509 design approval, cross-crate capnp migration plan, compatibility decision for schema/type IDs
