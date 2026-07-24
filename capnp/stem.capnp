@@ -1,6 +1,6 @@
 # Stem schema: epoch/provenance definitions.
-# Compiled by the membrane crate (crates/membrane/build.rs).
-# The host re-exports generated types via `pub use membrane::stem_capnp`.
+# Compiled by the authority crate (crates/authority/build.rs).
+# The host re-exports generated types via `pub use authority::stem_capnp`.
 
 @0x9bce094a026970c4;
 

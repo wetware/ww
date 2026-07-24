@@ -6,7 +6,7 @@ description = "Off-chain Atom runtime: head-following, finalization, and caching
 
 
 [dependencies]
-membrane = { path = "../membrane" }
+authority = { package = "wetware-authority", path = "../authority" }
 alloy = { version = "0.4", features = ["rpc-types", "sol-types"] }
 capnp = { workspace = true }
 anyhow = { workspace = true }

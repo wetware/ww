@@ -1,9 +1,9 @@
 use anyhow::{bail, Context, Result};
 use std::io::Write as _;
 
+use authority::{Epoch, Provenance};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::VerifyingKey;
-use membrane::{Epoch, Provenance};
 use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 

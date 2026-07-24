@@ -526,7 +526,7 @@ impl Service for SwarmService {
 // EpochService
 // ---------------------------------------------------------------------------
 
-use membrane::Epoch;
+use authority::Epoch;
 
 /// The on-chain epoch watcher running on its own thread.
 pub struct EpochService {

@@ -936,7 +936,6 @@ dependencies = [
  "k256",
  "libp2p-core",
  "libp2p-identity",
- "membrane",
  "rand 0.8.6",
  "reqwest",
  "rlp",
@@ -950,6 +949,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "wetware-authority",
 ]
 
 [[package]]
@@ -1400,7 +1400,6 @@ dependencies = [
  "hex",
  "ipfs",
  "lru",
- "membrane",
  "rand 0.9.4",
  "reqwest",
  "serde",
@@ -1413,6 +1412,7 @@ dependencies = [
  "wasmtime-wasi",
  "wasmtime-wasi-io",
  "wat",
+ "wetware-authority",
  "ww-cache",
 ]
 
@@ -4174,24 +4174,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
-name = "membrane"
-version = "0.1.0"
-dependencies = [
- "auth",
- "capnp",
- "capnp-rpc",
- "capnpc",
- "ed25519-dalek",
- "hex",
- "libp2p-core",
- "libp2p-identity",
- "rand 0.8.6",
- "schema-id",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5415,7 +5397,6 @@ dependencies = [
  "libp2p",
  "libp2p-core",
  "libp2p-stream",
- "membrane",
  "rand 0.9.4",
  "reqwest",
  "serde",
@@ -5424,6 +5405,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "wetware-authority",
  "ww-cache",
 ]
 
@@ -6009,12 +5991,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "atom",
- "membrane",
  "reqwest",
  "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
+ "wetware-authority",
 ]
 
 [[package]]
@@ -7424,6 +7406,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "wetware-authority"
+version = "0.1.0"
+dependencies = [
+ "auth",
+ "capnp",
+ "capnp-rpc",
+ "capnpc",
+ "ed25519-dalek",
+ "hex",
+ "libp2p-core",
+ "libp2p-identity",
+ "rand 0.8.6",
+ "schema-id",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "wetware-membrane"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnp-rpc",
+ "capnpc",
+ "criterion",
+ "futures",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "widestring"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8166,7 +8179,6 @@ dependencies = [
  "libp2p",
  "libp2p-core",
  "libp2p-stream",
- "membrane",
  "multiaddr",
  "nix 0.30.1",
  "rand 0.9.4",
@@ -8185,6 +8197,7 @@ dependencies = [
  "walkdir",
  "wasm-encoder 0.243.0",
  "wasmtime",
+ "wetware-authority",
  "ww-cache",
 ]
 
@@ -8199,19 +8212,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "ww-membrane"
-version = "0.1.0"
-dependencies = [
- "capnp",
- "capnp-rpc",
- "capnpc",
- "criterion",
- "futures",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]

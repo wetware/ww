@@ -46,6 +46,9 @@ impl SigningDomain {
     }
 
     /// Legacy domain for direct Membrane graft signing (pre-Terminal).
+    ///
+    /// This wire identifier intentionally retains its historical namespace
+    /// across Rust crate renames.
     pub fn membrane_graft() -> Self {
         Self::new("ww-membrane-graft")
     }

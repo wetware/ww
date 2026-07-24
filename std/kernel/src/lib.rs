@@ -152,8 +152,10 @@ struct Session {
     /// Host-side node identity hub for this session.
     ///
     /// Call `identity.signer("ww-membrane-graft")` (or another known domain) to
-    /// obtain a domain-scoped [`auth_capnp::signer::Client`].  The identity secret
-    /// never crosses the host–guest boundary; only this capability reference is passed.
+    /// obtain a domain-scoped [`auth_capnp::signer::Client`]. The legacy domain
+    /// is a stable wire identifier, independent of Rust crate naming. The
+    /// identity secret never crosses the host–guest boundary; only this
+    /// capability reference is passed.
     #[allow(dead_code)]
     identity: auth_capnp::identity::Client,
     /// Outbound HTTP capability for WASM guests.
@@ -2969,7 +2971,7 @@ mod tests {
                 Err(e) => e,
             };
             assert!(
-                err.to_string().contains(ww_membrane::DENIED_MARKER),
+                err.to_string().contains(membrane::DENIED_MARKER),
                 "denial must come from the membrane: {err}"
             );
         })
@@ -3093,7 +3095,7 @@ mod tests {
                 Err(e) => e,
             };
             assert!(
-                err.to_string().contains(ww_membrane::DENIED_MARKER),
+                err.to_string().contains(membrane::DENIED_MARKER),
                 "intersected denial must cross the wire: {err}"
             );
 
@@ -3103,7 +3105,7 @@ mod tests {
                 Err(e) => e,
             };
             assert!(
-                err.to_string().contains(ww_membrane::DENIED_MARKER),
+                err.to_string().contains(membrane::DENIED_MARKER),
                 "membrane denial must cross the wire: {err}"
             );
         })

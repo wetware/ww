@@ -27,7 +27,7 @@ wasmtime-wasi-io = "45.0.0"
 # Workspace crates
 atom = { path = "../atom" }
 stem = { path = "../stem" }
-membrane = { path = "../membrane" }
+authority = { package = "wetware-authority", path = "../authority" }
 cache = { package = "ww-cache", path = "../cache" }
 ipfs = { path = "../ipfs" }
 

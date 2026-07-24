@@ -17,7 +17,7 @@ use futures::FutureExt;
 use tokio::io;
 use tokio::sync::{mpsc, oneshot};
 
-use ::membrane::EpochGuard;
+use ::authority::EpochGuard;
 
 use crate::host::SwarmCommand;
 use crate::services::CompileRequest;
@@ -53,7 +53,7 @@ pub struct RuntimeImpl {
     swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
     wasm_debug: bool,
     guard: Option<EpochGuard>,
-    epoch_rx: Option<tokio::sync::watch::Receiver<::membrane::Epoch>>,
+    epoch_rx: Option<tokio::sync::watch::Receiver<::authority::Epoch>>,
     signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
     stream_control: Option<libp2p_stream::Control>,
     /// Runtime-wide cache policy (from `WW_RUNTIME_CACHE_POLICY` env var).
@@ -159,7 +159,7 @@ pub fn create_runtime_client(
     swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
     wasm_debug: bool,
     guard: Option<EpochGuard>,
-    epoch_rx: Option<tokio::sync::watch::Receiver<::membrane::Epoch>>,
+    epoch_rx: Option<tokio::sync::watch::Receiver<::authority::Epoch>>,
     signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
     stream_control: Option<libp2p_stream::Control>,
     engine: Option<Arc<wasmtime::Engine>>,
@@ -305,7 +305,7 @@ pub struct ExecutorImpl {
     network_state: NetworkState,
     swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
     guard: Option<EpochGuard>,
-    epoch_rx: Option<tokio::sync::watch::Receiver<::membrane::Epoch>>,
+    epoch_rx: Option<tokio::sync::watch::Receiver<::authority::Epoch>>,
     signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
     stream_control: Option<libp2p_stream::Control>,
     /// Runtime client (singleton) — passed to child cells through their membrane graft.

@@ -8,6 +8,7 @@
 //! The protocol name is a locator only; authority comes from the capability
 //! reference passed to `serve`.
 
+use authority::EpochGuard;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -15,9 +16,8 @@ use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use futures::StreamExt;
-use membrane::EpochGuard;
 
-use membrane::system_capnp;
+use authority::system_capnp;
 
 pub struct VatListenerImpl {
     stream_control: libp2p_stream::Control,

@@ -1557,13 +1557,13 @@ fn candidate_from_parts(peer: Option<PeerId>, addrs: Vec<Multiaddr>) -> Result<C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use authority::TerminalServer;
     use capnp::capability::Promise;
     use capnp_rpc::rpc_twoparty_capnp::Side;
     use capnp_rpc::twoparty::VatNetwork;
     use capnp_rpc::RpcSystem;
     use futures::AsyncReadExt;
     use futures::StreamExt;
-    use membrane::TerminalServer;
     use std::cell::RefCell;
     use std::rc::Rc;
     use tokio::io::AsyncWriteExt;
@@ -2206,10 +2206,10 @@ mod tests {
                         ipfs: grafted.ipfs,
                     });
 
-                let epoch = membrane::Epoch {
+                let epoch = authority::Epoch {
                     seq: 1,
                     head: b"head".to_vec(),
-                    provenance: membrane::Provenance::Block(0),
+                    provenance: authority::Provenance::Block(0),
                 };
                 let (_epoch_tx, epoch_rx) = watch::channel(epoch);
                 let terminal_server = TerminalServer::<ww::membrane_capnp::membrane::Owned>::new(

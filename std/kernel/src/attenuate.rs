@@ -2,7 +2,7 @@
 //!
 //! Implements the kernel side of `glia::eval::Dispatch::reify_attenuation`:
 //! `(attenuate cap [:method ...])` on a capnp-backed cap wraps the underlying
-//! client hook in a `ww-membrane` allowlist keyed by `(interface_id, ordinal)`,
+//! client hook in a `wetware-membrane` allowlist keyed by `(interface_id, ordinal)`,
 //! so the attenuation is enforced at the capability hook itself and travels
 //! with the cap across process/vat boundaries (export, serve, dial). The
 //! evaluator-local string check in glia remains only for `defcap` caps, which
@@ -26,7 +26,7 @@ use std::rc::Rc;
 
 use capnp::capability::FromClientHook;
 use glia::{extract_method, make_cap, HandledCapInner, Val};
-use ww_membrane::{membrane_hook, Allowlist, DENIED_MARKER};
+use membrane::{membrane_hook, Allowlist, DENIED_MARKER};
 
 use crate::{
     extract_capnp_client, make_host_handler, make_routing_handler, make_runtime_handler,
@@ -222,7 +222,7 @@ pub fn reify(
 
     // Re-attenuation of one of our membraned caps intersects the name sets;
     // the hook-level wrap below folds into a single membrane layer via
-    // ww-membrane's allowlist collapse.
+    // wetware-membrane's allowlist collapse.
     let (client, effective_allow): (capnp::capability::Client, BTreeSet<String>) =
         if let Some(handled) = inner.downcast_ref::<HandledCapInner>() {
             match handled.export.downcast_ref::<MembranedCap>() {

@@ -1,24 +1,25 @@
 [package]
-name = "membrane"
+name = "wetware-membrane"
 version = "0.1.0"
 edition = "2021"
-description = "Epoch-scoped capability primitives over Cap'n Proto RPC"
 
-[build-dependencies]
-capnpc = { workspace = true }
-schema-id = { path = "../schema-id" }
+[lib]
+name = "membrane"
 
 [dependencies]
 capnp = { workspace = true }
-capnp-rpc = { workspace = true }
-ed25519-dalek = { workspace = true, features = ["rand_core"] }
-hex = { workspace = true }
-libp2p-core = { workspace = true }
-libp2p-identity = { version = "0.2", features = ["ed25519"] }
-rand = "0.8"
-auth = { path = "../guest/auth" }
-tokio = { workspace = true, features = ["sync"] }
-tracing = { workspace = true }
+futures = { workspace = true }
+
+[build-dependencies]
+capnpc = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+capnp-rpc = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "sync"] }
+tokio-util = { workspace = true, features = ["compat"] }
+
+[[bench]]
+name = "membrane"
+harness = false

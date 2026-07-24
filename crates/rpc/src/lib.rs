@@ -28,12 +28,12 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use membrane::EpochGuard;
+use authority::EpochGuard;
 
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use tokio::sync::oneshot;
 
-use membrane::system_capnp;
+use authority::system_capnp;
 
 /// Commands sent from vat cells to the swarm event loop.
 pub enum SwarmCommand {
@@ -91,7 +91,7 @@ pub fn stream_protocol(protocol: &str) -> Result<StreamProtocol, capnp::Error> {
 /// Re-canonicalize a `Schema.Node` reader into raw single-segment bytes.
 ///
 /// Mirrors `crates/schema-id::canonicalize_node` and the build-time
-/// emission path so the bytes match what `crates/membrane`'s
+/// emission path so the bytes match what `crates/authority`'s
 /// `schema_registry` exposes for core caps. Returns `None` if the message
 /// produces an unexpected (non-single) segment count, which would indicate
 /// a malformed input.
@@ -1299,11 +1299,11 @@ mod tests {
     // =========================================================================
 
     /// Helper: create an EpochGuard and its sender for test manipulation.
-    fn test_epoch_guard(seq: u64) -> (tokio::sync::watch::Sender<membrane::Epoch>, EpochGuard) {
-        let epoch = membrane::Epoch {
+    fn test_epoch_guard(seq: u64) -> (tokio::sync::watch::Sender<authority::Epoch>, EpochGuard) {
+        let epoch = authority::Epoch {
             seq,
             head: vec![],
-            provenance: membrane::Provenance::Block(0),
+            provenance: authority::Provenance::Block(0),
         };
         let (tx, rx) = tokio::sync::watch::channel(epoch);
         let guard = EpochGuard {
@@ -1397,10 +1397,10 @@ mod tests {
                     capnp_rpc::new_client(listener_impl);
 
                 // Advance epoch to make guard stale.
-                tx.send(membrane::Epoch {
+                tx.send(authority::Epoch {
                     seq: 2,
                     head: vec![],
-                    provenance: membrane::Provenance::Block(0),
+                    provenance: authority::Provenance::Block(0),
                 })
                 .unwrap();
 
@@ -1426,10 +1426,10 @@ mod tests {
                 let dialer: system_capnp::vat_client::Client = capnp_rpc::new_client(dialer_impl);
 
                 // Advance epoch to make guard stale.
-                tx.send(membrane::Epoch {
+                tx.send(authority::Epoch {
                     seq: 2,
                     head: vec![],
-                    provenance: membrane::Provenance::Block(0),
+                    provenance: authority::Provenance::Block(0),
                 })
                 .unwrap();
 

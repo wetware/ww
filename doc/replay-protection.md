@@ -31,7 +31,8 @@ varint(payload_len) payload
 
 Well-known domains:
 - `ww-terminal-membrane` — Terminal login guarding a Membrane capability.
-- `ww-membrane-graft` — Legacy direct graft signing (pre-Terminal).
+- `ww-membrane-graft` — Legacy direct graft signing (pre-Terminal). This wire
+  identifier remains stable across Rust crate renames.
 
 ## Layer 2: Epoch-bound challenge-response (Terminal login)
 

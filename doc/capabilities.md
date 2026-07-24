@@ -38,7 +38,7 @@ root, not by the preopen.
 
 There is exactly one enforcement mechanism for capability policy that
 must survive a boundary crossing: the hook-level membrane
-(`crates/ww-membrane`), which filters calls by `(interfaceId, ordinal)`
+(`crates/membrane`), which filters calls by `(interfaceId, ordinal)`
 on the capability reference itself and recursively wraps capabilities
 found in results and pipelines. Everything else is configuration —
 three surfaces that decide *which references exist where*:
@@ -169,7 +169,7 @@ resolution in this mode.
 You cannot un-hand a CID. This is classical ocap semantics — once a
 cell knows a CID, it can fetch the content. Revocation works two ways:
 
-- **Epoch advance.** `EpochGuard` (`crates/membrane/src/epoch.rs`)
+- **Epoch advance.** `EpochGuard` (`crates/authority/src/epoch.rs`)
   invalidates every RPC capability bound to the old epoch. Method
   calls fail with `staleEpoch`. The cell must re-graft.
 - **Kill and respawn under a different root Atom.** New cell, new root

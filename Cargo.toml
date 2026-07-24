@@ -6,9 +6,9 @@ members = [
     "crates/cache",
     "crates/cell",
     "crates/ipfs",
+    "crates/authority",
     "crates/membrane",
     "crates/rpc",
-    "crates/ww-membrane",
     "crates/schema-id",
     "crates/stem",
     "crates/guest/auth",
@@ -96,7 +96,7 @@ wasmtime = { workspace = true, features = ["call-hook"] }
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 libp2p-stream = { workspace = true }
-membrane = { path = "crates/membrane" }
+authority = { package = "wetware-authority", path = "crates/authority" }
 atom = { path = "crates/atom" }
 stem = { path = "crates/stem" }
 cache = { package = "ww-cache", path = "crates/cache" }

@@ -31,21 +31,21 @@ pub use rpc::keys;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod services;
 
-// Re-export capnp schema modules from the membrane crate so host code can
+// Re-export capnp schema modules from the authority crate so host code can
 // use `crate::system_capnp`, `crate::routing_capnp`, `crate::auth_capnp`, etc.
 #[cfg(not(target_arch = "wasm32"))]
-pub use membrane::auth_capnp;
+pub use authority::auth_capnp;
 #[cfg(not(target_arch = "wasm32"))]
-pub use membrane::http_capnp;
+pub use authority::http_capnp;
 #[cfg(not(target_arch = "wasm32"))]
-pub use membrane::membrane_capnp;
+pub use authority::membrane_capnp;
 #[cfg(not(target_arch = "wasm32"))]
-pub use membrane::routing_capnp;
+pub use authority::routing_capnp;
 #[cfg(not(target_arch = "wasm32"))]
-pub use membrane::stem_capnp;
+pub use authority::stem_capnp;
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_arch = "wasm32"))]
-pub use membrane::system_capnp;
+pub use authority::system_capnp;
 
 // Example schemas compiled by build.rs for integration tests.
 #[cfg(not(target_arch = "wasm32"))]

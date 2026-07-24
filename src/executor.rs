@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Context, Result};
+use authority::{Epoch, Provenance};
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
 use ed25519_dalek::SigningKey;
 use futures::FutureExt;
 use libp2p::StreamProtocol;
-use membrane::{Epoch, Provenance};
 use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -781,7 +781,8 @@ async fn accept_terminal_streams(
 }
 
 /// Serve a single libp2p stream behind a Terminal auth gate.  The remote peer
-/// bootstraps a `Terminal<membrane::Owned>` and must `login(signer)` to receive
+/// bootstraps a `Terminal<membrane_capnp::membrane::Owned>` and must
+/// `login(signer)` to receive
 /// the underlying membrane.
 async fn serve_one_terminal_stream(
     stream: libp2p::Stream,
@@ -789,8 +790,8 @@ async fn serve_one_terminal_stream(
     vk: ed25519_dalek::VerifyingKey,
     epoch_rx: watch::Receiver<Epoch>,
 ) {
+    use authority::TerminalServer;
     use futures::AsyncReadExt;
-    use membrane::TerminalServer;
 
     let terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
         vk,
