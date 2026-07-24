@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Bounded inbound RPC admission and Terminal login deadlines.** Inbound raw
+  Cap'n Proto, Terminal, vat, and stream serving paths now acquire an RAII
+  connection permit before spawning per-connection work, rejecting excess
+  streams once the configurable budget is full and releasing capacity on
+  completion or task cancellation. Each listener defaults to 64 concurrent
+  connections; the daemon's raw and Terminal listeners can be configured with
+  `WW_MAX_INBOUND_RPC_CONNECTIONS`, while embedded listeners can receive a
+  shared or service-specific `ConnectionBudget`. Terminal-gated connections
+  must complete one successful login within 10 seconds by default (configurable
+  via `WW_TERMINAL_LOGIN_TIMEOUT_SECS`); the connection deadline is distinct
+  from the authorization backend timeout and stops unauthenticated peers from
+  occupying a slot indefinitely.
 - **Composable call-validity guards.** The membrane now exposes `CallGuard`
   and `GuardedPolicy`, with stable machine-readable failure codes for method
   denial, targeted revocation, and stale epochs. `EpochGuard` implements the

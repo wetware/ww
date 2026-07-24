@@ -17,10 +17,11 @@ use capnp::Error;
 use capnp_rpc::pry;
 use ed25519_dalek::VerifyingKey;
 use libp2p_core::SignedEnvelope;
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 /// Default upper bound for authorization backend work during a login.
 pub const DEFAULT_POLICY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -250,6 +251,7 @@ pub struct TerminalServer<Session: capnp::traits::Owned> {
     domain: SigningDomain,
     epoch_rx: watch::Receiver<Epoch>,
     policy_timeout: Duration,
+    grant_notifier: RefCell<Option<oneshot::Sender<()>>>,
 }
 
 impl<Session> TerminalServer<Session>
@@ -306,7 +308,14 @@ where
             domain,
             epoch_rx,
             policy_timeout,
+            grant_notifier: RefCell::new(None),
         }
+    }
+
+    /// Notify a connection supervisor after the first successfully committed login.
+    pub fn with_grant_notifier(self, notifier: oneshot::Sender<()>) -> Self {
+        *self.grant_notifier.borrow_mut() = Some(notifier);
+        self
     }
 }
 
@@ -462,7 +471,11 @@ where
                 return Ok(());
             }
 
-            grant.commit(&mut results)
+            grant.commit(&mut results)?;
+            if let Some(notifier) = self.grant_notifier.borrow_mut().take() {
+                let _ = notifier.send(());
+            }
+            Ok(())
         })
     }
 }
@@ -640,6 +653,62 @@ mod tests {
                     auth_capnp::LoginStatus::Granted
                 );
                 result.get_session().expect("granted session");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn grant_notifier_fires_only_after_successful_commit() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let expected = SigningKey::generate(&mut rand::rngs::OsRng);
+                let wrong = SigningKey::generate(&mut rand::rngs::OsRng);
+                let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
+                let membrane = crate::membrane::membrane_client(epoch_rx.clone());
+                let (granted_tx, mut granted_rx) = oneshot::channel();
+                let terminal = TerminalServer::new(
+                    expected.verifying_key(),
+                    membrane,
+                    SigningDomain::terminal_membrane(),
+                    epoch_rx,
+                )
+                .with_grant_notifier(granted_tx);
+                let client: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+                    capnp_rpc::new_client(terminal);
+
+                let wrong_signer: auth_capnp::signer::Client =
+                    capnp_rpc::new_client(TestSigner::from_ed25519(&wrong));
+                let mut denied = client.login_request();
+                denied.get().set_signer(wrong_signer);
+                let denied = denied.send().promise.await.expect("typed denial");
+                assert_eq!(
+                    denied
+                        .get()
+                        .expect("login results")
+                        .get_status()
+                        .expect("known status"),
+                    auth_capnp::LoginStatus::Denied
+                );
+                assert!(matches!(
+                    granted_rx.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+
+                let expected_signer: auth_capnp::signer::Client =
+                    capnp_rpc::new_client(TestSigner::from_ed25519(&expected));
+                let mut granted = client.login_request();
+                granted.get().set_signer(expected_signer);
+                let granted = granted.send().promise.await.expect("granted login");
+                assert_eq!(
+                    granted
+                        .get()
+                        .expect("login results")
+                        .get_status()
+                        .expect("known status"),
+                    auth_capnp::LoginStatus::Granted
+                );
+                granted_rx.await.expect("grant notification");
             })
             .await;
     }

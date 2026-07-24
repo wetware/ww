@@ -4,6 +4,7 @@
 //! streams (no TCP listener). See [`build_peer_rpc`] for the entry point.
 #![cfg(not(target_arch = "wasm32"))]
 
+pub mod connection_budget;
 pub mod dispatch;
 pub mod graft;
 pub mod http_client;
@@ -15,6 +16,11 @@ pub mod stream_listener;
 pub mod vat_client;
 pub mod vat_dial;
 pub mod vat_listener;
+
+pub use connection_budget::{
+    ConnectionBudget, ConnectionLimitReached, ConnectionPermit, InvalidConnectionLimit,
+    DEFAULT_MAX_INBOUND_CONNECTIONS,
+};
 pub mod wagi;
 
 use std::sync::Arc;

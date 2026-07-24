@@ -6,7 +6,9 @@ use capnp_rpc::RpcSystem;
 use ed25519_dalek::SigningKey;
 use futures::FutureExt;
 use libp2p::StreamProtocol;
+use std::future::Future;
 use std::io::IsTerminal;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{stderr, stdout, AsyncWriteExt};
@@ -22,6 +24,14 @@ use rpc::graft::GuestMembrane;
 use rpc::NetworkState;
 
 const CAPNP_PROTOCOL: StreamProtocol = StreamProtocol::new("/ww/0.1.0");
+const DEFAULT_TERMINAL_LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalPreAuthOutcome {
+    Authenticated,
+    ConnectionClosed,
+    LoginTimedOut,
+}
 
 /// Builder for constructing a [`Cell`].
 ///
@@ -734,10 +744,27 @@ async fn accept_capnp_streams(mut control: libp2p_stream::Control, membrane: Gue
         }
     };
     tracing::info!(protocol = %CAPNP_PROTOCOL, "Accepting capnp streams");
+    let budget = inbound_connection_budget();
     use futures::StreamExt;
-    while let Some((_peer_id, stream)) = incoming.next().await {
+    while let Some((peer_id, stream)) = incoming.next().await {
+        let permit = match budget.try_acquire() {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(
+                    %peer_id,
+                    capacity = error.capacity,
+                    active = budget.active(),
+                    "rejecting raw Cap'n Proto connection: connection budget exhausted"
+                );
+                drop(stream);
+                continue;
+            }
+        };
         let m = membrane.clone();
-        tokio::task::spawn_local(serve_one_capnp_stream(stream, m));
+        tokio::task::spawn_local(async move {
+            let _permit = permit;
+            serve_one_capnp_stream(stream, m).await;
+        });
     }
 }
 
@@ -771,12 +798,29 @@ async fn accept_terminal_streams(
     };
     let vk = signing_key.verifying_key();
     tracing::info!(protocol = %CAPNP_PROTOCOL, "Accepting Terminal-gated streams");
+    let budget = inbound_connection_budget();
     use futures::StreamExt;
     while let Some((peer_id, stream)) = incoming.next().await {
         tracing::debug!(%peer_id, "Terminal stream accepted");
+        let permit = match budget.try_acquire() {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(
+                    %peer_id,
+                    capacity = error.capacity,
+                    active = budget.active(),
+                    "rejecting Terminal connection: connection budget exhausted"
+                );
+                drop(stream);
+                continue;
+            }
+        };
         let m = membrane.clone();
         let erx = epoch_rx.clone();
-        tokio::task::spawn_local(serve_one_terminal_stream(stream, m, vk, erx));
+        tokio::task::spawn_local(async move {
+            let _permit = permit;
+            serve_one_terminal_stream(stream, m, vk, erx).await;
+        });
     }
 }
 
@@ -793,24 +837,147 @@ async fn serve_one_terminal_stream(
     use authority::TerminalServer;
     use futures::AsyncReadExt;
 
+    let (granted_tx, granted_rx) = tokio::sync::oneshot::channel();
     let terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
         vk,
         membrane,
         auth::SigningDomain::terminal_membrane(),
         epoch_rx,
-    );
+    )
+    .with_grant_notifier(granted_tx);
     let terminal_client: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
         capnp_rpc::new_client(terminal);
 
     let (reader, writer) = Box::pin(stream).split();
     let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
     let rpc_system = RpcSystem::new(Box::new(network), Some(terminal_client.client));
-    let _ = rpc_system.await;
+    tokio::pin!(rpc_system);
+
+    let deadline = tokio::time::sleep(terminal_login_timeout());
+    match supervise_terminal_login(rpc_system.as_mut(), granted_rx, deadline).await {
+        TerminalPreAuthOutcome::Authenticated => {
+            let _ = rpc_system.await;
+        }
+        TerminalPreAuthOutcome::ConnectionClosed => {}
+        TerminalPreAuthOutcome::LoginTimedOut => {
+            tracing::warn!("closing Terminal connection: login deadline expired");
+        }
+    }
+}
+
+async fn supervise_terminal_login<Rpc, Deadline>(
+    mut rpc_system: Pin<&mut Rpc>,
+    granted_rx: tokio::sync::oneshot::Receiver<()>,
+    deadline: Deadline,
+) -> TerminalPreAuthOutcome
+where
+    Rpc: Future,
+    Deadline: Future<Output = ()>,
+{
+    tokio::pin!(deadline);
+    tokio::select! {
+        biased;
+        _ = &mut deadline => TerminalPreAuthOutcome::LoginTimedOut,
+        result = granted_rx => {
+            if result.is_ok() {
+                TerminalPreAuthOutcome::Authenticated
+            } else {
+                TerminalPreAuthOutcome::ConnectionClosed
+            }
+        }
+        _ = rpc_system.as_mut() => TerminalPreAuthOutcome::ConnectionClosed,
+    }
+}
+
+fn inbound_connection_budget() -> rpc::ConnectionBudget {
+    let configured = std::env::var("WW_MAX_INBOUND_RPC_CONNECTIONS").ok();
+    let capacity = parse_inbound_connection_limit(configured.as_deref());
+    rpc::ConnectionBudget::new(capacity).expect("validated non-zero connection limit")
+}
+
+fn terminal_login_timeout() -> Duration {
+    let configured = std::env::var("WW_TERMINAL_LOGIN_TIMEOUT_SECS").ok();
+    parse_terminal_login_timeout(configured.as_deref())
+}
+
+fn parse_inbound_connection_limit(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.parse::<usize>().ok())
+        .filter(|capacity| *capacity > 0)
+        .unwrap_or(rpc::DEFAULT_MAX_INBOUND_CONNECTIONS)
+}
+
+fn parse_terminal_login_timeout(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_TERMINAL_LOGIN_TIMEOUT)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inbound_connection_limit_defaults_and_accepts_configuration() {
+        assert_eq!(
+            parse_inbound_connection_limit(None),
+            rpc::DEFAULT_MAX_INBOUND_CONNECTIONS
+        );
+        assert_eq!(parse_inbound_connection_limit(Some("7")), 7);
+        assert_eq!(
+            parse_inbound_connection_limit(Some("0")),
+            rpc::DEFAULT_MAX_INBOUND_CONNECTIONS
+        );
+        assert_eq!(
+            parse_inbound_connection_limit(Some("invalid")),
+            rpc::DEFAULT_MAX_INBOUND_CONNECTIONS
+        );
+    }
+
+    #[test]
+    fn terminal_login_timeout_defaults_and_accepts_configuration() {
+        assert_eq!(
+            parse_terminal_login_timeout(None),
+            DEFAULT_TERMINAL_LOGIN_TIMEOUT
+        );
+        assert_eq!(
+            parse_terminal_login_timeout(Some("3")),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            parse_terminal_login_timeout(Some("0")),
+            DEFAULT_TERMINAL_LOGIN_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_login_supervision_is_deterministic() {
+        let (granted_tx, granted_rx) = tokio::sync::oneshot::channel();
+        let rpc = std::future::pending::<()>();
+        tokio::pin!(rpc);
+        assert_eq!(
+            supervise_terminal_login(rpc.as_mut(), granted_rx, std::future::ready(())).await,
+            TerminalPreAuthOutcome::LoginTimedOut
+        );
+        drop(granted_tx);
+
+        let (granted_tx, granted_rx) = tokio::sync::oneshot::channel();
+        granted_tx.send(()).unwrap();
+        let rpc = std::future::pending::<()>();
+        tokio::pin!(rpc);
+        assert_eq!(
+            supervise_terminal_login(rpc.as_mut(), granted_rx, std::future::pending()).await,
+            TerminalPreAuthOutcome::Authenticated
+        );
+
+        let (_granted_tx, granted_rx) = tokio::sync::oneshot::channel();
+        let rpc = std::future::ready(());
+        tokio::pin!(rpc);
+        assert_eq!(
+            supervise_terminal_login(rpc.as_mut(), granted_rx, std::future::pending()).await,
+            TerminalPreAuthOutcome::ConnectionClosed
+        );
+    }
 
     /// T1 (Item 1b cleanup, regression test): `Cell::spawn_with_streams`
     /// must reject construction without a CidTree. The pre-#416 host-

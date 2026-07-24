@@ -17,11 +17,13 @@ use capnp_rpc::RpcSystem;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use futures::StreamExt;
 
+use crate::ConnectionBudget;
 use authority::system_capnp;
 
 pub struct VatListenerImpl {
     stream_control: libp2p_stream::Control,
     guard: EpochGuard,
+    budget: ConnectionBudget,
 }
 
 impl VatListenerImpl {
@@ -29,7 +31,13 @@ impl VatListenerImpl {
         Self {
             stream_control,
             guard,
+            budget: ConnectionBudget::default(),
         }
+    }
+
+    pub fn with_budget(mut self, budget: ConnectionBudget) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
@@ -68,6 +76,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
 
         let mut epoch_rx = self.guard.receiver.clone();
         let issued_seq = self.guard.issued_seq;
+        let budget = self.budget.clone();
         tokio::task::spawn_local(async move {
             loop {
                 tokio::select! {
@@ -83,9 +92,22 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                             service = %protocol_name,
                         ).entered();
                         tracing::debug!("incoming vat connection");
+                        let permit = match budget.try_acquire() {
+                            Ok(permit) => permit,
+                            Err(error) => {
+                                tracing::warn!(
+                                    capacity = error.capacity,
+                                    active = budget.active(),
+                                    "rejecting vat connection: service connection budget exhausted"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         let cap = bootstrap_cap.clone();
                         let protocol = protocol_name.clone();
                         tokio::task::spawn_local(async move {
+                            let _permit = permit;
                             let _handle_span = tracing::info_span!(
                                 "vat.handle",
                                 service = protocol.as_str(),
