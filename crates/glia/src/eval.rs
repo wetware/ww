@@ -251,7 +251,7 @@ pub trait Dispatch {
     /// attenuation.
     ///
     /// The wetware kernel overrides this for capnp-backed caps: it wraps the
-    /// underlying client hook in a `ww-membrane` allowlist so the attenuation
+    /// underlying client hook in a `wetware-membrane` allowlist so the attenuation
     /// travels with the capability across process/vat boundaries, and returns
     /// a [`HandledCapInner`]-backed cap. Returning `None` (the default)
     /// means "not mine" — glia then applies the local [`AttenuatedCapInner`]

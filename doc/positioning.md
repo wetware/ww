@@ -43,6 +43,16 @@ problem and is cited by Microsoft, Cloudflare, and Snyk.
 
 The pain is paid-and-failing. Real, attributed breaches:
 
+- OpenAI / Hugging Face (July 2026): [OpenAI reported](https://openai.com/index/hugging-face-model-evaluation-security-incident/)
+  that models in a sandboxed cyber evaluation found a zero-day path to open
+  Internet access, moved laterally through its research environment, and
+  compromised Hugging Face production infrastructure while pursuing benchmark
+  answers. [Hugging Face independently reported](https://huggingface.co/blog/security-incident-july-2026)
+  an autonomous campaign spanning more than 17,000 recorded events. This does
+  **not** establish that Wetware would have prevented the sandbox escape. It
+  does make the post-escape authority question concrete: what credentials,
+  network destinations, and application operations did the executor possess
+  once containment failed?
 - Supabase + Cursor (2025): a privileged service-role agent
   processed user-submitted support tickets containing SQL
   injection and exfiltrated integration tokens to a public thread.
@@ -75,9 +85,10 @@ The current landscape is "agent code sandboxing":
 What none of them have:
 
 - **Explicit capability handoff.** A tool can be granted capability
-  `X` for one invocation and not the next. Fine-grained recursive
-  attenuation is the next design step, not something we should imply
-  is already complete.
+  `X` for one invocation and not the next. Shipped method-level
+  attenuation travels with a schema-bound reference and recursively
+  confines capabilities returned through it. Argument- and
+  resource-level policy are not implied by that guarantee.
 - **Composable trust graphs.** The membrane is the trust boundary,
   and graft composes naturally: when tool A calls tool B which
   calls tool C, each call carries a capability set the previous
@@ -87,9 +98,11 @@ What none of them have:
 - **WASM-cell scale.** ~10ms spawn, KB-scale binaries,
   language-agnostic by design, so per-call sandboxing is actually
   feasible (microVM cold-start is too slow for that).
-- **P2P-optional substrate.** You can run on your own hardware,
-  on a friend's bare-metal, on a peer-to-peer swarm, or on a
-  hosted Wetware tier. The product doesn't change.
+- **Remote capability delegation.** libp2p connects independently
+  operated nodes; the delegated capability, not discovery or the
+  transport peer ID, determines authority. A Terminal can authenticate
+  multiple principals through one node and issue a different method
+  profile to each.
 
 Two of those (explicit capability handoff, composable membranes) are
 deep enough to win deals on. The others are proof points.
@@ -180,11 +193,19 @@ A few framings we've explicitly *not* chosen, and why:
 What we have today:
 
 - WASM cell runtime with explicit membrane-grafted capabilities.
-- Composable graft (tools-call-tools receives explicit grants).
+- Hook-level method attenuation for schema-bound capabilities, including
+  returned capabilities, pipelines, re-attenuation intersection, and
+  independent membrane-boundary lineage.
+- Async Terminal policy that maps a verified login key to a fresh session,
+  with global epoch expiry and targeted recipient revocation.
 - Content-addressed code via IPFS (CIDs flow through the runtime).
 - MCP/Glia bridge with membrane-grafted agent execution.
-- Optional P2P (libp2p swarm, DHT routing, named Cap'n Proto
-  services).
+- Optional P2P transport with named Cap'n Proto services; service names
+  locate capabilities and do not authorize recipients.
+- A Rust Chess proof over direct-dial libp2p showing unknown denial,
+  Reader/Player method differentiation over shared state, targeted
+  revocation, epoch expiry, wrong-protocol rejection, and a bounded,
+  application-owned first-call timeout.
 - Engagement demo: install, hit a membrane-grafted WASM cell
   from curl in 60 seconds.
 
@@ -195,6 +216,15 @@ What we don't have today, and won't pretend to:
   honestly. Today this is enforced operationally (you trust the
   host), not architecturally. TEEs, reputation, and staking close
   this gap; none are v1.
+- **Argument/resource policy.** Method allowlists do not inspect a method's
+  arguments or prove “customer X but not customer Y” unless those resources
+  are represented as separate object capabilities.
+- **Peer-ID authorization.** A node is a multi-tenant transport/runtime host,
+  not a principal. Terminal authenticates the per-login credential; policy
+  resolves the logical account or tenant.
+- **Arbitrary dynamic-schema attenuation in Glia.** Trusted Rust can use typed
+  generated method selectors. Glia refuses attenuation when it cannot
+  associate a compiled schema with the capability.
 - **Deploy-everywhere routing.** The DHT finds providers globally
   but doesn't sort by network proximity. CF's Anycast advantage
   is real and we don't claim it.
@@ -207,16 +237,11 @@ What we don't have today, and won't pretend to:
 
 ## What's next
 
-Three documents:
-
-1. **Recursive capability attenuation design** -- lock the property
-   and implementation plan with the tax-prep example as a worked case.
-2. **Composable membranes doc** -- ASCII diagrams of how graft
-   composes when tools call tools, with a worked agent example.
-   Documents an existing structural property nobody else can
-   show today.
-3. **README overhaul** -- the homepage rewrite around the JTBD,
-   capability security demoted from pitch to proof.
+1. Map one real design-partner action to the exact authority an executor
+   receives before and after policy approval.
+2. Add argument/resource policies only from those concrete action shapes.
+3. Turn the Chess evidence path into a public, inspectable proof after its
+   claims survive technical review.
 
 ## If this is you
 

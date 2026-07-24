@@ -1,0 +1,28 @@
+[package]
+name = "wetware-authority"
+version = "0.1.0"
+edition = "2021"
+description = "Epoch-scoped capability primitives over Cap'n Proto RPC"
+
+[lib]
+name = "authority"
+
+[build-dependencies]
+capnpc = { workspace = true }
+schema-id = { path = "../schema-id" }
+
+[dependencies]
+capnp = { workspace = true }
+capnp-rpc = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+hex = { workspace = true }
+libp2p-core = { workspace = true }
+libp2p-identity = { version = "0.2", features = ["ed25519"] }
+rand = "0.8"
+auth = { path = "../guest/auth" }
+call-guard = { package = "wetware-membrane", path = "../membrane" }
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

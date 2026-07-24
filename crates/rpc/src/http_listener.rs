@@ -14,14 +14,14 @@
 //! handler sends requests through an mpsc channel, and a local task on the
 //! RPC event loop spawns cells and sends responses back.
 
+use authority::EpochGuard;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
-use membrane::EpochGuard;
 use std::{fmt, time::Duration};
 use tokio::sync::mpsc;
 
 use crate::dispatch::{self, CgiRequest, CgiResponse, RouteRegistry};
-use membrane::system_capnp;
+use authority::system_capnp;
 
 /// Maximum response size from a cell process (16 MiB).
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -326,16 +326,16 @@ mod tests {
 
     /// Build an EpochGuard at seq=1 paired with its sender.
     fn test_epoch_guard() -> (
-        tokio::sync::watch::Sender<membrane::Epoch>,
-        membrane::EpochGuard,
+        tokio::sync::watch::Sender<authority::Epoch>,
+        authority::EpochGuard,
     ) {
-        let epoch = membrane::Epoch {
+        let epoch = authority::Epoch {
             seq: 1,
             head: vec![],
-            provenance: membrane::Provenance::Block(0),
+            provenance: authority::Provenance::Block(0),
         };
         let (tx, rx) = tokio::sync::watch::channel(epoch);
-        let guard = membrane::EpochGuard {
+        let guard = authority::EpochGuard {
             issued_seq: 1,
             receiver: rx,
         };
@@ -699,10 +699,10 @@ mod tests {
                     capnp_rpc::new_client(listener_impl);
 
                 // Advance the epoch past the issued seq.
-                tx.send(membrane::Epoch {
+                tx.send(authority::Epoch {
                     seq: 2,
                     head: vec![],
-                    provenance: membrane::Provenance::Block(0),
+                    provenance: authority::Provenance::Block(0),
                 })
                 .expect("epoch broadcast");
 

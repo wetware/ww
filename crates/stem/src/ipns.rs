@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use membrane::{Epoch, Provenance};
+use authority::{Epoch, Provenance};
 use tokio::sync::watch;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;

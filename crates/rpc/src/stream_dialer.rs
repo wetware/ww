@@ -5,16 +5,16 @@
 //! `ByteStream` capability — the guest reads/writes whatever wire protocol it
 //! wants directly.
 
+use authority::EpochGuard;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use futures::io::AsyncReadExt;
 use libp2p::PeerId;
-use membrane::EpochGuard;
 use std::time::Duration;
 use tokio::io;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
-use membrane::system_capnp;
+use authority::system_capnp;
 
 use super::{ByteStreamImpl, StreamMode};
 

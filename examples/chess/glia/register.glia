@@ -1,7 +1,8 @@
-; Demo snippet: register ChessEngine vat handler.
+; Explicitly ungated compatibility demo. The authority proof uses
+; VatListener.serveAuthenticated and one Terminal per libp2p stream.
 (def chess-wasm (perform :load "bin/chess-demo.wasm"))
 (def chess-executor (perform runtime :load chess-wasm))
 (def chess-process (perform chess-executor :spawn))
 (def chess-cap (perform chess-process :bootstrap))
 
-(perform host :serve-vat chess-cap "chess")
+(perform host :serve-raw-vat chess-cap "chess")

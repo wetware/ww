@@ -5,11 +5,12 @@ Two-node cross-network chess over libp2p RPC capabilities.
 ## What it demonstrates
 
 - **Cap'n Proto cell** (`WW_CELL_MODE=vat`) -- named vat RPC
-- `VatListener.serve` for persistent capability export
+- `VatListener.serveAuthenticated` for per-stream Terminal-gated export
 - `VatClient` for typed RPC dialing
 - Service-name DHT discovery via `routing.provide()` / `findProviders()`
-- IPFS replay log publishing
 - Dual-mode binary: cell mode (RPC server) + service mode (discovery loop)
+- A Rust-native authority proof in which one authenticated Reader and Player
+  receive different method authority over the same remote game
 
 ## Prerequisites
 
@@ -31,6 +32,36 @@ make chess
 This compiles the WASM guest and generates build-time schema-byte and CID
 metadata for introspection.
 Vat publication uses the service name `chess`.
+
+## Authority proof
+
+The reproducible security artifact uses two real Wetware libp2p hosts and
+publishes through the production `VatListener.serveAuthenticated` path:
+
+```sh
+cargo test -p chess direct_libp2p_terminal_enforces_chess_authority
+```
+
+It proves:
+
+- an unknown signing key receives no session;
+- an idle unauthenticated stream is closed at the login deadline and releases
+  its connection-budget permit;
+- each stream receives a single-use Terminal and cannot switch principals
+  after admission;
+- a Reader may call `getState` but is denied `applyMove`;
+- a Player may call both methods, and the Reader observes the same changed
+  game state;
+- revoking the Reader invalidates its existing session without affecting the
+  Player;
+- advancing the epoch invalidates the Player's existing session;
+- an unregistered libp2p protocol is rejected; and
+- a peer that accepts a stream but never answers the first method is stopped
+  by a named, application-owned deadline.
+
+The node is deliberately not treated as a principal. Multiple login keys can
+flow through one libp2p peer and receive independent authority. This is a
+method-level proof; it does not claim per-argument or per-resource filtering.
 
 ## Running
 
@@ -107,16 +138,19 @@ explicitly from `glia/register.glia`.
 ```
              ww shell loads glia/register.glia
                            |
-               (perform host :serve-vat ...)
+       explicit legacy compatibility path
+           (perform host :serve-raw-vat ...)
                            |
-                  persistent ChessEngine cap
+                    bare ChessEngine
 ```
 
 Two execution modes, selected by runtime inputs:
 
 - **Cell mode** (no args): spawned by Glia before publication.
   Creates a `ChessEngineImpl` and exports it via `system::serve()`.
-  `host :serve-vat` publishes that exported capability under `chess`.
+  The guest exports a bare capability. Trusted publication configuration may
+  publish it with `host :serve-vat ... :auth policy`. The manual random-game
+  compatibility flow below deliberately uses `host :serve-raw-vat`.
 - **Service mode** (default): long-running discovery loop. Provides
   the service-name routing key on the DHT, discovers peers via
   `routing.find_providers()`, dials them with `VatClient` to get
@@ -128,7 +162,8 @@ Two execution modes, selected by runtime inputs:
 The vat protocol is the normal service name `chess`. The DHT key is
 `routing.hash("chess")`, so the Routing API still receives a CID-shaped
 key without making schema identity the locator. Schema bytes are
-compiled at build time for tooling/introspection.
+compiled at build time for tooling/introspection. Neither the service name nor
+the libp2p peer ID authorizes a recipient.
 
 ### Schema
 
@@ -158,7 +193,7 @@ interface ChessEngine {
 (def chess-process (perform chess-executor :spawn))
 (def chess-cap (perform chess-process :bootstrap))
 
-(perform host :serve-vat chess-cap "chess")
+(perform host :serve-raw-vat chess-cap "chess")
 ```
 
 `glia/serve.glia`:
@@ -175,7 +210,14 @@ default demo flow.
 
 ```sh
 cargo test -p chess --lib
+cargo test -p chess direct_libp2p_terminal_enforces_chess_authority
 ```
+
+The manual `glia/register.glia` random-game flow explicitly publishes the bare
+Chess capability with `serve-raw-vat` for compatibility. It is not the
+authority proof and must not be described as recipient-gated. The security
+artifact above supplies deployer recipient keys and exercises the production
+authenticated listener path.
 
 ## See also
 

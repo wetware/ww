@@ -8,7 +8,7 @@ description = "Epoch source abstraction: atomic (on-chain) and eventual (IPNS) b
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 atom = { path = "../atom" }
-membrane = { path = "../membrane" }
+authority = { package = "wetware-authority", path = "../authority" }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }

@@ -5,17 +5,19 @@
 //! process (via the guest-provided `Executor`) with stdin/stdout wired to the
 //! stream — the cell speaks whatever wire protocol it wants over stdio.
 
+use authority::EpochGuard;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::StreamExt;
-use membrane::EpochGuard;
 
-use membrane::system_capnp;
+use crate::{inbound_connection_budget, ConnectionBudget};
+use authority::system_capnp;
 
 pub struct StreamListenerImpl {
     stream_control: libp2p_stream::Control,
     guard: EpochGuard,
+    budget: ConnectionBudget,
 }
 
 impl StreamListenerImpl {
@@ -23,7 +25,13 @@ impl StreamListenerImpl {
         Self {
             stream_control,
             guard,
+            budget: inbound_connection_budget(),
         }
+    }
+
+    pub fn with_budget(mut self, budget: ConnectionBudget) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
@@ -77,6 +85,7 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
         // Watches the epoch guard so we stop accepting when capabilities are revoked.
         let mut epoch_rx = self.guard.receiver.clone();
         let issued_seq = self.guard.issued_seq;
+        let budget = self.budget.clone();
         tokio::task::spawn_local(async move {
             loop {
                 tokio::select! {
@@ -91,10 +100,23 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
                             protocol = %stream_protocol,
                         ).entered();
                         tracing::debug!("Incoming stream connection");
+                        let permit = match budget.try_acquire() {
+                            Ok(permit) => permit,
+                            Err(error) => {
+                                tracing::warn!(
+                                    capacity = error.capacity,
+                                    active = budget.active(),
+                                    "rejecting stream connection: service connection budget exhausted"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         let executor = executor.clone();
                         let protocol = protocol_suffix.clone();
                         let caps = extra_caps.clone();
                         tokio::task::spawn_local(async move {
+                            let _permit = permit;
                             let _handle_span = tracing::info_span!(
                                 "stream.handle",
                                 protocol = protocol.as_str(),

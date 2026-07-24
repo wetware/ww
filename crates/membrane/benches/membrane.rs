@@ -24,10 +24,11 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use tokio::runtime::Builder;
 use tokio::task::LocalSet;
 
-use ww_membrane::{membrane, Allowlist, Policy};
+use membrane::{membrane, Allowlist, Policy};
 
 // Must be named `test_thing_capnp`: the generated code refers to its own
 // siblings via `crate::test_thing_capnp::...`.
+#[allow(dead_code)]
 mod test_thing_capnp {
     include!(concat!(env!("OUT_DIR"), "/test_thing_capnp.rs"));
 }

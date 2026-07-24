@@ -55,13 +55,13 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
             let peer_id_bytes = synth_peer_id_bytes();
             network_state.set_local_peer_id(peer_id_bytes.clone()).await;
 
-            let epoch = membrane::Epoch {
+            let epoch = authority::Epoch {
                 seq: 1,
                 head: vec![],
-                provenance: membrane::Provenance::Block(0),
+                provenance: authority::Provenance::Block(0),
             };
             let (_epoch_tx, epoch_rx) = watch::channel(epoch);
-            let guard = membrane::EpochGuard {
+            let guard = authority::EpochGuard {
                 issued_seq: 1,
                 receiver: epoch_rx.clone(),
             };

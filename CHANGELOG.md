@@ -7,15 +7,76 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Real libp2p Chess authority evidence.** A synchronized direct-dial test
+  now runs two Wetware hosts through the production authenticated VatListener
+  path and proves pre-auth deadline enforcement, connection-budget release,
+  unknown-login denial, one successful principal per stream, Reader/Player
+  method differentiation over one shared ChessEngine, epoch expiry,
+  wrong-protocol rejection, and an application-owned timeout for a
+  non-responsive first method call. The complementary in-process proof covers
+  targeted revocation without an epoch advance.
+- **Authenticated VAT publication by default.** Trusted FHS configuration now
+  calls `host :serve-vat cap "service" :auth policy`; VatListener compiles the
+  policy once and constructs a fresh single-use Terminal for every inbound
+  libp2p stream. Each stream has an independent challenge, login deadline,
+  authenticated principal, and issued session. Service names and transport
+  peer IDs do not authorize recipients. Bare publication remains available
+  only through the explicit `host :serve-raw-vat` escape hatch.
+- **Explicit deployer-controlled Terminal construction.** Epoch-scoped kernel
+  sessions retain the lower-level `authority :guard` constructor for callers
+  that need a Terminal as a first-class capability. The host validates named
+  method profiles, 32-byte signing keys, duplicate recipients, and profile
+  references, then constructs a fresh method/epoch/revocation-guarded membrane
+  per successful login.
+  Service names and libp2p peer IDs are absent from the policy API. The wire
+  policy accepts compiled method coordinates for trusted FHS configuration;
+  Rust configuration should prefer typed `MethodProfile::allow_method`
+  selectors, which remain a configuration-safety aid rather than a boundary
+  against malicious deployer code.
+- **Rust-native Chess identity-to-authority proof policy.** The Chess example
+  now exposes a host-side `ChessAuthorization` policy mapping verified Terminal
+  signing keys to typed Reader or Player method profiles. Every successful
+  login creates a new membrane boundary over the same underlying game, guarded
+  by both the current runtime epoch and a key-scoped targeted-revocation handle.
+  The in-process two-party RPC proof shows an unknown key receives no session,
+  Reader can observe but not move, Player can move, Reader observes Player's
+  shared state change, targeted Reader revocation leaves Player operational,
+  and an epoch advance expires an established Player session. Proof calls have
+  explicit application-owned deadlines.
+- **Bounded inbound RPC admission and Terminal login deadlines.** Inbound raw
+  Cap'n Proto, Terminal, vat, and stream serving paths now acquire an RAII
+  connection permit before spawning per-connection work, rejecting excess
+  streams once the configurable budget is full and releasing capacity on
+  completion or task cancellation. Each listener defaults to 64 concurrent
+  connections. Daemon, named VAT, and stream listeners read
+  `WW_MAX_INBOUND_RPC_CONNECTIONS`; embedded listeners may instead receive a
+  shared or service-specific `ConnectionBudget`. Terminal-gated connections
+  must complete one successful login within 10 seconds by default (configurable
+  via `WW_TERMINAL_LOGIN_TIMEOUT_SECS`); the connection deadline is distinct
+  from the authorization backend timeout and stops unauthenticated peers from
+  occupying a slot indefinitely.
+- **Composable call-validity guards.** The membrane now exposes `CallGuard`
+  and `GuardedPolicy`, with stable machine-readable failure codes for method
+  denial, targeted revocation, and stale epochs. `EpochGuard` implements the
+  shared contract, while `RevocablePolicy` is retained as a convenience layer
+  over the new `RevocationGuard`; targeted revocation no longer needs a global
+  Atom epoch advance.
+- **Typed Rust method profiles for capability attenuation.**
+  `membrane::MethodProfile::<Client>::allow_method(Client::method_request)`
+  records the interface ID and ordinal emitted by generated Cap'n Proto request
+  constructors, eliminating hand-written ordinals from trusted Rust
+  configuration. Selectors must construct exactly one request and fail closed
+  otherwise. This is a configuration-safety feature, not a security boundary
+  against malicious profile-building code.
 - **Runtime health, readiness, and provenance contract.** The localhost admin
   plane now starts before Kubo-backed mount resolution and exposes
   `GET /readyz` plus `GET /version` (source revision, optional OCI runtime
   digest, embedded kernel/shell BLAKE3 hashes, cache/degraded state).
   `ww healthcheck` provides distroless-safe liveness, readiness, and revision
-  checks. Serving/admin ports are pre-bound during startup, and unexpected
-  supervised-service exits now fail the process instead of remaining silent.
-  `scripts/deploy_verify.sh` checks both Kubernetes `pod.status.imageID` and
-  the binary's source revision after a manual promotion.
+   checks. Serving/admin ports are pre-bound during startup, and unexpected
+   supervised-service exits now fail the process instead of remaining silent.
+   `scripts/deploy_verify.sh` checks both Kubernetes `pod.status.imageID` and
+   the binary's source revision after a manual promotion.
 - **Local admin health endpoint.** `ww run` now starts its localhost-only
   admin endpoint on `127.0.0.1:2026` by default, including `GET /healthz` for
   future distroless exec probes. Override the bind address with
@@ -23,11 +84,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Wasmtime-managed persistent compilation cache (reliability slice 1 correction).** `ww` now delegates component-cache format, compatibility, and cleanup to Wasmtime. `WW_CWASM_DIR` selects an optional host-local cache directory and `WW_CWASM_CACHE_MAX_BYTES` sets its soft cleanup threshold (default 320 MiB). The process shares one cache policy across all canonical engines; invalid or unwritable cache configuration logs a warning and compiles uncached instead of blocking boot. Removed `ww compile`, custom `.cwasm` serialization/deserialization, and CI-produced native artifacts from the image. The local metrics endpoint reports cache state, successful loads and stores, and component compilation counts.
 - **Effect tracing + capability test harness (roadmap G3/G4).** `GLIA_TRACE_EFFECTS=1` traces the perform lifecycle to stderr (dispatch target + stack depth + match, resume values, and a handler-stack dump on unhandled effects) for debugging effect routing. `ww/test` gains a capability harness: `stub-handler` (canned replies scoped via `with-effect-handler`, unstubbed methods fail closed) and `recorder` (records `(:method args...)` payloads into an atom, then delegates — replay-style record/verify testing).
 - **`ww/policy` stdlib module: interposition handler patterns (P1).** New Glia module with policy-pattern effect handlers — `audit` (log + delegate), `mock` (canned replies, unstubbed methods fail closed), `budget` (at most n delegated calls, then structured denial), and `attenuate-handler` (sugar over `(attenuate ...)`, the explicit bridge from local interposition to membrane-enforced boundary authority). Enabled by two new glia primitives: `(perform* target payload)` — apply-style perform so a generic handler can delegate its `(:method args...)` payload without knowing the arity — and Clojure-style atoms (`atom`/`deref`/`reset!`), identity-compared evaluator-local mutable cells (a pinned-semantics test documents that `def` inside a closure cannot provide cross-invocation state). `retry` (delegate, re-attempt on throw up to n times) ships too, enabled by the closure macro-capture fix — the "try inside a handler yields nil" failure that originally blocked it.
-- **`ww-membrane` crate: hook-level capability attenuation.** New workspace crate implementing a schema-agnostic capability membrane on `capnp`'s `ClientHook`: calls are filtered by `(interfaceId, ordinal)` at the hook level (unbypassable by casting — typed clients, casts, and promise pipelines all bottom out in the same wrapped hook), and capabilities in results, promise pipelines, and promise resolution are recursively re-wrapped. `Policy` is a trait with three reference implementations — `Allowlist` (stateless allow/deny), `RevocablePolicy` (revoke switch), and `RateLimit` (fixed-window counter; rate-limit-as-capability) — so one enforcement mechanism serves multiple attenuation strategies. Denials carry a stable marker plus the denied method key for structured error routing. Not yet wired into the public ABI; the Export cutover lands separately.
-- **`(attenuate ...)` on capnp-backed caps now reifies into a hook-level membrane.** Glia's `Dispatch` trait gains a `reify_attenuation` hook and a `HandledCapInner` cap representation (a cap that carries its own dispatch handler plus an opaque export payload). The kernel implements the hook: method keywords are resolved against the cap's compiled canonical schema (kebab-case → camelCase; ordinal = position in the interface's method list; unknown names fail closed at attenuation time), and the underlying client hook is wrapped in a `ww-membrane` allowlist keyed by `(interfaceId, ordinal)`. The attenuation is therefore enforced at the capability itself and travels with it across boundaries: `extract_capnp_client` returns the membraned client, so `:listen` caps forwarding and `host :serve-vat` publish the restricted cap, and typed-client casting on the receiving side stays filtered. Local `perform` routes through the kernel's typed handler rebuilt over the membraned client, gated by the same allowlist, producing structured `:glia.error/permission-denied` (with interface id + method@ordinal keys) both locally and for membrane denials. Re-attenuation intersects allowlists and collapses to a single membrane layer. Caps without a compiled schema (e.g. dialed generic caps) fail closed pending the deferred schema-association design; pure-Glia `defcap` caps keep the evaluator-local attenuation path (they cannot cross a boundary, so that path is interposition within one trust domain, not a second enforcement mechanism).
-- **`ww-membrane`: production membrane recursion (identity, flush, reentry, collapse, bench).** The membrane now preserves capability identity across round-trips and folds stacked attenuations. A data-segment sentinel `get_brand` plus a `get_ptr`-keyed registry lets it recognise its own membranes without `Any` (and without colliding with capnp-rpc connection brands, so caps can't tunnel through the filter). A call parameter that is one of our own membranes is unwrapped to the bare backing cap before reaching the backend, restoring the identity the backend exported (foreign params pass through). Results-copy failures mid-answer now surface as the call's error via an explicit flush outcome instead of a silent empty result. Attenuating an already-membraned cap collapses to a single layer when both policies are static allowlists (intersection of key sets via the new `Policy::allowlist_keys`); stateful policies stack so their per-call state survives. Adds `benches/membrane.rs`: per-call overhead is sub-microsecond and constant per hop (ping +~357 ns, cap-returning child +~437 ns), so upstream capnp cap-table work stays deferred.
+- **`wetware-membrane` crate: hook-level capability attenuation.** New workspace crate implementing a schema-agnostic capability membrane on `capnp`'s `ClientHook`: calls are filtered by `(interfaceId, ordinal)` at the hook level (unbypassable by casting — typed clients, casts, and promise pipelines all bottom out in the same wrapped hook), and capabilities in results, promise pipelines, and promise resolution are recursively re-wrapped. `Policy` is a trait with three reference implementations — `Allowlist` (stateless allow/deny), `RevocablePolicy` (revoke switch), and `RateLimit` (fixed-window counter; rate-limit-as-capability) — so one enforcement mechanism serves multiple attenuation strategies. Denials carry a stable marker plus the denied method key for structured error routing. Not yet wired into the public ABI; the Export cutover lands separately.
+- **`(attenuate ...)` on capnp-backed caps now reifies into a hook-level membrane.** Glia's `Dispatch` trait gains a `reify_attenuation` hook and a `HandledCapInner` cap representation (a cap that carries its own dispatch handler plus an opaque export payload). The kernel implements the hook: method keywords are resolved against the cap's compiled canonical schema (kebab-case → camelCase; ordinal = position in the interface's method list; unknown names fail closed at attenuation time), and the underlying client hook is wrapped in a `wetware-membrane` allowlist keyed by `(interfaceId, ordinal)`. The attenuation is therefore enforced at the capability itself and travels with it across boundaries: `extract_capnp_client` returns the membraned client, so `:listen` caps forwarding and `host :serve-vat` publish the restricted cap, and typed-client casting on the receiving side stays filtered. Local `perform` routes through the kernel's typed handler rebuilt over the membraned client, gated by the same allowlist, producing structured `:glia.error/permission-denied` (with interface id + method@ordinal keys) both locally and for membrane denials. Re-attenuation intersects allowlists and collapses to a single membrane layer. Caps without a compiled schema (e.g. dialed generic caps) fail closed pending the deferred schema-association design; pure-Glia `defcap` caps keep the evaluator-local attenuation path (they cannot cross a boundary, so that path is interposition within one trust domain, not a second enforcement mechanism).
+- **`wetware-membrane`: production membrane recursion (identity, flush, reentry, collapse, bench).** The membrane now preserves capability identity across round-trips and folds stacked attenuations. A data-segment sentinel `get_brand` plus a `get_ptr`-keyed registry lets it recognise its own membranes without `Any` (and without colliding with capnp-rpc connection brands, so caps can't tunnel through the filter). A call parameter that is one of our own membranes is unwrapped to the bare backing cap before reaching the backend, restoring the identity the backend exported (foreign params pass through). Results-copy failures mid-answer now surface as the call's error via an explicit flush outcome instead of a silent empty result. Attenuating an already-membraned cap collapses to a single layer when both policies are static allowlists (intersection of key sets via the new `Policy::allowlist_keys`); stateful policies stack so their per-call state survives. Adds `benches/membrane.rs`: per-call overhead is sub-microsecond and constant per hop (ping +~357 ns, cap-returning child +~437 ns), so upstream capnp cap-table work stays deferred.
+
+### Fixed
+- **Direct-address swarm connections.** `SwarmCommand::Connect` now passes its
+  explicit address list to libp2p `DialOpts`; dialing only by peer ID discarded
+  that caller-supplied route and failed with `no addresses for peer`.
 
 ### Changed
+- **Membrane reentry is scoped to an explicit boundary lineage.** A request
+  unwraps round-tripped capability parameters only when they came from the
+  same session/tenant boundary. Independently membraned parameters remain
+  guarded, including across two-party RPC. `membrane` creates a new boundary;
+  `attenuate` narrows authority within an existing lineage so static-policy
+  collapse and backend identity restoration remain available without a
+  process-global unwrap bypass.
+- **Terminal authorization now constructs typed sessions asynchronously.**
+  `AuthPolicy<Session>::authorize` receives the verified login identity and a
+  deployer-supplied session template, then returns an owned, one-shot
+  `SessionGrant`. Terminal bounds policy work with a configurable deadline,
+  rechecks the epoch after asynchronous work, and commits the completed grant
+  synchronously. Expected outcomes use `LoginStatus` (`granted`, `denied`,
+  `invalidRequest`, `invalidProof`, `staleEpoch`, `backendUnavailable`,
+  `timedOut`, or `overloaded`) alongside non-normative detail; transport and
+  internal failures remain RPC exceptions. The fixed-session constructor is
+  retained explicitly as a compatibility policy.
+- **Authority and membrane crate names now match their roles.** The
+  authentication/epoch/session crate is now `wetware-authority` (`authority`,
+  `crates/authority`), while the hook-level call-filtering crate is now
+  `wetware-membrane` (`membrane`, `crates/membrane`). This is a mechanical,
+  pre-alpha package/import rename with no runtime or wire behavior change.
 - **Removed the dormant `std/mcp` WASM adapter.** `ww shell --mcp` has been
   the sole shipping MCP runtime since the process-local cutover; the unused
   guest crate, its standalone build files, and its CI-only test invocation are
@@ -52,7 +140,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Glia resumable-effects handler semantics are locked in with tests + docs.** Added focused tests pinning the algebraic-effects contract — abort-on-return (body after `perform` is skipped), exact-site resume inside a larger expression, one-shot resume, handler-forwarding-skips-self, fail-closed structured `Val::Effect` carrier for unhandled effects, async-native-handler resume, and the dynamic (invocation-time) handler-stack rule for closures/macros. Rewrote `doc/designs/glia-effects.md` to present these as test-backed guarantees plus explicit non-goals (no persisted stacks, no cross-peer continuations, no multi-shot) and corrected stale `with-handler` API references. No runtime behavior change.
 
 ### Changed
-- **Public capability boundaries now carry bare capabilities (Synapse ABI removed) — BREAKING.** `Membrane.Export` is now `{ name, cap :Capability }` (was `{ name, synapse }`), and `Process.bootstrap`, `VatListener.serve`, and `VatClient.dial` carry a bare `Capability` (was `Synapse`). Deleted `capnp/synapse.capnp`, the `synapse` crate, `rpc::synapse_abi`, and the internal vat `Bootstrap.get()->Synapse` shim; the vat bootstrap slot now carries the served capability directly. Graft, HTTP/stream forwarded caps, and stdio serve all set/read the capability directly (`Export.cap`) instead of a Synapse descriptor. Introspection (`schema`/`doc`/`help`) is unaffected — it reads compiled `Schema.Node` bytes, not the wire envelope. Attenuation moves to the hook-level membrane (`crates/ww-membrane`). Absorbs the earlier descriptor-honesty and `PayloadCodec`/`Value` cleanups (the whole Synapse schema is gone). `HOST`/`RUNTIME` schema CIDs were re-pinned (their reachable capability graph — `Host.network()` returning vat caps, `Runtime`→`Executor`→`Process.bootstrap` — changed); `ROUTING`/`IDENTITY`/`HTTP_CLIENT` are unchanged. No compatibility shim (matches the #553 cutover posture).
+- **Public capability boundaries now carry bare capabilities (Synapse ABI removed) — BREAKING.** `Membrane.Export` is now `{ name, cap :Capability }` (was `{ name, synapse }`), and `Process.bootstrap`, `VatListener.serve`, and `VatClient.dial` carry a bare `Capability` (was `Synapse`). Deleted `capnp/synapse.capnp`, the `synapse` crate, `rpc::synapse_abi`, and the internal vat `Bootstrap.get()->Synapse` shim; the vat bootstrap slot now carries the served capability directly. Graft, HTTP/stream forwarded caps, and stdio serve all set/read the capability directly (`Export.cap`) instead of a Synapse descriptor. Introspection (`schema`/`doc`/`help`) is unaffected — it reads compiled `Schema.Node` bytes, not the wire envelope. Attenuation moves to the hook-level membrane (`crates/membrane`). Absorbs the earlier descriptor-honesty and `PayloadCodec`/`Value` cleanups (the whole Synapse schema is gone). `HOST`/`RUNTIME` schema CIDs were re-pinned (their reachable capability graph — `Host.network()` returning vat caps, `Runtime`→`Executor`→`Process.bootstrap` — changed); `ROUTING`/`IDENTITY`/`HTTP_CLIENT` are unchanged. No compatibility shim (matches the #553 cutover posture).
 - **Vat and WAGI service boundaries are documented more explicitly.** Clarified that vat RPC is the long-lived stateful service surface, HTTP/WAGI is a stateless per-request adapter, and `host :serve-vat` publishes an already-exported capability rather than installing a per-request handler.
 - **Public capability boundaries now use the Synapse ABI.** Added the `synapse.capnp` capability currency and descriptor validation, changed membrane exports, process bootstrap, vat serve/dial, stdio serve, graft, and HTTP/stream forwarding to carry `Synapse`, and preserved Glia's effect-handler interception before backend capability invocation.
 - **CI IPFS release publishing now manages release pin retention.** The publish job adds release trees with implicit Kubo pinning disabled, explicitly pins the new release CID before publishing `ww-release` IPNS, tracks only CI-owned release CIDs in `/data/ipfs/ww-release-pins.txt`, retains the latest 10 releases for rollback, and prunes/gc's stale managed pins after IPNS has moved. Local Makefile publish targets now use `ipfs add --pin=false` and pin explicitly only for durable publishes.
@@ -205,7 +293,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`examples/oracle/README.md` port alignment.** All `8080` references updated to `2080` (lines 48, 53, 59, 62, 122) to match `README.md:103`'s standard ports table and the engagement starter kit's WAGI listener default. The README's worked examples now compose with the daemon's default `--http-listen 127.0.0.1:2080`.
 - **Glia `ww/fs` and `ww/routing` stdlib modules.** New `std/lib/ww/fs.glia` exposes `fs/read`, `fs/read-str`, `fs/ls`, `fs/stat`, `fs/exists?` (the last never errors on missing paths). New `std/lib/ww/routing.glia` exposes `routing/resolve`, `routing/provide`, `routing/find`, `routing/hash`. The pure-Glia helpers `ipfs-path`, `ipns-path`, `cid?` move from `ww/ipfs` into `ww/fs` (path helpers belong with the filesystem module).
 - **`make_fs_handler` host-side effect handler** (replaces `make_ipfs_handler`). Exposes `:read`, `:read-str`, `:ls`, `:stat`, `:exists?` methods on the `fs` cap. All error paths produce structured errors via the `glia::error::*` constructors landed in #419 (`:glia.error/cap-call-failed` for IO, `:glia.error/type-mismatch` for non-string args, `:glia.error/arity-mismatch` for missing args).
-- **Core capability schemas in `Export.schema` (#386, partial — Item 1a).** The membrane graft now populates `Export.schema` with canonical `Schema.Node` bytes for the five core capabilities (`identity`, `host`, `runtime`, `routing`, `http-client`). Bytes are extracted at build time by `crates/membrane/build.rs` via the existing `schema-id` pipeline and exposed through a new `membrane::schema_registry` module. Guest-side introspection (and the future MCP tool description generator) can now parse a real `Schema.Node` per cap instead of receiving an empty stub. Guest-contributed extras still get an empty schema — that's Item 1b (FHS-loaded `.capnpc` files).
+- **Core capability schemas in `Export.schema` (#386, partial — Item 1a).** The authority graft now populates `Export.schema` with canonical `Schema.Node` bytes for the five core capabilities (`identity`, `host`, `runtime`, `routing`, `http-client`). Bytes are extracted at build time by `crates/authority/build.rs` via the existing `schema-id` pipeline and exposed through a new `authority::schema_registry` module. Guest-side introspection (and the future MCP tool description generator) can now parse a real `Schema.Node` per cap instead of receiving an empty stub. Guest-contributed extras still get an empty schema — that's Item 1b (FHS-loaded `.capnpc` files).
 - **Structured Glia errors (#389, Item 2).** New `glia::error` module with typed constructor functions (`unbound_symbol`, `arity`, `type_mismatch`, `cap_call`, `epoch_expired`, `permission_denied`, `parse`, `rpc`, `fuel_exhausted`, `internal`) that return canonical `Val::Map` errors with namespaced keyword keys (`:glia.error/type`, `:glia.error/message`, `:glia.error/hint`, plus variant-specific fields). Inspection accessors `data`, `message`, `type_tag`, and `hint` mirror Clojure's `ex-data`/`ex-message`. Eight high-value `eval_err!` call sites in `crates/glia/src/eval.rs` (`def`, `if`, `let`, `fn` parameter, `defmacro`, `map`, `filter`, `reduce`) migrated to typed constructors. Legacy `eval_err!` macro continues to work; remaining call sites will be swept during the upcoming effect-based exceptions migration.
 - **MCP structured error envelope.** The MCP cell preserves the error `Val` end-to-end and serializes it into the JSON-RPC response: structured errors gain a `structuredContent` payload with the full schema map, prefixed text with the `:glia.error/type` tag, and the recovery hint inline. Plain-string (legacy) errors fall through unchanged.
 - **Glia introspection builtins `(schema cap)`, `(doc cap)`, `(help cap)`.** Pure data-lookup builtins registered by the kernel after graft. `(schema cap)` returns the cap's canonical `Schema.Node` bytes (`Val::Bytes`), sourced from the build-time registry. `(doc cap)` returns a human-readable summary. `(help cap)` returns a multi-line cap reference. Backed by 10 unit tests covering each variant's success and structured-error paths.
