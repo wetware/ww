@@ -66,6 +66,18 @@ mod integration_tests;
 /// human-readable prose. The legacy namespace is a compatibility identifier,
 /// not the Rust crate name.
 pub const DENIED_MARKER: &str = "ww-membrane/permission-denied";
+/// Stable marker for a capability revoked without advancing the global epoch.
+pub const REVOKED_MARKER: &str = "wetware/call-guard/target-revoked";
+/// Stable marker for a capability issued under an epoch that is no longer current.
+pub const STALE_EPOCH_MARKER: &str = "wetware/call-guard/staleEpoch";
+
+/// Stable machine-readable class for call-time authority failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallFailureCode {
+    PermissionDenied,
+    TargetRevoked,
+    StaleEpoch,
+}
 
 /// Construct a fail-closed denial error carrying the method key.
 pub fn denied_error(interface_id: u64, method_id: u16, reason: &str) -> Error {
@@ -91,9 +103,42 @@ pub fn denied_method_key(err: &Error) -> Option<(u64, u16)> {
     ))
 }
 
+/// Construct a targeted-revocation failure.
+pub fn revoked_error(detail: &str) -> Error {
+    Error::failed(format!("{REVOKED_MARKER}: {detail}"))
+}
+
+/// Construct an epoch-expiry failure.
+pub fn stale_epoch_error(detail: &str) -> Error {
+    Error::failed(format!("{STALE_EPOCH_MARKER}: {detail}"))
+}
+
+/// Parse a stable call-time failure class without inspecting diagnostic prose.
+pub fn call_failure_code(err: &Error) -> Option<CallFailureCode> {
+    let message = err.to_string();
+    if message.contains(DENIED_MARKER) {
+        Some(CallFailureCode::PermissionDenied)
+    } else if message.contains(REVOKED_MARKER) {
+        Some(CallFailureCode::TargetRevoked)
+    } else if message.contains(STALE_EPOCH_MARKER) {
+        Some(CallFailureCode::StaleEpoch)
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Policy
 // ---------------------------------------------------------------------------
+
+/// Synchronous call-validity check shared by epoch and targeted revocation.
+///
+/// Guards answer whether an already-issued capability remains valid. They do
+/// not select methods; compose them with a [`Policy`] through
+/// [`GuardedPolicy`].
+pub trait CallGuard {
+    fn check(&self) -> Result<(), Error>;
+}
 
 /// Attenuation policy: consulted on every call the membrane guards.
 ///
@@ -113,6 +158,42 @@ pub trait Policy {
     /// their per-call state cannot be merged into a set.
     fn allowlist_keys(&self) -> Option<HashSet<(u64, u16)>> {
         None
+    }
+}
+
+/// Applies one or more call-validity guards before a method policy.
+///
+/// Guarded policies are deliberately not collapsed into static allowlists:
+/// doing so would discard their live epoch or revocation state.
+pub struct GuardedPolicy {
+    inner: Box<dyn Policy>,
+    guards: Vec<Rc<dyn CallGuard>>,
+}
+
+impl GuardedPolicy {
+    pub fn new(inner: Box<dyn Policy>) -> Self {
+        Self {
+            inner,
+            guards: Vec::new(),
+        }
+    }
+
+    pub fn with_guard(mut self, guard: Rc<dyn CallGuard>) -> Self {
+        self.guards.push(guard);
+        self
+    }
+
+    pub fn push_guard(&mut self, guard: Rc<dyn CallGuard>) {
+        self.guards.push(guard);
+    }
+}
+
+impl Policy for GuardedPolicy {
+    fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error> {
+        for guard in &self.guards {
+            guard.check()?;
+        }
+        self.inner.check(interface_id, method_id)
     }
 }
 
@@ -330,21 +411,14 @@ impl Policy for Allowlist {
     }
 }
 
-/// Wraps another policy with a revoke switch. Dropping a granted capability's
-/// authority without killing the holder is the classic membrane use; call
-/// [`RevocablePolicy::revoke`] and every subsequent call fails closed.
-///
-/// Hold the `Rc<RevocablePolicy>` on the granter side and hand a
-/// `Rc<dyn Policy>` clone to [`membrane`]; both point at the same revoke flag.
-pub struct RevocablePolicy {
-    inner: Box<dyn Policy>,
+/// Call-validity guard for revoking one issued authority without an epoch change.
+pub struct RevocationGuard {
     revoked: Cell<bool>,
 }
 
-impl RevocablePolicy {
-    pub fn new(inner: Box<dyn Policy>) -> Rc<Self> {
+impl RevocationGuard {
+    pub fn new() -> Rc<Self> {
         Rc::new(Self {
-            inner,
             revoked: Cell::new(false),
         })
     }
@@ -358,11 +432,53 @@ impl RevocablePolicy {
     }
 }
 
+impl CallGuard for RevocationGuard {
+    fn check(&self) -> Result<(), Error> {
+        if self.revoked.get() {
+            Err(revoked_error("capability revoked"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Compatibility policy that applies a [`RevocationGuard`] before another policy.
+///
+/// Dropping a granted capability's authority without killing the holder is the
+/// classic membrane use; call [`RevocablePolicy::revoke`] and every subsequent
+/// call fails closed.
+///
+/// Hold the `Rc<RevocablePolicy>` on the granter side and hand a
+/// `Rc<dyn Policy>` clone to [`membrane`]; both point at the same revoke flag.
+pub struct RevocablePolicy {
+    inner: Box<dyn Policy>,
+    guard: Rc<RevocationGuard>,
+}
+
+impl RevocablePolicy {
+    pub fn new(inner: Box<dyn Policy>) -> Rc<Self> {
+        Rc::new(Self {
+            inner,
+            guard: RevocationGuard::new(),
+        })
+    }
+
+    pub fn revoke(&self) {
+        self.guard.revoke();
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        self.guard.is_revoked()
+    }
+
+    pub fn guard(&self) -> Rc<RevocationGuard> {
+        Rc::clone(&self.guard)
+    }
+}
+
 impl Policy for RevocablePolicy {
     fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error> {
-        if self.revoked.get() {
-            return Err(denied_error(interface_id, method_id, "capability revoked"));
-        }
+        self.guard.check()?;
         self.inner.check(interface_id, method_id)
     }
 }
@@ -1104,8 +1220,50 @@ mod tests {
         assert!(rev.check(IFACE, 0).is_ok());
         rev.revoke();
         let denied = rev.check(IFACE, 0).unwrap_err();
-        assert!(denied.to_string().contains(DENIED_MARKER));
+        assert_eq!(
+            call_failure_code(&denied),
+            Some(CallFailureCode::TargetRevoked)
+        );
         assert!(rev.is_revoked());
+    }
+
+    #[test]
+    fn guarded_policy_composes_revocation_and_method_authority() {
+        let revocation = RevocationGuard::new();
+        let policy = GuardedPolicy::new(Box::new(Allowlist::new().allow(IFACE, 0)))
+            .with_guard(revocation.clone());
+
+        assert!(policy.check(IFACE, 0).is_ok());
+        assert_eq!(
+            call_failure_code(&policy.check(IFACE, 1).unwrap_err()),
+            Some(CallFailureCode::PermissionDenied)
+        );
+
+        revocation.revoke();
+        assert_eq!(
+            call_failure_code(&policy.check(IFACE, 0).unwrap_err()),
+            Some(CallFailureCode::TargetRevoked)
+        );
+    }
+
+    #[test]
+    fn call_failure_codes_do_not_parse_diagnostic_prose() {
+        assert_eq!(
+            call_failure_code(&denied_error(IFACE, 0, "arbitrary detail")),
+            Some(CallFailureCode::PermissionDenied)
+        );
+        assert_eq!(
+            call_failure_code(&revoked_error("arbitrary detail")),
+            Some(CallFailureCode::TargetRevoked)
+        );
+        assert_eq!(
+            call_failure_code(&stale_epoch_error("arbitrary detail")),
+            Some(CallFailureCode::StaleEpoch)
+        );
+        assert_eq!(
+            call_failure_code(&Error::failed("staleEpoch prose only".into())),
+            None
+        );
     }
 
     #[test]

@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Composable call-validity guards.** The membrane now exposes `CallGuard`
+  and `GuardedPolicy`, with stable machine-readable failure codes for method
+  denial, targeted revocation, and stale epochs. `EpochGuard` implements the
+  shared contract, while `RevocablePolicy` is retained as a convenience layer
+  over the new `RevocationGuard`; targeted revocation no longer needs a global
+  Atom epoch advance.
 - **Typed Rust method profiles for capability attenuation.**
   `membrane::MethodProfile::<Client>::allow_method(Client::method_request)`
   records the interface ID and ordinal emitted by generated Cap'n Proto request

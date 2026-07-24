@@ -7422,6 +7422,7 @@ dependencies = [
  "schema-id",
  "tokio",
  "tracing",
+ "wetware-membrane",
 ]
 
 [[package]]

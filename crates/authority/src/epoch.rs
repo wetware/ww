@@ -1,5 +1,6 @@
 //! Epoch types and the epoch validity guard.
 
+use call_guard::{stale_epoch_error, CallGuard};
 use capnp::Error;
 use tokio::sync::watch;
 
@@ -37,11 +38,15 @@ pub struct EpochGuard {
 
 impl EpochGuard {
     pub fn check(&self) -> Result<(), Error> {
+        CallGuard::check(self)
+    }
+}
+
+impl CallGuard for EpochGuard {
+    fn check(&self) -> Result<(), Error> {
         let current = self.receiver.borrow();
         if current.seq != self.issued_seq {
-            return Err(Error::failed(
-                "staleEpoch: session epoch no longer current".to_string(),
-            ));
+            return Err(stale_epoch_error("session epoch no longer current"));
         }
         Ok(())
     }
@@ -80,6 +85,9 @@ mod tests {
         tx.send(epoch(2, b"head2", 101)).unwrap();
         let res = guard.check();
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("staleEpoch"));
+        assert_eq!(
+            call_guard::call_failure_code(&res.unwrap_err()),
+            Some(call_guard::CallFailureCode::StaleEpoch)
+        );
     }
 }
