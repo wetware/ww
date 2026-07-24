@@ -5,10 +5,12 @@
 set -euo pipefail
 
 : "${POD:?POD is required}"
+: "${WW_RELEASE_EXPECTED_CURRENT:?WW_RELEASE_EXPECTED_CURRENT is required}"
 
 REMOTE_RELEASE_TREE="${REMOTE_RELEASE_TREE:-/tmp/ww-release-tree}"
 POD_RELEASE_TREE="${POD_RELEASE_TREE:-/tmp/ww-release-tree-publish-$(date +%s)-$$}"
 STATE_FILE="${WW_RELEASE_PIN_STATE:-/data/ipfs/ww-release-pins.txt}"
+EXPECTED_CURRENT="$WW_RELEASE_EXPECTED_CURRENT"
 RETAIN="${WW_RELEASE_PIN_RETAIN:-10}"
 KUBECTL_TIMEOUT="${KUBECTL_TIMEOUT:-10m}"
 KUBECTL_BEST_EFFORT_TIMEOUT="${KUBECTL_BEST_EFFORT_TIMEOUT:-45s}"
@@ -25,6 +27,10 @@ case "$RETAIN" in
 esac
 if [ "$RETAIN" -lt 1 ]; then
   echo "ERROR: WW_RELEASE_PIN_RETAIN must be at least 1" >&2
+  exit 2
+fi
+if [[ ! "$EXPECTED_CURRENT" =~ ^/ipfs/[A-Za-z0-9]+$ ]]; then
+  echo "ERROR: WW_RELEASE_EXPECTED_CURRENT must be an /ipfs/<cid> path, got: $EXPECTED_CURRENT" >&2
   exit 2
 fi
 
@@ -54,6 +60,16 @@ repo_stat_size() {
     | tail -n 1 \
     | tr -d '\r' \
     || true
+}
+
+resolve_ww_release() {
+  pod sh -c "key=\$(ipfs key list -l | awk '\$2 == \"ww-release\" { print \$1; exit }'); \
+    [ -n \"\$key\" ] || exit 1; \
+    if command -v timeout >/dev/null 2>&1; then \
+      timeout '$IPFS_NAME_PUBLISH_TIMEOUT' ipfs name resolve \"/ipns/\$key\"; \
+    else \
+      ipfs name resolve \"/ipns/\$key\"; \
+    fi"
 }
 
 copy_release_tree() {
@@ -97,8 +113,20 @@ fi
 echo "CID=$CID"
 log "pinning release CID $CID"
 pod sh -c "if command -v timeout >/dev/null 2>&1; then timeout '$IPFS_PIN_TIMEOUT' ipfs pin add '$CID'; else ipfs pin add '$CID'; fi"
-log "publishing IPNS ww-release to $CID"
-pod sh -c "if command -v timeout >/dev/null 2>&1; then timeout '$IPFS_NAME_PUBLISH_TIMEOUT' ipfs name publish --key=ww-release '/ipfs/$CID'; else ipfs name publish --key=ww-release '/ipfs/$CID'; fi"
+
+log "checking IPNS compare-and-set precondition"
+current_release="$(resolve_ww_release | tail -n 1 | tr -d '\r')"
+if [ "$current_release" = "/ipfs/$CID" ]; then
+  log "IPNS ww-release already points to candidate CID $CID"
+  echo "IPNS_UPDATED=false"
+elif [ "$current_release" != "$EXPECTED_CURRENT" ]; then
+  echo "ERROR: IPNS ww-release changed during publish: expected $EXPECTED_CURRENT, found $current_release" >&2
+  exit 1
+else
+  log "publishing IPNS ww-release to $CID"
+  pod sh -c "if command -v timeout >/dev/null 2>&1; then timeout '$IPFS_NAME_PUBLISH_TIMEOUT' ipfs name publish --key=ww-release '/ipfs/$CID'; else ipfs name publish --key=ww-release '/ipfs/$CID'; fi"
+  echo "IPNS_UPDATED=true"
+fi
 
 log "announcing release CID to the DHT (best effort)"
 if ! pod sh -c "if command -v timeout >/dev/null 2>&1; then timeout '$IPFS_PROVIDE_TIMEOUT' ipfs routing provide -r '$CID'; else ipfs routing provide -r '$CID'; fi"; then

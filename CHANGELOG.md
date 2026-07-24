@@ -92,6 +92,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`ww shell` "AI agents:" startup hint.** The line `AI agents:  ipfs cat /ipns/releases.wetware.run/.agents/prompt.md` is gone from `src/cli/shell.rs`. The hint pointed at a host-shell command (`ipfs cat`) that's awkward to surface from inside a Glia REPL (the user can't paste it), and the obvious Glia-form rewrite — `(perform fs :read-str "/ipns/…")` — fails today because the WASI fs interceptor (`crates/cell/src/fs_intercept.rs:481-520`) only recognizes `ipfs/<CID>/…` paths (`parse_ipfs_path` at line 72 strips the `ipfs/` prefix; there's no `ipns/` sibling). `/ipfs/<CID>/…` reads through the cap *do* work — `open_ipfs` lazily materializes content from the pinset cache — so a hint pointing at a stable CID would work today; what's missing is IPNS resolution at the intercept layer (or a sibling cap method that calls Kubo `name/resolve` first, then routes through the existing pinset path). Restoring a pasteable Glia-form hint is the natural reward for that follow-up.
 
 ### Fixed
+- **Installer-facing IPNS releases can no longer roll back to older Git
+  revisions through CI.** Release trees now carry their full master commit SHA,
+  CI retains up to GitHub's 100-run concurrency limit, and the publisher checks
+  Git ancestry before moving `ww-release`. Equal revisions are a no-op; stale,
+  divergent, malformed, and non-master revisions fail closed. The remote
+  publisher also rechecks the previously observed CID immediately before
+  updating IPNS, so pointer changes during staging or retry fail closed.
 - **IPFS release publishing ignores stale daemon pods.** The CI publisher now
   selects a non-terminating, Ready IPFS daemon pod before staging or executing
   a release publish, and reselects one for each staging or publish retry,
