@@ -15,9 +15,11 @@
 //!
 //! Directions handled: caps flowing OUT of the membrane (results, pipelines,
 //! resolution) are re-wrapped as above. Caps flowing INTO the membrane
-//! (request params) that are our own membranes are unwrapped to the bare
-//! backing cap on send, restoring the identity the backend originally
-//! exported; foreign caps pass through unchanged — a parameter is
+//! (request params) are unwrapped only when they share the receiving
+//! membrane's boundary lineage, restoring the identity that backend originally
+//! exported. Caps from another session or tenant boundary remain wrapped — a
+//! process-global registry match is never sufficient authority to strip them.
+//! Other foreign caps pass through unchanged because a parameter is
 //! caller-granted authority, not something the outbound policy attenuates.
 //! (Reverse-wrapping foreign params — a fully symmetric membrane — is a
 //! deliberate non-goal for now.)
@@ -534,7 +536,7 @@ impl Policy for RateLimit {
 
 /// Wrap an untyped client hook in a membrane governed by `policy`.
 pub fn membrane_hook(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
-    MembraneHook::wrap(inner, policy)
+    MembraneHook::new_boundary(inner, policy)
 }
 
 /// Wrap a typed client in a membrane governed by `policy`.
@@ -542,13 +544,30 @@ pub fn membrane<C: capnp::capability::FromClientHook>(client: C, policy: Rc<dyn 
     C::new(membrane_hook(client.into_client_hook(), policy))
 }
 
+/// Attenuate an untyped hook while preserving an existing boundary lineage.
+///
+/// Use this when narrowing authority already issued by the same boundary. Use
+/// [`membrane_hook`] when constructing an independent session or tenant
+/// boundary.
+pub fn attenuate_hook(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
+    MembraneHook::attenuate(inner, policy)
+}
+
+/// Attenuate a typed capability within its existing boundary lineage.
+pub fn attenuate<C: capnp::capability::FromClientHook>(client: C, policy: Rc<dyn Policy>) -> C {
+    C::new(attenuate_hook(client.into_client_hook(), policy))
+}
+
 // ---------------------------------------------------------------------------
 // MembraneHook: the ClientHook wrapper
 // ---------------------------------------------------------------------------
 
+struct BoundaryLineage;
+
 struct MembraneState {
     inner: Box<dyn ClientHook>,
     policy: Rc<dyn Policy>,
+    lineage: Rc<BoundaryLineage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +615,21 @@ fn membrane_state_of(hook: &dyn ClientHook) -> Option<Rc<MembraneState>> {
     REGISTRY.with(|r| r.borrow().get(&key).and_then(Weak::upgrade))
 }
 
+fn unwrap_same_lineage(
+    mut hook: Box<dyn ClientHook>,
+    lineage: &Rc<BoundaryLineage>,
+) -> Box<dyn ClientHook> {
+    loop {
+        let Some(state) = membrane_state_of(&*hook) else {
+            return hook;
+        };
+        if !Rc::ptr_eq(&state.lineage, lineage) {
+            return hook;
+        }
+        hook = state.inner.add_ref();
+    }
+}
+
 impl Drop for MembraneState {
     fn drop(&mut self) {
         // Deregister by our own address (the registry key is Rc::as_ptr, which
@@ -612,29 +646,62 @@ pub struct MembraneHook {
 }
 
 impl MembraneHook {
-    pub fn wrap(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
+    fn new_boundary(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
+        Self::wrap_with_lineage(inner, policy, Rc::new(BoundaryLineage), false)
+    }
+
+    fn attenuate(inner: Box<dyn ClientHook>, policy: Rc<dyn Policy>) -> Box<dyn ClientHook> {
+        let lineage = membrane_state_of(&*inner)
+            .map(|state| Rc::clone(&state.lineage))
+            .unwrap_or_else(|| Rc::new(BoundaryLineage));
+        Self::wrap_with_lineage(inner, policy, lineage, true)
+    }
+
+    fn wrap_recursive(
+        inner: Box<dyn ClientHook>,
+        policy: Rc<dyn Policy>,
+        lineage: Rc<BoundaryLineage>,
+    ) -> Box<dyn ClientHook> {
+        Self::wrap_with_lineage(inner, policy, lineage, true)
+    }
+
+    fn wrap_with_lineage(
+        inner: Box<dyn ClientHook>,
+        policy: Rc<dyn Policy>,
+        lineage: Rc<BoundaryLineage>,
+        may_collapse: bool,
+    ) -> Box<dyn ClientHook> {
         // Collapse-on-wrap: wrapping one of our own membranes with a static
         // allowlist, when the inner policy is also a static allowlist, folds the
         // two into a single layer whose allowlist is the intersection. This
         // keeps `attenuate (attenuate c ..) ..` at one membrane hop instead of
         // nesting (roadmap D3/D18). If either side is stateful (returns `None`
         // from `allowlist_keys`), we fall through and stack, preserving its
-        // per-call state.
-        if let Some(existing) = membrane_state_of(&*inner) {
-            if let (Some(outer_keys), Some(inner_keys)) =
-                (policy.allowlist_keys(), existing.policy.allowlist_keys())
-            {
-                let allowed = outer_keys.intersection(&inner_keys).copied().collect();
-                let collapsed: Rc<dyn Policy> = Rc::new(Allowlist { allowed });
-                let state = Rc::new(MembraneState {
-                    inner: existing.inner.add_ref(),
-                    policy: collapsed,
-                });
-                registry_insert(&state);
-                return Box::new(Self { state });
+        // per-call state. Independent boundary lineages never collapse.
+        if may_collapse {
+            if let Some(existing) = membrane_state_of(&*inner) {
+                if Rc::ptr_eq(&existing.lineage, &lineage) {
+                    if let (Some(outer_keys), Some(inner_keys)) =
+                        (policy.allowlist_keys(), existing.policy.allowlist_keys())
+                    {
+                        let allowed = outer_keys.intersection(&inner_keys).copied().collect();
+                        let collapsed: Rc<dyn Policy> = Rc::new(Allowlist { allowed });
+                        let state = Rc::new(MembraneState {
+                            inner: existing.inner.add_ref(),
+                            policy: collapsed,
+                            lineage,
+                        });
+                        registry_insert(&state);
+                        return Box::new(Self { state });
+                    }
+                }
             }
         }
-        let state = Rc::new(MembraneState { inner, policy });
+        let state = Rc::new(MembraneState {
+            inner,
+            policy,
+            lineage,
+        });
         registry_insert(&state);
         Box::new(Self { state })
     }
@@ -663,6 +730,7 @@ impl ClientHook for MembraneHook {
         Request::new(Box::new(MembraneRequest {
             inner: inner_request.hook,
             policy: self.state.policy.clone(),
+            lineage: Rc::clone(&self.state.lineage),
             message: Builder::new_default(),
             cap_table: CapTable::new(),
         }))
@@ -686,8 +754,12 @@ impl ClientHook for MembraneHook {
         // result (roadmap D7). Drop remains the completion signal, matching
         // capnp-rpc's local `Results`.
         let (tx, rx) = oneshot::channel();
-        let wrapped_results =
-            Box::new(MembraneResults::new(results, self.state.policy.clone(), tx));
+        let wrapped_results = Box::new(MembraneResults::new(
+            results,
+            self.state.policy.clone(),
+            Rc::clone(&self.state.lineage),
+            tx,
+        ));
         let inner = self
             .state
             .inner
@@ -722,18 +794,17 @@ impl ClientHook for MembraneHook {
     }
 
     fn get_resolved(&self) -> Option<Box<dyn ClientHook>> {
-        self.state
-            .inner
-            .get_resolved()
-            .map(|h| Self::wrap(h, self.state.policy.clone()))
+        self.state.inner.get_resolved().map(|h| {
+            Self::wrap_recursive(h, self.state.policy.clone(), Rc::clone(&self.state.lineage))
+        })
     }
 
     fn when_more_resolved(&self) -> Option<Promise<Box<dyn ClientHook>, Error>> {
         let policy = self.state.policy.clone();
-        self.state
-            .inner
-            .when_more_resolved()
-            .map(|p| Promise::from_future(async move { Ok(Self::wrap(p.await?, policy)) }))
+        let lineage = Rc::clone(&self.state.lineage);
+        self.state.inner.when_more_resolved().map(|p| {
+            Promise::from_future(async move { Ok(Self::wrap_recursive(p.await?, policy, lineage)) })
+        })
     }
 
     fn when_resolved(&self) -> Promise<(), Error> {
@@ -748,6 +819,7 @@ impl ClientHook for MembraneHook {
 struct MembraneRequest {
     inner: Box<dyn RequestHook>,
     policy: Rc<dyn Policy>,
+    lineage: Rc<BoundaryLineage>,
     // Params are staged here so the cap table can be transformed on send.
     message: Builder<HeapAllocator>,
     cap_table: CapTable,
@@ -756,9 +828,9 @@ struct MembraneRequest {
 impl RequestHook for MembraneRequest {
     fn get(&mut self) -> any_pointer::Builder<'_> {
         // Stage params in our own buffer so `send` can transform their cap
-        // table: our own membraned caps that round-trip back in are unwrapped
-        // to their originals (restoring `==` identity and avoiding
-        // double-indirection); foreign caps pass through unchanged.
+        // table: same-lineage membraned caps that round-trip back in are
+        // unwrapped to their originals (restoring `==` identity and avoiding
+        // double-indirection); foreign-boundary caps remain wrapped.
         //
         // Note: this does NOT reverse-wrap foreign inbound caps in a policy of
         // their own — a param is authority the caller *grants* to the backend,
@@ -778,18 +850,16 @@ impl RequestHook for MembraneRequest {
         let Self {
             mut inner,
             policy,
+            lineage,
             message,
             mut cap_table,
         } = *self;
 
-        // Unwrap-on-reentry: any staged param cap that is one of our own
-        // membranes is replaced by its inner original; foreign caps are kept.
+        // Unwrap-on-reentry: peel only membrane layers created by this request's
+        // boundary lineage. A foreign session/tenant boundary remains intact.
         for slot in cap_table.iter_mut() {
             if let Some(hook) = slot.take() {
-                *slot = Some(match membrane_state_of(&*hook) {
-                    Some(state) => state.inner.add_ref(),
-                    None => hook,
-                });
+                *slot = Some(unwrap_same_lineage(hook, &lineage));
             }
         }
 
@@ -811,15 +881,17 @@ impl RequestHook for MembraneRequest {
 
         // Wrap the pipeline hook so promise-pipelined caps stay inside.
         let pipeline_policy = policy.clone();
+        let pipeline_lineage = Rc::clone(&lineage);
         let wrapped_pipeline: Box<dyn PipelineHook> = Box::new(MembranePipeline {
             inner: pipeline.hook,
             policy: pipeline_policy,
+            lineage: pipeline_lineage,
         });
 
         // Wrap the response so caps in the results stay inside.
         let wrapped_promise = Promise::from_future(async move {
             let response = promise.await?;
-            let membraned = MembraneResponse::rewrap(response.hook, policy)?;
+            let membraned = MembraneResponse::rewrap(response.hook, policy, lineage)?;
             Ok(Response::new(Box::new(membraned)))
         });
 
@@ -857,7 +929,11 @@ impl MembraneResponse {
     /// inner response's cap table is private to its hook, but `set_as` on an
     /// imbued `any_pointer::Builder` re-materializes the caps into our table.
     /// Cost O(response size); roadmap D13 tracks the benchmark + tripwire.
-    fn rewrap(inner: Box<dyn ResponseHook>, policy: Rc<dyn Policy>) -> capnp::Result<Self> {
+    fn rewrap(
+        inner: Box<dyn ResponseHook>,
+        policy: Rc<dyn Policy>,
+        lineage: Rc<BoundaryLineage>,
+    ) -> capnp::Result<Self> {
         let mut message = Builder::new_default();
         let mut cap_table = CapTable::new();
         {
@@ -867,7 +943,11 @@ impl MembraneResponse {
         }
         for slot in cap_table.iter_mut() {
             if let Some(hook) = slot.take() {
-                *slot = Some(MembraneHook::wrap(hook, policy.clone()));
+                *slot = Some(MembraneHook::wrap_recursive(
+                    hook,
+                    policy.clone(),
+                    Rc::clone(&lineage),
+                ));
             }
         }
         Ok(Self { message, cap_table })
@@ -889,6 +969,7 @@ impl ResponseHook for MembraneResponse {
 struct MembranePipeline {
     inner: Box<dyn PipelineHook>,
     policy: Rc<dyn Policy>,
+    lineage: Rc<BoundaryLineage>,
 }
 
 impl PipelineHook for MembranePipeline {
@@ -896,11 +977,16 @@ impl PipelineHook for MembranePipeline {
         Box::new(Self {
             inner: self.inner.add_ref(),
             policy: self.policy.clone(),
+            lineage: Rc::clone(&self.lineage),
         })
     }
 
     fn get_pipelined_cap(&self, ops: &[PipelineOp]) -> Box<dyn ClientHook> {
-        MembraneHook::wrap(self.inner.get_pipelined_cap(ops), self.policy.clone())
+        MembraneHook::wrap_recursive(
+            self.inner.get_pipelined_cap(ops),
+            self.policy.clone(),
+            Rc::clone(&self.lineage),
+        )
     }
 }
 
@@ -918,6 +1004,7 @@ struct MembraneResults {
     message: Builder<HeapAllocator>,
     cap_table: CapTable,
     policy: Rc<dyn Policy>,
+    lineage: Rc<BoundaryLineage>,
     outcome: Option<oneshot::Sender<capnp::Result<()>>>,
     /// True when the buffered payload has been copied into `inner` and not
     /// modified since. Prevents the Drop flush from re-copying (and
@@ -931,6 +1018,7 @@ impl MembraneResults {
     fn new(
         inner: Box<dyn ResultsHook>,
         policy: Rc<dyn Policy>,
+        lineage: Rc<BoundaryLineage>,
         outcome: oneshot::Sender<capnp::Result<()>>,
     ) -> Self {
         Self {
@@ -938,6 +1026,7 @@ impl MembraneResults {
             message: Builder::new_default(),
             cap_table: CapTable::new(),
             policy,
+            lineage,
             outcome: Some(outcome),
             flushed: false,
         }
@@ -951,8 +1040,13 @@ impl MembraneResults {
             .cap_table
             .iter()
             .map(|slot| {
-                slot.as_ref()
-                    .map(|h| MembraneHook::wrap(h.add_ref(), self.policy.clone()))
+                slot.as_ref().map(|h| {
+                    MembraneHook::wrap_recursive(
+                        h.add_ref(),
+                        self.policy.clone(),
+                        Rc::clone(&self.lineage),
+                    )
+                })
             })
             .collect();
         reader.imbue(&wrapped);
@@ -1318,7 +1412,7 @@ mod tests {
     #[test]
     fn membrane_recognizes_own_wrap_but_not_others() {
         let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
-        let wrapped = MembraneHook::wrap(dummy_hook(), policy);
+        let wrapped = MembraneHook::new_boundary(dummy_hook(), policy);
 
         // Our membrane advertises the sentinel brand and resolves via registry.
         assert_eq!(wrapped.get_brand(), membrane_brand());
@@ -1338,7 +1432,7 @@ mod tests {
     #[test]
     fn membrane_deregisters_on_drop() {
         let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
-        let wrapped = MembraneHook::wrap(dummy_hook(), policy);
+        let wrapped = MembraneHook::new_boundary(dummy_hook(), policy);
         let key = wrapped.get_ptr();
         assert!(REGISTRY.with(|r| r.borrow().contains_key(&key)));
         drop(wrapped);
@@ -1379,7 +1473,12 @@ mod tests {
 
         let (tx, mut rx) = oneshot::channel();
         let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
-        let mr = MembraneResults::new(Box::new(FailingResults), policy, tx);
+        let mr = MembraneResults::new(
+            Box::new(FailingResults),
+            policy,
+            Rc::new(BoundaryLineage),
+            tx,
+        );
         drop(mr); // callee-done signal → flush runs → inner.get() fails
 
         match rx.try_recv() {
@@ -1434,7 +1533,7 @@ mod tests {
         };
         let (tx, mut rx) = oneshot::channel();
         let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
-        let mut mr = MembraneResults::new(Box::new(inner), policy, tx);
+        let mut mr = MembraneResults::new(Box::new(inner), policy, Rc::new(BoundaryLineage), tx);
 
         mr.get().unwrap().set_as("hello").unwrap();
         mr.set_pipeline().unwrap();
@@ -1465,7 +1564,7 @@ mod tests {
         };
         let (tx, mut rx) = oneshot::channel();
         let policy: Rc<dyn Policy> = Rc::new(Allowlist::new());
-        let mut mr = MembraneResults::new(Box::new(inner), policy, tx);
+        let mut mr = MembraneResults::new(Box::new(inner), policy, Rc::new(BoundaryLineage), tx);
 
         mr.get().unwrap().set_as("early").unwrap();
         mr.set_pipeline().unwrap();

@@ -26,7 +26,7 @@ use std::rc::Rc;
 
 use capnp::capability::FromClientHook;
 use glia::{extract_method, make_cap, HandledCapInner, Val};
-use membrane::{membrane_hook, Allowlist, DENIED_MARKER};
+use membrane::{Allowlist, DENIED_MARKER};
 
 use crate::{
     extract_capnp_client, make_host_handler, make_routing_handler, make_runtime_handler,
@@ -261,7 +261,7 @@ pub fn reify(
     for (_, ordinal) in &resolved {
         allowlist = allowlist.allow(interface_id, *ordinal);
     }
-    let membraned_hook = membrane_hook(client.hook, Rc::new(allowlist));
+    let membraned_hook = membrane::attenuate_hook(client.hook, Rc::new(allowlist));
     let export_client = capnp::capability::Client::new(membraned_hook.add_ref());
 
     // Rebuild the cap's local dispatch over the MEMBRANED client, so local
