@@ -1,11 +1,34 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
     let target_dir = resolve_target_dir(manifest_path);
+
+    // Embed the source revision in every host binary. CI supplies the exact
+    // workflow revision; local builds fall back to the checked-out commit.
+    // Keeping this in build.rs makes `/version` useful outside containers too.
+    println!("cargo:rerun-if-env-changed=WW_BUILD_GIT_SHA");
+    emit_git_rerun_paths(manifest_path);
+    let git_sha = env::var("WW_BUILD_GIT_SHA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "--verify", "HEAD"])
+                .current_dir(manifest_path)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=WW_BUILD_GIT_SHA={git_sha}");
 
     // Compile example schemas so integration tests get typed access.
     let greeter_schema = manifest_path.join("examples/discovery/greeter.capnp");
@@ -129,6 +152,44 @@ fn main() {
             panic!("{msg}");
         } else {
             println!("cargo:warning={msg}");
+        }
+    }
+}
+
+fn emit_git_rerun_paths(manifest_path: &Path) {
+    let git_path = |name: &str| {
+        Command::new("git")
+            .args(["rev-parse", "--git-path", name])
+            .current_dir(manifest_path)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|path| PathBuf::from(path.trim()))
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    manifest_path.join(path)
+                }
+            })
+    };
+
+    if let Some(head) = git_path("HEAD") {
+        println!("cargo:rerun-if-changed={}", head.display());
+    }
+    let symbolic_ref = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .current_dir(manifest_path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(symbolic_ref) = symbolic_ref {
+        if let Some(reference) = git_path(&symbolic_ref) {
+            println!("cargo:rerun-if-changed={}", reference.display());
         }
     }
 }

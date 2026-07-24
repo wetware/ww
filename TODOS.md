@@ -36,14 +36,6 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 **Priority:** P2 (visible, but only on first request after pod restart)
 **Depends on:** none
 
-## Document deployment pipeline + ww-master infra (doc/deployment.md)
-**What:** Write `doc/deployment.md` capturing the end-to-end deployment pipeline: how a wetware/ww commit produces a release image and IPFS publication, then how an operator promotes the immutable image digest in the separate `wetware/infra` repository. Include ASCII diagrams for: (a) CI publish flow (build matrix → ghcr.io image → wasm-artifacts → IPFS publish → IPNS update at `k51qzi5uqu5dg9eci41ad4b1wyf9kocngntfviq12qjuvusra3nt94xlx98me1`), (b) manual image-promotion flow (Containerfile.deploy → ghcr.io immutable digest → infra `kustomization.yaml` digest commit → `make -C k8s/ww-master up`), (c) ww-master mount/layer model (kernel + shell + IPNS-loaded examples merged at `/`), (d) HTTP request path (Traefik → ww-master :2080 → CGI dispatch → cell `etc/init.d/*.glia` registered route).
-**Why:** Surfaced during the snap-hello-rs deploy: the deployment.yaml on disk had IPNS args that had never been applied through the authoritative infra path, the IPNS publish layout had never been intended to support `/ipns/.../examples/<name>` mount paths, and `/ipns/` mount paths crashed the daemon (Bug A in the lthibault/ipns-mount-fix branch). Multiple drift points across two repos (wetware/ww + wetware/infra) with no central documentation. Future operators (and future Louis) shouldn't have to reverse-engineer this.
-**Context:** Per-user direction: "Once we get this working / perma-fixed, would be nice to ensure our deployment pipeline is documented somewhere (ideally with appropriate diagrams). Somewhere under doc/ would seem like the appropriate place." Should reference the existing `doc/architecture.md`, `doc/capabilities.md`, and `doc/cli.md`. Keep ASCII diagrams in the "complex flow" sections per project convention (also seen in the design docs at `~/.gstack/projects/wetware-ww/`).
-**Effort:** S-M
-**Priority:** P2
-**Depends on:** lthibault/ipns-mount-fix branch landed + ww-master deploy verified working
-
 ## Revisit automated release promotion after the manual-promotion POC
 **What:** Consider bot-created promotion PRs, artifact attestations, a restricted deploy identity, drift detection, and deliberate auto-merge/rollback criteria only after the manual POC has generated real operational signal.
 **Why:** The POC intentionally favors a small, legible manual digest promotion and Git revert for a personal VPS. The automation would add credentials and failure modes without current product value.

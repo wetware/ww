@@ -57,6 +57,15 @@ pub struct Host {
     threads: Vec<(String, JoinHandle<Result<()>>)>,
     shutdown_tx: watch::Sender<()>,
     shutdown_rx: watch::Receiver<()>,
+    service_exit_tx: mpsc::UnboundedSender<ServiceExit>,
+    service_exit_rx: mpsc::UnboundedReceiver<ServiceExit>,
+}
+
+/// An unexpected service-thread exit observed before host shutdown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceExit {
+    pub name: String,
+    pub error: Option<String>,
 }
 
 impl Default for Host {
@@ -69,10 +78,13 @@ impl Host {
     /// Create a new Host supervisor.
     pub fn new() -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let (service_exit_tx, service_exit_rx) = mpsc::unbounded_channel();
         Self {
             threads: Vec::new(),
             shutdown_tx,
             shutdown_rx,
+            service_exit_tx,
+            service_exit_rx,
         }
     }
 
@@ -85,9 +97,38 @@ impl Host {
     pub fn try_spawn<S: Service>(&mut self, name: &str, service: S) -> Result<()> {
         let shutdown = self.shutdown_rx.clone();
         let thread_name = name.to_string();
+        let exit_name = thread_name.clone();
+        let service_exit_tx = self.service_exit_tx.clone();
         let handle = std::thread::Builder::new()
             .name(thread_name.clone())
-            .spawn(move || service.run(shutdown))
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    service.run(shutdown)
+                }));
+                match result {
+                    Ok(result) => {
+                        let error = result.as_ref().err().map(|error| format!("{error:#}"));
+                        let _ = service_exit_tx.send(ServiceExit {
+                            name: exit_name,
+                            error,
+                        });
+                        result
+                    }
+                    Err(panic) => {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("<non-string panic>")
+                            .to_string();
+                        let _ = service_exit_tx.send(ServiceExit {
+                            name: exit_name,
+                            error: Some(format!("service panicked: {message}")),
+                        });
+                        Err(anyhow::anyhow!("service panicked: {message}"))
+                    }
+                }
+            })
             .with_context(|| format!("failed to spawn service thread '{thread_name}'"))?;
         self.threads.push((name.to_string(), handle));
         Ok(())
@@ -99,6 +140,12 @@ impl Host {
     pub fn spawn<S: Service>(&mut self, name: &str, service: S) {
         self.try_spawn(name, service)
             .unwrap_or_else(|e| panic!("{e:#}"));
+    }
+
+    /// Wait for any supervised service to exit. Before shutdown, even a
+    /// successful return is unexpected because services are long-lived.
+    pub async fn next_service_exit(&mut self) -> Option<ServiceExit> {
+        self.service_exit_rx.recv().await
     }
 
     /// Signal all services to shut down and join all threads.
@@ -459,6 +506,7 @@ pub struct SwarmService {
     pub params: SwarmServiceParams,
     pub cmd_rx: mpsc::Receiver<SwarmCommand>,
     pub ready_tx: tokio::sync::oneshot::Sender<Result<SwarmReady>>,
+    pub network_state: NetworkState,
 }
 
 /// Values sent back from SwarmService after host construction.
@@ -501,7 +549,7 @@ impl Service for SwarmService {
                     return Ok(());
                 }
             };
-            let network_state = NetworkState::from_peer_id(host.local_peer_id().to_bytes());
+            let network_state = self.network_state;
             let stream_control = host.stream_control();
 
             // Send construction results back to the main thread.
@@ -926,8 +974,15 @@ mod tests {
 
         let mut host = Host::new();
         host.spawn("fail-svc", FailService);
-        std::thread::sleep(Duration::from_millis(50));
-        // Should not panic — errors are logged, not propagated.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let exit = rt
+            .block_on(host.next_service_exit())
+            .expect("service exit event");
+        assert_eq!(exit.name, "fail-svc");
+        assert_eq!(exit.error.as_deref(), Some("intentional failure"));
         host.shutdown();
     }
 
@@ -942,8 +997,18 @@ mod tests {
 
         let mut host = Host::new();
         host.spawn("panic-svc", PanicService);
-        std::thread::sleep(Duration::from_millis(50));
-        // Should not panic in the supervisor — panics are caught by join.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let exit = rt
+            .block_on(host.next_service_exit())
+            .expect("service exit event");
+        assert_eq!(exit.name, "panic-svc");
+        assert_eq!(
+            exit.error.as_deref(),
+            Some("service panicked: intentional panic")
+        );
         host.shutdown();
     }
 

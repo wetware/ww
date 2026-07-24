@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Runtime health, readiness, and provenance contract.** The localhost admin
+  plane now starts before Kubo-backed mount resolution and exposes
+  `GET /readyz` plus `GET /version` (source revision, optional OCI runtime
+  digest, embedded kernel/shell BLAKE3 hashes, cache/degraded state).
+  `ww healthcheck` provides distroless-safe liveness, readiness, and revision
+  checks. Serving/admin ports are pre-bound during startup, and unexpected
+  supervised-service exits now fail the process instead of remaining silent.
+  `scripts/deploy_verify.sh` checks both Kubernetes `pod.status.imageID` and
+  the binary's source revision after a manual promotion.
 - **Local admin health endpoint.** `ww run` now starts its localhost-only
   admin endpoint on `127.0.0.1:2026` by default, including `GET /healthz` for
   future distroless exec probes. Override the bind address with
