@@ -44,7 +44,7 @@ Layers stack with per-file union; later layers win.
 | `--insecure-ephemeral` | off | Allow ephemeral identity fallback if identity file is missing (insecure; for quick trial runs). |
 | `--http-listen <ADDR>` | none | Enable WAGI HTTP server (e.g. `127.0.0.1:2080`) |
 | `--http-dial <HOST>` | none | Allow outbound HTTP to host. Repeatable. Supports exact hosts, `*.example.com`, or `*`. Without this flag, no http-client capability is granted. |
-| `--with-http-admin <ADDR>` | `127.0.0.1:2026` | Local HTTP admin endpoint (`/healthz`, `/metrics`, `/host/id`, `/host/addrs`); set `off` to disable (case-insensitive). Also reads `WW_HTTP_ADMIN`. A non-loopback address exposes unauthenticated host diagnostics. |
+| `--with-http-admin <ADDR>` | `127.0.0.1:2026` | Local HTTP admin endpoint (`/healthz`, `/readyz`, `/version`, `/metrics`, `/host/id`, `/host/addrs`); set `off` to disable (case-insensitive). Also reads `WW_HTTP_ADMIN`. A non-loopback address exposes unauthenticated host diagnostics. |
 | `--wasm-debug` | off | Enable WASM debug info for guest processes |
 | `--executor-threads <N>` | `0` | Executor worker threads (0 = auto-detect, one per CPU core) |
 | `--runtime-cache-policy` | `shared` | `shared`: same WASM bytes share Executor. `isolated`: always fresh. |
@@ -88,7 +88,28 @@ ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 | `WW_HTTP_ADMIN` | user | Admin listener address, or `off` to disable it |
 | `WW_CWASM_DIR` | operator | Optional directory for Wasmtime's native compilation cache. Wasmtime owns artifact compatibility; an unavailable directory falls back to uncached compilation. |
 | `WW_CWASM_CACHE_MAX_BYTES` | operator | Wasmtime cache cleanup threshold in bytes (default: `335544320`). This is a soft limit, so leave filesystem headroom. |
+| `WW_OCI_IMAGE_ID` | operator | Optional immutable OCI image identity reported by `/version`. Deployment verification uses Kubernetes `pod.status.imageID` as the authority. |
 | `RUST_LOG` | user | Host-side tracing verbosity |
+
+## `ww healthcheck`
+
+Probe the admin endpoint without relying on shell tools. This is suitable for
+exec probes in the distroless deployment image.
+
+```sh
+ww healthcheck
+ww healthcheck --ready
+ww healthcheck --ready --expect-git-sha "$EXPECTED_SHA"
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--admin <ADDR>` | `127.0.0.1:2026` | Admin listener to probe; also reads `WW_HTTP_ADMIN` |
+| `--ready` | off | Probe `/readyz` instead of `/healthz` |
+| `--expect-git-sha <SHA>` | unset | Also require `/version` to report the exact source revision |
+| `--timeout-secs <N>` | `2` | Per-request timeout |
+
+The command prints `ok` and exits zero only when every requested check passes.
 
 ## ww shell
 

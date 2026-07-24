@@ -33,7 +33,9 @@ pub use rpc::dispatch::{new_registry, CgiRequest, CgiResponse, RequestSender, Ro
 ///  └── Threads: ExecutorPool
 /// ```
 pub struct WagiService {
-    pub listen_addr: std::net::SocketAddr,
+    /// Already-bound listener. The CLI binds before spawning the service so
+    /// an unavailable serving port is a synchronous startup error.
+    pub listener: std::net::TcpListener,
     pub registry: RouteRegistry,
 }
 
@@ -50,7 +52,7 @@ impl crate::services::Service for WagiService {
                 .route("/", any(handle_request))
                 .with_state(self.registry);
 
-            let listener = tokio::net::TcpListener::bind(self.listen_addr).await?;
+            let listener = tokio::net::TcpListener::from_std(self.listener)?;
             let local_addr = listener.local_addr()?;
             tracing::info!(%local_addr, "WAGI HTTP server listening");
 

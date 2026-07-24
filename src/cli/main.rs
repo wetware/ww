@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::io::Write as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use authority::{Epoch, Provenance};
 use clap::{Parser, Subcommand};
@@ -71,6 +72,23 @@ fn embedded_loader() -> EmbeddedLoader {
 /// CLI and environment input share one tested disable path.
 fn admin_listen_addr(value: String) -> Option<String> {
     (!value.trim().eq_ignore_ascii_case("off")).then_some(value)
+}
+
+fn embedded_blake3(bytes: &[u8]) -> Option<String> {
+    (!bytes.is_empty()).then(|| blake3::hash(bytes).to_hex().to_string())
+}
+
+fn service_exit_error(exit: Option<ww::services::ServiceExit>) -> anyhow::Error {
+    match exit {
+        Some(exit) => anyhow::anyhow!(
+            "supervised service '{}' exited: {}",
+            exit.name,
+            exit.error
+                .as_deref()
+                .unwrap_or("service stopped unexpectedly")
+        ),
+        None => anyhow::anyhow!("service supervision channel closed"),
+    }
 }
 
 #[derive(Parser)]
@@ -199,9 +217,10 @@ enum Commands {
         #[arg(long, default_value = "shared", env = "WW_RUNTIME_CACHE_POLICY")]
         runtime_cache_policy: String,
 
-        /// Local HTTP admin endpoint. Serves GET /healthz, GET /metrics,
-        /// GET /host/id, and GET /host/addrs. Defaults to localhost only;
-        /// pass `--with-http-admin off` to disable it.
+        /// Local HTTP admin endpoint. Serves GET /healthz, GET /readyz,
+        /// GET /version, GET /metrics, GET /host/id, and GET /host/addrs.
+        /// Defaults to localhost only; pass `--with-http-admin off` to
+        /// disable it.
         #[arg(
             long,
             value_name = "ADDR",
@@ -213,6 +232,33 @@ enum Commands {
         /// IPFS HTTP API endpoint
         #[arg(long, default_value = "http://localhost:5001", env = "IPFS_API")]
         ipfs_url: String,
+    },
+
+    /// Probe a running node's localhost admin endpoint.
+    ///
+    /// Designed for distroless container exec probes, where curl and wget are
+    /// intentionally unavailable.
+    Healthcheck {
+        /// Admin listener address.
+        #[arg(
+            long,
+            value_name = "ADDR",
+            default_value = "127.0.0.1:2026",
+            env = "WW_HTTP_ADMIN"
+        )]
+        admin: String,
+
+        /// Check serving readiness (`/readyz`) instead of liveness (`/healthz`).
+        #[arg(long)]
+        ready: bool,
+
+        /// Also require `/version` to report this exact source revision.
+        #[arg(long, value_name = "SHA")]
+        expect_git_sha: Option<String>,
+
+        /// Per-request timeout in seconds.
+        #[arg(long, default_value_t = 2)]
+        timeout_secs: u64,
     },
 
     /// Generate a new Ed25519 identity secret.
@@ -675,6 +721,12 @@ impl Commands {
                 )
                 .await
             }
+            Commands::Healthcheck {
+                admin,
+                ready,
+                expect_git_sha,
+                timeout_secs,
+            } => Self::healthcheck(admin, ready, expect_git_sha, timeout_secs).await,
             Commands::Daemon { action } => match action {
                 DaemonAction::Install {
                     identity,
@@ -723,6 +775,75 @@ impl Commands {
                 NsAction::Resolve { name } => Self::ns_resolve(name).await,
             },
         }
+    }
+
+    async fn admin_get(admin: &str, path: &str, timeout_secs: u64) -> Result<(u16, String)> {
+        if admin.trim().eq_ignore_ascii_case("off") {
+            bail!("admin endpoint is disabled");
+        }
+        let request = async {
+            let mut stream = tokio::net::TcpStream::connect(admin)
+                .await
+                .with_context(|| format!("connect to admin endpoint at {admin}"))?;
+            let request =
+                format!("GET {path} HTTP/1.1\r\nHost: {admin}\r\nConnection: close\r\n\r\n");
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .context("write admin request")?;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .context("read admin response")?;
+            let response = String::from_utf8(response).context("admin response was not UTF-8")?;
+            let (head, body) = response
+                .split_once("\r\n\r\n")
+                .context("admin response was not valid HTTP")?;
+            let status = head
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .context("admin response did not include a status")?
+                .parse::<u16>()
+                .context("admin response status was not numeric")?;
+            Ok((status, body.to_string()))
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), request)
+            .await
+            .with_context(|| format!("admin request to {path} timed out"))?
+    }
+
+    async fn healthcheck(
+        admin: String,
+        ready: bool,
+        expect_git_sha: Option<String>,
+        timeout_secs: u64,
+    ) -> Result<()> {
+        let path = if ready { "/readyz" } else { "/healthz" };
+        let (status, body) = Self::admin_get(&admin, path, timeout_secs).await?;
+        if status != 200 {
+            bail!("{path} returned HTTP {status}: {}", body.trim());
+        }
+
+        if let Some(expected) = expect_git_sha {
+            let (status, body) = Self::admin_get(&admin, "/version", timeout_secs).await?;
+            if status != 200 {
+                bail!("/version returned HTTP {status}: {}", body.trim());
+            }
+            let version: serde_json::Value =
+                serde_json::from_str(&body).context("parse /version response")?;
+            let actual = version["git_sha"]
+                .as_str()
+                .context("/version omitted git_sha")?;
+            if actual != expected {
+                bail!("source revision mismatch: expected {expected}, found {actual}");
+            }
+        }
+
+        println!("ok");
+        Ok(())
     }
 
     /// Initialize a new typed cell guest project.
@@ -1310,6 +1431,77 @@ wasip2::cli::command::export!({iface_name}Guest);
             Box::new(IpfsLoader::new(ipfs_client.clone())),
         ]);
 
+        // Resolve the host identity and start the local admin plane before
+        // waiting on Kubo or resolving mounts. This keeps liveness and boot
+        // phase diagnostics available during dependency outages.
+        tracing::debug!("resolving identity...");
+        let (sk, _verifying_key, identity_source) =
+            Self::resolve_identity(identity.as_deref(), insecure_ephemeral)?;
+        tracing::info!(source = identity_source, "Node identity resolved");
+        let keypair = ww::keys::to_libp2p(&sk)?;
+        let peer_id = keypair.public().to_peer_id();
+        let network_state = ww::rpc::NetworkState::from_peer_id(peer_id.to_bytes());
+        let runtime_status = ww::metrics::RuntimeStatus::starting();
+        let version_info = ww::metrics::VersionInfo {
+            git_sha: env!("WW_BUILD_GIT_SHA").to_string(),
+            // The OCI runtime digest is not intrinsically visible inside a
+            // container. Deployments may inject the authoritative value;
+            // deploy verification still checks pod.status.imageID directly.
+            oci_image_id: std::env::var("WW_OCI_IMAGE_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            kernel_wasm_blake3: embedded_blake3(EMBEDDED_KERNEL),
+            shell_wasm_blake3: embedded_blake3(EMBEDDED_SHELL),
+        };
+
+        let mut supervisor = ww::services::Host::new();
+        let fuel_registry = ww::metrics::new_fuel_registry();
+        let rpc_metrics = ww::metrics::new_rpc_metrics();
+        let cache_metrics = ww::metrics::new_cache_metrics();
+        let stream_metrics = ww::metrics::new_stream_metrics();
+        let wasmtime_cache_metrics = ww::cell::engine::wasmtime_cache_metrics();
+
+        // Bind before spawning so an unavailable control-plane port is a
+        // synchronous startup failure.
+        if let Some(ref addr) = with_http_admin {
+            let listen_addr: std::net::SocketAddr = addr
+                .parse()
+                .context("invalid --with-http-admin address (expected host:port)")?;
+            let listener = std::net::TcpListener::bind(listen_addr)
+                .with_context(|| format!("failed to bind --with-http-admin at {listen_addr}"))?;
+            listener
+                .set_nonblocking(true)
+                .context("failed to configure --with-http-admin listener")?;
+            supervisor.try_spawn(
+                "admin",
+                ww::metrics::AdminService {
+                    listener,
+                    peer_id: peer_id.to_string(),
+                    network_state: network_state.clone(),
+                    version_info,
+                    runtime_status: runtime_status.clone(),
+                    fuel_registry: fuel_registry.clone(),
+                    rpc_metrics: rpc_metrics.clone(),
+                    cache_metrics: cache_metrics.clone(),
+                    stream_metrics: stream_metrics.clone(),
+                    wasmtime_cache_metrics: wasmtime_cache_metrics.clone(),
+                },
+            )?;
+        }
+
+        // Every IPFS-backed boot operation below depends on Kubo. Wait before
+        // namespace resolution, pinning, or mount assembly so a transient
+        // outage remains observable through the already-running admin plane
+        // instead of becoming a CrashLoopBackOff.
+        runtime_status.set_phase("waiting-for-kubo");
+        tokio::select! {
+            result = wait_for_kubo_ready(&ipfs_client) => result?,
+            service_exit = supervisor.next_service_exit() => {
+                return Err(service_exit_error(service_exit));
+            }
+        }
+        runtime_status.set_phase("resolving-configuration");
+
         // If --stem is provided, read the on-chain head and prepend it
         // as a base root mount.
         let mut all_mounts: Vec<ww::cell::mount::Mount> = Vec::new();
@@ -1388,16 +1580,10 @@ wasip2::cli::command::export!({iface_name}Guest);
         // User mounts are highest priority — they override everything.
         all_mounts.extend(mounts);
 
-        // Resolve mounts into a merged root CID + local overrides. No
-        // tempdir materialization — guest filesystem reads are lazy via
-        // CidTree, backed by the IPFS DAG.
-        //
-        // This resolve hard-depends on kubo (add_dir/files_cp). Wait for kubo
-        // to become reachable instead of exiting on a transient outage — an
-        // exit here is a CrashLoopBackOff, and every boot recompiles all wasm,
-        // so a restart loop is a sustained-CPU throttle signature. See
-        // `wait_for_kubo_ready`.
-        wait_for_kubo_ready(&ipfs_client).await?;
+        // Resolve mounts into a merged root CID + local overrides. No tempdir
+        // materialization — guest filesystem reads are lazy via CidTree,
+        // backed by the IPFS DAG.
+        runtime_status.set_phase("resolving-mounts");
         tracing::debug!("resolving mounts (virtual)...");
         let (root_cid, local_overrides) =
             image::resolve_mounts_virtual(&all_mounts, &ipfs_client).await?;
@@ -1424,15 +1610,6 @@ wasip2::cli::command::export!({iface_name}Guest);
                 .context("failed to create PinsetCache")?,
         );
 
-        // Resolve identity from the explicit path (never from the merged FHS tree).
-        // The identity file is kept out of the merged tree so guests can't read it.
-        tracing::debug!("resolving identity...");
-        let (sk, _verifying_key, identity_source) =
-            Self::resolve_identity(identity.as_deref(), insecure_ephemeral)?;
-        tracing::info!(source = identity_source, "Node identity resolved");
-        tracing::debug!(source = identity_source, "identity resolved");
-
-        let keypair = ww::keys::to_libp2p(&sk)?;
         // Attempt to fetch Kubo's identity so we can bootstrap the in-process
         // Kad client against the local node (Amino DHT /ipfs/kad/1.0.0).
         // Non-fatal: if Kubo is unreachable we still start, just without Kad.
@@ -1485,8 +1662,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         let (swarm_cmd_tx, swarm_cmd_rx) = tokio::sync::mpsc::channel(64);
         let (swarm_ready_tx, swarm_ready_rx) = tokio::sync::oneshot::channel();
 
-        let mut supervisor = ww::services::Host::new();
-
         // Swarm thread: libp2p event loop.
         // The Libp2pHost is constructed inside the swarm thread so that
         // TCP listeners register with the correct tokio reactor.
@@ -1501,16 +1676,24 @@ wasip2::cli::command::export!({iface_name}Guest);
                 },
                 cmd_rx: swarm_cmd_rx,
                 ready_tx: swarm_ready_tx,
+                network_state: network_state.clone(),
             },
         )?;
 
         // Wait for the swarm thread to construct the host and send back
         // the stream control + network state.
         tracing::debug!("waiting for swarm ready...");
-        let swarm_ready = swarm_ready_rx
-            .await
-            .context("swarm thread exited before reporting readiness")?
-            .context("swarm service failed to start")?;
+        let swarm_ready = tokio::select! {
+            biased;
+            ready = swarm_ready_rx => {
+                ready
+                    .context("swarm thread exited before reporting readiness")?
+                    .context("swarm service failed to start")?
+            }
+            service_exit = supervisor.next_service_exit() => {
+                return Err(service_exit_error(service_exit));
+            }
+        };
         tracing::debug!("swarm ready");
         let network_state = swarm_ready.network_state;
         let stream_control = swarm_ready.stream_control;
@@ -1567,11 +1750,16 @@ wasip2::cli::command::export!({iface_name}Guest);
             let listen_addr: std::net::SocketAddr = addr
                 .parse()
                 .context("invalid --http-listen address (expected host:port)")?;
+            let listener = std::net::TcpListener::bind(listen_addr)
+                .with_context(|| format!("failed to bind --http-listen at {listen_addr}"))?;
+            listener
+                .set_nonblocking(true)
+                .context("failed to configure --http-listen listener")?;
             let registry = ww::dispatcher::server::new_registry();
             supervisor.try_spawn(
                 "wagi-http",
                 ww::services::WagiService {
-                    listen_addr,
+                    listener,
                     registry: registry.clone(),
                 },
             )?;
@@ -1579,42 +1767,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         } else {
             None
         };
-
-        // Bind the control-plane listener before spawning its service. This
-        // makes an unavailable admin port a startup error rather than a
-        // silently failed background thread.
-        let fuel_registry = ww::metrics::new_fuel_registry();
-        let rpc_metrics = ww::metrics::new_rpc_metrics();
-        let cache_metrics = ww::metrics::new_cache_metrics();
-        let stream_metrics = ww::metrics::new_stream_metrics();
-        let wasmtime_cache_metrics = ww::cell::engine::wasmtime_cache_metrics();
-        if let Some(ref addr) = with_http_admin {
-            let listen_addr: std::net::SocketAddr = addr
-                .parse()
-                .context("invalid --with-http-admin address (expected host:port)")?;
-            let listener = std::net::TcpListener::bind(listen_addr)
-                .with_context(|| format!("failed to bind --with-http-admin at {listen_addr}"))?;
-            listener
-                .set_nonblocking(true)
-                .context("failed to configure --with-http-admin listener")?;
-            let snapshot = network_state.snapshot().await;
-            let peer_id = libp2p::PeerId::from_bytes(&snapshot.local_peer_id)
-                .context("invalid peer ID in network state")?
-                .to_string();
-            supervisor.try_spawn(
-                "admin",
-                ww::metrics::AdminService {
-                    listener,
-                    peer_id,
-                    network_state: network_state.clone(),
-                    fuel_registry: fuel_registry.clone(),
-                    rpc_metrics: rpc_metrics.clone(),
-                    cache_metrics: cache_metrics.clone(),
-                    stream_metrics: stream_metrics.clone(),
-                    wasmtime_cache_metrics: wasmtime_cache_metrics.clone(),
-                },
-            )?;
-        }
 
         let listen_summary = listen
             .iter()
@@ -1656,8 +1808,8 @@ wasip2::cli::command::export!({iface_name}Guest);
             .with_ipfs_client(ipfs_client.clone())
             .with_http_dial(http_dial);
 
-        if let Some(registry) = route_registry {
-            builder = builder.with_route_registry(registry);
+        if let Some(ref registry) = route_registry {
+            builder = builder.with_route_registry(registry.clone());
         }
 
         if let Some(epoch_rx) = epoch_channel_rx {
@@ -1669,12 +1821,41 @@ wasip2::cli::command::export!({iface_name}Guest);
         // Spawn the kernel cell into the executor pool. The kernel's exit
         // code flows back through the oneshot channel.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        runtime_status.set_phase("starting-kernel");
+        let kernel_runtime_status = runtime_status.clone();
+        let readiness_route_registry = route_registry.clone();
         executor_pool
             .spawn(ww::services::SpawnRequest {
                 name: "kernel".into(),
                 factory: Box::new(move |_shutdown| {
                     Box::pin(async move {
-                        match cell.spawn_serving(stream_control).await {
+                        let (serving_ready_tx, serving_ready_rx) = tokio::sync::oneshot::channel();
+                        tokio::task::spawn_local(async move {
+                            if serving_ready_rx.await.is_ok() {
+                                if let Some(registry) = readiness_route_registry {
+                                    kernel_runtime_status.set_phase("waiting-for-http-route");
+                                    loop {
+                                        match registry.read() {
+                                            Ok(routes) if !routes.is_empty() => break,
+                                            Ok(_) => {}
+                                            Err(_) => {
+                                                kernel_runtime_status.mark_degraded(
+                                                    "HTTP route registry lock poisoned",
+                                                );
+                                                return;
+                                            }
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(100))
+                                            .await;
+                                    }
+                                }
+                                kernel_runtime_status.set_ready();
+                            }
+                        });
+                        match cell
+                            .spawn_serving_with_ready(stream_control, serving_ready_tx)
+                            .await
+                        {
                             Ok(result) => {
                                 let _ = result_tx.send(Ok(result.exit_code));
                             }
@@ -1690,14 +1871,21 @@ wasip2::cli::command::export!({iface_name}Guest);
             })
             .map_err(|_| anyhow::anyhow!("executor pool rejected kernel spawn"))?;
 
-        let exit_code = match result_rx.await {
-            Ok(Ok(code)) => code,
-            Ok(Err(e)) => {
-                tracing::error!("Kernel error: {}", e);
-                1
-            }
-            Err(_) => {
-                tracing::error!("Kernel result channel dropped");
+        let exit_code = tokio::select! {
+            biased;
+            result = result_rx => match result {
+                Ok(Ok(code)) => code,
+                Ok(Err(e)) => {
+                    tracing::error!("Kernel error: {}", e);
+                    1
+                }
+                Err(_) => {
+                    tracing::error!("Kernel result channel dropped");
+                    1
+                }
+            },
+            service_exit = supervisor.next_service_exit() => {
+                tracing::error!(error = %service_exit_error(service_exit), "runtime supervision failed");
                 1
             }
         };
@@ -2819,6 +3007,63 @@ mod tests {
             let configured = parse_run_admin_addr(&["ww", "run", "--with-http-admin", value]);
             assert_eq!(admin_listen_addr(configured), None, "{value}");
         }
+    }
+
+    #[test]
+    fn healthcheck_cli_supports_readiness_and_revision_checks() {
+        let command = Cli::try_parse_from([
+            "ww",
+            "healthcheck",
+            "--admin",
+            "127.0.0.1:3030",
+            "--ready",
+            "--expect-git-sha",
+            "0123456789abcdef",
+            "--timeout-secs",
+            "7",
+        ])
+        .expect("parse healthcheck command")
+        .command;
+
+        match command {
+            Commands::Healthcheck {
+                admin,
+                ready,
+                expect_git_sha,
+                timeout_secs,
+            } => {
+                assert_eq!(admin, "127.0.0.1:3030");
+                assert!(ready);
+                assert_eq!(expect_git_sha.as_deref(), Some("0123456789abcdef"));
+                assert_eq!(timeout_secs, 7);
+            }
+            _ => panic!("expected healthcheck command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_get_parses_status_and_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0u8; 512];
+            let count = socket.read(&mut request).await.expect("read request");
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /healthz "));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n")
+                .await
+                .expect("write response");
+        });
+
+        let (status, body) = Commands::admin_get(&address.to_string(), "/healthz", 2)
+            .await
+            .expect("admin GET");
+        assert_eq!(status, 200);
+        assert_eq!(body, "ok\n");
+        server.await.expect("test server");
     }
 
     #[test]
