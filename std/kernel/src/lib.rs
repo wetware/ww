@@ -1723,6 +1723,13 @@ impl Guest for Kernel {
     }
 }
 
+fn publish_bootstrap_membrane(
+    exported_membrane: &Rc<RefCell<Option<Membrane>>>,
+    membrane: &Membrane,
+) {
+    *exported_membrane.borrow_mut() = Some(membrane.clone());
+}
+
 fn run_impl() {
     init_logging();
 
@@ -1847,7 +1854,15 @@ fn run_impl() {
                 glia::load_prelude(&mut env, &mut kd).await;
             }
 
-            // Run init.d scripts first. If a foreground process blocked
+            // The host uses a successful reverse graft only to complete its
+            // internal RPC bootstrap. It is deliberately independent from
+            // externally visible serving readiness: /readyz remains closed
+            // until the host observes a registered HTTP route. Publish before
+            // init.d so a slow (or foreground-blocking) script cannot consume
+            // the host's export-policy timeout and abort the kernel.
+            publish_bootstrap_membrane(&exported_membrane, &membrane);
+
+            // Run init.d scripts. If a foreground process blocked
             // (e.g. `(runtime run ...)` in the script), we're done.
             let blocked = run_initd(&mut env, &ctx, &dispatch)
                 .await
@@ -1855,13 +1870,6 @@ fn run_impl() {
                     log::error!("init.d: {e}");
                     false
                 });
-
-            // The host treats a successful reverse graft as the kernel-ready
-            // acknowledgement. Publish it only after init.d has installed
-            // routes and services, never during the compile/boot window.
-            if !blocked {
-                *exported_membrane.borrow_mut() = Some(membrane.clone());
-            }
 
             if !blocked {
                 let is_tty = std::env::var("WW_TTY").is_ok();
@@ -2426,6 +2434,25 @@ mod tests {
                     );
                 }
             }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_is_published_before_initd_work() {
+        run_local(async {
+            let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(TestRuntime);
+            let upstream: Membrane = capnp_rpc::new_client(TestMembrane { runtime });
+            let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(None));
+            publish_bootstrap_membrane(&state, &upstream);
+
+            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap { membrane: state });
+            bootstrap
+                .graft_request()
+                .send()
+                .promise
+                .await
+                .expect("bootstrap must be available before init.d can block");
         })
         .await;
     }

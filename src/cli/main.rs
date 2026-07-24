@@ -1934,6 +1934,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             .map_err(|_| anyhow::anyhow!("executor pool rejected kernel spawn"))?;
 
         let exit_code = tokio::select! {
+            biased;
             result = result_rx => match result {
                 Ok(Ok(code)) => code,
                 Ok(Err(e)) => {
