@@ -69,6 +69,11 @@ run_publish() {
   local candidate="$3"
   local output_file="$4"
 
+  # The production publisher deletes the staged release tree after a
+  # successful run, so each scenario needs a fresh fixture.
+  rm -rf "$TEST_DIR/release"
+  mkdir -p "$TEST_DIR/release"
+  printf 'fixture\n' > "$TEST_DIR/release/VERSION"
   : > "$TEST_DIR/calls"
   PATH="$TEST_DIR/bin:$PATH" \
     POD=ipfs-test \
