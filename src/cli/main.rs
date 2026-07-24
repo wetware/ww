@@ -256,6 +256,10 @@ enum Commands {
         #[arg(long, value_name = "SHA")]
         expect_git_sha: Option<String>,
 
+        /// Require an enabled Wasmtime cache with at least one hit or store.
+        #[arg(long)]
+        require_cache_enabled: bool,
+
         /// Per-request timeout in seconds.
         #[arg(long, default_value_t = 2)]
         timeout_secs: u64,
@@ -725,8 +729,18 @@ impl Commands {
                 admin,
                 ready,
                 expect_git_sha,
+                require_cache_enabled,
                 timeout_secs,
-            } => Self::healthcheck(admin, ready, expect_git_sha, timeout_secs).await,
+            } => {
+                Self::healthcheck(
+                    admin,
+                    ready,
+                    expect_git_sha,
+                    require_cache_enabled,
+                    timeout_secs,
+                )
+                .await
+            }
             Commands::Daemon { action } => match action {
                 DaemonAction::Install {
                     identity,
@@ -815,10 +829,46 @@ impl Commands {
             .with_context(|| format!("admin request to {path} timed out"))?
     }
 
+    fn validate_version(
+        body: &str,
+        expected_git_sha: Option<&str>,
+        require_cache_enabled: bool,
+    ) -> Result<()> {
+        let version: serde_json::Value =
+            serde_json::from_str(body).context("parse /version response")?;
+        if let Some(expected) = expected_git_sha {
+            let actual = version["git_sha"]
+                .as_str()
+                .context("/version omitted git_sha")?;
+            if actual != expected {
+                bail!("source revision mismatch: expected {expected}, found {actual}");
+            }
+        }
+        if require_cache_enabled {
+            let state = version["wasmtime_cache_state"]
+                .as_str()
+                .context("/version omitted wasmtime_cache_state")?;
+            if state != "enabled" {
+                bail!("Wasmtime cache is not enabled: state={state}");
+            }
+            let hits = version["wasmtime_cache_hits_total"]
+                .as_u64()
+                .context("/version omitted wasmtime_cache_hits_total")?;
+            let stores = version["wasmtime_cache_stores_total"]
+                .as_u64()
+                .context("/version omitted wasmtime_cache_stores_total")?;
+            if hits == 0 && stores == 0 {
+                bail!("Wasmtime cache is enabled but has recorded no hits or stores");
+            }
+        }
+        Ok(())
+    }
+
     async fn healthcheck(
         admin: String,
         ready: bool,
         expect_git_sha: Option<String>,
+        require_cache_enabled: bool,
         timeout_secs: u64,
     ) -> Result<()> {
         let path = if ready { "/readyz" } else { "/healthz" };
@@ -827,19 +877,12 @@ impl Commands {
             bail!("{path} returned HTTP {status}: {}", body.trim());
         }
 
-        if let Some(expected) = expect_git_sha {
+        if expect_git_sha.is_some() || require_cache_enabled {
             let (status, body) = Self::admin_get(&admin, "/version", timeout_secs).await?;
             if status != 200 {
                 bail!("/version returned HTTP {status}: {}", body.trim());
             }
-            let version: serde_json::Value =
-                serde_json::from_str(&body).context("parse /version response")?;
-            let actual = version["git_sha"]
-                .as_str()
-                .context("/version omitted git_sha")?;
-            if actual != expected {
-                bail!("source revision mismatch: expected {expected}, found {actual}");
-            }
+            Self::validate_version(&body, expect_git_sha.as_deref(), require_cache_enabled)?;
         }
 
         println!("ok");
@@ -3016,6 +3059,7 @@ mod tests {
             "--ready",
             "--expect-git-sha",
             "0123456789abcdef",
+            "--require-cache-enabled",
             "--timeout-secs",
             "7",
         ])
@@ -3027,11 +3071,13 @@ mod tests {
                 admin,
                 ready,
                 expect_git_sha,
+                require_cache_enabled,
                 timeout_secs,
             } => {
                 assert_eq!(admin, "127.0.0.1:3030");
                 assert!(ready);
                 assert_eq!(expect_git_sha.as_deref(), Some("0123456789abcdef"));
+                assert!(require_cache_enabled);
                 assert_eq!(timeout_secs, 7);
             }
             _ => panic!("expected healthcheck command"),
@@ -3061,6 +3107,32 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body, "ok\n");
         server.await.expect("test server");
+    }
+
+    #[test]
+    fn healthcheck_version_validation_rejects_cache_fallback() {
+        Commands::validate_version(
+            r#"{"git_sha":"abc","wasmtime_cache_state":"enabled","wasmtime_cache_hits_total":0,"wasmtime_cache_stores_total":1}"#,
+            Some("abc"),
+            true,
+        )
+        .expect("enabled cache and matching revision");
+
+        let error = Commands::validate_version(
+            r#"{"git_sha":"abc","wasmtime_cache_state":"fallback","wasmtime_cache_hits_total":0,"wasmtime_cache_stores_total":0}"#,
+            Some("abc"),
+            true,
+        )
+        .expect_err("fallback cache must fail");
+        assert!(format!("{error:#}").contains("state=fallback"));
+
+        let error = Commands::validate_version(
+            r#"{"git_sha":"abc","wasmtime_cache_state":"enabled","wasmtime_cache_hits_total":0,"wasmtime_cache_stores_total":0}"#,
+            Some("abc"),
+            true,
+        )
+        .expect_err("idle cache must fail after runtime readiness");
+        assert!(format!("{error:#}").contains("no hits or stores"));
     }
 
     #[test]

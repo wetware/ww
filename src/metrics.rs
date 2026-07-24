@@ -446,6 +446,8 @@ async fn version_handler(State(state): State<AdminState>) -> impl IntoResponse {
         "degraded": runtime.degraded || cache.state == WasmtimeCacheState::Fallback,
         "degraded_reasons": runtime.degraded_reasons,
         "wasmtime_cache_state": cache.state.as_str(),
+        "wasmtime_cache_hits_total": cache.hits,
+        "wasmtime_cache_stores_total": cache.stores,
     });
     (
         [(
@@ -634,6 +636,8 @@ mod tests {
         assert_eq!(value["oci_image_id"], "sha256:image");
         assert_eq!(value["kernel_wasm_blake3"], "kernel");
         assert_eq!(value["shell_wasm_blake3"], "shell");
+        assert!(value["wasmtime_cache_hits_total"].is_u64());
+        assert!(value["wasmtime_cache_stores_total"].is_u64());
     }
 
     #[test]
