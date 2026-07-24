@@ -85,7 +85,7 @@ impl membrane_capnp::membrane::Server for KernelBootstrap {
             Some(m) => m,
             None => {
                 return capnp::capability::Promise::err(capnp::Error::failed(
-                    "kernel bootstrap membrane not ready".into(),
+                    "INIT_MEMBRANE_NOT_READY: kernel bootstrap membrane not ready".into(),
                 ))
             }
         };
@@ -1734,7 +1734,6 @@ fn run_impl() {
     system::serve(bootstrap.client, move |membrane: Membrane| {
         let exported_membrane = Rc::clone(&exported_membrane);
         async move {
-            *exported_membrane.borrow_mut() = Some(membrane.clone());
             let graft_resp = membrane.graft_request().send().promise.await?;
             let results = graft_resp.get()?;
 
@@ -1856,6 +1855,13 @@ fn run_impl() {
                     log::error!("init.d: {e}");
                     false
                 });
+
+            // The host treats a successful reverse graft as the kernel-ready
+            // acknowledgement. Publish it only after init.d has installed
+            // routes and services, never during the compile/boot window.
+            if !blocked {
+                *exported_membrane.borrow_mut() = Some(membrane.clone());
+            }
 
             if !blocked {
                 let is_tty = std::env::var("WW_TTY").is_ok();
@@ -2415,7 +2421,7 @@ mod tests {
                 Ok(_) => panic!("bootstrap graft should fail before membrane is ready"),
                 Err(err) => {
                     assert!(
-                        format!("{err}").contains("not ready"),
+                        format!("{err}").contains("INIT_MEMBRANE_NOT_READY"),
                         "unexpected error: {err}"
                     );
                 }

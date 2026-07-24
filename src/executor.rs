@@ -346,7 +346,7 @@ impl Cell {
     /// Returns a [`SpawnResult`] containing the guest's exit code, its exported
     /// [`GuestMembrane`], and the epoch sender for advancing epochs.
     pub async fn spawn(self) -> Result<SpawnResult> {
-        self.spawn_rpc_inner(None).await
+        self.spawn_rpc_inner(None, None).await
     }
 
     /// Like [`spawn`], but also accepts incoming libp2p streams on
@@ -357,7 +357,18 @@ impl Cell {
     /// obtain the kernel's capability surface.  Without a signing key
     /// (ephemeral node), the raw membrane is served directly.
     pub async fn spawn_serving(self, control: libp2p_stream::Control) -> Result<SpawnResult> {
-        self.spawn_rpc_inner(Some(control)).await
+        self.spawn_rpc_inner(Some(control), None).await
+    }
+
+    /// Like [`spawn_serving`](Self::spawn_serving), but acknowledges when the
+    /// kernel has completed its export-policy boot gate and the incoming
+    /// stream acceptor has been installed.
+    pub async fn spawn_serving_with_ready(
+        self,
+        control: libp2p_stream::Control,
+        ready_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<SpawnResult> {
+        self.spawn_rpc_inner(Some(control), Some(ready_tx)).await
     }
 
     /// Execute the cell command and return the join handle plus data stream handles.
@@ -514,12 +525,13 @@ impl Cell {
 
     /// Execute the cell command and serve Cap'n Proto RPC over wetware streams.
     pub async fn spawn_with_streams_rpc(self) -> Result<SpawnResult> {
-        self.spawn_rpc_inner(None).await
+        self.spawn_rpc_inner(None, None).await
     }
 
     async fn spawn_rpc_inner(
         mut self,
         stream_control: Option<libp2p_stream::Control>,
+        serving_ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<SpawnResult> {
         let wasm_debug = self.wasm_debug;
         let network_state = self.network_state.clone();
@@ -633,6 +645,10 @@ impl Cell {
                     tokio::task::spawn_local(accept_capnp_streams(control, membrane));
                 }
             }
+        }
+
+        if let Some(ready_tx) = serving_ready_tx {
+            let _ = ready_tx.send(());
         }
 
         let exit_code = match join.await {

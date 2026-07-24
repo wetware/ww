@@ -1,7 +1,9 @@
 //! Admin HTTP server for node introspection.
 //!
-//! Serves a health check at `GET /healthz`, Prometheus metrics at `GET /metrics`, and host identity/address/NAT
-//! information at `GET /host/id`, `GET /host/addrs`, and `GET /host/nat`.
+//! Serves liveness/readiness checks at `GET /healthz` and `GET /readyz`,
+//! build provenance at `GET /version`, Prometheus metrics at `GET /metrics`,
+//! and host identity/address/NAT information at `GET /host/id`,
+//! `GET /host/addrs`, and `GET /host/nat`.
 //!
 //! Fuel metrics (`ww_cell_fuel_remaining`, `ww_cell_fuel_consumed_total`)
 //! are live from host-side [`FuelEstimator`] state.  Auction-specific
@@ -14,6 +16,78 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::ge
 use tokio::sync::watch;
 
 use crate::cell::engine::{WasmtimeCacheMetrics, WasmtimeCacheSnapshot, WasmtimeCacheState};
+
+/// Immutable build and artifact identity exposed by `GET /version`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct VersionInfo {
+    pub git_sha: String,
+    pub oci_image_id: Option<String>,
+    pub kernel_wasm_blake3: Option<String>,
+    pub shell_wasm_blake3: Option<String>,
+}
+
+/// Mutable process readiness shared between the boot path and admin server.
+#[derive(Clone, Debug)]
+pub struct RuntimeStatus {
+    inner: Arc<RwLock<RuntimeStatusSnapshot>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct RuntimeStatusSnapshot {
+    ready: bool,
+    phase: String,
+    degraded: bool,
+    degraded_reasons: Vec<String>,
+}
+
+impl RuntimeStatus {
+    pub fn starting() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(RuntimeStatusSnapshot {
+                ready: false,
+                phase: "starting".to_string(),
+                degraded: false,
+                degraded_reasons: Vec::new(),
+            })),
+        }
+    }
+
+    pub fn set_phase(&self, phase: impl Into<String>) {
+        if let Ok(mut status) = self.inner.write() {
+            status.phase = phase.into();
+            status.ready = false;
+        }
+    }
+
+    pub fn set_ready(&self) {
+        if let Ok(mut status) = self.inner.write() {
+            status.phase = "ready".to_string();
+            status.ready = true;
+        }
+    }
+
+    pub fn mark_degraded(&self, reason: impl Into<String>) {
+        if let Ok(mut status) = self.inner.write() {
+            let reason = reason.into();
+            status.degraded = true;
+            if !status.degraded_reasons.contains(&reason) {
+                status.degraded_reasons.push(reason);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> RuntimeStatusSnapshot {
+        self.inner
+            .read()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| RuntimeStatusSnapshot {
+                ready: false,
+                phase: "status-unavailable".to_string(),
+                degraded: true,
+                degraded_reasons: vec!["runtime status lock poisoned".to_string()],
+            })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Per-cell fuel snapshot
@@ -172,6 +246,8 @@ pub fn new_stream_metrics() -> StreamMetricsRegistry {
 struct AdminState {
     peer_id: String,
     network_state: rpc::NetworkState,
+    version_info: VersionInfo,
+    runtime_status: RuntimeStatus,
     fuel_registry: FuelRegistry,
     rpc_metrics: RpcMetricsRegistry,
     cache_metrics: CacheMetricsRegistry,
@@ -337,6 +413,49 @@ async fn healthz_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
+/// `GET /readyz` — reports whether the host has reached its serving phase.
+async fn readyz_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    let status = state.runtime_status.snapshot();
+    let code = if status.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let payload = serde_json::to_string(&status).unwrap_or_else(|_| {
+        r#"{"ready":false,"phase":"serialization-error","degraded":true}"#.to_string()
+    });
+    (
+        code,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        payload,
+    )
+}
+
+/// `GET /version` — returns source, image, and embedded artifact provenance.
+async fn version_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    let runtime = state.runtime_status.snapshot();
+    let cache = state.wasmtime_cache_metrics.snapshot();
+    let payload = serde_json::json!({
+        "git_sha": state.version_info.git_sha,
+        "oci_image_id": state.version_info.oci_image_id,
+        "kernel_wasm_blake3": state.version_info.kernel_wasm_blake3,
+        "shell_wasm_blake3": state.version_info.shell_wasm_blake3,
+        "degraded": runtime.degraded || cache.state == WasmtimeCacheState::Fallback,
+        "degraded_reasons": runtime.degraded_reasons,
+        "wasmtime_cache_state": cache.state.as_str(),
+    });
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        payload.to_string(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Host introspection handlers
 // ---------------------------------------------------------------------------
@@ -399,6 +518,8 @@ pub struct AdminService {
     pub listener: std::net::TcpListener,
     pub peer_id: String,
     pub network_state: rpc::NetworkState,
+    pub version_info: VersionInfo,
+    pub runtime_status: RuntimeStatus,
     pub fuel_registry: FuelRegistry,
     pub rpc_metrics: RpcMetricsRegistry,
     pub cache_metrics: CacheMetricsRegistry,
@@ -417,6 +538,8 @@ impl crate::services::Service for AdminService {
             let state = AdminState {
                 peer_id: self.peer_id,
                 network_state: self.network_state,
+                version_info: self.version_info,
+                runtime_status: self.runtime_status,
                 fuel_registry: self.fuel_registry,
                 rpc_metrics: self.rpc_metrics,
                 cache_metrics: self.cache_metrics,
@@ -426,6 +549,8 @@ impl crate::services::Service for AdminService {
 
             let app = Router::new()
                 .route("/healthz", get(healthz_handler))
+                .route("/readyz", get(readyz_handler))
+                .route("/version", get(version_handler))
                 .route("/metrics", get(metrics_handler))
                 .route("/host/id", get(host_id_handler))
                 .route("/host/addrs", get(host_addrs_handler))
@@ -460,6 +585,13 @@ mod tests {
         AdminState {
             peer_id: "12D3KooWTestPeerId".to_string(),
             network_state: rpc::NetworkState::new(),
+            version_info: VersionInfo {
+                git_sha: "0123456789abcdef".to_string(),
+                oci_image_id: Some("sha256:image".to_string()),
+                kernel_wasm_blake3: Some("kernel".to_string()),
+                shell_wasm_blake3: Some("shell".to_string()),
+            },
+            runtime_status: RuntimeStatus::starting(),
             fuel_registry: new_fuel_registry(),
             rpc_metrics: new_rpc_metrics(),
             cache_metrics: new_cache_metrics(),
@@ -476,6 +608,32 @@ mod tests {
             .await
             .expect("healthz response body");
         assert_eq!(&body[..], b"ok\n");
+    }
+
+    #[tokio::test]
+    async fn readyz_is_unavailable_until_runtime_is_ready() {
+        let state = test_state();
+        let response = readyz_handler(State(state.clone())).await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        state.runtime_status.set_ready();
+        let response = readyz_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn version_reports_provenance_and_cache_degradation() {
+        let state = test_state();
+        let response = version_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("version response body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("version JSON");
+        assert_eq!(value["git_sha"], "0123456789abcdef");
+        assert_eq!(value["oci_image_id"], "sha256:image");
+        assert_eq!(value["kernel_wasm_blake3"], "kernel");
+        assert_eq!(value["shell_wasm_blake3"], "shell");
     }
 
     #[test]

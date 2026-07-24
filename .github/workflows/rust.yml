@@ -19,6 +19,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  WW_BUILD_GIT_SHA: ${{ github.sha }}
 
 jobs:
   # === Path-based change detection (master push only) ===
@@ -83,9 +84,10 @@ jobs:
         bash tests/test_ipfs_release_publish_runtime.sh
         bash tests/test_release_ancestry.sh
         bash tests/test_deploy_context.sh
+        bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/check_release_ancestry.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_release_workflow.sh
+          shellcheck scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh
         fi
 
   clippy:
