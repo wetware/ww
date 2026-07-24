@@ -83,7 +83,8 @@ grep -Fq 'queue: max' "$WORKFLOW" \
   || fail "release concurrency must retain every pending master run"
 publish_job="$({
   awk '
-    /^  publish:/ { in_job = 1 }
+    /^  publish:/ { in_job = 1; print; next }
+    in_job && /^  [[:alnum:]_-]+:/ { exit }
     in_job { print }
   ' "$WORKFLOW"
 })"
@@ -96,6 +97,9 @@ grep -Fq 'echo "${{ github.sha }}" > "$STAGE/REVISION"' "$WORKFLOW" \
   || fail "published release trees must record their Git revision"
 grep -Fq "WW_RELEASE_EXPECTED_CURRENT='\$CURRENT_RELEASE'" "$WORKFLOW" \
   || fail "workflow must pass the observed IPNS release into the remote compare-and-set check"
+exact_key_matches="$(grep -Fc "awk '\\\$2 == \\\"ww-release\\\" { print \\\$1; exit }'" "$WORKFLOW")"
+[ "$exact_key_matches" -eq 2 ] \
+  || fail "workflow must select the ww-release key exactly in both read paths"
 
 grep -Fq 'ipfs add --pin=false -r --cid-version=1 -Q' "$MAKEFILE" \
   || fail "publish-std must disable implicit ipfs add pinning"

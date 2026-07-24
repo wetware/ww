@@ -80,11 +80,12 @@ jobs:
     - name: Check IPFS release publish scripts
       run: |
         bash tests/test_ipfs_release_publish.sh
+        bash tests/test_ipfs_release_publish_runtime.sh
         bash tests/test_release_ancestry.sh
         bash tests/test_deploy_context.sh
         bash tests/test_release_workflow.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/check_release_ancestry.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_release_workflow.sh
+          shellcheck scripts/check_release_ancestry.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_release_workflow.sh
         fi
 
   clippy:
@@ -536,7 +537,7 @@ jobs:
           for attempt in 1 2 3; do
             if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
               echo "Release freshness attempt $attempt could not find a Ready IPFS daemon pod" >&2
-            elif ! release=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs name resolve /ipns/\$(kubectl exec $POD -- ipfs key list -l | grep ww-release | awk '{print \$1}')"); then
+            elif ! release=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs name resolve /ipns/\$(kubectl exec $POD -- ipfs key list -l | awk '\$2 == \"ww-release\" { print \$1; exit }')"); then
               echo "Release freshness attempt $attempt could not resolve ww-release IPNS" >&2
             elif [[ ! "$release" =~ ^/ipfs/[A-Za-z0-9]+$ ]]; then
               echo "Release freshness attempt $attempt returned an invalid path: $release" >&2
@@ -669,7 +670,7 @@ jobs:
             for attempt in 1 2 3; do
               if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
                 echo "Previous-release fetch attempt $attempt could not find a non-terminating Ready IPFS daemon pod"
-              elif ! prev=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs name resolve /ipns/\$(kubectl exec $POD -- ipfs key list -l | grep ww-release | awk '{print \$1}')"); then
+              elif ! prev=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs name resolve /ipns/\$(kubectl exec $POD -- ipfs key list -l | awk '\$2 == \"ww-release\" { print \$1; exit }')"); then
                 echo "Previous-release fetch attempt $attempt could not resolve the IPNS release through $POD"
               elif [ -z "$prev" ]; then
                 echo "Previous-release fetch attempt $attempt resolved an empty IPNS release through $POD"
