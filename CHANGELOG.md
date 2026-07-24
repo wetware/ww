@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Cause-monitor cache health assertions.** `ww healthcheck
+  --require-cache-enabled` fails unless `/version` reports Wasmtime's
+  compilation cache as enabled with a successful in-process load or store.
+  `--require-cache-warm` additionally requires a cache load and therefore
+  proves reuse across processes; use it after a container restart to detect an
+  ephemeral or lost cache volume. These checks do not claim to detect every
+  later filesystem failure without another compilation attempt.
 - **Runtime health, readiness, and provenance contract.** The localhost admin
   plane now starts before Kubo-backed mount resolution and exposes
   `GET /readyz` plus `GET /version` (source revision, optional OCI runtime

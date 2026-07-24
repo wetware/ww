@@ -100,6 +100,7 @@ exec probes in the distroless deployment image.
 ww healthcheck
 ww healthcheck --ready
 ww healthcheck --ready --expect-git-sha "$EXPECTED_SHA"
+ww healthcheck --ready --require-cache-enabled
 ```
 
 | Flag | Default | Description |
@@ -107,6 +108,7 @@ ww healthcheck --ready --expect-git-sha "$EXPECTED_SHA"
 | `--admin <ADDR>` | `127.0.0.1:2026` | Admin listener to probe; also reads `WW_HTTP_ADMIN` |
 | `--ready` | off | Probe `/readyz` instead of `/healthz` |
 | `--expect-git-sha <SHA>` | unset | Also require `/version` to report the exact source revision |
+| `--require-cache-enabled` | off | Also require `/version` to report an enabled persistent Wasmtime cache with at least one hit or store |
 | `--timeout-secs <N>` | `2` | Per-request timeout |
 
 The command prints `ok` and exits zero only when every requested check passes.
