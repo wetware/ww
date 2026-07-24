@@ -448,6 +448,7 @@ async fn version_handler(State(state): State<AdminState>) -> impl IntoResponse {
         "wasmtime_cache_state": cache.state.as_str(),
         "wasmtime_cache_hits_total": cache.hits,
         "wasmtime_cache_stores_total": cache.stores,
+        "wasmtime_component_compilations_total": cache.component_compilations,
     });
     (
         [(
@@ -638,6 +639,7 @@ mod tests {
         assert_eq!(value["shell_wasm_blake3"], "shell");
         assert!(value["wasmtime_cache_hits_total"].is_u64());
         assert!(value["wasmtime_cache_stores_total"].is_u64());
+        assert!(value["wasmtime_component_compilations_total"].is_u64());
     }
 
     #[test]
