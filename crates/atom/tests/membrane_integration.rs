@@ -195,11 +195,12 @@ async fn test_membrane_graft_runtime_against_anvil() {
     let mut login_req = terminal.login_request();
     login_req.get().set_signer(signer_client);
     let login_resp = login_req.send().promise.await.expect("login RPC");
-    let membrane = login_resp
-        .get()
-        .expect("login results")
-        .get_session()
-        .expect("session");
+    let login_result = login_resp.get().expect("login results");
+    assert_eq!(
+        login_result.get_status().expect("known status"),
+        auth_capnp::LoginStatus::Granted
+    );
+    let membrane = login_result.get_session().expect("session");
 
     let graft_rpc_response = membrane
         .graft_request()
@@ -351,19 +352,13 @@ async fn test_terminal_wrong_key_rejected() {
     let mut login_req = terminal.login_request();
     login_req.get().set_signer(signer_client);
 
-    match login_req.send().promise.await {
-        Ok(resp) => match resp.get() {
-            Ok(_) => panic!("login should fail with wrong key"),
-            Err(e) => assert!(
-                e.to_string().contains("login auth failed"),
-                "error should mention login auth failure, got: {e}"
-            ),
-        },
-        Err(e) => assert!(
-            e.to_string().contains("login auth failed"),
-            "error should mention login auth failure, got: {e}"
-        ),
-    }
+    let response = login_req.send().promise.await.expect("typed login outcome");
+    let result = response.get().expect("login results");
+    assert_eq!(
+        result.get_status().expect("known status"),
+        auth_capnp::LoginStatus::Denied
+    );
+    assert!(result.get_session().is_err());
 }
 
 /// Terminal login without signer should fail.
@@ -383,19 +378,13 @@ async fn test_terminal_missing_signer_rejected() {
 
     // Call login without setting signer.
     let login_req = terminal.login_request();
-    match login_req.send().promise.await {
-        Ok(resp) => match resp.get() {
-            Ok(_) => panic!("login should fail without signer"),
-            Err(e) => assert!(
-                e.to_string().contains("missing signer"),
-                "error should mention missing signer, got: {e}"
-            ),
-        },
-        Err(e) => assert!(
-            e.to_string().contains("missing signer"),
-            "error should mention missing signer, got: {e}"
-        ),
-    }
+    let response = login_req.send().promise.await.expect("typed login outcome");
+    let result = response.get().expect("login results");
+    assert_eq!(
+        result.get_status().expect("known status"),
+        auth_capnp::LoginStatus::InvalidRequest
+    );
+    assert!(result.get_session().is_err());
 }
 
 /// Helper: create a Membrane client with all 5 capabilities populated.
@@ -514,11 +503,13 @@ async fn test_terminal_over_stream_pair() {
                 .expect("login timed out")
                 .expect("login RPC");
 
-            let remote_membrane: membrane_capnp::membrane::Client = login_resp
-                .get()
-                .expect("login results")
-                .get_session()
-                .expect("session");
+            let login_result = login_resp.get().expect("login results");
+            assert_eq!(
+                login_result.get_status().expect("known status"),
+                auth_capnp::LoginStatus::Granted
+            );
+            let remote_membrane: membrane_capnp::membrane::Client =
+                login_result.get_session().expect("session");
 
             let graft_resp = timeout(
                 Duration::from_secs(5),
@@ -603,21 +594,16 @@ async fn test_terminal_over_stream_wrong_key_rejected() {
             let mut login_req = remote_terminal.login_request();
             login_req.get().set_signer(signer_client);
 
-            let result = timeout(Duration::from_secs(5), login_req.send().promise).await;
-            match result {
-                Ok(Ok(resp)) => match resp.get() {
-                    Ok(_) => panic!("login should fail with wrong key"),
-                    Err(e) => assert!(
-                        e.to_string().contains("login auth failed"),
-                        "expected login auth failure error, got: {e}"
-                    ),
-                },
-                Ok(Err(e)) => assert!(
-                    e.to_string().contains("login auth failed"),
-                    "expected login auth failure error, got: {e}"
-                ),
-                Err(_) => panic!("login timed out — expected auth failure"),
-            }
+            let response = timeout(Duration::from_secs(5), login_req.send().promise)
+                .await
+                .expect("login timed out")
+                .expect("typed login outcome");
+            let result = response.get().expect("login results");
+            assert_eq!(
+                result.get_status().expect("known status"),
+                auth_capnp::LoginStatus::Denied
+            );
+            assert!(result.get_session().is_err());
         })
         .await;
 }
@@ -657,19 +643,13 @@ async fn test_terminal_malformed_signature_rejected() {
     let mut login_req = terminal.login_request();
     login_req.get().set_signer(signer_client);
 
-    match login_req.send().promise.await {
-        Ok(resp) => match resp.get() {
-            Ok(_) => panic!("login should fail with malformed signature"),
-            Err(e) => assert!(
-                e.to_string().contains("invalid signed envelope"),
-                "error should mention invalid signed envelope, got: {e}"
-            ),
-        },
-        Err(e) => assert!(
-            e.to_string().contains("invalid signed envelope"),
-            "error should mention invalid signed envelope, got: {e}"
-        ),
-    }
+    let response = login_req.send().promise.await.expect("typed login outcome");
+    let result = response.get().expect("login results");
+    assert_eq!(
+        result.get_status().expect("known status"),
+        auth_capnp::LoginStatus::InvalidProof
+    );
+    assert!(result.get_session().is_err());
 }
 
 /// Terminal login should fail after epoch advances (epoch-bound signature is stale).

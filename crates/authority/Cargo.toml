@@ -20,7 +20,7 @@ libp2p-core = { workspace = true }
 libp2p-identity = { version = "0.2", features = ["ed25519"] }
 rand = "0.8"
 auth = { path = "../guest/auth" }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

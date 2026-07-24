@@ -13,47 +13,198 @@ use crate::epoch::Epoch;
 use auth::SigningDomain;
 use capnp::capability::Promise;
 use capnp::Error;
+#[cfg(test)]
 use capnp_rpc::pry;
 use ed25519_dalek::VerifyingKey;
 use libp2p_core::SignedEnvelope;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
 use tokio::sync::watch;
 
-/// Policy for Terminal authentication decisions.
-///
-/// Called after signature verification and nonce check succeed.
-/// The policy decides authorization (is this key allowed?),
-/// not authentication (is the signature valid?).
-pub trait AuthPolicy: Send + 'static {
-    /// Check whether the authenticated key is authorized.
-    fn check(&self, verifying_key: &VerifyingKey) -> Result<(), capnp::Error>;
+/// Default upper bound for authorization backend work during a login.
+pub const DEFAULT_POLICY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// An identity whose challenge proof has already been verified by Terminal.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedIdentity {
+    verifying_key: VerifyingKey,
 }
 
-/// Accept only a specific verifying key. This is the pre-refactor behavior.
-pub struct VerifyingKeyPolicy {
-    pub expected: VerifyingKey,
-}
+impl AuthenticatedIdentity {
+    pub fn verifying_key(&self) -> &VerifyingKey {
+        &self.verifying_key
+    }
 
-impl AuthPolicy for VerifyingKeyPolicy {
-    fn check(&self, vk: &VerifyingKey) -> Result<(), capnp::Error> {
-        if vk.to_bytes() != self.expected.to_bytes() {
-            return Err(capnp::Error::failed(
-                "login auth failed: signing key does not match expected identity".into(),
-            ));
-        }
-        Ok(())
+    pub fn verifying_key_bytes(&self) -> [u8; 32] {
+        self.verifying_key.to_bytes()
     }
 }
 
-/// Accept any valid signature. Logs the verifying key for audit.
+/// The deployer-provided capability from which a policy constructs a login session.
+///
+/// Cloning the template clones only the capability reference. A policy that needs an
+/// isolated application instance must construct one explicitly.
+pub struct SessionTemplate<Session>
+where
+    Session: capnp::traits::Owned,
+{
+    session: <Session as capnp::traits::Owned>::Reader<'static>,
+}
+
+impl<Session> Clone for SessionTemplate<Session>
+where
+    Session: capnp::traits::Owned + 'static,
+    <Session as capnp::traits::Owned>::Reader<'static>: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            session: self.session.clone(),
+        }
+    }
+}
+
+impl<Session> SessionTemplate<Session>
+where
+    Session: capnp::traits::Owned,
+{
+    pub fn new(session: <Session as capnp::traits::Owned>::Reader<'static>) -> Self {
+        Self { session }
+    }
+
+    pub fn into_session(self) -> <Session as capnp::traits::Owned>::Reader<'static> {
+        self.session
+    }
+}
+
+/// A complete, owned authorization decision ready for one synchronous commit.
+///
+/// Policies must finish all I/O and capability construction before returning a grant.
+/// Consuming `self` in [`SessionGrant::commit`] makes a grant one-shot and keeps policy
+/// code from holding a mutable Cap'n Proto response across an await point.
+pub struct SessionGrant<Session>
+where
+    Session: capnp::traits::Owned,
+{
+    session: <Session as capnp::traits::Owned>::Reader<'static>,
+}
+
+impl<Session> SessionGrant<Session>
+where
+    Session: capnp::traits::Owned,
+{
+    pub fn new(session: <Session as capnp::traits::Owned>::Reader<'static>) -> Self {
+        Self { session }
+    }
+
+    pub fn from_template(template: SessionTemplate<Session>) -> Self {
+        Self::new(template.into_session())
+    }
+
+    fn commit(self, results: &mut auth_capnp::terminal::LoginResults<Session>) -> Result<(), Error>
+    where
+        <Session as capnp::traits::Owned>::Reader<'static>: capnp::traits::SetterInput<Session>,
+    {
+        let mut builder = results.get();
+        builder.set_status(auth_capnp::LoginStatus::Granted);
+        builder.set_detail("");
+        // Install the capability last. If this fallible operation fails, login
+        // returns an RPC exception rather than exposing a successful result.
+        builder.set_session(self.session)
+    }
+}
+
+/// Expected authorization outcomes. Internal bugs remain RPC exceptions.
+#[derive(Debug)]
+pub enum AuthorizationError {
+    Denied(String),
+    BackendUnavailable(String),
+    Overloaded(String),
+    Internal(Error),
+}
+
+impl AuthorizationError {
+    fn into_login_outcome(self) -> Result<(auth_capnp::LoginStatus, String), Error> {
+        match self {
+            Self::Denied(detail) => Ok((auth_capnp::LoginStatus::Denied, detail)),
+            Self::BackendUnavailable(detail) => {
+                Ok((auth_capnp::LoginStatus::BackendUnavailable, detail))
+            }
+            Self::Overloaded(detail) => Ok((auth_capnp::LoginStatus::Overloaded, detail)),
+            Self::Internal(error) => Err(error),
+        }
+    }
+}
+
+/// A local, possibly `!Send` authorization future.
+pub type LocalPolicyFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+
+/// Policy for constructing the authority session returned by Terminal.
+///
+/// Called only after signature, domain, nonce, and challenge-epoch verification.
+/// The policy may perform asynchronous backend I/O and must return a completed,
+/// owned grant. It never receives the mutable login response.
+pub trait AuthPolicy<Session>: 'static
+where
+    Session: capnp::traits::Owned,
+{
+    fn authorize<'a>(
+        &'a self,
+        identity: AuthenticatedIdentity,
+        template: SessionTemplate<Session>,
+    ) -> LocalPolicyFuture<'a, Result<SessionGrant<Session>, AuthorizationError>>;
+}
+
+/// Compatibility policy that returns the fixed template for one verifying key.
+pub struct FixedSessionPolicy {
+    expected: VerifyingKey,
+}
+
+impl FixedSessionPolicy {
+    pub fn new(expected: VerifyingKey) -> Self {
+        Self { expected }
+    }
+}
+
+impl<Session> AuthPolicy<Session> for FixedSessionPolicy
+where
+    Session: capnp::traits::Owned + 'static,
+{
+    fn authorize<'a>(
+        &'a self,
+        identity: AuthenticatedIdentity,
+        template: SessionTemplate<Session>,
+    ) -> LocalPolicyFuture<'a, Result<SessionGrant<Session>, AuthorizationError>> {
+        Box::pin(async move {
+            if identity.verifying_key_bytes() != self.expected.to_bytes() {
+                return Err(AuthorizationError::Denied(
+                    "signing key is not authorized".into(),
+                ));
+            }
+            Ok(SessionGrant::from_template(template))
+        })
+    }
+}
+
+/// Explicit compatibility policy that returns the fixed template to any valid signer.
 pub struct AllowAllPolicy;
 
-impl AuthPolicy for AllowAllPolicy {
-    fn check(&self, vk: &VerifyingKey) -> Result<(), capnp::Error> {
-        tracing::info!(
-            peer_key = hex::encode(vk.to_bytes()),
-            "access granted (allow-all policy)"
-        );
-        Ok(())
+impl<Session> AuthPolicy<Session> for AllowAllPolicy
+where
+    Session: capnp::traits::Owned + 'static,
+{
+    fn authorize<'a>(
+        &'a self,
+        identity: AuthenticatedIdentity,
+        template: SessionTemplate<Session>,
+    ) -> LocalPolicyFuture<'a, Result<SessionGrant<Session>, AuthorizationError>> {
+        Box::pin(async move {
+            tracing::info!(
+                peer_key = hex::encode(identity.verifying_key_bytes()),
+                "access granted (explicit allow-all policy)"
+            );
+            Ok(SessionGrant::from_template(template))
+        })
     }
 }
 
@@ -94,20 +245,22 @@ fn to_verifying_key(pk: libp2p_identity::ed25519::PublicKey) -> Result<Verifying
 /// the epoch binding stops stale-epoch replay, and the EpochGuard on issued
 /// capabilities provides a final runtime check at capability-use time.
 pub struct TerminalServer<Session: capnp::traits::Owned> {
-    policy: Box<dyn AuthPolicy>,
-    session: <Session as capnp::traits::Owned>::Reader<'static>,
+    policy: Box<dyn AuthPolicy<Session>>,
+    template: SessionTemplate<Session>,
     domain: SigningDomain,
     epoch_rx: watch::Receiver<Epoch>,
+    policy_timeout: Duration,
 }
 
 impl<Session> TerminalServer<Session>
 where
-    Session: capnp::traits::Owned,
+    Session: capnp::traits::Owned + 'static,
     <Session as capnp::traits::Owned>::Reader<'static>: Clone,
 {
     /// Create a new Terminal guarding the given session capability.
     ///
-    /// Uses `VerifyingKeyPolicy` — only the given key is accepted.
+    /// Uses [`FixedSessionPolicy`] — only the given key is accepted and each
+    /// successful login receives a fresh grant containing the fixed template.
     ///
     /// The `domain` determines the signing context for challenge-response auth.
     /// Different guarded capabilities should use different domains to prevent
@@ -122,7 +275,7 @@ where
         epoch_rx: watch::Receiver<Epoch>,
     ) -> Self {
         Self::with_policy(
-            Box::new(VerifyingKeyPolicy { expected: vk }),
+            Box::new(FixedSessionPolicy::new(vk)),
             session,
             domain,
             epoch_rx,
@@ -131,18 +284,42 @@ where
 
     /// Create a new Terminal with a custom auth policy.
     pub fn with_policy(
-        policy: Box<dyn AuthPolicy>,
+        policy: Box<dyn AuthPolicy<Session>>,
         session: <Session as capnp::traits::Owned>::Reader<'static>,
         domain: SigningDomain,
         epoch_rx: watch::Receiver<Epoch>,
     ) -> Self {
+        Self::with_policy_timeout(policy, session, domain, epoch_rx, DEFAULT_POLICY_TIMEOUT)
+    }
+
+    /// Create a Terminal with a custom policy and authorization deadline.
+    pub fn with_policy_timeout(
+        policy: Box<dyn AuthPolicy<Session>>,
+        session: <Session as capnp::traits::Owned>::Reader<'static>,
+        domain: SigningDomain,
+        epoch_rx: watch::Receiver<Epoch>,
+        policy_timeout: Duration,
+    ) -> Self {
         Self {
             policy,
-            session,
+            template: SessionTemplate::new(session),
             domain,
             epoch_rx,
+            policy_timeout,
         }
     }
+}
+
+fn set_login_outcome<Session>(
+    results: &mut auth_capnp::terminal::LoginResults<Session>,
+    status: auth_capnp::LoginStatus,
+    detail: &str,
+) where
+    Session: capnp::traits::Owned,
+{
+    let mut builder = results.get();
+    builder.set_status(status);
+    builder.set_detail(detail);
 }
 
 #[allow(refining_impl_trait)]
@@ -156,12 +333,19 @@ where
         params: auth_capnp::terminal::LoginParams<Session>,
         mut results: auth_capnp::terminal::LoginResults<Session>,
     ) -> Promise<(), Error> {
-        let signer: auth_capnp::signer::Client = match pry!(params.get()).get_signer() {
-            Ok(s) => s,
-            Err(_) => return Promise::err(Error::failed("missing signer".into())),
+        let signer: auth_capnp::signer::Client = match params.get().and_then(|p| p.get_signer()) {
+            Ok(signer) => signer,
+            Err(_) => {
+                set_login_outcome(
+                    &mut results,
+                    auth_capnp::LoginStatus::InvalidRequest,
+                    "missing signer",
+                );
+                return Promise::ok(());
+            }
         };
 
-        let session = self.session.clone();
+        let template = self.template.clone();
         let domain = self.domain.clone();
 
         // Read current epoch — the seq is bound into the signed challenge
@@ -179,45 +363,106 @@ where
             let sig_bytes = sign_resp.get()?.get_sig()?;
 
             // Decode the libp2p SignedEnvelope (RFC 0002).
-            let envelope = SignedEnvelope::from_protobuf_encoding(sig_bytes)
-                .map_err(|e| Error::failed(format!("invalid signed envelope: {e}")))?;
+            let envelope = match SignedEnvelope::from_protobuf_encoding(sig_bytes) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    set_login_outcome(
+                        &mut results,
+                        auth_capnp::LoginStatus::InvalidProof,
+                        &format!("invalid signed envelope: {error}"),
+                    );
+                    return Ok(());
+                }
+            };
 
             // Verify signature and extract payload + signing key.
             // This checks domain separation and payload type in one step.
-            let (payload, pubkey) = envelope
+            let (payload, pubkey) = match envelope
                 .payload_and_signing_key(domain.as_str().to_string(), domain.payload_type())
-                .map_err(|e| Error::failed(format!("login auth failed: {e}")))?;
+            {
+                Ok(verified) => verified,
+                Err(error) => {
+                    set_login_outcome(
+                        &mut results,
+                        auth_capnp::LoginStatus::InvalidProof,
+                        &format!("signature verification failed: {error}"),
+                    );
+                    return Ok(());
+                }
+            };
 
             // Check the nonce || epoch_seq matches our challenge.
             let mut expected_payload = Vec::with_capacity(16);
             expected_payload.extend_from_slice(&nonce.to_be_bytes());
             expected_payload.extend_from_slice(&epoch_seq.to_be_bytes());
             if payload != expected_payload {
-                return Err(Error::failed(
-                    "login auth failed: challenge mismatch".into(),
-                ));
-            }
-
-            // Verify the epoch hasn't advanced since we issued the challenge.
-            // This closes the race where the epoch changes between challenge
-            // issuance and response verification.
-            let current_seq = self.epoch_rx.borrow().seq;
-            if current_seq != epoch_seq {
-                return Err(Error::failed(
-                    "login auth failed: epoch advanced during authentication".into(),
-                ));
+                set_login_outcome(
+                    &mut results,
+                    auth_capnp::LoginStatus::InvalidProof,
+                    "challenge mismatch",
+                );
+                return Ok(());
             }
 
             // Extract the ed25519 key and delegate authorization to the policy.
-            let envelope_ed = pubkey
-                .clone()
-                .try_into_ed25519()
-                .map_err(|_| Error::failed("login auth failed: not an ed25519 key".into()))?;
-            let vk = to_verifying_key(envelope_ed)?;
-            self.policy.check(&vk)?;
+            let envelope_ed = match pubkey.clone().try_into_ed25519() {
+                Ok(key) => key,
+                Err(_) => {
+                    set_login_outcome(
+                        &mut results,
+                        auth_capnp::LoginStatus::InvalidProof,
+                        "signing key is not Ed25519",
+                    );
+                    return Ok(());
+                }
+            };
+            let verifying_key = match to_verifying_key(envelope_ed) {
+                Ok(key) => key,
+                Err(error) => {
+                    set_login_outcome(
+                        &mut results,
+                        auth_capnp::LoginStatus::InvalidProof,
+                        &error.to_string(),
+                    );
+                    return Ok(());
+                }
+            };
+            let identity = AuthenticatedIdentity { verifying_key };
 
-            results.get().set_session(session)?;
-            Ok(())
+            let grant = match tokio::time::timeout(
+                self.policy_timeout,
+                self.policy.authorize(identity, template),
+            )
+            .await
+            {
+                Ok(Ok(grant)) => grant,
+                Ok(Err(error)) => {
+                    let (status, detail) = error.into_login_outcome()?;
+                    set_login_outcome(&mut results, status, &detail);
+                    return Ok(());
+                }
+                Err(_) => {
+                    set_login_outcome(
+                        &mut results,
+                        auth_capnp::LoginStatus::TimedOut,
+                        "authorization policy timed out",
+                    );
+                    return Ok(());
+                }
+            };
+
+            // Recheck after all asynchronous policy work and immediately before
+            // the synchronous one-shot commit.
+            if self.epoch_rx.borrow().seq != epoch_seq {
+                set_login_outcome(
+                    &mut results,
+                    auth_capnp::LoginStatus::StaleEpoch,
+                    "epoch advanced during authentication",
+                );
+                return Ok(());
+            }
+
+            grant.commit(&mut results)
         })
     }
 }
@@ -226,7 +471,11 @@ where
 mod tests {
     use super::*;
     use crate::membrane_capnp;
+    use crate::test_session_capnp::{leaf, structured_session};
+    use capnp::capability::Rc as CapRc;
     use ed25519_dalek::SigningKey;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     fn test_epoch(seq: u64) -> Epoch {
         Epoch {
@@ -380,10 +629,17 @@ mod tests {
                 let mut req = terminal.login_request();
                 req.get().set_signer(signer);
 
-                req.send()
+                let response = req
+                    .send()
                     .promise
                     .await
                     .expect("login should succeed with matching epoch");
+                let result = response.get().expect("login results");
+                assert_eq!(
+                    result.get_status().expect("known status"),
+                    auth_capnp::LoginStatus::Granted
+                );
+                result.get_session().expect("granted session");
             })
             .await;
     }
@@ -409,19 +665,16 @@ mod tests {
                 let mut req = terminal.login_request();
                 req.get().set_signer(signer);
 
-                match req.send().promise.await {
-                    Ok(resp) => match resp.get() {
-                        Ok(_) => panic!("login should fail with wrong epoch_seq"),
-                        Err(e) => assert!(
-                            e.to_string().contains("challenge mismatch"),
-                            "expected challenge mismatch, got: {e}"
-                        ),
-                    },
-                    Err(e) => assert!(
-                        e.to_string().contains("challenge mismatch"),
-                        "expected challenge mismatch, got: {e}"
-                    ),
-                }
+                let response = req.send().promise.await.expect("typed login outcome");
+                let result = response.get().expect("login results");
+                assert_eq!(
+                    result.get_status().expect("known status"),
+                    auth_capnp::LoginStatus::InvalidProof
+                );
+                assert!(
+                    result.get_session().is_err(),
+                    "invalid proof must not return a session"
+                );
             })
             .await;
     }
@@ -491,21 +744,329 @@ mod tests {
                 let mut req = terminal.login_request();
                 req.get().set_signer(signer);
 
-                match req.send().promise.await {
-                    Ok(resp) => match resp.get() {
-                        Ok(_) => panic!("login should fail when epoch advances during auth"),
-                        Err(e) => assert!(
-                            e.to_string()
-                                .contains("epoch advanced during authentication"),
-                            "expected epoch-advanced error, got: {e}"
-                        ),
-                    },
-                    Err(e) => assert!(
-                        e.to_string()
-                            .contains("epoch advanced during authentication"),
-                        "expected epoch-advanced error, got: {e}"
+                let response = req.send().promise.await.expect("typed login outcome");
+                let result = response.get().expect("login results");
+                assert_eq!(
+                    result.get_status().expect("known status"),
+                    auth_capnp::LoginStatus::StaleEpoch
+                );
+                assert!(
+                    result.get_session().is_err(),
+                    "stale login must not return a session"
+                );
+            })
+            .await;
+    }
+
+    struct LeafServer(&'static str);
+
+    impl leaf::Server for LeafServer {
+        fn read(
+            self: CapRc<Self>,
+            _params: leaf::ReadParams,
+            mut results: leaf::ReadResults,
+        ) -> impl Future<Output = Result<(), Error>> + 'static {
+            results.get().set_value(self.0);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    struct StructuredSessionServer {
+        first: Option<leaf::Client>,
+        second: Option<leaf::Client>,
+    }
+
+    impl structured_session::Server for StructuredSessionServer {
+        fn capabilities(
+            self: CapRc<Self>,
+            _params: structured_session::CapabilitiesParams,
+            mut results: structured_session::CapabilitiesResults,
+        ) -> impl Future<Output = Result<(), Error>> + 'static {
+            let mut builder = results.get();
+            if let Some(first) = &self.first {
+                builder.set_first(first.clone());
+            }
+            if let Some(second) = &self.second {
+                builder.set_second(second.clone());
+            }
+            std::future::ready(Ok(()))
+        }
+    }
+
+    fn structured_session(
+        first: &'static str,
+        second: Option<&'static str>,
+    ) -> structured_session::Client {
+        capnp_rpc::new_client(StructuredSessionServer {
+            first: Some(capnp_rpc::new_client(LeafServer(first))),
+            second: second.map(|value| capnp_rpc::new_client(LeafServer(value))),
+        })
+    }
+
+    fn structured_terminal(
+        policy: Box<dyn AuthPolicy<structured_session::Owned>>,
+        template: structured_session::Client,
+        timeout: Duration,
+    ) -> auth_capnp::terminal::Client<structured_session::Owned> {
+        let (_tx, rx) = watch::channel(test_epoch(1));
+        capnp_rpc::new_client(TerminalServer::with_policy_timeout(
+            policy,
+            template,
+            SigningDomain::terminal_membrane(),
+            rx,
+            timeout,
+        ))
+    }
+
+    async fn structured_login(
+        terminal: &auth_capnp::terminal::Client<structured_session::Owned>,
+        signing_key: &SigningKey,
+    ) -> capnp::capability::Response<
+        auth_capnp::terminal::login_results::Owned<structured_session::Owned>,
+    > {
+        let signer: auth_capnp::signer::Client =
+            capnp_rpc::new_client(TestSigner::from_ed25519(signing_key));
+        let mut request = terminal.login_request();
+        request.get().set_signer(signer);
+        request.send().promise.await.expect("login RPC")
+    }
+
+    struct ReplacementPolicy {
+        replacement: structured_session::Client,
+        called: Rc<Cell<bool>>,
+    }
+
+    impl AuthPolicy<structured_session::Owned> for ReplacementPolicy {
+        fn authorize<'a>(
+            &'a self,
+            _identity: AuthenticatedIdentity,
+            _template: SessionTemplate<structured_session::Owned>,
+        ) -> LocalPolicyFuture<
+            'a,
+            Result<SessionGrant<structured_session::Owned>, AuthorizationError>,
+        > {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                self.called.set(true);
+                Ok(SessionGrant::new(self.replacement.clone()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn async_local_policy_can_replace_and_withhold_structured_capabilities() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let called = Rc::new(Cell::new(false));
+                let terminal = structured_terminal(
+                    Box::new(ReplacementPolicy {
+                        replacement: structured_session("replacement", None),
+                        called: Rc::clone(&called),
+                    }),
+                    structured_session("template-first", Some("template-second")),
+                    Duration::from_secs(1),
+                );
+                let key = SigningKey::generate(&mut rand::rngs::OsRng);
+
+                let login = structured_login(&terminal, &key).await;
+                let result = login.get().expect("login results");
+                assert_eq!(
+                    result.get_status().expect("known status"),
+                    auth_capnp::LoginStatus::Granted
+                );
+                assert!(called.get());
+
+                let session = result.get_session().expect("granted session");
+                let caps = session
+                    .capabilities_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("capabilities RPC");
+                let caps = caps.get().expect("capabilities results");
+                assert!(caps.has_first());
+                assert!(!caps.has_second(), "policy must be able to withhold a cap");
+
+                let value = caps
+                    .get_first()
+                    .expect("first cap")
+                    .read_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("read RPC");
+                assert_eq!(
+                    value
+                        .get()
+                        .expect("read results")
+                        .get_value()
+                        .expect("value")
+                        .to_str()
+                        .expect("utf-8"),
+                    "replacement"
+                );
+            })
+            .await;
+    }
+
+    enum ExpectedPolicyFailure {
+        Denied,
+        BackendUnavailable,
+        Overloaded,
+    }
+
+    struct FailingPolicy(ExpectedPolicyFailure);
+
+    impl AuthPolicy<structured_session::Owned> for FailingPolicy {
+        fn authorize<'a>(
+            &'a self,
+            _identity: AuthenticatedIdentity,
+            _template: SessionTemplate<structured_session::Owned>,
+        ) -> LocalPolicyFuture<
+            'a,
+            Result<SessionGrant<structured_session::Owned>, AuthorizationError>,
+        > {
+            Box::pin(async move {
+                Err(match self.0 {
+                    ExpectedPolicyFailure::Denied => {
+                        AuthorizationError::Denied("not authorized".into())
+                    }
+                    ExpectedPolicyFailure::BackendUnavailable => {
+                        AuthorizationError::BackendUnavailable("database unavailable".into())
+                    }
+                    ExpectedPolicyFailure::Overloaded => {
+                        AuthorizationError::Overloaded("policy queue full".into())
+                    }
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn expected_policy_failures_are_typed_and_sessionless() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let key = SigningKey::generate(&mut rand::rngs::OsRng);
+                for (failure, expected) in [
+                    (
+                        ExpectedPolicyFailure::Denied,
+                        auth_capnp::LoginStatus::Denied,
                     ),
+                    (
+                        ExpectedPolicyFailure::BackendUnavailable,
+                        auth_capnp::LoginStatus::BackendUnavailable,
+                    ),
+                    (
+                        ExpectedPolicyFailure::Overloaded,
+                        auth_capnp::LoginStatus::Overloaded,
+                    ),
+                ] {
+                    let terminal = structured_terminal(
+                        Box::new(FailingPolicy(failure)),
+                        structured_session("template", Some("second")),
+                        Duration::from_secs(1),
+                    );
+                    let response = structured_login(&terminal, &key).await;
+                    let result = response.get().expect("login results");
+                    assert_eq!(result.get_status().expect("known status"), expected);
+                    assert!(result.get_session().is_err());
                 }
+            })
+            .await;
+    }
+
+    struct DropSignal(Rc<Cell<bool>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    struct HangingPolicy {
+        dropped: Rc<Cell<bool>>,
+    }
+
+    impl AuthPolicy<structured_session::Owned> for HangingPolicy {
+        fn authorize<'a>(
+            &'a self,
+            _identity: AuthenticatedIdentity,
+            _template: SessionTemplate<structured_session::Owned>,
+        ) -> LocalPolicyFuture<
+            'a,
+            Result<SessionGrant<structured_session::Owned>, AuthorizationError>,
+        > {
+            Box::pin(async move {
+                let _drop_signal = DropSignal(Rc::clone(&self.dropped));
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_timeout_is_typed_and_drops_the_local_future() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let dropped = Rc::new(Cell::new(false));
+                let terminal = structured_terminal(
+                    Box::new(HangingPolicy {
+                        dropped: Rc::clone(&dropped),
+                    }),
+                    structured_session("template", Some("second")),
+                    Duration::from_millis(1),
+                );
+                let key = SigningKey::generate(&mut rand::rngs::OsRng);
+
+                let response = structured_login(&terminal, &key).await;
+                let result = response.get().expect("login results");
+                assert_eq!(
+                    result.get_status().expect("known status"),
+                    auth_capnp::LoginStatus::TimedOut
+                );
+                assert!(result.get_session().is_err());
+                assert!(dropped.get(), "timeout must drop the local policy future");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn flat_login_result_preserves_session_pipelining() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let key = SigningKey::generate(&mut rand::rngs::OsRng);
+                let terminal = structured_terminal(
+                    Box::new(FixedSessionPolicy::new(key.verifying_key())),
+                    structured_session("pipelined", Some("second")),
+                    Duration::from_secs(1),
+                );
+                let signer: auth_capnp::signer::Client =
+                    capnp_rpc::new_client(TestSigner::from_ed25519(&key));
+                let mut request = terminal.login_request();
+                request.get().set_signer(signer);
+
+                let remote = request.send();
+                let pipelined_session = remote.pipeline.get_session();
+                let pipelined_call = pipelined_session.capabilities_request().send();
+                let (login, capabilities) = tokio::join!(remote.promise, pipelined_call.promise);
+
+                let login = login.expect("login RPC");
+                assert_eq!(
+                    login
+                        .get()
+                        .expect("login results")
+                        .get_status()
+                        .expect("known status"),
+                    auth_capnp::LoginStatus::Granted
+                );
+                let capabilities = capabilities.expect("pipelined capabilities RPC");
+                assert!(capabilities
+                    .get()
+                    .expect("capabilities results")
+                    .has_first());
             })
             .await;
     }

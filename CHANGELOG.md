@@ -19,6 +19,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`wetware-membrane`: production membrane recursion (identity, flush, reentry, collapse, bench).** The membrane now preserves capability identity across round-trips and folds stacked attenuations. A data-segment sentinel `get_brand` plus a `get_ptr`-keyed registry lets it recognise its own membranes without `Any` (and without colliding with capnp-rpc connection brands, so caps can't tunnel through the filter). A call parameter that is one of our own membranes is unwrapped to the bare backing cap before reaching the backend, restoring the identity the backend exported (foreign params pass through). Results-copy failures mid-answer now surface as the call's error via an explicit flush outcome instead of a silent empty result. Attenuating an already-membraned cap collapses to a single layer when both policies are static allowlists (intersection of key sets via the new `Policy::allowlist_keys`); stateful policies stack so their per-call state survives. Adds `benches/membrane.rs`: per-call overhead is sub-microsecond and constant per hop (ping +~357 ns, cap-returning child +~437 ns), so upstream capnp cap-table work stays deferred.
 
 ### Changed
+- **Terminal authorization now constructs typed sessions asynchronously.**
+  `AuthPolicy<Session>::authorize` receives the verified login identity and a
+  deployer-supplied session template, then returns an owned, one-shot
+  `SessionGrant`. Terminal bounds policy work with a configurable deadline,
+  rechecks the epoch after asynchronous work, and commits the completed grant
+  synchronously. Expected outcomes use `LoginStatus` (`granted`, `denied`,
+  `invalidRequest`, `invalidProof`, `staleEpoch`, `backendUnavailable`,
+  `timedOut`, or `overloaded`) alongside non-normative detail; transport and
+  internal failures remain RPC exceptions. The fixed-session constructor is
+  retained explicitly as a compatibility policy.
 - **Authority and membrane crate names now match their roles.** The
   authentication/epoch/session crate is now `wetware-authority` (`authority`,
   `crates/authority`), while the hook-level call-filtering crate is now

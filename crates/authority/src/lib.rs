@@ -47,6 +47,38 @@ pub mod http_capnp {
     include!(concat!(env!("OUT_DIR"), "/capnp/http_capnp.rs"));
 }
 
+/// Implement Cap'n Proto promise-pipeline conversion for a generated capability client.
+///
+/// `capnpc` 0.25 declares capability interfaces as pipelined but does not emit the
+/// corresponding `FromTypelessPipeline` implementation for their generated clients.
+/// Terminal session interfaces need that implementation for
+/// `login_request().send().pipeline.get_session()` to be callable. Invoke this macro in
+/// the crate that owns a generated session client until the upstream generator emits it.
+#[macro_export]
+macro_rules! impl_terminal_session_pipeline {
+    ($client:path) => {
+        impl ::capnp::capability::FromTypelessPipeline for $client {
+            fn new(typeless: ::capnp::any_pointer::Pipeline) -> Self {
+                <Self as ::capnp::capability::FromClientHook>::new(typeless.as_cap())
+            }
+        }
+    };
+}
+
+impl_terminal_session_pipeline!(membrane_capnp::membrane::Client);
+
+#[cfg(test)]
+#[allow(clippy::all, dead_code, unreachable_pub)]
+mod test_session_capnp {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/crates/authority/test_session_capnp.rs"
+    ));
+}
+
+#[cfg(test)]
+impl_terminal_session_pipeline!(test_session_capnp::structured_session::Client);
+
 /// Canonical Schema.Node bytes for each grafted capability interface.
 /// These back the `schema`/`doc`/`help` introspection builtins, not authority.
 pub mod schema_registry {
@@ -189,4 +221,7 @@ pub mod terminal;
 
 pub use epoch::{Epoch, EpochGuard, Provenance};
 pub use membrane::{membrane_client, GraftBuilder, MembraneServer, NoExtension};
-pub use terminal::{AllowAllPolicy, AuthPolicy, TerminalServer, VerifyingKeyPolicy};
+pub use terminal::{
+    AllowAllPolicy, AuthPolicy, AuthenticatedIdentity, AuthorizationError, FixedSessionPolicy,
+    LocalPolicyFuture, SessionGrant, SessionTemplate, TerminalServer, DEFAULT_POLICY_TIMEOUT,
+};

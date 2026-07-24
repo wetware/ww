@@ -588,10 +588,21 @@ async fn dial_shell(
         .await
         .context("terminal login timed out")??;
 
-    let membrane = login_resp
-        .get()?
+    let login_result = login_resp.get()?;
+    let login_status = login_result
+        .get_status()
+        .map_err(|status| anyhow::anyhow!("terminal returned unknown login status: {status:?}"))?;
+    if login_status != ww::auth_capnp::LoginStatus::Granted {
+        let detail = login_result
+            .get_detail()
+            .ok()
+            .and_then(|text| text.to_str().ok())
+            .unwrap_or("no diagnostic detail");
+        anyhow::bail!("terminal login {login_status:?}: {detail}");
+    }
+    let membrane = login_result
         .get_session()
-        .context("terminal login returned no session")?;
+        .context("granted terminal login returned no session")?;
 
     let graft_resp = tokio::time::timeout(RPC_TIMEOUT, membrane.graft_request().send().promise)
         .await

@@ -15,6 +15,7 @@ fn main() {
         .file(capnp_dir.join("membrane.capnp"))
         .file(capnp_dir.join("stem.capnp"))
         .file(capnp_dir.join("http.capnp"))
+        .file("test_session.capnp")
         .raw_code_generator_request_path(&raw_request)
         .run()
         .expect("capnp compile schemas");
@@ -44,4 +45,5 @@ fn main() {
             capnp_dir.join(format!("{schema}.capnp")).display()
         );
     }
+    println!("cargo:rerun-if-changed=test_session.capnp");
 }

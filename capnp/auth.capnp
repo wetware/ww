@@ -22,11 +22,29 @@ interface Identity @0xa7c200e5b4726d89 {
   # The signature is the 64-byte Ed25519 signature.
 }
 
+enum LoginStatus @0xb8b4d9a87c2e6f31 {
+  granted           @0;
+  denied            @1;
+  invalidRequest    @2;
+  invalidProof      @3;
+  staleEpoch        @4;
+  backendUnavailable @5;
+  timedOut          @6;
+  overloaded        @7;
+}
+
 interface Terminal @0xeae8840b2a898ba9 (Session) {
-  login @0 (signer :Signer) -> (session :Session);
+  login @0 (signer :Signer) -> (
+    session :Session,
+    status :LoginStatus,
+    detail :Text
+  );
   # Authenticate via epoch-bound challenge-response. The Terminal generates
   # a random nonce + current epoch seq, the Signer signs both, and the
   # Terminal verifies the signature, nonce, epoch freshness, and auth policy.
+  # `session` is present only when `status` is `granted`. Callers MUST route on
+  # `status`; `detail` is diagnostic prose and is not a machine-readable API.
+  # Transport failures and internal invariant violations remain RPC errors.
   # Having a Terminal reference does NOT grant access -- the caller must prove
   # identity by signing the challenge with the expected key.
 }
