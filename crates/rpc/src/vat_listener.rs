@@ -296,7 +296,6 @@ async fn handle_authenticated_vat_connection(
 
     tokio::select! {
         biased;
-        _ = &mut deadline => AuthenticatedConnectionOutcome::LoginTimedOut,
         result = granted_rx => {
             if result.is_ok() {
                 let _ = rpc_system.await;
@@ -305,6 +304,7 @@ async fn handle_authenticated_vat_connection(
                 AuthenticatedConnectionOutcome::ConnectionClosed
             }
         }
+        _ = &mut deadline => AuthenticatedConnectionOutcome::LoginTimedOut,
         _ = rpc_system.as_mut() => {
             tracing::debug!(protocol, "authenticated vat peer disconnected before login");
             AuthenticatedConnectionOutcome::ConnectionClosed
@@ -328,4 +328,46 @@ pub async fn handle_vat_connection_serve(
     tracing::debug!(protocol, "vat peer disconnected");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use authority::{Epoch, Provenance};
+    use tokio::sync::{oneshot, watch};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    #[tokio::test]
+    async fn committed_login_wins_a_deadline_tie() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_epoch_tx, epoch_rx) = watch::channel(Epoch {
+                    seq: 1,
+                    head: vec![1],
+                    provenance: Provenance::Block(1),
+                });
+                let bootstrap = authority::membrane_client(epoch_rx);
+                let (server_stream, peer_stream) = tokio::io::duplex(64);
+                let (granted_tx, granted_rx) = oneshot::channel();
+                granted_tx.send(()).expect("pre-commit grant signal");
+                drop(peer_stream);
+
+                let outcome = handle_authenticated_vat_connection(
+                    bootstrap.client,
+                    server_stream.compat(),
+                    "deadline-tie",
+                    granted_rx,
+                    Duration::ZERO,
+                )
+                .await;
+
+                assert_eq!(
+                    outcome,
+                    AuthenticatedConnectionOutcome::Authenticated,
+                    "a synchronously observable grant must win over an expiring deadline"
+                );
+            })
+            .await;
+    }
 }

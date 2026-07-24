@@ -232,11 +232,15 @@ flow through one node on separate streams. `host :serve-raw-vat` is the
 conspicuous unauthenticated escape hatch for services that deliberately do
 not need recipient authentication.
 
-Authenticated VAT admission has a per-service connection budget and closes
-streams that do not complete Terminal login before the configured deadline.
-This bounds per-connection resource use; it is not Sybil-resistant
-availability or a fairness guarantee. The budget is intentionally not an
-account authorization rule, and per-peer/per-principal quotas are deferred.
+Authenticated VAT admission closes streams that do not complete Terminal
+login before the configured deadline. Services published through one
+`VatListener` share that listener's connection budget by default, so a busy
+service can consume admission capacity that another service would otherwise
+use. Embedded callers may construct separate listeners or inject
+service-specific budgets. This bounds per-connection resource use; it is not
+Sybil-resistant availability or a fairness guarantee. The budget is
+intentionally not an account authorization rule, and per-peer/per-principal
+quotas are deferred.
 
 ## Configuration
 

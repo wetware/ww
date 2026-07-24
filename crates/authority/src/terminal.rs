@@ -812,6 +812,109 @@ mod tests {
             .await;
     }
 
+    struct CoordinatedPolicy {
+        expected: VerifyingKey,
+        barrier: Rc<tokio::sync::Barrier>,
+        authorizations: Rc<Cell<usize>>,
+    }
+
+    impl AuthPolicy<membrane_capnp::membrane::Owned> for CoordinatedPolicy {
+        fn authorize<'a>(
+            &'a self,
+            identity: AuthenticatedIdentity,
+            template: SessionTemplate<membrane_capnp::membrane::Owned>,
+        ) -> LocalPolicyFuture<
+            'a,
+            Result<SessionGrant<membrane_capnp::membrane::Owned>, AuthorizationError>,
+        > {
+            Box::pin(async move {
+                if identity.verifying_key_bytes() != self.expected.to_bytes() {
+                    return Err(AuthorizationError::Denied(
+                        "signing key is not authorized".into(),
+                    ));
+                }
+                self.authorizations.set(self.authorizations.get() + 1);
+                self.barrier.wait().await;
+                Ok(SessionGrant::from_template(template))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn single_use_terminal_commits_at_most_one_concurrent_login() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let key = SigningKey::generate(&mut rand::rngs::OsRng);
+                let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
+                let membrane = crate::membrane::membrane_client(epoch_rx.clone());
+                let authorizations = Rc::new(Cell::new(0));
+                let terminal = TerminalServer::with_policy(
+                    Box::new(CoordinatedPolicy {
+                        expected: key.verifying_key(),
+                        barrier: Rc::new(tokio::sync::Barrier::new(2)),
+                        authorizations: Rc::clone(&authorizations),
+                    }),
+                    membrane,
+                    SigningDomain::terminal_membrane(),
+                    epoch_rx,
+                )
+                .single_use();
+                let terminal: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+                    capnp_rpc::new_client(terminal);
+
+                let mut first = terminal.login_request();
+                first
+                    .get()
+                    .set_signer(capnp_rpc::new_client(TestSigner::from_ed25519(&key)));
+                let mut second = terminal.login_request();
+                second
+                    .get()
+                    .set_signer(capnp_rpc::new_client(TestSigner::from_ed25519(&key)));
+
+                let (first, second) = tokio::join!(first.send().promise, second.send().promise);
+                let first = first.expect("first concurrent login");
+                let second = second.expect("second concurrent login");
+                let first = first.get().expect("first concurrent login results");
+                let second = second.get().expect("second concurrent login results");
+                let statuses = [
+                    first.get_status().expect("known first status"),
+                    second.get_status().expect("known second status"),
+                ];
+
+                assert_eq!(
+                    authorizations.get(),
+                    2,
+                    "both requests must reach policy before the commit race"
+                );
+                assert_eq!(
+                    statuses
+                        .iter()
+                        .filter(|status| **status == auth_capnp::LoginStatus::Granted)
+                        .count(),
+                    1,
+                    "exactly one concurrent login may commit a session"
+                );
+                assert_eq!(
+                    statuses
+                        .iter()
+                        .filter(|status| **status == auth_capnp::LoginStatus::Denied)
+                        .count(),
+                    1,
+                    "the losing concurrent login must be denied"
+                );
+                assert_eq!(
+                    [first.has_session(), second.has_session()]
+                        .into_iter()
+                        .filter(|has_session| *has_session)
+                        .count(),
+                    1,
+                    "only the granted response may carry a session"
+                );
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn grant_notifier_fires_only_after_successful_commit() {
         let local = tokio::task::LocalSet::new();
@@ -1291,6 +1394,42 @@ mod tests {
                     .get()
                     .expect("capabilities results")
                     .has_first());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn denied_login_breaks_pipelined_session_calls() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let key = SigningKey::generate(&mut rand::rngs::OsRng);
+                let terminal = structured_terminal(
+                    Box::new(FailingPolicy(ExpectedPolicyFailure::Denied)),
+                    structured_session("must-not-leak", Some("second")),
+                    Duration::from_secs(1),
+                );
+                let signer: auth_capnp::signer::Client =
+                    capnp_rpc::new_client(TestSigner::from_ed25519(&key));
+                let mut request = terminal.login_request();
+                request.get().set_signer(signer);
+
+                let remote = request.send();
+                let pipelined_session = remote.pipeline.get_session();
+                let pipelined_call = pipelined_session.capabilities_request().send();
+                let (login, capabilities) = tokio::join!(remote.promise, pipelined_call.promise);
+
+                let login = login.expect("typed login denial");
+                let login = login.get().expect("login results");
+                assert_eq!(
+                    login.get_status().expect("known status"),
+                    auth_capnp::LoginStatus::Denied
+                );
+                assert!(!login.has_session(), "denied login must be sessionless");
+                assert!(
+                    capabilities.is_err(),
+                    "a call pipelined through a denied session must fail closed"
+                );
             })
             .await;
     }

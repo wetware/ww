@@ -23,8 +23,9 @@ interface Identity @0xa7c200e5b4726d89 {
 }
 
 enum LoginStatus @0xb8b4d9a87c2e6f31 {
-  # Keep the wire default fail-closed. Older peers decode granted @8 as an
-  # unknown value; newer peers decode an omitted/legacy @0 as uninitialized.
+  # Keep the wire default fail-closed: an omitted or zero-initialized status is
+  # never interpreted as a grant, and future enum extensions cannot make @0
+  # authorize a session accidentally.
   uninitialized     @0;
   denied            @1;
   invalidRequest    @2;

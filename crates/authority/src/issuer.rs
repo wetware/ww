@@ -278,7 +278,13 @@ impl auth_capnp::authority::Server for AuthorityServer {
 
 #[cfg(test)]
 mod tests {
+    use auth::SigningDomain;
+    use call_guard::{call_failure_code, CallFailureCode};
+    use capnp::capability::Promise;
     use capnp::traits::HasTypeId;
+    use capnp_rpc::pry;
+    use ed25519_dalek::SigningKey;
+    use libp2p_core::SignedEnvelope;
 
     use super::*;
     use crate::{membrane_capnp, membrane_client, Provenance};
@@ -309,6 +315,45 @@ mod tests {
         let mut recipient = recipients.reborrow().get(0);
         recipient.set_verifying_key(key);
         recipient.set_profile(recipient_profile);
+    }
+
+    struct TestSigner {
+        keypair: libp2p_identity::Keypair,
+    }
+
+    impl TestSigner {
+        fn from_ed25519(key: &SigningKey) -> Self {
+            let keypair =
+                libp2p_identity::ed25519::Keypair::try_from_bytes(&mut key.to_keypair_bytes())
+                    .expect("valid signing key");
+            Self {
+                keypair: keypair.into(),
+            }
+        }
+    }
+
+    #[allow(refining_impl_trait)]
+    impl auth_capnp::signer::Server for TestSigner {
+        fn sign(
+            self: capnp::capability::Rc<Self>,
+            params: auth_capnp::signer::SignParams,
+            mut results: auth_capnp::signer::SignResults,
+        ) -> Promise<(), capnp::Error> {
+            let params = pry!(params.get());
+            let domain = SigningDomain::terminal_membrane();
+            let mut payload = Vec::with_capacity(16);
+            payload.extend_from_slice(&params.get_nonce().to_be_bytes());
+            payload.extend_from_slice(&params.get_epoch_seq().to_be_bytes());
+            let envelope = pry!(SignedEnvelope::new(
+                &self.keypair,
+                domain.as_str().to_string(),
+                domain.payload_type().to_vec(),
+                payload,
+            )
+            .map_err(|error| capnp::Error::failed(format!("signing failed: {error}"))));
+            results.get().set_sig(&envelope.into_protobuf_encoding());
+            Promise::ok(())
+        }
     }
 
     #[test]
@@ -365,6 +410,82 @@ mod tests {
                     response.get().expect("guard results").has_terminal(),
                     "authority constructor returns a Terminal capability"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn compiled_policy_revokes_issued_session_and_denies_new_login() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let key = SigningKey::generate(&mut rand::rngs::OsRng);
+                let key_bytes = key.verifying_key().to_bytes();
+                let (_epoch_tx, epoch_rx) = watch::channel(epoch(1));
+                let mut message = capnp::message::Builder::new_default();
+                write_policy(
+                    message.init_root::<auth_capnp::authority_policy::Builder>(),
+                    &key_bytes,
+                    "reader",
+                    "reader",
+                );
+                let policy = message
+                    .get_root_as_reader::<auth_capnp::authority_policy::Reader>()
+                    .expect("policy reader");
+                let authorization = KeyMethodAuthorization::from_policy(epoch_rx.clone(), policy)
+                    .expect("compiled policy");
+                let session = membrane_client(epoch_rx.clone());
+                let terminal: auth_capnp::terminal::Client<auth_capnp::opaque_session::Owned> =
+                    capnp_rpc::new_client(TerminalServer::with_policy(
+                        Box::new(authorization.clone()),
+                        auth_capnp::opaque_session::Client {
+                            client: session.client,
+                        },
+                        SigningDomain::terminal_membrane(),
+                        epoch_rx,
+                    ));
+
+                let signer: auth_capnp::signer::Client =
+                    capnp_rpc::new_client(TestSigner::from_ed25519(&key));
+                let mut login = terminal.login_request();
+                login.get().set_signer(signer);
+                let login = login.send().promise.await.expect("initial login");
+                let login = login.get().expect("initial login results");
+                assert_eq!(
+                    login.get_status().expect("known status"),
+                    auth_capnp::LoginStatus::Granted
+                );
+                let issued = membrane_capnp::membrane::Client {
+                    client: login.get_session().expect("issued session").client,
+                };
+                issued
+                    .graft_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("issued session works before revocation");
+
+                assert!(authorization.revoke(&key_bytes), "binding must exist");
+                let revoked = match issued.graft_request().send().promise.await {
+                    Ok(_) => panic!("already-issued session must be revoked"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    call_failure_code(&revoked),
+                    Some(CallFailureCode::TargetRevoked)
+                );
+
+                let signer: auth_capnp::signer::Client =
+                    capnp_rpc::new_client(TestSigner::from_ed25519(&key));
+                let mut retry = terminal.login_request();
+                retry.get().set_signer(signer);
+                let retry = retry.send().promise.await.expect("typed retry denial");
+                let retry = retry.get().expect("retry login results");
+                assert_eq!(
+                    retry.get_status().expect("known status"),
+                    auth_capnp::LoginStatus::Denied
+                );
+                assert!(!retry.has_session(), "revoked binding denies new sessions");
             })
             .await;
     }

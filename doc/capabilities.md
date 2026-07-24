@@ -185,7 +185,11 @@ cell knows a CID, it can fetch the content. Revocation works two ways:
 - **Targeted recipient revocation.** A per-recipient `RevocationGuard`
   invalidates already-issued RPC sessions for that policy decision without
   advancing the global epoch. Removing the policy binding also denies new
-  logins.
+  logins. The guard mechanism is implemented, but generic `serve-vat`
+  publication does not yet return a deployer-facing management capability
+  that can trigger key-scoped revocation or replace bindings. Until that
+  pre-alpha API lands, generic published services use epoch advance for
+  operator-triggered invalidation.
 - **Kill and respawn under a different root Atom.** New cell, new root
   CID, fresh CID graph. The old cell's content knowledge is gone with
   the old process.
