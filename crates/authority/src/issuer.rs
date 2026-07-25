@@ -392,6 +392,11 @@ mod tests {
     }
 
     fn truncate_before(mut message: Vec<u8>, payload: &[u8], occurrence: usize) -> Vec<u8> {
+        assert_eq!(
+            &message[0..4],
+            &[0, 0, 0, 0],
+            "helper assumes a single-segment message"
+        );
         let offset = message
             .windows(payload.len())
             .enumerate()
@@ -399,6 +404,10 @@ mod tests {
             .nth(occurrence)
             .expect("payload occurrence exists");
         assert_eq!(offset % 8, 0, "payload starts on a word boundary");
+        assert!(
+            offset >= 16,
+            "truncation must leave at least one data word"
+        );
         let segment_words = u32::try_from(offset / 8 - 1).expect("segment length fits u32");
         message[4..8].copy_from_slice(&segment_words.to_le_bytes());
         message.truncate(offset);
@@ -411,10 +420,10 @@ mod tests {
             &mut input,
             capnp::message::ReaderOptions::new(),
         )
-        .map_err(malformed)?;
+        .expect("truncated fixture must still parse as a Cap'n Proto message");
         let policy = message
             .get_root::<auth_capnp::authority_policy::Reader>()
-            .map_err(malformed)?;
+            .expect("truncated fixture must still expose an authority-policy root");
         compile_policy(policy)
     }
 
