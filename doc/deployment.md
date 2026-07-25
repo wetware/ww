@@ -143,9 +143,11 @@ dependency outage.
 
 After Kubo identity succeeds, every boot-only Kubo API call used for namespace
 and mount resolution has a separate 90-second no-progress watchdog. Override
-it with `WW_KUBO_BOOT_OPERATION_TIMEOUT_SECS`; set it to `0` to disable that
-watchdog. `WW_KUBO_BOOT_RETRY_MAX_SECS` independently bounds how long a
-retryable boot call (Kubo transport failure, HTTP 429, or HTTP 5xx) may retry;
+it with `WW_KUBO_BOOT_OPERATION_TIMEOUT_SECS`; it must be a positive number
+because disabling it would reintroduce an unbounded boot hang.
+`WW_KUBO_BOOT_RETRY_MAX_SECS` independently bounds how long a
+retryable boot call (Kubo transport failure, HTTP 429, or HTTP 502/503/504)
+may retry;
 its development default is 120 seconds and `0` retries indefinitely. A bad
 local mount directory and Kubo 4xx response fail immediately rather than
 becoming a retry loop. The watchdog is deliberately scoped to individual API

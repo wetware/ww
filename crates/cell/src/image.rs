@@ -36,16 +36,16 @@ struct MfsNamespaceGuard {
 }
 
 impl MfsNamespaceGuard {
-    async fn new(client: &ipfs::BootClient) -> Result<Self> {
+    fn new(client: &ipfs::BootClient) -> Self {
         let id: u64 = rand::random();
         let path = format!("/ww-merge-{id:016x}");
         // Don't pre-create the directory — files_cp will create it when
         // copying the base layer, and fails if the destination already exists.
-        Ok(Self {
+        Self {
             client: client.client().clone(),
             path,
             cleaned: false,
-        })
+        }
     }
 
     fn path(&self) -> &str {
@@ -53,15 +53,15 @@ impl MfsNamespaceGuard {
     }
 
     async fn cleanup(mut self) {
-        self.cleaned = true;
-        if let Err(e) = tokio::time::timeout(
+        match tokio::time::timeout(
             std::time::Duration::from_secs(5),
             self.client.mfs().files_rm(&self.path, true),
         )
         .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("MFS cleanup timed out")))
         {
-            tracing::warn!(path = %self.path, "MFS cleanup failed: {e}");
+            Ok(Ok(())) => self.cleaned = true,
+            Ok(Err(error)) => tracing::warn!(path = %self.path, "MFS cleanup failed: {error}"),
+            Err(_) => tracing::warn!(path = %self.path, "MFS cleanup timed out"),
         }
     }
 }
@@ -98,7 +98,11 @@ impl Drop for MfsNamespaceGuard {
 ///
 /// Layers are applied left-to-right. Later layers win on file conflicts.
 /// Directories are merged recursively. Returns the root CID of the merged tree.
-async fn dag_merge(cids: &[String], client: &ipfs::BootClient) -> Result<String> {
+async fn dag_merge(
+    cids: &[String],
+    client: &ipfs::BootClient,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<String> {
     if cids.is_empty() {
         bail!("No CIDs to merge");
     }
@@ -106,32 +110,42 @@ async fn dag_merge(cids: &[String], client: &ipfs::BootClient) -> Result<String>
         return Ok(cids[0].clone());
     }
 
-    let guard = MfsNamespaceGuard::new(client).await?;
+    let guard = MfsNamespaceGuard::new(client);
 
-    let result = async {
-        // Copy the base layer (O(1) DAG link).
-        client
-            .mfs()
-            .files_cp(&format!("/ipfs/{}", cids[0]), guard.path())
-            .await
-            .context("Failed to copy base layer to MFS")?;
-
-        // Overlay each subsequent layer.
-        for cid in &cids[1..] {
-            merge_overlay_recursive(client, guard.path(), &format!("/ipfs/{cid}"))
+    let result = {
+        let merge = async {
+            // Copy the base layer (O(1) DAG link).
+            client
+                .mfs()
+                .files_cp(&format!("/ipfs/{}", cids[0]), guard.path())
                 .await
-                .with_context(|| format!("Failed to merge overlay {cid}"))?;
-        }
+                .context("Failed to copy base layer to MFS")?;
 
-        // Stat to get merged root CID.
-        let stat = client
-            .mfs()
-            .files_stat(guard.path(), true)
-            .await
-            .context("Failed to stat merged MFS namespace")?;
-        Ok(stat.hash)
-    }
-    .await;
+            // Overlay each subsequent layer.
+            for cid in &cids[1..] {
+                merge_overlay_recursive(client, guard.path(), &format!("/ipfs/{cid}"))
+                    .await
+                    .with_context(|| format!("Failed to merge overlay {cid}"))?;
+            }
+
+            // Stat to get merged root CID.
+            let stat = client
+                .mfs()
+                .files_stat(guard.path(), true)
+                .await
+                .context("Failed to stat merged MFS namespace")?;
+            Ok(stat.hash)
+        };
+        tokio::pin!(merge);
+        tokio::select! {
+            result = &mut merge => result,
+            changed = cancel.changed() => match changed {
+                Ok(()) if *cancel.borrow() => Err(anyhow::anyhow!("mount resolution cancelled")),
+                Ok(()) => Err(anyhow::anyhow!("mount resolution cancellation channel changed unexpectedly")),
+                Err(_) => Err(anyhow::anyhow!("mount resolution cancellation channel closed")),
+            }
+        }
+    };
     guard.cleanup().await;
     result
 }
@@ -223,6 +237,13 @@ pub async fn resolve_mounts_virtual(
     String,
     std::collections::HashMap<std::path::PathBuf, crate::vfs::LocalOverride>,
 )> {
+    let (_root_mounts, _targeted_mounts) = validate_mounts_virtual(mounts)?;
+    let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+    resolve_mounts_virtual_with_cancel(mounts, ipfs_client, &mut cancel).await
+}
+
+/// Validate local mount configuration before waiting for Kubo.
+pub fn validate_mounts_virtual(mounts: &[Mount]) -> Result<(Vec<&Mount>, Vec<&Mount>)> {
     if mounts.is_empty() {
         bail!("No mounts provided");
     }
@@ -251,14 +272,25 @@ pub async fn resolve_mounts_virtual(
         }
     }
 
+    Ok((root_mounts, targeted_mounts))
+}
+
+/// Cancellable variant used during host boot so service failure waits for MFS
+/// cleanup rather than abandoning a detached task.
+pub async fn resolve_mounts_virtual_with_cancel(
+    mounts: &[Mount],
+    ipfs_client: &ipfs::BootClient,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(
+    String,
+    std::collections::HashMap<std::path::PathBuf, crate::vfs::LocalOverride>,
+)> {
+    let (root_mounts, _) = validate_mounts_virtual(mounts)?;
+
     // Resolve all root mounts to CIDs.
     let mut cids = Vec::with_capacity(root_mounts.len());
     for mount in &root_mounts {
         if ipfs::is_ipfs_path(&mount.source) {
-            // `is_ipfs_path` accepts /ipfs/, /ipns/, /ipld/. /ipfs/ goes
-            // through directly. /ipns/<hash>[/<sub>] resolves to
-            // /ipfs/<cid>[/<sub>] via Kubo's name/resolve. /ipld/ falls
-            // through with the same strip behavior as /ipfs/.
             let ipfs_path = if mount.source.starts_with("/ipns/") {
                 resolve_ipns_to_ipfs(&mount.source, ipfs_client).await?
             } else {
@@ -269,7 +301,6 @@ pub async fn resolve_mounts_virtual(
                 .with_context(|| format!("expected resolved /ipfs/ path, got {ipfs_path}"))?;
             cids.push(cid_with_subpath.to_string());
         } else {
-            // Add local directory to IPFS.
             let cid = ipfs_client
                 .add_dir(Path::new(&mount.source))
                 .await
@@ -278,8 +309,7 @@ pub async fn resolve_mounts_virtual(
         }
     }
 
-    // DAG merge to produce a single root CID.
-    let root_cid = dag_merge(&cids, ipfs_client).await?;
+    let root_cid = dag_merge(&cids, ipfs_client, cancel).await?;
     tracing::info!(cid = %root_cid, layers = cids.len(), "Virtual DAG merge complete");
 
     Ok((root_cid, std::collections::HashMap::new()))
