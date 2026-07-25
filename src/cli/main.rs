@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use std::future::Future;
 use std::io::Write as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -573,6 +572,14 @@ const KUBO_WAIT_MAX_SECS_ENV: &str = "WW_KUBO_WAIT_MAX_SECS";
 /// than an indefinite hang. Deploys set the env to `0` for unbounded waiting.
 const KUBO_WAIT_DEFAULT_SECS: u64 = 120;
 
+/// Environment override for how long one retryable Kubo boot call may keep
+/// retrying. `0` means retry indefinitely.
+const KUBO_BOOT_RETRY_MAX_SECS_ENV: &str = "WW_KUBO_BOOT_RETRY_MAX_SECS";
+
+/// Development default for the retry budget. Production may opt into
+/// indefinite recovery independently of the initial Kubo-readiness wait.
+const KUBO_BOOT_RETRY_MAX_SECS_DEFAULT: u64 = 120;
+
 /// Environment override for a single Kubo-dependent boot operation. A timeout
 /// here never applies to guest content transfer or ordinary DHT operations.
 const KUBO_BOOT_OPERATION_TIMEOUT_SECS_ENV: &str = "WW_KUBO_BOOT_OPERATION_TIMEOUT_SECS";
@@ -589,78 +596,18 @@ fn kubo_wait_max_secs() -> u64 {
         .unwrap_or(KUBO_WAIT_DEFAULT_SECS)
 }
 
-fn kubo_boot_operation_timeout() -> std::time::Duration {
-    let secs = std::env::var(KUBO_BOOT_OPERATION_TIMEOUT_SECS_ENV)
+fn kubo_boot_retry_max_secs() -> u64 {
+    std::env::var(KUBO_BOOT_RETRY_MAX_SECS_ENV)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(KUBO_BOOT_OPERATION_TIMEOUT_DEFAULT_SECS);
-    std::time::Duration::from_secs(secs.max(1))
+        .unwrap_or(KUBO_BOOT_RETRY_MAX_SECS_DEFAULT)
 }
 
-/// Retry a Kubo-dependent boot operation without giving ordinary runtime data
-/// transfers a process-wide deadline. A stalled call is always retryable; an
-/// immediate error retries only when its chain identifies a transport failure.
-/// Configuration and content errors return immediately for an actionable
-/// failure instead of being mistaken for a recoverable Kubo outage.
-async fn retry_kubo_boot_operation<T, F, Fut>(
-    operation_name: &str,
-    max_wait_secs: u64,
-    operation_timeout: std::time::Duration,
-    mut operation: F,
-) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T>>,
-{
-    use std::time::{Duration, Instant};
-
-    let deadline = (max_wait_secs > 0).then(|| Instant::now() + Duration::from_secs(max_wait_secs));
-    let started = Instant::now();
-    let mut backoff = Duration::from_millis(500);
-    let backoff_cap = Duration::from_secs(15);
-    let mut attempt = 0u64;
-
-    loop {
-        attempt += 1;
-        let retry_reason = match tokio::time::timeout(operation_timeout, operation()).await {
-            Ok(Ok(value)) => return Ok(value),
-            Ok(Err(error)) if is_transient_kubo_error(&error) => {
-                format!("transient transport failure: {error:#}")
-            }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => {
-                format!("made no progress within {}s", operation_timeout.as_secs())
-            }
-        };
-
-        tracing::warn!(
-            operation = operation_name,
-            attempt,
-            timeout_secs = operation_timeout.as_secs(),
-            reason = %retry_reason,
-            "Kubo-dependent boot operation will retry"
-        );
-
-        if let Some(deadline) = deadline {
-            if Instant::now() + backoff >= deadline {
-                anyhow::bail!(
-                    "Kubo-dependent boot operation {operation_name} did not complete after {}s; set {}=0 to retry indefinitely",
-                    started.elapsed().as_secs(),
-                    KUBO_WAIT_MAX_SECS_ENV
-                );
-            }
-        }
-
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(backoff_cap);
-    }
-}
-
-/// `reqwest` preserves its error as an `anyhow` cause through our contextual
-/// IPFS errors. Retrying just that class keeps a malformed mount or an invalid
-/// local directory from becoming an infinite production boot loop.
-fn is_transient_kubo_error(error: &anyhow::Error) -> bool {
-    ipfs::is_transport_error(error)
+fn kubo_boot_operation_timeout_secs() -> u64 {
+    std::env::var(KUBO_BOOT_OPERATION_TIMEOUT_SECS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(KUBO_BOOT_OPERATION_TIMEOUT_DEFAULT_SECS)
 }
 
 /// Core of [`wait_for_kubo_ready`] with an explicit deadline (`max_secs`; `0` =
@@ -1626,7 +1573,18 @@ wasip2::cli::command::export!({iface_name}Guest);
         // instead of becoming a CrashLoopBackOff.
         runtime_status.set_phase("waiting-for-kubo");
         let kubo_wait_max_secs = kubo_wait_max_secs();
-        let kubo_operation_timeout = kubo_boot_operation_timeout();
+        let kubo_boot_retry_max_secs = kubo_boot_retry_max_secs();
+        let kubo_operation_timeout_secs = kubo_boot_operation_timeout_secs();
+        let boot_ipfs_client = ipfs::BootClient::new(
+            ipfs_client.clone(),
+            kubo_boot_retry_max_secs,
+            kubo_operation_timeout_secs,
+        );
+        tracing::info!(
+            retry_max_secs = kubo_boot_retry_max_secs,
+            operation_timeout_secs = kubo_operation_timeout_secs,
+            "Kubo boot retry policy configured (zero disables the respective deadline)"
+        );
         tokio::select! {
             result = wait_for_kubo_ready_with(&ipfs_client, kubo_wait_max_secs) => result?,
             service_exit = supervisor.next_service_exit() => {
@@ -1651,14 +1609,8 @@ wasip2::cli::command::export!({iface_name}Guest);
             );
 
             // Pin the initial head.
-            match tokio::time::timeout(kubo_operation_timeout, ipfs_client.pin_add(&ipfs_path))
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(path = %ipfs_path, "Failed to pin initial head: {e}"),
-                Err(_) => {
-                    tracing::warn!(path = %ipfs_path, "Initial-head pin made no progress before its timeout")
-                }
+            if let Err(error) = boot_ipfs_client.pin_add_once(&ipfs_path).await {
+                tracing::warn!(path = %ipfs_path, "Failed to pin initial head: {error}");
             }
 
             all_mounts.push(ww::cell::mount::Mount {
@@ -1701,21 +1653,22 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
         };
         if !ns_configs.is_empty() {
-            let resolved =
-                ww::ns::resolve_namespaces(&ns_configs, &ipfs_client, kubo_operation_timeout).await;
+            let resolved = tokio::select! {
+                resolved = ww::ns::resolve_namespaces(
+                    &ns_configs,
+                    &ipfs_client,
+                    boot_ipfs_client.operation_timeout(),
+                    &runtime_status,
+                ) => resolved,
+                service_exit = supervisor.next_service_exit() => {
+                    return Err(service_exit_error(service_exit));
+                }
+            };
             for (name, ipfs_path) in &resolved {
                 tracing::info!(ns = %name, path = %ipfs_path, "Mounting namespace");
                 // Pin the namespace tree so subsequent boots use the local copy.
-                match tokio::time::timeout(kubo_operation_timeout, ipfs_client.pin_add(ipfs_path))
-                    .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(ns = %name, path = %ipfs_path, "Failed to pin namespace: {e}")
-                    }
-                    Err(_) => {
-                        tracing::warn!(ns = %name, path = %ipfs_path, "Namespace pin made no progress before its timeout")
-                    }
+                if let Err(error) = boot_ipfs_client.pin_add_once(ipfs_path).await {
+                    tracing::warn!(ns = %name, path = %ipfs_path, "Failed to pin namespace: {error}");
                 }
                 all_mounts.push(ww::cell::mount::Mount {
                     source: ipfs_path.clone(),
@@ -1733,13 +1686,12 @@ wasip2::cli::command::export!({iface_name}Guest);
         // backed by the IPFS DAG.
         runtime_status.set_phase("resolving-mounts");
         tracing::debug!("resolving mounts (virtual)...");
-        let (root_cid, local_overrides) = retry_kubo_boot_operation(
-            "mount resolution",
-            kubo_wait_max_secs,
-            kubo_operation_timeout,
-            || image::resolve_mounts_virtual(&all_mounts, &ipfs_client),
-        )
-        .await?;
+        let (root_cid, local_overrides) = tokio::select! {
+            result = image::resolve_mounts_virtual(&all_mounts, &boot_ipfs_client) => result?,
+            service_exit = supervisor.next_service_exit() => {
+                return Err(service_exit_error(service_exit));
+            }
+        };
         let image_path = format!("/ipfs/{}", root_cid);
         tracing::debug!(root = %image_path, "virtual root resolved");
 
@@ -3014,97 +2966,6 @@ mod tests {
             msg.contains(KUBO_WAIT_MAX_SECS_ENV),
             "error should point at the unbounded-wait env override: {msg}"
         );
-    }
-
-    #[tokio::test]
-    async fn retry_kubo_boot_operation_retries_transport_failure() {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let operation_attempts = Arc::clone(&attempts);
-        let value = retry_kubo_boot_operation(
-            "test mount resolution",
-            2,
-            std::time::Duration::from_millis(50),
-            move || {
-                let attempts = Arc::clone(&operation_attempts);
-                async move {
-                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        return Err(anyhow::Error::from(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionRefused,
-                            "Kubo is restarting",
-                        )));
-                    }
-                    Ok("resolved")
-                }
-            },
-        )
-        .await
-        .expect("a transient Kubo transport failure should retry");
-
-        assert_eq!(value, "resolved");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn retry_kubo_boot_operation_retries_stalled_operation() {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let operation_attempts = Arc::clone(&attempts);
-        let value = retry_kubo_boot_operation(
-            "test mount resolution",
-            2,
-            std::time::Duration::from_millis(20),
-            move || {
-                let attempts = Arc::clone(&operation_attempts);
-                async move {
-                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    }
-                    Ok("resolved")
-                }
-            },
-        )
-        .await
-        .expect("a stalled Kubo operation should retry");
-
-        assert_eq!(value, "resolved");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn retry_kubo_boot_operation_does_not_retry_configuration_error() {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let operation_attempts = Arc::clone(&attempts);
-        let error = retry_kubo_boot_operation(
-            "test mount resolution",
-            2,
-            std::time::Duration::from_millis(20),
-            move || {
-                let attempts = Arc::clone(&operation_attempts);
-                async move {
-                    attempts.fetch_add(1, Ordering::SeqCst);
-                    Err::<(), _>(anyhow::anyhow!("No root mounts provided"))
-                }
-            },
-        )
-        .await
-        .expect_err("invalid mount configuration must fail immediately");
-
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert!(error.to_string().contains("No root mounts provided"));
     }
 
     #[test]
