@@ -10,11 +10,12 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-// A Kubo TCP listener can accept an HTTP connection yet never return a
-// response. Bound both phases so callers such as the boot-readiness loop can
-// retry instead of becoming permanently stuck in one request.
+// A failed TCP connection must not hold an IPFS operation indefinitely.
 const KUBO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const KUBO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// `/api/v0/id` is the readiness probe: it should be small and local. Bound
+// that probe separately from content and DHT operations, which may legitimately
+// transfer or resolve for much longer than a readiness interval.
+const KUBO_INFO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// HTTP client for talking to a Kubo node's `/api/v0/*` endpoints.
 #[derive(Clone)]
@@ -28,7 +29,6 @@ impl HttpClient {
     pub fn new(ipfs_url: String) -> Self {
         let http_client = reqwest::Client::builder()
             .connect_timeout(KUBO_CONNECT_TIMEOUT)
-            .timeout(KUBO_REQUEST_TIMEOUT)
             .build()
             .expect("fixed Kubo HTTP client configuration must be valid");
 
@@ -317,22 +317,26 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let http_client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(50))
-            .timeout(Duration::from_millis(100))
-            .build()
-            .unwrap();
+        let http_client = reqwest::Client::new();
         let client = HttpClient::with_http_client(format!("http://{address}"), http_client);
 
         let started = Instant::now();
         let error = client
-            .kubo_info()
+            .kubo_info_with_timeout(Duration::from_millis(100))
             .await
             .expect_err("a Kubo connection that never responds must time out");
 
         assert!(
+            started.elapsed() >= Duration::from_millis(75),
+            "request failed before the readiness timeout elapsed: {error:#}"
+        );
+        assert!(
             started.elapsed() < Duration::from_secs(1),
             "request timeout was not enforced promptly: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("kubo id timed out"),
+            "expected the readiness timeout error, got: {error:#}"
         );
         server.abort();
     }
@@ -548,22 +552,38 @@ impl HttpClient {
     /// Calls `POST /api/v0/id` and returns the peer ID and swarm addresses.
     /// Returns an error if Kubo is not reachable.
     pub async fn kubo_info(&self) -> Result<KuboInfo> {
+        self.kubo_info_with_timeout(KUBO_INFO_TIMEOUT).await
+    }
+
+    async fn kubo_info_with_timeout(&self, request_timeout: Duration) -> Result<KuboInfo> {
         let url = format!("{}/api/v0/id", self.base_url);
-        let response = self
-            .http_client
-            .post(&url)
-            .send()
-            .await
-            .with_context(|| format!("kubo id failed: {}", self.base_url))?;
+        let response = tokio::time::timeout(request_timeout, async {
+            let response = self
+                .http_client
+                .post(&url)
+                .send()
+                .await
+                .with_context(|| format!("kubo id failed: {}", self.base_url))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("kubo id failed: {}", response.status());
-        }
+            if !response.status().is_success() {
+                anyhow::bail!("kubo id failed: {}", response.status());
+            }
 
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .context("kubo id: failed to parse JSON response")?;
+            response
+                .json()
+                .await
+                .context("kubo id: failed to parse JSON response")
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "kubo id timed out after {}s: {}",
+                request_timeout.as_secs_f32(),
+                self.base_url
+            )
+        })??;
+
+        let body: serde_json::Value = response;
 
         let peer_id = body["ID"]
             .as_str()

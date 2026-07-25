@@ -125,10 +125,12 @@ localhost-only admin plane on `127.0.0.1:2026` is the process control surface:
 Keep the admin listener on loopback unless an authenticated network boundary
 is added; these endpoints are intentionally unauthenticated.
 
-Kubo HTTP requests are bounded to a five-second connection attempt and a
-30-second full request. A listener that accepts connections but fails to
-respond is therefore treated like an unavailable dependency rather than
-wedging startup inside one HTTP call.
+Kubo connections are bounded to five seconds. The small local `/api/v0/id`
+readiness probe is additionally bounded to 30 seconds, so a listener that
+accepts connections but fails to answer cannot wedge the startup wait loop.
+Bulk content transfer and DHT operations deliberately do not inherit that
+30-second deadline: they can make legitimate progress for longer than a
+readiness interval.
 
 `ww run` uses a 120-second Kubo wait by default so a local development
 invocation fails clearly when Kubo is absent. A production deployment that
