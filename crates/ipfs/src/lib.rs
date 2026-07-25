@@ -24,6 +24,15 @@ pub struct HttpClient {
     pub(crate) base_url: String,
 }
 
+/// Whether an IPFS API error represents a transport failure rather than an
+/// API/content response. Kept beside the HTTP client so callers do not need a
+/// direct `reqwest` dependency merely to choose a retry policy.
+pub fn is_transport_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<reqwest::Error>() || cause.is::<std::io::Error>())
+}
+
 impl HttpClient {
     /// Create a new IPFS client with the given HTTP API endpoint URL.
     pub fn new(ipfs_url: String) -> Self {

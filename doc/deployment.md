@@ -128,9 +128,9 @@ is added; these endpoints are intentionally unauthenticated.
 Kubo TCP connection attempts are bounded to five seconds. The small local `/api/v0/id`
 readiness probe is additionally bounded to 30 seconds, so a listener that
 accepts connections but fails to answer cannot wedge the startup wait loop.
-Bulk content transfer and DHT operations deliberately do not inherit that
-30-second deadline: they can make legitimate progress for longer than a
-readiness interval.
+Bulk content transfer and ordinary runtime DHT operations deliberately do not
+inherit that 30-second deadline: they can make legitimate progress for longer
+than a readiness interval.
 
 `ww run` uses a 120-second Kubo wait by default so a local development
 invocation fails clearly when Kubo is absent. A production deployment that
@@ -140,6 +140,16 @@ reviewed `ww-master` manifest does so. This keeps `/healthz` available while
 has completed. Readiness is intentionally not a continuous Kubo availability
 probe after startup; liveness remains the process-level signal during a later
 dependency outage.
+
+After Kubo identity succeeds, each boot-only namespace, pin, and mount-
+resolution operation has a separate 90-second no-progress watchdog. Override
+that watchdog with `WW_KUBO_BOOT_OPERATION_TIMEOUT_SECS`. A timed-out or
+transport-failed mandatory mount resolution retries with backoff while
+`/healthz` remains available and `/readyz` remains closed. Invalid mount
+configuration still fails immediately. This is an operation-level boot policy,
+not a global HTTP timeout: content reads and DHT activity after startup remain
+unbounded by it. Initial-head and namespace pins are best-effort, so a failed
+or stalled pin is logged and does not delay serving.
 
 Related references: [architecture](architecture.md),
 [capability model](capabilities.md), and [CLI](cli.md).

@@ -121,6 +121,7 @@ pub fn scan_namespace_configs(mount_paths: &[&Path]) -> Result<Vec<NamespaceConf
 pub async fn resolve_namespaces(
     configs: &[NamespaceConfig],
     ipfs_client: &crate::ipfs::HttpClient,
+    resolve_timeout: std::time::Duration,
 ) -> Vec<(String, String)> {
     let mut resolved = Vec::new();
 
@@ -128,8 +129,9 @@ pub async fn resolve_namespaces(
         // Try IPNS resolution first
         if !config.ipns.is_empty() {
             let ipns_path = format!("/ipns/{}", config.ipns);
-            match ipfs_client.name_resolve(&ipns_path).await {
-                Ok(resolved_path) => {
+            match tokio::time::timeout(resolve_timeout, ipfs_client.name_resolve(&ipns_path)).await
+            {
+                Ok(Ok(resolved_path)) => {
                     tracing::info!(
                         ns = %config.name,
                         ipns = %config.ipns,
@@ -139,7 +141,7 @@ pub async fn resolve_namespaces(
                     resolved.push((config.name.clone(), resolved_path));
                     continue;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!(
                         ns = %config.name,
                         ipns = %config.ipns,
@@ -147,6 +149,12 @@ pub async fn resolve_namespaces(
                         "IPNS resolution failed, trying bootstrap CID"
                     );
                 }
+                Err(_) => tracing::warn!(
+                    ns = %config.name,
+                    ipns = %config.ipns,
+                    timeout_secs = resolve_timeout.as_secs(),
+                    "IPNS resolution made no progress, trying bootstrap CID"
+                ),
             }
         }
 
