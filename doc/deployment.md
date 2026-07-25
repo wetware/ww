@@ -141,15 +141,21 @@ has completed. Readiness is intentionally not a continuous Kubo availability
 probe after startup; liveness remains the process-level signal during a later
 dependency outage.
 
-After Kubo identity succeeds, each boot-only namespace, pin, and mount-
-resolution operation has a separate 90-second no-progress watchdog. Override
-that watchdog with `WW_KUBO_BOOT_OPERATION_TIMEOUT_SECS`. A timed-out or
-transport-failed mandatory mount resolution retries with backoff while
-`/healthz` remains available and `/readyz` remains closed. Invalid mount
-configuration still fails immediately. This is an operation-level boot policy,
-not a global HTTP timeout: content reads and DHT activity after startup remain
-unbounded by it. Initial-head and namespace pins are best-effort, so a failed
-or stalled pin is logged and does not delay serving.
+After Kubo identity succeeds, every boot-only Kubo API call used for namespace
+and mount resolution has a separate 90-second no-progress watchdog. Override
+it with `WW_KUBO_BOOT_OPERATION_TIMEOUT_SECS`; set it to `0` to disable that
+watchdog. `WW_KUBO_BOOT_RETRY_MAX_SECS` independently bounds how long a
+retryable boot call (Kubo transport failure, HTTP 429, or HTTP 5xx) may retry;
+its development default is 120 seconds and `0` retries indefinitely. A bad
+local mount directory and Kubo 4xx response fail immediately rather than
+becoming a retry loop. The watchdog is deliberately scoped to individual API
+calls, not an entire image merge, so a slow valid multi-layer merge can make
+progress. `/healthz` remains available and `/readyz` remains closed while a
+mandatory mount call retries. Namespace fallback to its bootstrap CID marks
+the runtime degraded. This is not a global HTTP timeout: content reads and
+DHT activity after startup remain unbounded by it. Initial-head and namespace
+pins are best-effort, so a failed or stalled pin is logged and does not delay
+serving.
 
 Related references: [architecture](architecture.md),
 [capability model](capabilities.md), and [CLI](cli.md).

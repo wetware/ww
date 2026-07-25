@@ -121,7 +121,8 @@ pub fn scan_namespace_configs(mount_paths: &[&Path]) -> Result<Vec<NamespaceConf
 pub async fn resolve_namespaces(
     configs: &[NamespaceConfig],
     ipfs_client: &crate::ipfs::HttpClient,
-    resolve_timeout: std::time::Duration,
+    resolve_timeout: Option<std::time::Duration>,
+    runtime_status: &crate::metrics::RuntimeStatus,
 ) -> Vec<(String, String)> {
     let mut resolved = Vec::new();
 
@@ -129,9 +130,26 @@ pub async fn resolve_namespaces(
         // Try IPNS resolution first
         if !config.ipns.is_empty() {
             let ipns_path = format!("/ipns/{}", config.ipns);
-            match tokio::time::timeout(resolve_timeout, ipfs_client.name_resolve(&ipns_path)).await
-            {
-                Ok(Ok(resolved_path)) => {
+            let result = match resolve_timeout {
+                Some(timeout) => {
+                    match tokio::time::timeout(timeout, ipfs_client.name_resolve(&ipns_path)).await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::warn!(
+                                ns = %config.name,
+                                ipns = %config.ipns,
+                                timeout_secs = timeout.as_secs(),
+                                "IPNS resolution made no progress, trying bootstrap CID"
+                            );
+                            Err(anyhow::anyhow!("IPNS resolution timed out"))
+                        }
+                    }
+                }
+                None => ipfs_client.name_resolve(&ipns_path).await,
+            };
+            match result {
+                Ok(resolved_path) => {
                     tracing::info!(
                         ns = %config.name,
                         ipns = %config.ipns,
@@ -141,7 +159,11 @@ pub async fn resolve_namespaces(
                     resolved.push((config.name.clone(), resolved_path));
                     continue;
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
+                    runtime_status.mark_degraded(format!(
+                        "namespace {} IPNS resolution failed; using bootstrap if available",
+                        config.name
+                    ));
                     tracing::warn!(
                         ns = %config.name,
                         ipns = %config.ipns,
@@ -149,17 +171,18 @@ pub async fn resolve_namespaces(
                         "IPNS resolution failed, trying bootstrap CID"
                     );
                 }
-                Err(_) => tracing::warn!(
-                    ns = %config.name,
-                    ipns = %config.ipns,
-                    timeout_secs = resolve_timeout.as_secs(),
-                    "IPNS resolution made no progress, trying bootstrap CID"
-                ),
             }
         }
 
         // Fall back to bootstrap CID
-        if let Some(path) = config.ipfs_path() {
+        let bootstrap = (!config.bootstrap.is_empty()).then(|| {
+            if config.bootstrap.starts_with("/ipfs/") {
+                config.bootstrap.clone()
+            } else {
+                format!("/ipfs/{}", config.bootstrap)
+            }
+        });
+        if let Some(path) = bootstrap {
             if path.starts_with("/ipfs/") {
                 tracing::info!(
                     ns = %config.name,
@@ -169,6 +192,10 @@ pub async fn resolve_namespaces(
                 resolved.push((config.name.clone(), path));
             }
         } else {
+            runtime_status.mark_degraded(format!(
+                "namespace {} could not be resolved and has no bootstrap CID",
+                config.name
+            ));
             tracing::warn!(
                 ns = %config.name,
                 "Namespace has no IPNS name or bootstrap CID, skipping"
@@ -217,6 +244,59 @@ pub fn list_configs(ns_dir: &Path) -> Result<Vec<NamespaceConfig>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).await.unwrap();
+    }
+
+    async fn accept_identity_then_stall(listener: TcpListener) {
+        let (mut identity, _) = listener.accept().await.unwrap();
+        read_request(&mut identity).await;
+        identity
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 28\r\nConnection: close\r\n\r\n{\"ID\":\"test\",\"Addresses\":[]}",
+            )
+            .await
+            .unwrap();
+        drop(identity);
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        std::future::pending::<()>().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_ipns_resolution_uses_bootstrap_and_marks_degraded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(accept_identity_then_stall(listener));
+        let config = NamespaceConfig {
+            name: "ww".into(),
+            ipns: "k51-test".into(),
+            bootstrap: "/ipfs/bootstrap".into(),
+        };
+        let runtime_status = crate::metrics::RuntimeStatus::starting();
+        let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
+
+        client
+            .kubo_info()
+            .await
+            .expect("the fake Kubo identity endpoint must succeed first");
+
+        let resolved = resolve_namespaces(
+            &[config],
+            &client,
+            Some(std::time::Duration::from_millis(25)),
+            &runtime_status,
+        )
+        .await;
+
+        assert_eq!(resolved, vec![("ww".into(), "/ipfs/bootstrap".into())]);
+        server.abort();
+    }
 
     #[test]
     fn parse_full_config() {

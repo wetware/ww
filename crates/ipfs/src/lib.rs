@@ -4,7 +4,11 @@
 //! an internal helper — guests do not receive an IPFS capability. Content
 //! is served to guests through the WASI virtual filesystem (`CidTree`).
 
-use std::{path::Path, time::Duration};
+use std::{
+    future::Future,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -24,13 +28,254 @@ pub struct HttpClient {
     pub(crate) base_url: String,
 }
 
-/// Whether an IPFS API error represents a transport failure rather than an
-/// API/content response. Kept beside the HTTP client so callers do not need a
-/// direct `reqwest` dependency merely to choose a retry policy.
-pub fn is_transport_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<reqwest::Error>() || cause.is::<std::io::Error>())
+/// A non-success response from Kubo's HTTP API.
+///
+/// Keeping the status in the error chain lets boot retry policy distinguish a
+/// transient Kubo/server failure from a bad caller request without parsing
+/// diagnostic prose.
+#[derive(Debug)]
+pub struct KuboApiError {
+    operation: String,
+    status: reqwest::StatusCode,
+    message: String,
+}
+
+impl KuboApiError {
+    async fn from_response(operation: impl Into<String>, response: reqwest::Response) -> Self {
+        let status = response.status();
+        let message = response.text().await.unwrap_or_default();
+        Self {
+            operation: operation.into(),
+            status,
+            message,
+        }
+    }
+
+    /// 429 and server errors are Kubo overload/availability signals. Other
+    /// 4xx responses are caller/content errors and must remain actionable.
+    pub fn is_retryable(&self) -> bool {
+        self.status == reqwest::StatusCode::TOO_MANY_REQUESTS || self.status.is_server_error()
+    }
+}
+
+impl std::fmt::Display for KuboApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.message.is_empty() {
+            write!(formatter, "{} failed with {}", self.operation, self.status)
+        } else {
+            write!(
+                formatter,
+                "{} failed with {}: {}",
+                self.operation, self.status, self.message
+            )
+        }
+    }
+}
+
+impl std::error::Error for KuboApiError {}
+
+/// Whether an IPFS error is safe to retry during critical boot resolution.
+/// Transport failures, 429, and Kubo 5xx responses retry; local filesystem,
+/// malformed-path, and other 4xx errors fail immediately.
+pub fn is_retryable_kubo_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<reqwest::Error>()
+            || cause
+                .downcast_ref::<KuboApiError>()
+                .is_some_and(KuboApiError::is_retryable)
+    })
+}
+
+/// Retry policy used only while the host is resolving its initial boot image.
+/// The ordinary [`HttpClient`] remains deadline-free for content and DHT work
+/// after startup.
+#[derive(Clone)]
+pub struct BootClient {
+    client: HttpClient,
+    retry_deadline: Option<Duration>,
+    operation_timeout: Option<Duration>,
+}
+
+impl BootClient {
+    /// `retry_max_secs=0` retries transient failures indefinitely. Likewise,
+    /// `operation_timeout_secs=0` disables the per-request no-progress
+    /// watchdog rather than silently selecting an aggressive timeout.
+    pub fn new(client: HttpClient, retry_max_secs: u64, operation_timeout_secs: u64) -> Self {
+        Self {
+            client,
+            retry_deadline: (retry_max_secs > 0).then(|| Duration::from_secs(retry_max_secs)),
+            operation_timeout: (operation_timeout_secs > 0)
+                .then(|| Duration::from_secs(operation_timeout_secs)),
+        }
+    }
+
+    pub fn client(&self) -> &HttpClient {
+        &self.client
+    }
+
+    pub fn operation_timeout(&self) -> Option<Duration> {
+        self.operation_timeout
+    }
+
+    async fn retry<T, F, Fut>(&self, operation_name: &str, mut operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let started = Instant::now();
+        let deadline = self.retry_deadline.map(|duration| started + duration);
+        let mut backoff = Duration::from_millis(500);
+        let backoff_cap = Duration::from_secs(15);
+        let mut attempt = 0u64;
+
+        loop {
+            attempt += 1;
+            let remaining =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                anyhow::bail!(
+                    "Kubo boot operation {operation_name} did not complete after {}s",
+                    started.elapsed().as_secs()
+                );
+            }
+
+            let attempt_timeout = self
+                .operation_timeout
+                .map(|timeout| remaining.map_or(timeout, |remaining| timeout.min(remaining)));
+            let retry_reason = match attempt_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, operation()).await {
+                    Ok(Ok(value)) => return Ok(value),
+                    Ok(Err(error)) if is_retryable_kubo_error(&error) => {
+                        format!("transient Kubo failure: {error:#}")
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => format!("made no progress within {}s", timeout.as_secs_f64()),
+                },
+                None => match operation().await {
+                    Ok(value) => return Ok(value),
+                    Err(error) if is_retryable_kubo_error(&error) => {
+                        format!("transient Kubo failure: {error:#}")
+                    }
+                    Err(error) => return Err(error),
+                },
+            };
+
+            tracing::warn!(
+                operation = operation_name,
+                attempt,
+                reason = %retry_reason,
+                "Kubo boot operation will retry"
+            );
+
+            if let Some(remaining) =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            {
+                if remaining.is_zero() {
+                    anyhow::bail!(
+                        "Kubo boot operation {operation_name} did not complete after {}s",
+                        started.elapsed().as_secs()
+                    );
+                }
+                tokio::time::sleep(backoff.min(remaining)).await;
+            } else {
+                tokio::time::sleep(backoff).await;
+            }
+            backoff = (backoff * 2).min(backoff_cap);
+        }
+    }
+
+    /// One bounded best-effort operation. Pins are an optimization: callers
+    /// log and continue rather than holding serving readiness behind retries.
+    pub async fn pin_add_once(&self, cid: &str) -> Result<()> {
+        match self.operation_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, self.client.pin_add(cid))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "IPFS pin add made no progress within {}s",
+                        timeout.as_secs_f64()
+                    )
+                })?,
+            None => self.client.pin_add(cid).await,
+        }
+    }
+
+    pub async fn name_resolve(&self, name: &str) -> Result<String> {
+        self.retry("IPNS mount resolution", || self.client.name_resolve(name))
+            .await
+    }
+
+    pub async fn add_dir(&self, directory: &Path) -> Result<String> {
+        self.retry("local mount upload", || self.client.add_dir(directory))
+            .await
+    }
+
+    pub async fn ls(&self, path: &str) -> Result<Vec<LsEntry>> {
+        self.retry("IPFS directory listing", || self.client.ls(path))
+            .await
+    }
+
+    pub fn mfs(&self) -> BootMfs<'_> {
+        BootMfs { client: self }
+    }
+}
+
+/// Boot-only, individually retried MFS calls. These are deliberately separate
+/// from [`MFS`], whose ordinary runtime callers retain their existing timing.
+pub struct BootMfs<'a> {
+    client: &'a BootClient,
+}
+
+impl BootMfs<'_> {
+    pub async fn files_cp(&self, source: &str, destination: &str) -> Result<()> {
+        let client = self.client.client.clone();
+        let source = source.to_owned();
+        let destination = destination.to_owned();
+        self.client
+            .retry("MFS copy", move || {
+                let client = client.clone();
+                let source = source.clone();
+                let destination = destination.clone();
+                async move { client.mfs().files_cp(&source, &destination).await }
+            })
+            .await
+    }
+
+    pub async fn files_ls(&self, path: &str) -> Result<Vec<MfsEntry>> {
+        let client = self.client.client.clone();
+        let path = path.to_owned();
+        self.client
+            .retry("MFS listing", move || {
+                let client = client.clone();
+                let path = path.clone();
+                async move { client.mfs().files_ls(&path).await }
+            })
+            .await
+    }
+
+    pub async fn files_stat(&self, path: &str, hash: bool) -> Result<MfsStat> {
+        let client = self.client.client.clone();
+        let path = path.to_owned();
+        self.client
+            .retry("MFS stat", || {
+                let client = client.clone();
+                let path = path.clone();
+                async move { client.mfs().files_stat(&path, hash).await }
+            })
+            .await
+    }
+
+    pub async fn files_rm(&self, path: &str, recursive: bool) -> Result<()> {
+        let client = self.client.client.clone();
+        let path = path.to_owned();
+        self.client
+            .retry("MFS removal", || {
+                let client = client.clone();
+                let path = path.clone();
+                async move { client.mfs().files_rm(&path, recursive).await }
+            })
+            .await
+    }
 }
 
 impl HttpClient {
@@ -66,11 +311,11 @@ impl HttpClient {
             .with_context(|| format!("Failed to connect to IPFS node at {}", self.base_url))?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to retrieve file from IPFS: {} (path: {})",
-                response.status(),
-                path
-            ));
+            return Err(
+                KuboApiError::from_response(format!("IPFS cat (path: {path})"), response)
+                    .await
+                    .into(),
+            );
         }
 
         Ok(response)
@@ -149,11 +394,12 @@ impl HttpClient {
             })?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Failed to fetch IPFS directory: {} (path: {})",
-                response.status(),
-                ipfs_path
-            );
+            return Err(KuboApiError::from_response(
+                format!("IPFS directory fetch (path: {ipfs_path})"),
+                response,
+            )
+            .await
+            .into());
         }
 
         let bytes = response
@@ -207,15 +453,15 @@ impl HttpClient {
             .send()
             .await
             .context("IPNS name resolve request failed")?;
-        let status = response.status();
+        if !response.status().is_success() {
+            return Err(KuboApiError::from_response("IPNS name resolve", response)
+                .await
+                .into());
+        }
         let body: serde_json::Value = response
             .json()
             .await
             .context("Failed to parse name resolve response")?;
-        if !status.is_success() {
-            let msg = body["Message"].as_str().unwrap_or("unknown error");
-            anyhow::bail!("IPNS name resolve failed ({}): {}", status, msg);
-        }
         body["Path"]
             .as_str()
             .map(|s| s.to_string())
@@ -313,9 +559,24 @@ impl HttpClient {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::HttpClient;
+    use super::{is_retryable_kubo_error, BootClient, HttpClient};
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut request).await.unwrap();
+            if read == 0
+                || request[..read]
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+            {
+                return;
+            }
+        }
+    }
 
     #[tokio::test]
     async fn kubo_info_times_out_after_connection_without_response() {
@@ -348,6 +609,56 @@ mod tests {
         );
         server.abort();
     }
+
+    #[tokio::test]
+    async fn boot_client_retries_kubo_500_then_recovers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            read_request(&mut first).await;
+            first
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Message\":\"busy\"}")
+                .await
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            read_request(&mut second).await;
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"Path\":\"/ipfs/recovered\"}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = BootClient::new(HttpClient::new(format!("http://{address}")), 2, 1);
+        assert_eq!(
+            client.name_resolve("k51-test").await.unwrap(),
+            "/ipfs/recovered"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_local_directory_is_not_retryable() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let missing = directory.path().join("does-not-exist");
+        let client = HttpClient::new("http://127.0.0.1:1".into());
+        let error = client.add_dir(&missing).await.unwrap_err();
+
+        assert!(error.to_string().contains("Failed to read directory"));
+        assert!(
+            !is_retryable_kubo_error(&error),
+            "local filesystem failures must not become boot retry loops: {error:#}"
+        );
+    }
+
+    #[test]
+    fn zero_operation_timeout_disables_the_boot_watchdog() {
+        let client = BootClient::new(HttpClient::new("http://127.0.0.1:1".into()), 120, 0);
+        assert_eq!(client.operation_timeout(), None);
+    }
 }
 
 /// Directory listing entry from Kubo's `/api/v0/ls` endpoint.
@@ -373,7 +684,11 @@ impl HttpClient {
             .with_context(|| format!("Failed to ls IPFS path {path}"))?;
 
         if !response.status().is_success() {
-            anyhow::bail!("IPFS ls failed: {} (path: {})", response.status(), path);
+            return Err(
+                KuboApiError::from_response(format!("IPFS ls (path: {path})"), response)
+                    .await
+                    .into(),
+            );
         }
 
         let body: serde_json::Value = response
@@ -414,7 +729,12 @@ impl HttpClient {
             .with_context(|| format!("Failed to pin {cid}"))?;
 
         if !response.status().is_success() {
-            anyhow::bail!("IPFS pin add failed: {} (cid: {})", response.status(), cid);
+            return Err(KuboApiError::from_response(
+                format!("IPFS pin add (cid: {cid})"),
+                response,
+            )
+            .await
+            .into());
         }
 
         Ok(())
@@ -521,7 +841,9 @@ impl HttpClient {
             .context("Failed to add directory to IPFS")?;
 
         if !response.status().is_success() {
-            anyhow::bail!("IPFS add failed: {}", response.status());
+            return Err(KuboApiError::from_response("IPFS add directory", response)
+                .await
+                .into());
         }
 
         let body = response.text().await?;
@@ -849,8 +1171,11 @@ impl MFS<'_> {
             .with_context(|| format!("MFS mkdir failed for {path}"))?;
 
         if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("MFS mkdir failed for {path}: {body}");
+            return Err(
+                KuboApiError::from_response(format!("MFS mkdir (path: {path})"), response)
+                    .await
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -870,8 +1195,12 @@ impl MFS<'_> {
             .with_context(|| format!("MFS cp failed: {src} -> {dst}"))?;
 
         if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("MFS cp failed ({src} -> {dst}): {body}");
+            return Err(KuboApiError::from_response(
+                format!("MFS copy ({src} -> {dst})"),
+                response,
+            )
+            .await
+            .into());
         }
         Ok(())
     }
@@ -891,8 +1220,11 @@ impl MFS<'_> {
             .with_context(|| format!("MFS ls failed for {path}"))?;
 
         if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("MFS ls failed for {path}: {body}");
+            return Err(
+                KuboApiError::from_response(format!("MFS ls (path: {path})"), response)
+                    .await
+                    .into(),
+            );
         }
 
         let body: serde_json::Value = response
@@ -928,8 +1260,11 @@ impl MFS<'_> {
             .with_context(|| format!("MFS stat failed for {path}"))?;
 
         if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("MFS stat failed for {path}: {body}");
+            return Err(
+                KuboApiError::from_response(format!("MFS stat (path: {path})"), response)
+                    .await
+                    .into(),
+            );
         }
 
         response
@@ -953,8 +1288,11 @@ impl MFS<'_> {
             .with_context(|| format!("MFS rm failed for {path}"))?;
 
         if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("MFS rm failed for {path}: {body}");
+            return Err(
+                KuboApiError::from_response(format!("MFS rm (path: {path})"), response)
+                    .await
+                    .into(),
+            );
         }
         Ok(())
     }

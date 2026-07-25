@@ -27,28 +27,69 @@ use ipfs;
 
 // ── DAG merge via IPFS MFS ─────────────────────────────────────────
 
-/// RAII guard that cleans up an MFS namespace on drop.
-struct MfsNamespaceGuard<'a> {
-    client: &'a ipfs::HttpClient,
+/// RAII guard that cleans up an MFS namespace even when a boot watchdog
+/// cancels an in-progress DAG merge.
+struct MfsNamespaceGuard {
+    client: ipfs::HttpClient,
     path: String,
+    cleaned: bool,
 }
 
-impl<'a> MfsNamespaceGuard<'a> {
-    async fn new(client: &'a ipfs::HttpClient) -> Result<Self> {
+impl MfsNamespaceGuard {
+    async fn new(client: &ipfs::BootClient) -> Result<Self> {
         let id: u64 = rand::random();
         let path = format!("/ww-merge-{id:016x}");
         // Don't pre-create the directory — files_cp will create it when
         // copying the base layer, and fails if the destination already exists.
-        Ok(Self { client, path })
+        Ok(Self {
+            client: client.client().clone(),
+            path,
+            cleaned: false,
+        })
     }
 
     fn path(&self) -> &str {
         &self.path
     }
 
-    async fn cleanup(&self) {
-        if let Err(e) = self.client.mfs().files_rm(&self.path, true).await {
+    async fn cleanup(mut self) {
+        self.cleaned = true;
+        if let Err(e) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.client.mfs().files_rm(&self.path, true),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("MFS cleanup timed out")))
+        {
             tracing::warn!(path = %self.path, "MFS cleanup failed: {e}");
+        }
+    }
+}
+
+impl Drop for MfsNamespaceGuard {
+    fn drop(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        let client = self.client.clone();
+        let path = self.path.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.mfs().files_rm(&path, true),
+                )
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%path, "MFS cancellation cleanup failed: {error}")
+                    }
+                    Err(_) => tracing::warn!(%path, "MFS cancellation cleanup timed out"),
+                }
+            });
+        } else {
+            tracing::warn!(path = %self.path, "MFS namespace dropped without a Tokio runtime; cleanup deferred to Kubo GC");
         }
     }
 }
@@ -57,7 +98,7 @@ impl<'a> MfsNamespaceGuard<'a> {
 ///
 /// Layers are applied left-to-right. Later layers win on file conflicts.
 /// Directories are merged recursively. Returns the root CID of the merged tree.
-async fn dag_merge(cids: &[String], client: &ipfs::HttpClient) -> Result<String> {
+async fn dag_merge(cids: &[String], client: &ipfs::BootClient) -> Result<String> {
     if cids.is_empty() {
         bail!("No CIDs to merge");
     }
@@ -67,29 +108,32 @@ async fn dag_merge(cids: &[String], client: &ipfs::HttpClient) -> Result<String>
 
     let guard = MfsNamespaceGuard::new(client).await?;
 
-    // Copy the base layer (O(1) DAG link).
-    client
-        .mfs()
-        .files_cp(&format!("/ipfs/{}", cids[0]), guard.path())
-        .await
-        .context("Failed to copy base layer to MFS")?;
-
-    // Overlay each subsequent layer.
-    for cid in &cids[1..] {
-        merge_overlay_recursive(client, guard.path(), &format!("/ipfs/{cid}"))
+    let result = async {
+        // Copy the base layer (O(1) DAG link).
+        client
+            .mfs()
+            .files_cp(&format!("/ipfs/{}", cids[0]), guard.path())
             .await
-            .with_context(|| format!("Failed to merge overlay {cid}"))?;
+            .context("Failed to copy base layer to MFS")?;
+
+        // Overlay each subsequent layer.
+        for cid in &cids[1..] {
+            merge_overlay_recursive(client, guard.path(), &format!("/ipfs/{cid}"))
+                .await
+                .with_context(|| format!("Failed to merge overlay {cid}"))?;
+        }
+
+        // Stat to get merged root CID.
+        let stat = client
+            .mfs()
+            .files_stat(guard.path(), true)
+            .await
+            .context("Failed to stat merged MFS namespace")?;
+        Ok(stat.hash)
     }
-
-    // Stat to get merged root CID.
-    let stat = client
-        .mfs()
-        .files_stat(guard.path(), true)
-        .await
-        .context("Failed to stat merged MFS namespace")?;
-
+    .await;
     guard.cleanup().await;
-    Ok(stat.hash)
+    result
 }
 
 /// Recursively merge an overlay into the MFS namespace.
@@ -99,7 +143,7 @@ async fn dag_merge(cids: &[String], client: &ipfs::HttpClient) -> Result<String>
 /// - Both directories → recurse
 /// - Any conflict → `files rm` + `files cp` (replace)
 fn merge_overlay_recursive<'a>(
-    client: &'a ipfs::HttpClient,
+    client: &'a ipfs::BootClient,
     mfs_path: &'a str,
     overlay_path: &'a str,
 ) -> futures::future::BoxFuture<'a, Result<()>> {
@@ -111,7 +155,7 @@ fn merge_overlay_recursive<'a>(
 }
 
 async fn merge_overlay_recursive_inner(
-    client: &ipfs::HttpClient,
+    client: &ipfs::BootClient,
     mfs_path: &str,
     overlay_path: &str,
 ) -> Result<()> {
@@ -124,7 +168,7 @@ async fn merge_overlay_recursive_inner(
         .with_context(|| format!("ls overlay {overlay_path}"))?;
 
     // List existing MFS entries (may be empty if dir is new).
-    let mfs_entries = mfs.files_ls(mfs_path).await.unwrap_or_default();
+    let mfs_entries = mfs.files_ls(mfs_path).await?;
     let mfs_names: HashSet<&str> = mfs_entries.iter().map(|e| e.name.as_str()).collect();
 
     for entry in &overlay_entries {
@@ -174,7 +218,7 @@ async fn merge_overlay_recursive_inner(
 /// Returns `(root_cid, local_overrides)` suitable for constructing a `CidTree`.
 pub async fn resolve_mounts_virtual(
     mounts: &[Mount],
-    ipfs_client: &ipfs::HttpClient,
+    ipfs_client: &ipfs::BootClient,
 ) -> Result<(
     String,
     std::collections::HashMap<std::path::PathBuf, crate::vfs::LocalOverride>,
@@ -196,6 +240,15 @@ pub async fn resolve_mounts_virtual(
              publish content to IPFS/IPNS and mount as a root layer",
             targeted_mounts.len()
         );
+    }
+
+    for mount in &root_mounts {
+        if !ipfs::is_ipfs_path(&mount.source) && !Path::new(&mount.source).is_dir() {
+            bail!(
+                "local root mount must be an existing directory: {}",
+                mount.source
+            );
+        }
     }
 
     // Resolve all root mounts to CIDs.
@@ -254,7 +307,7 @@ fn split_ipns_path(path: &str) -> Result<(&str, &str)> {
 ///
 /// Kubo's `name/resolve` only resolves the IPNS hash — it doesn't
 /// preserve any subpath, so we splice the subpath back ourselves.
-async fn resolve_ipns_to_ipfs(ipns_path: &str, ipfs_client: &ipfs::HttpClient) -> Result<String> {
+async fn resolve_ipns_to_ipfs(ipns_path: &str, ipfs_client: &ipfs::BootClient) -> Result<String> {
     let (hash, subpath) = split_ipns_path(ipns_path)?;
     let resolved = ipfs_client
         .name_resolve(hash)
@@ -329,8 +382,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn stub_ipfs_client() -> ipfs::HttpClient {
-        ipfs::HttpClient::new("http://localhost:5001".into())
+    fn stub_ipfs_client() -> ipfs::BootClient {
+        ipfs::BootClient::new(ipfs::HttpClient::new("http://localhost:5001".into()), 1, 1)
     }
 
     fn root_mount(path: &str) -> Mount {
