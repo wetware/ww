@@ -76,6 +76,11 @@ impl RuntimeStatus {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_degraded(&self) -> bool {
+        self.snapshot().degraded
+    }
+
     fn snapshot(&self) -> RuntimeStatusSnapshot {
         self.inner
             .read()

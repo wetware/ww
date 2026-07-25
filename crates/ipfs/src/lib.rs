@@ -7,6 +7,7 @@
 use std::{
     future::Future,
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -20,6 +21,8 @@ const KUBO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // that probe separately from content and DHT operations, which may legitimately
 // transfer or resolve for much longer than a readiness interval.
 const KUBO_INFO_TIMEOUT: Duration = Duration::from_secs(30);
+
+type RetryObserver = Arc<dyn Fn(&str, u64) + Send + Sync>;
 
 /// HTTP client for talking to a Kubo node's `/api/v0/*` endpoints.
 #[derive(Clone)]
@@ -51,10 +54,17 @@ impl KuboApiError {
         }
     }
 
-    /// 429 and server errors are Kubo overload/availability signals. Other
-    /// 4xx responses are caller/content errors and must remain actionable.
+    /// Kubo uses 500 for ordinary caller/content errors, so only rate limiting
+    /// and gateway failures are safe to retry without inspecting unstable
+    /// diagnostic prose.
     pub fn is_retryable(&self) -> bool {
-        self.status == reqwest::StatusCode::TOO_MANY_REQUESTS || self.status.is_server_error()
+        matches!(
+            self.status,
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+                | reqwest::StatusCode::BAD_GATEWAY
+                | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                | reqwest::StatusCode::GATEWAY_TIMEOUT
+        )
     }
 }
 
@@ -75,8 +85,8 @@ impl std::fmt::Display for KuboApiError {
 impl std::error::Error for KuboApiError {}
 
 /// Whether an IPFS error is safe to retry during critical boot resolution.
-/// Transport failures, 429, and Kubo 5xx responses retry; local filesystem,
-/// malformed-path, and other 4xx errors fail immediately.
+/// Transport failures, 429, and gateway failures retry; local filesystem and
+/// ordinary Kubo API errors fail immediately.
 pub fn is_retryable_kubo_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.is::<reqwest::Error>()
@@ -94,6 +104,7 @@ pub struct BootClient {
     client: HttpClient,
     retry_deadline: Option<Duration>,
     operation_timeout: Option<Duration>,
+    retry_observer: Option<RetryObserver>,
 }
 
 impl BootClient {
@@ -106,6 +117,7 @@ impl BootClient {
             retry_deadline: (retry_max_secs > 0).then(|| Duration::from_secs(retry_max_secs)),
             operation_timeout: (operation_timeout_secs > 0)
                 .then(|| Duration::from_secs(operation_timeout_secs)),
+            retry_observer: None,
         }
     }
 
@@ -115,6 +127,13 @@ impl BootClient {
 
     pub fn operation_timeout(&self) -> Option<Duration> {
         self.operation_timeout
+    }
+
+    /// Attach boot-status reporting without coupling this crate to the host's
+    /// metrics implementation.
+    pub fn with_retry_observer(mut self, observer: RetryObserver) -> Self {
+        self.retry_observer = Some(observer);
+        self
     }
 
     async fn retry<T, F, Fut>(&self, operation_name: &str, mut operation: F) -> Result<T>
@@ -139,9 +158,12 @@ impl BootClient {
                 );
             }
 
-            let attempt_timeout = self
-                .operation_timeout
-                .map(|timeout| remaining.map_or(timeout, |remaining| timeout.min(remaining)));
+            let attempt_timeout = match (self.operation_timeout, remaining) {
+                (Some(watchdog), Some(remaining)) => Some(watchdog.min(remaining)),
+                (Some(watchdog), None) => Some(watchdog),
+                (None, Some(remaining)) => Some(remaining),
+                (None, None) => None,
+            };
             let retry_reason = match attempt_timeout {
                 Some(timeout) => match tokio::time::timeout(timeout, operation()).await {
                     Ok(Ok(value)) => return Ok(value),
@@ -166,6 +188,9 @@ impl BootClient {
                 reason = %retry_reason,
                 "Kubo boot operation will retry"
             );
+            if let Some(observer) = &self.retry_observer {
+                observer(operation_name, attempt);
+            }
 
             if let Some(remaining) =
                 deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
@@ -228,17 +253,27 @@ pub struct BootMfs<'a> {
 
 impl BootMfs<'_> {
     pub async fn files_cp(&self, source: &str, destination: &str) -> Result<()> {
-        let client = self.client.client.clone();
-        let source = source.to_owned();
-        let destination = destination.to_owned();
-        self.client
-            .retry("MFS copy", move || {
-                let client = client.clone();
-                let source = source.clone();
-                let destination = destination.clone();
-                async move { client.mfs().files_cp(&source, &destination).await }
-            })
-            .await
+        // Kubo can complete a copy after the caller's watchdog fires. Reusing
+        // the destination would then fail with "already has entry", so do not
+        // blindly retry this non-idempotent request. The caller owns a unique
+        // MFS namespace and can restart safely with a new destination.
+        let timeout = match (self.client.operation_timeout, self.client.retry_deadline) {
+            (Some(watchdog), Some(budget)) => Some(watchdog.min(budget)),
+            (Some(watchdog), None) => Some(watchdog),
+            (None, Some(budget)) => Some(budget),
+            (None, None) => None,
+        };
+        let mfs = self.client.client.mfs();
+        let copy = mfs.files_cp(source, destination);
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, copy).await.map_err(|_| {
+                anyhow::anyhow!(
+                    "MFS copy made no progress within {}s",
+                    timeout.as_secs_f64()
+                )
+            })?,
+            None => copy.await,
+        }
     }
 
     pub async fn files_ls(&self, path: &str) -> Result<Vec<MfsEntry>> {
@@ -565,14 +600,12 @@ mod tests {
     use super::{is_retryable_kubo_error, BootClient, HttpClient};
 
     async fn read_request(stream: &mut tokio::net::TcpStream) {
-        let mut request = [0u8; 4096];
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
         loop {
-            let read = stream.read(&mut request).await.unwrap();
-            if read == 0
-                || request[..read]
-                    .windows(4)
-                    .any(|window| window == b"\r\n\r\n")
-            {
+            let read = stream.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..read]);
+            if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
                 return;
             }
         }
@@ -611,14 +644,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_client_retries_kubo_500_then_recovers() {
+    async fn boot_client_retries_gateway_failure_then_recovers() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             read_request(&mut first).await;
             first
-                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Message\":\"busy\"}")
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Message\":\"busy\"}")
                 .await
                 .unwrap();
 
@@ -632,7 +665,7 @@ mod tests {
                 .unwrap();
         });
 
-        let client = BootClient::new(HttpClient::new(format!("http://{address}")), 2, 1);
+        let client = BootClient::new(HttpClient::new(format!("http://{address}")), 30, 5);
         assert_eq!(
             client.name_resolve("k51-test").await.unwrap(),
             "/ipfs/recovered"
@@ -654,10 +687,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn zero_operation_timeout_disables_the_boot_watchdog() {
-        let client = BootClient::new(HttpClient::new("http://127.0.0.1:1".into()), 120, 0);
-        assert_eq!(client.operation_timeout(), None);
+    #[tokio::test]
+    async fn kubo_500_is_terminal_even_with_a_json_error_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{\"Message\":\"invalid CID\"}")
+                .await
+                .unwrap();
+        });
+        let client = HttpClient::new(format!("http://{address}"));
+        let error = client.name_resolve("not-a-cid").await.unwrap_err();
+
+        assert!(!is_retryable_kubo_error(&error));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finite_retry_budget_bounds_attempt_when_watchdog_is_disabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            std::future::pending::<()>().await;
+        });
+
+        let client = BootClient::new(HttpClient::new(format!("http://{address}")), 1, 0);
+        let started = Instant::now();
+        let error = client.name_resolve("k51-test").await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("did not complete"));
+        server.abort();
     }
 }
 

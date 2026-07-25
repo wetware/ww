@@ -124,30 +124,30 @@ pub async fn resolve_namespaces(
     resolve_timeout: Option<std::time::Duration>,
     runtime_status: &crate::metrics::RuntimeStatus,
 ) -> Vec<(String, String)> {
+    // A disabled generic mount watchdog must not recreate the exact IPNS hang
+    // this fallback path is meant to avoid.
+    let resolve_timeout = resolve_timeout.unwrap_or(std::time::Duration::from_secs(90));
     let mut resolved = Vec::new();
 
     for config in configs {
         // Try IPNS resolution first
         if !config.ipns.is_empty() {
             let ipns_path = format!("/ipns/{}", config.ipns);
-            let result = match resolve_timeout {
-                Some(timeout) => {
-                    match tokio::time::timeout(timeout, ipfs_client.name_resolve(&ipns_path)).await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            tracing::warn!(
-                                ns = %config.name,
-                                ipns = %config.ipns,
-                                timeout_secs = timeout.as_secs(),
-                                "IPNS resolution made no progress, trying bootstrap CID"
-                            );
-                            Err(anyhow::anyhow!("IPNS resolution timed out"))
-                        }
+            let result =
+                match tokio::time::timeout(resolve_timeout, ipfs_client.name_resolve(&ipns_path))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(
+                            ns = %config.name,
+                            ipns = %config.ipns,
+                            timeout_secs = resolve_timeout.as_secs(),
+                            "IPNS resolution made no progress, trying bootstrap CID"
+                        );
+                        Err(anyhow::anyhow!("IPNS resolution timed out"))
                     }
-                }
-                None => ipfs_client.name_resolve(&ipns_path).await,
-            };
+                };
             match result {
                 Ok(resolved_path) => {
                     tracing::info!(
@@ -295,6 +295,7 @@ mod tests {
         .await;
 
         assert_eq!(resolved, vec![("ww".into(), "/ipfs/bootstrap".into())]);
+        assert!(runtime_status.is_degraded());
         server.abort();
     }
 
