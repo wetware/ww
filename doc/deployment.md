@@ -125,11 +125,19 @@ localhost-only admin plane on `127.0.0.1:2026` is the process control surface:
 Keep the admin listener on loopback unless an authenticated network boundary
 is added; these endpoints are intentionally unauthenticated.
 
+Kubo HTTP requests are bounded to a five-second connection attempt and a
+30-second full request. A listener that accepts connections but fails to
+respond is therefore treated like an unavailable dependency rather than
+wedging startup inside one HTTP call.
+
 `ww run` uses a 120-second Kubo wait by default so a local development
 invocation fails clearly when Kubo is absent. A production deployment that
 must survive a sustained Kubo outage must set `WW_KUBO_WAIT_MAX_SECS=0`; the
 reviewed `ww-master` manifest does so. This keeps `/healthz` available while
-`/readyz` remains closed until Kubo and route registration recover.
+`/readyz` remains closed until the initial Kubo and route-registration phase
+has completed. Readiness is intentionally not a continuous Kubo availability
+probe after startup; liveness remains the process-level signal during a later
+dependency outage.
 
 Related references: [architecture](architecture.md),
 [capability model](capabilities.md), and [CLI](cli.md).

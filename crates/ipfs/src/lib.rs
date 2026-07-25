@@ -4,11 +4,17 @@
 //! an internal helper — guests do not receive an IPFS capability. Content
 //! is served to guests through the WASI virtual filesystem (`CidTree`).
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+// A Kubo TCP listener can accept an HTTP connection yet never return a
+// response. Bound both phases so callers such as the boot-readiness loop can
+// retry instead of becoming permanently stuck in one request.
+const KUBO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const KUBO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// HTTP client for talking to a Kubo node's `/api/v0/*` endpoints.
 #[derive(Clone)]
@@ -20,8 +26,18 @@ pub struct HttpClient {
 impl HttpClient {
     /// Create a new IPFS client with the given HTTP API endpoint URL.
     pub fn new(ipfs_url: String) -> Self {
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(KUBO_CONNECT_TIMEOUT)
+            .timeout(KUBO_REQUEST_TIMEOUT)
+            .build()
+            .expect("fixed Kubo HTTP client configuration must be valid");
+
+        Self::with_http_client(ipfs_url, http_client)
+    }
+
+    fn with_http_client(ipfs_url: String, http_client: reqwest::Client) -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client,
             base_url: ipfs_url.trim_end_matches('/').to_string(),
         }
     }
@@ -281,6 +297,44 @@ impl HttpClient {
             .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow::anyhow!("key gen response missing Id field"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use tokio::net::TcpListener;
+
+    use super::HttpClient;
+
+    #[tokio::test]
+    async fn kubo_request_times_out_after_connection_without_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(50))
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let client = HttpClient::with_http_client(format!("http://{address}"), http_client);
+
+        let started = Instant::now();
+        let error = client
+            .kubo_info()
+            .await
+            .expect_err("a Kubo connection that never responds must time out");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "request timeout was not enforced promptly: {error:#}"
+        );
+        server.abort();
     }
 }
 
