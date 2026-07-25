@@ -16,6 +16,14 @@
 **What:** `isolate` was removed 2026-07 (weak isolation-vs-attenuation separation; confinement leak unfixable under dynamic effect scope). Revisit only if a concrete need arises that neither the capnp membrane (attenuation) nor a spawned cell (isolation) serves, and only with membrane-backed cap authority (a cap carries its granted authority explicitly, independent of definition-site and call-site handler stacks).
 **Priority:** P3
 
+## Action-scoped AuthorityIssuer for approved agent actions
+**What:** Define a typed capability issuer that accepts an authenticated principal plus an approved action or decision receipt and mints only the authority required for that action.
+**Why:** Login-time `AuthPolicy` can construct an identity- or session-scoped authority environment, but it has no proposed-action context and therefore cannot express “refund order 123 and nothing else.”
+**Context:** The async `AuthPolicy` session may provision an `AuthorityIssuer` capability. A policy engine such as Warrant can approve an action; the executor presents that decision to the issuer; Wetware constructs the action-scoped capability so unrelated executor authority is structurally absent. This is also a plausible paid-product seam for decision receipts, issuance, revocation, and audit. Do not design the generic action or receipt schema from the Chess fixture: first use the Cerebral discovery call to map one real Warrant-approved action, the approval output, the capabilities the executor receives today, and its residual ambient paths. ICME is analogous at the decision-proof layer; neither policy approval nor proof substitutes for Wetware's capability issuance.
+**Effort:** L
+**Priority:** P2
+**Depends on:** asynchronous `AuthPolicy` session binding; Cerebral authority map
+
 ## AutoNAT v2: expose per-address reachability (follow-up after node-level parity)
 **What:** Extend runtime network state to expose per-address reachability outcomes from AutoNAT v2 probes, instead of only the node-level `NatReachability` enum.
 **Why:** Node-level state is enough for current relay/Kad policy, but operators and future policy layers may need richer diagnostics (which address was tested, by which server, and why it failed).
