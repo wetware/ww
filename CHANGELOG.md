@@ -105,6 +105,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and UTF-8 failures in profile names, method lists, recipient keys, and
   recipient profile names now surface as `PolicyCompileError::Malformed`
   instead of misleading semantic errors derived from empty defaults.
+- **Kubo mount resolution now survives a ready-but-stalled sidecar.** After
+  the bounded Kubo identity probe succeeds, boot-only namespace, pin, and
+  mount-resolution calls receive a 90-second no-progress watchdog
+  (`WW_KUBO_BOOT_OPERATION_TIMEOUT_SECS`). Timed-out or transport-failed
+  mandatory mount resolution retries with capped backoff while `/healthz`
+  stays available and `/readyz` stays closed. Invalid mount configuration
+  still fails immediately; content transfer and ordinary DHT operations do
+  not inherit a global deadline.
 - **Kubo readiness is bounded without truncating content operations.** The
   IPFS client limits connection attempts to five seconds, while only the small
   local Kubo identity probe has a 30-second deadline. A listener that accepts
