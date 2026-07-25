@@ -309,7 +309,7 @@ mod tests {
     use super::HttpClient;
 
     #[tokio::test]
-    async fn kubo_request_times_out_after_connection_without_response() {
+    async fn kubo_info_times_out_after_connection_without_response() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -317,8 +317,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let http_client = reqwest::Client::new();
-        let client = HttpClient::with_http_client(format!("http://{address}"), http_client);
+        let client = HttpClient::new(format!("http://{address}"));
 
         let started = Instant::now();
         let error = client

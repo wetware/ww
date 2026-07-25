@@ -125,7 +125,7 @@ localhost-only admin plane on `127.0.0.1:2026` is the process control surface:
 Keep the admin listener on loopback unless an authenticated network boundary
 is added; these endpoints are intentionally unauthenticated.
 
-Kubo connections are bounded to five seconds. The small local `/api/v0/id`
+Kubo TCP connection attempts are bounded to five seconds. The small local `/api/v0/id`
 readiness probe is additionally bounded to 30 seconds, so a listener that
 accepts connections but fails to answer cannot wedge the startup wait loop.
 Bulk content transfer and DHT operations deliberately do not inherit that
