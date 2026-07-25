@@ -168,31 +168,32 @@ impl fmt::Display for PolicyCompileError {
 
 impl std::error::Error for PolicyCompileError {}
 
+fn malformed(error: impl fmt::Display) -> PolicyCompileError {
+    PolicyCompileError::Malformed(error.to_string())
+}
+
 fn compile_policy(
     policy: auth_capnp::authority_policy::Reader<'_>,
 ) -> Result<CompiledPolicy, PolicyCompileError> {
     let mut profiles = HashMap::<String, HashSet<MethodKey>>::new();
-    let profile_list = policy
-        .get_profiles()
-        .map_err(|error| PolicyCompileError::Malformed(error.to_string()))?;
+    let profile_list = policy.get_profiles().map_err(malformed)?;
     for profile in profile_list {
         let name = profile
             .get_name()
-            .ok()
-            .and_then(|name| name.to_str().ok())
-            .unwrap_or_default()
+            .map_err(malformed)?
+            .to_str()
+            .map_err(malformed)?
             .to_string();
         if name.is_empty() {
             return Err(PolicyCompileError::EmptyProfileName);
         }
         let mut methods = HashSet::new();
-        if let Ok(method_list) = profile.get_methods() {
-            for method in method_list {
-                methods.insert(MethodKey::new(
-                    method.get_interface_id(),
-                    method.get_ordinal(),
-                ));
-            }
+        let method_list = profile.get_methods().map_err(malformed)?;
+        for method in method_list {
+            methods.insert(MethodKey::new(
+                method.get_interface_id(),
+                method.get_ordinal(),
+            ));
         }
         if methods.is_empty() {
             return Err(PolicyCompileError::EmptyProfile(name));
@@ -203,14 +204,12 @@ fn compile_policy(
     }
 
     let mut bindings = HashMap::new();
-    let recipients = policy
-        .get_recipients()
-        .map_err(|error| PolicyCompileError::Malformed(error.to_string()))?;
+    let recipients = policy.get_recipients().map_err(malformed)?;
     if recipients.is_empty() {
         return Err(PolicyCompileError::NoRecipients);
     }
     for recipient in recipients {
-        let raw_key = recipient.get_verifying_key().unwrap_or_default();
+        let raw_key = recipient.get_verifying_key().map_err(malformed)?;
         let key: [u8; 32] =
             raw_key
                 .try_into()
@@ -219,9 +218,9 @@ fn compile_policy(
                 })?;
         let profile_name = recipient
             .get_profile()
-            .ok()
-            .and_then(|name| name.to_str().ok())
-            .unwrap_or_default()
+            .map_err(malformed)?
+            .to_str()
+            .map_err(malformed)?
             .to_string();
         let methods = profiles
             .get(&profile_name)
@@ -379,6 +378,85 @@ mod tests {
             compile_policy(policy),
             Err(PolicyCompileError::InvalidKeyLength { length: 31 })
         );
+    }
+
+    fn serialized_policy() -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        write_policy(
+            message.init_root::<auth_capnp::authority_policy::Builder>(),
+            &[0xa5; 32],
+            "selected-profile",
+            "selected-profile",
+        );
+        capnp::serialize::write_message_to_words(&message)
+    }
+
+    fn truncate_before(mut message: Vec<u8>, payload: &[u8], occurrence: usize) -> Vec<u8> {
+        assert_eq!(
+            &message[0..4],
+            &[0, 0, 0, 0],
+            "helper assumes a single-segment message"
+        );
+        let offset = message
+            .windows(payload.len())
+            .enumerate()
+            .filter_map(|(offset, candidate)| (candidate == payload).then_some(offset))
+            .nth(occurrence)
+            .expect("payload occurrence exists");
+        assert_eq!(offset % 8, 0, "payload starts on a word boundary");
+        assert!(offset >= 16, "truncation must leave at least one data word");
+        let segment_words = u32::try_from(offset / 8 - 1).expect("segment length fits u32");
+        message[4..8].copy_from_slice(&segment_words.to_le_bytes());
+        message.truncate(offset);
+        message
+    }
+
+    fn compile_serialized_policy(message: &[u8]) -> Result<CompiledPolicy, PolicyCompileError> {
+        let mut input = message;
+        let message = capnp::serialize::read_message_from_flat_slice(
+            &mut input,
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("truncated fixture must still parse as a Cap'n Proto message");
+        let policy = message
+            .get_root::<auth_capnp::authority_policy::Reader>()
+            .expect("truncated fixture must still expose an authority-policy root");
+        compile_policy(policy)
+    }
+
+    #[test]
+    fn policy_compilation_reports_truncated_nested_fields_as_malformed() {
+        let profile = b"selected-profile\0";
+        let interface_id = membrane_capnp::membrane::Client::TYPE_ID.to_le_bytes();
+
+        let cases = [
+            (
+                "profile name",
+                truncate_before(serialized_policy(), profile, 0),
+            ),
+            (
+                "profile methods",
+                truncate_before(serialized_policy(), &interface_id, 0),
+            ),
+            (
+                "recipient verifying key",
+                truncate_before(serialized_policy(), &[0xa5; 32], 0),
+            ),
+            (
+                "recipient profile",
+                truncate_before(serialized_policy(), profile, 1),
+            ),
+        ];
+
+        for (field, policy) in cases {
+            assert!(
+                matches!(
+                    compile_serialized_policy(&policy),
+                    Err(PolicyCompileError::Malformed(_))
+                ),
+                "truncated {field} should be reported as malformed"
+            );
+        }
     }
 
     #[tokio::test]
