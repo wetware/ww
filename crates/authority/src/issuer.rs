@@ -404,10 +404,7 @@ mod tests {
             .nth(occurrence)
             .expect("payload occurrence exists");
         assert_eq!(offset % 8, 0, "payload starts on a word boundary");
-        assert!(
-            offset >= 16,
-            "truncation must leave at least one data word"
-        );
+        assert!(offset >= 16, "truncation must leave at least one data word");
         let segment_words = u32::try_from(offset / 8 - 1).expect("segment length fits u32");
         message[4..8].copy_from_slice(&segment_words.to_le_bytes());
         message.truncate(offset);
