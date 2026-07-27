@@ -17,7 +17,7 @@ use crate::{
 };
 use tokio::sync::watch;
 
-type RecipientMethods = (String, HashSet<MethodKey>);
+type RecipientMethods = (String, Rc<HashSet<MethodKey>>);
 type CompiledPolicy = HashMap<[u8; 32], RecipientMethods>;
 
 #[derive(Clone)]
@@ -45,7 +45,7 @@ impl KeyMethodAuthorization {
         policy: auth_capnp::authority_policy::Reader<'_>,
     ) -> Result<Self, PolicyCompileError> {
         let bindings = compile_policy(policy)?;
-        Ok(Self::new(
+        Ok(Self::from_shared(
             epoch_rx,
             bindings
                 .into_iter()
@@ -57,6 +57,18 @@ impl KeyMethodAuthorization {
         epoch_rx: watch::Receiver<Epoch>,
         bindings: impl IntoIterator<Item = ([u8; 32], String, HashSet<MethodKey>)>,
     ) -> Self {
+        Self::from_shared(
+            epoch_rx,
+            bindings
+                .into_iter()
+                .map(|(key, profile_name, methods)| (key, profile_name, Rc::new(methods))),
+        )
+    }
+
+    fn from_shared(
+        epoch_rx: watch::Receiver<Epoch>,
+        bindings: impl IntoIterator<Item = ([u8; 32], String, Rc<HashSet<MethodKey>>)>,
+    ) -> Self {
         let bindings = bindings
             .into_iter()
             .map(|(key, profile_name, methods)| {
@@ -64,7 +76,7 @@ impl KeyMethodAuthorization {
                     key,
                     Binding {
                         profile_name: profile_name.into(),
-                        methods: Rc::new(methods),
+                        methods,
                         revocation: RevocationGuard::new(),
                     },
                 )
@@ -175,7 +187,7 @@ fn malformed(error: impl fmt::Display) -> PolicyCompileError {
 fn compile_policy(
     policy: auth_capnp::authority_policy::Reader<'_>,
 ) -> Result<CompiledPolicy, PolicyCompileError> {
-    let mut profiles = HashMap::<String, HashSet<MethodKey>>::new();
+    let mut profiles = HashMap::<String, Rc<HashSet<MethodKey>>>::new();
     let profile_list = policy.get_profiles().map_err(malformed)?;
     for profile in profile_list {
         let name = profile
@@ -198,7 +210,7 @@ fn compile_policy(
         if methods.is_empty() {
             return Err(PolicyCompileError::EmptyProfile(name));
         }
-        if profiles.insert(name.clone(), methods).is_some() {
+        if profiles.insert(name.clone(), Rc::new(methods)).is_some() {
             return Err(PolicyCompileError::DuplicateProfile(name));
         }
     }
@@ -457,6 +469,73 @@ mod tests {
                 "truncated {field} should be reported as malformed"
             );
         }
+    }
+
+    #[test]
+    fn compiled_policy_interns_large_profiles_across_recipients() {
+        const METHOD_COUNT: u32 = 2_048;
+        const RECIPIENT_COUNT: u32 = 128;
+
+        fn recipient_key(index: u32) -> [u8; 32] {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&index.to_be_bytes());
+            key
+        }
+
+        let mut message = capnp::message::Builder::new_default();
+        let mut policy = message.init_root::<auth_capnp::authority_policy::Builder>();
+        let mut profiles = policy.reborrow().init_profiles(1);
+        let mut profile = profiles.reborrow().get(0);
+        profile.set_name("large");
+        let mut methods = profile.init_methods(METHOD_COUNT);
+        for index in 0..METHOD_COUNT {
+            let mut method = methods.reborrow().get(index);
+            method.set_interface_id(membrane_capnp::membrane::Client::TYPE_ID);
+            method.set_ordinal(u16::try_from(index).expect("fixture method ordinal fits u16"));
+        }
+        let mut recipients = policy.init_recipients(RECIPIENT_COUNT);
+        for index in 0..RECIPIENT_COUNT {
+            let mut recipient = recipients.reborrow().get(index);
+            recipient.set_verifying_key(&recipient_key(index));
+            recipient.set_profile("large");
+        }
+
+        let policy = message
+            .get_root_as_reader::<auth_capnp::authority_policy::Reader>()
+            .expect("policy reader");
+        let (_epoch_tx, epoch_rx) = watch::channel(epoch(1));
+        let authorization =
+            KeyMethodAuthorization::from_policy(epoch_rx, policy).expect("compiled policy");
+
+        {
+            let bindings = authorization.bindings.borrow();
+            assert_eq!(bindings.len(), RECIPIENT_COUNT as usize);
+            let first = bindings.get(&recipient_key(0)).expect("first recipient");
+            assert_eq!(first.methods.len(), METHOD_COUNT as usize);
+            assert!(first.methods.contains(&MethodKey::new(
+                membrane_capnp::membrane::Client::TYPE_ID,
+                u16::try_from(METHOD_COUNT - 1).expect("fixture method ordinal fits u16"),
+            )));
+
+            for index in 1..RECIPIENT_COUNT {
+                let binding = bindings
+                    .get(&recipient_key(index))
+                    .expect("recipient binding");
+                assert!(
+                    Rc::ptr_eq(&first.methods, &binding.methods),
+                    "recipients selecting one profile must share its method allocation"
+                );
+                assert!(
+                    !Rc::ptr_eq(&first.revocation, &binding.revocation),
+                    "recipient revocation state must remain independent"
+                );
+            }
+        }
+
+        assert!(authorization.revoke(&recipient_key(0)));
+        let bindings = authorization.bindings.borrow();
+        assert!(!bindings.contains_key(&recipient_key(0)));
+        assert!(bindings.contains_key(&recipient_key(1)));
     }
 
     #[tokio::test]
