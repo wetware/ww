@@ -105,6 +105,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and UTF-8 failures in profile names, method lists, recipient keys, and
   recipient profile names now surface as `PolicyCompileError::Malformed`
   instead of misleading semantic errors derived from empty defaults.
+- **Kubo mount resolution now survives a ready-but-stalled sidecar.** After
+  the bounded Kubo identity probe succeeds, each boot-only Kubo API call used
+  for namespace and mount resolution receives its own 90-second no-progress
+  watchdog (`WW_KUBO_BOOT_OPERATION_TIMEOUT_SECS`, which must be positive). Kubo
+  transport failures, HTTP 429, and HTTP 502/503/504 retry with capped backoff under
+  the independent `WW_KUBO_BOOT_RETRY_MAX_SECS` budget (`0` retries
+  indefinitely), while malformed local mounts and Kubo 4xx responses other
+  than 429 fail immediately. Namespace IPNS lookups use the same bounded
+  retry policy before selecting their bootstrap fallback. `/healthz` stays
+  available and `/readyz` stays closed during
+  retries; content transfer and ordinary DHT operations do not inherit a
+  global deadline.
 - **Kubo readiness is bounded without truncating content operations.** The
   IPFS client limits connection attempts to five seconds, while only the small
   local Kubo identity probe has a 30-second deadline. A listener that accepts

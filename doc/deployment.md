@@ -128,9 +128,9 @@ is added; these endpoints are intentionally unauthenticated.
 Kubo TCP connection attempts are bounded to five seconds. The small local `/api/v0/id`
 readiness probe is additionally bounded to 30 seconds, so a listener that
 accepts connections but fails to answer cannot wedge the startup wait loop.
-Bulk content transfer and DHT operations deliberately do not inherit that
-30-second deadline: they can make legitimate progress for longer than a
-readiness interval.
+Bulk content transfer and ordinary runtime DHT operations deliberately do not
+inherit that 30-second deadline: they can make legitimate progress for longer
+than a readiness interval.
 
 `ww run` uses a 120-second Kubo wait by default so a local development
 invocation fails clearly when Kubo is absent. A production deployment that
@@ -140,6 +140,24 @@ reviewed `ww-master` manifest does so. This keeps `/healthz` available while
 has completed. Readiness is intentionally not a continuous Kubo availability
 probe after startup; liveness remains the process-level signal during a later
 dependency outage.
+
+After Kubo identity succeeds, every boot-only Kubo API call used for namespace
+and mount resolution has a separate 90-second no-progress watchdog. Override
+it with `WW_KUBO_BOOT_OPERATION_TIMEOUT_SECS`; it must be a positive number
+because disabling it would reintroduce an unbounded boot hang.
+`WW_KUBO_BOOT_RETRY_MAX_SECS` independently bounds how long a
+retryable boot call (Kubo transport failure, HTTP 429, or HTTP 502/503/504)
+may retry;
+its development default is 120 seconds and `0` retries indefinitely. A bad
+local mount directory and Kubo 4xx response other than 429 fail immediately rather than
+becoming a retry loop. The watchdog is deliberately scoped to individual API
+calls, not an entire image merge, so a slow valid multi-layer merge can make
+progress. `/healthz` remains available and `/readyz` remains closed while a
+mandatory mount call retries. Namespace fallback to its bootstrap CID marks
+the runtime degraded. This is not a global HTTP timeout: content reads and
+DHT activity after startup remain unbounded by it. Initial-head and namespace
+pins are best-effort, so a failed or stalled pin is logged and does not delay
+serving.
 
 Related references: [architecture](architecture.md),
 [capability model](capabilities.md), and [CLI](cli.md).

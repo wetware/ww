@@ -12,7 +12,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 cid = { workspace = true }
 cache = { package = "ww-cache", path = "../cache" }
-tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util", "time"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }

@@ -563,8 +563,7 @@ fn parse_kubo_bootstrap(info: &ipfs::KuboInfo) -> Option<host::KuboBootstrapInfo
 }
 
 /// Environment override for the kubo-readiness wait deadline, in seconds.
-/// `0` means wait indefinitely (the production posture — see
-/// [`wait_for_kubo_ready`]).
+/// `0` means wait indefinitely (the production posture).
 const KUBO_WAIT_MAX_SECS_ENV: &str = "WW_KUBO_WAIT_MAX_SECS";
 
 /// Default kubo-readiness deadline when [`KUBO_WAIT_MAX_SECS_ENV`] is unset.
@@ -573,27 +572,55 @@ const KUBO_WAIT_MAX_SECS_ENV: &str = "WW_KUBO_WAIT_MAX_SECS";
 /// than an indefinite hang. Deploys set the env to `0` for unbounded waiting.
 const KUBO_WAIT_DEFAULT_SECS: u64 = 120;
 
-/// Block until the local kubo node answers `/api/v0/id`, polling with capped
-/// exponential backoff.
-///
-/// The boot-critical FHS resolve (`resolve_mounts_virtual`) hard-depends on
-/// kubo: an `add_dir`/`files_cp` against an unreachable node fails, and until
-/// now that error propagated straight out of `ww run`, exiting the process. In
-/// Kubernetes that is a CrashLoopBackOff, and because every boot recompiles all
-/// wasm from scratch, a restart loop reads as *sustained* CPU — the signature
-/// that tripped the provider Fair-Use throttle. Waiting in place instead of
-/// exiting turns a hot restart loop into a nearly-idle poll (one HTTP GET per
-/// backoff interval), so a transient kubo outage no longer burns CPU.
-///
-/// Returns `Ok(())` once kubo is reachable. With a non-zero deadline it returns
-/// an error after the deadline (dev fail-fast); with `WW_KUBO_WAIT_MAX_SECS=0`
-/// it never gives up (the production "never exit" posture).
-async fn wait_for_kubo_ready(client: &ipfs::HttpClient) -> Result<()> {
-    let max_secs = std::env::var(KUBO_WAIT_MAX_SECS_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(KUBO_WAIT_DEFAULT_SECS);
-    wait_for_kubo_ready_with(client, max_secs).await
+/// Environment override for how long one retryable Kubo boot call may keep
+/// retrying. `0` means retry indefinitely.
+const KUBO_BOOT_RETRY_MAX_SECS_ENV: &str = "WW_KUBO_BOOT_RETRY_MAX_SECS";
+
+/// Development default for the retry budget. Production may opt into
+/// indefinite recovery independently of the initial Kubo-readiness wait.
+const KUBO_BOOT_RETRY_MAX_SECS_DEFAULT: u64 = 120;
+
+/// Environment override for a single Kubo-dependent boot operation. A timeout
+/// here never applies to guest content transfer or ordinary DHT operations.
+const KUBO_BOOT_OPERATION_TIMEOUT_SECS_ENV: &str = "WW_KUBO_BOOT_OPERATION_TIMEOUT_SECS";
+
+/// Long enough for normal cold IPNS/DHT work, short enough to turn a Kubo
+/// no-progress state into an observable retry instead of a permanently
+/// liveness-green, readiness-closed process.
+const KUBO_BOOT_OPERATION_TIMEOUT_DEFAULT_SECS: u64 = 90;
+
+fn kubo_env_u64(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("{name} must be an unsigned integer, got {value:?}")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(anyhow::anyhow!("failed to read {name}: {error}")),
+    }
+}
+
+fn kubo_wait_max_secs() -> Result<u64> {
+    kubo_env_u64(KUBO_WAIT_MAX_SECS_ENV, KUBO_WAIT_DEFAULT_SECS)
+}
+
+fn kubo_boot_retry_max_secs() -> Result<u64> {
+    kubo_env_u64(
+        KUBO_BOOT_RETRY_MAX_SECS_ENV,
+        KUBO_BOOT_RETRY_MAX_SECS_DEFAULT,
+    )
+}
+
+fn kubo_boot_operation_timeout_secs() -> Result<u64> {
+    let secs = kubo_env_u64(
+        KUBO_BOOT_OPERATION_TIMEOUT_SECS_ENV,
+        KUBO_BOOT_OPERATION_TIMEOUT_DEFAULT_SECS,
+    )?;
+    if secs == 0 {
+        bail!(
+            "{KUBO_BOOT_OPERATION_TIMEOUT_SECS_ENV}=0 is unsafe for boot-critical Kubo calls; use a positive number"
+        );
+    }
+    Ok(secs)
 }
 
 /// Core of [`wait_for_kubo_ready`] with an explicit deadline (`max_secs`; `0` =
@@ -1482,6 +1509,17 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
         }
 
+        // Reject local configuration before Kubo readiness can intentionally
+        // wait forever in production. A bad path must remain actionable.
+        image::validate_mounts_virtual(&mounts)?;
+        let local_roots: Vec<&std::path::Path> = mounts
+            .iter()
+            .filter(|mount| mount.is_root() && !ww::ipfs::is_ipfs_path(&mount.source))
+            .map(|mount| std::path::Path::new(&mount.source))
+            .collect();
+        let ns_configs = ww::ns::scan_namespace_configs(&local_roots)
+            .context("Failed to scan namespace configs")?;
+
         ww::config::init_tracing_to_stderr(false);
 
         // Build a chain loader: HostPath > Embedded > IPFS.
@@ -1558,8 +1596,26 @@ wasip2::cli::command::export!({iface_name}Guest);
         // outage remains observable through the already-running admin plane
         // instead of becoming a CrashLoopBackOff.
         runtime_status.set_phase("waiting-for-kubo");
+        let kubo_wait_max_secs = kubo_wait_max_secs()?;
+        let kubo_boot_retry_max_secs = kubo_boot_retry_max_secs()?;
+        let kubo_operation_timeout_secs = kubo_boot_operation_timeout_secs()?;
+        let retry_status = runtime_status.clone();
+        let boot_ipfs_client = ipfs::BootClient::new(
+            ipfs_client.clone(),
+            kubo_boot_retry_max_secs,
+            kubo_operation_timeout_secs,
+        )
+        .with_retry_observer(std::sync::Arc::new(move |operation, attempt| {
+            retry_status.mark_degraded(format!("Kubo boot operation {operation} is retrying"));
+            tracing::debug!(operation, attempt, "Kubo boot retry status updated");
+        }));
+        tracing::info!(
+            retry_max_secs = kubo_boot_retry_max_secs,
+            operation_timeout_secs = kubo_operation_timeout_secs,
+            "Kubo boot retry policy configured"
+        );
         tokio::select! {
-            result = wait_for_kubo_ready(&ipfs_client) => result?,
+            result = wait_for_kubo_ready_with(&ipfs_client, kubo_wait_max_secs) => result?,
             service_exit = supervisor.next_service_exit() => {
                 return Err(service_exit_error(service_exit));
             }
@@ -1582,8 +1638,8 @@ wasip2::cli::command::export!({iface_name}Guest);
             );
 
             // Pin the initial head.
-            if let Err(e) = ipfs_client.pin_add(&ipfs_path).await {
-                tracing::warn!(path = %ipfs_path, "Failed to pin initial head: {e}");
+            if let Err(error) = boot_ipfs_client.pin_add_once(&ipfs_path).await {
+                tracing::warn!(path = %ipfs_path, "Failed to pin initial head: {error}");
             }
 
             all_mounts.push(ww::cell::mount::Mount {
@@ -1611,27 +1667,23 @@ wasip2::cli::command::export!({iface_name}Guest);
             None
         };
 
-        // Resolve namespace mounts from etc/ns/ in user-specified local paths.
         // Namespace layers sit between stem (on-chain base) and user mounts.
-        let local_roots: Vec<&std::path::Path> = mounts
-            .iter()
-            .filter(|m| m.is_root() && !ww::ipfs::is_ipfs_path(&m.source))
-            .map(|m| std::path::Path::new(&m.source))
-            .collect();
-        let ns_configs = match ww::ns::scan_namespace_configs(&local_roots) {
-            Ok(configs) => configs,
-            Err(e) => {
-                tracing::warn!("Failed to scan namespace configs: {e}");
-                Vec::new()
-            }
-        };
         if !ns_configs.is_empty() {
-            let resolved = ww::ns::resolve_namespaces(&ns_configs, &ipfs_client).await;
+            let resolved = tokio::select! {
+                resolved = ww::ns::resolve_namespaces(
+                    &ns_configs,
+                    &boot_ipfs_client,
+                    &runtime_status,
+                ) => resolved,
+                service_exit = supervisor.next_service_exit() => {
+                    return Err(service_exit_error(service_exit));
+                }
+            };
             for (name, ipfs_path) in &resolved {
                 tracing::info!(ns = %name, path = %ipfs_path, "Mounting namespace");
                 // Pin the namespace tree so subsequent boots use the local copy.
-                if let Err(e) = ipfs_client.pin_add(ipfs_path).await {
-                    tracing::warn!(ns = %name, path = %ipfs_path, "Failed to pin namespace: {e}");
+                if let Err(error) = boot_ipfs_client.pin_add_once(ipfs_path).await {
+                    tracing::warn!(ns = %name, path = %ipfs_path, "Failed to pin namespace: {error}");
                 }
                 all_mounts.push(ww::cell::mount::Mount {
                     source: ipfs_path.clone(),
@@ -1649,8 +1701,22 @@ wasip2::cli::command::export!({iface_name}Guest);
         // backed by the IPFS DAG.
         runtime_status.set_phase("resolving-mounts");
         tracing::debug!("resolving mounts (virtual)...");
-        let (root_cid, local_overrides) =
-            image::resolve_mounts_virtual(&all_mounts, &ipfs_client).await?;
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let mut mount_resolution = Box::pin(image::resolve_mounts_virtual_with_cancel(
+            &all_mounts,
+            &boot_ipfs_client,
+            &mut cancel_rx,
+        ));
+        let (root_cid, local_overrides) = tokio::select! {
+            result = &mut mount_resolution => result?,
+            service_exit = supervisor.next_service_exit() => {
+                let _ = cancel_tx.send(true);
+                if let Err(cleanup_error) = mount_resolution.await {
+                    tracing::warn!("mount resolution cancelled after service exit: {cleanup_error:#}");
+                }
+                return Err(service_exit_error(service_exit));
+            }
+        };
         let image_path = format!("/ipfs/{}", root_cid);
         tracing::debug!(root = %image_path, "virtual root resolved");
 
