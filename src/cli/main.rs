@@ -1606,9 +1606,8 @@ wasip2::cli::command::export!({iface_name}Guest);
             kubo_operation_timeout_secs,
         )
         .with_retry_observer(std::sync::Arc::new(move |operation, attempt| {
-            retry_status.mark_degraded(format!(
-                "Kubo boot operation {operation} is retrying (attempt {attempt})"
-            ));
+            retry_status.mark_degraded(format!("Kubo boot operation {operation} is retrying"));
+            tracing::debug!(operation, attempt, "Kubo boot retry status updated");
         }));
         tracing::info!(
             retry_max_secs = kubo_boot_retry_max_secs,

@@ -17,6 +17,7 @@
 //! used by `resolve_mounts_virtual`.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -33,6 +34,23 @@ struct MfsNamespaceGuard {
     client: ipfs::HttpClient,
     path: String,
     cleaned: bool,
+}
+
+async fn await_or_cancel<T, F>(
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+    operation: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    tokio::select! {
+        result = operation => result,
+        changed = cancel.changed() => match changed {
+            Ok(()) if *cancel.borrow() => Err(anyhow::anyhow!("mount resolution cancelled")),
+            Ok(()) => Err(anyhow::anyhow!("mount resolution cancellation channel changed unexpectedly")),
+            Err(_) => Err(anyhow::anyhow!("mount resolution cancellation channel closed")),
+        }
+    }
 }
 
 impl MfsNamespaceGuard {
@@ -89,7 +107,7 @@ impl Drop for MfsNamespaceGuard {
                 }
             });
         } else {
-            tracing::warn!(path = %self.path, "MFS namespace dropped without a Tokio runtime; cleanup deferred to Kubo GC");
+            tracing::warn!(path = %self.path, "MFS namespace dropped without a Tokio runtime; manual MFS cleanup may be required");
         }
     }
 }
@@ -292,7 +310,7 @@ pub async fn resolve_mounts_virtual_with_cancel(
     for mount in &root_mounts {
         if ipfs::is_ipfs_path(&mount.source) {
             let ipfs_path = if mount.source.starts_with("/ipns/") {
-                resolve_ipns_to_ipfs(&mount.source, ipfs_client).await?
+                await_or_cancel(cancel, resolve_ipns_to_ipfs(&mount.source, ipfs_client)).await?
             } else {
                 mount.source.clone()
             };
@@ -301,8 +319,7 @@ pub async fn resolve_mounts_virtual_with_cancel(
                 .with_context(|| format!("expected resolved /ipfs/ path, got {ipfs_path}"))?;
             cids.push(cid_with_subpath.to_string());
         } else {
-            let cid = ipfs_client
-                .add_dir(Path::new(&mount.source))
+            let cid = await_or_cancel(cancel, ipfs_client.add_dir(Path::new(&mount.source)))
                 .await
                 .with_context(|| format!("Failed to add local layer to IPFS: {}", mount.source))?;
             cids.push(cid);
@@ -411,6 +428,8 @@ pub fn cid_bytes_to_ipfs_path(cid_bytes: &[u8]) -> Result<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
 
     fn stub_ipfs_client() -> ipfs::BootClient {
         ipfs::BootClient::new(ipfs::HttpClient::new("http://localhost:5001".into()), 1, 1)
@@ -448,6 +467,33 @@ mod tests {
         let result =
             resolve_mounts_virtual(&[root_mount("/nonexistent/path/abc123")], &client).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_root_ipns_resolution() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client =
+            ipfs::BootClient::new(ipfs::HttpClient::new(format!("http://{address}")), 0, 1);
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let mounts = [root_mount("/ipns/k51-test")];
+        let resolution = resolve_mounts_virtual_with_cancel(&mounts, &client, &mut cancel_rx);
+        tokio::pin!(resolution);
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        cancel_tx.send(true).unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), &mut resolution)
+            .await
+            .expect("root IPNS resolution must observe cancellation")
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        server.abort();
     }
 
     #[tokio::test]
