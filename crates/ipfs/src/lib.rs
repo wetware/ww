@@ -298,6 +298,22 @@ pub struct BootMfs<'a> {
 }
 
 impl BootMfs<'_> {
+    pub async fn files_mkdir(&self, path: &str, parents: bool) -> Result<()> {
+        // Namespace creation is non-idempotent: Kubo may have created the
+        // directory even if a client-side watchdog expires. Let the enclosing
+        // DAG merge retry in a fresh random namespace instead of replaying
+        // this request against an ambiguous path.
+        let timeout = self.client.bounded_timeout();
+        let mfs = self.client.client.mfs();
+        let mkdir = mfs.files_mkdir(path, parents);
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, mkdir)
+                .await
+                .map_err(|_| KuboOperationTimeout::new("MFS mkdir", timeout))?,
+            None => mkdir.await,
+        }
+    }
+
     pub async fn files_cp(&self, source: &str, destination: &str) -> Result<()> {
         // Kubo can complete a copy after the caller's watchdog fires. Reusing
         // the destination would then fail with "already has entry", so do not

@@ -1620,6 +1620,16 @@ wasip2::cli::command::export!({iface_name}Guest);
                 return Err(service_exit_error(service_exit));
             }
         }
+        // Cleanup is deliberately detached: it may use at most a short,
+        // internal deadline, but boot must not wait for best-effort hygiene.
+        let sweep_ipfs_client = boot_ipfs_client.clone();
+        tokio::spawn(async move {
+            match image::sweep_stale_mfs_namespaces(&sweep_ipfs_client).await {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "Stale MFS merge namespace sweep complete"),
+                Err(error) => tracing::warn!("Stale MFS merge namespace sweep skipped: {error}"),
+            }
+        });
         runtime_status.set_phase("resolving-configuration");
 
         // If --stem is provided, read the on-chain head and prepend it
