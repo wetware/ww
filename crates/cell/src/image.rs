@@ -19,6 +19,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use cid::Cid;
@@ -78,7 +79,12 @@ impl MfsNamespaceGuard {
         .await
         {
             Ok(Ok(())) => self.cleaned = true,
-            Ok(Err(error)) => tracing::warn!(path = %self.path, "MFS cleanup failed: {error}"),
+            Ok(Err(error)) => {
+                // A terminal Kubo response will not become useful on a second
+                // identical remove, so avoid a duplicate Drop-time request.
+                self.cleaned = true;
+                tracing::warn!(path = %self.path, "MFS cleanup failed: {error}");
+            }
             Err(_) => tracing::warn!(path = %self.path, "MFS cleanup timed out"),
         }
     }
@@ -128,44 +134,98 @@ async fn dag_merge(
         return Ok(cids[0].clone());
     }
 
-    let guard = MfsNamespaceGuard::new(client);
+    let started = Instant::now();
+    let deadline = client
+        .retry_max_duration()
+        .map(|duration| started + duration);
+    let mut backoff = Duration::from_millis(500);
+    let mut attempt = 0u64;
 
-    let result = {
-        let merge = async {
-            // Copy the base layer (O(1) DAG link).
-            client
-                .mfs()
-                .files_cp(&format!("/ipfs/{}", cids[0]), guard.path())
-                .await
-                .context("Failed to copy base layer to MFS")?;
-
-            // Overlay each subsequent layer.
-            for cid in &cids[1..] {
-                merge_overlay_recursive(client, guard.path(), &format!("/ipfs/{cid}"))
-                    .await
-                    .with_context(|| format!("Failed to merge overlay {cid}"))?;
-            }
-
-            // Stat to get merged root CID.
-            let stat = client
-                .mfs()
-                .files_stat(guard.path(), true)
-                .await
-                .context("Failed to stat merged MFS namespace")?;
-            Ok(stat.hash)
-        };
-        tokio::pin!(merge);
-        tokio::select! {
-            result = &mut merge => result,
-            changed = cancel.changed() => match changed {
-                Ok(()) if *cancel.borrow() => Err(anyhow::anyhow!("mount resolution cancelled")),
-                Ok(()) => Err(anyhow::anyhow!("mount resolution cancellation channel changed unexpectedly")),
-                Err(_) => Err(anyhow::anyhow!("mount resolution cancellation channel closed")),
-            }
+    loop {
+        attempt += 1;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            bail!(
+                "Kubo boot operation MFS DAG merge did not complete after {}s",
+                started.elapsed().as_secs()
+            );
         }
+
+        // Each retry receives a new namespace. This is essential because a
+        // timed-out copy or remove may have completed inside Kubo, making a
+        // replay against the previous path non-idempotent.
+        let guard = MfsNamespaceGuard::new(client);
+        let result = dag_merge_attempt(cids, client, cancel, guard.path()).await;
+        guard.cleanup().await;
+
+        match result {
+            Ok(root) => return Ok(root),
+            Err(error) if ipfs::is_retryable_kubo_error(&error) => {
+                tracing::warn!(
+                    operation = "MFS DAG merge",
+                    attempt,
+                    error = %error,
+                    "Kubo boot operation will retry with a fresh MFS namespace"
+                );
+                client.report_retry("MFS DAG merge", attempt);
+
+                let delay = deadline
+                    .map(|deadline| backoff.min(deadline.saturating_duration_since(Instant::now())))
+                    .unwrap_or(backoff);
+                if delay.is_zero() {
+                    bail!(
+                        "Kubo boot operation MFS DAG merge did not complete after {}s",
+                        started.elapsed().as_secs()
+                    );
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    changed = cancel.changed() => return match changed {
+                        Ok(()) if *cancel.borrow() => Err(anyhow::anyhow!("mount resolution cancelled")),
+                        Ok(()) => Err(anyhow::anyhow!("mount resolution cancellation channel changed unexpectedly")),
+                        Err(_) => Err(anyhow::anyhow!("mount resolution cancellation channel closed")),
+                    },
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(15));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn dag_merge_attempt(
+    cids: &[String],
+    client: &ipfs::BootClient,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+    mfs_path: &str,
+) -> Result<String> {
+    if *cancel.borrow() {
+        bail!("mount resolution cancelled");
+    }
+
+    let merge = async {
+        // Copy the base layer (O(1) DAG link).
+        client
+            .mfs()
+            .files_cp(&format!("/ipfs/{}", cids[0]), mfs_path)
+            .await
+            .context("Failed to copy base layer to MFS")?;
+
+        // Overlay each subsequent layer.
+        for cid in &cids[1..] {
+            merge_overlay_recursive(client, mfs_path, &format!("/ipfs/{cid}"))
+                .await
+                .with_context(|| format!("Failed to merge overlay {cid}"))?;
+        }
+
+        // Stat to get merged root CID.
+        let stat = client
+            .mfs()
+            .files_stat(mfs_path, true)
+            .await
+            .context("Failed to stat merged MFS namespace")?;
+        Ok(stat.hash)
     };
-    guard.cleanup().await;
-    result
+    await_or_cancel(cancel, merge).await
 }
 
 /// Recursively merge an overlay into the MFS namespace.
@@ -199,7 +259,8 @@ async fn merge_overlay_recursive_inner(
         .await
         .with_context(|| format!("ls overlay {overlay_path}"))?;
 
-    // List existing MFS entries (may be empty if dir is new).
+    // Recursion only descends into directories already copied into MFS, so a
+    // listing error is an operation failure rather than evidence of an empty dir.
     let mfs_entries = mfs.files_ls(mfs_path).await?;
     let mfs_names: HashSet<&str> = mfs_entries.iter().map(|e| e.name.as_str()).collect();
 
@@ -255,7 +316,6 @@ pub async fn resolve_mounts_virtual(
     String,
     std::collections::HashMap<std::path::PathBuf, crate::vfs::LocalOverride>,
 )> {
-    let (_root_mounts, _targeted_mounts) = validate_mounts_virtual(mounts)?;
     let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
     resolve_mounts_virtual_with_cancel(mounts, ipfs_client, &mut cancel).await
 }
@@ -428,7 +488,7 @@ pub fn cid_bytes_to_ipfs_path(cid_bytes: &[u8]) -> Result<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn stub_ipfs_client() -> ipfs::BootClient {
@@ -467,6 +527,39 @@ mod tests {
         let result =
             resolve_mounts_virtual(&[root_mount("/nonexistent/path/abc123")], &client).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dag_merge_retries_a_transient_copy_in_a_fresh_namespace() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let responses = [
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Message\":\"busy\"}".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"Objects\":[{\"Links\":[]}]}".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"Entries\":[]}".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 45\r\nConnection: close\r\n\r\n{\"Hash\":\"merged\",\"Size\":0,\"Type\":\"directory\"}".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            ];
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await.unwrap();
+                stream.write_all(response).await.unwrap();
+            }
+        });
+        let client =
+            ipfs::BootClient::new(ipfs::HttpClient::new(format!("http://{address}")), 3, 1);
+
+        let result = resolve_mounts_virtual(
+            &[root_mount("/ipfs/base"), root_mount("/ipfs/overlay")],
+            &client,
+        )
+        .await;
+        assert_eq!(result.unwrap().0, "merged");
+        server.await.unwrap();
     }
 
     #[tokio::test]

@@ -1672,8 +1672,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             let resolved = tokio::select! {
                 resolved = ww::ns::resolve_namespaces(
                     &ns_configs,
-                    &ipfs_client,
-                    boot_ipfs_client.operation_timeout(),
+                    &boot_ipfs_client,
                     &runtime_status,
                 ) => resolved,
                 service_exit = supervisor.next_service_exit() => {

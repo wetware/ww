@@ -84,6 +84,32 @@ impl std::fmt::Display for KuboApiError {
 
 impl std::error::Error for KuboApiError {}
 
+/// A boot-operation watchdog elapsed before Kubo made progress.
+#[derive(Debug)]
+pub struct KuboOperationTimeout {
+    operation: &'static str,
+    timeout: Duration,
+}
+
+impl KuboOperationTimeout {
+    fn new(operation: &'static str, timeout: Duration) -> Self {
+        Self { operation, timeout }
+    }
+}
+
+impl std::fmt::Display for KuboOperationTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} made no progress within {}s",
+            self.operation,
+            self.timeout.as_secs_f64()
+        )
+    }
+}
+
+impl std::error::Error for KuboOperationTimeout {}
+
 /// Whether an IPFS error is safe to retry during critical boot resolution.
 /// Transport failures, 429, and gateway failures retry; local filesystem and
 /// ordinary Kubo API errors fail immediately.
@@ -91,10 +117,11 @@ pub fn is_retryable_kubo_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<reqwest::Error>()
-            .is_some_and(|error| error.is_connect() || error.is_timeout())
+            .is_some_and(|error| error.is_connect() || error.is_timeout() || error.is_request())
             || cause
                 .downcast_ref::<KuboApiError>()
                 .is_some_and(KuboApiError::is_retryable)
+            || cause.is::<KuboOperationTimeout>()
     })
 }
 
@@ -131,11 +158,35 @@ impl BootClient {
         self.operation_timeout
     }
 
+    /// Maximum cumulative retry duration for one boot operation, if finite.
+    pub fn retry_max_duration(&self) -> Option<Duration> {
+        self.retry_deadline
+    }
+
+    /// Bound one non-idempotent request by the stricter of its watchdog and
+    /// finite retry budget. The caller may retry a larger idempotent unit in a
+    /// fresh namespace, but must never leave the individual request unbounded.
+    fn bounded_timeout(&self) -> Option<Duration> {
+        match (self.operation_timeout, self.retry_deadline) {
+            (Some(watchdog), Some(budget)) => Some(watchdog.min(budget)),
+            (Some(watchdog), None) => Some(watchdog),
+            (None, Some(budget)) => Some(budget),
+            (None, None) => None,
+        }
+    }
+
     /// Attach boot-status reporting without coupling this crate to the host's
     /// metrics implementation.
     pub fn with_retry_observer(mut self, observer: RetryObserver) -> Self {
         self.retry_observer = Some(observer);
         self
+    }
+
+    /// Record a retry of a composite boot operation in the configured observer.
+    pub fn report_retry(&self, operation_name: &str, attempt: u64) {
+        if let Some(observer) = &self.retry_observer {
+            observer(operation_name, attempt);
+        }
     }
 
     async fn retry<T, F, Fut>(&self, operation_name: &str, mut operation: F) -> Result<T>
@@ -160,9 +211,9 @@ impl BootClient {
                 );
             }
 
-            let attempt_timeout = match (self.operation_timeout, remaining) {
-                (Some(watchdog), Some(remaining)) => Some(watchdog.min(remaining)),
-                (Some(watchdog), None) => Some(watchdog),
+            let attempt_timeout = match (self.bounded_timeout(), remaining) {
+                (Some(timeout), Some(remaining)) => Some(timeout.min(remaining)),
+                (Some(timeout), None) => Some(timeout),
                 (None, Some(remaining)) => Some(remaining),
                 (None, None) => None,
             };
@@ -190,9 +241,7 @@ impl BootClient {
                 reason = %retry_reason,
                 "Kubo boot operation will retry"
             );
-            if let Some(observer) = &self.retry_observer {
-                observer(operation_name, attempt);
-            }
+            self.report_retry(operation_name, attempt);
 
             if let Some(remaining) =
                 deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
@@ -214,15 +263,10 @@ impl BootClient {
     /// One bounded best-effort operation. Pins are an optimization: callers
     /// log and continue rather than holding serving readiness behind retries.
     pub async fn pin_add_once(&self, cid: &str) -> Result<()> {
-        match self.operation_timeout {
+        match self.bounded_timeout() {
             Some(timeout) => tokio::time::timeout(timeout, self.client.pin_add(cid))
                 .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "IPFS pin add made no progress within {}s",
-                        timeout.as_secs_f64()
-                    )
-                })?,
+                .map_err(|_| KuboOperationTimeout::new("IPFS pin add", timeout))?,
             None => self.client.pin_add(cid).await,
         }
     }
@@ -257,23 +301,15 @@ impl BootMfs<'_> {
     pub async fn files_cp(&self, source: &str, destination: &str) -> Result<()> {
         // Kubo can complete a copy after the caller's watchdog fires. Reusing
         // the destination would then fail with "already has entry", so do not
-        // blindly retry this non-idempotent request. The caller owns a unique
-        // MFS namespace and can restart safely with a new destination.
-        let timeout = match (self.client.operation_timeout, self.client.retry_deadline) {
-            (Some(watchdog), Some(budget)) => Some(watchdog.min(budget)),
-            (Some(watchdog), None) => Some(watchdog),
-            (None, Some(budget)) => Some(budget),
-            (None, None) => None,
-        };
+        // blindly retry this non-idempotent request. The caller retries the
+        // enclosing merge with a fresh namespace when this attempt is transient.
+        let timeout = self.client.bounded_timeout();
         let mfs = self.client.client.mfs();
         let copy = mfs.files_cp(source, destination);
         match timeout {
-            Some(timeout) => tokio::time::timeout(timeout, copy).await.map_err(|_| {
-                anyhow::anyhow!(
-                    "MFS copy made no progress within {}s",
-                    timeout.as_secs_f64()
-                )
-            })?,
+            Some(timeout) => tokio::time::timeout(timeout, copy)
+                .await
+                .map_err(|_| KuboOperationTimeout::new("MFS copy", timeout))?,
             None => copy.await,
         }
     }
@@ -306,21 +342,13 @@ impl BootMfs<'_> {
         // As with copy, a timed-out remove may complete server-side. Repeating
         // it can turn a successful first removal into Kubo's terminal
         // "not found" response, so keep this single-attempt and bounded.
-        let timeout = match (self.client.operation_timeout, self.client.retry_deadline) {
-            (Some(watchdog), Some(budget)) => Some(watchdog.min(budget)),
-            (Some(watchdog), None) => Some(watchdog),
-            (None, Some(budget)) => Some(budget),
-            (None, None) => None,
-        };
+        let timeout = self.client.bounded_timeout();
         let mfs = self.client.client.mfs();
         let remove = mfs.files_rm(path, recursive);
         match timeout {
-            Some(timeout) => tokio::time::timeout(timeout, remove).await.map_err(|_| {
-                anyhow::anyhow!(
-                    "MFS removal made no progress within {}s",
-                    timeout.as_secs_f64()
-                )
-            })?,
+            Some(timeout) => tokio::time::timeout(timeout, remove)
+                .await
+                .map_err(|_| KuboOperationTimeout::new("MFS removal", timeout))?,
             None => remove.await,
         }
     }
@@ -687,6 +715,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_inflight_request_is_retryable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            // Dropping an accepted connection before response headers models a
+            // Kubo restart after the client has already connected.
+            drop(stream);
+        });
+
+        let client = HttpClient::new(format!("http://{address}"));
+        let error = client.name_resolve("k51-test").await.unwrap_err();
+        assert!(
+            is_retryable_kubo_error(&error),
+            "an in-flight transport reset must retry: {error:#}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn kubo_429_is_retryable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Message\":\"busy\"}")
+                .await
+                .unwrap();
+        });
+
+        let client = HttpClient::new(format!("http://{address}"));
+        let error = client.name_resolve("k51-test").await.unwrap_err();
+        assert!(is_retryable_kubo_error(&error));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn missing_local_directory_is_not_retryable() {
         let directory = tempfile::TempDir::new().unwrap();
         let missing = directory.path().join("does-not-exist");
@@ -753,6 +821,24 @@ mod tests {
         let error = client.name_resolve("k51-test").await.unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(error.to_string().contains("did not complete"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn finite_retry_budget_bounds_best_effort_pin_without_watchdog() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            std::future::pending::<()>().await;
+        });
+
+        let client = BootClient::new(HttpClient::new(format!("http://{address}")), 1, 0);
+        let started = Instant::now();
+        let error = client.pin_add_once("bafy-test").await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("IPFS pin add made no progress"));
         server.abort();
     }
 }

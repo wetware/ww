@@ -111,8 +111,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   watchdog (`WW_KUBO_BOOT_OPERATION_TIMEOUT_SECS`, which must be positive). Kubo
   transport failures, HTTP 429, and HTTP 502/503/504 retry with capped backoff under
   the independent `WW_KUBO_BOOT_RETRY_MAX_SECS` budget (`0` retries
-  indefinitely), while malformed local mounts and Kubo 4xx responses fail
-  immediately. `/healthz` stays available and `/readyz` stays closed during
+  indefinitely), while malformed local mounts and Kubo 4xx responses other
+  than 429 fail immediately. Namespace IPNS lookups use the same bounded
+  retry policy before selecting their bootstrap fallback. `/healthz` stays
+  available and `/readyz` stays closed during
   retries; content transfer and ordinary DHT operations do not inherit a
   global deadline.
 - **Kubo readiness is bounded without truncating content operations.** The

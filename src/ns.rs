@@ -120,13 +120,16 @@ pub fn scan_namespace_configs(mount_paths: &[&Path]) -> Result<Vec<NamespaceConf
 /// then falls back to the bootstrap CID. Returns a list of (name, ipfs_path) pairs.
 pub async fn resolve_namespaces(
     configs: &[NamespaceConfig],
-    ipfs_client: &crate::ipfs::HttpClient,
-    resolve_timeout: Option<std::time::Duration>,
+    ipfs_client: &crate::ipfs::BootClient,
     runtime_status: &crate::metrics::RuntimeStatus,
 ) -> Vec<(String, String)> {
-    // A disabled generic mount watchdog must not recreate the exact IPNS hang
-    // this fallback path is meant to avoid.
-    let resolve_timeout = resolve_timeout.unwrap_or(std::time::Duration::from_secs(90));
+    // Namespace fallback must stay bounded even when the generic boot retry
+    // budget is intentionally unbounded. Within this window, BootClient still
+    // retries transport and gateway failures; a no-progress stall selects the
+    // configured bootstrap rather than holding the whole image indefinitely.
+    let resolve_timeout = ipfs_client
+        .operation_timeout()
+        .unwrap_or(std::time::Duration::from_secs(90));
     let mut resolved = Vec::new();
 
     for config in configs {
@@ -279,20 +282,15 @@ mod tests {
             bootstrap: "/ipfs/bootstrap".into(),
         };
         let runtime_status = crate::metrics::RuntimeStatus::starting();
-        let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
+        let raw_client = crate::ipfs::HttpClient::new(format!("http://{address}"));
 
-        client
+        raw_client
             .kubo_info()
             .await
             .expect("the fake Kubo identity endpoint must succeed first");
+        let client = crate::ipfs::BootClient::new(raw_client, 1, 1);
 
-        let resolved = resolve_namespaces(
-            &[config],
-            &client,
-            Some(std::time::Duration::from_millis(25)),
-            &runtime_status,
-        )
-        .await;
+        let resolved = resolve_namespaces(&[config], &client, &runtime_status).await;
 
         assert_eq!(resolved, vec![("ww".into(), "/ipfs/bootstrap".into())]);
         assert!(runtime_status.is_degraded());
