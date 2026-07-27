@@ -473,10 +473,12 @@ mod tests {
     async fn cancellation_interrupts_root_ipns_resolution() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 4096];
             let _ = stream.read(&mut request).await.unwrap();
+            let _ = started_tx.send(());
             std::future::pending::<()>().await;
         });
         let client =
@@ -486,7 +488,10 @@ mod tests {
         let resolution = resolve_mounts_virtual_with_cancel(&mounts, &client, &mut cancel_rx);
         tokio::pin!(resolution);
 
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        tokio::select! {
+            result = &mut resolution => panic!("root resolution completed before cancellation: {result:?}"),
+            started = started_rx => started.expect("fake Kubo must receive the root IPNS request before cancellation"),
+        }
         cancel_tx.send(true).unwrap();
         let error = tokio::time::timeout(std::time::Duration::from_secs(1), &mut resolution)
             .await
