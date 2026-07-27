@@ -105,6 +105,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and UTF-8 failures in profile names, method lists, recipient keys, and
   recipient profile names now surface as `PolicyCompileError::Malformed`
   instead of misleading semantic errors derived from empty defaults.
+- **Abandoned MFS merge namespaces are reclaimed conservatively.** New merge
+  workspaces live under a versioned private root and carry paired random owner
+  and reapable markers. After 24 hours, a later boot makes a bounded,
+  best-effort sweep only of positively owned workspaces whose merge attempt
+  has already ended. Active, malformed, foreign-looking, and legacy paths are
+  intentionally left untouched.
 - **Kubo mount resolution now survives a ready-but-stalled sidecar.** After
   the bounded Kubo identity probe succeeds, each boot-only Kubo API call used
   for namespace and mount resolution receives its own 90-second no-progress

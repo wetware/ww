@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use cid::Cid;
@@ -29,11 +29,138 @@ use ipfs;
 
 // ── DAG merge via IPFS MFS ─────────────────────────────────────────
 
+// Merge workspaces live below a versioned, private-to-ww MFS root. Older
+// `/ww-merge-*` paths deliberately remain outside the sweeper's authority:
+// their origin and liveness cannot be established safely.
+const MFS_MERGE_ROOT: &str = "/wetware-ww/merge-v1";
+const MFS_MERGE_WORKSPACE: &str = "root";
+const MFS_OWNER_MARKER_PREFIX: &str = ".wetware-ww-owner-v1-";
+const MFS_REAPABLE_MARKER_PREFIX: &str = ".wetware-ww-reapable-v1-";
+// A DAG merge is bounded by the boot operation watchdog. Keep namespaces for
+// much longer than a normal boot so a temporarily unhealthy Kubo cannot cause
+// a later boot to remove a live merge namespace.
+const MFS_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+const MFS_SWEEP_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+const MFS_CLEANUP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn mfs_namespace_name(created_at_secs: u64, token: u128) -> String {
+    format!("{created_at_secs:016x}-{token:032x}")
+}
+
+fn mfs_namespace_parts(name: &str) -> Option<(u64, &str)> {
+    let (created_at, token) = name.split_once('-')?;
+    if created_at.len() != 16
+        || token.len() != 32
+        || !created_at.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    u64::from_str_radix(created_at, 16)
+        .ok()
+        .map(|created_at| (created_at, token))
+}
+
+fn mfs_owner_marker(token: &str) -> String {
+    format!("{MFS_OWNER_MARKER_PREFIX}{token}")
+}
+
+fn mfs_reapable_marker(token: &str) -> String {
+    format!("{MFS_REAPABLE_MARKER_PREFIX}{token}")
+}
+
+fn mfs_entry_is_directory(entries: &[ipfs::MfsEntry], name: &str) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.entry_type == 1 && entry.name == name)
+}
+
+/// Remove abandoned merge namespaces created by this version of `ww`.
+///
+/// A namespace is eligible only when it is below the versioned ww root, has
+/// both an unguessable owner marker and a reapable marker written after its
+/// merge attempt ended, and has aged for a full day. An active workspace has
+/// no reapable marker, so it is never swept even if its clock timestamp is
+/// old or skewed. The sweep is best-effort and must never block boot.
+pub async fn sweep_stale_mfs_namespaces(client: &ipfs::BootClient) -> Result<usize> {
+    // One deadline bounds the *entire* background pass. Giving every entry a
+    // fresh timeout would let a large collection of abandoned namespaces hold
+    // this task indefinitely.
+    let deadline = tokio::time::Instant::now() + MFS_SWEEP_OPERATION_TIMEOUT;
+    let entries = tokio::time::timeout_at(deadline, client.client().mfs().files_ls(MFS_MERGE_ROOT))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out listing MFS merge root for stale namespaces"))??;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    let mut removed = 0;
+
+    for entry in entries {
+        if entry.entry_type != 1 {
+            continue;
+        }
+        let Some((created_at, token)) = mfs_namespace_parts(&entry.name) else {
+            continue;
+        };
+        if now.saturating_sub(created_at) < MFS_STALE_AFTER.as_secs() {
+            continue;
+        }
+
+        let path = format!("{MFS_MERGE_ROOT}/{}", entry.name);
+        // A name alone is never enough to establish ownership. Refuse to
+        // remove a workspace unless its paired, random owner and reapable
+        // markers are both present as directories.
+        let children = match tokio::time::timeout_at(
+            deadline,
+            client.client().mfs().files_ls(&path),
+        )
+        .await
+        {
+            Ok(Ok(children)) => children,
+            Ok(Err(error)) => {
+                tracing::warn!(%path, "Failed to inspect MFS merge namespace before sweeping: {error}");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(%path, "Timed out inspecting MFS merge namespace before sweeping");
+                break;
+            }
+        };
+        if !mfs_entry_is_directory(&children, &mfs_owner_marker(token))
+            || !mfs_entry_is_directory(&children, &mfs_reapable_marker(token))
+        {
+            continue;
+        }
+
+        match tokio::time::timeout_at(deadline, client.client().mfs().files_rm(&path, true)).await {
+            Ok(Ok(())) => {
+                removed += 1;
+                tracing::info!(%path, "Removed stale MFS merge namespace");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%path, "Failed to remove stale MFS merge namespace: {error}");
+            }
+            Err(_) => {
+                tracing::warn!(%path, "Timed out removing stale MFS merge namespace");
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
 /// RAII guard that cleans up an MFS namespace even when a boot watchdog
 /// cancels an in-progress DAG merge.
 struct MfsNamespaceGuard {
+    boot_client: ipfs::BootClient,
     client: ipfs::HttpClient,
-    path: String,
+    namespace_path: String,
+    workspace_path: String,
+    owner_marker_path: String,
+    reapable_marker_path: String,
+    owned: bool,
     cleaned: bool,
 }
 
@@ -56,25 +183,81 @@ where
 
 impl MfsNamespaceGuard {
     fn new(client: &ipfs::BootClient) -> Self {
-        let id: u64 = rand::random();
-        let path = format!("/ww-merge-{id:016x}");
-        // Don't pre-create the directory — files_cp will create it when
-        // copying the base layer, and fails if the destination already exists.
+        let token: u128 = rand::random();
+        let created_at_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let namespace_path = format!(
+            "{MFS_MERGE_ROOT}/{}",
+            mfs_namespace_name(created_at_secs, token)
+        );
+        let token = format!("{token:032x}");
         Self {
+            boot_client: client.clone(),
             client: client.client().clone(),
-            path,
+            workspace_path: format!("{namespace_path}/{MFS_MERGE_WORKSPACE}"),
+            owner_marker_path: format!("{namespace_path}/{}", mfs_owner_marker(&token)),
+            reapable_marker_path: format!("{namespace_path}/{}", mfs_reapable_marker(&token)),
+            namespace_path,
+            owned: false,
             cleaned: false,
         }
     }
 
     fn path(&self) -> &str {
-        &self.path
+        &self.workspace_path
     }
 
-    async fn cleanup(mut self) {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.client.mfs().files_rm(&self.path, true),
+    async fn prepare(&mut self) -> Result<()> {
+        self.boot_client
+            .mfs()
+            .files_mkdir(&self.namespace_path, true)
+            .await
+            .context("creating MFS merge namespace")?;
+        self.boot_client
+            .mfs()
+            .files_mkdir(&self.owner_marker_path, false)
+            .await
+            .context("marking MFS merge namespace ownership")?;
+        self.owned = true;
+        Ok(())
+    }
+
+    async fn mark_reapable(&self, deadline: tokio::time::Instant) {
+        if !self.owned {
+            return;
+        }
+        match tokio::time::timeout_at(
+            deadline,
+            self.client
+                .mfs()
+                .files_mkdir(&self.reapable_marker_path, false),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(path = %self.namespace_path, "Failed to mark inactive MFS merge namespace reapable: {error}")
+            }
+            Err(_) => {
+                tracing::warn!(path = %self.namespace_path, "Timed out marking inactive MFS merge namespace reapable")
+            }
+        }
+    }
+
+    async fn cleanup(mut self, reapable: bool) {
+        // A timed-out or cancelled Kubo request can still be running on the
+        // daemon after its client future is dropped. Such a namespace may be
+        // cleaned directly here, but must never become sweep-eligible later.
+        // Only a fully completed merge is known not to be active.
+        let deadline = tokio::time::Instant::now() + MFS_CLEANUP_OPERATION_TIMEOUT;
+        if reapable {
+            self.mark_reapable(deadline).await;
+        }
+        match tokio::time::timeout_at(
+            deadline,
+            self.client.mfs().files_rm(&self.namespace_path, true),
         )
         .await
         {
@@ -84,13 +267,13 @@ impl MfsNamespaceGuard {
                 // identical remove. A transient failure, however, needs the
                 // Drop-time best-effort cleanup to avoid leaking the namespace.
                 self.cleaned = !ipfs::is_retryable_kubo_error(&error);
-                tracing::warn!(path = %self.path, "MFS cleanup failed: {error}");
+                tracing::warn!(path = %self.namespace_path, "MFS cleanup failed: {error}");
             }
             // The server may have completed a timed-out remove. Do not replay
             // this non-idempotent operation from Drop.
             Err(_) => {
                 self.cleaned = true;
-                tracing::warn!(path = %self.path, "MFS cleanup timed out");
+                tracing::warn!(path = %self.namespace_path, "MFS cleanup timed out");
             }
         }
     }
@@ -98,28 +281,28 @@ impl MfsNamespaceGuard {
 
 impl Drop for MfsNamespaceGuard {
     fn drop(&mut self) {
-        if self.cleaned {
+        if self.cleaned || !self.owned {
             return;
         }
         let client = self.client.clone();
-        let path = self.path.clone();
+        let namespace_path = self.namespace_path.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    client.mfs().files_rm(&path, true),
+                    MFS_CLEANUP_OPERATION_TIMEOUT,
+                    client.mfs().files_rm(&namespace_path, true),
                 )
                 .await;
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        tracing::warn!(%path, "MFS cancellation cleanup failed: {error}")
+                        tracing::warn!(path = %namespace_path, "MFS cancellation cleanup failed: {error}")
                     }
-                    Err(_) => tracing::warn!(%path, "MFS cancellation cleanup timed out"),
+                    Err(_) => tracing::warn!(path = %namespace_path, "MFS cancellation cleanup timed out"),
                 }
             });
         } else {
-            tracing::warn!(path = %self.path, "MFS namespace dropped without a Tokio runtime; manual MFS cleanup may be required");
+            tracing::warn!(path = %self.namespace_path, "MFS namespace dropped without a Tokio runtime; manual MFS cleanup may be required");
         }
     }
 }
@@ -159,14 +342,14 @@ async fn dag_merge(
         // Each retry receives a new namespace. This is essential because a
         // timed-out copy or remove may have completed inside Kubo, making a
         // replay against the previous path non-idempotent.
-        let guard = MfsNamespaceGuard::new(client);
+        let mut guard = MfsNamespaceGuard::new(client);
         let result = match deadline {
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                match tokio::time::timeout(
-                    remaining,
-                    dag_merge_attempt(cids, client, cancel, guard.path()),
-                )
+                match tokio::time::timeout(remaining, async {
+                    guard.prepare().await?;
+                    dag_merge_attempt(cids, client, cancel, guard.path()).await
+                })
                 .await
                 {
                     Ok(result) => result,
@@ -176,9 +359,16 @@ async fn dag_merge(
                     )),
                 }
             }
-            None => dag_merge_attempt(cids, client, cancel, guard.path()).await,
+            None => {
+                async {
+                    guard.prepare().await?;
+                    dag_merge_attempt(cids, client, cancel, guard.path()).await
+                }
+                .await
+            }
         };
-        guard.cleanup().await;
+        let reapable = result.is_ok();
+        guard.cleanup(reapable).await;
 
         match result {
             Ok(root) => return Ok(root),
@@ -526,6 +716,123 @@ mod tests {
         }
     }
 
+    #[test]
+    fn merge_namespace_name_roundtrips_its_creation_time() {
+        let name = mfs_namespace_name(1_752_000_000, 0xdead_beef);
+        assert_eq!(
+            mfs_namespace_parts(&name).map(|(created_at, _)| created_at),
+            Some(1_752_000_000)
+        );
+    }
+
+    #[test]
+    fn merge_namespace_parser_ignores_legacy_and_unrecognized_names() {
+        assert_eq!(mfs_namespace_parts("ww-merge-deadbeefdeadbeef"), None);
+        assert_eq!(mfs_namespace_parts("not-a-time-deadbeefdeadbeef"), None);
+        assert_eq!(mfs_namespace_parts("unrelated"), None);
+    }
+
+    fn mfs_listing_response(entries: Vec<serde_json::Value>) -> Vec<u8> {
+        let body = serde_json::json!({ "Entries": entries }).to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    fn mfs_directory_entry(name: impl Into<String>) -> serde_json::Value {
+        serde_json::json!({ "Name": name.into(), "Hash": "Qmfixture", "Size": 0, "Type": 1 })
+    }
+
+    #[tokio::test]
+    async fn stale_mfs_sweep_removes_only_owned_reapable_workspaces() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stale_time = now - MFS_STALE_AFTER.as_secs() - 1;
+        let foreign = mfs_namespace_name(stale_time, 0x11);
+        let malformed = "ww-merge-legacy-path";
+        let recent = mfs_namespace_name(now, 0x22);
+        let stale = mfs_namespace_name(stale_time, 0x33);
+        let active = mfs_namespace_name(stale_time, 0x44);
+        let (_, stale_token) = mfs_namespace_parts(&stale).unwrap();
+        let (_, active_token) = mfs_namespace_parts(&active).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
+
+        let root_listing = mfs_listing_response(vec![
+            mfs_directory_entry(&foreign),
+            mfs_directory_entry(malformed),
+            mfs_directory_entry(&recent),
+            mfs_directory_entry(&stale),
+            mfs_directory_entry(&active),
+        ]);
+        let foreign_listing = mfs_listing_response(vec![
+            mfs_directory_entry(mfs_owner_marker("00000000000000000000000000000000")),
+            mfs_directory_entry(mfs_reapable_marker("00000000000000000000000000000000")),
+        ]);
+        let stale_listing = mfs_listing_response(vec![
+            mfs_directory_entry(mfs_owner_marker(stale_token)),
+            mfs_directory_entry(mfs_reapable_marker(stale_token)),
+        ]);
+        let active_listing =
+            mfs_listing_response(vec![mfs_directory_entry(mfs_owner_marker(active_token))]);
+        let responses = vec![
+            (
+                format!("/api/v0/files/ls?arg={MFS_MERGE_ROOT}&long=true"),
+                root_listing,
+            ),
+            (
+                format!("/api/v0/files/ls?arg={MFS_MERGE_ROOT}/{foreign}&long=true"),
+                foreign_listing,
+            ),
+            (
+                format!("/api/v0/files/ls?arg={MFS_MERGE_ROOT}/{stale}&long=true"),
+                stale_listing,
+            ),
+            (
+                format!("/api/v0/files/rm?arg={MFS_MERGE_ROOT}/{stale}&recursive=true"),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            ),
+            (
+                format!("/api/v0/files/ls?arg={MFS_MERGE_ROOT}/{active}&long=true"),
+                active_listing,
+            ),
+        ];
+        let server = tokio::spawn(async move {
+            for (expected, response) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let bytes = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..bytes]).into_owned();
+                assert!(request.contains(&expected), "unexpected request: {request}");
+                server_requests.lock().unwrap().push(request);
+                stream.write_all(&response).await.unwrap();
+            }
+        });
+
+        let client =
+            ipfs::BootClient::new(ipfs::HttpClient::new(format!("http://{address}")), 1, 1);
+        assert_eq!(sweep_stale_mfs_namespaces(&client).await.unwrap(), 1);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("fake Kubo must receive only the safe sweep requests")
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests.iter().all(|request| !request.contains(&recent)));
+        assert!(requests.iter().all(|request| !request.contains(malformed)));
+        assert!(requests
+            .iter()
+            .filter(|request| request.contains("/api/v0/files/rm"))
+            .all(|request| request.contains(&stale)));
+    }
+
     // ── resolve_mounts_virtual tests (production path) ──
     //
     // Two pure-validation cases live here (no IPFS roundtrip needed).
@@ -560,23 +867,34 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server_requests = Arc::clone(&requests);
         let server = tokio::spawn(async move {
-            let responses = [
-                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Message\":\"busy\"}".as_slice(),
-                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
-                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
-                b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"Objects\":[{\"Links\":[]}]}".as_slice(),
-                b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"Entries\":[]}".as_slice(),
-                b"HTTP/1.1 200 OK\r\nContent-Length: 45\r\nConnection: close\r\n\r\n{\"Hash\":\"merged\",\"Size\":0,\"Type\":\"directory\"}".as_slice(),
-                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
-            ];
-            for response in responses {
+            let mut copies = 0;
+            // Two attempts: mkdir + owner marker + copy, then direct cleanup
+            // after the uncertain failed attempt. The successful attempt adds
+            // overlay/MFS listings and stat before marking itself reapable and
+            // cleaning up.
+            for _ in 0..12 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0u8; 4096];
                 let bytes = stream.read(&mut request).await.unwrap();
-                server_requests
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&request[..bytes]).into_owned());
+                let request = String::from_utf8_lossy(&request[..bytes]).into_owned();
+                let response = if request.contains("/api/v0/files/cp") {
+                    copies += 1;
+                    if copies == 1 {
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Message\":\"busy\"}".as_slice()
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .as_slice()
+                    }
+                } else if request.contains("/api/v0/ls?arg=/ipfs/overlay") {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"Objects\":[{\"Links\":[]}]}".as_slice()
+                } else if request.contains("/api/v0/files/ls") {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"Entries\":[]}".as_slice()
+                } else if request.contains("/api/v0/files/stat") {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 45\r\nConnection: close\r\n\r\n{\"Hash\":\"merged\",\"Size\":0,\"Type\":\"directory\"}".as_slice()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+                };
+                server_requests.lock().unwrap().push(request);
                 stream.write_all(response).await.unwrap();
             }
         });
@@ -603,6 +921,17 @@ mod tests {
         assert_ne!(
             copies[0], copies[1],
             "a transient copy must retry in a fresh MFS namespace"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.contains("/api/v0/files/mkdir")
+                        && request.contains(MFS_REAPABLE_MARKER_PREFIX)
+                })
+                .count(),
+            1,
+            "only the completed merge may become sweep-eligible"
         );
     }
 
