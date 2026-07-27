@@ -24,7 +24,7 @@ pub(super) async fn ns_list() -> Result<()> {
         } else {
             config.bootstrap.clone()
         };
-        let path = config.ipfs_path().unwrap_or_else(|| "-".to_string());
+        let path = config.ipfs_path()?.unwrap_or_else(|| "-".to_string());
         println!("{:<12} {:<24} {:<24} {path}", config.name, ipns, bootstrap);
     }
     Ok(())
@@ -66,6 +66,7 @@ pub(super) async fn ns_add(
         bail!("At least one of --ipns or --bootstrap is required");
     }
 
+    config.validate()?;
     config.write_to(&ns_path)?;
     println!("Namespace '{name}' configured at {}", ns_path.display());
     Ok(())
@@ -96,6 +97,7 @@ pub(super) async fn ns_resolve(name: String) -> Result<()> {
     }
     let content = std::fs::read_to_string(&ns_path)?;
     let config = ww::ns::NamespaceConfig::parse(&name, &content);
+    config.validate()?;
 
     // Try IPNS resolution
     if !config.ipns.is_empty() {
@@ -114,12 +116,7 @@ pub(super) async fn ns_resolve(name: String) -> Result<()> {
     }
 
     // Fall back to bootstrap
-    if !config.bootstrap.is_empty() {
-        let path = if config.bootstrap.starts_with("/ipfs/") {
-            config.bootstrap.clone()
-        } else {
-            format!("/ipfs/{}", config.bootstrap)
-        };
+    if let Some(path) = config.bootstrap_ipfs_path()? {
         println!("{path}");
     } else {
         bail!("Namespace '{name}' has no IPNS name or bootstrap CID");

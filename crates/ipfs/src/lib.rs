@@ -92,7 +92,7 @@ pub struct KuboOperationTimeout {
 }
 
 impl KuboOperationTimeout {
-    fn new(operation: &'static str, timeout: Duration) -> Self {
+    pub fn new(operation: &'static str, timeout: Duration) -> Self {
         Self { operation, timeout }
     }
 }
@@ -110,6 +110,36 @@ impl std::fmt::Display for KuboOperationTimeout {
 
 impl std::error::Error for KuboOperationTimeout {}
 
+/// The finite retry budget for a Kubo boot operation elapsed while Kubo
+/// remained unavailable.
+#[derive(Debug)]
+pub struct KuboRetryBudgetExhausted {
+    operation: String,
+    elapsed: Duration,
+}
+
+impl KuboRetryBudgetExhausted {
+    fn new(operation: impl Into<String>, elapsed: Duration) -> Self {
+        Self {
+            operation: operation.into(),
+            elapsed,
+        }
+    }
+}
+
+impl std::fmt::Display for KuboRetryBudgetExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Kubo boot operation {} did not complete after {}s",
+            self.operation,
+            self.elapsed.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for KuboRetryBudgetExhausted {}
+
 /// Whether an IPFS error is safe to retry during critical boot resolution.
 /// Transport failures, 429, and gateway failures retry; local filesystem and
 /// ordinary Kubo API errors fail immediately.
@@ -123,6 +153,16 @@ pub fn is_retryable_kubo_error(error: &anyhow::Error) -> bool {
                 .is_some_and(KuboApiError::is_retryable)
             || cause.is::<KuboOperationTimeout>()
     })
+}
+
+/// Whether a failed boot operation represents Kubo unavailability rather than
+/// a caller or protocol fault. Callers may use an already-validated offline
+/// fallback only for this class of failure.
+pub fn is_kubo_unavailable_error(error: &anyhow::Error) -> bool {
+    is_retryable_kubo_error(error)
+        || error.chain().any(|cause| {
+            cause.is::<KuboOperationTimeout>() || cause.is::<KuboRetryBudgetExhausted>()
+        })
 }
 
 /// Retry policy used only while the host is resolving its initial boot image.
@@ -205,9 +245,8 @@ impl BootClient {
             let remaining =
                 deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             if remaining.is_some_and(|remaining| remaining.is_zero()) {
-                anyhow::bail!(
-                    "Kubo boot operation {operation_name} did not complete after {}s",
-                    started.elapsed().as_secs()
+                return Err(
+                    KuboRetryBudgetExhausted::new(operation_name, started.elapsed()).into(),
                 );
             }
 
@@ -247,9 +286,8 @@ impl BootClient {
                 deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
             {
                 if remaining.is_zero() {
-                    anyhow::bail!(
-                        "Kubo boot operation {operation_name} did not complete after {}s",
-                        started.elapsed().as_secs()
+                    return Err(
+                        KuboRetryBudgetExhausted::new(operation_name, started.elapsed()).into(),
                     );
                 }
                 tokio::time::sleep(backoff.min(remaining)).await;
