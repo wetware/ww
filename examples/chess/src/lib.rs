@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+
 //! Chess guest: cross-node play via RPC capability cells.
 //!
 //! This binary serves two roles, selected by env vars set in the
@@ -612,6 +614,7 @@ impl Guest for ChessGuest {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 wasip2::cli::command::export!(ChessGuest);
 
 // ---------------------------------------------------------------------------
@@ -622,20 +625,16 @@ wasip2::cli::command::export!(ChessGuest);
 mod tests {
     use super::*;
     use chess_capnp::chess_engine::GameStatus;
-    use membrane::{MethodProfile, Policy};
+    use membrane::Policy;
 
     #[test]
     fn test_typed_method_profile_uses_generated_chess_client() {
         use capnp::traits::HasTypeId;
 
-        let reader = MethodProfile::<chess_capnp::chess_engine::Client>::new()
-            .allow_method(chess_capnp::chess_engine::Client::get_state_request)
+        let reader = chess_authority::chess_method_profile(chess_authority::ChessProfile::Reader)
             .unwrap()
             .build();
-        let player = MethodProfile::<chess_capnp::chess_engine::Client>::new()
-            .allow_method(chess_capnp::chess_engine::Client::get_state_request)
-            .unwrap()
-            .allow_method(chess_capnp::chess_engine::Client::apply_move_request)
+        let player = chess_authority::chess_method_profile(chess_authority::ChessProfile::Player)
             .unwrap()
             .build();
         let interface_id = chess_capnp::chess_engine::Client::TYPE_ID;

@@ -20,7 +20,7 @@ membrane = { package = "wetware-membrane", path = "../../crates/membrane" }
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
 anyhow     = { workspace = true }
