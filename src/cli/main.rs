@@ -1620,6 +1620,16 @@ wasip2::cli::command::export!({iface_name}Guest);
                 return Err(service_exit_error(service_exit));
             }
         }
+        tokio::select! {
+            result = image::sweep_stale_mfs_namespaces(&boot_ipfs_client) => match result {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "Stale MFS merge namespace sweep complete"),
+                Err(error) => tracing::warn!("Stale MFS merge namespace sweep skipped: {error}"),
+            },
+            service_exit = supervisor.next_service_exit() => {
+                return Err(service_exit_error(service_exit));
+            }
+        }
         runtime_status.set_phase("resolving-configuration");
 
         // If --stem is provided, read the on-chain head and prepend it

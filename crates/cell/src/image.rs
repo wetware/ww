@@ -19,6 +19,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use cid::Cid;
@@ -27,6 +28,84 @@ use crate::mount::Mount;
 use ipfs;
 
 // ── DAG merge via IPFS MFS ─────────────────────────────────────────
+
+const MFS_MERGE_PREFIX: &str = "ww-merge-";
+// A DAG merge is bounded by the boot operation watchdog. Keep namespaces for
+// much longer than a normal boot so a temporarily unhealthy Kubo cannot cause
+// a later boot to remove a live merge namespace.
+const MFS_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+const MFS_SWEEP_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn mfs_namespace_name(created_at_secs: u64, id: u64) -> String {
+    format!("{MFS_MERGE_PREFIX}{created_at_secs:016x}-{id:016x}")
+}
+
+fn mfs_namespace_created_at(name: &str) -> Option<u64> {
+    let suffix = name.strip_prefix(MFS_MERGE_PREFIX)?;
+    let (created_at, id) = suffix.split_once('-')?;
+    if created_at.len() != 16
+        || id.len() != 16
+        || !created_at.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    u64::from_str_radix(created_at, 16).ok()
+}
+
+/// Remove abandoned merge namespaces created by this version of `ww`.
+///
+/// Namespaces include their creation time so this function never guesses at
+/// the age of legacy random-only names. A namespace is eligible only after a
+/// full day, which is deliberately far longer than the bounded merge
+/// operations; the sweep is best-effort and must never block boot.
+pub async fn sweep_stale_mfs_namespaces(client: &ipfs::BootClient) -> Result<usize> {
+    let entries = tokio::time::timeout(
+        MFS_SWEEP_OPERATION_TIMEOUT,
+        client.client().mfs().files_ls("/"),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out listing MFS root for stale merge namespaces"))??;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    let mut removed = 0;
+
+    for entry in entries {
+        if entry.entry_type != 1 {
+            continue;
+        }
+        let Some(created_at) = mfs_namespace_created_at(&entry.name) else {
+            continue;
+        };
+        if now.saturating_sub(created_at) < MFS_STALE_AFTER.as_secs() {
+            continue;
+        }
+
+        let path = format!("/{}", entry.name);
+        match tokio::time::timeout(
+            MFS_SWEEP_OPERATION_TIMEOUT,
+            client.client().mfs().files_rm(&path, true),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                removed += 1;
+                tracing::info!(%path, "Removed stale MFS merge namespace");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%path, "Failed to remove stale MFS merge namespace: {error}");
+            }
+            Err(_) => {
+                tracing::warn!(%path, "Timed out removing stale MFS merge namespace");
+            }
+        }
+    }
+
+    Ok(removed)
+}
 
 /// RAII guard that cleans up an MFS namespace even when a boot watchdog
 /// cancels an in-progress DAG merge.
@@ -56,7 +135,11 @@ where
 impl MfsNamespaceGuard {
     fn new(client: &ipfs::BootClient) -> Self {
         let id: u64 = rand::random();
-        let path = format!("/ww-merge-{id:016x}");
+        let created_at_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let path = format!("/{}", mfs_namespace_name(created_at_secs, id));
         // Don't pre-create the directory — files_cp will create it when
         // copying the base layer, and fails if the destination already exists.
         Self {
@@ -440,6 +523,22 @@ mod tests {
             source: path.to_string(),
             target: PathBuf::from("/"),
         }
+    }
+
+    #[test]
+    fn merge_namespace_name_roundtrips_its_creation_time() {
+        let name = mfs_namespace_name(1_752_000_000, 0xdead_beef);
+        assert_eq!(mfs_namespace_created_at(&name), Some(1_752_000_000));
+    }
+
+    #[test]
+    fn merge_namespace_parser_ignores_legacy_and_unrecognized_names() {
+        assert_eq!(mfs_namespace_created_at("ww-merge-deadbeefdeadbeef"), None);
+        assert_eq!(
+            mfs_namespace_created_at("ww-merge-not-a-time-deadbeefdeadbeef"),
+            None
+        );
+        assert_eq!(mfs_namespace_created_at("unrelated"), None);
     }
 
     // ── resolve_mounts_virtual tests (production path) ──
