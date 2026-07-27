@@ -89,7 +89,9 @@ impl std::error::Error for KuboApiError {}
 /// ordinary Kubo API errors fail immediately.
 pub fn is_retryable_kubo_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause.is::<reqwest::Error>()
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_connect() || error.is_timeout())
             || cause
                 .downcast_ref::<KuboApiError>()
                 .is_some_and(KuboApiError::is_retryable)
@@ -301,15 +303,26 @@ impl BootMfs<'_> {
     }
 
     pub async fn files_rm(&self, path: &str, recursive: bool) -> Result<()> {
-        let client = self.client.client.clone();
-        let path = path.to_owned();
-        self.client
-            .retry("MFS removal", || {
-                let client = client.clone();
-                let path = path.clone();
-                async move { client.mfs().files_rm(&path, recursive).await }
-            })
-            .await
+        // As with copy, a timed-out remove may complete server-side. Repeating
+        // it can turn a successful first removal into Kubo's terminal
+        // "not found" response, so keep this single-attempt and bounded.
+        let timeout = match (self.client.operation_timeout, self.client.retry_deadline) {
+            (Some(watchdog), Some(budget)) => Some(watchdog.min(budget)),
+            (Some(watchdog), None) => Some(watchdog),
+            (None, Some(budget)) => Some(budget),
+            (None, None) => None,
+        };
+        let mfs = self.client.client.mfs();
+        let remove = mfs.files_rm(path, recursive);
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, remove).await.map_err(|_| {
+                anyhow::anyhow!(
+                    "MFS removal made no progress within {}s",
+                    timeout.as_secs_f64()
+                )
+            })?,
+            None => remove.await,
+        }
     }
 }
 
@@ -701,6 +714,25 @@ mod tests {
         });
         let client = HttpClient::new(format!("http://{address}"));
         let error = client.name_resolve("not-a-cid").await.unwrap_err();
+
+        assert!(!is_retryable_kubo_error(&error));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_json_success_response_is_terminal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nConnection: close\r\n\r\n<html>error</html>")
+                .await
+                .unwrap();
+        });
+        let client = HttpClient::new(format!("http://{address}"));
+        let error = client.name_resolve("k51-test").await.unwrap_err();
 
         assert!(!is_retryable_kubo_error(&error));
         server.await.unwrap();
