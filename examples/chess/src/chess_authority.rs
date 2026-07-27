@@ -98,17 +98,27 @@ impl ChessAuthorization {
     }
 }
 
-fn method_policy(profile: ChessProfile) -> Result<Box<dyn Policy>, MethodCaptureError> {
+/// Capture the generated Chess methods allowed by a trusted named profile.
+///
+/// Typed method capture prevents accidental interface-ID and ordinal mistakes
+/// in trusted configuration. It does not constrain malicious configuration
+/// code, which can still choose or synthesize a different callable.
+pub fn chess_method_profile(
+    profile: ChessProfile,
+) -> Result<MethodProfile<chess_capnp::chess_engine::Client>, MethodCaptureError> {
     let reader = MethodProfile::<chess_capnp::chess_engine::Client>::new()
         .allow_method(chess_capnp::chess_engine::Client::get_state_request)?;
 
-    let policy = match profile {
-        ChessProfile::Reader => reader.build(),
-        ChessProfile::Player => reader
-            .allow_method(chess_capnp::chess_engine::Client::apply_move_request)?
-            .build(),
-    };
-    Ok(Box::new(policy))
+    match profile {
+        ChessProfile::Reader => Ok(reader),
+        ChessProfile::Player => {
+            reader.allow_method(chess_capnp::chess_engine::Client::apply_move_request)
+        }
+    }
+}
+
+fn method_policy(profile: ChessProfile) -> Result<Box<dyn Policy>, MethodCaptureError> {
+    Ok(Box::new(chess_method_profile(profile)?.build()))
 }
 
 impl AuthPolicy<chess_capnp::chess_engine::Owned> for ChessAuthorization {
@@ -303,14 +313,8 @@ mod tests {
         reader_key: &SigningKey,
         player_key: &SigningKey,
     ) {
-        let reader = MethodProfile::<chess_capnp::chess_engine::Client>::new()
-            .allow_method(chess_capnp::chess_engine::Client::get_state_request)
-            .expect("capture getState");
-        let player = MethodProfile::<chess_capnp::chess_engine::Client>::new()
-            .allow_method(chess_capnp::chess_engine::Client::get_state_request)
-            .expect("capture getState")
-            .allow_method(chess_capnp::chess_engine::Client::apply_move_request)
-            .expect("capture applyMove");
+        let reader = chess_method_profile(ChessProfile::Reader).expect("capture Reader methods");
+        let player = chess_method_profile(ChessProfile::Player).expect("capture Player methods");
 
         let profiles = [("reader", reader), ("player", player)];
         let mut profile_builders = policy.reborrow().init_profiles(profiles.len() as u32);

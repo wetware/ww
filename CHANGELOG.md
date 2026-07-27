@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **One-command Chess authority proof.** `cargo run -p chess --example
+  authority_proof` runs the full two-host libp2p authority demonstration and
+  prints a fixed 30-line transcript: identities, policy, per-principal
+  outcomes, an explicit scope statement, and a single terminal `PASS`. The
+  command exits non-zero with a staged `FAIL` diagnostic on any proof or
+  cleanup failure, and CI verifies the exact output contract.
 - **Cause-monitor cache health assertions.** `ww healthcheck
   --require-cache-enabled` fails unless `/version` reports Wasmtime's
   compilation cache as enabled with a successful in-process load or store.

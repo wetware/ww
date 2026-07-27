@@ -221,6 +221,42 @@ jobs:
     - name: Run host workspace tests (hot cache from build job)
       run: cargo test --workspace
 
+    - name: Smoke-test Chess authority proof command
+      run: |
+        set -euo pipefail
+        proof_exit=0
+        cargo run -q -p chess --example authority_proof \
+          >proof.stdout 2>proof.stderr || proof_exit=$?
+        status=0
+        if [ "$proof_exit" -ne 0 ]; then
+          echo "FAIL: proof command exited with status $proof_exit"
+          status=1
+        fi
+        if [ -s proof.stderr ]; then
+          echo "FAIL: proof wrote to stderr:"; cat proof.stderr; status=1
+        fi
+        lines="$(wc -l < proof.stdout)"
+        if [ "$lines" -ne 30 ]; then
+          echo "FAIL: expected exactly 30 stdout lines, got $lines"; status=1
+        fi
+        if [ "$(head -n 1 proof.stdout)" != "WETWARE CHESS AUTHORITY PROOF" ]; then
+          echo "FAIL: unexpected first stdout line"; status=1
+        fi
+        if [ "$(tail -n 1 proof.stdout)" != "PASS" ]; then
+          echo "FAIL: transcript does not end with PASS"; status=1
+        fi
+        if [ "$(grep -c '^PASS$' proof.stdout)" != "1" ]; then
+          echo "FAIL: expected exactly one PASS line"; status=1
+        fi
+        if grep -q '^ERROR:' proof.stdout; then
+          echo "FAIL: stray ERROR lines in stdout"; status=1
+        fi
+        if [ "$status" -ne 0 ]; then
+          echo "--- stdout ---"; cat proof.stdout
+          exit 1
+        fi
+        cat proof.stdout
+
     - name: Run standalone standard-library tests
       if: ${{ always() }}
       run: |

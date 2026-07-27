@@ -35,23 +35,51 @@ Vat publication uses the service name `chess`.
 
 ## Authority proof
 
-The reproducible security artifact uses two real Wetware libp2p hosts and
-publishes through the production `VatListener.serveAuthenticated` path:
+Run the one-command authority proof:
+
+```sh
+cargo run -p chess --example authority_proof
+```
+
+The command starts two real Wetware libp2p hosts on ephemeral loopback ports,
+directly connects them, and publishes one shared game through the production
+`VatListener.serveAuthenticated` path. Its stable transcript is produced only
+after decoding and checking each real RPC response:
+
+- a valid but unknown signing identity receives no session;
+- a Reader may call `getState` but receives the structured
+  `permissionDenied` result from `applyMove`;
+- a Player may apply `e2e4`; and
+- the already-issued Reader observes `e2e4` in the same shared game.
+
+The command advances the Atom epoch, verifies that issued authority is stale,
+aborts and awaits its client RPC systems, waits for the listener connection
+budget to drain to zero, and aborts and awaits both host tasks before printing
+`PASS`. It prints `ww::VERSION`; build Git state is deliberately excluded from
+the stable transcript.
+
+The Reader and Player profiles are captured through generated, typed Cap'n
+Proto request constructors. This prevents accidental interface-ID or ordinal
+mistakes by trusted configuration. It is not a security boundary against
+malicious configuration code, which can deliberately select or synthesize
+different methods.
+
+This proof controls calls through the issued Chess capability. It does not
+remove ambient credentials or constrain shell access, filesystem access,
+network egress, alternate APIs, or side channels.
+
+The extended security oracle remains:
 
 ```sh
 cargo test -p chess direct_libp2p_terminal_enforces_chess_authority
 ```
 
-It proves:
+In addition to the command-level outcomes, that test proves:
 
-- an unknown signing key receives no session;
 - an idle unauthenticated stream is closed at the login deadline and releases
   its connection-budget permit;
 - each stream receives a single-use Terminal and cannot switch principals
   after admission;
-- a Reader may call `getState` but is denied `applyMove`;
-- a Player may call both methods, and the Reader observes the same changed
-  game state;
 - revoking the Reader invalidates its existing session without affecting the
   Player;
 - advancing the epoch invalidates the Player's existing session;
@@ -210,7 +238,9 @@ default demo flow.
 
 ```sh
 cargo test -p chess --lib
+cargo test -p chess --test authority_proof
 cargo test -p chess direct_libp2p_terminal_enforces_chess_authority
+cargo run -p chess --example authority_proof
 ```
 
 The manual `glia/register.glia` random-game flow explicitly publishes the bare
@@ -231,6 +261,12 @@ examples/chess/
 ├── Makefile              # make chess
 ├── README.md             # this file
 ├── chess.capnp           # ChessEngine schema source
+├── examples/
+│   └── authority_proof.rs # thin command renderer
+├── proof/
+│   └── authority_proof.rs # shared real-network proof runner
+├── tests/
+│   └── authority_proof.rs # exact evidence + cleanup assertions
 ├── bin/                  # build output (gitignored)
 │   ├── chess-demo.wasm
 │   └── chess-demo.wasm
@@ -243,5 +279,6 @@ examples/chess/
 │   └── init.d/
 │       └── chess.glia    # deployment-only hook
 └── src/
-    └── lib.rs            # guest implementation
+    ├── chess_authority.rs # reusable typed Chess policy recipe
+    └── lib.rs             # guest implementation
 ```
