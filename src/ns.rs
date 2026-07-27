@@ -151,12 +151,22 @@ pub fn scan_namespace_configs(mount_paths: &[&Path]) -> Result<Vec<NamespaceConf
 /// Resolve namespace configs into IPFS mount paths.
 ///
 /// For each namespace, tries IPNS resolution first (via the provided resolver),
-/// then falls back to the bootstrap CID. Returns a list of (name, ipfs_path) pairs.
+/// then falls back to the bootstrap CID only when Kubo is unavailable. Invalid
+/// configuration and terminal Kubo responses are returned to the caller.
 pub async fn resolve_namespaces(
     configs: &[NamespaceConfig],
     ipfs_client: &crate::ipfs::BootClient,
     runtime_status: &crate::metrics::RuntimeStatus,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>> {
+    // This public boundary also validates directly constructed configs. Do it
+    // before touching Kubo so a local configuration error cannot be masked by
+    // an unavailable daemon or a bootstrap fallback.
+    for config in configs {
+        config
+            .validate()
+            .with_context(|| format!("Invalid namespace config '{}'", config.name))?;
+    }
+
     // Namespace fallback must stay bounded even when the generic boot retry
     // budget is intentionally unbounded. Within this window, BootClient still
     // retries transport and gateway failures; a no-progress stall selects the
@@ -182,7 +192,11 @@ pub async fn resolve_namespaces(
                             timeout_secs = resolve_timeout.as_secs(),
                             "IPNS resolution made no progress, trying bootstrap CID"
                         );
-                        Err(anyhow::anyhow!("IPNS resolution timed out"))
+                        Err(crate::ipfs::KuboOperationTimeout::new(
+                            "IPNS namespace resolution",
+                            resolve_timeout,
+                        )
+                        .into())
                     }
                 };
             match result {
@@ -196,7 +210,7 @@ pub async fn resolve_namespaces(
                     resolved.push((config.name.clone(), resolved_path));
                     continue;
                 }
-                Err(e) => {
+                Err(e) if crate::ipfs::is_kubo_unavailable_error(&e) => {
                     runtime_status.mark_degraded(format!(
                         "namespace {} IPNS resolution failed; using bootstrap if available",
                         config.name
@@ -208,14 +222,16 @@ pub async fn resolve_namespaces(
                         "IPNS resolution failed, trying bootstrap CID"
                     );
                 }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("Namespace '{}' IPNS resolution failed", config.name)
+                    });
+                }
             }
         }
 
         // Fall back to bootstrap CID
-        if let Some(path) = config
-            .bootstrap_ipfs_path()
-            .expect("namespace configs are validated before resolution")
-        {
+        if let Some(path) = config.bootstrap_ipfs_path()? {
             if path.starts_with("/ipfs/") {
                 tracing::info!(
                     ns = %config.name,
@@ -236,7 +252,7 @@ pub async fn resolve_namespaces(
         }
     }
 
-    resolved
+    Ok(resolved)
 }
 
 /// Validate that a namespace name is safe for use as a filename.
@@ -322,7 +338,9 @@ mod tests {
             .expect("the fake Kubo identity endpoint must succeed first");
         let client = crate::ipfs::BootClient::new(raw_client, 1, 1);
 
-        let resolved = resolve_namespaces(&[config], &client, &runtime_status).await;
+        let resolved = resolve_namespaces(&[config], &client, &runtime_status)
+            .await
+            .unwrap();
 
         assert_eq!(
             resolved,
@@ -356,7 +374,7 @@ mod tests {
         let config = NamespaceConfig {
             name: "ww".into(),
             ipns: "k51-test".into(),
-            bootstrap: "/ipfs/bootstrap".into(),
+            bootstrap: format!("/ipfs/{}", test_cid()),
         };
         let runtime_status = crate::metrics::RuntimeStatus::starting();
         let client = crate::ipfs::BootClient::new(
@@ -365,11 +383,74 @@ mod tests {
             1,
         );
 
-        let resolved = resolve_namespaces(&[config], &client, &runtime_status).await;
+        let resolved = resolve_namespaces(&[config], &client, &runtime_status)
+            .await
+            .unwrap();
 
         assert_eq!(resolved, vec![("ww".into(), "/ipfs/recovered".into())]);
         assert!(!runtime_status.is_degraded());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_invalid_direct_config_before_kubo_resolution() {
+        let config = NamespaceConfig {
+            name: "ww".into(),
+            ipns: "k51-test".into(),
+            bootstrap: "/ipfs/not-a-cid".into(),
+        };
+        let runtime_status = crate::metrics::RuntimeStatus::starting();
+        let client = crate::ipfs::BootClient::new(
+            crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            0,
+            0,
+        );
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            resolve_namespaces(&[config], &client, &runtime_status),
+        )
+        .await
+        .expect("invalid config must fail before Kubo resolution")
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("invalid bootstrap CID"));
+        assert!(!runtime_status.is_degraded());
+    }
+
+    #[tokio::test]
+    async fn terminal_ipns_4xx_does_not_fallback_to_bootstrap() {
+        for (status, reason) in [(400, "Bad Request"), (404, "Not Found")] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request(&mut stream).await;
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{{\"Message\":\"bad name\"}}"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let config = NamespaceConfig {
+                name: "ww".into(),
+                ipns: "k51-test".into(),
+                bootstrap: format!("/ipfs/{}", test_cid()),
+            };
+            let runtime_status = crate::metrics::RuntimeStatus::starting();
+            let client = crate::ipfs::BootClient::new(
+                crate::ipfs::HttpClient::new(format!("http://{address}")),
+                1,
+                1,
+            );
+
+            let error = resolve_namespaces(&[config], &client, &runtime_status)
+                .await
+                .expect_err("terminal Kubo response must not select bootstrap");
+
+            assert!(format!("{error:#}").contains(&status.to_string()));
+            assert!(!runtime_status.is_degraded());
+            server.await.unwrap();
+        }
     }
 
     fn test_cid() -> String {

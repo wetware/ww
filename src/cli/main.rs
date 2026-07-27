@@ -1684,7 +1684,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                     &ns_configs,
                     &boot_ipfs_client,
                     &runtime_status,
-                ) => resolved,
+                ) => resolved.context("Failed to resolve namespace configs")?,
                 service_exit = supervisor.next_service_exit() => {
                     return Err(service_exit_error(service_exit));
                 }
