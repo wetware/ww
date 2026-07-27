@@ -297,6 +297,46 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn transient_ipns_failure_retries_without_degrading() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            read_request(&mut first).await;
+            first
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Message\":\"busy\"}")
+                .await
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            read_request(&mut second).await;
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"Path\":\"/ipfs/recovered\"}",
+                )
+                .await
+                .unwrap();
+        });
+        let config = NamespaceConfig {
+            name: "ww".into(),
+            ipns: "k51-test".into(),
+            bootstrap: "/ipfs/bootstrap".into(),
+        };
+        let runtime_status = crate::metrics::RuntimeStatus::starting();
+        let client = crate::ipfs::BootClient::new(
+            crate::ipfs::HttpClient::new(format!("http://{address}")),
+            2,
+            1,
+        );
+
+        let resolved = resolve_namespaces(&[config], &client, &runtime_status).await;
+
+        assert_eq!(resolved, vec![("ww".into(), "/ipfs/recovered".into())]);
+        assert!(!runtime_status.is_degraded());
+        server.await.unwrap();
+    }
+
     #[test]
     fn parse_full_config() {
         let content = "# Wetware namespace: ww\nipns=k51qzi5uqu5d\nbootstrap=/ipfs/bafyrei123\n";

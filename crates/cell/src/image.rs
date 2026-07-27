@@ -81,11 +81,17 @@ impl MfsNamespaceGuard {
             Ok(Ok(())) => self.cleaned = true,
             Ok(Err(error)) => {
                 // A terminal Kubo response will not become useful on a second
-                // identical remove, so avoid a duplicate Drop-time request.
-                self.cleaned = true;
+                // identical remove. A transient failure, however, needs the
+                // Drop-time best-effort cleanup to avoid leaking the namespace.
+                self.cleaned = !ipfs::is_retryable_kubo_error(&error);
                 tracing::warn!(path = %self.path, "MFS cleanup failed: {error}");
             }
-            Err(_) => tracing::warn!(path = %self.path, "MFS cleanup timed out"),
+            // The server may have completed a timed-out remove. Do not replay
+            // this non-idempotent operation from Drop.
+            Err(_) => {
+                self.cleaned = true;
+                tracing::warn!(path = %self.path, "MFS cleanup timed out");
+            }
         }
     }
 }
@@ -154,7 +160,24 @@ async fn dag_merge(
         // timed-out copy or remove may have completed inside Kubo, making a
         // replay against the previous path non-idempotent.
         let guard = MfsNamespaceGuard::new(client);
-        let result = dag_merge_attempt(cids, client, cancel, guard.path()).await;
+        let result = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(
+                    remaining,
+                    dag_merge_attempt(cids, client, cancel, guard.path()),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Kubo boot operation MFS DAG merge did not complete after {}s",
+                        started.elapsed().as_secs()
+                    )),
+                }
+            }
+            None => dag_merge_attempt(cids, client, cancel, guard.path()).await,
+        };
         guard.cleanup().await;
 
         match result {
@@ -488,6 +511,7 @@ pub fn cid_bytes_to_ipfs_path(cid_bytes: &[u8]) -> Result<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -533,6 +557,8 @@ mod tests {
     async fn dag_merge_retries_a_transient_copy_in_a_fresh_namespace() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
         let server = tokio::spawn(async move {
             let responses = [
                 b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Message\":\"busy\"}".as_slice(),
@@ -546,7 +572,11 @@ mod tests {
             for response in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0u8; 4096];
-                let _ = stream.read(&mut request).await.unwrap();
+                let bytes = stream.read(&mut request).await.unwrap();
+                server_requests
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..bytes]).into_owned());
                 stream.write_all(response).await.unwrap();
             }
         });
@@ -559,7 +589,21 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap().0, "merged");
-        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("fake Kubo must receive every expected request")
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        let copies: Vec<_> = requests
+            .iter()
+            .filter(|request| request.contains("/api/v0/files/cp"))
+            .collect();
+        assert_eq!(copies.len(), 2);
+        assert_ne!(
+            copies[0], copies[1],
+            "a transient copy must retry in a fresh MFS namespace"
+        );
     }
 
     #[tokio::test]
