@@ -11,7 +11,9 @@ use capnp_rpc::pry;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::StreamExt;
 
-use crate::{inbound_connection_budget, ConnectionBudget};
+use crate::{
+    decode_exports, encode_exports, inbound_connection_budget, ConnectionBudget, NamedCapabilities,
+};
 use authority::system_capnp;
 
 pub struct StreamListenerImpl {
@@ -35,10 +37,6 @@ impl StreamListenerImpl {
     }
 }
 
-/// A captured init.d `with`-block grant. Cloned per incoming stream and
-/// re-emitted on the spawned cell's graft.
-type ExtraCap = (String, capnp::capability::Client);
-
 #[allow(refining_impl_trait)]
 impl system_capnp::stream_listener::Server for StreamListenerImpl {
     fn listen(
@@ -57,22 +55,7 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
         let protocol_suffix = protocol_str.to_string();
         let stream_protocol = pry!(super::stream_protocol(&protocol_suffix));
 
-        let extra_caps: Vec<ExtraCap> = {
-            let mut caps_vec = Vec::new();
-            if let Ok(caps_reader) = params.get_caps() {
-                for entry in caps_reader.iter() {
-                    if let Ok(name) = entry.get_name().map(|n| n.to_string().unwrap_or_default()) {
-                        if let Ok(cap) = entry
-                            .get_cap()
-                            .get_as_capability::<capnp::capability::Client>()
-                        {
-                            caps_vec.push((name, cap));
-                        }
-                    }
-                }
-            }
-            caps_vec
-        };
+        let extra_caps = pry!(params.get_caps().and_then(decode_exports));
 
         let mut control = self.stream_control.clone();
         let mut incoming = pry!(control
@@ -147,19 +130,15 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
 /// stdin/stdout between the libp2p stream and the process.
 async fn handle_connection(
     executor: system_capnp::executor::Client,
-    caps: Vec<ExtraCap>,
+    caps: NamedCapabilities,
     stream: libp2p::Stream,
     protocol: &str,
 ) -> Result<(), capnp::Error> {
     // Spawn cell process via Executor.spawn().
     let mut spawn_req = executor.spawn_request();
     if !caps.is_empty() {
-        let mut caps_builder = spawn_req.get().init_caps(caps.len() as u32);
-        for (i, (name, cap)) in caps.iter().enumerate() {
-            let mut entry = caps_builder.reborrow().get(i as u32);
-            entry.set_name(name);
-            entry.init_cap().set_as_capability(cap.clone().hook);
-        }
+        let caps_builder = spawn_req.get().init_caps(caps.len() as u32);
+        encode_exports(&caps, caps_builder)?;
     }
     let response = spawn_req.send().promise.await?;
     let process = response.get()?.get_process()?;
