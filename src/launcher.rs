@@ -313,7 +313,7 @@ impl OwnedChildLifecycle {
         };
 
         self.stop_auxiliary_tasks().await;
-        self.bootstrap_control.clear().await;
+        self.bootstrap_control.clear();
         // Keep the immutable record live through process execution, then
         // release it after child RPC and the stored guest bootstrap are gone
         // but before reporting exit to the parent.

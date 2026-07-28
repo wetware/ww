@@ -489,7 +489,12 @@ fn child_exit_releases_record_owned_grant_references() {
             cap: host.client,
         };
 
-        let process = spawn_probe(&harness.executor, "enumerate", &[], &[grant.clone()])
+        let process = spawn_probe(
+            &harness.executor,
+            "enumerate",
+            &[],
+            std::slice::from_ref(&grant),
+        )
             .await
             .expect("spawn tracked child");
         drop(grant);

@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Constructive authority for ordinary child processes.** `Executor.spawn`
+  validates named grants before process construction and gives each child only
+  its immutable `InitialAuthorityRecord`; ordinary children no longer retain
+  ambient host/runtime, network, epoch/signing, stream, IPFS, or HTTP inputs,
+  while trusted pid0 retains the full host graft. Child lifecycle ownership now
+  clears the parent-held bootstrap and releases grant references on exit, and
+  HTTP/stream listeners replay fixed registration templates without widening
+  authority.
 - **Immutable initial authority records.** Shared RPC helpers now decode,
   validate, retain, and re-encode ordered named capabilities, while rejecting
   empty or duplicate names without invoking opaque clients. Spawn decoding,
@@ -15,9 +23,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Child-authority confinement security harness.** A reusable real-WASM probe
   and ordinary green characterization suite now document spawned-child
   bootstrap behavior, including the Cargo.lock-pinned same-capability/two-name
-  routing gate. Seven isolated ignored regressions remain intentionally red
-  when explicitly invoked, proving the current ambient-authority leaks without
-  making default CI red or changing production authority semantics.
+  routing gate. Two isolated ignored regressions remain intentionally red when
+  explicitly invoked, pinning the remaining T4 lexical-capture and T5
+  compatibility-interface work without making default CI red.
 - **One-command Chess authority proof.** `cargo run -p chess --example
   authority_proof` runs the full two-host libp2p authority demonstration and
   prints a fixed 30-line transcript: identities, policy, per-principal

@@ -29,6 +29,8 @@ pub mod wagi;
 pub use initial_authority::InitialAuthorityRecord;
 pub use named_capability::{decode_exports, encode_exports, NamedCapabilities, NamedCapability};
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use capnp::capability::Promise;
@@ -365,18 +367,18 @@ pub struct ProcessImpl {
     stdout: system_capnp::byte_stream::Client,
     stderr: system_capnp::byte_stream::Client,
     exit_rx: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<i32>>>>,
-    bootstrap_cap: Arc<Mutex<Option<capnp::capability::Client>>>,
+    bootstrap_cap: Rc<RefCell<Option<capnp::capability::Client>>>,
     kill_tx: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 #[derive(Clone)]
 pub struct ProcessBootstrapControl {
-    bootstrap_cap: Arc<Mutex<Option<capnp::capability::Client>>>,
+    bootstrap_cap: Rc<RefCell<Option<capnp::capability::Client>>>,
 }
 
 impl ProcessBootstrapControl {
-    pub async fn clear(&self) {
-        self.bootstrap_cap.lock().await.take();
+    pub fn clear(&self) {
+        self.bootstrap_cap.borrow_mut().take();
     }
 }
 
@@ -393,7 +395,7 @@ impl ProcessImpl {
             stdout,
             stderr,
             exit_rx: Arc::new(Mutex::new(Some(exit_rx))),
-            bootstrap_cap: Arc::new(Mutex::new(None)),
+            bootstrap_cap: Rc::new(RefCell::new(None)),
             kill_tx: Arc::new(kill_tx),
         }
     }
@@ -417,7 +419,7 @@ impl ProcessImpl {
         bootstrap_cap: capnp::capability::Client,
         kill_tx: tokio::sync::watch::Sender<bool>,
     ) -> (Self, ProcessBootstrapControl) {
-        let bootstrap_cap = Arc::new(Mutex::new(Some(bootstrap_cap)));
+        let bootstrap_cap = Rc::new(RefCell::new(Some(bootstrap_cap)));
         let control = ProcessBootstrapControl {
             bootstrap_cap: bootstrap_cap.clone(),
         };
@@ -487,7 +489,7 @@ impl system_capnp::process::Server for ProcessImpl {
     ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
         let bootstrap_cap = self.bootstrap_cap.clone();
         Promise::from_future(async move {
-            let cap = bootstrap_cap.lock().await.clone();
+            let cap = bootstrap_cap.borrow().clone();
             let cap = cap.ok_or_else(|| {
                 capnp::Error::failed(
                     "process did not export a bootstrap capability via system::serve()".into(),
@@ -1126,7 +1128,7 @@ mod tests {
                     .promise
                     .await
                     .expect("bootstrap exists before child exit");
-                control.clear().await;
+                control.clear();
                 assert!(
                     process.bootstrap_request().send().promise.await.is_err(),
                     "child exit must clear the stored guest bootstrap client"
