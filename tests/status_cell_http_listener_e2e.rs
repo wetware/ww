@@ -12,12 +12,11 @@
 //!
 //! The test additionally seeds a non-empty caps list (kernel emits this
 //! when an init.d author wraps `(perform host :listen ...)` in a `with`
-//! block — e.g. `(with [(host (perform host :host))] ...)`). The status
-//! cell ignores extras and uses the default-graft `host` cap, but the
-//! dispatcher path must not drop or corrupt the caps in flight. A
-//! regression that breaks caps forwarding (e.g. the prior
-//! `// TODO: thread _caps` regression that #429 closed) would surface
-//! here as `peer_id: null` or a CGI dispatch failure.
+//! block — e.g. `(with [(host (perform host :host))] ...)`). That fixed
+//! registration-time template is the status cell's only host authority; the
+//! dispatcher path must reproduce it for each child without widening or
+//! corruption. A regression would surface here as `peer_id: null` or a CGI
+//! dispatch failure.
 //!
 //! Requires pre-built status WASM: `make -C std/status`.
 
@@ -67,20 +66,15 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
             let stream_control = libp2p_stream::Behaviour::new().new_control();
 
             let (swarm_tx, _swarm_rx) = mpsc::channel(16);
-            let runtime = create_runtime_client(
+            let runtime =
+                create_runtime_client(false, Some(guard.clone()), None, None, CachePolicy::Shared);
+            let host: system_capnp::host::Client = capnp_rpc::new_client(ww::rpc::HostImpl::new(
                 network_state,
                 swarm_tx,
                 false,
                 Some(guard.clone()),
-                Some(epoch_rx.clone()),
-                None,
                 Some(stream_control),
-                None,
-                None,
-                CachePolicy::Shared,
-                ww::ipfs::HttpClient::new("http://localhost:5001".into()),
-                Vec::new(),
-            );
+            ));
 
             // Load the status WASM, get an executor.
             let wasm = std::fs::read(STATUS_WASM_PATH).expect("read status.wasm");
@@ -109,12 +103,10 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
             {
                 let mut caps_builder = listen_req.get().init_caps(1);
                 let mut entry = caps_builder.reborrow().get(0);
-                entry.set_name("test-extra");
-                // Any capability works here; the test asserts a non-empty caps
-                // list is accepted, not the cap's identity.
-                entry
-                    .init_cap()
-                    .set_as_capability(listener.client.clone().hook);
+                entry.set_name("host");
+                // Registration-time caps are the fixed grant template for
+                // every request child. Status requires only this explicit host.
+                entry.init_cap().set_as_capability(host.client.clone().hook);
             }
             listen_req
                 .send()

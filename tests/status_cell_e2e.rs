@@ -5,11 +5,9 @@
 //! shape AND that `peer_id` is a non-null base58 string.
 //!
 //! The `peer_id` non-null assertion is the load-bearing one: it proves
-//! the `host` cap from the kernel's default graft actually reaches the
-//! WAGI cell's membrane (the contract HttpListener caps propagation
-//! landed in #429 makes possible). Without it, a regression would let
-//! `peer_id: null` slip through and the engagement starter kit's WHOA 1
-//! pitch would be hollow even though the test "passes."
+//! an explicitly supplied `host` grant reaches the WAGI cell's bounded
+//! initial-authority bootstrap. Without it, a regression would let `peer_id:
+//! null` slip through even though the test otherwise "passes."
 //!
 //! Requires pre-built status WASM: `make -C std/status`.
 
@@ -18,6 +16,7 @@ use tokio::sync::{mpsc, watch};
 use ww::dispatcher::wagi;
 use ww::launcher::create_runtime_client;
 use ww::rpc::{CachePolicy, NetworkState};
+use ww::system_capnp;
 
 const STATUS_WASM_PATH: &str = "std/status/bin/status.wasm";
 
@@ -46,11 +45,9 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
         .run_until(async {
             // ── Set up an in-process runtime with a known peer ID ───────
             //
-            // The full membrane (with `host` cap) is only wired when the
-            // runtime has BOTH an epoch receiver AND a stream control.
-            // Without them, RuntimeImpl falls back to the test-only
-            // `build_peer_rpc` path which does NOT expose host. This was
-            // the cause of CGI-empty-output failures during dev.
+            // Runtime/Executor carries no ambient host authority. Construct
+            // the one host capability this status child needs and grant it
+            // explicitly in the spawn request below.
             let network_state = NetworkState::new();
             let peer_id_bytes = synth_peer_id_bytes();
             network_state.set_local_peer_id(peer_id_bytes.clone()).await;
@@ -68,20 +65,15 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
             let stream_control = libp2p_stream::Behaviour::new().new_control();
 
             let (swarm_tx, _swarm_rx) = mpsc::channel(16);
-            let runtime = create_runtime_client(
+            let runtime =
+                create_runtime_client(false, Some(guard.clone()), None, None, CachePolicy::Shared);
+            let host: system_capnp::host::Client = capnp_rpc::new_client(ww::rpc::HostImpl::new(
                 network_state,
                 swarm_tx,
                 false,
                 Some(guard),
-                Some(epoch_rx),
-                None,
                 Some(stream_control),
-                None,
-                None,
-                CachePolicy::Shared,
-                ww::ipfs::HttpClient::new("http://localhost:5001".into()),
-                Vec::new(),
-            );
+            ));
 
             // Load the status WASM.
             let wasm = std::fs::read(STATUS_WASM_PATH).expect("failed to read status.wasm");
@@ -111,6 +103,12 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
                 for (i, e) in env.iter().enumerate() {
                     env_list.set(i as u32, e);
                 }
+                let mut caps = builder.init_caps(1);
+                let mut host_grant = caps.reborrow().get(0);
+                host_grant.set_name("host");
+                host_grant
+                    .init_cap()
+                    .set_as_capability(host.client.clone().hook);
             }
             let spawn_resp = spawn_req
                 .send()

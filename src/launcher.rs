@@ -8,7 +8,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use capnp::capability::Promise;
@@ -19,12 +18,12 @@ use tokio::sync::{mpsc, oneshot};
 
 use ::authority::EpochGuard;
 
-use crate::host::SwarmCommand;
 use crate::services::CompileRequest;
 use crate::system_capnp;
-use cell::proc::{Builder as ProcBuilder, FuelEstimator};
+use cell::proc::{Builder as ProcBuilder, FuelEstimator, Proc};
 use rpc::{
-    build_peer_rpc, graft, ByteStreamImpl, CachePolicy, NetworkState, ProcessImpl, StreamMode,
+    graft, ByteStreamImpl, CachePolicy, InitialAuthorityRecord, ProcessBootstrapControl,
+    ProcessImpl, StreamMode,
 };
 
 /// Maximum WASM binary size accepted by the Executor.
@@ -40,22 +39,13 @@ const MAX_WASM_BYTES: usize = 8 * 1024 * 1024;
 
 /// The Runtime capability: compiles WASM and returns attenuated Executors.
 ///
-/// **System-wide singleton**: RuntimeImpl is created once and every membrane
-/// graft (including child cells) receives a clone of the same client. This
-/// guarantees system-wide cache sharing by construction.
-///
 /// **OCAP discipline**: Runtime is the powerful capability (can load any binary).
-/// Only pid0 gets it from `graft()`. Executor is the attenuated capability
-/// (bound to one binary, can only spawn instances). pid0 hands Executors to
-/// listeners, never Runtime.
+/// Executor is the attenuated capability (bound to one binary, can only spawn
+/// instances). Compilation and executor caching remain implementation details
+/// behind Runtime; Executors carry no Runtime or ambient host authority.
 pub struct RuntimeImpl {
-    network_state: NetworkState,
-    swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
     wasm_debug: bool,
     guard: Option<EpochGuard>,
-    epoch_rx: Option<tokio::sync::watch::Receiver<::authority::Epoch>>,
-    signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
-    stream_control: Option<libp2p_stream::Control>,
     /// Runtime-wide cache policy (from `WW_RUNTIME_CACHE_POLICY` env var).
     cache_policy: CachePolicy,
     /// BLAKE3(wasm bytes) → cached Executor client (used when policy = Shared).
@@ -63,19 +53,10 @@ pub struct RuntimeImpl {
     /// RefCell is correct because Cap'n Proto server dispatch runs on a
     /// single-threaded LocalSet.
     executor_cache: RefCell<HashMap<[u8; 32], system_capnp::executor::Client>>,
-    /// Back-reference to this Runtime's own client. Injected by
-    /// [`create_runtime_client`] after construction. Cloned into each
-    /// ExecutorImpl so child cells receive the same Runtime through their
-    /// membrane graft.
-    self_client: Rc<RefCell<Option<system_capnp::runtime::Client>>>,
     /// Shared Wasmtime engine for this runtime and all executors it creates.
     engine: Arc<wasmtime::Engine>,
     /// Optional compilation service channel.
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
-    /// IPFS HTTP client for Kubo API calls (e.g. IPNS resolution via routing).
-    ipfs_client: crate::ipfs::HttpClient,
-    /// Allowed outbound HTTP hosts — inherited by child cells.
-    http_dial: Vec<String>,
 }
 
 impl RuntimeImpl {
@@ -92,25 +73,12 @@ impl RuntimeImpl {
         bytecode: Arc<Vec<u8>>,
         component: Option<Arc<wasmtime::component::Component>>,
     ) -> system_capnp::executor::Client {
-        let runtime_client = self
-            .self_client
-            .borrow()
-            .clone()
-            .expect("runtime self-reference must be set (use create_runtime_client)");
         capnp_rpc::new_client(ExecutorImpl {
             bytecode,
             component,
             engine: self.engine.clone(),
             wasm_debug: self.wasm_debug,
-            network_state: self.network_state.clone(),
-            swarm_cmd_tx: self.swarm_cmd_tx.clone(),
             guard: self.guard.clone(),
-            epoch_rx: self.epoch_rx.clone(),
-            signing_key: self.signing_key.clone(),
-            stream_control: self.stream_control.clone(),
-            runtime_client,
-            ipfs_client: self.ipfs_client.clone(),
-            http_dial: self.http_dial.clone(),
         })
     }
 }
@@ -145,46 +113,27 @@ async fn compile_with_service(
     Ok(Some(Arc::new(component)))
 }
 
-/// Create a RuntimeImpl, wrap it as a client, and inject the self-reference.
+/// Create the image-loading Runtime capability.
 ///
 /// This is the only way to construct a `runtime::Client` backed by a real RuntimeImpl.
-/// The returned client is a singleton — clone it wherever a Runtime is needed to
-/// ensure all cells share the same compilation/executor cache.
-#[allow(clippy::too_many_arguments)]
+/// The returned client owns compilation and executor-cache state only; host
+/// services used by pid0's graft are passed separately at the pid0 call site.
 pub fn create_runtime_client(
-    network_state: NetworkState,
-    swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
     wasm_debug: bool,
     guard: Option<EpochGuard>,
-    epoch_rx: Option<tokio::sync::watch::Receiver<::authority::Epoch>>,
-    signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
-    stream_control: Option<libp2p_stream::Control>,
     engine: Option<Arc<wasmtime::Engine>>,
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
-    ipfs_client: crate::ipfs::HttpClient,
-    http_dial: Vec<String>,
 ) -> system_capnp::runtime::Client {
-    let self_client = Rc::new(RefCell::new(None));
     let runtime = RuntimeImpl {
-        network_state,
-        swarm_cmd_tx,
         wasm_debug,
         guard,
-        epoch_rx,
-        signing_key,
-        stream_control,
         cache_policy,
         executor_cache: RefCell::new(HashMap::new()),
-        self_client: self_client.clone(),
         engine: engine.unwrap_or_else(build_wasmtime_engine),
         compile_tx,
-        ipfs_client,
-        http_dial,
     };
-    let client: system_capnp::runtime::Client = capnp_rpc::new_client(runtime);
-    *self_client.borrow_mut() = Some(client.clone());
-    client
+    capnp_rpc::new_client(runtime)
 }
 
 fn read_text_list(list: capnp::text_list::Reader<'_>) -> Vec<String> {
@@ -299,18 +248,147 @@ pub struct ExecutorImpl {
     component: Option<Arc<wasmtime::component::Component>>,
     engine: Arc<wasmtime::Engine>,
     wasm_debug: bool,
-    network_state: NetworkState,
-    swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
     guard: Option<EpochGuard>,
-    epoch_rx: Option<tokio::sync::watch::Receiver<::authority::Epoch>>,
-    signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
-    stream_control: Option<libp2p_stream::Control>,
-    /// Runtime client (singleton) — passed to child cells through their membrane graft.
-    runtime_client: system_capnp::runtime::Client,
-    /// IPFS HTTP client — passed to child cells through their membrane graft.
-    ipfs_client: crate::ipfs::HttpClient,
-    /// Allowed outbound HTTP hosts — inherited by child cells.
-    http_dial: Vec<String>,
+}
+
+/// Owns every resource whose lifetime is exactly one running child.
+///
+/// The task running this value is the authority-record lifetime boundary:
+/// process exit or kill aborts child RPC/stderr work and releases the record.
+/// Grant references cannot keep the process or its RPC task alive.
+struct OwnedChildLifecycle {
+    proc: Option<Proc>,
+    rpc_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+    record: Option<InitialAuthorityRecord>,
+    bootstrap_control: ProcessBootstrapControl,
+    kill_rx: tokio::sync::watch::Receiver<bool>,
+    exit_tx: Option<tokio::sync::oneshot::Sender<i32>>,
+}
+
+impl OwnedChildLifecycle {
+    async fn run(mut self) {
+        let proc = self
+            .proc
+            .take()
+            .expect("owned child lifecycle starts with a process");
+        let mut proc_run = Box::pin(proc.run());
+        let mut watch_kill = true;
+        let exit_code = loop {
+            if watch_kill {
+                tokio::select! {
+                    result = &mut proc_run => {
+                        break match result {
+                            Ok(()) => 0,
+                            Err(error) => {
+                                tracing::error!("executor: child process failed: {error}");
+                                1
+                            }
+                        };
+                    }
+                    changed = self.kill_rx.changed() => {
+                        match changed {
+                            Ok(()) if *self.kill_rx.borrow() => {
+                                tracing::info!("executor: child process killed");
+                                break 137;
+                            }
+                            Ok(()) => {}
+                            Err(_) => {
+                                // Dropping every Process handle is not an
+                                // implicit kill operation. Await natural exit.
+                                watch_kill = false;
+                            }
+                        }
+                    }
+                }
+            } else {
+                break match proc_run.await {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        tracing::error!("executor: child process failed: {error}");
+                        1
+                    }
+                };
+            }
+        };
+
+        self.stop_auxiliary_tasks().await;
+        self.bootstrap_control.clear().await;
+        // Keep the immutable record live through process execution, then
+        // release it after child RPC and the stored guest bootstrap are gone
+        // but before reporting exit to the parent.
+        drop(self.record.take());
+        tracing::info!("executor: child process exited with code {exit_code}");
+        if let Some(exit_tx) = self.exit_tx.take() {
+            let _ = exit_tx.send(exit_code);
+        }
+    }
+
+    fn abort_auxiliary_tasks(&mut self) {
+        if let Some(task) = self.rpc_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+        }
+    }
+
+    async fn stop_auxiliary_tasks(&mut self) {
+        let rpc_task = self.rpc_task.take();
+        let stderr_task = self.stderr_task.take();
+        if let Some(task) = &rpc_task {
+            task.abort();
+        }
+        if let Some(task) = &stderr_task {
+            task.abort();
+        }
+        if let Some(task) = rpc_task {
+            let _ = task.await;
+        }
+        if let Some(task) = stderr_task {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for OwnedChildLifecycle {
+    fn drop(&mut self) {
+        self.abort_auxiliary_tasks();
+    }
+}
+
+/// Armed only until the Process capability is installed in the spawn result.
+///
+/// If the RPC call is cancelled or errors during that handoff, aborting the
+/// owner task drops the process, streams, record, and child RPC task together.
+struct SpawnHandoffGuard {
+    abort_handle: Option<tokio::task::AbortHandle>,
+    kill_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl SpawnHandoffGuard {
+    fn new(
+        abort_handle: tokio::task::AbortHandle,
+        kill_tx: tokio::sync::watch::Sender<bool>,
+    ) -> Self {
+        Self {
+            abort_handle: Some(abort_handle),
+            kill_tx,
+        }
+    }
+
+    fn complete(mut self) {
+        self.abort_handle.take();
+    }
+}
+
+impl Drop for SpawnHandoffGuard {
+    fn drop(&mut self) {
+        if let Some(abort_handle) = self.abort_handle.take() {
+            let _ = self.kill_tx.send(true);
+            abort_handle.abort();
+        }
+    }
 }
 
 #[allow(refining_impl_trait)]
@@ -353,23 +431,15 @@ impl system_capnp::executor::Server for ExecutorImpl {
             None // Default: scheduled (unlimited)
         };
 
-        // Validate optional named capabilities before any process construction.
-        // T3 will wrap this collection in InitialAuthorityRecord and bind it to
-        // the child lifecycle; T2 deliberately leaves bootstrap behavior intact.
-        let extra_caps = pry!(params.get_caps().and_then(rpc::decode_exports));
+        // Final child-admission chokepoint: decode, validate, and retain the
+        // complete immutable record before stdio allocation or process build.
+        // Promise/pipelined/broken references remain opaque here.
+        let initial_authority = pry!(params.get_caps().and_then(InitialAuthorityRecord::decode));
 
         let bytecode = self.bytecode.clone();
         let component = self.component.clone();
         let engine = self.engine.clone();
         let wasm_debug = self.wasm_debug;
-        let network_state = self.network_state.clone();
-        let swarm_cmd_tx = self.swarm_cmd_tx.clone();
-        let epoch_rx = self.epoch_rx.clone();
-        let signing_key = self.signing_key.clone();
-        let stream_control = self.stream_control.clone();
-        let runtime_client = self.runtime_client.clone();
-        let ipfs_client = self.ipfs_client.clone();
-        let http_dial = self.http_dial.clone();
 
         Promise::from_future(async move {
             let (host_stderr, guest_stderr) = io::duplex(64 * 1024);
@@ -405,86 +475,20 @@ impl system_capnp::executor::Server for ExecutorImpl {
                 .take_host_split()
                 .ok_or_else(|| capnp::Error::failed("host stream missing".into()))?;
 
-            let mut bootstrap_cap: Option<capnp::capability::Client> = None;
-            let child_rpc_system = if let (Some(erx), Some(sc)) = (epoch_rx, stream_control) {
-                let (rpc, guest) = graft::build_membrane_rpc(
-                    reader,
-                    writer,
-                    network_state,
-                    swarm_cmd_tx,
-                    wasm_debug,
-                    erx,
-                    signing_key,
-                    sc,
-                    None, // route_registry: spawned cells don't get HTTP routes
-                    runtime_client,
-                    extra_caps,
-                    ipfs_client,
-                    http_dial,
-                );
-                bootstrap_cap = Some(guest.client);
-                rpc
-            } else {
-                build_peer_rpc(reader, writer, network_state, swarm_cmd_tx, wasm_debug)
-            };
+            // Every Runtime/Executor configuration uses the same bounded,
+            // record-served child authority model. There is no raw Host
+            // fallback when epoch or stream wiring is absent.
+            let (child_rpc_system, guest_bootstrap) =
+                graft::build_initial_authority_rpc(reader, writer, initial_authority.clone());
 
-            let mut kill_rx = kill_rx;
-            // Spawn RPC system and stderr drain on the ambient LocalSet.
-            tokio::task::spawn_local(child_rpc_system.map(|_| ()));
-
-            tokio::task::spawn_local(async move {
+            let rpc_task = tokio::task::spawn_local(child_rpc_system.map(|_| ()));
+            let stderr_task = tokio::task::spawn_local(async move {
                 use tokio::io::AsyncBufReadExt;
                 let reader = tokio::io::BufReader::new(host_stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::info!("{}", line);
                 }
-            });
-
-            tokio::task::spawn_local(async move {
-                let mut proc_run = Box::pin(proc.run());
-                let mut watch_kill = true;
-                let exit_code = loop {
-                    if watch_kill {
-                        tokio::select! {
-                            result = &mut proc_run => {
-                                break match result {
-                                    Ok(()) => 0,
-                                    Err(e) => {
-                                        tracing::error!("executor: child process failed: {}", e);
-                                        1
-                                    }
-                                };
-                            }
-                            changed = kill_rx.changed() => {
-                                match changed {
-                                    Ok(()) => {
-                                        if *kill_rx.borrow() {
-                                            tracing::info!("executor: child process killed");
-                                            break 137; // SIGKILL convention
-                                        }
-                                        // Spurious wakeup/value refresh with `false`: keep waiting.
-                                    }
-                                    Err(_) => {
-                                        // All kill handles were dropped. Stop polling kill_rx and
-                                        // await natural process exit to avoid a tight ready-loop.
-                                        watch_kill = false;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        break match proc_run.await {
-                            Ok(()) => 0,
-                            Err(e) => {
-                                tracing::error!("executor: child process failed: {}", e);
-                                1
-                            }
-                        };
-                    }
-                };
-                tracing::info!("executor: child process exited with code {}", exit_code);
-                let _ = exit_tx.send(exit_code);
             });
 
             let stdin =
@@ -494,14 +498,43 @@ impl system_capnp::executor::Server for ExecutorImpl {
             let (dummy_stderr, _) = io::duplex(1);
             let stderr =
                 capnp_rpc::new_client(ByteStreamImpl::new(dummy_stderr, StreamMode::ReadOnly));
+            let (process_impl, bootstrap_control) = ProcessImpl::with_controlled_bootstrap(
+                stdin,
+                stdout,
+                stderr,
+                exit_rx,
+                guest_bootstrap.client,
+                kill_tx.clone(),
+            );
 
-            let process_impl = if let Some(cap) = bootstrap_cap {
-                ProcessImpl::with_bootstrap(stdin, stdout, stderr, exit_rx, cap, kill_tx)
-            } else {
-                ProcessImpl::new(stdin, stdout, stderr, exit_rx, kill_tx)
-            };
+            let lifecycle_task = tokio::task::spawn_local(
+                OwnedChildLifecycle {
+                    proc: Some(proc),
+                    rpc_task: Some(rpc_task),
+                    stderr_task: Some(stderr_task),
+                    record: Some(initial_authority),
+                    bootstrap_control,
+                    kill_rx,
+                    exit_tx: Some(exit_tx),
+                }
+                .run(),
+            );
+            let handoff = SpawnHandoffGuard::new(lifecycle_task.abort_handle(), kill_tx.clone());
+
+            // Make the post-instantiation cancellation boundary explicit. If
+            // the caller drops the spawn promise here, `handoff` aborts the
+            // complete owned lifecycle before any Process becomes visible.
+            tokio::task::yield_now().await;
+
+            // Expose the parent-held process authority only after the entire
+            // owned child lifecycle exists.
             let process_client: system_capnp::process::Client = capnp_rpc::new_client(process_impl);
             results.get().set_process(process_client);
+            handoff.complete();
+
+            // Detach only the single lifecycle owner. It remains responsible
+            // for aborting its subordinate RPC/stderr tasks on every exit path.
+            drop(lifecycle_task);
 
             Ok(())
         })
@@ -521,5 +554,60 @@ impl system_capnp::executor::Server for ExecutorImpl {
         let cid = cid::Cid::new_v1(RAW_CODEC, mh);
         results.get().set_cid(cid.to_string());
         Promise::ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct DropFlag {
+        dropped: Rc<Cell<u32>>,
+    }
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.dropped.set(self.dropped.get() + 1);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_spawn_handoff_aborts_all_owned_child_resources() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let dropped = Rc::new(Cell::new(0));
+                let resources: Vec<_> = (0..4)
+                    .map(|_| DropFlag {
+                        dropped: dropped.clone(),
+                    })
+                    .collect();
+
+                // Model the production owner task after process construction:
+                // process, RPC task, streams, and record are all captured by
+                // the one abort target guarded until Process handoff.
+                let lifecycle_task = tokio::task::spawn_local(async move {
+                    let _resources = resources;
+                    std::future::pending::<()>().await;
+                });
+                let (kill_tx, mut kill_rx) = tokio::sync::watch::channel(false);
+                let handoff = SpawnHandoffGuard::new(lifecycle_task.abort_handle(), kill_tx);
+
+                drop(handoff);
+                assert!(
+                    kill_rx.changed().await.is_ok() && *kill_rx.borrow(),
+                    "cancellation must signal child termination"
+                );
+                let result = lifecycle_task.await;
+                assert!(result.is_err() && result.unwrap_err().is_cancelled());
+                assert_eq!(
+                    dropped.get(),
+                    4,
+                    "process, RPC task, streams, and record must all be released"
+                );
+            })
+            .await;
     }
 }

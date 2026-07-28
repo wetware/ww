@@ -24,7 +24,10 @@ use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::{ByteStreamImpl, NamedCapabilities, NamedCapability, StreamMode, SwarmCommand};
+use crate::{
+    ByteStreamImpl, InitialAuthorityRecord, NamedCapabilities, NamedCapability, StreamMode,
+    SwarmCommand,
+};
 use auth::SigningDomain;
 use authority::http_capnp;
 use authority::routing_capnp;
@@ -382,7 +385,7 @@ impl GraftBuilder for HostGraftBuilder {
 // See src/vfs.rs and src/fs_intercept.rs.
 
 // ---------------------------------------------------------------------------
-// build_membrane_rpc — bootstrap Membrane instead of Host
+// RPC bootstrap constructors
 // ---------------------------------------------------------------------------
 
 /// The Membrane type exported by WASM guests back to the host.
@@ -392,7 +395,66 @@ impl GraftBuilder for HostGraftBuilder {
 /// allowing the guest to attenuate or enrich the capability surface it exposes.
 pub type GuestMembrane = authority::membrane_capnp::membrane::Client;
 
-/// Build an RPC system that bootstraps a `Membrane` instead of a bare `Host`.
+/// Temporary T3-compatible child bootstrap server.
+///
+/// T5 owns the distinct grants-only guest-facing schema. Until then, ordinary
+/// children still speak the existing `Membrane.graft()` wire method, but this
+/// server is deliberately closed over one immutable [`InitialAuthorityRecord`]
+/// and can return nothing except that record.
+struct InitialAuthorityBootstrap {
+    record: InitialAuthorityRecord,
+}
+
+#[allow(refining_impl_trait)]
+impl membrane_capnp::membrane::Server for InitialAuthorityBootstrap {
+    fn graft(
+        self: capnp::capability::Rc<Self>,
+        _params: membrane_capnp::membrane::GraftParams,
+        mut results: membrane_capnp::membrane::GraftResults,
+    ) -> Promise<(), capnp::Error> {
+        let count = match self.record.grants().len().try_into() {
+            Ok(count) => count,
+            Err(_) => {
+                return Promise::err(capnp::Error::failed(
+                    "too many initial authority grants for Cap'n Proto".into(),
+                ));
+            }
+        };
+        let caps = results.get().init_caps(count);
+        match self.record.encode(caps) {
+            Ok(()) => Promise::ok(()),
+            Err(error) => Promise::err(error),
+        }
+    }
+}
+
+/// Build the sole ordinary-child RPC/bootstrap path.
+///
+/// The bootstrap contains exactly `record`, including when the record is
+/// empty. It has no host/runtime/routing/identity/IPFS/HTTP inputs and no
+/// alternate constructor selected by missing epoch or stream wiring.
+pub fn build_initial_authority_rpc<R, W>(
+    reader: R,
+    writer: W,
+    record: InitialAuthorityRecord,
+) -> (RpcSystem<Side>, GuestMembrane)
+where
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
+{
+    let bootstrap: GuestMembrane = capnp_rpc::new_client(InitialAuthorityBootstrap { record });
+    let rpc_network = VatNetwork::new(
+        reader.compat(),
+        writer.compat_write(),
+        Side::Server,
+        Default::default(),
+    );
+    let mut rpc_system = RpcSystem::new(Box::new(rpc_network), Some(bootstrap.client));
+    let guest_membrane: GuestMembrane = rpc_system.bootstrap(Side::Client);
+    (rpc_system, guest_membrane)
+}
+
+/// Build the trusted pid0 RPC system with its full graft-capable `Membrane`.
 ///
 /// The membrane provides epoch-scoped sessions containing `Host`, `Executor`,
 /// and (when `signing_key` is `Some`) a host-side node identity signer.
@@ -406,7 +468,7 @@ pub type GuestMembrane = authority::membrane_capnp::membrane::Client;
 /// the guest called `runtime::serve()`. If the guest called `runtime::run()`
 /// instead, the returned capability is broken and attempts to use it will fail.
 #[allow(clippy::too_many_arguments)]
-pub fn build_membrane_rpc<R, W>(
+pub fn build_pid0_membrane_rpc<R, W>(
     reader: R,
     writer: W,
     network_state: NetworkState,
@@ -463,7 +525,12 @@ where
 mod tests {
     use super::*;
     use authority::{Epoch, Provenance};
+    use capnp::traits::{Imbue, ImbueMut};
     use ed25519_dalek::Signer;
+    use futures::FutureExt;
+
+    struct RuntimeStub;
+    impl system_capnp::runtime::Server for RuntimeStub {}
 
     /// Generate a random Ed25519 signing key (compatible with the rand version
     /// used by the root crate, which may differ from ed25519_dalek's rand_core).
@@ -496,6 +563,155 @@ mod tests {
     /// Helper: sign data with a given signing key (raw Ed25519, no envelope).
     fn sign_data(sk: &ed25519_dalek::SigningKey, data: &[u8]) -> ed25519_dalek::Signature {
         sk.sign(data)
+    }
+
+    #[test]
+    fn pid0_builder_still_emits_the_full_host_graft() {
+        let epoch = Epoch {
+            seq: 1,
+            head: b"pid0".to_vec(),
+            provenance: Provenance::Block(1),
+        };
+        let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch);
+        let guard = EpochGuard {
+            issued_seq: 1,
+            receiver: epoch_rx,
+        };
+        let (swarm_tx, _swarm_rx) = mpsc::channel(1);
+        let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
+        let builder = HostGraftBuilder::new(
+            NetworkState::from_peer_id(vec![1, 2, 3]),
+            swarm_tx,
+            false,
+            Some(Arc::new(gen_signing_key())),
+            libp2p_stream::Behaviour::new().new_control(),
+            vec!["example.com".into()],
+            runtime,
+            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+        );
+
+        let mut message = capnp::message::Builder::new_default();
+        let mut cap_table = Vec::new();
+        {
+            let mut results =
+                message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+            results.imbue_mut(&mut cap_table);
+            builder.build(&guard, results).expect("build pid0 graft");
+        }
+        let mut results = message
+            .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
+            .expect("read pid0 graft");
+        results.imbue(&cap_table);
+        let names: std::collections::HashSet<_> = results
+            .get_caps()
+            .expect("pid0 caps")
+            .iter()
+            .map(|entry| {
+                entry
+                    .get_name()
+                    .expect("cap name")
+                    .to_str()
+                    .expect("UTF-8 cap name")
+                    .to_owned()
+            })
+            .collect();
+        for expected in [
+            "identity",
+            "host",
+            "runtime",
+            "routing",
+            "authority",
+            "ipfs",
+            "http-client",
+        ] {
+            assert!(
+                names.contains(expected),
+                "trusted pid0 graft lost required capability {expected}: {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pid0_rpc_bootstrap_still_serves_the_full_graft() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let epoch = Epoch {
+                    seq: 1,
+                    head: b"pid0-rpc".to_vec(),
+                    provenance: Provenance::Block(1),
+                };
+                let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch);
+                let (swarm_tx, _swarm_rx) = mpsc::channel(1);
+                let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
+                let (host_stream, guest_stream) = io::duplex(16 * 1024);
+                let (host_reader, host_writer) = io::split(host_stream);
+                let (guest_reader, guest_writer) = io::split(guest_stream);
+
+                let (host_rpc, _guest_export) = build_pid0_membrane_rpc(
+                    host_reader,
+                    host_writer,
+                    NetworkState::from_peer_id(vec![1, 2, 3]),
+                    swarm_tx,
+                    false,
+                    epoch_rx,
+                    Some(Arc::new(gen_signing_key())),
+                    libp2p_stream::Behaviour::new().new_control(),
+                    None,
+                    runtime,
+                    NamedCapabilities::default(),
+                    ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+                    vec!["example.com".into()],
+                );
+                tokio::task::spawn_local(host_rpc.map(|_| ()));
+
+                let guest_network = VatNetwork::new(
+                    guest_reader.compat(),
+                    guest_writer.compat_write(),
+                    Side::Client,
+                    Default::default(),
+                );
+                let mut guest_rpc = RpcSystem::new(Box::new(guest_network), None);
+                let membrane: GuestMembrane = guest_rpc.bootstrap(Side::Server);
+                tokio::task::spawn_local(guest_rpc.map(|_| ()));
+
+                let response = membrane
+                    .graft_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("pid0 graft RPC");
+                let names: std::collections::HashSet<_> = response
+                    .get()
+                    .expect("pid0 graft results")
+                    .get_caps()
+                    .expect("pid0 RPC caps")
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .get_name()
+                            .expect("cap name")
+                            .to_str()
+                            .expect("UTF-8 cap name")
+                            .to_owned()
+                    })
+                    .collect();
+                for expected in [
+                    "identity",
+                    "host",
+                    "runtime",
+                    "routing",
+                    "authority",
+                    "ipfs",
+                    "http-client",
+                ] {
+                    assert!(
+                        names.contains(expected),
+                        "pid0 RPC bootstrap lost {expected}: {names:?}"
+                    );
+                }
+            })
+            .await;
     }
 
     #[tokio::test]

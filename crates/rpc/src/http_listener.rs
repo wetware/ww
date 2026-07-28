@@ -64,16 +64,17 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
             format!("/{prefix}")
         };
 
-        // Read optional caps from the listen request (init.d `with` block grants).
-        // Same pattern as VatListenerImpl::listen.
-        let extra_caps = pry!(reader.get_caps().and_then(decode_exports));
+        // Decode once at registration. `NamedCapabilities` is immutable, so
+        // every request receives the same fixed grant template and the
+        // listener cannot widen it after registration.
+        let grant_template = pry!(reader.get_caps().and_then(decode_exports));
 
         // Create a channel for the axum handler to send requests through.
         let (tx, rx) = mpsc::channel::<CgiRequest>(64);
 
         // Spawn a local task that receives HTTP requests from the channel,
         // spawns cells via Executor, and sends CGI responses back.
-        tokio::task::spawn_local(dispatch_loop(executor, extra_caps, rx));
+        tokio::task::spawn_local(dispatch_loop(executor, grant_template, rx));
 
         // Register the route with its request sender.
         match self.registry.write() {
@@ -299,6 +300,8 @@ mod tests {
     use super::*;
     use crate::dispatch::new_registry;
     use crate::{ByteStreamImpl, ProcessImpl, StreamMode};
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use tokio::io::{self, AsyncWriteExt};
     use tokio::sync::{oneshot, watch};
 
@@ -339,6 +342,48 @@ mod tests {
 
     fn stub_executor() -> system_capnp::executor::Client {
         capnp_rpc::new_client(StubExecutor)
+    }
+
+    struct RecordingExecutor {
+        observed_grants: Rc<RefCell<Vec<Vec<String>>>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::executor::Server for RecordingExecutor {
+        fn spawn(
+            self: capnp::capability::Rc<Self>,
+            params: system_capnp::executor::SpawnParams,
+            mut results: system_capnp::executor::SpawnResults,
+        ) -> Promise<(), capnp::Error> {
+            let params = pry!(params.get());
+            let grants = pry!(params.get_caps().and_then(decode_exports));
+            self.observed_grants
+                .borrow_mut()
+                .push(grants.iter().map(|entry| entry.name().to_owned()).collect());
+
+            let (stdout_stream, mut stdout_writer) = io::duplex(1024);
+            tokio::task::spawn_local(async move {
+                stdout_writer
+                    .write_all(b"Content-Type: application/json\r\n\r\n{}")
+                    .await
+                    .expect("write CGI fixture");
+                stdout_writer.shutdown().await.expect("close CGI fixture");
+            });
+            let (kill_tx, _kill_rx) = watch::channel(false);
+            results
+                .get()
+                .set_process(process_with_stdout(stdout_stream, kill_tx));
+            Promise::ok(())
+        }
+
+        fn cid(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::executor::CidParams,
+            mut results: system_capnp::executor::CidResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_cid("fixed-template-test");
+            Promise::ok(())
+        }
     }
 
     struct ProcessExecutor {
@@ -659,6 +704,69 @@ mod tests {
                 assert!(
                     routes.contains_key("/status"),
                     "route /status should be registered"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn registration_caps_are_a_fixed_template_for_every_request_child() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_tx, guard) = test_epoch_guard();
+                let registry = new_registry();
+                let listener: system_capnp::http_listener::Client =
+                    capnp_rpc::new_client(HttpListenerImpl::new(guard, registry.clone()));
+                let observed_grants = Rc::new(RefCell::new(Vec::new()));
+                let executor: system_capnp::executor::Client =
+                    capnp_rpc::new_client(RecordingExecutor {
+                        observed_grants: observed_grants.clone(),
+                    });
+
+                let mut listen = listener.listen_request();
+                listen.get().set_executor(executor);
+                listen.get().set_prefix("/fixed");
+                {
+                    let mut entry = listen.get().init_caps(1).get(0);
+                    entry.set_name("only-grant");
+                    entry
+                        .init_cap()
+                        .set_as_capability(stub_executor().client.hook);
+                }
+                listen
+                    .send()
+                    .promise
+                    .await
+                    .expect("register fixed grant template");
+
+                let route = registry
+                    .read()
+                    .expect("registry lock")
+                    .get("/fixed")
+                    .cloned()
+                    .expect("fixed route");
+                for _ in 0..2 {
+                    let (response_tx, response_rx) = oneshot::channel();
+                    route
+                        .send(CgiRequest {
+                            method: "GET".into(),
+                            path: "/fixed".into(),
+                            query: String::new(),
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                            response_tx,
+                        })
+                        .await
+                        .expect("dispatch fixed-template request");
+                    let response = response_rx.await.expect("CGI response");
+                    assert_eq!(response.status, 200);
+                }
+
+                assert_eq!(
+                    observed_grants.borrow().as_slice(),
+                    &[vec!["only-grant".to_owned()], vec!["only-grant".to_owned()]],
+                    "each request must instantiate the same immutable registration template"
                 );
             })
             .await;
