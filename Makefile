@@ -6,7 +6,7 @@
 WASM_TARGET := wasm32-wasip2
 
 .PHONY: all host std kernel shell status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
-.PHONY: publish-std try-publish-std publish test-deps test test-wasm check-glia-effects
+.PHONY: publish-std try-publish-std publish test-deps test test-wasm check-glia-effects authority-probe
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
 
@@ -22,6 +22,14 @@ test-deps:
 
 test: test-deps
 	cargo test --workspace
+
+# Build the disposable real-WASM adversarial guest used by the T1 confinement
+# harness. The integration test also builds it on demand in a separate target
+# directory so clean CI runs do not depend on a checked-in binary.
+authority-probe:
+	CARGO_TARGET_DIR=target/authority-probe cargo build --locked \
+		--manifest-path tests/fixtures/authority-probe/Cargo.toml \
+		--target $(WASM_TARGET) --release
 
 # Guard the explicit pre-alpha Glia host-effect syntax. Historical audits and
 # changelog entries intentionally retain old spellings as evidence.
