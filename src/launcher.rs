@@ -353,24 +353,10 @@ impl system_capnp::executor::Server for ExecutorImpl {
             None // Default: scheduled (unlimited)
         };
 
-        // Read optional Synapse caps from spawn request (forwarded from init.d
-        // `with` blocks) and preserve them for the child graft response.
-        let extra_caps: Vec<(String, capnp::capability::Client)> = {
-            let mut caps_vec = Vec::new();
-            if let Ok(caps_reader) = params.get_caps() {
-                for entry in caps_reader.iter() {
-                    if let Ok(name) = entry.get_name().map(|n| n.to_string().unwrap_or_default()) {
-                        if let Ok(cap) = entry
-                            .get_cap()
-                            .get_as_capability::<capnp::capability::Client>()
-                        {
-                            caps_vec.push((name, cap));
-                        }
-                    }
-                }
-            }
-            caps_vec
-        };
+        // Validate optional named capabilities before any process construction.
+        // T3 will wrap this collection in InitialAuthorityRecord and bind it to
+        // the child lifecycle; T2 deliberately leaves bootstrap behavior intact.
+        let extra_caps = pry!(params.get_caps().and_then(rpc::decode_exports));
 
         let bytecode = self.bytecode.clone();
         let component = self.component.clone();

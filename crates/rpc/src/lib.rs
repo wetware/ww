@@ -9,7 +9,9 @@ pub mod dispatch;
 pub mod graft;
 pub mod http_client;
 pub mod http_listener;
+pub mod initial_authority;
 pub mod keys;
+pub mod named_capability;
 pub mod routing;
 pub mod stream_dialer;
 pub mod stream_listener;
@@ -23,6 +25,9 @@ pub use connection_budget::{
     InvalidConnectionLimit, DEFAULT_MAX_INBOUND_CONNECTIONS, DEFAULT_TERMINAL_LOGIN_TIMEOUT,
 };
 pub mod wagi;
+
+pub use initial_authority::InitialAuthorityRecord;
+pub use named_capability::{decode_exports, encode_exports, NamedCapabilities, NamedCapability};
 
 use std::sync::Arc;
 

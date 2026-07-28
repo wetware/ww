@@ -616,7 +616,7 @@ impl Cell {
             membrane_stream_control,
             route_registry,
             runtime_client,
-            Vec::new(), // pid0 gets full membrane, no extras
+            rpc::NamedCapabilities::default(), // pid0 gets full membrane, no extras
             ipfs_client,
             http_dial,
         );

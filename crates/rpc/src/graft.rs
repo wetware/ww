@@ -24,7 +24,7 @@ use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::{ByteStreamImpl, StreamMode, SwarmCommand};
+use crate::{ByteStreamImpl, NamedCapabilities, NamedCapability, StreamMode, SwarmCommand};
 use auth::SigningDomain;
 use authority::http_capnp;
 use authority::routing_capnp;
@@ -248,7 +248,7 @@ pub struct HostGraftBuilder {
     runtime_client: system_capnp::runtime::Client,
     /// Named capabilities from init.d `with` blocks, forwarded to the child
     /// cell's graft response as `Export { name, cap }` entries.
-    extras: Vec<(String, capnp::capability::Client)>,
+    extras: NamedCapabilities,
     /// IPFS HTTP client for Kubo API calls (e.g. IPNS resolution).
     ipfs_client: ipfs::HttpClient,
 }
@@ -274,7 +274,7 @@ impl HostGraftBuilder {
             allowed_hosts,
             route_registry: None,
             runtime_client,
-            extras: Vec::new(),
+            extras: NamedCapabilities::default(),
             ipfs_client,
         }
     }
@@ -287,7 +287,7 @@ impl HostGraftBuilder {
 
     /// Set named capabilities from init.d `with` block to inject into graft.
     ///
-    pub fn with_extras(mut self, extras: Vec<(String, capnp::capability::Client)>) -> Self {
+    pub fn with_extras(mut self, extras: NamedCapabilities) -> Self {
         self.extras = extras;
         self
     }
@@ -320,27 +320,30 @@ impl GraftBuilder for HostGraftBuilder {
             ));
 
         // Collect all capabilities into a flat list of Export entries.
-        let mut entries: Vec<(&str, capnp::capability::Client)> = Vec::new();
+        let mut entries = Vec::new();
 
         if let Some(sk) = &self.signing_key {
             let keypair =
                 crate::keys::to_libp2p(sk).map_err(|e| capnp::Error::failed(e.to_string()))?;
             let identity: auth_capnp::identity::Client =
                 capnp_rpc::new_client(EpochGuardedIdentity::new(keypair, guard.clone()));
-            entries.push(("identity", identity.client));
+            entries.push(NamedCapability::new("identity", identity.client)?);
         }
 
-        entries.push(("host", host.client));
-        entries.push(("runtime", self.runtime_client.clone().client));
-        entries.push(("routing", routing.client));
+        entries.push(NamedCapability::new("host", host.client)?);
+        entries.push(NamedCapability::new(
+            "runtime",
+            self.runtime_client.clone().client,
+        )?);
+        entries.push(NamedCapability::new("routing", routing.client)?);
         let authority: auth_capnp::authority::Client =
             capnp_rpc::new_client(authority::AuthorityServer::new(guard.clone()));
-        entries.push(("authority", authority.client));
+        entries.push(NamedCapability::new("authority", authority.client)?);
         let ipfs_cap: system_capnp::ipfs::Client = capnp_rpc::new_client(EpochGuardedIpfs {
             guard: guard.clone(),
             ipfs_client: self.ipfs_client.clone(),
         });
-        entries.push(("ipfs", ipfs_cap.client));
+        entries.push(NamedCapability::new("ipfs", ipfs_cap.client)?);
 
         // Only grant http-client if the operator explicitly opted in via --http-dial.
         if !self.allowed_hosts.is_empty() {
@@ -349,32 +352,28 @@ impl GraftBuilder for HostGraftBuilder {
                     self.allowed_hosts.clone(),
                     guard.clone(),
                 ));
-            entries.push(("http-client", http_client.client));
+            entries.push(NamedCapability::new("http-client", http_client.client)?);
         }
 
         // Append init.d-scoped extras.
-        let extras_owned: Vec<(String, capnp::capability::Client)> = self
-            .extras
-            .iter()
-            .map(|(name, client)| (name.clone(), client.clone()))
-            .collect();
-
-        let count = (entries.len() + extras_owned.len()) as u32;
+        // Keep ambient graft entries and parent extras as independently
+        // validated sets. Collision policy between those sets remains a graft
+        // concern until the T3 bootstrap cutover.
+        let ambient = NamedCapabilities::try_from_iter(entries)?;
+        let count = ambient
+            .len()
+            .checked_add(self.extras.len())
+            .and_then(|len| len.try_into().ok())
+            .ok_or_else(|| {
+                capnp::Error::failed("too many capability exports for Cap'n Proto".into())
+            })?;
         let mut caps_builder = builder.reborrow().init_caps(count);
-
-        for (i, (name, client)) in entries.iter().enumerate() {
-            let mut entry = caps_builder.reborrow().get(i as u32);
-            entry.set_name(name);
-            entry.init_cap().set_as_capability(client.clone().hook);
+        for (index, capability) in ambient.iter().chain(self.extras.iter()).enumerate() {
+            crate::named_capability::encode_export(
+                capability,
+                caps_builder.reborrow().get(index as u32),
+            );
         }
-
-        let offset = entries.len();
-        for (i, (name, client)) in extras_owned.iter().enumerate() {
-            let mut entry = caps_builder.reborrow().get((offset + i) as u32);
-            entry.set_name(name);
-            entry.init_cap().set_as_capability(client.clone().hook);
-        }
-
         Ok(())
     }
 }
@@ -418,7 +417,7 @@ pub fn build_membrane_rpc<R, W>(
     stream_control: libp2p_stream::Control,
     route_registry: Option<crate::dispatch::RouteRegistry>,
     runtime_client: system_capnp::runtime::Client,
-    extras: Vec<(String, capnp::capability::Client)>,
+    extras: NamedCapabilities,
     ipfs_client: ipfs::HttpClient,
     http_dial: Vec<String>,
 ) -> (RpcSystem<Side>, GuestMembrane)

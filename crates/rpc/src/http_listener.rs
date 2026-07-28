@@ -21,6 +21,7 @@ use std::{fmt, time::Duration};
 use tokio::sync::mpsc;
 
 use crate::dispatch::{self, CgiRequest, CgiResponse, RouteRegistry};
+use crate::{decode_exports, encode_exports, NamedCapabilities};
 use authority::system_capnp;
 
 /// Maximum response size from a cell process (16 MiB).
@@ -42,10 +43,6 @@ impl HttpListenerImpl {
         Self { guard, registry }
     }
 }
-
-/// A captured init.d `with`-block grant. Cloned per request and re-emitted on
-/// each spawned cell's graft.
-type ExtraCap = (String, capnp::capability::Client);
 
 #[allow(refining_impl_trait)]
 impl system_capnp::http_listener::Server for HttpListenerImpl {
@@ -69,22 +66,7 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
 
         // Read optional caps from the listen request (init.d `with` block grants).
         // Same pattern as VatListenerImpl::listen.
-        let extra_caps: Vec<ExtraCap> = {
-            let mut caps_vec = Vec::new();
-            if let Ok(caps_reader) = reader.get_caps() {
-                for entry in caps_reader.iter() {
-                    if let Ok(name) = entry.get_name().map(|n| n.to_string().unwrap_or_default()) {
-                        if let Ok(cap) = entry
-                            .get_cap()
-                            .get_as_capability::<capnp::capability::Client>()
-                        {
-                            caps_vec.push((name, cap));
-                        }
-                    }
-                }
-            }
-            caps_vec
-        };
+        let extra_caps = pry!(reader.get_caps().and_then(decode_exports));
 
         // Create a channel for the axum handler to send requests through.
         let (tx, rx) = mpsc::channel::<CgiRequest>(64);
@@ -108,7 +90,7 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
 /// Receive HTTP requests from the channel, spawn cells, send responses back.
 async fn dispatch_loop(
     executor: system_capnp::executor::Client,
-    caps: Vec<ExtraCap>,
+    caps: NamedCapabilities,
     mut rx: mpsc::Receiver<CgiRequest>,
 ) {
     // Fetch the cell's CID for provenance headers.
@@ -150,7 +132,7 @@ async fn dispatch_loop(
 /// Spawn a cell, pipe stdin/stdout, parse CGI response.
 async fn handle_one_request(
     executor: &system_capnp::executor::Client,
-    caps: &[ExtraCap],
+    caps: &NamedCapabilities,
     req: &CgiRequest,
 ) -> CgiResponse {
     handle_one_request_with_timeout(executor, caps, req, WAGI_REQUEST_TIMEOUT).await
@@ -158,7 +140,7 @@ async fn handle_one_request(
 
 async fn handle_one_request_with_timeout(
     executor: &system_capnp::executor::Client,
-    caps: &[ExtraCap],
+    caps: &NamedCapabilities,
     req: &CgiRequest,
     timeout: Duration,
 ) -> CgiResponse {
@@ -218,7 +200,7 @@ impl From<capnp::Error> for WagiRequestError {
 /// membrane graft, so a WAGI cell only sees what the init.d author handed it.
 async fn spawn_and_run(
     executor: &system_capnp::executor::Client,
-    caps: &[ExtraCap],
+    caps: &NamedCapabilities,
     req: &CgiRequest,
     timeout: Duration,
 ) -> Result<Vec<u8>, WagiRequestError> {
@@ -241,12 +223,8 @@ async fn spawn_and_run(
         }
     }
     if !caps.is_empty() {
-        let mut caps_builder = spawn_req.get().init_caps(caps.len() as u32);
-        for (i, (name, cap)) in caps.iter().enumerate() {
-            let mut entry = caps_builder.reborrow().get(i as u32);
-            entry.set_name(name);
-            entry.init_cap().set_as_capability(cap.clone().hook);
-        }
+        let caps_builder = spawn_req.get().init_caps(caps.len() as u32);
+        encode_exports(caps, caps_builder)?;
     }
     let spawn_resp = spawn_req.send().promise.await?;
     let process = spawn_resp.get()?.get_process()?;
@@ -494,7 +472,8 @@ mod tests {
     ) -> CgiResponse {
         let executor = executor_for_process(process);
         let req = test_request();
-        handle_one_request_with_timeout(&executor, &[], &req, timeout).await
+        handle_one_request_with_timeout(&executor, &NamedCapabilities::default(), &req, timeout)
+            .await
     }
 
     #[tokio::test]
