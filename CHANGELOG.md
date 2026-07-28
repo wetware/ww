@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Immutable initial authority records.** Shared RPC helpers now decode,
+  validate, retain, and re-encode ordered named capabilities, while rejecting
+  empty or duplicate names without invoking opaque clients. Spawn decoding,
+  graft extras, and listener templates use the helpers; production child
+  bootstrap behavior is unchanged.
 - **Child-authority confinement security harness.** A reusable real-WASM probe
   and ordinary green characterization suite now document spawned-child
   bootstrap behavior, including the Cargo.lock-pinned same-capability/two-name
