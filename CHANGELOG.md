@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Child-authority confinement security harness.** A reusable real-WASM probe
+  and ordinary green characterization suite now document spawned-child
+  bootstrap behavior, including the Cargo.lock-pinned same-capability/two-name
+  routing gate. Seven isolated ignored regressions remain intentionally red
+  when explicitly invoked, proving the current ambient-authority leaks without
+  making default CI red or changing production authority semantics.
 - **One-command Chess authority proof.** `cargo run -p chess --example
   authority_proof` runs the full two-host libp2p authority demonstration and
   prints a fixed 30-line transcript: identities, policy, per-principal
