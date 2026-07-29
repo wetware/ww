@@ -55,7 +55,10 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
         let protocol_suffix = protocol_str.to_string();
         let stream_protocol = pry!(super::stream_protocol(&protocol_suffix));
 
-        let extra_caps = pry!(params.get_caps().and_then(decode_exports));
+        // Decode once at registration. `NamedCapabilities` is immutable, so
+        // each connection receives a clone of this fixed grant template and
+        // cannot widen it after registration.
+        let grant_template = pry!(params.get_caps().and_then(decode_exports));
 
         let mut control = self.stream_control.clone();
         let mut incoming = pry!(control
@@ -97,7 +100,7 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
                         };
                         let executor = executor.clone();
                         let protocol = protocol_suffix.clone();
-                        let caps = extra_caps.clone();
+                        let caps = grant_template.clone();
                         tokio::task::spawn_local(async move {
                             let _permit = permit;
                             let _handle_span = tracing::info_span!(
@@ -134,14 +137,7 @@ async fn handle_connection(
     stream: libp2p::Stream,
     protocol: &str,
 ) -> Result<(), capnp::Error> {
-    // Spawn cell process via Executor.spawn().
-    let mut spawn_req = executor.spawn_request();
-    if !caps.is_empty() {
-        let caps_builder = spawn_req.get().init_caps(caps.len() as u32);
-        encode_exports(&caps, caps_builder)?;
-    }
-    let response = spawn_req.send().promise.await?;
-    let process = response.get()?.get_process()?;
+    let process = spawn_connection_child(&executor, &caps).await?;
 
     // Get stdin (write-only) and stdout (read-only) ByteStream clients.
     let stdin_resp = process.stdin_request().send().promise.await?;
@@ -173,6 +169,20 @@ async fn handle_connection(
     tracing::debug!(exit_code, protocol, "Cell process exited");
 
     Ok(())
+}
+
+async fn spawn_connection_child(
+    executor: &system_capnp::executor::Client,
+    caps: &NamedCapabilities,
+) -> Result<system_capnp::process::Client, capnp::Error> {
+    // Spawn cell process via Executor.spawn().
+    let mut spawn_req = executor.spawn_request();
+    if !caps.is_empty() {
+        let caps_builder = spawn_req.get().init_caps(caps.len() as u32);
+        encode_exports(caps, caps_builder)?;
+    }
+    let response = spawn_req.send().promise.await?;
+    response.get()?.get_process()
 }
 
 /// Read from the libp2p stream and write to the cell's stdin.
@@ -237,5 +247,62 @@ pub(crate) async fn pump_stdout_to_stream(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct RecordingExecutor {
+        observed_grants: Rc<RefCell<Vec<Vec<String>>>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::executor::Server for RecordingExecutor {
+        fn spawn(
+            self: capnp::capability::Rc<Self>,
+            params: system_capnp::executor::SpawnParams,
+            _results: system_capnp::executor::SpawnResults,
+        ) -> Promise<(), capnp::Error> {
+            let params = pry!(params.get());
+            let grants = pry!(params.get_caps().and_then(decode_exports));
+            self.observed_grants
+                .borrow_mut()
+                .push(grants.iter().map(|entry| entry.name().to_owned()).collect());
+            Promise::err(capnp::Error::failed(
+                "recording executor has no process".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_caps_are_a_fixed_template_for_every_connection_child() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let observed_grants = Rc::new(RefCell::new(Vec::new()));
+                let executor: system_capnp::executor::Client =
+                    capnp_rpc::new_client(RecordingExecutor {
+                        observed_grants: observed_grants.clone(),
+                    });
+                let grant_template =
+                    NamedCapabilities::try_from_pairs([("only-grant", executor.clone().client)])
+                        .expect("fixed grant template");
+
+                for _ in 0..2 {
+                    let result = spawn_connection_child(&executor, &grant_template).await;
+                    assert!(result.is_err(), "recording executor intentionally rejects");
+                }
+
+                assert_eq!(
+                    observed_grants.borrow().as_slice(),
+                    &[vec!["only-grant".to_owned()], vec!["only-grant".to_owned()]],
+                    "each connection must instantiate the same immutable registration template"
+                );
+            })
+            .await;
     }
 }

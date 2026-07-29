@@ -13,33 +13,15 @@
 //!
 //! Run: cargo run --example echo_handler_e2e
 
-use tokio::sync::mpsc;
-
 use ww::launcher::create_runtime_client;
-use ww::rpc::{CachePolicy, NetworkState};
+use ww::rpc::CachePolicy;
 use ww::system_capnp;
 
 const ECHO_WASM: &[u8] = include_bytes!("echo/bin/echo.wasm");
 
 /// Create a Runtime client for testing (no network, no epoch guard).
 fn setup_runtime() -> system_capnp::runtime::Client {
-    let network_state = NetworkState::new();
-    let (swarm_tx, _swarm_rx) = mpsc::channel(16);
-
-    create_runtime_client(
-        network_state,
-        swarm_tx,
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        CachePolicy::Shared,
-        ww::ipfs::HttpClient::new("http://localhost:5001".into()),
-        Vec::new(),
-    )
+    create_runtime_client(false, None, None, None, CachePolicy::Shared)
 }
 
 #[tokio::main(flavor = "current_thread")]

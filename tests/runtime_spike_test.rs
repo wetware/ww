@@ -9,10 +9,8 @@
 //! Requires pre-built echo WASM at examples/echo/bin/echo.wasm.
 //! Build: make echo
 
-use tokio::sync::mpsc;
-
 use ww::launcher::create_runtime_client;
-use ww::rpc::{CachePolicy, NetworkState};
+use ww::rpc::CachePolicy;
 use ww::system_capnp;
 
 const ECHO_WASM_PATH: &str = "examples/echo/bin/echo.wasm";
@@ -22,23 +20,7 @@ fn load_echo_wasm() -> Option<Vec<u8>> {
 }
 
 fn setup_runtime() -> system_capnp::runtime::Client {
-    let network_state = NetworkState::new();
-    let (swarm_tx, _swarm_rx) = mpsc::channel(16);
-
-    create_runtime_client(
-        network_state,
-        swarm_tx,
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        CachePolicy::Shared,
-        ww::ipfs::HttpClient::new("http://localhost:5001".into()),
-        Vec::new(),
-    )
+    create_runtime_client(false, None, None, None, CachePolicy::Shared)
 }
 
 /// Load echo WASM via runtime.load() and spawn a cell, returning its Process capability.

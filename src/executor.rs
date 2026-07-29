@@ -584,28 +584,21 @@ impl Cell {
             libp2p_stream::Behaviour::new().new_control()
         });
 
-        // Create the Runtime singleton for this cell's worker thread.
-        // The same client is cloned into every membrane graft on this worker,
-        // so all child cells share the same compilation/executor cache.
+        // Runtime owns image loading, compilation, and executor caching only.
+        // pid0 receives this client through its trusted full graft below;
+        // image-bound Executors never retain or propagate it to children.
         let runtime_client = crate::launcher::create_runtime_client(
-            network_state.clone(),
-            swarm_cmd_tx.clone(),
             wasm_debug,
             None,
-            Some(epoch_rx.clone()),
-            signing_key.clone(),
-            Some(membrane_stream_control.clone()),
             runtime_engine,
             compile_tx,
             cache_policy,
-            ipfs_client.clone(),
-            http_dial.clone(),
         );
 
         // Clone epoch receiver for Terminal auth before it's moved into the RPC system.
         let terminal_epoch_rx = epoch_rx.clone();
 
-        let (rpc_system, guest_membrane) = rpc::graft::build_membrane_rpc(
+        let (rpc_system, guest_membrane) = rpc::graft::build_pid0_membrane_rpc(
             reader,
             writer,
             network_state,

@@ -1,29 +1,29 @@
 //! T1 constructive child-authority confinement harness.
 //!
-//! Ordinary `cargo test` runs the characterization tests and the mandatory
-//! Cap'n Proto fork gate. Expected security regressions are isolated:
+//! Ordinary `cargo test` runs the characterization tests, closed confinement
+//! regressions, and the mandatory Cap'n Proto fork gate. The two remaining
+//! cross-tranche expected-red cases are isolated:
 //!
 //! ```text
 //! cargo test --test child_authority_confinement t1_expected_red -- --ignored --nocapture
 //! ```
 //!
-//! Those ignored tests are intentionally strong and currently fail. Each one
-//! names the authority leak it proves; do not turn them into characterization
-//! tests while production behavior remains ambient.
+//! T4 owns implicit Glia lexical capture. T5 owns removal of the temporary
+//! child-side `Membrane.graft()` compatibility shape.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use capnp::capability::Promise;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use ww::launcher::create_runtime_client;
-use ww::rpc::{CachePolicy, NetworkState, SwarmCommand};
+use ww::rpc::CachePolicy;
 use ww::system_capnp;
 
 const CAPNP_FORK_REVISION: &str = "c6eecf42da63296e5bf628251935cf5af09d80be";
@@ -153,32 +153,7 @@ async fn probe_backend() -> (String, Rc<BackendCounts>) {
 
 async fn harness(wasm: &[u8]) -> Harness {
     let (backend_url, backend_counts) = probe_backend().await;
-    let network_state = NetworkState::from_peer_id(vec![0x57, 0x57, 0x01]);
-    let (swarm_tx, mut swarm_rx) = mpsc::channel(16);
     let counts = Rc::new(SwarmCounts::default());
-    let responder_counts = counts.clone();
-    tokio::task::spawn_local(async move {
-        while let Some(command) = swarm_rx.recv().await {
-            match command {
-                SwarmCommand::KadProvide { reply, .. } => {
-                    responder_counts
-                        .provide
-                        .set(responder_counts.provide.get() + 1);
-                    let _ = reply.send(Ok(()));
-                }
-                SwarmCommand::KadFindProviders { reply, .. } => {
-                    responder_counts.find.set(responder_counts.find.get() + 1);
-                    let _ = reply.send(ww::rpc::PeerInfo {
-                        peer_id: vec![9, 9, 9],
-                        addrs: Vec::new(),
-                    });
-                }
-                SwarmCommand::Connect { reply, .. } => {
-                    let _ = reply.send(Ok(()));
-                }
-            }
-        }
-    });
 
     let epoch = authority::Epoch {
         seq: 1,
@@ -190,22 +165,7 @@ async fn harness(wasm: &[u8]) -> Harness {
         issued_seq: 1,
         receiver: epoch_rx.clone(),
     };
-    let signing_key = Arc::new(ww::keys::generate().expect("test signing key"));
-    let stream_control = libp2p_stream::Behaviour::new().new_control();
-    let runtime = create_runtime_client(
-        network_state,
-        swarm_tx,
-        false,
-        Some(guard),
-        Some(epoch_rx),
-        Some(signing_key),
-        Some(stream_control),
-        None,
-        None,
-        CachePolicy::Shared,
-        ww::ipfs::HttpClient::new(backend_url.clone()),
-        vec!["127.0.0.1".into()],
-    );
+    let runtime = create_runtime_client(false, Some(guard), None, None, CachePolicy::Shared);
     let executor = load_executor(&runtime, wasm).await;
     Harness {
         executor,
@@ -217,21 +177,7 @@ async fn harness(wasm: &[u8]) -> Harness {
 }
 
 async fn raw_fallback_executor(wasm: &[u8]) -> system_capnp::executor::Client {
-    let (swarm_tx, _swarm_rx) = mpsc::channel(4);
-    let runtime = create_runtime_client(
-        NetworkState::from_peer_id(vec![0x48, 0x4f, 0x53, 0x54]),
-        swarm_tx,
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        CachePolicy::Isolated,
-        ww::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
-        Vec::new(),
-    );
+    let runtime = create_runtime_client(false, None, None, None, CachePolicy::Isolated);
     load_executor(&runtime, wasm).await
 }
 
@@ -363,6 +309,18 @@ fn counting_host(identity: &[u8]) -> (Grant, Rc<Cell<u32>>) {
     )
 }
 
+struct DropTrackedHost {
+    dropped: Rc<Cell<bool>>,
+}
+
+impl Drop for DropTrackedHost {
+    fn drop(&mut self) {
+        self.dropped.set(true);
+    }
+}
+
+impl system_capnp::host::Server for DropTrackedHost {}
+
 fn names(report: &Value, delivery: &str) -> Vec<String> {
     report[delivery]
         .as_array()
@@ -484,6 +442,118 @@ fn probe_can_invoke_a_test_local_parent_capability_when_explicitly_supplied() {
 }
 
 #[test]
+fn runtime_is_available_only_when_explicitly_granted() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+
+        let absent = probe_report(
+            &harness.executor,
+            "invoke",
+            &[("WW_PROBE_CAP", "runtime")],
+            &[],
+        )
+        .await;
+        assert_eq!(absent["ok"], false, "Runtime must not be ambient: {absent}");
+
+        let present = probe_report(
+            &harness.executor,
+            "invoke",
+            &[("WW_PROBE_CAP", "runtime")],
+            &[Grant {
+                name: "runtime".into(),
+                cap: create_runtime_client(false, None, None, None, CachePolicy::Isolated).client,
+            }],
+        )
+        .await;
+        assert_eq!(
+            present["ok"], true,
+            "an explicitly granted Runtime must retain normal Cap'n Proto behavior: {present}"
+        );
+    });
+}
+
+#[test]
+fn child_exit_releases_record_owned_grant_references() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let dropped = Rc::new(Cell::new(false));
+        let host: system_capnp::host::Client = capnp_rpc::new_client(DropTrackedHost {
+            dropped: dropped.clone(),
+        });
+        let grant = Grant {
+            name: "tracked".into(),
+            cap: host.client,
+        };
+
+        let process = spawn_probe(
+            &harness.executor,
+            "enumerate",
+            &[],
+            std::slice::from_ref(&grant),
+        )
+            .await
+            .expect("spawn tracked child");
+        drop(grant);
+
+        let stdout = process
+            .stdout_request()
+            .send()
+            .promise
+            .await
+            .expect("process.stdout")
+            .get()
+            .expect("stdout results")
+            .get_stream()
+            .expect("stdout stream");
+        let _ = read_all(stdout).await.expect("drain tracked child output");
+        process
+            .wait_request()
+            .send()
+            .promise
+            .await
+            .expect("wait tracked child");
+
+        assert!(
+            dropped.get(),
+            "child exit must release record and RPC references even while the Process handle remains"
+        );
+    });
+}
+
+#[test]
+fn invalid_grants_are_rejected_before_process_build() {
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        // Runtime.load intentionally defers component compilation when no
+        // compile service is configured. If spawn reached ProcBuilder::build,
+        // these bytes would fail as invalid WASM.
+        let runtime = create_runtime_client(false, None, None, None, CachePolicy::Isolated);
+        let executor = load_executor(&runtime, b"not a WebAssembly component").await;
+        let (grant, _calls) = counting_host(b"never-started");
+        let error = spawn_probe(
+            &executor,
+            "enumerate",
+            &[],
+            &[Grant {
+                name: String::new(),
+                cap: grant.cap,
+            }],
+        )
+        .await
+        .err()
+        .expect("invalid grant must reject the spawn");
+        assert!(
+            error.to_string().contains("capability name"),
+            "grant validation must win before WASM process build: {error}"
+        );
+    });
+}
+
+#[test]
 fn current_empty_grant_substrate_characterization() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
@@ -566,8 +636,7 @@ fn current_process_stdio_topology_has_three_host_handles() {
 }
 
 #[test]
-#[ignore = "T1 expected red: empty caps still receives and can invoke every host-built core capability"]
-fn t1_expected_red_empty_grant_child_cannot_invoke_node_authority() {
+fn empty_grant_child_cannot_invoke_node_authority() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
@@ -590,13 +659,13 @@ fn t1_expected_red_empty_grant_child_cannot_invoke_node_authority() {
         }
         assert_eq!(
             harness.backend_counts.http.get(),
-            1,
-            "HTTP invocation must reach the test-local server"
+            0,
+            "empty authority must not reach the test-local HTTP backend"
         );
         assert_eq!(
             harness.backend_counts.ipfs.get(),
-            1,
-            "IPFS invocation must reach the test-local server"
+            0,
+            "empty authority must not reach the test-local IPFS backend"
         );
         assert!(
             usable.is_empty(),
@@ -606,8 +675,7 @@ fn t1_expected_red_empty_grant_child_cannot_invoke_node_authority() {
 }
 
 #[test]
-#[ignore = "T1 expected red: implicit routing supports provide/find and exposes publishing RPC"]
-fn t1_expected_red_empty_grant_child_cannot_route_discover_or_publish() {
+fn empty_grant_child_cannot_route_discover_or_publish() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
@@ -623,8 +691,7 @@ fn t1_expected_red_empty_grant_child_cannot_route_discover_or_publish() {
 }
 
 #[test]
-#[ignore = "T1 expected red: current child graft adds core exports beyond the supplied caps list"]
-fn t1_expected_red_bootstrap_exports_must_equal_supplied_set() {
+fn bootstrap_exports_equal_supplied_set() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
@@ -638,19 +705,13 @@ fn t1_expected_red_bootstrap_exports_must_equal_supplied_set() {
 }
 
 #[test]
-#[ignore = "T1 expected red: current caps decoder accepts empty, malformed, and duplicate names"]
-fn t1_expected_red_malformed_and_duplicate_wire_names_abort_spawn() {
+fn empty_and_duplicate_wire_names_abort_spawn_but_path_like_labels_are_valid() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
         let harness = harness(&wasm).await;
         let (grant, _calls) = counting_host(b"wire");
-        let mut accepted = Vec::new();
-        for names in [
-            vec![""],
-            vec!["bad/name"],
-            vec!["duplicate", "duplicate"],
-        ] {
+        for names in [vec![""], vec!["duplicate", "duplicate"]] {
             let grants: Vec<_> = names
                 .iter()
                 .map(|name| Grant {
@@ -659,19 +720,31 @@ fn t1_expected_red_malformed_and_duplicate_wire_names_abort_spawn() {
                 })
                 .collect();
             let result = spawn_probe(&harness.executor, "enumerate", &[], &grants).await;
-            if result.is_ok() {
-                accepted.push(names);
-            }
+            assert!(
+                result.is_err(),
+                "invalid wire names {names:?} started a child"
+            );
         }
+
+        let report = probe_report(
+            &harness.executor,
+            "enumerate",
+            &[],
+            &[Grant {
+                name: "bad/name".to_owned(),
+                cap: grant.cap,
+            }],
+        )
+        .await;
         assert!(
-            accepted.is_empty(),
-            "wire names {accepted:?} started children; this does not cover Glia map-literal duplicates"
+            names(&report, "first").contains(&"bad/name".to_owned()),
+            "path-like labels remain valid opaque capability names: {report}"
         );
     });
 }
 
 #[test]
-#[ignore = "T1 expected red: both Glia cell evaluation paths still collect lexical capabilities"]
+#[ignore = "T1 expected red (T4): both Glia cell evaluation paths still collect lexical capabilities"]
 fn t1_expected_red_glia_cell_has_no_implicit_lexical_capability_capture() {
     let source = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/glia/src/eval.rs"),
@@ -685,8 +758,20 @@ fn t1_expected_red_glia_cell_has_no_implicit_lexical_capability_capture() {
 }
 
 #[test]
-#[ignore = "T1 expected red: a restricted Executor spawns a descendant with the universal child graft"]
-fn t1_expected_red_restricted_executor_cannot_amplify_descendant() {
+#[ignore = "T1 expected red (T5): ordinary children still expose InitialAuthorityRecord through the compatibility Membrane.graft() interface"]
+fn t1_expected_red_child_bootstrap_has_no_membrane_graft_compatibility_shape() {
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/rpc/src/graft.rs"),
+    )
+    .expect("graft source");
+    assert!(
+        !source.contains("impl membrane_capnp::membrane::Server for InitialAuthorityBootstrap"),
+        "T5 must replace the temporary child Membrane.graft() compatibility interface"
+    );
+}
+
+#[test]
+fn restricted_executor_cannot_amplify_descendant() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
@@ -716,8 +801,7 @@ fn t1_expected_red_restricted_executor_cannot_amplify_descendant() {
 }
 
 #[test]
-#[ignore = "T1 expected red: no-epoch/no-stream constructor gives the child a usable raw Host bootstrap"]
-fn t1_expected_red_no_epoch_no_stream_has_no_raw_host_fallback() {
+fn no_epoch_no_stream_has_no_raw_host_fallback() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {

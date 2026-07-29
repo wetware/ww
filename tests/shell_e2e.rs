@@ -13,9 +13,9 @@ use capnp_rpc::RpcSystem;
 use tokio::sync::{mpsc, watch};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use ww::rpc::{CachePolicy, NetworkState};
+use ww::rpc::{routing::LocalRouting, CachePolicy, HostImpl, NetworkState};
 use ww::services::{ExecutorPool, SpawnRequest};
-use ww::shell_capnp;
+use ww::{routing_capnp, shell_capnp, system_capnp};
 
 fn shell_wasm_exists() -> bool {
     std::path::Path::new("std/shell/bin/shell.wasm").exists()
@@ -38,8 +38,6 @@ async fn spawn_shell_on_pool(pool: &ExecutorPool) -> Result<shell_capnp::shell::
         factory: Box::new(move |_shutdown| {
             Box::pin(async move {
                 // Create runtime on the worker thread (capnp clients are !Send).
-                let network_state = NetworkState::new();
-                let (swarm_tx, _swarm_rx) = mpsc::channel(16);
                 let epoch = authority::Epoch {
                     seq: 1,
                     head: vec![],
@@ -50,21 +48,24 @@ async fn spawn_shell_on_pool(pool: &ExecutorPool) -> Result<shell_capnp::shell::
                     issued_seq: 1,
                     receiver: epoch_rx.clone(),
                 };
+                let network_state = NetworkState::new();
+                let (swarm_tx, _swarm_rx) = mpsc::channel(16);
                 let stream_control = libp2p_stream::Behaviour::new().new_control();
-
-                let runtime = ww::launcher::create_runtime_client(
+                let host: system_capnp::host::Client = capnp_rpc::new_client(HostImpl::new(
                     network_state,
                     swarm_tx,
                     false,
-                    Some(guard),
-                    Some(epoch_rx),
-                    None,
+                    Some(guard.clone()),
                     Some(stream_control),
+                ));
+                let routing: routing_capnp::routing::Client =
+                    capnp_rpc::new_client(LocalRouting::new());
+                let runtime = ww::launcher::create_runtime_client(
+                    false,
+                    Some(guard),
                     None,
                     None,
                     CachePolicy::Shared,
-                    ww::ipfs::HttpClient::new("http://localhost:5001".into()),
-                    Vec::new(),
                 );
 
                 eprintln!("  [worker] loading WASM ({} bytes)", wasm.len());
@@ -75,8 +76,22 @@ async fn spawn_shell_on_pool(pool: &ExecutorPool) -> Result<shell_capnp::shell::
                 let executor = load_resp.get().unwrap().get_executor().unwrap();
                 eprintln!("  [worker] executor obtained, spawning cell");
 
-                // Spawn the cell via executor.spawn()
-                let spawn_resp = executor.spawn_request().send().promise.await.unwrap();
+                // Shell initialization requires host and routing. T3 makes
+                // those grants explicit instead of inheriting a full ambient
+                // host graft from the launcher.
+                let mut spawn = executor.spawn_request();
+                {
+                    let mut grants = spawn.get().init_caps(2);
+                    let mut host_grant = grants.reborrow().get(0);
+                    host_grant.set_name("host");
+                    host_grant.init_cap().set_as_capability(host.client.hook);
+                    let mut routing_grant = grants.get(1);
+                    routing_grant.set_name("routing");
+                    routing_grant
+                        .init_cap()
+                        .set_as_capability(routing.client.hook);
+                }
+                let spawn_resp = spawn.send().promise.await.unwrap();
                 let process = spawn_resp.get().unwrap().get_process().unwrap();
                 eprintln!("  [worker] process spawned, waiting for bootstrap");
 

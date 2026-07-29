@@ -13,11 +13,11 @@
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use ww::greeter_capnp;
-use ww::rpc::{CachePolicy, NetworkState};
+use ww::rpc::CachePolicy;
 use ww::services::{ExecutorPool, SpawnRequest};
 
 const DISCOVERY_WASM_PATH: &str = "examples/discovery/bin/discovery.wasm";
@@ -42,8 +42,6 @@ async fn spawn_greeter_on_pool(
         factory: Box::new(move |_shutdown| {
             Box::pin(async move {
                 // Create runtime on the worker thread (capnp clients are !Send).
-                let network_state = NetworkState::new();
-                let (swarm_tx, _swarm_rx) = mpsc::channel(16);
                 let epoch = authority::Epoch {
                     seq: 1,
                     head: vec![],
@@ -54,21 +52,12 @@ async fn spawn_greeter_on_pool(
                     issued_seq: 1,
                     receiver: epoch_rx.clone(),
                 };
-                let stream_control = libp2p_stream::Behaviour::new().new_control();
-
                 let runtime = ww::launcher::create_runtime_client(
-                    network_state,
-                    swarm_tx,
                     false,
                     Some(guard),
-                    Some(epoch_rx),
-                    None, // no signing key
-                    Some(stream_control),
                     None,
                     None,
                     CachePolicy::Shared,
-                    ww::ipfs::HttpClient::new("http://localhost:5001".into()),
-                    Vec::new(), // no outbound HTTP access
                 );
 
                 // Load WASM via runtime to get an Executor.

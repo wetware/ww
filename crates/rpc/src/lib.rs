@@ -29,6 +29,8 @@ pub mod wagi;
 pub use initial_authority::InitialAuthorityRecord;
 pub use named_capability::{decode_exports, encode_exports, NamedCapabilities, NamedCapability};
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use capnp::capability::Promise;
@@ -365,8 +367,19 @@ pub struct ProcessImpl {
     stdout: system_capnp::byte_stream::Client,
     stderr: system_capnp::byte_stream::Client,
     exit_rx: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<i32>>>>,
-    bootstrap_cap: Option<capnp::capability::Client>,
+    bootstrap_cap: Rc<RefCell<Option<capnp::capability::Client>>>,
     kill_tx: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+#[derive(Clone)]
+pub struct ProcessBootstrapControl {
+    bootstrap_cap: Rc<RefCell<Option<capnp::capability::Client>>>,
+}
+
+impl ProcessBootstrapControl {
+    pub fn clear(&self) {
+        self.bootstrap_cap.borrow_mut().take();
+    }
 }
 
 impl ProcessImpl {
@@ -382,7 +395,7 @@ impl ProcessImpl {
             stdout,
             stderr,
             exit_rx: Arc::new(Mutex::new(Some(exit_rx))),
-            bootstrap_cap: None,
+            bootstrap_cap: Rc::new(RefCell::new(None)),
             kill_tx: Arc::new(kill_tx),
         }
     }
@@ -395,14 +408,32 @@ impl ProcessImpl {
         bootstrap_cap: capnp::capability::Client,
         kill_tx: tokio::sync::watch::Sender<bool>,
     ) -> Self {
-        Self {
-            stdin,
-            stdout,
-            stderr,
-            exit_rx: Arc::new(Mutex::new(Some(exit_rx))),
-            bootstrap_cap: Some(bootstrap_cap),
-            kill_tx: Arc::new(kill_tx),
-        }
+        Self::with_controlled_bootstrap(stdin, stdout, stderr, exit_rx, bootstrap_cap, kill_tx).0
+    }
+
+    pub fn with_controlled_bootstrap(
+        stdin: system_capnp::byte_stream::Client,
+        stdout: system_capnp::byte_stream::Client,
+        stderr: system_capnp::byte_stream::Client,
+        exit_rx: tokio::sync::oneshot::Receiver<i32>,
+        bootstrap_cap: capnp::capability::Client,
+        kill_tx: tokio::sync::watch::Sender<bool>,
+    ) -> (Self, ProcessBootstrapControl) {
+        let bootstrap_cap = Rc::new(RefCell::new(Some(bootstrap_cap)));
+        let control = ProcessBootstrapControl {
+            bootstrap_cap: bootstrap_cap.clone(),
+        };
+        (
+            Self {
+                stdin,
+                stdout,
+                stderr,
+                exit_rx: Arc::new(Mutex::new(Some(exit_rx))),
+                bootstrap_cap,
+                kill_tx: Arc::new(kill_tx),
+            },
+            control,
+        )
     }
 }
 
@@ -456,8 +487,9 @@ impl system_capnp::process::Server for ProcessImpl {
         _params: system_capnp::process::BootstrapParams,
         mut results: system_capnp::process::BootstrapResults,
     ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
-        let cap = self.bootstrap_cap.clone();
+        let bootstrap_cap = self.bootstrap_cap.clone();
         Promise::from_future(async move {
+            let cap = bootstrap_cap.borrow().clone();
             let cap = cap.ok_or_else(|| {
                 capnp::Error::failed(
                     "process did not export a bootstrap capability via system::serve()".into(),
@@ -1069,6 +1101,38 @@ mod tests {
                         .get_as_capability::<capnp::capability::Client>()
                         .unwrap();
                 }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_process_bootstrap_control_releases_cap_on_child_exit() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (host, _server, _rx) = setup_rpc();
+                let (stdin, stdout, stderr, exit_rx, kill_tx) = dummy_process_parts();
+                let (process_impl, control) = ProcessImpl::with_controlled_bootstrap(
+                    stdin,
+                    stdout,
+                    stderr,
+                    exit_rx,
+                    host.client,
+                    kill_tx,
+                );
+                let process = setup_process_rpc(process_impl);
+
+                process
+                    .bootstrap_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("bootstrap exists before child exit");
+                control.clear();
+                assert!(
+                    process.bootstrap_request().send().promise.await.is_err(),
+                    "child exit must clear the stored guest bootstrap client"
+                );
             })
             .await;
     }
