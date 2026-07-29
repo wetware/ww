@@ -176,6 +176,14 @@ type BoxAsyncWrite = Box<dyn AsyncWrite + Send + Sync + Unpin + 'static>;
 pub struct ComponentRunStates {
     pub wasi_ctx: WasiCtx,
     pub resource_table: ResourceTable,
+    /// Private empty root used by byte-loaded Executor children.
+    ///
+    /// A CidTree-backed cell uses the tree staging directory instead. Keeping
+    /// this TempDir in the store makes the preopen valid for the process
+    /// lifetime without exposing any host filesystem path.
+    pub image_root: Option<tempfile::TempDir>,
+    /// Process-private writable scratch preopened at `/tmp`.
+    pub scratch: tempfile::TempDir,
     pub loader: Option<Box<dyn Loader>>,
     // Guest-side bidirectional stream used to build WASI io/streams resources.
     pub data_stream: Option<tokio::io::DuplexStream>,
@@ -188,6 +196,11 @@ pub struct ComponentRunStates {
     /// When `Some`, the guest filesystem is backed by a CidTree
     /// instead of a preopened host directory.
     pub cid_tree: Option<std::sync::Arc<crate::vfs::CidTree>>,
+    /// Descriptor identities rooted at the private writable `/tmp` preopen.
+    ///
+    /// The CidTree interceptor uses this execution-context state to delegate
+    /// scratch operations to WASI without making the image root writable.
+    pub(crate) writable_fs_descriptors: std::collections::HashSet<u32>,
     /// EWMA fuel estimator, refuels at host call boundaries.
     pub fuel_estimator: FuelEstimator,
 }
@@ -222,6 +235,45 @@ struct ProcInit {
     cache_mode: Option<cache::CacheMode>,
     cid_tree: Option<std::sync::Arc<crate::vfs::CidTree>>,
     fuel_estimator: Option<FuelEstimator>,
+}
+
+struct ProcessFilesystem {
+    image_root: Option<tempfile::TempDir>,
+    scratch: tempfile::TempDir,
+}
+
+fn configure_process_filesystem(
+    wasi_builder: &mut WasiCtxBuilder,
+    cid_tree: Option<&Arc<crate::vfs::CidTree>>,
+) -> Result<ProcessFilesystem> {
+    let image_root = if let Some(tree) = cid_tree {
+        wasi_builder
+            .preopened_dir(tree.staging_dir(), "/", DirPerms::READ, FilePerms::READ)
+            .map_err(|e| anyhow!("failed to preopen CidTree staging dir at /: {e}"))?;
+        tracing::debug!(
+            staging = %tree.staging_dir().display(),
+            "Mounted CidTree staging at / (fs_intercept routes via virtual FS)"
+        );
+        None
+    } else {
+        let root = tempfile::TempDir::new()
+            .map_err(|e| anyhow!("failed to create private process image root: {e}"))?;
+        wasi_builder
+            .preopened_dir(root.path(), "/", DirPerms::READ, FilePerms::READ)
+            .map_err(|e| anyhow!("failed to preopen private image root at /: {e}"))?;
+        Some(root)
+    };
+
+    let scratch = tempfile::TempDir::new()
+        .map_err(|e| anyhow!("failed to create private process scratch: {e}"))?;
+    wasi_builder
+        .preopened_dir(scratch.path(), "/tmp", DirPerms::all(), FilePerms::all())
+        .map_err(|e| anyhow!("failed to preopen private process scratch at /tmp: {e}"))?;
+
+    Ok(ProcessFilesystem {
+        image_root,
+        scratch,
+    })
 }
 
 /// Builder for constructing a Proc configuration
@@ -534,15 +586,7 @@ impl Proc {
         // `CidTree::resolve_path`. The preopen's actual on-disk contents
         // are dir-listing stubs populated lazily by `fs_intercept`, not
         // the guest's view. See doc/capabilities.md.
-        if let Some(ref tree) = cid_tree {
-            wasi_builder
-                .preopened_dir(tree.staging_dir(), "/", DirPerms::READ, FilePerms::READ)
-                .map_err(|e| anyhow!("failed to preopen CidTree staging dir at /: {e}"))?;
-            tracing::debug!(
-                staging = %tree.staging_dir().display(),
-                "Mounted CidTree staging at / (fs_intercept routes via virtual FS)"
-            );
-        }
+        let filesystem = configure_process_filesystem(&mut wasi_builder, cid_tree.as_ref())?;
 
         let wasi = wasi_builder.build();
 
@@ -557,10 +601,13 @@ impl Proc {
         let state = ComponentRunStates {
             wasi_ctx: wasi,
             resource_table: ResourceTable::new(),
+            image_root: filesystem.image_root,
+            scratch: filesystem.scratch,
             loader,
             data_stream,
             cache_mode,
             cid_tree,
+            writable_fs_descriptors: std::collections::HashSet::new(),
             fuel_estimator: fuel_estimator.unwrap_or_else(|| FuelEstimator::new(INITIAL_FUEL)),
         };
 
@@ -878,6 +925,58 @@ mod tests {
         assert!(builder.wasm_debug);
         assert_eq!(builder.env.len(), 1);
         assert_eq!(builder.args.len(), 1);
+    }
+
+    #[test]
+    fn byte_loaded_filesystem_uses_private_empty_root_and_cleans_scratch() {
+        let mut wasi = WasiCtxBuilder::new();
+        let filesystem =
+            configure_process_filesystem(&mut wasi, None).expect("configure byte-loaded roots");
+        let root = filesystem
+            .image_root
+            .as_ref()
+            .expect("byte-loaded process owns an empty image root");
+        assert!(
+            std::fs::read_dir(root.path())
+                .expect("read private root")
+                .next()
+                .is_none(),
+            "byte-loaded image root must contain no host or FHS files"
+        );
+        let root_path = root.path().to_path_buf();
+        let scratch_path = filesystem.scratch.path().to_path_buf();
+        assert_ne!(root_path, scratch_path);
+        std::fs::write(scratch_path.join("marker"), b"private").expect("write scratch marker");
+
+        drop(filesystem);
+        assert!(!root_path.exists(), "private empty root must be cleaned up");
+        assert!(
+            !scratch_path.exists(),
+            "private /tmp must be cleaned up on process-state drop"
+        );
+    }
+
+    #[test]
+    fn image_backed_filesystem_retains_cid_tree_root_and_private_scratch() {
+        let staging = tempfile::tempdir().expect("image staging");
+        let root_cid = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
+        let tree = Arc::new(crate::vfs::CidTree::new(
+            root_cid.to_string(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
+            std::collections::HashMap::new(),
+            staging.path().to_path_buf(),
+        ));
+        let mut wasi = WasiCtxBuilder::new();
+        let filesystem = configure_process_filesystem(&mut wasi, Some(&tree))
+            .expect("configure image-backed roots");
+
+        assert!(
+            filesystem.image_root.is_none(),
+            "image-backed cells must not be replaced by the byte-loaded empty root"
+        );
+        assert_eq!(tree.root_cid().as_str(), root_cid);
+        assert_eq!(tree.staging_dir(), staging.path());
+        assert_ne!(filesystem.scratch.path(), tree.staging_dir());
     }
 
     #[tokio::test]

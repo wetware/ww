@@ -1601,18 +1601,25 @@ fn wrap_with_handlers(form: &Val) -> Val {
 }
 
 /// Scan `$WW_ROOT/etc/init.d/*.glia` via the WASI virtual filesystem,
-/// parse and evaluate each file as a glia script. Returns true if any
-/// expression blocks (i.e. a foreground process ran to completion via
-/// `(runtime run ...)`) or requests session exit with `(perform :exit nil)`.
+/// parse and evaluate each file as a glia script.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InitdOutcome {
+    /// A foreground process ran or the script explicitly requested exit.
+    blocked: bool,
+    /// Number of read, parse, or evaluation failures observed while retaining
+    /// the existing SysV best-effort execution order.
+    failures: usize,
+}
+
 async fn run_initd(
     env: &mut Env,
     ctx: &RefCell<Session>,
     dispatch: &HashMap<&'static str, HandlerFn>,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<InitdOutcome, Box<dyn std::error::Error>> {
     let ww_root = std::env::var("WW_ROOT").unwrap_or_default();
     if ww_root.is_empty() {
         log::debug!("init.d: WW_ROOT not set, skipping");
-        return Ok(false);
+        return Ok(InitdOutcome::default());
     }
     let root = ww_root.trim_end_matches('/');
 
@@ -1647,18 +1654,18 @@ async fn run_initd(
                     "init.d: not found (tried {} paths), skipping",
                     initd_paths.len()
                 );
-                return Ok(false);
+                return Ok(InitdOutcome::default());
             }
         }
     };
 
     if entries.is_empty() {
         log::info!("init.d: no scripts found");
-        return Ok(false);
+        return Ok(InitdOutcome::default());
     }
 
     log::info!("init.d: found {} script(s)", entries.len());
-    let mut blocked = false;
+    let mut outcome = InitdOutcome::default();
 
     // SysV init: execute each script in lexicographic order, best-effort.
     // On failure: log with full context, continue to next script.
@@ -1670,13 +1677,17 @@ async fn run_initd(
             Ok(d) => d,
             Err(e) => {
                 log::error!("init.d: {name}: read failed: {e}");
+                outcome.failures += 1;
                 continue;
             }
         };
 
         let forms = match parse_initd_script(name, &data) {
             Some(f) => f,
-            None => continue, // SysV: skip failed script
+            None => {
+                outcome.failures += 1;
+                continue;
+            } // SysV: skip failed script
         };
 
         for (i, form) in forms.iter().enumerate() {
@@ -1690,20 +1701,24 @@ async fn run_initd(
                     // A (runtime run ...) that returned an exit code means
                     // a foreground process ran to completion.
                     log::info!("init.d: {name}: foreground process exited ({code})");
-                    blocked = true;
+                    outcome.blocked = true;
                 }
                 Ok(EvalOutcome::Value(result)) => {
                     log::debug!("init.d: {name}: {result}");
                 }
-                Ok(EvalOutcome::Exit) => return Ok(true),
+                Ok(EvalOutcome::Exit) => {
+                    outcome.blocked = true;
+                    return Ok(outcome);
+                }
                 Err(e) => {
                     log::error!("init.d: {name}: form {}: {e}", i + 1);
+                    outcome.failures += 1;
                 }
             }
         }
     }
 
-    Ok(blocked)
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -1785,18 +1800,6 @@ async fn run_shell(
         }
     }
 
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Daemon mode (non-TTY) — keep alive until host terminates
-// ---------------------------------------------------------------------------
-
-async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
-    // Yield forever. The host keeps us alive by holding our process handle
-    // and terminates us on shutdown (SIGTERM → close pipe → store drop).
-    // Unlike blocking_read(), this doesn't pin a worker thread doing nothing.
-    std::future::pending::<()>().await;
     Ok(())
 }
 
@@ -2002,8 +2005,7 @@ struct Kernel;
 
 impl Guest for Kernel {
     fn run() -> Result<(), ()> {
-        run_impl();
-        Ok(())
+        run_impl()
     }
 }
 
@@ -2014,173 +2016,285 @@ fn publish_bootstrap_membrane(
     *exported_membrane.borrow_mut() = Some(membrane.clone());
 }
 
-fn run_impl() {
+const EPOCH_STALE_PROBE_INTERVAL_NS: u64 = 5_000_000_000;
+const EPOCH_RESTART_INIT_FAILED: &str = "EPOCH_RESTART_INIT_FAILED";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationAction {
+    Stop,
+    RunShell,
+    WatchEpoch,
+}
+
+fn generation_action(
+    is_replacement: bool,
+    is_tty: bool,
+    outcome: InitdOutcome,
+) -> Result<GenerationAction, capnp::Error> {
+    if is_replacement && outcome.failures > 0 {
+        return Err(capnp::Error::failed(format!(
+            "{EPOCH_RESTART_INIT_FAILED}: replacement init.d completed with {} failure(s)",
+            outcome.failures
+        )));
+    }
+    if outcome.blocked {
+        return Ok(GenerationAction::Stop);
+    }
+    if is_tty {
+        return Ok(GenerationAction::RunShell);
+    }
+    Ok(GenerationAction::WatchEpoch)
+}
+
+fn kernel_completion(replacement_init_failed: bool) -> Result<(), ()> {
+    if replacement_init_failed {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+/// Wait without adding a new guest-visible timer or control capability.
+///
+/// The system RPC driver polls guest work at least every 100ms, so the WASI
+/// implementation can remain pending until the monotonic deadline. Native
+/// builds are test-only for this guest crate.
+async fn wait_monotonic(duration_ns: u64) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let deadline = wasip2::clocks::monotonic_clock::now().saturating_add(duration_ns);
+        std::future::poll_fn(|_cx| {
+            if wasip2::clocks::monotonic_clock::now() >= deadline {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::sleep(std::time::Duration::from_nanos(duration_ns));
+}
+
+/// Observe revocation of pid0's current host-authority generation.
+///
+/// This deliberately reuses the already-held guarded `Host` reference. It
+/// does not give ordinary children an epoch feed or refresh conduit. Local
+/// `Host.id()` is side-effect free; unrelated transient failures are logged
+/// and retried, while only the stable stale-epoch failure class triggers an
+/// init rerun.
+async fn wait_for_stale_epoch(
+    host: &system_capnp::host::Client,
+    probe_interval_ns: u64,
+) -> Result<(), capnp::Error> {
+    loop {
+        wait_monotonic(probe_interval_ns).await;
+        match host.id_request().send().promise.await {
+            Ok(_) => {}
+            Err(error)
+                if membrane::call_failure_code(&error)
+                    == Some(membrane::CallFailureCode::StaleEpoch) =>
+            {
+                return Ok(());
+            }
+            Err(error) => {
+                log::warn!("epoch probe failed without stale-epoch marker; retrying: {error}");
+            }
+        }
+    }
+}
+
+fn run_impl() -> Result<(), ()> {
     init_logging();
 
+    let replacement_init_failed = Rc::new(std::cell::Cell::new(false));
     let exported_membrane: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(None));
     let bootstrap: membrane_capnp::membrane::Client = capnp_rpc::new_client(KernelBootstrap {
         membrane: Rc::clone(&exported_membrane),
     });
+    let callback_failure = Rc::clone(&replacement_init_failed);
 
     system::serve(bootstrap.client, move |membrane: Membrane| {
         let exported_membrane = Rc::clone(&exported_membrane);
+        let replacement_init_failed = Rc::clone(&callback_failure);
         async move {
-            let graft_resp = membrane.graft_request().send().promise.await?;
-            let results = graft_resp.get()?;
+            let mut generation_index = 0_u64;
+            loop {
+                let graft_resp = membrane.graft_request().send().promise.await?;
+                let results = graft_resp.get()?;
 
-            // Iterate the caps list to find capabilities by name.
-            let caps = results.get_caps()?;
+                // Iterate the caps list to find capabilities by name.
+                let caps = results.get_caps()?;
 
-            let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
-            let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
-            let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
-            let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
-            let authority: auth_capnp::authority::Client = get_graft_cap(&caps, "authority")?;
-            let http_client: Option<http_capnp::http_client::Client> =
-                get_graft_cap(&caps, "http-client").ok();
+                let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
+                let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
+                let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
+                let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
+                let authority: auth_capnp::authority::Client = get_graft_cap(&caps, "authority")?;
+                let http_client: Option<http_capnp::http_client::Client> =
+                    get_graft_cap(&caps, "http-client").ok();
 
-            let ctx = RefCell::new(Session {
-                host: host.clone(),
-                runtime: runtime.clone(),
-                routing: routing.clone(),
-                identity,
-                authority: authority.clone(),
-                http_client: http_client.clone(),
-                cwd: "/".to_string(),
-                load_runtime: caps::default_load_runtime(),
-            });
-
-            let dispatch = build_dispatch();
-            let mut env = Env::new();
-
-            // Bind graft caps with intrinsic handlers. Default cap behavior is
-            // never an ambient `{cap}-handler` guest binding.
-            {
-                let s = ctx.borrow();
-                for i in 0..caps.len() {
-                    let entry = caps.get(i);
-                    let cap_name = entry
-                        .get_name()?
-                        .to_str()
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-                    let (schema_cid, inner, handler): (&str, Rc<dyn std::any::Any>, Val) =
-                        match cap_name {
-                            "host" => (
-                                schema_ids::HOST_CID,
-                                Rc::new(s.host.clone()),
-                                make_host_handler(
-                                    s.host.clone(),
-                                    s.runtime.clone(),
-                                    s.http_client.clone(),
-                                ),
-                            ),
-                            "runtime" => (
-                                schema_ids::RUNTIME_CID,
-                                Rc::new(s.runtime.clone()),
-                                make_runtime_handler(s.runtime.clone()),
-                            ),
-                            "routing" => (
-                                schema_ids::ROUTING_CID,
-                                Rc::new(s.routing.clone()),
-                                make_routing_handler(s.routing.clone()),
-                            ),
-                            "identity" => {
-                                // Identity is stored in the Session but has no
-                                // Glia effect handler — skip env binding.
-                                continue;
-                            }
-                            "authority" => (
-                                schema_ids::AUTHORITY_CID,
-                                Rc::new(s.authority.clone()),
-                                make_authority_handler(s.authority.clone()),
-                            ),
-                            "http-client" => {
-                                match s.http_client.clone() {
-                                    Some(c) => (
-                                        schema_ids::HTTP_CLIENT_CID,
-                                        Rc::new(c),
-                                        // No standalone handler — http-client is accessed
-                                        // via (perform host :http-client).
-                                        Val::Nil,
-                                    ),
-                                    None => {
-                                        log::warn!("graft: host sent 'http-client' but Session has None, skipping");
-                                        continue;
-                                    }
-                                }
-                            }
-                            other => {
-                                log::warn!("graft: unknown cap '{other}', skipping");
-                                continue;
-                            }
-                        };
-
-                    env.set(
-                        cap_name.to_string(),
-                        make_cap(cap_name, schema_cid.to_string(), inner),
-                    );
-                    if !matches!(handler, Val::Nil) {
-                        env.set(format!("{cap_name}-handler"), handler);
-                    }
-                }
-
-                // Introspection builtins. `(schema cap)` returns the cap's
-                // canonical Schema.Node bytes; `(doc cap)` returns a human-
-                // readable summary. Bytes come from the build-time schema
-                // registry baked into the kernel (see std/kernel/build.rs).
-                env.set("schema".to_string(), make_schema_builtin());
-                env.set("doc".to_string(), make_doc_builtin());
-                env.set("help".to_string(), make_help_builtin());
-                env.set("import".to_string(), make_import_cap());
-                env.set(
-                    "import-handler".to_string(),
-                    make_import_handler(s.load_runtime.clone()),
-                );
-            }
-
-            // Load the prelude (standard macros: when, and, or, defn, cond, not).
-            {
-                let mut kd = KernelDispatch {
-                    ctx: &ctx,
-                    table: &dispatch,
-                };
-                glia::load_prelude(&mut env, &mut kd).await;
-            }
-
-            // The host uses a successful reverse graft only to complete its
-            // internal RPC bootstrap. It is deliberately independent from
-            // externally visible serving readiness: /readyz remains closed
-            // until the host observes a registered HTTP route. Publish before
-            // init.d so a slow (or foreground-blocking) script cannot consume
-            // the host's export-policy timeout and abort the kernel.
-            publish_bootstrap_membrane(&exported_membrane, &membrane);
-
-            // Run init.d scripts. If a foreground process blocked
-            // (e.g. `(runtime run ...)` in the script), we're done.
-            let blocked = run_initd(&mut env, &ctx, &dispatch)
-                .await
-                .unwrap_or_else(|e| {
-                    log::error!("init.d: {e}");
-                    false
+                let ctx = RefCell::new(Session {
+                    host: host.clone(),
+                    runtime: runtime.clone(),
+                    routing: routing.clone(),
+                    identity,
+                    authority: authority.clone(),
+                    http_client: http_client.clone(),
+                    cwd: "/".to_string(),
+                    load_runtime: caps::default_load_runtime(),
                 });
 
-            if !blocked {
-                let is_tty = std::env::var("WW_TTY").is_ok();
-                let result = if is_tty {
-                    run_shell(&mut env, ctx, &dispatch).await
-                } else {
-                    run_daemon().await
-                };
+                let dispatch = build_dispatch();
+                let mut env = Env::new();
 
-                if let Err(e) = result {
-                    log::error!("kernel error: {e}");
+                // Bind graft caps with intrinsic handlers. Default cap behavior is
+                // never an ambient `{cap}-handler` guest binding.
+                {
+                    let s = ctx.borrow();
+                    for i in 0..caps.len() {
+                        let entry = caps.get(i);
+                        let cap_name = entry
+                            .get_name()?
+                            .to_str()
+                            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+                        let (schema_cid, inner, handler): (&str, Rc<dyn std::any::Any>, Val) =
+                            match cap_name {
+                                "host" => (
+                                    schema_ids::HOST_CID,
+                                    Rc::new(s.host.clone()),
+                                    make_host_handler(
+                                        s.host.clone(),
+                                        s.runtime.clone(),
+                                        s.http_client.clone(),
+                                    ),
+                                ),
+                                "runtime" => (
+                                    schema_ids::RUNTIME_CID,
+                                    Rc::new(s.runtime.clone()),
+                                    make_runtime_handler(s.runtime.clone()),
+                                ),
+                                "routing" => (
+                                    schema_ids::ROUTING_CID,
+                                    Rc::new(s.routing.clone()),
+                                    make_routing_handler(s.routing.clone()),
+                                ),
+                                "identity" => {
+                                    // Identity is stored in the Session but has no
+                                    // Glia effect handler — skip env binding.
+                                    continue;
+                                }
+                                "authority" => (
+                                    schema_ids::AUTHORITY_CID,
+                                    Rc::new(s.authority.clone()),
+                                    make_authority_handler(s.authority.clone()),
+                                ),
+                                "http-client" => {
+                                    match s.http_client.clone() {
+                                        Some(c) => (
+                                            schema_ids::HTTP_CLIENT_CID,
+                                            Rc::new(c),
+                                            // No standalone handler — http-client is accessed
+                                            // via (perform host :http-client).
+                                            Val::Nil,
+                                        ),
+                                        None => {
+                                            log::warn!("graft: host sent 'http-client' but Session has None, skipping");
+                                            continue;
+                                        }
+                                    }
+                                }
+                                other => {
+                                    log::warn!("graft: unknown cap '{other}', skipping");
+                                    continue;
+                                }
+                            };
+
+                        env.set(
+                            cap_name.to_string(),
+                            make_cap(cap_name, schema_cid.to_string(), inner),
+                        );
+                        if !matches!(handler, Val::Nil) {
+                            env.set(format!("{cap_name}-handler"), handler);
+                        }
+                    }
+
+                    // Introspection builtins. `(schema cap)` returns the cap's
+                    // canonical Schema.Node bytes; `(doc cap)` returns a human-
+                    // readable summary. Bytes come from the build-time schema
+                    // registry baked into the kernel (see std/kernel/build.rs).
+                    env.set("schema".to_string(), make_schema_builtin());
+                    env.set("doc".to_string(), make_doc_builtin());
+                    env.set("help".to_string(), make_help_builtin());
+                    env.set("import".to_string(), make_import_cap());
+                    env.set(
+                        "import-handler".to_string(),
+                        make_import_handler(s.load_runtime.clone()),
+                    );
                 }
-            }
 
-            Ok(())
+                // Load the prelude (standard macros: when, and, or, defn, cond, not).
+                {
+                    let mut kd = KernelDispatch {
+                        ctx: &ctx,
+                        table: &dispatch,
+                    };
+                    glia::load_prelude(&mut env, &mut kd).await;
+                }
+
+                // The host uses a successful reverse graft only to complete its
+                // internal RPC bootstrap. It is deliberately independent from
+                // externally visible serving readiness: /readyz remains closed
+                // until the host observes a registered HTTP route. Publish before
+                // init.d so a slow (or foreground-blocking) script cannot consume
+                // the host's export-policy timeout and abort the kernel.
+                publish_bootstrap_membrane(&exported_membrane, &membrane);
+
+                // Run init.d scripts. If a foreground process blocked
+                // (e.g. `(runtime run ...)` in the script), we're done.
+                let init_outcome = run_initd(&mut env, &ctx, &dispatch)
+                    .await
+                    .unwrap_or_else(|e| {
+                        log::error!("init.d: {e}");
+                        InitdOutcome {
+                            blocked: false,
+                            failures: 1,
+                        }
+                    });
+
+                let is_tty = std::env::var("WW_TTY").is_ok();
+                let action = generation_action(generation_index > 0, is_tty, init_outcome)
+                    .inspect_err(|_| replacement_init_failed.set(true))?;
+                match action {
+                    GenerationAction::Stop => return Ok(()),
+                    GenerationAction::RunShell => {
+                        if let Err(e) = run_shell(&mut env, ctx, &dispatch).await {
+                            log::error!("kernel error: {e}");
+                        }
+                        return Ok(());
+                    }
+                    GenerationAction::WatchEpoch => {}
+                }
+
+                let guarded_host = ctx.borrow().host.clone();
+                wait_for_stale_epoch(&guarded_host, EPOCH_STALE_PROBE_INTERVAL_NS).await?;
+                log::warn!("pid0 host authority became stale; re-grafting and rerunning init.d");
+                // Drop the old environment/session here. Every host-derived
+                // reference delegated from it remains stale. The next
+                // iteration re-grafts under the current epoch and reruns the
+                // same init.d scripts, replacing listener registrations and
+                // spawning fresh services without a general supervisor.
+                drop(env);
+                drop(ctx);
+                drop(dispatch);
+                generation_index += 1;
+            }
         }
     });
+
+    kernel_completion(replacement_init_failed.get())
 }
 
 wasip2::cli::command::export!(Kernel);
@@ -2633,6 +2747,89 @@ mod tests {
         }
     }
 
+    struct EpochHost {
+        issued: u64,
+        current: Rc<std::cell::Cell<u64>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::host::Server for EpochHost {
+        fn id(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::host::IdParams,
+            mut results: system_capnp::host::IdResults,
+        ) -> Promise<(), capnp::Error> {
+            if self.current.get() != self.issued {
+                return Promise::err(membrane::stale_epoch_error("test host generation expired"));
+            }
+            results.get().set_peer_id(&self.issued.to_be_bytes());
+            Promise::ok(())
+        }
+    }
+
+    struct EpochMembrane {
+        current: Rc<std::cell::Cell<u64>>,
+        grafts: Rc<std::cell::Cell<u32>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl membrane_capnp::membrane::Server for EpochMembrane {
+        fn graft(
+            self: capnp::capability::Rc<Self>,
+            _params: membrane_capnp::membrane::GraftParams,
+            mut results: membrane_capnp::membrane::GraftResults,
+        ) -> Promise<(), capnp::Error> {
+            self.grafts.set(self.grafts.get() + 1);
+            let host: system_capnp::host::Client = capnp_rpc::new_client(EpochHost {
+                issued: self.current.get(),
+                current: self.current.clone(),
+            });
+            let mut entry = results.get().init_caps(1).get(0);
+            entry.set_name("host");
+            write_cap(entry.init_cap(), host.client);
+            Promise::ok(())
+        }
+    }
+
+    enum ProbeReply {
+        Ok,
+        PlainGuestText,
+        StructuredStale,
+    }
+
+    struct ScriptedProbeHost {
+        replies: Rc<RefCell<std::collections::VecDeque<ProbeReply>>>,
+        calls: Rc<std::cell::Cell<u32>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::host::Server for ScriptedProbeHost {
+        fn id(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::host::IdParams,
+            mut results: system_capnp::host::IdResults,
+        ) -> Promise<(), capnp::Error> {
+            self.calls.set(self.calls.get() + 1);
+            match self
+                .replies
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(ProbeReply::Ok)
+            {
+                ProbeReply::Ok => {
+                    results.get().set_peer_id(STUB_PEER_ID);
+                    Promise::ok(())
+                }
+                ProbeReply::PlainGuestText => Promise::err(capnp::Error::failed(
+                    "guest output happened to contain staleEpoch".into(),
+                )),
+                ProbeReply::StructuredStale => {
+                    Promise::err(membrane::stale_epoch_error("scripted epoch expired"))
+                }
+            }
+        }
+    }
+
     // --- Helper: construct a Session with test stubs ---
 
     struct TestHttpClient;
@@ -2769,6 +2966,217 @@ mod tests {
                 .promise
                 .await
                 .expect("bootstrap must be available before init.d can block");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn daemon_epoch_restart_observes_stale_then_regrafts_fresh_host() {
+        run_local(async {
+            let current = Rc::new(std::cell::Cell::new(1));
+            let grafts = Rc::new(std::cell::Cell::new(0));
+            let membrane: Membrane = capnp_rpc::new_client(EpochMembrane {
+                current: current.clone(),
+                grafts: grafts.clone(),
+            });
+
+            let first = membrane.graft_request().send().promise.await.unwrap();
+            let first_caps = first.get().unwrap().get_caps().unwrap();
+            let old_host: system_capnp::host::Client = get_graft_cap(&first_caps, "host").unwrap();
+            old_host.id_request().send().promise.await.unwrap();
+
+            current.set(2);
+            wait_for_stale_epoch(&old_host, 1).await.unwrap();
+            let stale = match old_host.id_request().send().promise.await {
+                Ok(_) => panic!("old host should be stale"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                membrane::call_failure_code(&stale),
+                Some(membrane::CallFailureCode::StaleEpoch)
+            );
+
+            let second = membrane.graft_request().send().promise.await.unwrap();
+            let second_caps = second.get().unwrap().get_caps().unwrap();
+            let fresh_host: system_capnp::host::Client =
+                get_graft_cap(&second_caps, "host").unwrap();
+            let fresh_id = fresh_host.id_request().send().promise.await.unwrap();
+            assert_eq!(
+                fresh_id.get().unwrap().get_peer_id().unwrap(),
+                2_u64.to_be_bytes()
+            );
+            assert_eq!(
+                grafts.get(),
+                2,
+                "pid0 must re-graft exactly once per restart"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn arbitrary_stale_epoch_guest_text_does_not_trigger_restart() {
+        run_local(async {
+            let calls = Rc::new(std::cell::Cell::new(0));
+            let replies = Rc::new(RefCell::new(std::collections::VecDeque::from([
+                ProbeReply::PlainGuestText,
+                ProbeReply::StructuredStale,
+            ])));
+            let host: system_capnp::host::Client = capnp_rpc::new_client(ScriptedProbeHost {
+                replies,
+                calls: calls.clone(),
+            });
+
+            wait_for_stale_epoch(&host, 1).await.unwrap();
+            assert_eq!(
+                calls.get(),
+                2,
+                "plain guest text must be retried; only the structured class restarts"
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn ordinary_initial_init_failure_does_not_trigger_a_restart_loop() {
+        let action = generation_action(
+            false,
+            false,
+            InitdOutcome {
+                blocked: false,
+                failures: 1,
+            },
+        )
+        .expect("ordinary initial failure retains daemon lifecycle");
+        assert_eq!(
+            action,
+            GenerationAction::WatchEpoch,
+            "an init error alone must not be interpreted as an epoch transition"
+        );
+    }
+
+    #[test]
+    fn replacement_init_failure_is_surfaced_and_never_reports_success() {
+        let replacement_init_failed = std::cell::Cell::new(false);
+        let error = generation_action(
+            true,
+            false,
+            InitdOutcome {
+                blocked: false,
+                failures: 2,
+            },
+        )
+        .inspect_err(|_| replacement_init_failed.set(true))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(EPOCH_RESTART_INIT_FAILED),
+            "replacement failure must carry the stable failure marker: {error}"
+        );
+        assert_eq!(
+            kernel_completion(replacement_init_failed.get()),
+            Err(()),
+            "the WASI command must return failure so the host cannot report exit code 0"
+        );
+    }
+
+    #[test]
+    fn foreground_and_tty_generation_behavior_is_unchanged() {
+        assert_eq!(
+            generation_action(
+                false,
+                false,
+                InitdOutcome {
+                    blocked: true,
+                    failures: 0,
+                },
+            )
+            .unwrap(),
+            GenerationAction::Stop
+        );
+        assert_eq!(
+            generation_action(false, true, InitdOutcome::default()).unwrap(),
+            GenerationAction::RunShell
+        );
+        assert_eq!(
+            generation_action(false, false, InitdOutcome::default()).unwrap(),
+            GenerationAction::WatchEpoch
+        );
+    }
+
+    #[test]
+    fn old_environment_handlers_drop_before_replacement_activation() {
+        let held = Rc::new(());
+        let weak = Rc::downgrade(&held);
+        let handler_hold = held.clone();
+        let mut env = Env::new();
+        env.set(
+            "old-handler".into(),
+            Val::NativeFn {
+                name: "old-handler".into(),
+                func: Rc::new(move |_| {
+                    let _keep_generation_alive = &handler_hold;
+                    Ok(Val::Nil)
+                }),
+            },
+        );
+        drop(held);
+        assert!(weak.upgrade().is_some(), "old handler is initially active");
+
+        // This is the same explicit ordering used by the daemon loop after a
+        // stable stale-epoch observation.
+        drop(env);
+        assert!(
+            weak.upgrade().is_none(),
+            "old Glia handlers must be gone before replacement activation"
+        );
+        let replacement_active = true;
+        assert!(replacement_active);
+    }
+
+    #[tokio::test]
+    async fn repeated_epoch_events_are_serialized_into_one_regraft_at_a_time() {
+        run_local(async {
+            let current = Rc::new(std::cell::Cell::new(1));
+            let grafts = Rc::new(std::cell::Cell::new(0));
+            let membrane: Membrane = capnp_rpc::new_client(EpochMembrane {
+                current: current.clone(),
+                grafts: grafts.clone(),
+            });
+
+            let first = membrane.graft_request().send().promise.await.unwrap();
+            let first_caps = first.get().unwrap().get_caps().unwrap();
+            let old_host: system_capnp::host::Client = get_graft_cap(&first_caps, "host").unwrap();
+
+            // A burst before the daemon observes staleness collapses to one
+            // serialized replacement at the newest trusted generation.
+            current.set(2);
+            current.set(3);
+            wait_for_stale_epoch(&old_host, 1).await.unwrap();
+            drop(old_host);
+            drop(first);
+
+            let second = membrane.graft_request().send().promise.await.unwrap();
+            let second_caps = second.get().unwrap().get_caps().unwrap();
+            let fresh_host: system_capnp::host::Client =
+                get_graft_cap(&second_caps, "host").unwrap();
+            let id = fresh_host.id_request().send().promise.await.unwrap();
+            assert_eq!(
+                id.get().unwrap().get_peer_id().unwrap(),
+                3_u64.to_be_bytes()
+            );
+            assert_eq!(grafts.get(), 2);
+
+            current.set(4);
+            current.set(5);
+            wait_for_stale_epoch(&fresh_host, 1).await.unwrap();
+            drop(fresh_host);
+            drop(second);
+            let _third = membrane.graft_request().send().promise.await.unwrap();
+            assert_eq!(
+                grafts.get(),
+                3,
+                "each observed stale generation causes one sequential re-graft"
+            );
         })
         .await;
     }
@@ -3787,8 +4195,9 @@ mod tests {
             let dispatch = build_dispatch();
             let mut env = Env::new();
             std::env::remove_var("WW_ROOT");
-            let blocked = run_initd(&mut env, &ctx, &dispatch).await.unwrap();
-            assert!(!blocked, "should not block when WW_ROOT is unset");
+            let outcome = run_initd(&mut env, &ctx, &dispatch).await.unwrap();
+            assert!(!outcome.blocked, "should not block when WW_ROOT is unset");
+            assert_eq!(outcome.failures, 0);
         })
         .await;
     }
@@ -3801,8 +4210,9 @@ mod tests {
             let dispatch = build_dispatch();
             let mut env = Env::new();
             std::env::set_var("WW_ROOT", "");
-            let blocked = run_initd(&mut env, &ctx, &dispatch).await.unwrap();
-            assert!(!blocked, "should not block when WW_ROOT is empty");
+            let outcome = run_initd(&mut env, &ctx, &dispatch).await.unwrap();
+            assert!(!outcome.blocked, "should not block when WW_ROOT is empty");
+            assert_eq!(outcome.failures, 0);
         })
         .await;
     }

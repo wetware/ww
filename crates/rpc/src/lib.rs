@@ -519,6 +519,10 @@ pub struct HostImpl {
     guard: Option<EpochGuard>,
     stream_control: Option<libp2p_stream::Control>,
     route_registry: Option<crate::dispatch::RouteRegistry>,
+    /// Host-internal view of the trusted pid0 execution-generation lifetime.
+    /// Its sender is owned outside every exported capability, so a route
+    /// cannot keep its issuing generation alive.
+    registration_scope: Option<tokio::sync::watch::Receiver<()>>,
 }
 
 impl HostImpl {
@@ -536,12 +540,23 @@ impl HostImpl {
             guard,
             stream_control,
             route_registry: None,
+            registration_scope: None,
         }
     }
 
     /// Set the HTTP route registry for WAGI service integration.
     pub fn with_route_registry(mut self, registry: crate::dispatch::RouteRegistry) -> Self {
         self.route_registry = Some(registry);
+        self
+    }
+
+    /// Attach host-internal execution-generation state. Child-visible
+    /// capabilities receive no sender or locator for it.
+    pub(crate) fn with_registration_scope(
+        mut self,
+        scope: tokio::sync::watch::Receiver<()>,
+    ) -> Self {
+        self.registration_scope = Some(scope);
         self
     }
 
@@ -647,7 +662,13 @@ impl system_capnp::host::Server for HostImpl {
             .clone()
             .unwrap_or_else(crate::dispatch::new_registry);
         let http_listener: system_capnp::http_listener::Client =
-            capnp_rpc::new_client(http_listener::HttpListenerImpl::new(guard, registry));
+            if let Some(scope) = self.registration_scope.clone() {
+                capnp_rpc::new_client(http_listener::HttpListenerImpl::new_scoped(
+                    guard, registry, scope,
+                ))
+            } else {
+                capnp_rpc::new_client(http_listener::HttpListenerImpl::new(guard, registry))
+            };
         results.get().set_stream_listener(stream_listener);
         results.get().set_stream_dialer(stream_dialer);
         results.get().set_vat_listener(vat_listener);

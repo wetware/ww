@@ -1549,6 +1549,11 @@ wasip2::cli::command::export!({iface_name}Guest);
         let peer_id = keypair.public().to_peer_id();
         let network_state = ww::rpc::NetworkState::from_peer_id(peer_id.to_bytes());
         let runtime_status = ww::metrics::RuntimeStatus::starting();
+        // Allocate the WAGI route map before the admin plane so `/readyz`
+        // observes the exact same registration lifecycle as HTTP dispatch.
+        let route_registry = http_listen
+            .as_ref()
+            .map(|_| ww::dispatcher::server::new_registry());
         let version_info = ww::metrics::VersionInfo {
             git_sha: env!("WW_BUILD_GIT_SHA").to_string(),
             // The OCI runtime digest is not intrinsically visible inside a
@@ -1587,6 +1592,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                     network_state: network_state.clone(),
                     version_info,
                     runtime_status: runtime_status.clone(),
+                    route_registry: route_registry.clone(),
                     fuel_registry: fuel_registry.clone(),
                     rpc_metrics: rpc_metrics.clone(),
                     cache_metrics: cache_metrics.clone(),
@@ -1891,7 +1897,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         )?;
 
         // WAGI HTTP server thread (only when --http-listen is provided).
-        let route_registry = if let Some(ref addr) = http_listen {
+        if let (Some(addr), Some(registry)) = (http_listen.as_ref(), route_registry.as_ref()) {
             let listen_addr: std::net::SocketAddr = addr
                 .parse()
                 .context("invalid --http-listen address (expected host:port)")?;
@@ -1900,7 +1906,6 @@ wasip2::cli::command::export!({iface_name}Guest);
             listener
                 .set_nonblocking(true)
                 .context("failed to configure --http-listen listener")?;
-            let registry = ww::dispatcher::server::new_registry();
             supervisor.try_spawn(
                 "wagi-http",
                 ww::services::WagiService {
@@ -1908,10 +1913,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                     registry: registry.clone(),
                 },
             )?;
-            Some(registry)
-        } else {
-            None
-        };
+        }
 
         let listen_summary = listen
             .iter()

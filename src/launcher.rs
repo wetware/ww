@@ -57,6 +57,13 @@ pub struct RuntimeImpl {
     engine: Arc<wasmtime::Engine>,
     /// Optional compilation service channel.
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
+    /// Optional host-managed cache for the accepted known-CID read substrate.
+    ///
+    /// This is process substrate, not a grant: it permits reads only when the
+    /// guest already knows a CID and exposes no enumeration, mutation, pin,
+    /// publishing, routing, or network-dial API. Reads can still consume node
+    /// network, disk, pin/cache budget, and eviction work.
+    pinset_cache: Option<Arc<cache::PinsetCache>>,
 }
 
 impl RuntimeImpl {
@@ -79,6 +86,7 @@ impl RuntimeImpl {
             engine: self.engine.clone(),
             wasm_debug: self.wasm_debug,
             guard: self.guard.clone(),
+            pinset_cache: self.pinset_cache.clone(),
         })
     }
 }
@@ -125,6 +133,22 @@ pub fn create_runtime_client(
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
 ) -> system_capnp::runtime::Client {
+    create_runtime_client_with_pinset(wasm_debug, guard, engine, compile_tx, cache_policy, None)
+}
+
+/// Create a Runtime whose Executors receive the fixed known-CID read
+/// substrate through a host-managed shared pinset cache.
+///
+/// Ordinary tests and embedded callers can continue using
+/// [`create_runtime_client`] for a cache-free substrate.
+pub fn create_runtime_client_with_pinset(
+    wasm_debug: bool,
+    guard: Option<EpochGuard>,
+    engine: Option<Arc<wasmtime::Engine>>,
+    compile_tx: Option<mpsc::Sender<CompileRequest>>,
+    cache_policy: CachePolicy,
+    pinset_cache: Option<Arc<cache::PinsetCache>>,
+) -> system_capnp::runtime::Client {
     let runtime = RuntimeImpl {
         wasm_debug,
         guard,
@@ -132,6 +156,7 @@ pub fn create_runtime_client(
         executor_cache: RefCell::new(HashMap::new()),
         engine: engine.unwrap_or_else(build_wasmtime_engine),
         compile_tx,
+        pinset_cache,
     };
     capnp_rpc::new_client(runtime)
 }
@@ -249,6 +274,7 @@ pub struct ExecutorImpl {
     engine: Arc<wasmtime::Engine>,
     wasm_debug: bool,
     guard: Option<EpochGuard>,
+    pinset_cache: Option<Arc<cache::PinsetCache>>,
 }
 
 /// Owns every resource whose lifetime is exactly one running child.
@@ -440,6 +466,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
         let component = self.component.clone();
         let engine = self.engine.clone();
         let wasm_debug = self.wasm_debug;
+        let pinset_cache = self.pinset_cache.clone();
 
         Promise::from_future(async move {
             let (host_stderr, guest_stderr) = io::duplex(64 * 1024);
@@ -463,6 +490,9 @@ impl system_capnp::executor::Server for ExecutorImpl {
             }
             if let Some(est) = fuel_estimator {
                 proc_builder = proc_builder.with_fuel_estimator(est);
+            }
+            if let Some(pinset_cache) = pinset_cache {
+                proc_builder = proc_builder.with_cache(cache::CacheMode::Shared(pinset_cache));
             }
             let (builder, mut handles) = proc_builder.with_data_streams();
 

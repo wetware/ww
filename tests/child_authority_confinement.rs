@@ -10,14 +10,15 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use capnp::capability::Promise;
+use capnp::capability::{FromClientHook, Promise};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
-use ww::launcher::create_runtime_client;
+use ww::launcher::{create_runtime_client, create_runtime_client_with_pinset};
 use ww::rpc::CachePolicy;
 use ww::system_capnp;
 
@@ -31,6 +32,7 @@ const SENSITIVE_CAPS: &[&str] = &[
     "ipfs",
     "http-client",
 ];
+const KNOWN_CID: &str = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
 
 fn assert_capnp_rpc_revision(lock: &str, label: &str) {
     let stanza = lock
@@ -249,23 +251,28 @@ async fn probe_report(
     env: &[(&str, &str)],
     grants: &[Grant],
 ) -> Value {
-    let process = spawn_probe(executor, mode, env, grants)
-        .await
-        .expect("spawn authority probe");
-    let stdout = process
-        .stdout_request()
-        .send()
-        .promise
-        .await
-        .expect("process.stdout")
-        .get()
-        .expect("stdout results")
-        .get_stream()
-        .expect("stdout stream");
-    let bytes = tokio::time::timeout(std::time::Duration::from_secs(30), read_all(stdout))
-        .await
-        .expect("authority probe stdout timeout")
-        .expect("read authority probe stdout");
+    // CI runners execute many real-WASM cases concurrently. Descendant probes
+    // perform additional nested spawns and can legitimately cross 30 seconds
+    // under CPU contention even though each RPC remains live. Bound the whole
+    // probe lifecycle instead of timing only stdout after an unbounded spawn.
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let process = spawn_probe(executor, mode, env, grants)
+            .await
+            .expect("spawn authority probe");
+        let stdout = process
+            .stdout_request()
+            .send()
+            .promise
+            .await
+            .expect("process.stdout")
+            .get()
+            .expect("stdout results")
+            .get_stream()
+            .expect("stdout stream");
+        read_all(stdout).await.expect("read authority probe stdout")
+    })
+    .await
+    .unwrap_or_else(|_| panic!("authority probe {mode:?} timed out after 120 seconds"));
     let text = String::from_utf8(bytes).expect("probe stdout UTF-8");
     serde_json::from_str(text.trim())
         .unwrap_or_else(|error| panic!("probe emitted invalid JSON ({error}): {text:?}"))
@@ -315,6 +322,110 @@ impl Drop for DropTrackedHost {
 }
 
 impl system_capnp::host::Server for DropTrackedHost {}
+
+struct GatedDropTrackedHost {
+    dropped: Rc<Cell<bool>>,
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for GatedDropTrackedHost {
+    fn drop(&mut self) {
+        self.dropped.set(true);
+    }
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::host::Server for GatedDropTrackedHost {
+    async fn id(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::host::IdParams,
+        mut results: system_capnp::host::IdResults,
+    ) -> Result<(), capnp::Error> {
+        self.started.notify_one();
+        self.release.notified().await;
+        results.get().set_peer_id(b"record-pinned");
+        Ok(())
+    }
+}
+
+struct KnownCidPinner {
+    cid: cid::Cid,
+    bytes: Vec<u8>,
+    pins: AtomicUsize,
+    fetches: AtomicUsize,
+    unpins: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl cache::Pinner for KnownCidPinner {
+    async fn pin(&self, cid: &cid::Cid) -> anyhow::Result<()> {
+        anyhow::ensure!(cid == &self.cid, "unknown CID");
+        self.pins.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn unpin(&self, cid: &cid::Cid) -> anyhow::Result<()> {
+        anyhow::ensure!(cid == &self.cid, "unknown CID");
+        self.unpins.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn fetch(&self, cid: &cid::Cid) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(cid == &self.cid, "unknown CID");
+        self.fetches.fetch_add(1, Ordering::Relaxed);
+        Ok(self.bytes.clone())
+    }
+
+    async fn size(&self, cid: &cid::Cid) -> anyhow::Result<u64> {
+        anyhow::ensure!(cid == &self.cid, "unknown CID");
+        Ok(self.bytes.len() as u64)
+    }
+}
+
+struct LateVatClient {
+    delegated: system_capnp::host::Client,
+    calls: Rc<Cell<u32>>,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::vat_client::Server for LateVatClient {
+    fn dial(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::vat_client::DialParams,
+        mut results: system_capnp::vat_client::DialResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = capnp_rpc::pry!(params.get());
+        let protocol = capnp_rpc::pry!(capnp_rpc::pry!(params.get_protocol()).to_str());
+        if protocol != "late-delegation" {
+            return Promise::err(capnp::Error::failed(format!(
+                "unexpected delegation protocol: {protocol}"
+            )));
+        }
+        self.calls.set(self.calls.get() + 1);
+        results
+            .get()
+            .init_cap()
+            .set_as_capability(self.delegated.client.clone().hook);
+        Promise::ok(())
+    }
+}
+
+struct MailboxHost {
+    vat_client: system_capnp::vat_client::Client,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::host::Server for MailboxHost {
+    fn network(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::host::NetworkParams,
+        mut results: system_capnp::host::NetworkResults,
+    ) -> Promise<(), capnp::Error> {
+        results.get().set_vat_client(self.vat_client.clone());
+        Promise::ok(())
+    }
+}
 
 fn names(report: &Value, delivery: &str) -> Vec<String> {
     report[delivery]
@@ -437,6 +548,198 @@ fn probe_can_invoke_a_test_local_parent_capability_when_explicitly_supplied() {
 }
 
 #[test]
+fn promised_and_broken_references_preserve_behavior_through_initial_grants() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let promised_calls = Rc::new(Cell::new(0));
+        let promised_identity = b"promised-host".to_vec();
+        let promised_calls_server = promised_calls.clone();
+        let promised: system_capnp::host::Client = capnp_rpc::new_future_client(async move {
+            tokio::task::yield_now().await;
+            Ok(capnp_rpc::new_client(CountingHost {
+                calls: promised_calls_server,
+                identity: promised_identity,
+            }))
+        });
+        let promised_report = probe_report(
+            &harness.executor,
+            "invoke",
+            &[("WW_PROBE_CAP", "ambient-parent")],
+            &[Grant {
+                name: "ambient-parent".into(),
+                cap: promised.client,
+            }],
+        )
+        .await;
+        assert_eq!(
+            promised_report["ok"], true,
+            "promised reference did not resolve through InitialGrants: {promised_report}"
+        );
+        assert_eq!(promised_calls.get(), 1);
+
+        let broken: system_capnp::host::Client = capnp_rpc::new_future_client(async {
+            Err(capnp::Error::failed("broken-ref-probe".into()))
+        });
+        let broken_report = probe_report(
+            &harness.executor,
+            "invoke",
+            &[("WW_PROBE_CAP", "ambient-parent")],
+            &[Grant {
+                name: "ambient-parent".into(),
+                cap: broken.client,
+            }],
+        )
+        .await;
+        assert_eq!(broken_report["ok"], false);
+        assert!(
+            broken_report["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("broken-ref-probe")),
+            "broken reference must remain observably broken: {broken_report}"
+        );
+    });
+}
+
+#[test]
+fn attenuated_grant_allows_id_and_denies_network_through_real_wasm() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let calls = Rc::new(Cell::new(0));
+        let host: system_capnp::host::Client = capnp_rpc::new_client(CountingHost {
+            calls: calls.clone(),
+            identity: b"attenuated".to_vec(),
+        });
+        let policy = membrane::MethodProfile::<system_capnp::host::Client>::new()
+            .allow_method(system_capnp::host::Client::id_request)
+            .expect("capture Host.id method")
+            .build();
+        let attenuated = membrane::membrane(host, Rc::new(policy));
+
+        let report = probe_report(
+            &harness.executor,
+            "attenuated",
+            &[],
+            &[Grant {
+                name: "attenuated-host".into(),
+                cap: attenuated.client,
+            }],
+        )
+        .await;
+        assert_eq!(report["ok"], true, "attenuation probe failed: {report}");
+        assert_eq!(
+            report["detail"]["names"],
+            serde_json::json!(["attenuated-host"])
+        );
+        assert_eq!(
+            report["detail"]["peer_id"],
+            serde_json::json!(b"attenuated")
+        );
+        assert!(
+            report["detail"]["denied"]
+                .as_str()
+                .is_some_and(|error| error.contains(membrane::DENIED_MARKER)),
+            "denial must retain its stable class: {report}"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "only the allowed Host.id reached the server"
+        );
+    });
+}
+
+#[test]
+fn multi_grant_trusted_constructor_lattice_is_concrete_and_exact() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let runtime = create_runtime_client(false, None, None, None, CachePolicy::Isolated);
+        let report = probe_report(
+            &harness.executor,
+            "trusted-lattice",
+            &[("WW_PROBE_IMAGE", "runtime-selected-image")],
+            &[
+                Grant {
+                    name: "runtime".into(),
+                    cap: runtime.client,
+                },
+                Grant {
+                    name: "bound-executor".into(),
+                    cap: harness.executor.clone().client,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(report["ok"], true, "multi-grant probe failed: {report}");
+        assert_eq!(
+            report["detail"]["names"],
+            serde_json::json!(["runtime", "bound-executor"])
+        );
+        assert_eq!(report["detail"]["different_images"], true);
+    });
+}
+
+#[test]
+fn late_delegation_uses_explicit_conduit_without_mutating_birth_set() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let (mut delegated_grant, delegated_calls) = counting_host(b"late-x");
+        delegated_grant.name = "delegated-x".into();
+        let delegated = system_capnp::host::Client::new(delegated_grant.cap.hook);
+        let conduit_calls = Rc::new(Cell::new(0));
+        let vat_client: system_capnp::vat_client::Client = capnp_rpc::new_client(LateVatClient {
+            delegated,
+            calls: conduit_calls.clone(),
+        });
+        let mailbox: system_capnp::host::Client = capnp_rpc::new_client(MailboxHost { vat_client });
+
+        let report = probe_report(
+            &harness.executor,
+            "late-delegation",
+            &[],
+            &[Grant {
+                name: "mailbox".into(),
+                cap: mailbox.client,
+            }],
+        )
+        .await;
+        assert_eq!(report["ok"], true, "late delegation failed: {report}");
+        assert_eq!(
+            report["detail"]["initial_names"],
+            serde_json::json!(["mailbox"])
+        );
+        assert_eq!(
+            report["detail"]["received_later"],
+            serde_json::json!(["delegated-x"]),
+            "late capabilities must be reported separately from birth grants"
+        );
+        assert_eq!(
+            report["detail"]["current_holdings"],
+            serde_json::json!(["mailbox", "delegated-x"]),
+            "late delegation changes current holdings through the explicit conduit"
+        );
+        assert_eq!(
+            report["detail"]["after_names"],
+            serde_json::json!(["mailbox"]),
+            "InitialGrants.get() must remain the immutable birth set"
+        );
+        assert_eq!(
+            report["detail"]["delegated_peer_id"],
+            serde_json::json!(b"late-x")
+        );
+        assert_eq!(conduit_calls.get(), 1);
+        assert_eq!(delegated_calls.get(), 1);
+    });
+}
+
+#[test]
 fn runtime_is_available_only_when_explicitly_granted() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
@@ -451,6 +754,12 @@ fn runtime_is_available_only_when_explicitly_granted() {
         )
         .await;
         assert_eq!(absent["ok"], false, "Runtime must not be ambient: {absent}");
+        assert!(
+            absent["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("capability 'runtime' not found")),
+            "missing required grant must be a clear guest-level failure: {absent}"
+        );
 
         let present = probe_report(
             &harness.executor,
@@ -465,6 +774,66 @@ fn runtime_is_available_only_when_explicitly_granted() {
         assert_eq!(
             present["ok"], true,
             "an explicitly granted Runtime must retain normal Cap'n Proto behavior: {present}"
+        );
+    });
+}
+
+#[test]
+fn parent_local_drop_does_not_revoke_record_pinned_authority() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let dropped = Rc::new(Cell::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let host: system_capnp::host::Client = capnp_rpc::new_client(GatedDropTrackedHost {
+            dropped: dropped.clone(),
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let grant = Grant {
+            name: "tracked".into(),
+            cap: host.client,
+        };
+
+        let call_started = started.notified();
+        let process = spawn_probe(
+            &harness.executor,
+            "invoke",
+            &[("WW_PROBE_CAP", "tracked")],
+            std::slice::from_ref(&grant),
+        )
+        .await
+        .expect("spawn record-pinned child");
+        call_started.await;
+
+        drop(grant);
+        assert!(
+            !dropped.get(),
+            "dropping the parent's local reference must not revoke the child's birth record"
+        );
+        release.notify_one();
+
+        let stdout = process
+            .stdout_request()
+            .send()
+            .promise
+            .await
+            .expect("process.stdout")
+            .get()
+            .expect("stdout results")
+            .get_stream()
+            .expect("stdout stream");
+        let output = read_all(stdout).await.expect("read record-pinned probe");
+        let report: Value = serde_json::from_slice(&output).expect("record-pinned JSON");
+        assert_eq!(
+            report["ok"], true,
+            "record-pinned invocation failed: {report}"
+        );
+        assert_eq!(
+            report["detail"]["peer_id"],
+            serde_json::json!(b"record-pinned")
         );
     });
 }
@@ -554,10 +923,14 @@ fn current_empty_grant_substrate_characterization() {
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
         let harness = harness(&wasm).await;
+        let known_path = format!("/ipfs/{KNOWN_CID}");
         let report = probe_report(
             &harness.executor,
             "substrate",
-            &[("T1_VISIBLE_ENV", "present")],
+            &[
+                ("T1_VISIBLE_ENV", "present"),
+                ("WW_PROBE_KNOWN_CID_PATH", &known_path),
+            ],
             &[],
         )
         .await;
@@ -577,12 +950,132 @@ fn current_empty_grant_substrate_characterization() {
         assert!(report["clock"]["monotonic_nanos"].is_u64());
         assert!(report["random_u64"].is_u64());
 
-        // Current ExecutorImpl supplies neither CidTree nor cache mode. These
-        // are current-negative observations, not the future substrate contract.
-        assert!(report["filesystem"]["root_entries"]["error"].is_string());
+        assert_eq!(
+            report["filesystem"]["root_entries"],
+            serde_json::json!([]),
+            "byte-loaded children receive a private empty image root; /tmp is a separate preopen"
+        );
         assert!(report["filesystem"]["cid_enumeration"]["error"].is_string());
-        assert!(report["filesystem"]["scratch"]["error"].is_string());
-        assert!(report["filesystem"]["known_cid_read"].is_null());
+        assert_eq!(
+            report["filesystem"]["scratch"], true,
+            "the process-private /tmp preopen must be writable"
+        );
+        assert!(
+            report["filesystem"]["known_cid_read"]["error"].is_string(),
+            "without explicit cache wiring there is no global-host fallback: {report}"
+        );
+    });
+}
+
+#[test]
+fn explicitly_wired_known_cid_read_has_path_only_authority_and_node_effects() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let cid: cid::Cid = KNOWN_CID.parse().expect("known CID");
+        let bytes = b"known-cid-content".to_vec();
+        let pinner = Arc::new(KnownCidPinner {
+            cid,
+            bytes: bytes.clone(),
+            pins: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            unpins: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(cache::PinsetCache::new(pinner.clone(), 1024).unwrap());
+        let runtime = create_runtime_client_with_pinset(
+            false,
+            None,
+            None,
+            None,
+            CachePolicy::Isolated,
+            Some(cache.clone()),
+        );
+        let executor = load_executor(&runtime, &wasm).await;
+        let path = format!("/ipfs/{KNOWN_CID}");
+        let report = probe_report(
+            &executor,
+            "substrate",
+            &[("WW_PROBE_KNOWN_CID_PATH", &path)],
+            &[],
+        )
+        .await;
+
+        assert_eq!(
+            report["filesystem"]["known_cid_read"],
+            serde_json::json!(bytes.len())
+        );
+        assert!(report["filesystem"]["cid_enumeration"]["error"].is_string());
+        assert!(report["filesystem"]["ipfs_mutation"]["error"].is_string());
+        assert_eq!(report["filesystem"]["scratch"], true);
+
+        // The substrate grants no RPC capability or locator. The child can
+        // only cause a path-based read of the CID it already supplied.
+        let authority = probe_report(&executor, "invoke-all", &[], &[]).await;
+        assert_eq!(authority["usable"], serde_json::json!([]));
+
+        // This read is not "no node effect": it consumed pin/cache/fetch work
+        // and materialized bytes in the host-managed cache.
+        assert_eq!(pinner.pins.load(Ordering::Relaxed), 1);
+        assert_eq!(pinner.fetches.load(Ordering::Relaxed), 1);
+        assert!(cache.staging_dir().join(KNOWN_CID).is_file());
+        assert!(cache.probably_cached(&cid));
+
+        let repeated_env = [("WW_PROBE_KNOWN_CID_PATH", path.as_str())];
+        let repeat_a = probe_report(&executor, "substrate", &repeated_env, &[]);
+        let repeat_b = probe_report(&executor, "substrate", &repeated_env, &[]);
+        let (repeat_a, repeat_b) = tokio::join!(repeat_a, repeat_b);
+        assert_eq!(
+            repeat_a["filesystem"]["known_cid_read"],
+            serde_json::json!(bytes.len())
+        );
+        assert_eq!(
+            repeat_b["filesystem"]["known_cid_read"],
+            serde_json::json!(bytes.len())
+        );
+        assert_eq!(
+            pinner.pins.load(Ordering::Relaxed),
+            1,
+            "concurrent repeated reads must reuse the tracked pin"
+        );
+        assert_eq!(
+            pinner.fetches.load(Ordering::Relaxed),
+            1,
+            "concurrent warm reads must reuse the staged immutable bytes"
+        );
+    });
+}
+
+#[test]
+fn writable_tmp_is_private_between_parent_and_descendant() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let report = probe_report(
+            &harness.executor,
+            "scratch-parent",
+            &[],
+            &[Grant {
+                name: "restricted-executor".into(),
+                cap: harness.executor.clone().client,
+            }],
+        )
+        .await;
+        assert_eq!(report["ok"], true, "scratch probe failed: {report}");
+        assert_eq!(
+            report["detail"]["child"]["observed_before_write"], false,
+            "a descendant must not observe its parent's /tmp"
+        );
+        assert_eq!(
+            report["detail"]["child"]["write"],
+            Value::Null,
+            "the descendant must receive its own writable /tmp"
+        );
+        assert_eq!(
+            report["detail"]["parent_after"],
+            serde_json::json!(b"parent"),
+            "the descendant's write must not mutate the parent's scratch"
+        );
     });
 }
 
@@ -682,6 +1175,31 @@ fn empty_grant_child_cannot_route_discover_or_publish() {
         );
         assert_eq!(harness.counts.provide.get(), 0);
         assert_eq!(harness.counts.find.get(), 0);
+    });
+}
+
+#[test]
+fn explicitly_granted_routing_remains_concretely_callable() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let routing: ww::routing_capnp::routing::Client =
+            capnp_rpc::new_client(ww::rpc::routing::LocalRouting::new());
+        let report = probe_report(
+            &harness.executor,
+            "routing",
+            &[],
+            &[Grant {
+                name: "routing".into(),
+                cap: routing.client,
+            }],
+        )
+        .await;
+        assert_eq!(report["ok"], true, "routing probe failed: {report}");
+        assert_eq!(report["detail"]["provide"], true);
+        assert_eq!(report["detail"]["find_providers"], true);
+        assert_eq!(report["detail"]["done"], true);
     });
 }
 
@@ -857,21 +1375,39 @@ fn restricted_executor_cannot_amplify_descendant() {
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
         let harness = harness(&wasm).await;
+        let (mut narrow, calls) = counting_host(b"descendant-narrow");
+        narrow.name = "narrow".into();
         let report = probe_report(
             &harness.executor,
             "descendant",
             &[("WW_PROBE_HTTP_URL", &harness.backend_url)],
-            &[Grant {
-                name: "restricted-executor".into(),
-                cap: harness.executor.clone().client,
-            }],
+            &[
+                Grant {
+                    name: "restricted-executor".into(),
+                    cap: harness.executor.clone().client,
+                },
+                narrow,
+            ],
         )
         .await;
         assert_eq!(
             report["ok"], true,
             "descendant probe itself failed: {report}"
         );
-        let leaked = report["detail"]["descendant"]["usable"]
+        assert_eq!(
+            report["detail"]["parent_names"],
+            serde_json::json!(["restricted-executor", "narrow"])
+        );
+        assert_eq!(
+            report["detail"]["aliases"]["ok"], true,
+            "explicitly forwarded descendant aliases must remain callable: {report}"
+        );
+        assert_eq!(
+            calls.get(),
+            4,
+            "same descendant capability under two names must survive two get() deliveries"
+        );
+        let leaked = report["detail"]["omitted"]["usable"]
             .as_array()
             .expect("descendant usable capability list");
         assert!(

@@ -128,9 +128,17 @@ re-delegates fresh references or respawns it.
 
 ### Content access (WASI path I/O only)
 
-Cells do not receive an explicit filesystem capability over the
-membrane. Content access flows through the WASI virtual filesystem,
-which the host backs with `CidTree`.
+Cells do not receive an explicit filesystem capability over the membrane.
+Filesystem substrate is fixed by the trusted execution context:
+
+- an Executor created from `Runtime.load(wasm bytes)` has a private empty
+  read-only root because those bytes have no associated FHS image;
+- an image-backed cell retains its actual `CidTree`-rooted read-only image;
+- each process has a separate writable `/tmp`, removed with that process and
+  inaccessible through sibling filesystem namespaces;
+- `/ipfs/<cid>` materializes only when the host explicitly supplies the
+  pinset/cache wiring. Without it, the path fails instead of falling back to
+  global host services.
 
 Use regular guest file I/O against filesystem paths:
 - `(perform :load "path")` for bytes in Glia
@@ -143,6 +151,16 @@ embedding handler performs the read; it makes the language-level host boundary
 explicit without becoming an authority grant. The WASI virtual filesystem and
 its reachable CID tree still govern guest path I/O, while the membrane governs
 RPC capability authority.
+
+Known-CID cache wiring is execution-context state, not a child-visible
+capability or locator. A child cannot replace or widen it, and it provides no
+CID enumeration, mutation, pin management, publishing, routing, arbitrary
+dialing, ambient network API, or `ipfs` RPC capability.
+
+This does not mean a CAS read has no node effect. A read can fetch over the
+node's network, pin and materialize blocks on disk, occupy cache budget, affect
+cache timing, and cause eviction/unpin work. Those bounded cache effects are
+intentional substrate effects, not node-control authority.
 
 ### Content mutation (explicit capability API)
 

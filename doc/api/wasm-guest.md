@@ -158,8 +158,12 @@ named capabilities delegated at spawn:
 | Routing | `routing_capnp::routing` | DHT operations (provide/find_providers). |
 | Identity | `auth_capnp::identity` | Host-side signing, only when explicitly delegated. |
 
-IPFS content is not a capability; guests read `/ipfs/<cid>/...` through
-the WASI virtual filesystem.
+IPFS content is not an RPC capability. If the host explicitly installs the
+known-CID cache substrate, guests may read `/ipfs/<cid>/...` for CIDs they
+already know. Without that execution-context wiring the path does not
+materialize. The substrate provides no enumeration, mutation, pin management,
+publishing, routing, dialing, or ambient network API, though reads can consume
+node network, disk, cache, and eviction resources.
 
 Host-derived grants retain their **epoch guards** and become invalid when the
 host advances its epoch. Repeated `InitialGrants.get()` calls return the same

@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Child-authority lifecycle and substrate scenarios.** Trusted pid0 services
+  now re-graft and rerun init after structured epoch staleness; epoch-owned HTTP
+  route leases clean up by identity, and readiness reflects live current-epoch
+  registration. Real-WASM scenarios cover explicit, attenuated, descendant,
+  and late-delegated grants without changing the immutable birth record.
+  Byte-loaded children receive a private empty read-only root and writable
+  per-child `/tmp`; optional host-wired known-CID reads expose no CAS control
+  capability or fallback while retaining their network, disk, cache, and
+  eviction effects. Cancellation rolls back only pin/cache state it still owns.
 - **Explicit Glia child grants.** `(cell image)` now creates a child with zero
   application grants, while `(cell image :grants {...})` transfers exactly the
   named capabilities in deterministic order. Literal duplicate names,

@@ -118,7 +118,7 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
                 let routes = route_registry.read().expect("registry read lock");
                 routes
                     .get("/status")
-                    .cloned()
+                    .map(|entry| entry.sender())
                     .expect("route /status should be registered")
             };
             let (response_tx, response_rx) = oneshot::channel();

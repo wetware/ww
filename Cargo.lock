@@ -8209,6 +8209,7 @@ dependencies = [
  "wasm-encoder 0.243.0",
  "wasmtime",
  "wetware-authority",
+ "wetware-membrane",
  "ww-cache",
 ]
 

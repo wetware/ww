@@ -487,11 +487,12 @@ without materializing every file's content. Stubs are sparse files with
 the declared size; opening one redirects (via `fs_intercept`) to the
 real bytes in `PinsetCache`.
 
-The single WASI preopen at `/` points at `staging_dir`. It is a protocol
-anchor, not a guest-visible filesystem: `fs_intercept` overrides every
-`open_at`, `readdir`, and `stat` before it reads from the staging
-directory, so the guest never sees the stub contents directly. See
-`src/cell/proc.rs` (preopen call) and `src/fs_intercept.rs` (overrides).
+For image-backed cells, the read-only WASI preopen at `/` points at
+`staging_dir`. It is a protocol anchor, not a guest-visible host path:
+`fs_intercept` routes image opens through the `CidTree`. A second,
+process-private preopen provides writable `/tmp`; descriptor identity keeps
+that scratch subtree out of CidTree resolution. Byte-loaded Executors instead
+receive a private empty root plus the same private `/tmp`.
 
 ## State management
 

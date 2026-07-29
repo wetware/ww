@@ -21,9 +21,9 @@ implements the graft-capable `Membrane`.
 | Restricted Executor descendant amplification | Passing T3 regression |
 | No-epoch/no-stream usable raw `Host` | Passing T3 regression |
 | Args/env/stdio and clock/randomness | Passing characterization |
-| Mounted image-rooted filesystem, known-CID read, scratch isolation | Blocked: current `ExecutorImpl` supplies neither `CidTree` nor cache mode |
-| CID enumeration and `/ipfs` mutation absence | Current-negative characterization only |
-| CAS size/concurrency/fetch/cache pressure | Blocked on the T6 substrate/CAS fixture and measurable cache wiring |
+| Byte-loaded empty root, retained image root, private writable scratch | Passing T6 focused/unit and real-WASM descendant regressions |
+| Explicit known-CID read; no fallback, enumeration, or mutation | Passing T6 deterministic real-WASM regression |
+| CAS pin/fetch/cache/eviction effects and cancellation cleanup | Passing deterministic cache and real-WASM characterization |
 | `InitialAuthorityRecord`, exact record delivery, shared encoder | Passing T3 regression |
 | Grants-only bootstrap surface/no `graft()` | Passing T5 regression |
 | Glia `:grants`, source duplicate diagnostics, lexical-capture removal | Passing T4 regression |
@@ -31,6 +31,11 @@ implements the graft-capable `Membrane`.
 The wire duplicate test deliberately says nothing about Glia map literals:
 Glia's ordinary map evaluation normalizes through `im::HashMap`, so source
 duplicate detection belongs at parse/analysis time in T4.
+
+T6 deliberately leaves any richer association between arbitrary
+`Runtime.load(wasm bytes)` input and an FHS image undefined. Byte-loaded
+Executors receive the private empty root; image selection remains a trusted
+image-backed construction path.
 
 ## Post-T3 migration inventory
 
