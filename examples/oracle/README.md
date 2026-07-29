@@ -142,7 +142,7 @@ ORACLE NODE:                            CURL CLIENT:
                                            v
   HttpListener accepts     <---HTTP---  axum server
   spawns WAGI cell per request          routes by prefix
-    membrane.graft()                       |
+    initial_grants.get()                   |
     http_client.get(blocknative)           v
     build JSON response                 CGI response -> JSON
     write to stdout
@@ -169,13 +169,13 @@ The same binary serves all modes. Detection:
 | **Consumer** | `consume` subcommand | DHT discover + RPC query |
 
 - **Vat cell mode** (no args): spawned by Glia before publication.
-  Creates a `PriceOracleImpl`, grafts to obtain `HttpClient`, fetches
+  Creates a `PriceOracleImpl`, reads its explicit `http-client` grant, fetches
   prices from Blocknative, and exports the oracle as the bootstrap
   capability. This compatibility demo uses `host :serve-raw-vat` to publish
   that capability under `oracle` without recipient authentication.
 - **WAGI cell mode** (`WW_CELL_MODE=http`): spawned by `HttpListener`
-  per HTTP request. Grafts the membrane over `wetware:streams`
-  (side-channel), fetches prices via `HttpClient`, writes a JSON
+  per HTTP request. Reads the fixed listener grant template over
+  `wetware:streams`, fetches prices via `HttpClient`, writes a JSON
   response to stdout via CGI. Stateless -- one cell per request.
 - **Service mode**: long-running DHT provider loop. Provides the
   service-name routing key on the DHT and re-provides periodically
@@ -212,8 +212,8 @@ Supported pairs: `ETH/gas`, `POLYGON/gas`, `BASE/gas`.
 
 ### Price fetching
 
-The cell uses the `HttpClient` capability (obtained via
-`membrane.graft()`) to call the Blocknative gas price API.
+The cell uses the explicitly delegated `http-client` capability, obtained via
+`initial_grants.get()`, to call the Blocknative gas price API.
 `HttpClient` is domain-scoped -- the host controls which domains
 the cell can reach. Prices are cached in-process and served via
 RPC. Confidence decays toward 0.0 if data goes stale.
@@ -228,7 +228,9 @@ RPC. Confidence decays toward 0.0 if data goes stale.
   (cell oracle-wasm :grants {:http-client http-client}))
 
 (def oracle-executor (perform runtime :load oracle-wasm))
-(def oracle-process (perform oracle-executor :spawn :caps {}))
+(def oracle-process
+  (perform oracle-executor :spawn
+    :caps {"http-client" http-client}))
 (def oracle-cap (perform oracle-process :bootstrap))
 
 (perform host :serve-raw-vat oracle-cap "oracle")
@@ -238,13 +240,25 @@ RPC. Confidence decays toward 0.0 if data goes stale.
 `glia/serve.glia`:
 
 ```clojure
-(perform runtime :run (perform :load "bin/oracle.wasm") "serve")
+(def oracle-service-executor
+  (perform runtime :load (perform :load "bin/oracle.wasm")))
+(def oracle-service-process
+  (perform oracle-service-executor :spawn
+    :args ["serve"]
+    :caps {"host" host "routing" routing}))
+(perform oracle-service-process :wait)
 ```
 
 `glia/consume.glia`:
 
 ```clojure
-(perform runtime :run (perform :load "bin/oracle.wasm") "consume")
+(def oracle-consumer-executor
+  (perform runtime :load (perform :load "bin/oracle.wasm")))
+(def oracle-consumer-process
+  (perform oracle-consumer-executor :spawn
+    :args ["consume"]
+    :caps {"host" host "routing" routing}))
+(perform oracle-consumer-process :wait)
 ```
 
 The host registration forms split by transport:

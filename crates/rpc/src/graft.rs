@@ -395,22 +395,24 @@ impl GraftBuilder for HostGraftBuilder {
 /// allowing the guest to attenuate or enrich the capability surface it exposes.
 pub type GuestMembrane = authority::membrane_capnp::membrane::Client;
 
-/// Temporary T3-compatible child bootstrap server.
-///
-/// T5 owns the distinct grants-only guest-facing schema. Until then, ordinary
-/// children still speak the existing `Membrane.graft()` wire method, but this
-/// server is deliberately closed over one immutable [`InitialAuthorityRecord`]
-/// and can return nothing except that record.
-struct InitialAuthorityBootstrap {
+/// Host-provided bootstrap received by an ordinary child.
+pub type ChildInitialGrants = authority::membrane_capnp::initial_grants::Client;
+
+/// Guest-exported capability imported by the host and exposed only through the
+/// parent-held `Process.bootstrap()` operation.
+pub type GuestExport = capnp::capability::Client;
+
+/// Closed-delivery server for one immutable child authority record.
+struct InitialGrantsServer {
     record: InitialAuthorityRecord,
 }
 
 #[allow(refining_impl_trait)]
-impl membrane_capnp::membrane::Server for InitialAuthorityBootstrap {
-    fn graft(
+impl membrane_capnp::initial_grants::Server for InitialGrantsServer {
+    fn get(
         self: capnp::capability::Rc<Self>,
-        _params: membrane_capnp::membrane::GraftParams,
-        mut results: membrane_capnp::membrane::GraftResults,
+        _params: membrane_capnp::initial_grants::GetParams,
+        mut results: membrane_capnp::initial_grants::GetResults,
     ) -> Promise<(), capnp::Error> {
         let count = match self.record.grants().len().try_into() {
             Ok(count) => count,
@@ -437,12 +439,12 @@ pub fn build_initial_authority_rpc<R, W>(
     reader: R,
     writer: W,
     record: InitialAuthorityRecord,
-) -> (RpcSystem<Side>, GuestMembrane)
+) -> (RpcSystem<Side>, GuestExport)
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
-    let bootstrap: GuestMembrane = capnp_rpc::new_client(InitialAuthorityBootstrap { record });
+    let bootstrap: ChildInitialGrants = capnp_rpc::new_client(InitialGrantsServer { record });
     let rpc_network = VatNetwork::new(
         reader.compat(),
         writer.compat_write(),
@@ -450,8 +452,8 @@ where
         Default::default(),
     );
     let mut rpc_system = RpcSystem::new(Box::new(rpc_network), Some(bootstrap.client));
-    let guest_membrane: GuestMembrane = rpc_system.bootstrap(Side::Client);
-    (rpc_system, guest_membrane)
+    let guest_export: GuestExport = rpc_system.bootstrap(Side::Client);
+    (rpc_system, guest_export)
 }
 
 /// Build the trusted pid0 RPC system with its full graft-capable `Membrane`.
@@ -710,6 +712,67 @@ mod tests {
                         "pid0 RPC bootstrap lost {expected}: {names:?}"
                     );
                 }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_child_rpc_serves_empty_grants_and_rejects_membrane_graft() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (host_stream, guest_stream) = io::duplex(16 * 1024);
+                let (host_reader, host_writer) = io::split(host_stream);
+                let (guest_reader, guest_writer) = io::split(guest_stream);
+
+                let (host_rpc, _guest_export) = build_initial_authority_rpc(
+                    host_reader,
+                    host_writer,
+                    InitialAuthorityRecord::default(),
+                );
+                tokio::task::spawn_local(host_rpc.map(|_| ()));
+
+                let guest_network = VatNetwork::new(
+                    guest_reader.compat(),
+                    guest_writer.compat_write(),
+                    Side::Client,
+                    Default::default(),
+                );
+                let mut guest_rpc = RpcSystem::new(Box::new(guest_network), None);
+                let bootstrap: capnp::capability::Client = guest_rpc.bootstrap(Side::Server);
+                tokio::task::spawn_local(guest_rpc.map(|_| ()));
+
+                let grants = ChildInitialGrants {
+                    client: bootstrap.clone(),
+                };
+                let response = grants
+                    .get_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("InitialGrants.get RPC");
+                assert_eq!(
+                    response
+                        .get()
+                        .expect("initial grants results")
+                        .get_caps()
+                        .expect("initial grants")
+                        .len(),
+                    0
+                );
+
+                let membrane = GuestMembrane { client: bootstrap };
+                let error = match membrane.graft_request().send().promise.await {
+                    Ok(_) => panic!("ordinary child bootstrap must reject Membrane.graft"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("unimplemented"),
+                    "unexpected graft rejection: {error}"
+                );
             })
             .await;
     }

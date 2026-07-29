@@ -12,28 +12,28 @@ Cap'n Proto RPC session, letting guest code call host capabilities using ordinar
 ## Entry points
 
 ```rust
-// Receive host capabilities; no export back to the host.
-system::run(|host: Membrane| async move {
-    let session = host.graft_request().send().promise.await?;
+// Ordinary child: receive exactly the immutable parent-selected grants.
+system::run(|grants: InitialGrants| async move {
+    let initial = grants.get_request().send().promise.await?;
     // ...
     Ok(())
 });
 
-// Receive host capabilities AND export `bootstrap` back to the host.
+// Receive initial grants AND export `my_capability` back to the parent.
 // Use this when the agent needs to surface a capability to external peers.
-system::serve(my_capability, |host: Membrane| async move {
+system::serve(my_capability, |grants: InitialGrants| async move {
     // ...
     Ok(())
 });
 ```
 
 `run()` is suitable for agents that consume capabilities but don't export any.
-`serve()` is the pattern for agents that act as intermediaries — they receive
-capabilities from the host, wrap or attenuate them, and hand the wrapped version
-back so the host can expose it to external peers.
+`serve()` is the pattern for agents that export a guest capability. The
+parent-held `Process.bootstrap()` retrieves that export; it is distinct from
+the host-provided `InitialGrants` received by the child.
 
 ## Relationship to the kernel
 
-The kernel (`std/kernel`) uses `serve()` to export an attenuated Membrane back
-to the host. Other agents that only need to *use* capabilities (not re-export them)
-use `run()`.
+The trusted pid0 kernel is the exception: it receives the full `Membrane` and
+uses `serve()` to re-export its membrane policy surface. Ordinary agents receive
+only `InitialGrants` and use `run()` unless they also export a capability.

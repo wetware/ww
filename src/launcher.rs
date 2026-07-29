@@ -503,7 +503,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
                 stdout,
                 stderr,
                 exit_rx,
-                guest_bootstrap.client,
+                guest_bootstrap,
                 kill_tx.clone(),
             );
 

@@ -1,2 +1,8 @@
 ; Demo snippet: start discovery + game loop.
-(perform runtime :run (perform :load "bin/chess-demo.wasm") "serve")
+(def chess-service-executor
+  (perform runtime :load (perform :load "bin/chess-demo.wasm")))
+(def chess-service-process
+  (perform chess-service-executor :spawn
+    :args ["serve"]
+    :caps {"host" host "routing" routing}))
+(perform chess-service-process :wait)

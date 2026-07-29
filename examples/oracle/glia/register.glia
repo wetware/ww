@@ -4,7 +4,9 @@
   (cell oracle-wasm :grants {:http-client http-client}))
 
 (def oracle-executor (perform runtime :load oracle-wasm))
-(def oracle-process (perform oracle-executor :spawn :caps {}))
+(def oracle-process
+  (perform oracle-executor :spawn
+    :caps {"http-client" http-client}))
 (def oracle-cap (perform oracle-process :bootstrap))
 
 (perform host :serve-raw-vat oracle-cap "oracle")

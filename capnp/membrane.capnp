@@ -1,4 +1,4 @@
-# Membrane transport schema: exported capabilities + membrane graft contract.
+# Capability export transport plus trusted-root and ordinary-child bootstraps.
 #
 # Split from stem.capnp to separate capability transport metadata from
 # auth/session and epoch/provenance concerns.
@@ -12,6 +12,15 @@ struct Export @0xbb8d5590cb2f3d2e {
   # capability reference itself; the name is a local binding key, not authority.
 }
 
+interface InitialGrants @0xae9edc968ee787fe {
+  get @0 () -> (
+    caps :List(Export)
+  );
+  # Closed, idempotent delivery of an ordinary child's immutable initial
+  # grants. The server returns exactly the parent-delegated Export list and
+  # exposes no graft, lookup, refresh, append, policy, or parent-channel API.
+}
+
 interface Membrane @0xdb52c25106bc2c5e {
   graft @0 () -> (
     caps :List(Export)
@@ -20,7 +29,7 @@ interface Membrane @0xdb52c25106bc2c5e {
   # authorization — no signer needed. Wrap in Terminal(Membrane) to gate access.
   #
   # Canonical names: "identity", "host", "runtime", "routing", "http-client", "ipfs".
-  # Init.d-scoped grants (from `with` blocks) are appended after the core caps.
+  # Trusted pid0 may also receive explicitly configured extras.
   #
   # Listener/Dialer accessed via host.network().
   # WASI guests resolve content via the virtual filesystem (CidTree).

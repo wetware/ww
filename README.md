@@ -61,7 +61,7 @@ Here is the capability surface in action, directly in the Wetware shell (Glia):
 
 ## Features
 
-- **Explicit capability grafts.** Each cell starts with a typed bundle of capabilities and nothing else. Parent cells choose which capabilities to hand down; method-level restrictions are enforced on the capability reference and on capabilities reached through it.
+- **Explicit child grants.** Each ordinary cell starts with a typed bundle of capabilities and nothing else. Parent cells choose which capabilities to hand down; method-level restrictions are enforced on the capability reference and on capabilities reached through it.
 - **Composable membranes.** Tool A calls tool B which calls tool C, each link carrying an explicit capability set. The membrane is the boundary at every hop. See [examples/oracle/](examples/oracle/) for the runnable version.
 - **Content-addressed code.** Cells are identified by CID. The binary that ran is the binary you pinned; no swap-under-the-rug between generation and execution.
 - **WASM cell scale.** ~10ms spawn, KB-scale binaries, language-agnostic via `wasm32-wasip2`. Per-call sandboxing is only feasible because cells are cheap; microVM cold-start is too slow for that.
@@ -122,9 +122,13 @@ Wires the node into Claude Code as an MCP server. The LLM gets a Glia shell over
 
 ## How it works
 
-`ww run` starts a libp2p node on port 2025, merges any [image layers](doc/images.md) into a virtual FHS filesystem, and spawns `boot/main.wasm` with a Membrane: the typed capability hub the cell uses to reach the host.
+`ww run` starts a libp2p node on port 2025, merges any [image layers](doc/images.md) into a virtual FHS filesystem, and spawns trusted `boot/main.wasm` (pid0) with the full graft-capable Membrane.
 
-A guest calls `membrane.graft()` to obtain its capabilities as a `List(Export)`. When the on-chain epoch advances (new code deployed, configuration changed), the membrane revokes everything; the guest re-grafts and picks up the new state automatically. Parent cells use the same membrane machinery to pass explicit capability sets to child cells.
+Pid0 calls `membrane.graft()` to obtain host capabilities. Ordinary children
+instead call `initial_grants.get()` and receive exactly the immutable
+`List(Export)` selected by their parent—no host graft or fallback. After an
+epoch transition, delegated host capabilities stay stale until an authorized
+ancestor explicitly re-delegates fresh references or respawns the child.
 
 [doc/architecture.md](doc/architecture.md) is the canonical reference; [doc/capabilities.md](doc/capabilities.md) is the capability surface.
 

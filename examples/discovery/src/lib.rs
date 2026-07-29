@@ -70,11 +70,11 @@ include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
 const GREETER_SERVICE: &str = "greeter";
 
-/// Bootstrap capability: the concrete Membrane defined in membrane.capnp.
-type Membrane = membrane_capnp::membrane::Client;
+/// Host-provided closed delivery of this child's immutable initial grants.
+type InitialGrants = membrane_capnp::initial_grants::Client;
 
-/// Look up a typed capability by name from the graft caps list.
-fn get_graft_cap<T: capnp::capability::FromClientHook>(
+/// Look up a typed capability by name from the initial grants list.
+fn get_initial_grant<T: capnp::capability::FromClientHook>(
     caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Result<T, capnp::Error> {
@@ -89,7 +89,7 @@ fn get_graft_cap<T: capnp::capability::FromClientHook>(
         }
     }
     Err(capnp::Error::failed(format!(
-        "capability '{name}' not found in graft response"
+        "required initial grant '{name}' is missing"
     )))
 }
 
@@ -189,7 +189,7 @@ fn run_cell() {
     let greeter = GreeterImpl { peer_id };
     let client: greeter_capnp::greeter::Client = capnp_rpc::new_client(greeter);
     log::info!("cell: exporting Greeter via RPC");
-    system::serve(client.client, |_membrane: Membrane| async move {
+    system::serve(client.client, |_initial_grants: InitialGrants| async move {
         std::future::pending().await
     });
 }
@@ -273,12 +273,12 @@ async fn greet_peer(
 // Service mode — discovery loop with VatClient
 // ---------------------------------------------------------------------------
 
-async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
-    let graft_resp = membrane.graft_request().send().promise.await?;
-    let results = graft_resp.get()?;
+async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> {
+    let grants_resp = initial_grants.get_request().send().promise.await?;
+    let results = grants_resp.get()?;
     let caps = results.get_caps()?;
-    let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
-    let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
+    let host: system_capnp::host::Client = get_initial_grant(&caps, "host")?;
+    let routing: routing_capnp::routing::Client = get_initial_grant(&caps, "routing")?;
 
     let network_resp = host.network_request().send().promise.await?;
     let network = network_resp.get()?;
@@ -347,7 +347,9 @@ impl Guest for DiscoveryGuest {
         match std::env::args().nth(1).as_deref() {
             Some("serve") => {
                 log::info!("discovery: serve — DHT provide + peer discovery");
-                system::run(|membrane: Membrane| async move { run_service(membrane).await });
+                system::run(|initial_grants: InitialGrants| async move {
+                    run_service(initial_grants).await
+                });
             }
             _ => {
                 // Default (no args): cell mode — export the Greeter capability.

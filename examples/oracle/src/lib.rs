@@ -66,10 +66,10 @@ include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
 const ORACLE_SERVICE: &str = "oracle";
 
-type Membrane = membrane_capnp::membrane::Client;
+type InitialGrants = membrane_capnp::initial_grants::Client;
 
-/// Look up a typed capability by name from the graft caps list.
-fn get_graft_cap<T: capnp::capability::FromClientHook>(
+/// Look up a typed capability by name from the initial grants list.
+fn get_initial_grant<T: capnp::capability::FromClientHook>(
     caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Result<T, capnp::Error> {
@@ -81,7 +81,7 @@ fn get_graft_cap<T: capnp::capability::FromClientHook>(
         }
     }
     Err(capnp::Error::failed(format!(
-        "capability '{name}' not found in graft response"
+        "required initial grant '{name}' is missing"
     )))
 }
 
@@ -313,12 +313,11 @@ fn run_cell() {
     };
     let client: oracle_capnp::price_oracle::Client = capnp_rpc::new_client(oracle);
     log::info!("cell: exporting PriceOracle via RPC");
-    system::serve(client.client, |membrane: Membrane| async move {
-        // Fetch prices using HttpClient from the membrane.
-        let graft_resp = membrane.graft_request().send().promise.await?;
-        let graft = graft_resp.get()?;
-        let caps = graft.get_caps()?;
-        let http: http_capnp::http_client::Client = get_graft_cap(&caps, "http-client")?;
+    system::serve(client.client, |initial_grants: InitialGrants| async move {
+        let grants_resp = initial_grants.get_request().send().promise.await?;
+        let caps = grants_resp.get()?.get_caps()?;
+        let http: http_capnp::http_client::Client =
+            get_initial_grant(&caps, "http-client")?;
 
         if let Err(e) = fetch_prices(&http, &cache).await {
             log::warn!("cell: initial price fetch failed: {e}");
@@ -343,12 +342,12 @@ fn run_cell() {
 // Service mode — DHT registration and discovery
 // ---------------------------------------------------------------------------
 
-async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
-    let graft_resp = membrane.graft_request().send().promise.await?;
-    let results = graft_resp.get()?;
+async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> {
+    let grants_resp = initial_grants.get_request().send().promise.await?;
+    let results = grants_resp.get()?;
     let caps = results.get_caps()?;
-    let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
-    let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
+    let host: system_capnp::host::Client = get_initial_grant(&caps, "host")?;
+    let routing: routing_capnp::routing::Client = get_initial_grant(&caps, "routing")?;
 
     let id_resp = host.id_request().send().promise.await?;
     let self_id = id_resp.get()?.get_peer_id()?.to_vec();
@@ -460,12 +459,12 @@ async fn query_oracle(
     Ok(())
 }
 
-async fn run_consumer(membrane: Membrane) -> Result<(), capnp::Error> {
-    let graft_resp = membrane.graft_request().send().promise.await?;
-    let results = graft_resp.get()?;
+async fn run_consumer(initial_grants: InitialGrants) -> Result<(), capnp::Error> {
+    let grants_resp = initial_grants.get_request().send().promise.await?;
+    let results = grants_resp.get()?;
     let caps = results.get_caps()?;
-    let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
-    let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
+    let host: system_capnp::host::Client = get_initial_grant(&caps, "host")?;
+    let routing: routing_capnp::routing::Client = get_initial_grant(&caps, "routing")?;
 
     let network_resp = host.network_request().send().promise.await?;
     let network = network_resp.get()?;
@@ -518,19 +517,18 @@ async fn run_consumer(membrane: Membrane) -> Result<(), capnp::Error> {
 // HTTP/WAGI mode — stateless per-request handler
 // ---------------------------------------------------------------------------
 
-/// WAGI cell handler: graft membrane, fetch prices, respond with JSON.
+/// WAGI cell handler: read initial grants, fetch prices, respond with JSON.
 ///
-/// stdin/stdout carry CGI (body in, response out). The capnp membrane runs
+/// stdin/stdout carry CGI (body in, response out). The Cap'n Proto RPC runs
 /// over the `wetware:streams` side-channel — no conflict.
 fn run_http() -> Result<(), ()> {
     use wagi_guest as wagi;
 
-    system::run(|membrane: Membrane| async move {
-        let graft_resp = membrane.graft_request().send().promise.await?;
-        let graft = graft_resp.get()?;
-        let graft_caps = graft.get_caps()?;
+    system::run(|initial_grants: InitialGrants| async move {
+        let grants_resp = initial_grants.get_request().send().promise.await?;
+        let grants = grants_resp.get()?.get_caps()?;
         let http: http_capnp::http_client::Client =
-            get_graft_cap(&graft_caps, "http-client")?;
+            get_initial_grant(&grants, "http-client")?;
 
         let cache = init_cache();
         if let Err(e) = fetch_prices(&http, &cache).await {
@@ -611,11 +609,15 @@ impl Guest for OracleGuest {
         match std::env::args().nth(1).as_deref() {
             Some("serve") => {
                 log::info!("oracle: serve — DHT provide loop");
-                system::run(|membrane: Membrane| async move { run_service(membrane).await });
+                system::run(|initial_grants: InitialGrants| async move {
+                    run_service(initial_grants).await
+                });
             }
             Some("consume") => {
                 log::info!("oracle: consume — discover + query prices");
-                system::run(|membrane: Membrane| async move { run_consumer(membrane).await });
+                system::run(|initial_grants: InitialGrants| async move {
+                    run_consumer(initial_grants).await
+                });
             }
             _ => {
                 // Default (no args): cell mode — export the PriceOracle capability.

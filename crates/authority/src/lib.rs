@@ -211,17 +211,16 @@ pub mod schema_registry {
         #[test]
         fn core_cap_schema_cids_are_stable() {
             // CID snapshots guard against accidental protocol drift.
-            // Re-pinned for the authenticated VAT publication cutover:
-            // Host.network() transitively exposes VatListener's explicit
-            // serveRaw/serveAuthenticated methods. The interface IDs remain
-            // pinned; this snapshot records the intentional schema change.
+            // Host and Runtime reach Executor.spawn's Export type, so adding
+            // the sibling InitialGrants interface to membrane.capnp changes
+            // their canonical dependency graph. Interface IDs remain pinned.
             assert_eq!(
                 HOST_CID,
-                "bafkr4ie7d2lzj7ktjj5j5jmampbskj6wqi4hssa37ccgwtvxe5euxkbday"
+                "bafkr4icm7fhyzerlzv477jxvwkohhkyig6p3pzfc2twhcbowiqz6iugl7m"
             );
             assert_eq!(
                 RUNTIME_CID,
-                "bafkr4ifljlnaebne6hrnoxgzzlnuxcynbxn6hr6ebcoip455vn4sfdzoqm"
+                "bafkr4ics33cfatdvjuso5btlgkzdcvlrsoufo3fb6d6w5hthgfq35yt6oa"
             );
             assert_eq!(
                 ROUTING_CID,

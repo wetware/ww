@@ -2,24 +2,18 @@
 
 The real-WASM probe lives at `tests/fixtures/authority-probe`. It emits one
 small JSON line per focused probe. Ordinary tests run current characterization,
-the closed T3 confinement regressions, and the Cap'n Proto fork gate. The two
-intentionally failing cross-tranche tests are isolated from CI:
+the closed confinement regressions, and the Cap'n Proto fork gate.
 
-```sh
-cargo test --test child_authority_confinement t1_expected_red -- --ignored --nocapture --test-threads=1
-```
-
-The former T4 expected-red test is now a normal green regression covering both
-Glia evaluator paths. The remaining T5 expected-red test covers the temporary
-child-side `Membrane.graft()` compatibility interface used to deliver an exact
-`InitialAuthorityRecord`.
+The former T4 and T5 expected-red tests are normal green regressions. The probe
+reads exact named grants through `InitialGrants.get()`; no ordinary-child server
+implements the graft-capable `Membrane`.
 
 ## Layering and blocked cases
 
 | Case | T1 state |
 |---|---|
 | Empty-grant guest enumeration and concrete core-cap calls | Passing T3 regression |
-| Repeated current `graft()` name set | Passing characterization |
+| Repeated `InitialGrants.get()` name set | Passing characterization |
 | Same server under two names, two deliveries | Passing hard gate; exact fork revision asserted |
 | Empty/duplicate `caps` wire names | Passing T3 regression |
 | Path-like opaque wire label (`bad/name`) | Passing valid-name regression |
@@ -31,7 +25,7 @@ child-side `Membrane.graft()` compatibility interface used to deliver an exact
 | CID enumeration and `/ipfs` mutation absence | Current-negative characterization only |
 | CAS size/concurrency/fetch/cache pressure | Blocked on the T6 substrate/CAS fixture and measurable cache wiring |
 | `InitialAuthorityRecord`, exact record delivery, shared encoder | Passing T3 regression |
-| Grants-only bootstrap surface/no `graft()` | Expected red; owned by T5 |
+| Grants-only bootstrap surface/no `graft()` | Passing T5 regression |
 | Glia `:grants`, source duplicate diagnostics, lexical-capture removal | Passing T4 regression |
 
 The wire duplicate test deliberately says nothing about Glia map literals:
@@ -47,12 +41,13 @@ migrated as ordinary children:
   corrected Autoplan addendum explicitly keeps this pid0/shell export surface.
 - `src/executor.rs`, `src/cli/main.rs`, and `src/cli/shell.rs`: pid0/daemon and
   remote shell bootstrap consumers.
-- `std/shell/src/lib.rs`: shell-side consumption of the pid0-exported membrane.
+- `std/shell/src/lib.rs` is an ordinary WASM guest and reads explicit
+  `host`/`routing` grants. The CLI-side `src/cli/shell.rs` Terminal/Membrane
+  path remains the trusted remote surface.
 
-Ordinary children now receive exactly their requested named grants through
-`InitialAuthorityRecord`; they do not receive a universal host graft. The
-temporary compatibility bootstrap still implements `Membrane.graft()`, so the
-following guest consumers remain migration targets for T5:
+Ordinary children receive exactly their requested named grants through
+`InitialAuthorityRecord` and `InitialGrants.get()`; they do not receive a
+universal host graft. Migrated consumers include:
 
 - `std/status/src/lib.rs`: status cell obtains `host`.
 - `examples/oracle/src/lib.rs`: HTTP cell obtains `http-client`; serve and
@@ -60,8 +55,7 @@ following guest consumers remain migration targets for T5:
 - `examples/discovery/src/lib.rs`: service mode obtains `host` and `routing`.
 - `examples/chess/src/lib.rs`: service mode obtains host/routing/network
   authority.
-- Their README snippets and architecture/capability docs must move from
-  `membrane.graft()` to the T5 grants-only interface with the guest migration.
+- Their directly stale README snippets use the grants-only interface.
 
 Spawner/listener state after T3:
 

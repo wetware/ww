@@ -25,14 +25,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Immutable initial authority records.** Shared RPC helpers now decode,
   validate, retain, and re-encode ordered named capabilities, while rejecting
   empty or duplicate names without invoking opaque clients. Spawn decoding,
-  graft extras, and listener templates use the helpers; production child
-  bootstrap behavior is unchanged.
+  grants-only delivery, and listener templates use the helpers; repeated child
+  delivery returns the same immutable record.
 - **Child-authority confinement security harness.** A reusable real-WASM probe
   and ordinary green characterization suite now document spawned-child
   bootstrap behavior, including the Cargo.lock-pinned same-capability/two-name
-  routing gate. Two isolated ignored regressions remain intentionally red when
-  explicitly invoked, pinning the remaining T4 lexical-capture and T5
-  compatibility-interface work without making default CI red.
+  routing gate. The former T4 lexical-capture and T5 compatibility-interface
+  expected-red cases are now ordinary green regressions.
 - **One-command Chess authority proof.** `cargo run -p chess --example
   authority_proof` runs the full two-host libp2p authority demonstration and
   prints a fixed 30-line transcript: identities, policy, per-principal
@@ -170,6 +169,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   that caller-supplied route and failed with `no addresses for peer`.
 
 ### Changed
+- **Ordinary children now use a grants-only bootstrap.** The distinct
+  `InitialGrants` interface idempotently delivers only each child's immutable
+  named grants; the temporary child `Membrane.graft()` compatibility server is
+  removed. Status, shell, probe, generated-app, and example guests/spawners use
+  explicit grants, while pid0 and remote authenticated `Membrane` graft
+  behavior is unchanged.
 - **Membrane reentry is scoped to an explicit boundary lineage.** A request
   unwraps round-tripped capability parameters only when they came from the
   same session/tenant boundary. Independently membraned parameters remain

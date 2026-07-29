@@ -40,7 +40,7 @@ mod http_capnp {
     include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
 }
 
-type Membrane = membrane_capnp::membrane::Client;
+type InitialGrants = membrane_capnp::initial_grants::Client;
 
 #[derive(Clone)]
 struct NamedCap {
@@ -52,8 +52,8 @@ fn text_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-async fn graft(membrane: &Membrane) -> Result<Vec<NamedCap>, capnp::Error> {
-    let response = membrane.graft_request().send().promise.await?;
+async fn read_initial_grants(grants: &InitialGrants) -> Result<Vec<NamedCap>, capnp::Error> {
+    let response = grants.get_request().send().promise.await?;
     let caps = response.get()?.get_caps()?;
     let mut result = Vec::with_capacity(caps.len() as usize);
     for entry in caps.iter() {
@@ -102,9 +102,9 @@ fn optional_result<T: serde::Serialize, E: std::fmt::Display>(
 }
 
 fn run_enumerate() {
-    system::run(|membrane: Membrane| async move {
-        let first = graft(&membrane).await;
-        let second = graft(&membrane).await;
+    system::run(|initial_grants: InitialGrants| async move {
+        let first = read_initial_grants(&initial_grants).await;
+        let second = read_initial_grants(&initial_grants).await;
         emit(json!({
             "mode": "enumerate",
             "first": value_or_error(first.as_ref().map(|caps| names(caps))),
@@ -114,8 +114,8 @@ fn run_enumerate() {
     });
 }
 
-async fn invoke_named(membrane: Membrane, requested: String) -> Value {
-    let caps = match graft(&membrane).await {
+async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value {
+    let caps = match read_initial_grants(&initial_grants).await {
         Ok(caps) => caps,
         Err(error) => {
             return json!({"mode": "invoke", "name": requested, "ok": false, "error": text_error(error)});
@@ -255,8 +255,8 @@ async fn invoke_named(membrane: Membrane, requested: String) -> Value {
 
 fn run_invoke() {
     let requested = std::env::var("WW_PROBE_CAP").unwrap_or_else(|_| "host".to_owned());
-    system::run(|membrane: Membrane| async move {
-        emit(invoke_named(membrane, requested).await);
+    system::run(|initial_grants: InitialGrants| async move {
+        emit(invoke_named(initial_grants, requested).await);
         Ok(())
     });
 }
@@ -264,8 +264,8 @@ fn run_invoke() {
 fn run_arbitrary_name() {
     let requested =
         std::env::var("WW_PROBE_NAME").unwrap_or_else(|_| "definitely-not-granted".to_owned());
-    system::run(|membrane: Membrane| async move {
-        let value = match graft(&membrane).await {
+    system::run(|initial_grants: InitialGrants| async move {
+        let value = match read_initial_grants(&initial_grants).await {
             Ok(caps) => {
                 let matching: Vec<_> = caps
                     .iter()
@@ -292,9 +292,12 @@ fn run_arbitrary_name() {
 }
 
 fn run_alias_redelivery() {
-    system::run(|membrane: Membrane| async move {
+    system::run(|initial_grants: InitialGrants| async move {
         let result: Result<Value, capnp::Error> = async {
-            let deliveries = [graft(&membrane).await?, graft(&membrane).await?];
+            let deliveries = [
+                read_initial_grants(&initial_grants).await?,
+                read_initial_grants(&initial_grants).await?,
+            ];
             let mut observed = Vec::new();
             for (delivery, caps) in deliveries.iter().enumerate() {
                 for name in ["alias-a", "alias-b"] {
@@ -321,7 +324,7 @@ fn run_alias_redelivery() {
 }
 
 fn run_invoke_all() {
-    system::run(|membrane: Membrane| async move {
+    system::run(|initial_grants: InitialGrants| async move {
         let mut results = Vec::new();
         let mut usable = Vec::new();
         for name in [
@@ -333,7 +336,7 @@ fn run_invoke_all() {
             "ipfs",
             "http-client",
         ] {
-            let result = invoke_named(membrane.clone(), name.to_owned()).await;
+            let result = invoke_named(initial_grants.clone(), name.to_owned()).await;
             if result["ok"] == true {
                 usable.push(name);
             }
@@ -374,9 +377,9 @@ impl routing_capnp::provider_sink::Server for ProviderSink {
 }
 
 fn run_routing() {
-    system::run(|membrane: Membrane| async move {
+    system::run(|initial_grants: InitialGrants| async move {
         let result: Result<Value, capnp::Error> = async {
-            let caps = graft(&membrane).await?;
+            let caps = read_initial_grants(&initial_grants).await?;
             let routing: routing_capnp::routing::Client = find_cap(&caps, "routing")?;
 
             let mut hash = routing.hash_request();
@@ -453,9 +456,9 @@ async fn read_all(stream: system_capnp::byte_stream::Client) -> Result<Vec<u8>, 
 
 fn run_descendant() {
     let http_url = std::env::var("WW_PROBE_HTTP_URL").ok();
-    system::run(|membrane: Membrane| async move {
+    system::run(|initial_grants: InitialGrants| async move {
         let result: Result<Value, capnp::Error> = async {
-            let caps = graft(&membrane).await?;
+            let caps = read_initial_grants(&initial_grants).await?;
             let executor: system_capnp::executor::Client = find_cap(&caps, "restricted-executor")?;
             let mut request = executor.spawn_request();
             {
@@ -510,7 +513,7 @@ fn run_raw_host() {
 }
 
 fn run_substrate() {
-    system::run(|_membrane: Membrane| async move {
+    system::run(|_initial_grants: InitialGrants| async move {
         let args: Vec<String> = std::env::args().collect();
         let env: Vec<(String, String)> = std::env::vars().collect();
         let root = std::fs::read_dir("/").map(|entries| {

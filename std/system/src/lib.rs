@@ -584,16 +584,19 @@ where
 
 /// Run a guest program with an async entry point.
 ///
-/// Sets up the RPC session, bootstraps the host capability, and drives
+/// Sets up the RPC session, bootstraps the host-provided capability, and drives
 /// the provided async closure to completion alongside the RPC system.
 /// Handles all resource cleanup automatically.
+///
+/// For pid0 the host-provided capability is the graft-capable `Membrane`.
+/// Ordinary children receive the distinct grants-only `InitialGrants`.
 ///
 /// # Example
 ///
 /// ```no_run
-/// system::run(|membrane: capnp::capability::Client| async move {
-///     // Cast membrane to the generated Membrane client type in real guests.
-///     let _ = membrane;
+/// system::run(|initial_grants: capnp::capability::Client| async move {
+///     // Cast to the generated InitialGrants client type in ordinary guests.
+///     let _ = initial_grants;
 ///     Ok::<(), capnp::Error>(())
 /// });
 /// ```

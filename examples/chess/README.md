@@ -218,7 +218,7 @@ interface ChessEngine {
 ```clojure
 (def chess-wasm (perform :load "bin/chess-demo.wasm"))
 (def chess-executor (perform runtime :load chess-wasm))
-(def chess-process (perform chess-executor :spawn))
+(def chess-process (perform chess-executor :spawn :caps {}))
 (def chess-cap (perform chess-process :bootstrap))
 
 (perform host :serve-raw-vat chess-cap "chess")
@@ -227,7 +227,13 @@ interface ChessEngine {
 `glia/serve.glia`:
 
 ```clojure
-(perform runtime :run (perform :load "bin/chess-demo.wasm") "serve")
+(def chess-service-executor
+  (perform runtime :load (perform :load "bin/chess-demo.wasm")))
+(def chess-service-process
+  (perform chess-service-executor :spawn
+    :args ["serve"]
+    :caps {"host" host "routing" routing}))
+(perform chess-service-process :wait)
 ```
 
 `etc/init.d/chess.glia` is now a deployment-only hook. Keep

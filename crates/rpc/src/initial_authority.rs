@@ -130,13 +130,13 @@ mod tests {
             let mut cap_table = Vec::new();
             {
                 let mut results =
-                    message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                    message.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
                 results.imbue_mut(&mut cap_table);
                 let exports = results.reborrow().init_caps(record.grants().len() as u32);
                 record.encode(exports).unwrap();
             }
             let mut results = message
-                .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
+                .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
                 .unwrap();
             results.imbue(&cap_table);
             let decoded = InitialAuthorityRecord::decode(results.get_caps().unwrap()).unwrap();

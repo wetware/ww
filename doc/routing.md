@@ -8,7 +8,8 @@ service providers on the peer-to-peer network. The DHT is untrusted discovery
 
 ## Capabilities
 
-The `Routing` capability (obtained via `membrane.graft()`) provides:
+The `Routing` capability (explicitly delegated to an ordinary child and read
+via `initial_grants.get()`) provides:
 
 | Method | Shell syntax | Description |
 |--------|-------------|-------------|
@@ -21,8 +22,9 @@ The `Routing` capability (obtained via `membrane.graft()`) provides:
 | `remove` | `(perform routing :remove "<base-cid>" "path" true)` | Remove path from a derived UnixFS root; returns new root CID |
 | `publish` | `(perform routing :publish "ww" "<cid>" "/ipfs/<expected>")` | Publish CID to IPNS with optional CAS guard |
 
-All methods are epoch-guarded: they fail with `staleEpoch` when the on-chain head
-advances, forcing a re-graft.
+All methods are epoch-guarded: they fail with `staleEpoch` when the on-chain
+head advances. Pid0 must explicitly re-delegate fresh routing authority or
+respawn the child.
 
 ## Service discovery pattern
 
