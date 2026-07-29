@@ -137,7 +137,8 @@ async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value
                 let _ = network.get_http_listener()?;
                 Ok(json!({"peer_id": peer_id, "network_caps": true}))
             }
-            "ambient-parent" | "alias-a" | "alias-b" => {
+            "ambient-parent" | "alias-a" | "alias-b" | "status-source" | "narrow"
+            | "delegated-x" | "tracked" => {
                 let host: system_capnp::host::Client = find_cap(&caps, &requested)?;
                 let id = host.id_request().send().promise.await?;
                 Ok(json!({"peer_id": id.get()?.get_peer_id()?.to_vec()}))
@@ -323,6 +324,130 @@ fn run_alias_redelivery() {
     });
 }
 
+fn run_attenuated() {
+    system::run(|initial_grants: InitialGrants| async move {
+        let result: Result<Value, capnp::Error> = async {
+            let caps = read_initial_grants(&initial_grants).await?;
+            let names = names(&caps);
+            let host: system_capnp::host::Client = find_cap(&caps, "attenuated-host")?;
+            let id = host.id_request().send().promise.await?;
+            let peer_id = id.get()?.get_peer_id()?.to_vec();
+            let denied = match host.network_request().send().promise.await {
+                Ok(_) => {
+                    return Err(capnp::Error::failed(
+                        "attenuated host unexpectedly allowed network".into(),
+                    ))
+                }
+                Err(error) => error,
+            };
+            Ok(json!({
+                "names": names,
+                "peer_id": peer_id,
+                "denied": denied.to_string(),
+            }))
+        }
+        .await;
+        emit(match result {
+            Ok(detail) => json!({"mode": "attenuated", "ok": true, "detail": detail}),
+            Err(error) => json!({"mode": "attenuated", "ok": false, "error": text_error(error)}),
+        });
+        Ok(())
+    });
+}
+
+fn run_trusted_lattice() {
+    let image = std::env::var("WW_PROBE_IMAGE")
+        .unwrap_or_else(|_| "runtime-selected-image".to_owned())
+        .into_bytes();
+    system::run(|initial_grants: InitialGrants| async move {
+        let result: Result<Value, capnp::Error> = async {
+            let caps = read_initial_grants(&initial_grants).await?;
+            let runtime: system_capnp::runtime::Client = find_cap(&caps, "runtime")?;
+            let bound: system_capnp::executor::Client = find_cap(&caps, "bound-executor")?;
+
+            let mut load = runtime.load_request();
+            load.get().set_wasm(&image);
+            let selected = load.send().promise.await?.get()?.get_executor()?;
+            let selected_cid = selected
+                .cid_request()
+                .send()
+                .promise
+                .await?
+                .get()?
+                .get_cid()?
+                .to_str()
+                .map_err(|error| capnp::Error::failed(error.to_string()))?
+                .to_owned();
+            let bound_cid = bound
+                .cid_request()
+                .send()
+                .promise
+                .await?
+                .get()?
+                .get_cid()?
+                .to_str()
+                .map_err(|error| capnp::Error::failed(error.to_string()))?
+                .to_owned();
+            Ok(json!({
+                "names": names(&caps),
+                "selected_cid": selected_cid,
+                "bound_cid": bound_cid,
+                "different_images": selected_cid != bound_cid,
+            }))
+        }
+        .await;
+        emit(match result {
+            Ok(detail) => json!({"mode": "trusted-lattice", "ok": true, "detail": detail}),
+            Err(error) => {
+                json!({"mode": "trusted-lattice", "ok": false, "error": text_error(error)})
+            }
+        });
+        Ok(())
+    });
+}
+
+fn run_late_delegation() {
+    system::run(|initial_grants: InitialGrants| async move {
+        let result: Result<Value, capnp::Error> = async {
+            let initial = read_initial_grants(&initial_grants).await?;
+            let initial_names = names(&initial);
+            let mailbox: system_capnp::host::Client = find_cap(&initial, "mailbox")?;
+            let network = mailbox.network_request().send().promise.await?;
+            let vat_client = network.get()?.get_vat_client()?;
+            let mut receive = vat_client.dial_request();
+            receive.get().set_peer(&[]);
+            receive.get().set_protocol("late-delegation");
+            let delegated = receive
+                .send()
+                .promise
+                .await?
+                .get()?
+                .get_cap()
+                .get_as_capability::<AnyClient>()?;
+            let delegated: system_capnp::host::Client =
+                system_capnp::host::Client::new(delegated.hook);
+            let response = delegated.id_request().send().promise.await?;
+            let peer_id = response.get()?.get_peer_id()?.to_vec();
+            let after_names = names(&read_initial_grants(&initial_grants).await?);
+            Ok(json!({
+                "initial_names": initial_names,
+                "received_later": ["delegated-x"],
+                "current_holdings": ["mailbox", "delegated-x"],
+                "after_names": after_names,
+                "delegated_peer_id": peer_id,
+            }))
+        }
+        .await;
+        emit(match result {
+            Ok(detail) => json!({"mode": "late-delegation", "ok": true, "detail": detail}),
+            Err(error) => {
+                json!({"mode": "late-delegation", "ok": false, "error": text_error(error)})
+            }
+        });
+        Ok(())
+    });
+}
+
 fn run_invoke_all() {
     system::run(|initial_grants: InitialGrants| async move {
         let mut results = Vec::new();
@@ -460,33 +585,70 @@ fn run_descendant() {
         let result: Result<Value, capnp::Error> = async {
             let caps = read_initial_grants(&initial_grants).await?;
             let executor: system_capnp::executor::Client = find_cap(&caps, "restricted-executor")?;
-            let mut request = executor.spawn_request();
+            let narrow = caps.iter().find(|entry| entry.name == "narrow");
+
+            let mut alias_request = executor.spawn_request();
             {
-                let mut args = request.get().init_args(2);
+                let mut args = alias_request.get().init_args(2);
                 args.set(0, "authority-probe");
-                args.set(1, "invoke-all");
+                args.set(1, "alias-redelivery");
             }
-            if let Some(http_url) = http_url {
-                let mut env = request.get().init_env(1);
-                env.set(0, format!("WW_PROBE_HTTP_URL={http_url}"));
+            alias_request.get().init_env(0);
+            if let Some(narrow) = narrow {
+                let mut grants = alias_request.get().init_caps(2);
+                for (index, name) in ["alias-a", "alias-b"].iter().enumerate() {
+                    let mut entry = grants.reborrow().get(index as u32);
+                    entry.set_name(name);
+                    entry.init_cap().set_as_capability(narrow.cap.clone().hook);
+                }
             } else {
-                request.get().init_env(0);
+                alias_request.get().init_caps(0);
             }
-            request.get().init_caps(0);
-            let process = request.send().promise.await?.get()?.get_process()?;
-            let stdout = process
+            let alias_process = alias_request.send().promise.await?.get()?.get_process()?;
+            let alias_stdout = alias_process
                 .stdout_request()
                 .send()
                 .promise
                 .await?
                 .get()?
                 .get_stream()?;
-            let output = read_all(stdout).await?;
-            let text = String::from_utf8(output)
+            let alias_output = read_all(alias_stdout).await?;
+            let alias_text = String::from_utf8(alias_output)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
-            let nested: Value = serde_json::from_str(text.trim())
+            let aliases: Value = serde_json::from_str(alias_text.trim())
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
-            Ok(json!({"descendant": nested}))
+
+            let mut omitted_request = executor.spawn_request();
+            {
+                let mut args = omitted_request.get().init_args(2);
+                args.set(0, "authority-probe");
+                args.set(1, "invoke-all");
+            }
+            if let Some(http_url) = http_url {
+                let mut env = omitted_request.get().init_env(1);
+                env.set(0, format!("WW_PROBE_HTTP_URL={http_url}"));
+            } else {
+                omitted_request.get().init_env(0);
+            }
+            omitted_request.get().init_caps(0);
+            let omitted_process = omitted_request.send().promise.await?.get()?.get_process()?;
+            let omitted_stdout = omitted_process
+                .stdout_request()
+                .send()
+                .promise
+                .await?
+                .get()?
+                .get_stream()?;
+            let omitted_output = read_all(omitted_stdout).await?;
+            let omitted_text = String::from_utf8(omitted_output)
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            let omitted: Value = serde_json::from_str(omitted_text.trim())
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            Ok(json!({
+                "parent_names": names(&caps),
+                "aliases": aliases,
+                "omitted": omitted,
+            }))
         }
         .await;
         emit(match result {
@@ -568,6 +730,68 @@ fn run_substrate() {
     });
 }
 
+fn run_scratch_observe() {
+    system::run(|_initial_grants: InitialGrants| async move {
+        let path = "/tmp/authority-probe-private";
+        let observed_before_write = std::path::Path::new(path).exists();
+        let write = std::fs::write(path, b"sibling").map_err(text_error);
+        emit(json!({
+            "mode": "scratch-observe",
+            "observed_before_write": observed_before_write,
+            "write": value_or_error(write),
+        }));
+        Ok(())
+    });
+}
+
+fn run_scratch_parent() {
+    system::run(|initial_grants: InitialGrants| async move {
+        let result: Result<Value, capnp::Error> = async {
+            let caps = read_initial_grants(&initial_grants).await?;
+            let executor: system_capnp::executor::Client = find_cap(&caps, "restricted-executor")?;
+            let path = "/tmp/authority-probe-private";
+            std::fs::write(path, b"parent")
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+
+            let mut spawn = executor.spawn_request();
+            {
+                let mut args = spawn.get().init_args(2);
+                args.set(0, "authority-probe");
+                args.set(1, "scratch-observe");
+            }
+            spawn.get().init_env(0);
+            spawn.get().init_caps(0);
+            let child = spawn.send().promise.await?.get()?.get_process()?;
+            let stdout = child
+                .stdout_request()
+                .send()
+                .promise
+                .await?
+                .get()?
+                .get_stream()?;
+            let output = read_all(stdout).await?;
+            let child_report: Value = serde_json::from_slice(&output)
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            let parent_after =
+                std::fs::read(path).map_err(|error| capnp::Error::failed(error.to_string()))?;
+
+            Ok(json!({
+                "parent_names": names(&caps),
+                "child": child_report,
+                "parent_after": parent_after,
+            }))
+        }
+        .await;
+        emit(match result {
+            Ok(detail) => json!({"mode": "scratch-parent", "ok": true, "detail": detail}),
+            Err(error) => {
+                json!({"mode": "scratch-parent", "ok": false, "error": text_error(error)})
+            }
+        });
+        Ok(())
+    });
+}
+
 struct AuthorityProbe;
 
 impl Guest for AuthorityProbe {
@@ -576,11 +800,16 @@ impl Guest for AuthorityProbe {
             Some("invoke") => run_invoke(),
             Some("arbitrary-name") => run_arbitrary_name(),
             Some("alias-redelivery") => run_alias_redelivery(),
+            Some("attenuated") => run_attenuated(),
+            Some("trusted-lattice") => run_trusted_lattice(),
+            Some("late-delegation") => run_late_delegation(),
             Some("invoke-all") => run_invoke_all(),
             Some("routing") => run_routing(),
             Some("descendant") => run_descendant(),
             Some("raw-host") => run_raw_host(),
             Some("substrate") => run_substrate(),
+            Some("scratch-observe") => run_scratch_observe(),
+            Some("scratch-parent") => run_scratch_parent(),
             _ => run_enumerate(),
         }
         Ok(())

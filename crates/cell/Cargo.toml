@@ -22,6 +22,7 @@ cap-std = "3.4"
 wasmtime = { workspace = true, features = ["call-hook"] }
 wasmtime-wasi = "45.0.0"
 wasmtime-wasi-io = "45.0.0"
+tempfile = { workspace = true }
 
 # Workspace crates
 atom = { path = "../atom" }
@@ -32,4 +33,3 @@ ipfs = { path = "../ipfs" }
 
 [dev-dependencies]
 wat = "1"
-tempfile = { workspace = true }

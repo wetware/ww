@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,94 @@ struct CacheState {
     inflight: HashMap<Cid, Arc<Notify>>,
 }
 
+struct EnsureCancellationGuard {
+    state: Arc<Mutex<CacheState>>,
+    pinner: Arc<dyn Pinner>,
+    cid: Cid,
+    notify: Arc<Notify>,
+    pin_started: bool,
+    armed: bool,
+}
+
+impl EnsureCancellationGuard {
+    fn new(
+        state: Arc<Mutex<CacheState>>,
+        pinner: Arc<dyn Pinner>,
+        cid: Cid,
+        notify: Arc<Notify>,
+    ) -> Self {
+        Self {
+            state,
+            pinner,
+            cid,
+            notify,
+            pin_started: false,
+            armed: true,
+        }
+    }
+
+    fn mark_pin_started(&mut self) {
+        self.pin_started = true;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EnsureCancellationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let state = Arc::clone(&self.state);
+        let pinner = Arc::clone(&self.pinner);
+        let cid = self.cid;
+        let notify = Arc::clone(&self.notify);
+        let pin_started = self.pin_started;
+        tokio::spawn(async move {
+            let owns_inflight = {
+                let state = state.lock().await;
+                state
+                    .inflight
+                    .get(&cid)
+                    .is_some_and(|current| Arc::ptr_eq(current, &notify))
+            };
+            if !owns_inflight {
+                return;
+            }
+
+            if pin_started {
+                // Keep the in-flight slot occupied until rollback completes.
+                // Otherwise a waiter could install a fresh pin that this
+                // cleanup would then accidentally remove.
+                //
+                // Pin RPC cancellation does not prove whether the backend
+                // committed. Best-effort unpin prevents an untracked pin from
+                // escaping the cache lifecycle. Cancellation before pin
+                // begins never unpins someone else's existing state.
+                unpin_with_retry(&*pinner, &cid).await;
+            }
+
+            let removed = {
+                let mut state = state.lock().await;
+                let still_owns_inflight = state
+                    .inflight
+                    .get(&cid)
+                    .is_some_and(|current| Arc::ptr_eq(current, &notify));
+                if still_owns_inflight {
+                    state.inflight.remove(&cid);
+                }
+                still_owns_inflight
+            };
+            if removed {
+                notify.notify_waiters();
+            }
+        });
+    }
+}
+
 /// CID-keyed cache backed by IPFS pins, with a weight-aware ARC eviction policy.
 ///
 /// Manages which CIDs stay pinned in the IPFS node. Does not hold file
@@ -32,7 +121,7 @@ struct CacheState {
 /// Thread-safe: the inner ARC is wrapped in a `Mutex`. The expensive I/O
 /// operations (pin, unpin) happen outside the lock.
 pub struct PinsetCache {
-    state: Mutex<CacheState>,
+    state: Arc<Mutex<CacheState>>,
     pinner: Arc<dyn Pinner>,
     /// Host-wide staging directory for materialized IPFS content.
     /// Shared across all processes using `CacheMode::Shared`.
@@ -44,6 +133,79 @@ pub struct PinsetCache {
 
 /// Maximum retry attempts for failed unpins.
 const MAX_UNPIN_RETRIES: u32 = 3;
+static MATERIALIZATION_SEQ: AtomicU64 = AtomicU64::new(1);
+
+struct MaterializationGuard {
+    temporary_path: std::path::PathBuf,
+    committed: bool,
+}
+
+impl MaterializationGuard {
+    fn new(destination: &Path) -> Result<Self> {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("materialization destination has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("cid");
+        let seq = MATERIALIZATION_SEQ.fetch_add(1, Ordering::Relaxed);
+        Ok(Self {
+            temporary_path: parent.join(format!(".{name}.ww-part-{seq}")),
+            committed: false,
+        })
+    }
+
+    fn commit(mut self, destination: &Path) -> Result<()> {
+        if destination.exists() {
+            remove_materialized_path(&self.temporary_path);
+        } else {
+            std::fs::rename(&self.temporary_path, destination).with_context(|| {
+                format!(
+                    "failed to commit CAS materialization to {}",
+                    destination.display()
+                )
+            })?;
+        }
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for MaterializationGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            remove_materialized_path(&self.temporary_path);
+        }
+    }
+}
+
+fn remove_materialized_path(path: &Path) {
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+async fn fetch_to_path_atomically(
+    pinner: &dyn Pinner,
+    cid: &Cid,
+    subpath: Option<&str>,
+    destination: &Path,
+) -> Result<()> {
+    let guard = MaterializationGuard::new(destination)?;
+    match subpath {
+        Some(subpath) => {
+            pinner
+                .fetch_path_to_path(cid, subpath, &guard.temporary_path)
+                .await?
+        }
+        None => pinner.fetch_to_path(cid, &guard.temporary_path).await?,
+    }
+    guard.commit(destination)
+}
 
 fn pin_entry_weighter(_k: &Cid, v: &PinEntry) -> usize {
     v.size as usize
@@ -63,10 +225,10 @@ impl PinsetCache {
     pub fn new(pinner: Arc<dyn Pinner>, budget: usize) -> Result<Self> {
         let staging = TempDir::new().context("failed to create shared IPFS staging directory")?;
         Ok(Self {
-            state: Mutex::new(CacheState {
+            state: Arc::new(Mutex::new(CacheState {
                 arc: ArcInner::new(budget, Self::DEFAULT_GHOST_CAPACITY, pin_entry_weighter),
                 inflight: HashMap::new(),
-            }),
+            })),
             pinner,
             staging,
             bloom: crate::bloom::AtomicBloom::new(100_000, 0.00001),
@@ -90,12 +252,11 @@ impl PinsetCache {
     }
 
     pub async fn ensure(&self, cid: &Cid) -> Result<()> {
-        // Lock-free fast path: if bloom says definitely absent, skip the
-        // arc.get() probe inside the lock (saves ~200ns under lock on misses).
-        let maybe_cached = self.bloom.probably_contains(cid);
-
         // Check cache under lock.
-        loop {
+        let notify = loop {
+            // Re-evaluate after every wake. A waiter can begin before the
+            // winning insertion sets the bloom bits.
+            let maybe_cached = self.bloom.probably_contains(cid);
             let mut state = self.state.lock().await;
 
             if maybe_cached && state.arc.get(cid).is_some() {
@@ -105,24 +266,64 @@ impl PinsetCache {
             // Check if another task is already pinning this CID.
             if let Some(notify) = state.inflight.get(cid) {
                 let notify = Arc::clone(notify);
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                // Register while the state lock still prevents the owner from
+                // removing the slot and broadcasting completion.
+                notified.as_mut().enable();
                 drop(state);
 
                 // Wait for the in-flight pin to complete, then re-check.
-                notify.notified().await;
+                notified.await;
                 continue;
             }
 
             // Register ourselves as the in-flight pinner.
-            state.inflight.insert(*cid, Arc::new(Notify::new()));
-            break;
-        }
+            let notify = Arc::new(Notify::new());
+            state.inflight.insert(*cid, Arc::clone(&notify));
+            break notify;
+        };
 
-        // Slow path: size + pin outside the lock.
-        let result = self.size_and_pin(cid).await;
+        let mut cancellation = EnsureCancellationGuard::new(
+            Arc::clone(&self.state),
+            Arc::clone(&self.pinner),
+            *cid,
+            Arc::clone(&notify),
+        );
+
+        // Slow path: size + pin outside the lock. Record the exact point at
+        // which cancellation starts carrying an uncertain backend pin effect.
+        let result: Result<PinEntry> = async {
+            let size = self
+                .pinner
+                .size(cid)
+                .await
+                .context("failed to get size for CID")?;
+            cancellation.mark_pin_started();
+            self.pinner.pin(cid).await.context("failed to pin CID")?;
+            Ok(PinEntry { size })
+        }
+        .await;
+
+        // A failed pin may have committed remotely. Roll it back while this
+        // operation still owns the in-flight slot so a waiter cannot repin
+        // the CID until the uncertain effect has been removed.
+        if result.is_err() && cancellation.pin_started {
+            unpin_with_retry(&*self.pinner, cid).await;
+            cancellation.pin_started = false;
+        }
 
         // Re-lock and finalize.
         let mut state = self.state.lock().await;
-        let notify = state.inflight.remove(cid);
+        let owns_inflight = state
+            .inflight
+            .get(cid)
+            .is_some_and(|current| Arc::ptr_eq(current, &notify));
+        let removed_notify = if owns_inflight {
+            state.inflight.remove(cid)
+        } else {
+            None
+        };
 
         match result {
             Ok(entry) => {
@@ -130,36 +331,25 @@ impl PinsetCache {
                 self.bloom.insert(cid);
 
                 // Notify waiters before spawning unpins.
-                if let Some(n) = notify {
+                if let Some(n) = removed_notify {
                     n.notify_waiters();
                 }
 
                 // Unpin evicted entries in background.
                 self.spawn_unpins(evicted);
+                cancellation.disarm();
 
                 Ok(())
             }
             Err(e) => {
                 // Notify waiters that we failed.
-                if let Some(n) = notify {
+                if let Some(n) = removed_notify {
                     n.notify_waiters();
                 }
+                cancellation.disarm();
                 Err(e)
             }
         }
-    }
-
-    /// Get the size of a CID and pin it in the IPFS node.
-    async fn size_and_pin(&self, cid: &Cid) -> Result<PinEntry> {
-        let size = self
-            .pinner
-            .size(cid)
-            .await
-            .context("failed to get size for CID")?;
-
-        self.pinner.pin(cid).await.context("failed to pin CID")?;
-
-        Ok(PinEntry { size })
     }
 
     /// Fetch raw bytes for a CID from the IPFS node.
@@ -183,8 +373,7 @@ impl PinsetCache {
     ///
     /// The CID should already be pinned via a prior `ensure()` call.
     pub async fn fetch_to_path(&self, cid: &Cid, dst: &Path) -> Result<()> {
-        self.pinner
-            .fetch_to_path(cid, dst)
+        fetch_to_path_atomically(&*self.pinner, cid, None, dst)
             .await
             .with_context(|| format!("failed to stream CID /ipfs/{cid} to {}", dst.display()))
     }
@@ -193,8 +382,7 @@ impl PinsetCache {
     ///
     /// The CID should already be pinned via a prior `ensure()` call.
     pub async fn fetch_path_to_path(&self, cid: &Cid, subpath: &str, dst: &Path) -> Result<()> {
-        self.pinner
-            .fetch_path_to_path(cid, subpath, dst)
+        fetch_to_path_atomically(&*self.pinner, cid, Some(subpath), dst)
             .await
             .with_context(|| {
                 format!(
@@ -372,8 +560,7 @@ impl IsolatedPinset {
     ///
     /// The CID should already be pinned via a prior `ensure()` call.
     pub async fn fetch_to_path(&self, cid: &Cid, dst: &Path) -> Result<()> {
-        self.pinner
-            .fetch_to_path(cid, dst)
+        fetch_to_path_atomically(&*self.pinner, cid, None, dst)
             .await
             .with_context(|| format!("failed to stream CID /ipfs/{cid} to {}", dst.display()))
     }
@@ -382,8 +569,7 @@ impl IsolatedPinset {
     ///
     /// The CID should already be pinned via a prior `ensure()` call.
     pub async fn fetch_path_to_path(&self, cid: &Cid, subpath: &str, dst: &Path) -> Result<()> {
-        self.pinner
-            .fetch_path_to_path(cid, subpath, dst)
+        fetch_to_path_atomically(&*self.pinner, cid, Some(subpath), dst)
             .await
             .with_context(|| {
                 format!(
@@ -565,6 +751,302 @@ mod tests {
 
         // Should only pin once despite 10 concurrent callers.
         assert_eq!(pinner.pin_count.load(Ordering::Relaxed), 1);
+    }
+
+    struct CancelledPinPinner {
+        started: Notify,
+        unpin_count: AtomicUsize,
+    }
+
+    struct CancellationRacePinner {
+        first_pin_started: Notify,
+        unpin_started: Notify,
+        release_unpin: Notify,
+        second_pin_started: Notify,
+        pin_count: AtomicUsize,
+        unpin_count: AtomicUsize,
+        pinned: AtomicBool,
+    }
+
+    struct GatedPinPinner {
+        pin_started: Notify,
+        release_pin: Notify,
+        pin_count: AtomicUsize,
+    }
+
+    struct CancelledFetchPinner {
+        started: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Pinner for CancelledFetchPinner {
+        async fn pin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn unpin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(&self, _cid: &Cid) -> Result<Vec<u8>> {
+            anyhow::bail!("streaming path expected")
+        }
+
+        async fn fetch_to_path(&self, _cid: &Cid, dst: &Path) -> Result<()> {
+            std::fs::write(dst, b"partial")?;
+            self.started.notify_waiters();
+            std::future::pending::<Result<()>>().await
+        }
+
+        async fn size(&self, _cid: &Cid) -> Result<u64> {
+            Ok(7)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Pinner for CancelledPinPinner {
+        async fn pin(&self, _cid: &Cid) -> Result<()> {
+            self.started.notify_waiters();
+            std::future::pending::<Result<()>>().await
+        }
+
+        async fn unpin(&self, _cid: &Cid) -> Result<()> {
+            self.unpin_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn fetch(&self, _cid: &Cid) -> Result<Vec<u8>> {
+            anyhow::bail!("not used")
+        }
+
+        async fn size(&self, _cid: &Cid) -> Result<u64> {
+            Ok(1)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Pinner for CancellationRacePinner {
+        async fn pin(&self, _cid: &Cid) -> Result<()> {
+            let call = self.pin_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 1 {
+                self.first_pin_started.notify_waiters();
+                std::future::pending::<Result<()>>().await
+            } else {
+                self.pinned.store(true, Ordering::SeqCst);
+                self.second_pin_started.notify_waiters();
+                Ok(())
+            }
+        }
+
+        async fn unpin(&self, _cid: &Cid) -> Result<()> {
+            self.unpin_count.fetch_add(1, Ordering::SeqCst);
+            self.unpin_started.notify_waiters();
+            self.release_unpin.notified().await;
+            self.pinned.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn fetch(&self, _cid: &Cid) -> Result<Vec<u8>> {
+            anyhow::bail!("not used")
+        }
+
+        async fn size(&self, _cid: &Cid) -> Result<u64> {
+            Ok(1)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Pinner for GatedPinPinner {
+        async fn pin(&self, _cid: &Cid) -> Result<()> {
+            self.pin_count.fetch_add(1, Ordering::SeqCst);
+            self.pin_started.notify_one();
+            self.release_pin.notified().await;
+            Ok(())
+        }
+
+        async fn unpin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(&self, _cid: &Cid) -> Result<Vec<u8>> {
+            anyhow::bail!("not used")
+        }
+
+        async fn size(&self, _cid: &Cid) -> Result<u64> {
+            Ok(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_ensure_releases_inflight_and_pin_state() {
+        let pinner = Arc::new(CancelledPinPinner {
+            started: Notify::new(),
+            unpin_count: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(PinsetCache::new(pinner.clone(), 1024).unwrap());
+        let cid = test_cid(9);
+        let started = pinner.started.notified();
+        let task = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.ensure(&cid).await })
+        };
+        started.await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let inflight = cache.state.lock().await.inflight.contains_key(&cid);
+                if !inflight && pinner.unpin_count.load(Ordering::Relaxed) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation cleanup should finish");
+
+        let state = cache.state.lock().await;
+        assert!(
+            !state.inflight.contains_key(&cid),
+            "cancelling materialization must not strand an in-flight cache entry"
+        );
+        assert!(
+            !state.arc.contains(&cid),
+            "cancelling materialization must not publish cache ownership"
+        );
+        drop(state);
+        assert_eq!(
+            pinner.unpin_count.load(Ordering::Relaxed),
+            1,
+            "a cancelled cache insertion must release any partial backend pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_rollback_precedes_waiter_repin() {
+        let pinner = Arc::new(CancellationRacePinner {
+            first_pin_started: Notify::new(),
+            unpin_started: Notify::new(),
+            release_unpin: Notify::new(),
+            second_pin_started: Notify::new(),
+            pin_count: AtomicUsize::new(0),
+            unpin_count: AtomicUsize::new(0),
+            pinned: AtomicBool::new(false),
+        });
+        let cache = Arc::new(PinsetCache::new(pinner.clone(), 1024).unwrap());
+        let cid = test_cid(11);
+
+        let first_started = pinner.first_pin_started.notified();
+        let first = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.ensure(&cid).await })
+        };
+        first_started.await;
+        let unpin_started = pinner.unpin_started.notified();
+        first.abort();
+        let _ = first.await;
+        unpin_started.await;
+
+        let second_pin_started = pinner.second_pin_started.notified();
+        let second = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.ensure(&cid).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), second_pin_started)
+                .await
+                .is_err(),
+            "a waiter must remain blocked while cancellation rollback owns the in-flight slot"
+        );
+        assert_eq!(pinner.pin_count.load(Ordering::SeqCst), 1);
+
+        pinner.release_unpin.notify_one();
+        second.await.unwrap().unwrap();
+
+        assert_eq!(pinner.unpin_count.load(Ordering::SeqCst), 1);
+        assert_eq!(pinner.pin_count.load(Ordering::SeqCst), 2);
+        assert!(
+            pinner.pinned.load(Ordering::SeqCst),
+            "late cleanup must not remove the waiter's fresh pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_waiter_observes_completed_cache_entry_without_repinning() {
+        let pinner = Arc::new(GatedPinPinner {
+            pin_started: Notify::new(),
+            release_pin: Notify::new(),
+            pin_count: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(PinsetCache::new(pinner.clone(), 1024).unwrap());
+        let cid = test_cid(12);
+
+        let first_started = pinner.pin_started.notified();
+        let first = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.ensure(&cid).await })
+        };
+        first_started.await;
+
+        let second = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.ensure(&cid).await })
+        };
+        // Poll the waiter through registration before allowing the owner to
+        // broadcast. This exercises the no-lost-wakeup ordering.
+        tokio::task::yield_now().await;
+        pinner.release_pin.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+        })
+        .await
+        .expect("both concurrent ensures should complete");
+        assert_eq!(
+            pinner.pin_count.load(Ordering::SeqCst),
+            1,
+            "the waiter must observe the winning ARC entry instead of repinning"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_fetch_does_not_publish_or_leak_partial_staging_files() {
+        let pinner = Arc::new(CancelledFetchPinner {
+            started: Notify::new(),
+        });
+        let cache = Arc::new(PinsetCache::new(pinner.clone(), 1024).unwrap());
+        let cid = test_cid(10);
+        cache.ensure(&cid).await.unwrap();
+        let destination = cache.staging_dir().join(cid.to_string());
+        let started = pinner.started.notified();
+        let task = {
+            let cache = cache.clone();
+            let destination = destination.clone();
+            tokio::spawn(async move { cache.fetch_to_path(&cid, &destination).await })
+        };
+        started.await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            !destination.exists(),
+            "cancelled bytes must never become the committed CID path"
+        );
+        let leaked: Vec<_> = std::fs::read_dir(cache.staging_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "cancellation must remove temporary staging artifacts: {leaked:?}"
+        );
+        let state = cache.state.lock().await;
+        assert!(state.inflight.is_empty());
+        assert!(
+            state.arc.contains(&cid),
+            "the successfully committed bounded cache pin remains an intentional cache effect"
+        );
     }
 
     #[tokio::test]

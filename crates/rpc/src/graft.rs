@@ -254,6 +254,10 @@ pub struct HostGraftBuilder {
     extras: NamedCapabilities,
     /// IPFS HTTP client for Kubo API calls (e.g. IPNS resolution).
     ipfs_client: ipfs::HttpClient,
+    /// Host-internal view of the pid0 execution-generation lifetime. Every
+    /// graft for that generation shares this receiver; unrelated graft calls
+    /// therefore cannot invalidate pid0 registrations.
+    registration_scope: Option<watch::Receiver<()>>,
 }
 
 impl HostGraftBuilder {
@@ -279,6 +283,7 @@ impl HostGraftBuilder {
             runtime_client,
             extras: NamedCapabilities::default(),
             ipfs_client,
+            registration_scope: None,
         }
     }
 
@@ -292,6 +297,11 @@ impl HostGraftBuilder {
     ///
     pub fn with_extras(mut self, extras: NamedCapabilities) -> Self {
         self.extras = extras;
+        self
+    }
+
+    fn with_registration_scope(mut self, scope: watch::Receiver<()>) -> Self {
+        self.registration_scope = Some(scope);
         self
     }
 }
@@ -310,6 +320,9 @@ impl GraftBuilder for HostGraftBuilder {
             Some(guard.clone()),
             Some(self.stream_control.clone()),
         );
+        if let Some(scope) = self.registration_scope.clone() {
+            host_impl = host_impl.with_registration_scope(scope);
+        }
         if let Some(ref registry) = self.route_registry {
             host_impl = host_impl.with_route_registry(registry.clone());
         }
@@ -469,6 +482,18 @@ where
 /// Returns both the RPC system and the guest's exported [`GuestMembrane`], if
 /// the guest called `runtime::serve()`. If the guest called `runtime::run()`
 /// instead, the returned capability is broken and attempts to use it will fail.
+#[must_use = "dropping the scope owner invalidates this pid0 generation's HTTP registrations"]
+pub struct Pid0RegistrationScope {
+    _sender: watch::Sender<()>,
+}
+
+impl Pid0RegistrationScope {
+    fn new() -> (Self, watch::Receiver<()>) {
+        let (sender, receiver) = watch::channel(());
+        (Self { _sender: sender }, receiver)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_pid0_membrane_rpc<R, W>(
     reader: R,
@@ -484,11 +509,12 @@ pub fn build_pid0_membrane_rpc<R, W>(
     extras: NamedCapabilities,
     ipfs_client: ipfs::HttpClient,
     http_dial: Vec<String>,
-) -> (RpcSystem<Side>, GuestMembrane)
+) -> (RpcSystem<Side>, GuestMembrane, Pid0RegistrationScope)
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
+    let (registration_scope, registration_scope_rx) = Pid0RegistrationScope::new();
     let mut sess_builder = HostGraftBuilder::new(
         network_state,
         swarm_cmd_tx,
@@ -498,7 +524,8 @@ where
         http_dial,
         runtime_client,
         ipfs_client,
-    );
+    )
+    .with_registration_scope(registration_scope_rx);
     if !extras.is_empty() {
         sess_builder = sess_builder.with_extras(extras);
     }
@@ -518,7 +545,7 @@ where
     );
     let mut rpc_system = RpcSystem::new(Box::new(rpc_network), Some(membrane.client));
     let guest_membrane: GuestMembrane = rpc_system.bootstrap(Side::Client);
-    (rpc_system, guest_membrane)
+    (rpc_system, guest_membrane, registration_scope)
 }
 
 // IPFS content access is tested in fs_intercept::tests and vfs::tests.
@@ -533,6 +560,9 @@ mod tests {
 
     struct RuntimeStub;
     impl system_capnp::runtime::Server for RuntimeStub {}
+
+    struct ExecutorStub;
+    impl system_capnp::executor::Server for ExecutorStub {}
 
     /// Generate a random Ed25519 signing key (compatible with the rand version
     /// used by the root crate, which may differ from ed25519_dalek's rand_core).
@@ -634,6 +664,132 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn retained_issuing_host_cannot_keep_previous_registration_live() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let epoch = Epoch {
+                    seq: 1,
+                    head: b"pid0-session".to_vec(),
+                    provenance: Provenance::Block(1),
+                };
+                let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch);
+                let guard = EpochGuard {
+                    issued_seq: 1,
+                    receiver: epoch_rx,
+                };
+                let (swarm_tx, _swarm_rx) = mpsc::channel(1);
+                let registry = crate::dispatch::new_registry();
+                let (registration_scope, registration_scope_rx) = Pid0RegistrationScope::new();
+                let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
+                let builder = HostGraftBuilder::new(
+                    NetworkState::from_peer_id(vec![1, 2, 3]),
+                    swarm_tx,
+                    false,
+                    None,
+                    libp2p_stream::Behaviour::new().new_control(),
+                    Vec::new(),
+                    runtime,
+                    ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+                )
+                .with_route_registry(registry.clone())
+                .with_registration_scope(registration_scope_rx);
+
+                let mut first_message = capnp::message::Builder::new_default();
+                let mut first_cap_table = Vec::new();
+                {
+                    let mut results = first_message
+                        .init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                    results.imbue_mut(&mut first_cap_table);
+                    builder.build(&guard, results).expect("build first graft");
+                }
+                let mut first_results = first_message
+                    .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
+                    .expect("read first graft");
+                first_results.imbue(&first_cap_table);
+                let first_caps =
+                    crate::decode_exports(first_results.get_caps().expect("first graft caps"))
+                        .expect("decode first graft caps");
+                let host = first_caps
+                    .iter()
+                    .find(|entry| entry.name() == "host")
+                    .map(|entry| system_capnp::host::Client {
+                        client: entry.capability().clone(),
+                    })
+                    .expect("first graft host");
+
+                let network = host
+                    .network_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("network request")
+                    .get()
+                    .expect("network response")
+                    .get_http_listener()
+                    .expect("HTTP listener");
+                let retained_host =
+                    NamedCapabilities::try_from_pairs([("issuing-host", host.clone().client)])
+                        .expect("retained issuing host grant");
+                let executor: system_capnp::executor::Client = capnp_rpc::new_client(ExecutorStub);
+                let mut listen = network.listen_request();
+                listen.get().set_executor(executor);
+                listen.get().set_prefix("/status");
+                crate::encode_exports(
+                    &retained_host,
+                    listen.get().init_caps(retained_host.len() as u32),
+                )
+                .expect("encode retained host");
+                listen
+                    .send()
+                    .promise
+                    .await
+                    .expect("register first graft route");
+                assert_eq!(crate::dispatch::live_route_count(&registry), Ok(1));
+
+                // Readiness probes and external clients may perform additional
+                // grafts during one pid0 generation. Those grafts must not
+                // invalidate the generation's live route.
+                let mut replacement_message = capnp::message::Builder::new_default();
+                let mut replacement_cap_table = Vec::new();
+                {
+                    let mut results = replacement_message
+                        .init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>(
+                    );
+                    results.imbue_mut(&mut replacement_cap_table);
+                    builder
+                        .build(&guard, results)
+                        .expect("build replacement graft");
+                }
+                assert_eq!(
+                    crate::dispatch::live_route_count(&registry),
+                    Ok(1),
+                    "an unrelated graft must not invalidate pid0 registrations"
+                );
+
+                // Failed init or pid0 exit drops the execution-generation
+                // owner. The route retains its issuing Host as a grant, but
+                // that back-reference owns only a receiver and therefore
+                // cannot prolong readiness.
+                drop(registration_scope);
+                assert_eq!(
+                    crate::dispatch::live_route_count(&registry),
+                    Ok(0),
+                    "a retained issuing Host must not keep the old session ready"
+                );
+
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while !registry.read().expect("registry lock").is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("old registration cleanup");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn pid0_rpc_bootstrap_still_serves_the_full_graft() {
         let local = tokio::task::LocalSet::new();
         local
@@ -650,7 +806,7 @@ mod tests {
                 let (host_reader, host_writer) = io::split(host_stream);
                 let (guest_reader, guest_writer) = io::split(guest_stream);
 
-                let (host_rpc, _guest_export) = build_pid0_membrane_rpc(
+                let (host_rpc, _guest_export, _registration_scope) = build_pid0_membrane_rpc(
                     host_reader,
                     host_writer,
                     NetworkState::from_peer_id(vec![1, 2, 3]),

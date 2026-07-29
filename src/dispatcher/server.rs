@@ -21,7 +21,9 @@ use axum::routing::any;
 use axum::Router;
 use tokio::sync::{oneshot, watch};
 
-pub use rpc::dispatch::{new_registry, CgiRequest, CgiResponse, RequestSender, RouteRegistry};
+pub use rpc::dispatch::{
+    new_registry, CgiRequest, CgiResponse, RegistrationId, RequestSender, RouteEntry, RouteRegistry,
+};
 
 /// The axum HTTP server running on its own OS thread.
 ///
@@ -128,20 +130,17 @@ async fn handle_request(State(registry): State<RouteRegistry>, request: Request<
 }
 
 /// Find the longest prefix match in the route table.
-fn find_longest_prefix(
-    routes: &HashMap<String, RequestSender>,
-    path: &str,
-) -> Option<RequestSender> {
-    let mut best: Option<(&str, &RequestSender)> = None;
-    for (prefix, sender) in routes {
-        if path.starts_with(prefix.as_str()) {
+fn find_longest_prefix(routes: &HashMap<String, RouteEntry>, path: &str) -> Option<RequestSender> {
+    let mut best: Option<(&str, &RouteEntry)> = None;
+    for (prefix, entry) in routes {
+        if entry.is_live() && path.starts_with(prefix.as_str()) {
             match best {
                 Some((current_best, _)) if prefix.len() <= current_best.len() => {}
-                _ => best = Some((prefix.as_str(), sender)),
+                _ => best = Some((prefix.as_str(), entry)),
             }
         }
     }
-    best.map(|(_, sender)| sender.clone())
+    best.map(|(_, entry)| entry.sender())
 }
 
 /// Build an axum Response from a CgiResponse.
@@ -171,6 +170,32 @@ pub use rpc::dispatch::extract_server_info;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use authority::{system_capnp, Epoch, EpochGuard, Provenance};
+    use capnp::capability::Promise;
+
+    struct DispatchTestExecutor;
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::executor::Server for DispatchTestExecutor {
+        fn spawn(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::executor::SpawnParams,
+            _results: system_capnp::executor::SpawnResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::failed(
+                "dispatch test executor does not spawn".into(),
+            ))
+        }
+
+        fn cid(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::executor::CidParams,
+            mut results: system_capnp::executor::CidResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_cid("dispatch-test");
+            Promise::ok(())
+        }
+    }
 
     #[test]
     fn find_longest_prefix_empty_returns_none() {
@@ -206,5 +231,64 @@ mod tests {
     fn new_registry_is_empty() {
         let reg = new_registry();
         assert!(reg.read().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_route_stops_dispatch_before_async_cleanup() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(Epoch {
+                    seq: 1,
+                    head: Vec::new(),
+                    provenance: Provenance::Block(0),
+                });
+                let registry = new_registry();
+                let listener: system_capnp::http_listener::Client =
+                    capnp_rpc::new_client(rpc::http_listener::HttpListenerImpl::new(
+                        EpochGuard {
+                            issued_seq: 1,
+                            receiver: epoch_rx,
+                        },
+                        registry.clone(),
+                    ));
+                let mut listen = listener.listen_request();
+                listen
+                    .get()
+                    .set_executor(capnp_rpc::new_client(DispatchTestExecutor));
+                listen.get().set_prefix("/status");
+                listen
+                    .send()
+                    .promise
+                    .await
+                    .expect("install dispatch test route");
+
+                epoch_tx.send_replace(Epoch {
+                    seq: 2,
+                    head: Vec::new(),
+                    provenance: Provenance::Block(0),
+                });
+                assert_eq!(
+                    registry.read().expect("registry lock").len(),
+                    1,
+                    "the assertion must run before the cleanup task removes the entry"
+                );
+
+                let request = Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("dispatch request");
+                let response = handle_request(State(registry.clone()), request).await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "dispatch must ignore a stale entry without waiting for cleanup"
+                );
+                assert_eq!(
+                    registry.read().expect("registry lock").len(),
+                    1,
+                    "the stale entry should still be present, proving liveness rejected it first"
+                );
+            })
+            .await;
     }
 }

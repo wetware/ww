@@ -253,6 +253,7 @@ struct AdminState {
     network_state: rpc::NetworkState,
     version_info: VersionInfo,
     runtime_status: RuntimeStatus,
+    route_registry: Option<rpc::dispatch::RouteRegistry>,
     fuel_registry: FuelRegistry,
     rpc_metrics: RpcMetricsRegistry,
     cache_metrics: CacheMetricsRegistry,
@@ -420,7 +421,26 @@ async fn healthz_handler() -> impl IntoResponse {
 
 /// `GET /readyz` — reports whether the host has reached its serving phase.
 async fn readyz_handler(State(state): State<AdminState>) -> impl IntoResponse {
-    let status = state.runtime_status.snapshot();
+    let mut status = state.runtime_status.snapshot();
+    if status.ready {
+        if let Some(registry) = &state.route_registry {
+            match rpc::dispatch::live_route_count(registry) {
+                Ok(0) => {
+                    status.ready = false;
+                    status.phase = "waiting-for-http-route".to_string();
+                }
+                Ok(_) => {}
+                Err(reason) => {
+                    status.ready = false;
+                    status.phase = "route-status-unavailable".to_string();
+                    status.degraded = true;
+                    if !status.degraded_reasons.iter().any(|entry| entry == reason) {
+                        status.degraded_reasons.push(reason.to_string());
+                    }
+                }
+            }
+        }
+    }
     let code = if status.ready {
         StatusCode::OK
     } else {
@@ -528,6 +548,9 @@ pub struct AdminService {
     pub network_state: rpc::NetworkState,
     pub version_info: VersionInfo,
     pub runtime_status: RuntimeStatus,
+    /// When WAGI serving is enabled, readiness is derived from this same live
+    /// registration map rather than a separately maintained route count.
+    pub route_registry: Option<rpc::dispatch::RouteRegistry>,
     pub fuel_registry: FuelRegistry,
     pub rpc_metrics: RpcMetricsRegistry,
     pub cache_metrics: CacheMetricsRegistry,
@@ -548,6 +571,7 @@ impl crate::services::Service for AdminService {
                 network_state: self.network_state,
                 version_info: self.version_info,
                 runtime_status: self.runtime_status,
+                route_registry: self.route_registry,
                 fuel_registry: self.fuel_registry,
                 rpc_metrics: self.rpc_metrics,
                 cache_metrics: self.cache_metrics,
@@ -588,6 +612,8 @@ impl crate::services::Service for AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use authority::{system_capnp, Epoch, EpochGuard, Provenance};
+    use capnp::capability::Promise;
 
     fn test_state() -> AdminState {
         AdminState {
@@ -600,12 +626,88 @@ mod tests {
                 shell_wasm_blake3: Some("shell".to_string()),
             },
             runtime_status: RuntimeStatus::starting(),
+            route_registry: None,
             fuel_registry: new_fuel_registry(),
             rpc_metrics: new_rpc_metrics(),
             cache_metrics: new_cache_metrics(),
             stream_metrics: new_stream_metrics(),
             wasmtime_cache_metrics: crate::cell::engine::wasmtime_cache_metrics(),
         }
+    }
+
+    struct ReadinessExecutor;
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::executor::Server for ReadinessExecutor {
+        fn spawn(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::executor::SpawnParams,
+            _results: system_capnp::executor::SpawnResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::failed(
+                "readiness executor does not spawn".into(),
+            ))
+        }
+
+        fn cid(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::executor::CidParams,
+            mut results: system_capnp::executor::CidResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_cid("readiness-test");
+            Promise::ok(())
+        }
+    }
+
+    fn readiness_epoch() -> (tokio::sync::watch::Sender<Epoch>, EpochGuard) {
+        let (tx, receiver) = tokio::sync::watch::channel(Epoch {
+            seq: 1,
+            head: Vec::new(),
+            provenance: Provenance::Block(0),
+        });
+        (
+            tx,
+            EpochGuard {
+                issued_seq: 1,
+                receiver,
+            },
+        )
+    }
+
+    fn readiness_guard(tx: &tokio::sync::watch::Sender<Epoch>, issued_seq: u64) -> EpochGuard {
+        EpochGuard {
+            issued_seq,
+            receiver: tx.subscribe(),
+        }
+    }
+
+    fn advance_readiness_epoch(tx: &tokio::sync::watch::Sender<Epoch>, seq: u64) {
+        tx.send_replace(Epoch {
+            seq,
+            head: Vec::new(),
+            provenance: Provenance::Block(0),
+        });
+    }
+
+    async fn install_readiness_route(registry: &rpc::dispatch::RouteRegistry, guard: EpochGuard) {
+        let listener: system_capnp::http_listener::Client = capnp_rpc::new_client(
+            rpc::http_listener::HttpListenerImpl::new(guard, registry.clone()),
+        );
+        let mut request = listener.listen_request();
+        request
+            .get()
+            .set_executor(capnp_rpc::new_client(ReadinessExecutor));
+        request.get().set_prefix("/status");
+        request
+            .send()
+            .promise
+            .await
+            .expect("install readiness route");
+    }
+
+    async fn assert_readyz(state: &AdminState, expected: StatusCode) {
+        let response = readyz_handler(State(state.clone())).await.into_response();
+        assert_eq!(response.status(), expected);
     }
 
     #[tokio::test]
@@ -627,6 +729,71 @@ mod tests {
         state.runtime_status.set_ready();
         let response = readyz_handler(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_tracks_epoch_scoped_http_registration_lifecycle() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut state = test_state();
+                let registry = rpc::dispatch::new_registry();
+                state.route_registry = Some(registry.clone());
+                state.runtime_status.set_ready();
+                let (epoch_tx, old_guard) = readiness_epoch();
+
+                // Replacement init has not installed anything yet.
+                assert_readyz(&state, StatusCode::SERVICE_UNAVAILABLE).await;
+
+                install_readiness_route(&registry, old_guard).await;
+                assert_eq!(rpc::dispatch::live_route_count(&registry), Ok(1));
+                assert_readyz(&state, StatusCode::OK).await;
+
+                // Epoch liveness is checked from the entry itself, so the old
+                // route stops counting even before its cleanup task is polled.
+                advance_readiness_epoch(&epoch_tx, 2);
+                assert_eq!(rpc::dispatch::live_route_count(&registry), Ok(0));
+                assert_readyz(&state, StatusCode::SERVICE_UNAVAILABLE).await;
+
+                // Incomplete replacement init leaves readiness false.
+                tokio::task::yield_now().await;
+                assert_readyz(&state, StatusCode::SERVICE_UNAVAILABLE).await;
+
+                install_readiness_route(&registry, readiness_guard(&epoch_tx, 2)).await;
+                assert_eq!(rpc::dispatch::live_route_count(&registry), Ok(1));
+                assert_readyz(&state, StatusCode::OK).await;
+
+                // A late cleanup from epoch 1 must not disturb the epoch-2
+                // route or its derived readiness.
+                tokio::task::yield_now().await;
+                tokio::task::yield_now().await;
+                assert_eq!(registry.read().expect("registry lock").len(), 1);
+                assert_eq!(rpc::dispatch::live_route_count(&registry), Ok(1));
+                assert_readyz(&state, StatusCode::OK).await;
+
+                // A failed epoch-3 replacement performs no registration.
+                advance_readiness_epoch(&epoch_tx, 3);
+                tokio::task::yield_now().await;
+                assert_eq!(rpc::dispatch::live_route_count(&registry), Ok(0));
+                assert_readyz(&state, StatusCode::SERVICE_UNAVAILABLE).await;
+
+                // Repeated replacements overwrite the one path instead of
+                // accumulating route or readiness counts.
+                for seq in 3..=6 {
+                    install_readiness_route(&registry, readiness_guard(&epoch_tx, seq)).await;
+                    assert_eq!(registry.read().expect("registry lock").len(), 1);
+                    assert_eq!(rpc::dispatch::live_route_count(&registry), Ok(1));
+                    assert_readyz(&state, StatusCode::OK).await;
+
+                    advance_readiness_epoch(&epoch_tx, seq + 1);
+                    assert_eq!(rpc::dispatch::live_route_count(&registry), Ok(0));
+                    assert_readyz(&state, StatusCode::SERVICE_UNAVAILABLE).await;
+                }
+
+                tokio::task::yield_now().await;
+                assert!(registry.read().expect("registry lock").is_empty());
+            })
+            .await;
     }
 
     #[tokio::test]

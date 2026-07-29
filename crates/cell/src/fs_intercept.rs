@@ -34,6 +34,7 @@ pub(crate) struct IpfsFilesystemView<'a> {
     pub table: &'a mut wasmtime::component::ResourceTable,
     pub cache_mode: &'a Option<cache::CacheMode>,
     pub cid_tree: &'a Option<Arc<CidTree>>,
+    pub writable_descriptors: &'a mut std::collections::HashSet<u32>,
 }
 
 impl IpfsFilesystemView<'_> {
@@ -55,6 +56,7 @@ fn ipfs_filesystem(state: &mut ComponentRunStates) -> IpfsFilesystemView<'_> {
         table: &mut state.resource_table,
         cache_mode: &state.cache_mode,
         cid_tree: &state.cid_tree,
+        writable_descriptors: &mut state.writable_fs_descriptors,
     }
 }
 
@@ -486,6 +488,19 @@ impl types::HostDescriptor for IpfsFilesystemView<'_> {
         oflags: types::OpenFlags,
         flags: types::DescriptorFlags,
     ) -> FsResult<Resource<types::Descriptor>> {
+        // `/tmp` and every descriptor opened beneath it belong to the
+        // process-private scratch preopen, not to the immutable image tree.
+        // Descriptor identity keeps this routing decision out of guest paths
+        // and prevents a child from widening it.
+        if self.writable_descriptors.contains(&fd.rep()) {
+            let opened = self
+                .as_wasi_view()
+                .open_at(fd, path_flags, path, oflags, flags)
+                .await?;
+            self.writable_descriptors.insert(opened.rep());
+            return Ok(opened);
+        }
+
         // CidTree-rooted paths resolve through the virtual filesystem.
         // Guests build `$WW_ROOT/…` paths which wasi-libc turns into
         // relative `ipfs/<root_cid>/…`; route those through CidTree so
@@ -526,6 +541,7 @@ impl types::HostDescriptor for IpfsFilesystemView<'_> {
     }
 
     fn drop(&mut self, fd: Resource<types::Descriptor>) -> wasmtime::Result<()> {
+        self.writable_descriptors.remove(&fd.rep());
         self.as_wasi_view().drop(fd)
     }
 
@@ -660,7 +676,13 @@ impl types::HostDirectoryEntryStream for IpfsFilesystemView<'_> {
 
 impl preopens::Host for IpfsFilesystemView<'_> {
     fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<types::Descriptor>, String)>> {
-        self.as_wasi_view().get_directories()
+        let directories = self.as_wasi_view().get_directories()?;
+        for (descriptor, path) in &directories {
+            if path == "/tmp" {
+                self.writable_descriptors.insert(descriptor.rep());
+            }
+        }
+        Ok(directories)
     }
 }
 
@@ -811,6 +833,7 @@ mod tests {
         resource_table: wasmtime::component::ResourceTable,
         cache_mode: Option<cache::CacheMode>,
         cid_tree: Option<Arc<CidTree>>,
+        writable_descriptors: std::collections::HashSet<u32>,
     }
 
     impl TestHarness {
@@ -820,6 +843,7 @@ mod tests {
                 resource_table: wasmtime::component::ResourceTable::new(),
                 cache_mode,
                 cid_tree: None,
+                writable_descriptors: std::collections::HashSet::new(),
             }
         }
 
@@ -829,6 +853,7 @@ mod tests {
                 table: &mut self.resource_table,
                 cache_mode: &self.cache_mode,
                 cid_tree: &self.cid_tree,
+                writable_descriptors: &mut self.writable_descriptors,
             }
         }
     }

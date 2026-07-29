@@ -555,6 +555,7 @@ impl Cell {
         let ipfs_client = self.ipfs_client.clone();
         let http_dial = self.http_dial.clone();
         let runtime_engine = self.wasmtime_engine.clone();
+        let runtime_pinset_cache = self.pinset_cache.clone();
         let initial_epoch = self.initial_epoch.clone().unwrap_or(Epoch {
             seq: 0,
             head: vec![],
@@ -587,18 +588,19 @@ impl Cell {
         // Runtime owns image loading, compilation, and executor caching only.
         // pid0 receives this client through its trusted full graft below;
         // image-bound Executors never retain or propagate it to children.
-        let runtime_client = crate::launcher::create_runtime_client(
+        let runtime_client = crate::launcher::create_runtime_client_with_pinset(
             wasm_debug,
             None,
             runtime_engine,
             compile_tx,
             cache_policy,
+            runtime_pinset_cache,
         );
 
         // Clone epoch receiver for Terminal auth before it's moved into the RPC system.
         let terminal_epoch_rx = epoch_rx.clone();
 
-        let (rpc_system, guest_membrane) = rpc::graft::build_pid0_membrane_rpc(
+        let (rpc_system, guest_membrane, registration_scope) = rpc::graft::build_pid0_membrane_rpc(
             reader,
             writer,
             network_state,
@@ -663,6 +665,10 @@ impl Cell {
                 1
             }
         };
+        // The trusted execution generation, rather than any child-visible
+        // capability or individual graft call, owns HTTP registration
+        // liveness. Drop it as soon as the pid0 guest exits or fails.
+        drop(registration_scope);
         tracing::debug!(code = exit_code, "Guest exited (streams RPC)");
 
         Ok(SpawnResult {
