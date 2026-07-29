@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Explicit Glia child grants.** `(cell image)` now creates a child with zero
+  application grants, while `(cell image :grants {...})` transfers exactly the
+  named capabilities in deterministic order. Literal duplicate names,
+  non-capability values, and capabilities that cannot cross the process
+  boundary fail before spawn instead of being silently dropped. Shipped init
+  and example registrations now declare their grant sets explicitly, and
+  likely legacy lexical-capture sites receive a migration warning.
 - **Constructive authority for ordinary child processes.** `Executor.spawn`
   validates named grants before process construction and gives each child only
   its immutable `InitialAuthorityRecord`; ordinary children no longer retain
