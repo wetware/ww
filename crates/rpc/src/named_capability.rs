@@ -286,14 +286,14 @@ mod tests {
         let mut cap_table = Vec::new();
         {
             let mut results =
-                message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                message.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
             results.imbue_mut(&mut cap_table);
             let exports = results.reborrow().init_caps(capabilities.len() as u32);
             encode_exports(capabilities, exports).expect("encode exports");
         }
         let mut results = message
-            .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
-            .expect("graft results reader");
+            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
+            .expect("initial grants results reader");
         results.imbue(&cap_table);
         decode_exports(results.get_caps().expect("exports reader")).expect("decode exports")
     }
@@ -374,14 +374,14 @@ mod tests {
         let mut cap_table = Vec::new();
         {
             let mut results =
-                message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                message.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
             results.imbue_mut(&mut cap_table);
             let mut entry = results.reborrow().init_caps(1).get(0);
             entry.set_name(capnp::text::Reader(&[0xff]));
             entry.init_cap().set_as_capability(cap.hook);
         }
         let mut results = message
-            .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
+            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
             .unwrap();
         results.imbue(&cap_table);
         let error = decode_exports(results.get_caps().unwrap())
@@ -397,7 +397,7 @@ mod tests {
         let mut cap_table = Vec::new();
         {
             let mut results =
-                message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                message.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
             results.imbue_mut(&mut cap_table);
             let mut exports = results.reborrow().init_caps(2);
             for index in 0..2 {
@@ -407,7 +407,7 @@ mod tests {
             }
         }
         let mut results = message
-            .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
+            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
             .unwrap();
         results.imbue(&cap_table);
         let error = decode_exports(results.get_caps().unwrap())
@@ -421,11 +421,11 @@ mod tests {
         let mut missing = capnp::message::Builder::new_default();
         {
             let mut results =
-                missing.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                missing.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
             results.reborrow().init_caps(1).get(0).set_name("missing");
         }
         let results = missing
-            .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
+            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
             .unwrap();
         let error = decode_exports(results.get_caps().unwrap())
             .err()
@@ -435,7 +435,7 @@ mod tests {
         let mut malformed = capnp::message::Builder::new_default();
         {
             let mut results =
-                malformed.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                malformed.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
             let mut entry = results.reborrow().init_caps(1).get(0);
             entry.set_name("malformed");
             entry
@@ -444,7 +444,7 @@ mod tests {
                 .unwrap();
         }
         let results = malformed
-            .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
+            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
             .unwrap();
         assert!(decode_exports(results.get_caps().unwrap()).is_err());
     }

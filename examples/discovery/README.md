@@ -95,7 +95,7 @@ BUILD TIME:
   greeter.capnp --> capnpc --> discovery.wasm
 
 AGENT A (service mode):                    AGENT B (service mode):
-  membrane.graft()                           membrane.graft()
+  initial_grants.get()                       initial_grants.get()
   routing.hash("greeter")                    routing.hash("greeter")
   routing.provide(key)  --DHT-->            routing.find_providers(key)
                                              |
@@ -138,7 +138,7 @@ The same binary serves both roles:
 ```clojure
 (def discovery-wasm (perform :load "bin/discovery.wasm"))
 (def discovery-executor (perform runtime :load discovery-wasm))
-(def discovery-process (perform discovery-executor :spawn))
+(def discovery-process (perform discovery-executor :spawn :caps {}))
 (def discovery-cap (perform discovery-process :bootstrap))
 
 (perform host :serve-raw-vat discovery-cap "greeter")
@@ -147,7 +147,13 @@ The same binary serves both roles:
 `glia/serve.glia`:
 
 ```clojure
-(perform runtime :run (perform :load "bin/discovery.wasm") "serve")
+(def discovery-service-executor
+  (perform runtime :load (perform :load "bin/discovery.wasm")))
+(def discovery-service-process
+  (perform discovery-service-executor :spawn
+    :args ["serve"]
+    :caps {"host" host "routing" routing}))
+(perform discovery-service-process :wait)
 ```
 
 `etc/init.d/discovery.glia` is now a deployment-only hook. Keep

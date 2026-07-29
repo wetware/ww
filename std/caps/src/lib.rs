@@ -831,11 +831,11 @@ pub fn wrap_with_handlers(form: &Val, extra_caps: &[&str]) -> Val {
 }
 
 // ---------------------------------------------------------------------------
-// Graft helpers: name-based lookup in parallel lists
+// Initial-grant helpers: name-based lookup in the delivered Export list
 // ---------------------------------------------------------------------------
 
-/// Look up a typed capability by name from the graft caps list.
-pub fn get_graft_cap<T: capnp::capability::FromClientHook>(
+/// Look up a typed capability by name from the initial grants list.
+pub fn get_initial_grant<T: capnp::capability::FromClientHook>(
     caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Result<T, capnp::Error> {
@@ -850,7 +850,7 @@ pub fn get_graft_cap<T: capnp::capability::FromClientHook>(
         }
     }
     Err(capnp::Error::failed(format!(
-        "capability '{name}' not found in graft response"
+        "required initial grant '{name}' is missing"
     )))
 }
 
@@ -861,6 +861,27 @@ pub fn get_graft_cap<T: capnp::capability::FromClientHook>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_required_initial_grant_fails_clearly() {
+        let mut message = capnp::message::Builder::new_default();
+        let _: capnp::struct_list::Builder<'_, membrane_capnp::export::Owned> =
+            message.initn_root(0);
+        let caps = message
+            .get_root_as_reader::<capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>>()
+            .expect("initial grants");
+
+        let error = match get_initial_grant::<capnp::capability::Client>(&caps, "host") {
+            Ok(_) => panic!("missing required grant must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("required initial grant 'host' is missing"),
+            "unexpected missing-grant diagnostic: {error}"
+        );
+    }
 
     #[test]
     fn import_path_resolution_relative() {

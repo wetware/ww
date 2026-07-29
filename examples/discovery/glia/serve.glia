@@ -1,2 +1,8 @@
 ; Demo snippet: start DHT provide + peer discovery loop.
-(perform runtime :run (perform :load "bin/discovery.wasm") "serve")
+(def discovery-service-executor
+  (perform runtime :load (perform :load "bin/discovery.wasm")))
+(def discovery-service-process
+  (perform discovery-service-executor :spawn
+    :args ["serve"]
+    :caps {"host" host "routing" routing}))
+(perform discovery-service-process :wait)

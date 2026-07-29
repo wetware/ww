@@ -1,9 +1,9 @@
 # Wetware peer interfaces.
 #
-# These capabilities are surfaced to WASM guests through the Membrane's
-# epoch-scoped session (see membrane.capnp).  Each capability wrapper
-# holds an EpochGuard and fails with a stale-epoch error once the guard
-# detects the epoch has advanced.
+# Trusted pid0 obtains these capabilities through its Membrane. Ordinary
+# children can receive selected references only through explicit parent grants
+# delivered by InitialGrants (see membrane.capnp). Host-derived wrappers hold
+# an EpochGuard and fail with a stale-epoch error after an epoch advance.
 
 @0xbf5147b78c0e6a2f;
 
@@ -84,8 +84,8 @@ interface Executor {
   # args and env.  Late-binding args/env is required for WAGI, which
   # injects per-request CGI env vars (REQUEST_METHOD, PATH_INFO, etc.).
   #
-  # caps: optional named capabilities to inject into the child's
-  # membrane graft as extras.  Forwarded from init.d `with` blocks.
+  # caps: the child's complete named initial grant set. Empty means the child
+  # receives zero application capabilities.
 
   cid @1 () -> (cid :Text);
   # Return the CID of the bound WASM binary.
@@ -98,9 +98,8 @@ interface StreamListener {
   # For each stream, spawn a cell process via Executor
   # and wire stdin/stdout to the stream.
   #
-  # caps: optional named capabilities from the init.d `with` block.
-  # Forwarded into spawned cells' membranes as graft extras.
-  # Empty list (default) = no extra caps.
+  # caps: immutable registration-time grant template copied exactly into each
+  # spawned child's InitialAuthorityRecord. Empty means zero grants.
 }
 
 interface HttpListener {
@@ -111,9 +110,8 @@ interface HttpListener {
   # CGI env vars are passed as environment, request body to stdin,
   # CGI response read from stdout.
   #
-  # caps: optional named capabilities from the init.d `with` block.
-  # Forwarded into spawned cells' membranes as graft extras.
-  # Empty list (default) = no extra caps.
+  # caps: immutable registration-time grant template copied exactly into each
+  # spawned child's InitialAuthorityRecord. Empty means zero grants.
 }
 
 interface StreamDialer {

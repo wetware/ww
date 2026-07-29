@@ -1,2 +1,8 @@
 ; Demo snippet: start oracle DHT provide loop.
-(perform runtime :run (perform :load "bin/oracle.wasm") "serve")
+(def oracle-service-executor
+  (perform runtime :load (perform :load "bin/oracle.wasm")))
+(def oracle-service-process
+  (perform oracle-service-executor :spawn
+    :args ["serve"]
+    :caps {"host" host "routing" routing}))
+(perform oracle-service-process :wait)

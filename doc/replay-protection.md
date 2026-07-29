@@ -110,8 +110,9 @@ pub fn check(&self) -> Result<(), Error> {
 
 When the epoch advances (on-chain `HeadUpdated` event, finalized by the
 confirmation-depth strategy), all outstanding capabilities fail simultaneously.
-The agent must call `Membrane.graft()` again to receive fresh capabilities
-bound to the new epoch.
+Trusted pid0 may call `Membrane.graft()` again. Ordinary children have no graft
+surface: they receive fresh references only through explicit ancestor
+re-delegation or respawn.
 
 This is the runtime backstop. Even if Layers 1 and 2 were somehow bypassed,
 a capability issued under epoch N cannot be used during epoch N+1.

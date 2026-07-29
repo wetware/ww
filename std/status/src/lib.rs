@@ -14,7 +14,7 @@
 //!
 //! `status` and `version` are always populated. `peer_id`, `listen_addrs`,
 //! and `peer_count` come from the `host` capability if it's in the cell's
-//! graft; if the cap is withheld they degrade to `null`.
+//! initial grants; if the cap is withheld they degrade to `null`.
 //!
 //! WAGI mode only. Runs once per HTTP request — fresh cell, no state.
 
@@ -53,13 +53,13 @@ mod http_capnp {
     include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
 }
 
-type Membrane = membrane_capnp::membrane::Client;
+type InitialGrants = membrane_capnp::initial_grants::Client;
 
 const HOST_CALL_TIMEOUT_NS: u64 = 500_000_000; // 500ms
 
-/// Look up a typed capability by name in the graft caps list.
+/// Look up a typed capability by name in the initial grants list.
 /// Returns `None` if the cap is missing — used for graceful degradation.
-fn graft_cap_opt<T: FromClientHook>(
+fn initial_grant_opt<T: FromClientHook>(
     caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Option<T> {
@@ -196,7 +196,7 @@ async fn host_peer_count(host: &system_capnp::host::Client) -> Option<usize> {
 }
 
 /// Build the JSON body for `/status`. `host_cap` is `None` when the
-/// graft did not include it.
+/// initial grants did not include it.
 async fn build_status_json(host_cap: Option<system_capnp::host::Client>) -> String {
     let (peer_id, listen_addrs, peer_count) = match host_cap {
         Some(h) => (
@@ -220,10 +220,10 @@ async fn build_status_json(host_cap: Option<system_capnp::host::Client>) -> Stri
 fn run_http() -> Result<(), ()> {
     use wagi_guest as wagi;
 
-    system::run(|membrane: Membrane| async move {
-        let graft_resp = membrane.graft_request().send().promise.await?;
-        let caps = graft_resp.get()?.get_caps()?;
-        let host_cap: Option<system_capnp::host::Client> = graft_cap_opt(&caps, "host");
+    system::run(|initial_grants: InitialGrants| async move {
+        let grants_resp = initial_grants.get_request().send().promise.await?;
+        let caps = grants_resp.get()?.get_caps()?;
+        let host_cap: Option<system_capnp::host::Client> = initial_grant_opt(&caps, "host");
         if host_cap.is_none() {
             log::info!("host cap withheld — peer_id/listen_addrs/peer_count will be null");
         }

@@ -24,7 +24,7 @@ use wasip2::exports::cli::run::Guest;
 
 // Shared effect handler factories.
 use caps::{
-    get_graft_cap, make_host_handler, make_import_handler, make_routing_handler,
+    get_initial_grant, make_host_handler, make_import_handler, make_routing_handler,
     membrane_capnp, routing_capnp, system_capnp, LoadRuntime,
 };
 
@@ -40,7 +40,7 @@ mod schema_ids {
     include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 }
 
-type Membrane = membrane_capnp::membrane::Client;
+type InitialGrants = membrane_capnp::initial_grants::Client;
 
 // ---------------------------------------------------------------------------
 // Session — capability context for the shell cell
@@ -278,15 +278,15 @@ fn run_impl() {
     };
     let client: shell_capnp::shell::Client = capnp_rpc::new_client(shell_impl);
 
-    system::serve(client.client, |membrane: Membrane| async move {
-        // 1. Graft the membrane to obtain capabilities.
-        let graft_resp = membrane.graft_request().send().promise.await?;
-        let results = graft_resp.get()?;
+    system::serve(client.client, |initial_grants: InitialGrants| async move {
+        // 1. Read this process's fixed initial grants.
+        let grants_resp = initial_grants.get_request().send().promise.await?;
+        let results = grants_resp.get()?;
 
-        // Find capabilities by name in the graft caps list.
+        // Find capabilities by name in the initial grants list.
         let caps = results.get_caps()?;
-        let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
-        let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
+        let host: system_capnp::host::Client = get_initial_grant(&caps, "host")?;
+        let routing: routing_capnp::routing::Client = get_initial_grant(&caps, "routing")?;
 
         // Populate session so cap handlers can access capabilities.
         {

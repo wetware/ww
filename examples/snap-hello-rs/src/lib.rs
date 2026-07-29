@@ -17,7 +17,7 @@
 //!       https://docs.farcaster.xyz/snap/auth
 //!       https://docs.farcaster.xyz/snap/buttons
 //!
-//! Stateless. Fresh cell per request. No graft caps used.
+//! Stateless. Fresh cell per request. No initial grants used.
 //!
 //! IMPORTANT — FID trust model: this example verifies the payload
 //! signature, but does not query a Farcaster Hub to confirm that the

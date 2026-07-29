@@ -1,15 +1,10 @@
 //! T1 constructive child-authority confinement harness.
 //!
 //! Ordinary `cargo test` runs the characterization tests, closed confinement
-//! regressions, and the mandatory Cap'n Proto fork gate. The remaining
-//! cross-tranche expected-red case is isolated:
-//!
-//! ```text
-//! cargo test --test child_authority_confinement t1_expected_red -- --ignored --nocapture
-//! ```
-//!
-//! T4 owns implicit Glia lexical capture. T5 owns removal of the temporary
-//! child-side `Membrane.graft()` compatibility shape.
+//! regressions, and the mandatory Cap'n Proto fork gate. The former T4 and T5
+//! expected-red cases are ordinary green regressions. Ordinary children now
+//! receive their immutable grants through the distinct `InitialGrants`
+//! interface.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -772,11 +767,42 @@ fn t4_migrated_glia_cell_sites_parse() {
         ("examples/echo/glia/register.glia", &[":grants {}"][..]),
         (
             "examples/oracle/glia/register.glia",
-            &[":grants {:http-client http-client}", ":spawn :caps {}"][..],
+            &[
+                ":grants {:http-client http-client}",
+                ":caps {\"http-client\" http-client}",
+            ][..],
         ),
         (
             "examples/snap-hello-rs/glia/register.glia",
             &[":grants {}"][..],
+        ),
+        (
+            "examples/chess/glia/serve.glia",
+            &[
+                ":args [\"serve\"]",
+                ":caps {\"host\" host \"routing\" routing}",
+            ][..],
+        ),
+        (
+            "examples/discovery/glia/serve.glia",
+            &[
+                ":args [\"serve\"]",
+                ":caps {\"host\" host \"routing\" routing}",
+            ][..],
+        ),
+        (
+            "examples/oracle/glia/serve.glia",
+            &[
+                ":args [\"serve\"]",
+                ":caps {\"host\" host \"routing\" routing}",
+            ][..],
+        ),
+        (
+            "examples/oracle/glia/consume.glia",
+            &[
+                ":args [\"consume\"]",
+                ":caps {\"host\" host \"routing\" routing}",
+            ][..],
         ),
         (
             "std/status/etc/init.d/05-status.glia",
@@ -797,15 +823,31 @@ fn t4_migrated_glia_cell_sites_parse() {
 }
 
 #[test]
-#[ignore = "T1 expected red (T5): ordinary children still expose InitialAuthorityRecord through the compatibility Membrane.graft() interface"]
-fn t1_expected_red_child_bootstrap_has_no_membrane_graft_compatibility_shape() {
+fn ordinary_child_bootstrap_has_no_membrane_graft_compatibility_shape() {
     let source = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/rpc/src/graft.rs"),
     )
     .expect("graft source");
     assert!(
+        source.contains("impl membrane_capnp::initial_grants::Server for InitialGrantsServer"),
+        "ordinary children must be served by the grants-only interface"
+    );
+    assert!(
         !source.contains("impl membrane_capnp::membrane::Server for InitialAuthorityBootstrap"),
-        "T5 must replace the temporary child Membrane.graft() compatibility interface"
+        "the temporary child Membrane.graft() compatibility interface must stay removed"
+    );
+
+    let schema =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("capnp/membrane.capnp"))
+            .expect("membrane schema");
+    let initial_grants = schema
+        .split("interface InitialGrants")
+        .nth(1)
+        .and_then(|rest| rest.split("interface Membrane").next())
+        .expect("InitialGrants schema section");
+    assert!(
+        !initial_grants.contains("graft @"),
+        "the grants-only interface must expose no graft operation"
     );
 }
 

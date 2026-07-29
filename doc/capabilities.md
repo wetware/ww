@@ -54,7 +54,7 @@ references exist where*:
 
 Trusted pid0 receives the host graft; each ordinary child receives only its
 immutable `InitialAuthorityRecord`, constructed from the parent’s explicit
-grants. The root Atom binding flows
+grants and delivered through `InitialGrants.get()`. The root Atom binding flows
 through `stem::Atom` — when the Atom's value changes, `CidTree`'s root
 swaps atomically (`src/vfs.rs:CidTree::swap_root`), and old CIDs the
 cell had cached in memory still resolve to whatever they pointed to,
@@ -120,10 +120,11 @@ Application-specific entries use their parent-chosen grant-map keys.
 
 The wire-side `StreamListener` / `StreamDialer` / `VatListener` /
 `VatClient` interfaces are reached via `host.network()` rather than
-appearing in the top-level graft list.
+appearing as separate initial grants.
 
-Every capability is epoch-guarded: it fails with `staleEpoch` once the
-on-chain head advances, forcing a re-graft.
+Host-derived capabilities are epoch-guarded: they fail with `staleEpoch` once
+the on-chain head advances. An ordinary child cannot re-graft; pid0 explicitly
+re-delegates fresh references or respawns it.
 
 ### Content access (WASI path I/O only)
 
@@ -307,7 +308,7 @@ Schema definitions live in `capnp/`:
   StreamListener, StreamDialer, VatListener, VatClient, HttpListener
 - **`stem.capnp`** — Epoch and provenance metadata
 - **`auth.capnp`** — Terminal, Signer, Identity, Authority policy constructor
-- **`membrane.capnp`** — Membrane, Export
+- **`membrane.capnp`** — trusted-root Membrane, child InitialGrants, Export
 - **`routing.capnp`** — Kademlia DHT (provide, findProviders, hash)
 - **`http.capnp`** — HttpClient
 

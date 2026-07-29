@@ -95,7 +95,7 @@ through capabilities (IPFS, ByteStream, etc.).
 ### wetware:streams/streams@0.1.0
 
 Bidirectional data channel between host and guest, used as the transport
-layer for Cap'n Proto RPC (Membrane bootstrap).
+layer for Cap'n Proto RPC (pid0 Membrane or ordinary-child InitialGrants).
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
@@ -120,8 +120,9 @@ semantics on the RPC channel.
 ## Cap'n Proto RPC (over wetware:streams)
 
 Once the guest obtains input/output streams from `wetware:streams`,
-it bootstraps a Cap'n Proto RPC session over them. The host serves
-the **Membrane** as the bootstrap capability.
+it bootstraps a Cap'n Proto RPC session over them. The host serves the full
+**Membrane** only to trusted pid0. Ordinary children receive the distinct
+**InitialGrants** closed-delivery capability.
 
 ### Connection Setup
 
@@ -129,7 +130,9 @@ the **Membrane** as the bootstrap capability.
 2. Guest calls `connection.get-input-stream()` and `connection.get-output-stream()`
 3. Guest creates `VatNetwork::new(reader, writer, Side::Client, ...)`
 4. Guest creates `RpcSystem::new(network, bootstrap_export)`
-5. Guest bootstraps host capability: `rpc_system.bootstrap(Side::Server)` → `Membrane`
+5. Guest bootstraps the host-provided capability:
+   `rpc_system.bootstrap(Side::Server)` → `Membrane` for pid0 or
+   `InitialGrants` for an ordinary child
 6. Guest optionally exports its own bootstrap cap (for `system::serve()`)
 
 ### Guest Entry Points
@@ -141,26 +144,27 @@ all connection setup automatically:
 |----------|-----------|-------------|
 | `system::run` | `(f: FnOnce(C) -> Future) -> ()` | Bootstrap host cap, run closure, drive RPC. |
 | `system::serve` | `(bootstrap: Client, f: FnOnce(C) -> Future) -> ()` | Same as `run`, but also exports `bootstrap` to host. |
-| `system::serve_stdio` | `(bootstrap: Client) -> ()` | Export cap over stdin/stdout (no Membrane). For byte-stream handlers. |
+| `system::serve_stdio` | `(bootstrap: Client) -> ()` | Export cap over stdin/stdout (no host bootstrap). For byte-stream handlers. |
 
-### Membrane Capabilities
+### Child Initial Grants
 
-After bootstrapping, the guest calls `membrane.graft()` to obtain
-session-scoped capabilities:
+An ordinary child calls `initial_grants.get()` to obtain exactly the immutable
+named capabilities delegated at spawn:
 
 | Capability | Interface | Description |
 |------------|-----------|-------------|
 | Host | `system_capnp::host` | Node identity, network interfaces. |
 | Runtime | `system_capnp::runtime` | Load WASM binaries and obtain Executors. |
 | Routing | `routing_capnp::routing` | DHT operations (provide/find_providers). |
-| Identity | `stem_capnp::identity` | Host-side signing (private key never leaves host). |
+| Identity | `auth_capnp::identity` | Host-side signing, only when explicitly delegated. |
 
 IPFS content is not a capability; guests read `/ipfs/<cid>/...` through
 the WASI virtual filesystem.
 
-All capabilities are **epoch-guarded**: they become invalid when the
-host advances its epoch. Calls on stale capabilities return a
-`staleEpoch` error.
+Host-derived grants retain their **epoch guards** and become invalid when the
+host advances its epoch. Repeated `InitialGrants.get()` calls return the same
+recorded references; fresh authority requires explicit ancestor re-delegation
+or child respawn. Non-host grants keep their own normal lifetime semantics.
 
 ## Cap'n Proto RPC (system.capnp)
 
@@ -186,7 +190,7 @@ Full interface reference for the capabilities available to guests.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `spawn` | `(args: List(Text), env: List(Text), caps: List(Export), fuelPolicy: FuelPolicy) -> (process: Process)` | Spawn a new instance of the bound WASM binary with args, env, optional graft extras, and fuel policy. |
+| `spawn` | `(args: List(Text), env: List(Text), caps: List(Export), fuelPolicy: FuelPolicy) -> (process: Process)` | Spawn a new instance of the bound WASM binary with args, env, explicit initial grants, and fuel policy. |
 
 ### Process
 
@@ -267,10 +271,10 @@ revisit when wasmtime stabilizes resource cleanup ordering.
 
 ### Epoch guards
 
-All Membrane-provided capabilities are wrapped in epoch guards. When
-the host advances its epoch (e.g., on-chain state change), all outstanding
-capabilities become invalid. Calls return `staleEpoch` errors. Guests
-must re-graft to obtain fresh capabilities.
+Host capabilities grafted by pid0 are wrapped in epoch guards. When the host
+advances its epoch (e.g., on-chain state change), delegated copies also become
+invalid and calls return `staleEpoch` errors. Ordinary children cannot
+re-graft; pid0 must explicitly re-delegate fresh authority or respawn them.
 
 ### Pipe buffer sizes
 

@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 /// Build script for the status cell.
 ///
-/// Compiles the shared system + stem schemas so the WAGI cell can
-/// graft the membrane and call `host.id` / `host.addrs` / `host.peers`.
+/// Compiles the shared schemas so the WAGI cell can read its explicit `host`
+/// grant and call `host.id` / `host.addrs` / `host.peers`.
 /// No status-local schema — the cell is HTTP-only and does not export
 /// a Cap'n Proto interface.
 fn main() {

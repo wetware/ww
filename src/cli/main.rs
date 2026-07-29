@@ -1130,10 +1130,10 @@ mod {name}_capnp {{
 
 include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
-type Membrane = membrane_capnp::membrane::Client;
+type InitialGrants = membrane_capnp::initial_grants::Client;
 
-/// Look up a typed capability by name from the graft caps list.
-fn get_graft_cap<T: capnp::capability::FromClientHook>(
+/// Look up a typed capability by name from the initial grants list.
+fn get_initial_grant<T: capnp::capability::FromClientHook>(
     caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
     name: &str,
 ) -> Result<T, capnp::Error> {{
@@ -1145,7 +1145,7 @@ fn get_graft_cap<T: capnp::capability::FromClientHook>(
         }}
     }}
     Err(capnp::Error::failed(format!(
-        "capability '{{name}}' not found in graft response"
+        "required initial grant '{{name}}' is missing"
     )))
 }}
 
@@ -1183,11 +1183,11 @@ impl Guest for {iface_name}Guest {{
         match std::env::args().nth(1).as_deref() {{
             Some("serve") => {{
                 log::info!("{name}: serve");
-                system::run(|membrane: Membrane| async move {{
-                    let graft_resp = membrane.graft_request().send().promise.await?;
-                    let results = graft_resp.get()?;
-                    let graft_caps = results.get_caps()?;
-                    let host: system_capnp::host::Client = get_graft_cap(&graft_caps, "host")?;
+                system::run(|initial_grants: InitialGrants| async move {{
+                    let grants_resp = initial_grants.get_request().send().promise.await?;
+                    let grants = grants_resp.get()?.get_caps()?;
+                    let host: system_capnp::host::Client =
+                        get_initial_grant(&grants, "host")?;
 
                     let id_resp = host.id_request().send().promise.await?;
                     let peer_id = id_resp.get()?.get_peer_id()?;
@@ -1203,7 +1203,7 @@ impl Guest for {iface_name}Guest {{
                 let impl_ = {iface_name}Impl;
                 let client: {name}_capnp::{snake_name}::Client = capnp_rpc::new_client(impl_);
                 log::info!("{name}: cell mode");
-                system::serve(client.client, |_membrane: Membrane| async move {{
+                system::serve(client.client, |_initial_grants: InitialGrants| async move {{
                     std::future::pending().await
                 }});
             }}
@@ -1228,11 +1228,16 @@ wasip2::cli::command::export!({iface_name}Guest);
 ; exposing authority that requires recipient authentication.
 ;
 ; To run the service from the shell:
-;   (perform runtime :run (perform :load "bin/{name}.wasm") :args ["serve"])
+;   (def service-executor (perform runtime :load (perform :load "bin/{name}.wasm")))
+;   (def service-process
+;     (perform service-executor :spawn
+;       :args ["serve"]
+;       :caps {{"host" host}}))
+;   (perform service-process :wait)
 
 (def {snake_name}-wasm (perform :load "bin/{name}.wasm"))
 (def {snake_name}-executor (perform runtime :load {snake_name}-wasm))
-(def {snake_name}-process (perform {snake_name}-executor :spawn))
+(def {snake_name}-process (perform {snake_name}-executor :spawn :caps {{}}))
 (def {snake_name}-cap (perform {snake_name}-process :bootstrap))
 
 (perform host :serve-raw-vat {snake_name}-cap "{name}")

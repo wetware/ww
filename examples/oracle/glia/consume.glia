@@ -1,2 +1,8 @@
 ; Demo snippet: discover providers and query prices.
-(perform runtime :run (perform :load "bin/oracle.wasm") "consume")
+(def oracle-consumer-executor
+  (perform runtime :load (perform :load "bin/oracle.wasm")))
+(def oracle-consumer-process
+  (perform oracle-consumer-executor :spawn
+    :args ["consume"]
+    :caps {"host" host "routing" routing}))
+(perform oracle-consumer-process :wait)
