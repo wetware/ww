@@ -1,7 +1,7 @@
 ; Explicitly ungated discovery demo.
 (def discovery-wasm (perform :load "bin/discovery.wasm"))
 (def discovery-executor (perform runtime :load discovery-wasm))
-(def discovery-process (perform discovery-executor :spawn))
+(def discovery-process (perform discovery-executor :spawn :caps {}))
 (def discovery-cap (perform discovery-process :bootstrap))
 
 (perform host :serve-raw-vat discovery-cap "greeter")

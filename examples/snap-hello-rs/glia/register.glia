@@ -1,4 +1,5 @@
-; Demo snippet: register snap HTTP handler.
-(def snap-hello (cell (perform :load "bin/snap-hello-rs.wasm")))
+; Demo snippet: register a substrate-only snap HTTP handler.
+(def snap-hello
+  (cell (perform :load "bin/snap-hello-rs.wasm") :grants {}))
 
 (perform host :listen snap-hello "/snaps/hello")

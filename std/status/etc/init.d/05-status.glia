@@ -3,12 +3,12 @@
 ;;   $ curl http://localhost:2080/status
 ;;   {"status":"ok","version":"...","peer_id":"...","listen_addrs":[...],"peer_count":...}
 ;;
-;; The status cell is granted the default membrane and reads the `host`
-;; capability to report peer ID, listen addrs, and connected peer count.
-;; That's the only cap it uses — no filesystem, no network, no other I/O.
+;; The status cell receives only the `host` capability it uses to report peer
+;; ID, listen addrs, and connected peer count.
 ;;
-;; For attenuated grants (e.g. host-only, no http-client) the init.d
-;; author can wrap with `(with [(host (perform host :http-client))] ...)`
-;; — the HttpListener caps propagation landed in #429 makes this real.
+;; Grant values may be attenuated before they are inserted in the map.
 
-(perform host :listen (cell (perform :load "bin/status.wasm")) "/status")
+(perform host :listen
+  (cell (perform :load "bin/status.wasm")
+    :grants {:host host})
+  "/status")

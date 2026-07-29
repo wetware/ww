@@ -139,13 +139,16 @@
      (do ~@body)))
 
 ;; ---------------------------------------------------------------------------
-;; Capability scoping
+;; Lexical composition
 ;; ---------------------------------------------------------------------------
 
-;; with — capability grant bindings (sugar over let)
+;; with — intent-revealing lexical bindings (sugar over let)
 ;;
-;; Signals intent: "these are capability grants to the body."
-;; Semantically identical to let, but reads as a policy declaration.
-;; Composes with with-effect-handler for eval-time attenuation.
+;; `with` does not transfer authority across a cell boundary. A child receives
+;; only values named explicitly in `(cell image :grants {...})`.
+;;
+;; Example:
+;; (with [status-host (attenuate host [:id :addrs :peers])]
+;;   (cell status-image :grants {:host status-host}))
 (defmacro with [bindings & body]
   `(let ~bindings ~@body))

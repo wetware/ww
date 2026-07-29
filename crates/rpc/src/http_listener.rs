@@ -196,7 +196,7 @@ impl From<capnp::Error> for WagiRequestError {
 ///
 /// Per-request CGI env vars (REQUEST_METHOD, PATH_INFO, etc.) are passed via
 /// `executor.spawn(args, env, caps, ...)` — this is the late-binding pattern that the
-/// Runtime+Executor API was designed for. `caps` carries init.d `with`-block grants
+/// Runtime+Executor API was designed for. `caps` carries explicit init.d grants
 /// (name + capnp client + canonical Schema.Node bytes) into the spawned cell's
 /// membrane graft, so a WAGI cell only sees what the init.d author handed it.
 async fn spawn_and_run(
@@ -637,7 +637,8 @@ mod tests {
     }
 
     /// `HttpListener.listen` should accept an empty caps list and register
-    /// the route — the no-with-block case (e.g. `(perform host :listen cell "/path")`).
+    /// the route — the explicit zero-grant case
+    /// (e.g. `(perform host :listen (cell image :grants {}) "/path")`).
     #[tokio::test]
     async fn test_http_listener_listen_with_empty_caps_registers_route() {
         let local = tokio::task::LocalSet::new();
@@ -669,9 +670,9 @@ mod tests {
     }
 
     /// `HttpListener.listen` should accept a non-empty caps list (the init.d
-    /// `with`-block grant case) and still register the route. This is the
-    /// shape the kernel emits for `(with [(host (perform host :host))]
-    /// (perform host :listen cell "/path"))`.
+    /// explicit-grant case) and still register the route. This is the
+    /// shape the kernel emits for
+    /// `(perform host :listen (cell image :grants {:host host}) "/path")`.
     #[tokio::test]
     async fn test_http_listener_listen_with_caps_registers_route() {
         let local = tokio::task::LocalSet::new();

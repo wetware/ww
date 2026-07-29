@@ -5,67 +5,108 @@
 //! can swap to an IPLD HAMT (CID-linked blocks) without changing callers.
 
 use crate::Val;
+use std::rc::Rc;
 
 /// A persistent map backed by im::HashMap (CHAMP trie).
 ///
 /// O(1) clone via structural sharing. O(log N) insert. O(1) amortized lookup.
 /// The wrapper exists as the future seam for IPLD-backed persistent maps.
 #[derive(Clone)]
-pub struct ValMap(im::HashMap<Val, Val>);
+pub struct ValMap {
+    values: im::HashMap<Val, Val>,
+    /// Original reader pairs, retained only until a literal is analyzed.
+    ///
+    /// Runtime map semantics still use `values`; this provenance exists so
+    /// syntax-sensitive consumers such as `cell :grants` can diagnose
+    /// duplicate source keys before normalization erases them.
+    literal_pairs: Option<Rc<Vec<(Val, Val)>>>,
+}
 
 impl ValMap {
     /// Create an empty map.
     #[inline]
     pub fn new() -> Self {
-        ValMap(im::HashMap::new())
+        ValMap {
+            values: im::HashMap::new(),
+            literal_pairs: None,
+        }
     }
 
     /// Create a map from key-value pairs.
     #[inline]
     pub fn from_pairs(pairs: Vec<(Val, Val)>) -> Self {
-        ValMap(pairs.into_iter().collect())
+        ValMap {
+            values: pairs.into_iter().collect(),
+            literal_pairs: None,
+        }
+    }
+
+    /// Create a map parsed from source while retaining its unnormalized pairs.
+    ///
+    /// Ordinary lookup/equality/hash behavior remains map-like and uses the
+    /// normalized values. The analyzer may inspect `literal_pairs()` before
+    /// evaluating the literal into a runtime map.
+    #[inline]
+    pub(crate) fn from_literal_pairs(pairs: Vec<(Val, Val)>) -> Self {
+        ValMap {
+            values: pairs.iter().cloned().collect(),
+            literal_pairs: Some(Rc::new(pairs)),
+        }
+    }
+
+    /// Original source pairs, including duplicate keys, when this map came
+    /// directly from the reader.
+    #[inline]
+    pub(crate) fn literal_pairs(&self) -> Option<&[(Val, Val)]> {
+        self.literal_pairs.as_deref().map(Vec::as_slice)
     }
 
     /// Number of entries.
     #[inline]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.values.len()
     }
 
     /// True if the map has no entries.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.values.is_empty()
     }
 
     /// Look up a value by key.
     #[inline]
     pub fn get(&self, key: &Val) -> Option<&Val> {
-        self.0.get(key)
+        self.values.get(key)
     }
 
     /// True if the map contains the given key.
     #[inline]
     pub fn contains_key(&self, key: &Val) -> bool {
-        self.0.contains_key(key)
+        self.values.contains_key(key)
     }
 
     /// Return a new map with the key-value pair inserted or updated.
     #[inline]
     pub fn assoc(&self, key: Val, val: Val) -> Self {
-        ValMap(self.0.update(key, val))
+        ValMap {
+            values: self.values.update(key, val),
+            literal_pairs: None,
+        }
     }
 
     /// Return a new map without the given key.
     #[inline]
     pub fn dissoc(&self, key: &Val) -> Self {
-        ValMap(self.0.without(key))
+        ValMap {
+            values: self.values.without(key),
+            literal_pairs: None,
+        }
     }
 
     /// Iterate over key-value pairs.
     #[inline]
     pub fn iter(&self) -> im::hashmap::Iter<'_, Val, Val> {
-        self.0.iter()
+        self.values.iter()
     }
 }
 
@@ -87,7 +128,7 @@ impl Default for ValMap {
 
 impl PartialEq for ValMap {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.values == other.values
     }
 }
 
@@ -95,7 +136,7 @@ impl Eq for ValMap {}
 
 impl core::fmt::Debug for ValMap {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_map().entries(self.0.iter()).finish()
+        f.debug_map().entries(self.values.iter()).finish()
     }
 }
 
@@ -103,7 +144,7 @@ impl std::hash::Hash for ValMap {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         // Order-independent hash: XOR individual pair hashes.
         let mut xor_hash: u64 = 0;
-        for (k, v) in self.0.iter() {
+        for (k, v) in self.values.iter() {
             use std::hash::Hasher;
             let mut h = std::collections::hash_map::DefaultHasher::new();
             k.hash(&mut h);
@@ -111,7 +152,7 @@ impl std::hash::Hash for ValMap {
             xor_hash ^= h.finish();
         }
         state.write_u64(xor_hash);
-        state.write_usize(self.0.len());
+        state.write_usize(self.values.len());
     }
 }
 

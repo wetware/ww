@@ -2,7 +2,7 @@
 ; VatListener.serveAuthenticated and one Terminal per libp2p stream.
 (def chess-wasm (perform :load "bin/chess-demo.wasm"))
 (def chess-executor (perform runtime :load chess-wasm))
-(def chess-process (perform chess-executor :spawn))
+(def chess-process (perform chess-executor :spawn :caps {}))
 (def chess-cap (perform chess-process :bootstrap))
 
 (perform host :serve-raw-vat chess-cap "chess")
