@@ -11,8 +11,7 @@
 //!                 └─ WAGI cell grafts membrane, returns JSON
 //!
 //! The test additionally seeds a non-empty caps list (kernel emits this
-//! when an init.d author wraps `(perform host :listen ...)` in a `with`
-//! block — e.g. `(with [(host (perform host :host))] ...)`). That fixed
+//! when an init.d author supplies `:grants {:host host}` to `cell`. That fixed
 //! registration-time template is the status cell's only host authority; the
 //! dispatcher path must reproduce it for each child without widening or
 //! corruption. A regression would surface here as `peer_id: null` or a CGI
@@ -95,8 +94,8 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
                 capnp_rpc::new_client(listener_impl);
 
             // Register the route, with a non-empty caps list (mirrors what
-            // the kernel emits for `(with [(extra-cap ...)] (perform host
-            // :listen status "/status"))`).
+            // the kernel emits for `(perform host :listen
+            // (cell image :grants {:host host}) "/status")`).
             let mut listen_req = listener.listen_request();
             listen_req.get().set_executor(executor);
             listen_req.get().set_prefix("/status");

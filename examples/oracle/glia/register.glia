@@ -1,9 +1,10 @@
 ; Explicitly ungated RPC demo plus the HTTP adapter.
 (def oracle-wasm (perform :load "bin/oracle.wasm"))
-(def oracle-http (cell oracle-wasm))
+(def oracle-http
+  (cell oracle-wasm :grants {:http-client http-client}))
 
 (def oracle-executor (perform runtime :load oracle-wasm))
-(def oracle-process (perform oracle-executor :spawn))
+(def oracle-process (perform oracle-executor :spawn :caps {}))
 (def oracle-cap (perform oracle-process :bootstrap))
 
 (perform host :serve-raw-vat oracle-cap "oracle")

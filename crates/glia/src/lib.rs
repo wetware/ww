@@ -251,12 +251,12 @@ pub enum Val {
         cap_id: u64,
         inner: std::rc::Rc<dyn std::any::Any>,
     },
-    /// A cell definition: WASM binary + captured capabilities.
+    /// A cell definition: WASM binary + explicitly granted capabilities.
     ///
-    /// Created by the `cell` function, which bundles wasm bytes with all
-    /// `Val::Cap` bindings from its lexical scope. When the cell is registered
-    /// with a byte adapter, the host injects captured caps into spawned
-    /// children's membranes.
+    /// Created by `(cell wasm :grants {...})`. Omitting `:grants` produces an
+    /// intentionally zero-authority cell; lexical bindings are never captured.
+    /// When the cell is registered with a byte adapter, the host forwards only
+    /// these named grants to spawned children.
     Cell {
         wasm: Vec<u8>,
         caps: Vec<(String, Val)>,
@@ -537,6 +537,7 @@ pub fn read(input: &str) -> Result<Val, String> {
     if !rest.is_empty() {
         return Err("unexpected tokens after expression".into());
     }
+    validate_source_grant_maps(&val)?;
     Ok(val)
 }
 
@@ -550,10 +551,76 @@ pub fn read_many(input: &str) -> Result<Vec<Val>, String> {
     let mut rest = tokens.as_slice();
     while !rest.is_empty() {
         let (val, remaining) = parse_tokens(rest)?;
+        validate_source_grant_maps(&val)?;
         results.push(val);
         rest = remaining;
     }
     Ok(results)
+}
+
+/// Reject duplicate names only in source maps used as literal `cell :grants`.
+///
+/// Ordinary Glia maps retain last-write-wins semantics. This reader pass runs
+/// while `ValMap::literal_pairs` still contains every source entry, before
+/// analysis/evaluation normalizes a map to its runtime representation.
+fn validate_source_grant_maps(value: &Val) -> Result<(), String> {
+    fn walk(value: &Val) -> Result<(), String> {
+        match value {
+            Val::List(items) => {
+                // A quoted form is data, not executable source. Preserve
+                // ordinary map semantics inside it, even when that data has
+                // the shape of a `cell :grants` call.
+                if matches!(items.first(), Some(Val::Sym(head)) if head == "quote") {
+                    return Ok(());
+                }
+                if matches!(items.first(), Some(Val::Sym(head)) if head == "cell")
+                    && matches!(items.get(2), Some(Val::Keyword(keyword)) if keyword == "grants")
+                {
+                    if let Some(Val::Map(map)) = items.get(3) {
+                        if let Some(pairs) = map.literal_pairs() {
+                            let mut first_sites = HashMap::<String, usize>::new();
+                            for (index, (key, _)) in pairs.iter().enumerate() {
+                                let Val::Keyword(name) = key else {
+                                    continue;
+                                };
+                                if let Some(first) = first_sites.insert(name.clone(), index + 1) {
+                                    return Err(format!(
+                                        "duplicate grant name \"{name}\": first defined at grant-map entry {first}, again at entry {}; grant names must be unique",
+                                        index + 1
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                for item in items {
+                    walk(item)?;
+                }
+            }
+            Val::Vector(items) | Val::Set(items) => {
+                for item in items {
+                    walk(item)?;
+                }
+            }
+            Val::Map(map) => {
+                if let Some(pairs) = map.literal_pairs() {
+                    for (key, item) in pairs {
+                        walk(key)?;
+                        walk(item)?;
+                    }
+                } else {
+                    for (key, item) in map.iter() {
+                        walk(key)?;
+                        walk(item)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    walk(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -848,7 +915,7 @@ fn parse_map_inner(tokens: &[Token], raw: bool) -> Result<(Val, &[Token]), Strin
             return Err("unclosed map".into());
         }
         if rest[0] == Token::MapClose {
-            return Ok((Val::Map(ValMap::from_pairs(pairs)), &rest[1..]));
+            return Ok((Val::Map(ValMap::from_literal_pairs(pairs)), &rest[1..]));
         }
         let (key, after_key) = if raw {
             parse_tokens_raw(rest)?
@@ -1520,6 +1587,35 @@ mod tests {
             }
             other => panic!("expected Map, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn duplicate_ordinary_map_keys_remain_last_write_wins() {
+        match read("{:a 1 :a 2}").unwrap() {
+            Val::Map(map) => {
+                assert_eq!(map.len(), 1);
+                assert_eq!(map.get(&Val::Keyword("a".into())), Some(&Val::Int(2)));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_cell_grant_names_fail_in_reader_with_both_entry_sites() {
+        let error = read("(cell image :grants {:db first :db second})").unwrap_err();
+        assert!(
+            error.contains("duplicate grant name \"db\""),
+            "got: {error}"
+        );
+        assert!(error.contains("entry 1"), "got: {error}");
+        assert!(error.contains("entry 2"), "got: {error}");
+        assert!(error.contains("grant names must be unique"), "got: {error}");
+    }
+
+    #[test]
+    fn quoted_cell_shaped_data_keeps_ordinary_map_semantics() {
+        read("'(cell image :grants {:db first :db second})")
+            .expect("quoted cell-shaped data is not executable grant syntax");
     }
 
     #[test]

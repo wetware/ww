@@ -48,6 +48,12 @@ static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct Env {
     frames: Vec<Frame>,
     handler_stack: HandlerStack,
+    /// Whether the outermost frame came from lexical closure capture.
+    ///
+    /// The embedding's root frame is ambient process context and should not
+    /// trigger the transitional cell warning. A closure snapshot, however,
+    /// contains bindings that the old `cell` behavior would have captured.
+    root_frame_is_lexical: bool,
 }
 
 impl Default for Env {
@@ -65,6 +71,7 @@ impl Env {
         Self {
             frames: vec![Frame::new()],
             handler_stack: effect::new_handler_stack(),
+            root_frame_is_lexical: false,
         }
     }
 
@@ -105,21 +112,23 @@ impl Env {
         }
     }
 
-    /// Collect all `Val::Cap` bindings visible in the current scope.
+    /// Capability-valued bindings introduced by non-root lexical scopes.
     ///
-    /// Searches from innermost scope outward, returning `(name, cap)` pairs.
-    /// Inner bindings shadow outer ones (only the innermost binding per name
-    /// is returned). Used by `cell` to capture granted capabilities.
-    pub fn collect_caps(&self) -> Vec<(String, Val)> {
+    /// Used only by the transitional `with`/`let` migration warning. Root
+    /// capabilities are intentionally excluded so a legitimate top-level
+    /// zero-grant `cell` does not warn merely because the embedding has caps.
+    fn scoped_cap_names(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut caps = Vec::new();
-        for frame in self.frames.iter().rev() {
+        let first_scoped_frame = usize::from(!self.root_frame_is_lexical);
+        for frame in self.frames.iter().skip(first_scoped_frame).rev() {
             for (name, val) in frame {
-                if matches!(val, Val::Cap { .. }) && seen.insert(name.clone()) {
-                    caps.push((name.clone(), val.clone()));
+                if seen.insert(name.clone()) && matches!(val, Val::Cap { .. }) {
+                    caps.push(name.clone());
                 }
             }
         }
+        caps.sort();
         caps
     }
 
@@ -153,6 +162,7 @@ impl Env {
             // Keep the current stack on snapshots; invocation still routes through
             // the caller's handler stack via `Env::for_call`.
             handler_stack: self.handler_stack.clone(),
+            root_frame_is_lexical: true,
         }
     }
 
@@ -169,6 +179,7 @@ impl Env {
         Self {
             frames: vec![filtered],
             handler_stack: self.handler_stack.clone(),
+            root_frame_is_lexical: true,
         }
     }
 
@@ -200,6 +211,7 @@ impl Env {
         Self {
             frames: vec![captured],
             handler_stack: self.handler_stack.clone(),
+            root_frame_is_lexical: true,
         }
     }
 
@@ -222,6 +234,7 @@ impl Env {
         Self {
             frames: vec![root, Frame::new()], // root + param frame
             handler_stack: caller_hs.clone(),
+            root_frame_is_lexical: true,
         }
     }
 }
@@ -264,6 +277,21 @@ pub trait Dispatch {
     ) -> Option<Result<Val, Val>> {
         let _ = (cap, allow_methods);
         None
+    }
+
+    /// Embedding-specific exportability check for a `cell` grant.
+    ///
+    /// Glia rejects non-capabilities and evaluator-local `defcap` values
+    /// itself. Embeddings may additionally reject capability wrappers that
+    /// cannot be encoded for their process boundary.
+    fn validate_cell_grant(&self, name: &str, cap: &Val) -> Result<(), Val> {
+        let _ = (name, cap);
+        Ok(())
+    }
+
+    /// Report a non-blocking transitional authoring warning.
+    fn report_warning(&self, warning: &str) {
+        let _ = warning;
     }
 }
 
@@ -369,6 +397,218 @@ fn compute_cap_status(env: &Env) -> (bool, Option<String>) {
         }
     }
     (true, None)
+}
+
+// ---------------------------------------------------------------------------
+// Explicit cell grants
+// ---------------------------------------------------------------------------
+
+fn cell_error(message: impl Into<String>) -> Val {
+    error::internal("cell", message)
+}
+
+fn cell_call_grants_index(raw_args: &[Val]) -> Result<Option<usize>, Val> {
+    match raw_args {
+        [] => Err(error::arity("cell", "1 or 3", 0)),
+        [_wasm] => Ok(None),
+        [_wasm, Val::Keyword(keyword)] if keyword == "grants" => Err(cell_error(
+            "cell — missing grant map after :grants; use (cell image :grants {})",
+        )),
+        [_wasm, Val::Keyword(keyword)] => Err(cell_error(format!(
+            "cell — unknown keyword :{keyword}; supported keyword: :grants"
+        ))),
+        [_wasm, _] => Err(cell_error(
+            "cell — malformed keyword arguments; use (cell image) or (cell image :grants grant-map)",
+        )),
+        [_wasm, Val::Keyword(keyword), _grants] if keyword == "grants" => Ok(Some(2)),
+        [_wasm, Val::Keyword(keyword), _] => Err(cell_error(format!(
+            "cell — unknown keyword :{keyword}; supported keyword: :grants"
+        ))),
+        [_wasm, other, _] => Err(error::type_mismatch(
+            "cell option",
+            "keyword :grants",
+            other,
+        )),
+        _ => Err(cell_error(format!(
+            "cell — malformed keyword arguments: expected (cell image) or (cell image :grants grant-map), got {} arguments",
+            raw_args.len()
+        ))),
+    }
+}
+
+fn validate_literal_grant_duplicates(raw_grants: &Val) -> Result<(), Val> {
+    let Val::Map(map) = raw_grants else {
+        return Ok(());
+    };
+    let Some(pairs) = map.literal_pairs() else {
+        return Ok(());
+    };
+
+    let mut first_sites = HashMap::<String, usize>::new();
+    for (index, (key, _)) in pairs.iter().enumerate() {
+        let Val::Keyword(name) = key else {
+            continue;
+        };
+        if let Some(first) = first_sites.insert(name.clone(), index + 1) {
+            return Err(cell_error(format!(
+                "duplicate grant name \"{name}\": first defined at grant-map entry {first}, again at entry {}; grant names must be unique",
+                index + 1
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn cell_wasm(value: Val) -> Result<Vec<u8>, Val> {
+    match value {
+        Val::Bytes(bytes) => Ok(bytes),
+        other => Err(error::type_mismatch(
+            "cell first arg (wasm)",
+            "bytes",
+            &other,
+        )),
+    }
+}
+
+fn grant_value_error(name: &str, value: &Val) -> Val {
+    cell_error(format!(
+        "grant \"{name}\" expected a capability, got {}; use a capability value in :grants, for example :{name} {name}-cap",
+        error::val_type_name(value)
+    ))
+}
+
+fn validate_glia_grant(name: &str, value: &Val) -> Result<(), Val> {
+    let Val::Cap { inner, .. } = value else {
+        return Err(grant_value_error(name, value));
+    };
+    if inner.downcast_ref::<GliaCapInner>().is_some()
+        || inner.downcast_ref::<AttenuatedCapInner>().is_some()
+    {
+        return Err(cell_error(format!(
+            "grant \"{name}\" is a Glia-native capability that cannot yet cross a cell boundary; use a Cap'n Proto-backed capability or follow the defcap-export work"
+        )));
+    }
+    Ok(())
+}
+
+fn build_explicit_cell<D: Dispatch>(
+    wasm: Vec<u8>,
+    entries: Vec<(Val, Val)>,
+    dispatch: &D,
+) -> Result<Val, Val> {
+    let mut grants = std::collections::BTreeMap::<String, Val>::new();
+    for (key, value) in entries {
+        let name = match key {
+            Val::Keyword(name) => name,
+            other => {
+                return Err(error::type_mismatch(
+                    "cell :grants map key",
+                    "keyword",
+                    &other,
+                ))
+            }
+        };
+        if grants.contains_key(&name) {
+            return Err(cell_error(format!(
+                "duplicate grant name \"{name}\"; grant names must be unique"
+            )));
+        }
+        validate_glia_grant(&name, &value)?;
+        dispatch.validate_cell_grant(&name, &value)?;
+        grants.insert(name, value);
+    }
+    Ok(Val::Cell {
+        wasm,
+        caps: grants.into_iter().collect(),
+    })
+}
+
+fn report_legacy_cell_capture<D: Dispatch>(env: &Env, dispatch: &D) {
+    let names = env.scoped_cap_names();
+    if names.is_empty() {
+        return;
+    }
+    let bindings = names.join(", ");
+    let rewrite = names
+        .iter()
+        .map(|name| format!(":{name} {name}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    dispatch.report_warning(&format!(
+        "transitional cell grant migration warning: lexical capability capture was removed; scoped capability binding(s) {bindings} are not granted to this child. Rewrite as (cell image :grants {{{rewrite}}})"
+    ));
+}
+
+async fn eval_cell_expr<D: Dispatch>(
+    args: &[Expr],
+    raw_args: &[Val],
+    env: &mut Env,
+    dispatch: &D,
+) -> Result<Val, Val> {
+    let grants_index = cell_call_grants_index(raw_args)?;
+    if let Some(index) = grants_index {
+        validate_literal_grant_duplicates(&raw_args[index])?;
+    }
+
+    let wasm = cell_wasm(eval_expr(&args[0], env, dispatch).await?)?;
+    let Some(index) = grants_index else {
+        report_legacy_cell_capture(env, dispatch);
+        return build_explicit_cell(wasm, Vec::new(), dispatch);
+    };
+
+    let entries = match &args[index] {
+        Expr::Map(pairs) => {
+            let mut entries = Vec::with_capacity(pairs.len());
+            for (key, value) in pairs {
+                entries.push((
+                    eval_expr(key, env, dispatch).await?,
+                    eval_expr(value, env, dispatch).await?,
+                ));
+            }
+            entries
+        }
+        grants_expr => match eval_expr(grants_expr, env, dispatch).await? {
+            Val::Map(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            other => return Err(error::type_mismatch("cell :grants", "map", &other)),
+        },
+    };
+    build_explicit_cell(wasm, entries, dispatch)
+}
+
+async fn eval_cell_raw<D: Dispatch>(
+    raw_args: &[Val],
+    env: &mut Env,
+    dispatch: &D,
+) -> Result<Val, Val> {
+    let grants_index = cell_call_grants_index(raw_args)?;
+    if let Some(index) = grants_index {
+        validate_literal_grant_duplicates(&raw_args[index])?;
+    }
+
+    let wasm = cell_wasm(eval(&raw_args[0], env, dispatch).await?)?;
+    let Some(index) = grants_index else {
+        report_legacy_cell_capture(env, dispatch);
+        return build_explicit_cell(wasm, Vec::new(), dispatch);
+    };
+
+    let entries = match &raw_args[index] {
+        Val::Map(map) if map.literal_pairs().is_some() => {
+            let pairs = map.literal_pairs().expect("checked literal pairs");
+            let mut entries = Vec::with_capacity(pairs.len());
+            for (key, value) in pairs {
+                entries.push((
+                    eval(key, env, dispatch).await?,
+                    eval(value, env, dispatch).await?,
+                ));
+            }
+            entries
+        }
+        grants_expr => match eval(grants_expr, env, dispatch).await? {
+            Val::Map(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            other => return Err(error::type_mismatch("cell :grants", "map", &other)),
+        },
+    };
+    build_explicit_cell(wasm, entries, dispatch)
 }
 
 /// Evaluate a function/macro body, dispatching on `FnBody` variant.
@@ -2308,32 +2548,18 @@ pub fn eval_expr<'a, D: Dispatch>(
                     return func(evaled_args).await;
                 }
 
+                // 3b. `cell` needs the unevaluated grant-map syntax for
+                // duplicate detection, so it owns argument evaluation.
+                if head == "cell" {
+                    return eval_cell_expr(args, raw_args, env, dispatch).await;
+                }
+
                 // 3. Evaluate args for remaining paths
                 let evaled_args = eval_expr_args(args, env, dispatch).await?;
 
                 // 4. HOF builtins
                 if head == "map" || head == "filter" || head == "reduce" {
                     return eval_hof(head, &evaled_args, env, dispatch).await;
-                }
-
-                // 4b. cell builtin (captures Val::Cap bindings from scope)
-                if head == "cell" {
-                    let wasm = match evaled_args.first() {
-                        Some(Val::Bytes(b)) => b.clone(),
-                        Some(other) => {
-                            return Err(error::type_mismatch(
-                                "cell first arg (wasm)",
-                                "bytes",
-                                other,
-                            ))
-                        }
-                        None => return Err(error::arity("cell", "1", 0)),
-                    };
-                    if evaled_args.len() > 1 {
-                        return Err(error::arity("cell", "1", evaled_args.len()));
-                    }
-                    let caps = env.collect_caps();
-                    return Ok(Val::Cell { wasm, caps });
                 }
 
                 // 5. Sync builtins
@@ -2924,26 +3150,9 @@ pub fn eval<'a, D: Dispatch>(
                     }
                 }
 
-                // --- Built-in: cell (captures Val::Cap bindings from scope) ---
+                // --- Built-in: cell (explicit grants only) ---
                 if head == "cell" {
-                    let args = eval_args(raw_args, env, dispatch).await?;
-                    let wasm = match args.first() {
-                        Some(Val::Bytes(b)) => b.clone(),
-                        Some(other) => {
-                            return Err(error::type_mismatch(
-                                "cell first arg (wasm)",
-                                "bytes",
-                                other,
-                            ))
-                        }
-                        None => return Err(error::arity("cell", "1", 0)),
-                    };
-                    if args.len() > 1 {
-                        return Err(error::arity("cell", "1", args.len()));
-                    }
-                    // Capture all Val::Cap bindings from the lexical environment.
-                    let caps = env.collect_caps();
-                    return Ok(Val::Cell { wasm, caps });
+                    return eval_cell_raw(raw_args, env, dispatch).await;
                 }
 
                 // --- Higher-order builtins (need env + dispatch for fn invocation) ---
@@ -3045,12 +3254,14 @@ mod tests {
     /// Uses RefCell for interior mutability (Dispatch takes &self).
     struct RecordingDispatch {
         calls: RefCell<Vec<(String, Vec<Val>)>>,
+        warnings: RefCell<Vec<String>>,
     }
 
     impl RecordingDispatch {
         fn new() -> Self {
             Self {
                 calls: RefCell::new(Vec::new()),
+                warnings: RefCell::new(Vec::new()),
             }
         }
     }
@@ -3065,6 +3276,10 @@ mod tests {
                 .borrow_mut()
                 .push((name.to_string(), args.to_vec()));
             Box::pin(core::future::ready(Ok(Val::Nil)))
+        }
+
+        fn report_warning(&self, warning: &str) {
+            self.warnings.borrow_mut().push(warning.to_string());
         }
     }
 
@@ -4362,6 +4577,276 @@ mod tests {
     fn eval_str(input: &str, env: &mut Env, d: &RecordingDispatch) -> Result<Val, Val> {
         let expr = crate::read(input).map_err(|e| error::parse(None, e.to_string()))?;
         eval_blocking(&expr, env, d)
+    }
+
+    fn cell_caps(value: Val) -> Vec<(String, Val)> {
+        match value {
+            Val::Cell { caps, .. } => caps,
+            other => panic!("expected cell, got {other}"),
+        }
+    }
+
+    fn cell_test_env() -> Env {
+        let mut env = Env::new();
+        env.set("image".into(), Val::Bytes(vec![0, 97, 115, 109]));
+        env.set("db".into(), make_cap("database", "cid:db", Rc::new(())));
+        env.set(
+            "logger".into(),
+            make_cap("logger", "cid:logger", Rc::new(())),
+        );
+        env
+    }
+
+    #[test]
+    fn duplicate_ordinary_map_literal_does_not_evaluate_discarded_value() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        let result = eval_str("(get {:a missing :a 2} :a)", &mut env, &d).unwrap();
+        assert_eq!(result, Val::Int(2));
+    }
+
+    #[test]
+    fn cell_without_grants_has_zero_authority() {
+        let mut env = cell_test_env();
+        let d = RecordingDispatch::new();
+        let caps = cell_caps(eval_str("(cell image)", &mut env, &d).unwrap());
+        assert!(caps.is_empty());
+        assert!(d.warnings.borrow().is_empty());
+    }
+
+    #[test]
+    fn cell_with_empty_grant_map_has_zero_authority() {
+        let mut env = cell_test_env();
+        let d = RecordingDispatch::new();
+        let caps = cell_caps(eval_str("(cell image :grants {})", &mut env, &d).unwrap());
+        assert!(caps.is_empty());
+    }
+
+    #[test]
+    fn cell_explicit_grants_are_renamed_and_deterministically_sorted() {
+        let mut env = cell_test_env();
+        let d = RecordingDispatch::new();
+        let caps = cell_caps(
+            eval_str(
+                "(cell image :grants {:z-log logger :app-db db})",
+                &mut env,
+                &d,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            caps.iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app-db", "z-log"]
+        );
+        assert!(matches!(
+            &caps[0].1,
+            Val::Cap { name, .. } if name == "database"
+        ));
+    }
+
+    #[test]
+    fn cell_accepts_programmatically_built_grant_map() {
+        let mut env = cell_test_env();
+        let db = env.get("db").unwrap().clone();
+        env.set(
+            "bundle".into(),
+            Val::Map(ValMap::from_pairs(vec![(
+                Val::Keyword("renamed".into()),
+                db,
+            )])),
+        );
+        let d = RecordingDispatch::new();
+        let caps = cell_caps(eval_str("(cell image :grants bundle)", &mut env, &d).unwrap());
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].0, "renamed");
+    }
+
+    #[test]
+    fn cell_rejects_non_capability_before_construction() {
+        let mut env = cell_test_env();
+        let d = RecordingDispatch::new();
+        let err = eval_str("(cell image :grants {:db 42})", &mut env, &d).unwrap_err();
+        let message = error::message(&err).unwrap();
+        assert!(
+            message.contains("grant \"db\" expected a capability, got int"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn cell_rejects_glia_native_defcap_with_grant_name() {
+        let mut env = cell_test_env();
+        let d = RecordingDispatch::new();
+        eval_str(
+            "(defcap local-logger :write (fn [message] message))",
+            &mut env,
+            &d,
+        )
+        .unwrap();
+        let err =
+            eval_str("(cell image :grants {:logger local-logger})", &mut env, &d).unwrap_err();
+        let message = error::message(&err).unwrap();
+        assert!(message.contains("grant \"logger\""), "got: {message}");
+        assert!(
+            message.contains("Glia-native capability that cannot yet cross a cell boundary"),
+            "got: {message}"
+        );
+        assert!(message.contains("defcap-export"), "got: {message}");
+    }
+
+    #[test]
+    fn cell_duplicate_literal_grant_reports_both_source_entries() {
+        let mut env = cell_test_env();
+        let d = RecordingDispatch::new();
+        let err = eval_str("(cell image :grants {:db db :db logger})", &mut env, &d).unwrap_err();
+        let message = error::message(&err).unwrap();
+        assert!(
+            message.contains("duplicate grant name \"db\""),
+            "got: {message}"
+        );
+        assert!(message.contains("entry 1"), "got: {message}");
+        assert!(message.contains("entry 2"), "got: {message}");
+        assert!(
+            message.contains("grant names must be unique"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn cell_rejects_malformed_and_unknown_keyword_arguments() {
+        let mut env = cell_test_env();
+        let d = RecordingDispatch::new();
+        let missing =
+            eval_str("(cell image :grants)", &mut env, &d).expect_err("missing map must fail");
+        assert!(error::message(&missing)
+            .unwrap()
+            .contains("missing grant map after :grants"));
+
+        let unknown =
+            eval_str("(cell image :inherit {})", &mut env, &d).expect_err("unknown keyword");
+        assert!(error::message(&unknown)
+            .unwrap()
+            .contains("unknown keyword :inherit"));
+
+        let malformed =
+            eval_str("(cell image {} {})", &mut env, &d).expect_err("malformed options");
+        assert!(error::message(&malformed)
+            .unwrap()
+            .contains("keyword :grants"));
+
+        let string_name = eval_str("(cell image :grants {\"db\" db})", &mut env, &d)
+            .expect_err("grant names must be keywords");
+        assert!(error::message(&string_name)
+            .unwrap()
+            .contains("cell :grants map key"));
+    }
+
+    #[test]
+    fn analyzed_and_raw_cell_paths_have_identical_grant_behavior() {
+        let form = crate::read("(cell image :grants {:renamed db :log logger})").unwrap();
+        let mut analyzed_env = cell_test_env();
+        let analyzed_dispatch = RecordingDispatch::new();
+        let analyzed =
+            cell_caps(eval_blocking(&form, &mut analyzed_env, &analyzed_dispatch).unwrap());
+
+        let mut raw_env = cell_test_env();
+        let raw_dispatch = RecordingDispatch::new();
+        let raw = cell_caps(pollster_eval(eval(&form, &mut raw_env, &raw_dispatch)).unwrap());
+
+        assert_eq!(
+            analyzed
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+            raw.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
+        );
+
+        let malformed = crate::read("(cell image :inherit {})").unwrap();
+        let analyzed_error =
+            eval_blocking(&malformed, &mut analyzed_env, &analyzed_dispatch).unwrap_err();
+        let raw_error = pollster_eval(eval(&malformed, &mut raw_env, &raw_dispatch)).unwrap_err();
+        assert_eq!(error::message(&analyzed_error), error::message(&raw_error));
+
+        let programmatic = crate::read("(cell image :grants bundle)").unwrap();
+        let db = raw_env.get("db").unwrap().clone();
+        raw_env.set(
+            "bundle".into(),
+            Val::Map(ValMap::from_pairs(vec![(
+                Val::Keyword("programmatic".into()),
+                db,
+            )])),
+        );
+        let raw_programmatic =
+            cell_caps(pollster_eval(eval(&programmatic, &mut raw_env, &raw_dispatch)).unwrap());
+        assert_eq!(raw_programmatic.len(), 1);
+        assert_eq!(raw_programmatic[0].0, "programmatic");
+    }
+
+    #[test]
+    fn lexical_capabilities_are_not_captured_and_legacy_with_warns() {
+        let mut env = cell_test_env();
+        let mut d = RecordingDispatch::new();
+        pollster_eval(crate::load_prelude(&mut env, &mut d));
+        let caps =
+            cell_caps(eval_str("(with [status-host db] (cell image))", &mut env, &d).unwrap());
+        assert!(caps.is_empty());
+        let warnings = d.warnings.borrow();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("lexical capability capture was removed"),
+            "got: {}",
+            warnings[0]
+        );
+        assert!(warnings[0].contains("status-host"), "got: {}", warnings[0]);
+        assert!(
+            warnings[0].contains(":grants {:status-host status-host}"),
+            "got: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn explicit_or_legitimate_zero_grant_cells_do_not_warn() {
+        let mut env = cell_test_env();
+        let mut d = RecordingDispatch::new();
+        pollster_eval(crate::load_prelude(&mut env, &mut d));
+
+        eval_str("(cell image)", &mut env, &d).unwrap();
+        eval_str(
+            "(with [status-host db] (cell image :grants {:host status-host}))",
+            &mut env,
+            &d,
+        )
+        .unwrap();
+        assert!(d.warnings.borrow().is_empty());
+    }
+
+    #[test]
+    fn closure_captured_capability_triggers_legacy_warning() {
+        let mut env = cell_test_env();
+        let mut d = RecordingDispatch::new();
+        pollster_eval(crate::load_prelude(&mut env, &mut d));
+
+        eval_str(
+            "(def spawn
+               (let [status-host db]
+                 (fn [] (do status-host (cell image)))))",
+            &mut env,
+            &d,
+        )
+        .unwrap();
+        let caps = cell_caps(eval_str("(spawn)", &mut env, &d).unwrap());
+        assert!(caps.is_empty());
+        let warnings = d.warnings.borrow();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("status-host"), "got: {}", warnings[0]);
+        assert!(
+            warnings[0].contains(":grants {:status-host status-host}"),
+            "got: {}",
+            warnings[0]
+        );
     }
 
     #[test]
@@ -7075,6 +7560,34 @@ mod tests {
                 assert_eq!(schema_cid, "methods-2", "allow set must reach the embedder");
             }
             other => panic!("expected reified cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cell_preserves_reified_attenuation_in_explicit_grant() {
+        let mut env = Env::new();
+        let d = ReifyingDispatch;
+        env.set("image".into(), Val::Bytes(vec![0, 97, 115, 109]));
+        env.set("svc".into(), make_test_cap("svc", 1));
+        let expr = crate::read(
+            "(let [svc-ro (attenuate svc [:run])]
+               (cell image :grants {:restricted svc-ro}))",
+        )
+        .unwrap();
+        let result = pollster_eval(eval_toplevel(&expr, &mut env, &d)).unwrap();
+        let Val::Cell { caps, .. } = result else {
+            panic!("expected cell");
+        };
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].0, "restricted");
+        match &caps[0].1 {
+            Val::Cap {
+                name, schema_cid, ..
+            } => {
+                assert_eq!(name, "svc-reified");
+                assert_eq!(schema_cid, "methods-1");
+            }
+            other => panic!("expected reified cap, got {other}"),
         }
     }
 

@@ -9,11 +9,10 @@ intentionally failing cross-tranche tests are isolated from CI:
 cargo test --test child_authority_confinement t1_expected_red -- --ignored --nocapture --test-threads=1
 ```
 
-The T4 expected-red test covers Glia's two implicit lexical-capability capture
-paths. The T5 expected-red test covers the temporary child-side
-`Membrane.graft()` compatibility interface used to deliver an exact
-`InitialAuthorityRecord`. They remain ignored until their owning tranches remove
-those shapes.
+The former T4 expected-red test is now a normal green regression covering both
+Glia evaluator paths. The remaining T5 expected-red test covers the temporary
+child-side `Membrane.graft()` compatibility interface used to deliver an exact
+`InitialAuthorityRecord`.
 
 ## Layering and blocked cases
 
@@ -33,7 +32,7 @@ those shapes.
 | CAS size/concurrency/fetch/cache pressure | Blocked on the T6 substrate/CAS fixture and measurable cache wiring |
 | `InitialAuthorityRecord`, exact record delivery, shared encoder | Passing T3 regression |
 | Grants-only bootstrap surface/no `graft()` | Expected red; owned by T5 |
-| Glia `:grants`, source duplicate diagnostics, lexical-capture removal | Blocked on T4 |
+| Glia `:grants`, source duplicate diagnostics, lexical-capture removal | Passing T4 regression |
 
 The wire duplicate test deliberately says nothing about Glia map literals:
 Glia's ordinary map evaluation normalizes through `im::HashMap`, so source
@@ -85,8 +84,8 @@ Spawner/listener state after T3:
 - Direct `Executor.spawn` flows in the chess, discovery, and oracle registration
   scripts should explicitly pass zero grants unless their default cell mode
   grows an authority dependency.
-- `crates/glia/src/eval.rs` has two `cell` paths that call
-  `env.collect_caps()`; removing that lexical capture belongs to T4.
+- `crates/glia/src/eval.rs` now routes both `cell` paths through one explicit
+  grant validator; neither path captures lexical capabilities.
 - `std/kernel/src/lib.rs` has both `cell` spawn encoders and the direct
   `runtime :run` spawn path, plus HTTP- and stream-listener grant encoders.
 - `crates/rpc/src/http_listener.rs` and

@@ -1,8 +1,8 @@
 //! T1 constructive child-authority confinement harness.
 //!
 //! Ordinary `cargo test` runs the characterization tests, closed confinement
-//! regressions, and the mandatory Cap'n Proto fork gate. The two remaining
-//! cross-tranche expected-red cases are isolated:
+//! regressions, and the mandatory Cap'n Proto fork gate. The remaining
+//! cross-tranche expected-red case is isolated:
 //!
 //! ```text
 //! cargo test --test child_authority_confinement t1_expected_red -- --ignored --nocapture
@@ -744,8 +744,7 @@ fn empty_and_duplicate_wire_names_abort_spawn_but_path_like_labels_are_valid() {
 }
 
 #[test]
-#[ignore = "T1 expected red (T4): both Glia cell evaluation paths still collect lexical capabilities"]
-fn t1_expected_red_glia_cell_has_no_implicit_lexical_capability_capture() {
+fn t1_glia_cell_has_no_implicit_lexical_capability_capture() {
     let source = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/glia/src/eval.rs"),
     )
@@ -755,6 +754,46 @@ fn t1_expected_red_glia_cell_has_no_implicit_lexical_capability_capture() {
         captures, 0,
         "Glia cell evaluation still has {captures} implicit lexical-capability capture paths"
     );
+}
+
+#[test]
+fn t4_migrated_glia_cell_sites_parse() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (relative, expected_grants) in [
+        (
+            "examples/chess/glia/register.glia",
+            &[":spawn :caps {}"][..],
+        ),
+        ("examples/counter/glia/register.glia", &[":grants {}"][..]),
+        (
+            "examples/discovery/glia/register.glia",
+            &[":spawn :caps {}"][..],
+        ),
+        ("examples/echo/glia/register.glia", &[":grants {}"][..]),
+        (
+            "examples/oracle/glia/register.glia",
+            &[":grants {:http-client http-client}", ":spawn :caps {}"][..],
+        ),
+        (
+            "examples/snap-hello-rs/glia/register.glia",
+            &[":grants {}"][..],
+        ),
+        (
+            "std/status/etc/init.d/05-status.glia",
+            &[":grants {:host host}"][..],
+        ),
+    ] {
+        let source = std::fs::read_to_string(root.join(relative))
+            .unwrap_or_else(|error| panic!("read migrated Glia source {relative}: {error}"));
+        for expected_grant in expected_grants {
+            assert!(
+                source.contains(expected_grant),
+                "{relative} must retain its reviewed explicit-grant shape: {expected_grant}"
+            );
+        }
+        glia::read_many(&source)
+            .unwrap_or_else(|error| panic!("parse migrated Glia source {relative}: {error}"));
+    }
 }
 
 #[test]

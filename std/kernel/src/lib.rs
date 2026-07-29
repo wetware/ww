@@ -221,16 +221,20 @@ fn extract_capnp_client(
 fn collect_forwardable_caps(
     caps: &[(String, Val)],
     context: &str,
-) -> Vec<(String, capnp::capability::Client)> {
+) -> Result<Vec<(String, capnp::capability::Client)>, Val> {
     caps.iter()
-        .filter_map(|(name, val)| {
-            if let Val::Cap { inner, .. } = val {
-                if let Some(client) = extract_capnp_client(inner) {
-                    return Some((name.clone(), client));
-                }
-                log::debug!("{context} — cap '{name}' is not a capnp client, skipping");
-            }
-            None
+        .map(|(name, val)| {
+            let Val::Cap { inner, .. } = val else {
+                return Err(glia::error::internal(context, format!(
+                    "{context} — grant \"{name}\" expected a capability, got {val}"
+                )));
+            };
+            let client = extract_capnp_client(inner).ok_or_else(|| {
+                glia::error::internal(context, format!(
+                    "{context} — grant \"{name}\" is not backed by an exportable Cap'n Proto capability; use a Cap'n Proto-backed capability or follow the defcap-export work"
+                ))
+            })?;
+            Ok((name.clone(), client))
         })
         .collect()
 }
@@ -427,9 +431,12 @@ fn make_executor_cap(executor: system_capnp::executor::Client) -> Val {
                                                 cap_val,
                                             ));
                                         };
-                                        if let Some(client) = extract_capnp_client(inner) {
-                                            cap_pairs.push((name, client));
-                                        }
+                                        let client = extract_capnp_client(inner).ok_or_else(|| {
+                                            glia::error::internal("executor :spawn :caps", format!(
+                                                "executor :spawn :caps grant \"{name}\" is not backed by an exportable Cap'n Proto capability"
+                                            ))
+                                        })?;
+                                        cap_pairs.push((name, client));
                                     }
                                 }
                                 other => {
@@ -562,6 +569,24 @@ impl<'k> Dispatch for KernelDispatch<'k> {
         allow_methods: &std::collections::BTreeSet<String>,
     ) -> Option<Result<Val, Val>> {
         attenuate::reify(self.ctx, cap, allow_methods)
+    }
+
+    fn validate_cell_grant(&self, name: &str, cap: &Val) -> Result<(), Val> {
+        let Val::Cap { inner, .. } = cap else {
+            return Err(glia::error::internal(
+                "cell :grants",
+                format!("grant \"{name}\" expected a capability, got {cap}"),
+            ));
+        };
+        extract_capnp_client(inner).map(|_| ()).ok_or_else(|| {
+            glia::error::internal("cell :grants", format!(
+                "grant \"{name}\" is not backed by an exportable Cap'n Proto capability; use a Cap'n Proto-backed capability or follow the defcap-export work"
+            ))
+        })
+    }
+
+    fn report_warning(&self, warning: &str) {
+        log::warn!("{warning}");
     }
 }
 
@@ -1001,7 +1026,7 @@ fn make_host_handler(
                         req.get().set_executor(executor);
                         req.get().set_prefix(prefix);
 
-                        let valid_caps = collect_forwardable_caps(caps, "host :listen");
+                        let valid_caps = collect_forwardable_caps(caps, "host :listen")?;
                         if !valid_caps.is_empty() {
                             let mut caps_builder = req.get().init_caps(valid_caps.len() as u32);
                             for (i, (name, client)) in valid_caps.into_iter().enumerate() {
@@ -1053,7 +1078,7 @@ fn make_host_handler(
                         req.get().set_executor(executor);
                         req.get().set_protocol(protocol);
 
-                        let valid_caps = collect_forwardable_caps(caps, "host :listen-stream");
+                        let valid_caps = collect_forwardable_caps(caps, "host :listen-stream")?;
                         if !valid_caps.is_empty() {
                             let mut caps_builder = req.get().init_caps(valid_caps.len() as u32);
                             for (i, (name, client)) in valid_caps.into_iter().enumerate() {
@@ -3695,7 +3720,7 @@ mod tests {
             std::env::remove_var("WW_ROOT");
 
             let script = format!(
-                r#"(perform host :listen (cell (perform :load "{}")) "/demo")"#,
+                r#"(perform host :listen (cell (perform :load "{}") :grants {{}}) "/demo")"#,
                 wasm_path.to_str().unwrap()
             );
             let form = read(&script).unwrap();
@@ -3725,7 +3750,7 @@ mod tests {
             std::env::remove_var("WW_ROOT");
 
             let script = format!(
-                r#"(perform host :listen-stream (cell (perform :load "{}")) "chess")
+                r#"(perform host :listen-stream (cell (perform :load "{}") :grants {{}}) "chess")
                    (perform runtime :run (perform :load "{}"))"#,
                 wasm_path.to_str().unwrap(),
                 wasm_path.to_str().unwrap()
@@ -3864,6 +3889,78 @@ mod tests {
                 result.is_ok(),
                 "cell-based listen without caps failed: {:?}",
                 result.unwrap_err()
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn test_cell_grant_encoding_rejects_non_exportable_cap_without_skipping() {
+        let cap = make_cap("local", "glia:local", Rc::new(42i32));
+        let err = match collect_forwardable_caps(&[("logger".to_string(), cap)], "host :listen") {
+            Ok(_) => panic!("non-exportable grant must fail closed"),
+            Err(err) => err,
+        };
+        let message = glia::error::message(&err).expect("structured diagnostic");
+        assert!(message.contains("grant \"logger\""), "got: {message}");
+        assert!(
+            message.contains("not backed by an exportable Cap'n Proto capability"),
+            "got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_glia_cell_rejects_non_exportable_grant_before_listener_spawn() {
+        run_local(async {
+            let ctx = RefCell::new(test_session());
+            let dispatch = build_dispatch();
+            let mut env = Env::new();
+            env.set("image".into(), Val::Bytes(b"fake-wasm".to_vec()));
+            env.set(
+                "local-logger".into(),
+                make_cap("local-logger", "glia:local", Rc::new(42i32)),
+            );
+            let form = read("(cell image :grants {:logger local-logger})").expect("valid Glia");
+            let err = eval(&form, &mut env, &ctx, &dispatch)
+                .await
+                .expect_err("cell construction must fail before listener registration");
+            let message = glia::error::message(&err).expect("structured diagnostic");
+            assert!(message.contains("grant \"logger\""), "got: {message}");
+            assert!(
+                message.contains("not backed by an exportable Cap'n Proto capability"),
+                "got: {message}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_direct_executor_spawn_rejects_non_exportable_cap_without_sending() {
+        run_local(async {
+            let ctx = RefCell::new(test_session());
+            let dispatch = build_dispatch();
+            let mut env = Env::new();
+            env.set(
+                "executor".into(),
+                make_executor_cap(capnp_rpc::new_client(TestExecutor)),
+            );
+            env.set(
+                "local-logger".into(),
+                make_cap("local-logger", "glia:local", Rc::new(42i32)),
+            );
+            let form = read("(perform executor :spawn :caps {\"logger\" local-logger})")
+                .expect("valid Glia");
+            let err = eval(&form, &mut env, &ctx, &dispatch)
+                .await
+                .expect_err("non-exportable direct grant must fail before spawn RPC");
+            let message = glia::error::message(&err).expect("structured diagnostic");
+            assert!(
+                message.contains("executor :spawn :caps grant \"logger\""),
+                "got: {message}"
+            );
+            assert!(
+                message.contains("not backed by an exportable Cap'n Proto capability"),
+                "got: {message}"
             );
         })
         .await;

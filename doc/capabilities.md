@@ -2,7 +2,7 @@
 
 Wetware is capability-secure all the way down: there is no ambient
 authority, and content access is gated by which CIDs a cell can reach.
-This document covers the capability model an agent sees after grafting,
+This document covers the capability model an agent sees at bootstrap,
 the membrane mechanism that enforces attenuation, and the four
 configuration surfaces that determine what the agent can do.
 
@@ -47,13 +47,14 @@ references exist where*:
 
 | Surface | What it controls | How to change it |
 |---------|------------------|------------------|
-| **Membrane graft** | Which RPC capability references enter the cell (`host`, `runtime`, `routing`, `identity`, `http-client`, plus `with`-block grants) | Edit the init.d `with` block; regraft |
+| **Initial grants** | Which RPC capability references enter an ordinary child | Edit the spawning `cell :grants` map; respawn |
 | **Terminal authority policy** | Which verified login identity receives which method profile over one application capability | Publish with `host :serve-vat ... :auth policy`; the listener creates one Terminal per stream |
 | **Root Atom binding** | The cell's root CID — the initial reachable content subgraph | Bind the cell to a different `stem::Atom`; respawn |
 | **Glia env bindings** | Which capability references code inside the cell can name (`fs`, `routing`, `host`, …) | Edit init.d to bind/unbind names; re-eval |
 
-The membrane graft is the canonical RPC surface
-(`crates/rpc/src/graft.rs:HostGraftBuilder`). The root Atom binding flows
+Trusted pid0 receives the host graft; each ordinary child receives only its
+immutable `InitialAuthorityRecord`, constructed from the parent’s explicit
+grants. The root Atom binding flows
 through `stem::Atom` — when the Atom's value changes, `CidTree`'s root
 swaps atomically (`src/vfs.rs:CidTree::swap_root`), and old CIDs the
 cell had cached in memory still resolve to whatever they pointed to,
@@ -69,7 +70,7 @@ cell; they are never load-bearing across a boundary. See
 Attenuating a capnp-backed capability constructs a hook-level membrane
 around it. The returned cap enforces its method allowlist at the
 capability reference itself, so the policy travels with the cap across
-boundaries — export it via a `with` block, publish it explicitly with
+boundaries — insert it in a `cell :grants` map, publish it explicitly with
 `(perform host :serve-raw-vat cap "svc")`, use it as the session template
 for authenticated `host :serve-vat`, or hand it to another cell, and
 callers on the far side are filtered even if they cast the reference to
@@ -99,12 +100,13 @@ a typed client. Denied methods fail closed with
   semantics: they cannot cross a boundary, so the local check is
   interposition within one trust domain, not boundary enforcement.
 
-## Capabilities exposed to grafted agents
+## Capabilities exposed at bootstrap
 
-After calling `membrane.graft()`, an agent holds references to a list
-of named `Export`s (`membrane.capnp:Export`). Each entry carries the cap
-name and the capability itself. The name is the local binding key;
-authority is carried by the capability reference.
+Trusted pid0 receives the host capabilities below. An ordinary child receives
+only the named references its parent supplied in `cell :grants` (or the
+equivalent `Executor.spawn` caps list). Each `Export` entry carries an inert
+name and a capability reference; authority is carried by the reference, never
+looked up from the name.
 
 | Capability | What it does |
 |------------|--------------|
@@ -114,7 +116,7 @@ authority is carried by the capability reference.
 | **runtime** | Load WASM binaries and obtain scoped Executors (with compilation caching) |
 | **routing** | Kademlia DHT: provide and find content/services |
 | **http-client** | Outbound HTTP requests, gated by `--http-dial` allowlist |
-| `with`-scoped extras | Init.d-granted caps for application-specific RPC interfaces, bound by name in the graft. |
+Application-specific entries use their parent-chosen grant-map keys.
 
 The wire-side `StreamListener` / `StreamDialer` / `VatListener` /
 `VatClient` interfaces are reached via `host.network()` rather than
@@ -167,12 +169,12 @@ resolution in this mode.
 
 ## Capability lifecycle
 
-1. Agent calls `membrane.graft()` to receive epoch-scoped capabilities
-2. Having a Membrane reference IS authorization (ocap model)
+1. Trusted pid0 grafts epoch-scoped host capabilities
+2. A parent constructs each ordinary child’s exact named grant set
 3. To gate a remotely published capability, trusted configuration attaches
    an explicit policy and publishes the resulting `Terminal(Session)`
 4. When the on-chain epoch advances, all capabilities are revoked
-5. Agents re-graft, picking up the new state automatically
+5. pid0 re-grafts and explicitly re-delegates fresh references or respawns a child
 
 ## Revocation
 
@@ -181,7 +183,8 @@ cell knows a CID, it can fetch the content. Revocation works two ways:
 
 - **Epoch advance.** `EpochGuard` (`crates/authority/src/epoch.rs`)
   invalidates every RPC capability bound to the old epoch. Method
-  calls fail with `staleEpoch`. The cell must re-graft.
+  calls fail with `staleEpoch`. pid0 explicitly delegates fresh references or
+  respawns the child; ordinary children have no ambient refresh path.
 - **Targeted recipient revocation.** A per-recipient `RevocationGuard`
   invalidates already-issued RPC sessions for that policy decision without
   advancing the global epoch. Removing the policy binding also denies new

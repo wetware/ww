@@ -94,7 +94,9 @@ output.
 ```clojure
 ; Register the echo cell as a raw stream handler.
 ; StreamListener spawns a cell per connection.
-(perform host :listen-stream (cell (perform :load "bin/echo.wasm")) "echo")
+(perform host :listen-stream
+  (cell (perform :load "bin/echo.wasm") :grants {})
+  "echo")
 ```
 
 `etc/init.d/echo.glia` is now a deployment-only hook. Keep

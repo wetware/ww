@@ -146,7 +146,8 @@ well-specified binary protocol for this job.
 ```clojure
 ; Register the counter cell as an HTTP handler at /counter.
 ; HttpListener spawns a cell per request and pipes FastCGI.
-(def counter (cell (perform :load "bin/counter.wasm")))
+(def counter
+  (cell (perform :load "bin/counter.wasm") :grants {}))
 
 (perform host :listen counter "/counter")
 ```
