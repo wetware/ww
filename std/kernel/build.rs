@@ -80,5 +80,13 @@ fn main() {
         "cargo:rerun-if-changed={}",
         capnp_dir.join("stem.capnp").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        capnp_dir.join("http.capnp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        capnp_dir.join("shell.capnp").display()
+    );
     println!("cargo:rerun-if-changed={}", catalog_overlay.display());
 }
