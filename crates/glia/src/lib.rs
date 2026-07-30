@@ -2570,4 +2570,32 @@ mod tests {
             "unquoted symbol should appear in expansion, got: {display}"
         );
     }
+
+    #[test]
+    fn explicit_grant_examples_parse() {
+        for (name, source) in [
+            (
+                "00-zero-grant.glia",
+                include_str!("../../../examples/grants/00-zero-grant.glia"),
+            ),
+            (
+                "01-status-one-grant.glia",
+                include_str!("../../../examples/grants/01-status-one-grant.glia"),
+            ),
+            (
+                "02-attenuated-routing.glia",
+                include_str!("../../../examples/grants/02-attenuated-routing.glia"),
+            ),
+            (
+                "03-image-bound-executor.glia",
+                include_str!("../../../examples/grants/03-image-bound-executor.glia"),
+            ),
+            (
+                "04-deliberate-runtime.glia",
+                include_str!("../../../examples/grants/04-deliberate-runtime.glia"),
+            ),
+        ] {
+            read_many(source).unwrap_or_else(|error| panic!("{name} does not parse: {error}"));
+        }
+    }
 }

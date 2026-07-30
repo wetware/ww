@@ -17,7 +17,6 @@ glia = { path = "../../crates/glia" }
 system = { path = "../system" }
 caps = { path = "../caps" }
 membrane = { package = "wetware-membrane", path = "../../crates/membrane" }
-serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "io-util"] }

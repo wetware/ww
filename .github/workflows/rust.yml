@@ -164,12 +164,6 @@ jobs:
       with:
         key: build-test
 
-    - name: Check generated capability catalog
-      run: make capability-catalog-check
-
-    - name: Review explicit Glia grants
-      run: make grant-lint
-
     - name: Build host workspace test binaries
       run: cargo build --workspace --tests
 

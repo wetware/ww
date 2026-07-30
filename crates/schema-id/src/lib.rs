@@ -40,8 +40,6 @@
 
 use std::path::Path;
 
-pub mod catalog;
-
 /// A named schema with its canonical bytes and derived CID.
 pub struct SchemaEntry {
     /// Const name prefix (e.g., "CHESS_ENGINE").

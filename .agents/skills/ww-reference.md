@@ -6,9 +6,6 @@ reads:
   - doc/cli.md
   - doc/shell.md
   - doc/capabilities.md
-  - doc/capability-catalog.md
-  - doc/generated/capability-catalog.json
-  - doc/grant-lint.md
   - doc/rpc-transport.md
   - doc/keys.md
   - doc/guest-runtime.md
@@ -54,9 +51,6 @@ If they want to browse, show the menu:
 >     channel, WASI integration (`doc/guest-runtime.md`)
 > 14. **Design docs** — deep dives on effects, macros, HTTP surface,
 >     economic platform (`doc/designs/`)
-> 15. **Capability grants** — generated interface catalog, explicit grant
->     examples, attenuation guidance, and review lint
->     (`doc/generated/capability-catalog.json`, `doc/grant-lint.md`)
 
 ## How to present reference material
 

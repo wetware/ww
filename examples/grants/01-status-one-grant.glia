@@ -1,4 +1,3 @@
 ;; Status needs only read-only node identity and connection observations.
 (def status-host (attenuate host [:id :addrs :peers]))
-;; grant-lint: allow WWG101 host -- status needs only the attenuated observation methods above
 (cell status-image :grants {:host status-host})

@@ -1,4 +1,3 @@
 ;; Local hashing does not need DHT announcements, IPNS, or content mutation.
 (def hash-only-routing (attenuate routing [:hash]))
-;; grant-lint: allow WWG101 routing -- the reference permits only local hash
 (cell hasher-image :grants {:routing hash-only-routing})

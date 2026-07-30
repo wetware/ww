@@ -10,6 +10,5 @@
 
 (perform host :listen
   (cell (perform :load "bin/status.wasm")
-    ;; grant-lint: allow WWG101 host -- status guest calls only id/addrs/peers; method attenuation is tracked separately
     :grants {:host host})
   "/status")
