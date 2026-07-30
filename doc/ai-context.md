@@ -25,9 +25,9 @@ envvar tells the guest what plumbing it's running under:
 | `http` | CGI env vars + stdin/stdout | WAGI (CGI for WASM) |
 | absent | Cap'n Proto RPC (host channel) | pid0 -- full Membrane graft |
 
-The kernel (`boot/main.wasm`) is pid0 -- a raw cell whose stdio
-is the host's Cap'n Proto RPC channel, not a libp2p stream.  It
-grafts the full Membrane and spawns all other cells.
+The kernel (`boot/main.wasm`) is trusted pid0. Its stdio is the host's Cap'n
+Proto RPC channel, not a libp2p stream. It alone receives the graft-capable
+`Membrane` and spawns other cells.
 
 Architecture (three layers):
 - **Host** (`ww` binary): boots a libp2p swarm, loads the kernel
@@ -35,17 +35,19 @@ Architecture (three layers):
 - **Kernel** (pid0): calls `membrane.graft()` to obtain capabilities
   (Host, Runtime, Routing, Identity, HttpClient).  Interprets the FHS
   image layout.  All policy lives here.
-- **Children**: spawned by pid0 with explicit capability grants.
+- **Ordinary children**: spawned with an immutable `InitialAuthorityRecord`
+  delivered by `InitialGrants`; they do not receive `Membrane.graft()`.
 
 Key abstractions:
 - **Cell type system**: Glia spawns cells, obtains exported capabilities,
   and publishes them with named vat services; HTTP/raw listeners are byte
   adapters and still spawn handler cells.
-- **Membrane**: the capability hub.  `graft()` returns epoch-scoped
-  capabilities.  pid0 can wrap/filter capabilities and export a
-  derived Membrane to the network.
-- **Epoch lifecycle**: when `--stem` points to an on-chain Atom
-  contract, capabilities are revoked on each epoch advance.
+- **Membrane**: graft-capable authority issuance for pid0 and separately for
+  authenticated remote sessions; it is not child bootstrap.
+- **InitialGrants**: the grants-only ordinary-child bootstrap. It returns the
+  exact parent-selected record and has no refresh, graft, or lookup API.
+- **Epoch lifecycle**: an advance stales host-issued guarded references. pid0
+  re-grafts and reruns affected init; children cannot refresh themselves.
 - **FHS images**: layers are stacked with per-file union.  Later
   layers override earlier ones.
 - **Cap'n Proto RPC**: bidirectional -- both host and guest can serve
@@ -65,7 +67,8 @@ the LLM is the driver.  "Agent" means any autonomous process --
 AI, human, script.  Wetware controls what they're *allowed to do*,
 not what they *are*.
 
-Capabilities after grafting:
+Capabilities after pid0 grafting (ordinary children receive only explicitly
+granted entries):
 
 | Capability | Purpose |
 |------------|---------|

@@ -108,8 +108,9 @@ pub fn check(&self) -> Result<(), Error> {
 }
 ```
 
-When the epoch advances (on-chain `HeadUpdated` event, finalized by the
-confirmation-depth strategy), all outstanding capabilities fail simultaneously.
+When the epoch advances (an on-chain `HeadUpdated` event, finalized by the
+confirmation-depth strategy), host-issued capabilities guarded by that epoch
+fail simultaneously. This does not revoke arbitrary non-host capabilities.
 Trusted pid0 may call `Membrane.graft()` again. Ordinary children have no graft
 surface: they receive fresh references only through explicit ancestor
 re-delegation or respawn.
