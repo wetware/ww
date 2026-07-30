@@ -1,0 +1,2 @@
+;; Substrate-only child: no application capabilities.
+(cell image)

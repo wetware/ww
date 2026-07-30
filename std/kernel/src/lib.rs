@@ -57,6 +57,9 @@ mod schema_ids {
     include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 }
 
+const CAPABILITY_CATALOG_JSON: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/capability-catalog.json"));
+
 mod attenuate;
 
 /// Bootstrap capability: the concrete Membrane defined in membrane.capnp.
@@ -1550,7 +1553,11 @@ Effects:
 
 Built-ins:
   (cd \"<path>\")                  Change working directory
-  (help)                         This message
+  (help)                           This message
+  (schema cap)                     Schema bytes for a capability you possess
+  (doc cap)                        Documentation for a capability you possess
+  (capabilities)                   Static capability catalog (JSON)
+  (capabilities :host)             One static catalog entry (JSON)
 \nUnknown commands fail with command-not-found.";
 
 // ---------------------------------------------------------------------------
@@ -1997,6 +2004,68 @@ fn make_help_builtin() -> Val {
     }
 }
 
+/// Static capability documentation generated from repository schemas and the
+/// checked policy overlay. This builtin deliberately has no Session, RPC
+/// client, effect handler, or environment-mutation access.
+fn make_capabilities_builtin() -> Val {
+    Val::NativeFn {
+        name: "capabilities".into(),
+        func: Rc::new(|args: &[Val]| -> Result<Val, Val> {
+            if args.is_empty() {
+                return Ok(Val::Str(CAPABILITY_CATALOG_JSON.to_owned()));
+            }
+            if args.len() != 1 {
+                return Err(glia::error::arity("capabilities", "0 or 1", args.len()));
+            }
+            let requested = match &args[0] {
+                Val::Keyword(name) | Val::Str(name) => name.as_str(),
+                other => {
+                    return Err(glia::error::type_mismatch(
+                        "capabilities optional catalog label",
+                        "keyword or string",
+                        other,
+                    ))
+                }
+            };
+            let catalog: serde_json::Value = serde_json::from_str(CAPABILITY_CATALOG_JSON)
+                .map_err(|error| {
+                    glia::error::internal(
+                        "capabilities",
+                        format!("invalid embedded capability catalog: {error}"),
+                    )
+                })?;
+            let entry = catalog
+                .get("capabilities")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|entries| {
+                    entries.iter().find(|entry| {
+                        entry
+                            .get("conventionalName")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(requested)
+                            || entry.get("catalogId").and_then(serde_json::Value::as_str)
+                                == Some(requested)
+                    })
+                })
+                .ok_or_else(|| {
+                    glia::error::permission_denied(
+                        &format!("capability catalog entry '{requested}' is not known"),
+                        Some("call (capabilities) to list static documentation entries"),
+                    )
+                })?;
+            let result = serde_json::json!({
+                "notice": catalog.get("notice").cloned().unwrap_or(serde_json::Value::Null),
+                "capability": entry
+            });
+            serde_json::to_string_pretty(&result)
+                .map(Val::Str)
+                .map_err(|error| {
+                    glia::error::internal("capabilities", format!("encode catalog entry: {error}"))
+                })
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -2228,6 +2297,7 @@ fn run_impl() -> Result<(), ()> {
                     env.set("schema".to_string(), make_schema_builtin());
                     env.set("doc".to_string(), make_doc_builtin());
                     env.set("help".to_string(), make_help_builtin());
+                    env.set("capabilities".to_string(), make_capabilities_builtin());
                     env.set("import".to_string(), make_import_cap());
                     env.set(
                         "import-handler".to_string(),
@@ -4511,6 +4581,57 @@ mod tests {
             text.contains("not registered"),
             "help should note unregistered schema: {text}"
         );
+    }
+
+    #[test]
+    fn capabilities_lists_static_docs_without_claiming_possession() {
+        let builtin = make_capabilities_builtin();
+        let result = call_builtin(&builtin, &[]).unwrap();
+        let Val::Str(json) = result else {
+            panic!("capabilities must return JSON text");
+        };
+        assert!(json.contains("\"catalogId\": \"ww.host\""), "{json}");
+        assert!(
+            json.contains("does not imply runtime availability or possession"),
+            "{json}"
+        );
+        assert!(
+            json.contains("cannot resolve, mint, or grant a capability"),
+            "{json}"
+        );
+        assert!(!json.contains("\"client\""), "{json}");
+        assert!(!json.contains("\"liveReference\""), "{json}");
+    }
+
+    #[test]
+    fn capabilities_describes_one_static_interface_by_inert_label() {
+        let builtin = make_capabilities_builtin();
+        let result = call_builtin(&builtin, &[Val::Keyword("runtime".into())]).unwrap();
+        let Val::Str(json) = result else {
+            panic!("capabilities query must return JSON text");
+        };
+        assert!(json.contains("\"catalogId\": \"ww.runtime\""), "{json}");
+        assert!(json.contains("\"name\": \"load\""), "{json}");
+        assert!(json.contains("\"ordinal\": 0"), "{json}");
+        assert!(json.contains("\"normallyGrantable\": false"), "{json}");
+        assert!(json.contains("\"notice\""), "{json}");
+    }
+
+    #[test]
+    fn capabilities_unknown_label_fails_without_resolving() {
+        let builtin = make_capabilities_builtin();
+        let error = call_builtin(
+            &builtin,
+            &[Val::Keyword("definitely-not-a-capability".into())],
+        )
+        .unwrap_err();
+        assert_eq!(
+            glia::error::type_tag(&error),
+            Some(glia::error::tag::PERMISSION_DENIED)
+        );
+        assert!(glia::error::message(&error)
+            .unwrap()
+            .contains("is not known"));
     }
 
     #[test]

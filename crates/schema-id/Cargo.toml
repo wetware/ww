@@ -9,3 +9,6 @@ capnp = { workspace = true }
 capnpc = { workspace = true } # runtime dep: extract_schemas uses capnpc for canonical encoding
 blake3 = { workspace = true }
 cid = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

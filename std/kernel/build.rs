@@ -50,6 +50,16 @@ fn main() {
     schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
         .expect("emit schema consts");
 
+    let repository_root = capnp_dir
+        .parent()
+        .expect("capnp directory has repository parent");
+    let catalog_overlay = capnp_dir.join("capability-policy.json");
+    let catalog =
+        schema_id::catalog::generate_repository_catalog(repository_root, &catalog_overlay)
+            .expect("generate capability catalog");
+    schema_id::catalog::write_catalog(&out_dir.join("capability-catalog.json"), &catalog)
+        .expect("emit capability catalog");
+
     println!(
         "cargo:rerun-if-changed={}",
         capnp_dir.join("system.capnp").display()
@@ -70,4 +80,5 @@ fn main() {
         "cargo:rerun-if-changed={}",
         capnp_dir.join("stem.capnp").display()
     );
+    println!("cargo:rerun-if-changed={}", catalog_overlay.display());
 }
