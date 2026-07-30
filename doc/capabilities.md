@@ -1,8 +1,7 @@
 # Capabilities
 
-Wetware is capability-secure all the way down: there is no ambient
-authority, and content access is gated by which CIDs a cell can reach.
-This document covers the capability model an agent sees at bootstrap,
+Wetware has no ambient node authority. This document covers the capability
+model an agent receives at birth,
 the membrane mechanism that enforces attenuation, and the four
 configuration surfaces that determine what the agent can do.
 
@@ -11,22 +10,12 @@ resolution), see [architecture.md](architecture.md).
 
 ## Content as capability
 
-Wetware's filesystem is the IPFS UnixFS DAG, exposed to guests through
-the WASI virtual filesystem (`CidTree` in `src/vfs.rs`). Every reachable
-path resolves to a CID, and a CID is an unforgeable cryptographic hash
-of its content. This collapses two ideas that are usually separate:
-
-- **CIDs are sturdyrefs.** You cannot guess a CID for content you don't
-  have. If someone hands you a CID, they have effectively granted you
-  the ability to fetch that content. If they don't, you can't discover
-  it through the filesystem. This is the classical object-capability
-  property: an unforgeable reference IS the grant of access.
-
-- **The "filesystem" is the reachable CID subgraph.** Each cell starts
-  rooted at a particular CID (its image root). It can read anything
-  walkable from that root, plus any CIDs handed to it over RPC at
-  runtime. There's no path-based permission model — there's only
-  "what CIDs does this cell know."
+An image-backed cell's read-only filesystem is a `CidTree` rooted at its
+image. A CID names content; when known-CID CAS wiring is present, that name is
+a copyable bearer locator for readable content, not a confidential or
+unforgeable authority reference. It can be shared and can have node resource
+effects. The host does not give an ordinary child a general IPFS control
+capability merely by making that read path available.
 
 This makes WASI preopens a protocol detail, not a security boundary.
 The host preopens `CidTree::staging_dir()` at `/` so the guest's WASI
@@ -49,8 +38,8 @@ references exist where*:
 |---------|------------------|------------------|
 | **Initial grants** | Which RPC capability references enter an ordinary child | Edit the spawning `cell :grants` map; respawn |
 | **Terminal authority policy** | Which verified login identity receives which method profile over one application capability | Publish with `host :serve-vat ... :auth policy`; the listener creates one Terminal per stream |
-| **Root Atom binding** | The cell's root CID — the initial reachable content subgraph | Bind the cell to a different `stem::Atom`; respawn |
-| **Glia env bindings** | Which capability references code inside the cell can name (`fs`, `routing`, `host`, …) | Edit init.d to bind/unbind names; re-eval |
+| **Image root / CAS wiring** | The fixed read-only root and optional known-CID reads | Select the execution context; respawn |
+| **Glia bindings** | Names available while trusted Glia composes an authority graph | Edit init; they do not cross a child boundary by lexical capture |
 
 Trusted pid0 receives the host graft; each ordinary child receives only its
 immutable `InitialAuthorityRecord`, constructed from the parent’s explicit
@@ -122,9 +111,11 @@ The wire-side `StreamListener` / `StreamDialer` / `VatListener` /
 `VatClient` interfaces are reached via `host.network()` rather than
 appearing as separate initial grants.
 
-Host-derived capabilities are epoch-guarded: they fail with `staleEpoch` once
-the on-chain head advances. An ordinary child cannot re-graft; pid0 explicitly
-re-delegates fresh references or respawns it.
+Host-issued delegated capabilities are epoch-guarded: they fail with
+`staleEpoch` once the on-chain head advances. An ordinary child cannot
+re-graft; pid0 reruns affected init and explicitly re-delegates fresh
+references or respawns it. Epoch guards do not revoke arbitrary capability
+references that were not issued by the host.
 
 ### Content access (WASI path I/O only)
 
@@ -152,8 +143,8 @@ explicit without becoming an authority grant. The WASI virtual filesystem and
 its reachable CID tree still govern guest path I/O, while the membrane governs
 RPC capability authority.
 
-Known-CID cache wiring is execution-context state, not a child-visible
-capability or locator. A child cannot replace or widen it, and it provides no
+Known-CID cache wiring is execution-context state, not a child-visible control
+capability. A child cannot replace or widen it, and it provides no
 CID enumeration, mutation, pin management, publishing, routing, arbitrary
 dialing, ambient network API, or `ipfs` RPC capability.
 
@@ -192,13 +183,15 @@ resolution in this mode.
 2. A parent constructs each ordinary child’s exact named grant set
 3. To gate a remotely published capability, trusted configuration attaches
    an explicit policy and publishes the resulting `Terminal(Session)`
-4. When the on-chain epoch advances, all capabilities are revoked
-5. pid0 re-grafts and explicitly re-delegates fresh references or respawns a child
+4. An epoch advance stales host-issued guarded capabilities
+5. pid0 re-grafts, reruns affected init, and explicitly re-delegates fresh
+   references or replaces affected children
 
 ## Revocation
 
-You cannot un-hand a CID. This is classical ocap semantics — once a
-cell knows a CID, it can fetch the content. Revocation works two ways:
+A CID already handed to a cell remains copyable knowledge; it is not a
+confidential capability. Whether it is readable depends on the applicable
+image root and optional known-CID CAS wiring. RPC revocation works two ways:
 
 - **Epoch advance.** `EpochGuard` (`crates/authority/src/epoch.rs`)
   invalidates every RPC capability bound to the old epoch. Method

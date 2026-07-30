@@ -165,8 +165,8 @@ loop:
 ```
 pid0 (kernel)               host                        child agent
 ─────────────              ──────                      ─────────────
-graft() -> Session
-load+spawn    ───────────> spawn child Proc + RpcSystem
+Membrane.graft() -> host grants
+load+spawn(explicit grants) ─> spawn child Proc + InitialGrants RpcSystem
                            return Process cap
 wait RPC     <──────────── ProcessImpl::wait
 ```
@@ -174,10 +174,9 @@ wait RPC     <──────────── ProcessImpl::wait
 ### Flow B: child loads + spawns a grandchild
 
 ```
-child agent                 host
-───────────                ──────
-graft() -> Session
-runtime.load(wasm) ──────> RuntimeImpl::load (cache lookup or compile)
+child agent (with Runtime grant)    host
+───────────────────────────────     ──────
+runtime.load(wasm) ───────────────> RuntimeImpl::load (cache lookup or compile)
   -> Executor client <──── return pipelined Executor
 executor.spawn()   ──────> ExecutorImpl::spawn
   -> Process client <───── return Process cap
@@ -217,11 +216,14 @@ transport. The host never writes bytes. All RPC I/O goes through the WIT
 data_streams side-channel.
 
 Vat publication is publisher-owned: the publisher spawns a cell, imports its
-bootstrap capability with `Process.bootstrap`, and passes that capability plus
+guest-exported capability with `Process.bootstrap()`, and passes that capability plus
 an explicit auth policy to `VatListener.serveAuthenticated`. The listener owns
 one Terminal and login deadline per stream, but it does not own or spawn the
 publishing cell. `handle_vat_connection_serve` is retained for the explicit
 raw-serving path.
+
+`Process.bootstrap()` is parent-held guest-exported authority, not the
+host-provided `InitialGrants` that bootstraps an ordinary child.
 
 ## Executor pool and M:N scheduling
 

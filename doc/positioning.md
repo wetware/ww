@@ -116,15 +116,15 @@ some are written by the LLM at runtime (definitely untrusted).
 
 On Wetware:
 
-- The orchestrator runs as a cell with a membrane that grants it
-  the capabilities it needs: the user's tax document arrives as a
-  CID (a sturdyref into the IPFS UnixFS DAG, unforgeable and
-  content-addressed -- no host filesystem access, no path-based
-  authority); `http-client` for the IRS API (gated to `irs.gov`
-  via `--http-dial`); `identity` for signing. Nothing else.
+- Trusted pid0 receives the host `Membrane` and explicitly grants the
+  orchestrator the references it needs: the user's tax document may arrive as
+  a CID (a copyable locator into the IPFS UnixFS DAG, not host-filesystem or
+  path-based authority); `http-client` for the IRS API (gated to `irs.gov`
+  via `--http-dial`); and `identity` for signing. Nothing else is acquired by
+  the child bootstrap.
 - Each tool the orchestrator calls runs as a child cell. The
-  orchestrator decides what fragment of its membrane to graft
-  to the child. The IRS API tool gets an `http-client` whose
+  orchestrator decides which explicit references to grant to the child. The
+  IRS API tool gets an `http-client` whose
   dial allowlist is just `irs.gov`; it cannot reach any other
   domain.
 - A third-party MCP server pulled from GitHub gets *zero*
@@ -136,8 +136,9 @@ On Wetware:
   it runs. The orchestrator can verify the CID matches what the
   model produced; the runtime enforces that the binary wasn't
   swapped between generation and execution.
-- When the orchestrator finishes the user's request, every cell's
-  capabilities are revoked. There's no ambient state for a tool
+- When the orchestrator finishes the user's request, its cells can be
+  terminated and host-issued epoch-guarded capabilities become stale on an
+  epoch advance. There is no ambient node authority for a tool
   to abuse on the next request.
 
 The pitch to that startup: *your tax-prep agent can pull a new
@@ -192,7 +193,8 @@ A few framings we've explicitly *not* chosen, and why:
 
 What we have today:
 
-- WASM cell runtime with explicit membrane-grafted capabilities.
+- WASM cell runtime with a graft-capable trusted pid0 and explicit ordinary
+  child grants.
 - Hook-level method attenuation for schema-bound capabilities, including
   returned capabilities, pipelines, re-attenuation intersection, and
   independent membrane-boundary lineage.
