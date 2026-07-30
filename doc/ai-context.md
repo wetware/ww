@@ -80,6 +80,24 @@ granted entries):
 | StreamListener / StreamDialer | P2P byte streams for raw cells |
 | VatListener / VatClient | Cap'n Proto RPC for capnp cells |
 
+Grant authoring and review:
+
+- Read `doc/generated/capability-catalog.json` for stable machine-readable
+  interface IDs, methods/ordinals, conventional grant names, sensitivity,
+  attenuation guidance, required configuration, and explicit-map examples.
+- The catalog is documentation only. It cannot prove availability or
+  possession and never resolves a reference.
+- In Glia, `(capabilities)` lists static JSON documentation;
+  `(capabilities :runtime)` describes one entry. `(schema cap)`, `(doc cap)`,
+  and `(help cap)` instead inspect a capability value already possessed.
+- `(cell image)` means zero application capabilities. Write
+  `(cell image :grants {:name possessed-cap})` for exact delegation.
+- Prefer an image-bound Executor over Runtime, scoped Signer over Identity,
+  attenuated methods over broad Host/Routing, and a capability protocol over
+  bearer tokens in args/env.
+- Run `cargo run -p grant-lint -- <paths>` for focused structural, sensitive
+  grant, bearer-string, stale-`with`, broad-Host, and reviewability diagnostics.
+
 Quick start:
 ```
 rustup target add wasm32-wasip2

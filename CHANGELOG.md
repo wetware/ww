@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Discoverable explicit child grants.** A deterministic machine-readable
+  capability catalog now joins Cap’n Proto-reflected interface IDs,
+  schema CIDs, and method ordinals with a checked repository-policy overlay.
+  Glia exposes the static, non-authorizing catalog through `(capabilities)`;
+  focused grant lint reports structural, sensitive-authority, bearer-string,
+  stale-`with`, broad-Host, and reviewability patterns with concrete rewrites
+  and narrow reasoned suppressions. Five parse-tested examples cover zero,
+  explicit, attenuated, image-bound Executor, and deliberate Runtime grants.
 - **Child-authority lifecycle and substrate scenarios.** Trusted pid0 services
   now re-graft and rerun init after structured epoch staleness; epoch-owned HTTP
   route leases clean up by identity, and readiness reflects live current-epoch

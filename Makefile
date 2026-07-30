@@ -7,6 +7,7 @@ WASM_TARGET := wasm32-wasip2
 
 .PHONY: all host std kernel shell status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
 .PHONY: publish-std try-publish-std publish test-deps test test-wasm check-glia-effects authority-probe
+.PHONY: capability-catalog-check grant-lint
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
 
@@ -42,6 +43,12 @@ check-glia-effects:
 		--glob '*.rs' --glob '!.git/**' --glob '!target/**' --glob '!std/**/target/**' .
 	@! rg -n --hidden 'Val::Keyword\(("exit"|\x27exit\x27)' \
 		--glob '!.git/**' --glob '!target/**' --glob '!std/**/target/**' .
+
+capability-catalog-check:
+	cargo run -p schema-id --bin capability-catalog -- check
+
+grant-lint:
+	cargo run -p grant-lint -- --deny-warnings std examples
 
 # --- Std components ----------------------------------------------------------
 

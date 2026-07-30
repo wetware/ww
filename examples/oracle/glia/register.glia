@@ -1,6 +1,7 @@
 ; Explicitly ungated RPC demo plus the HTTP adapter.
 (def oracle-wasm (perform :load "bin/oracle.wasm"))
 (def oracle-http
+  ;; grant-lint: allow WWG101 http-client -- oracle calls the operator-allowlisted price API
   (cell oracle-wasm :grants {:http-client http-client}))
 
 (def oracle-executor (perform runtime :load oracle-wasm))

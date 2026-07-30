@@ -677,6 +677,7 @@ dependencies = [
  "log",
  "multiaddr",
  "schema-id",
+ "serde_json",
  "system",
  "tempfile",
  "tokio",
@@ -894,6 +895,9 @@ dependencies = [
  "capnp",
  "capnpc",
  "cid",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

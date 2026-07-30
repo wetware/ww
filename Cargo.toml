@@ -10,6 +10,7 @@ members = [
     "crates/membrane",
     "crates/rpc",
     "crates/schema-id",
+    "crates/grant-lint",
     "crates/stem",
     "crates/guest/auth",
     "std/system",
