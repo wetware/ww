@@ -47,21 +47,8 @@ Glia-native capabilities created by `defcap` cannot yet cross a cell boundary.
 Granting one fails before spawn; use a Cap’n Proto-backed capability until the
 separate `defcap` export bridge lands.
 
-## Find and review grantable interfaces
+## Examples
 
-Use `(capabilities)` or `(capabilities :runtime)` for static JSON documentation.
-Listing an interface does not mean the current Glia environment possesses it.
-Only an existing capability value can be placed in `:grants`; labels and
-interface IDs never resolve authority.
-
-The five parse-tested patterns in [`examples/grants/`](../examples/grants/)
+The five parse-checked patterns in [`examples/grants/`](../examples/grants/)
 cover zero grants, one status grant, attenuation, an image-bound Executor, and
-a deliberate Runtime grant. Review Glia files with:
-
-```sh
-cargo run -p grant-lint -- path/to/init.glia
-```
-
-See [`capability-catalog.md`](capability-catalog.md) and
-[`grant-lint.md`](grant-lint.md) for generation, rule severity, concrete fixes,
-and narrow reasoned suppressions.
+a deliberate Runtime grant.

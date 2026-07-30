@@ -274,7 +274,7 @@ User code constructs structured errors via the `ex-info` builtin:
 
 ## Introspection
 
-Three Glia builtins return data about caps an agent already holds. They are
+Three Glia builtins return data about caps an agent holds. They are
 registered by the kernel after graft (`std/kernel/src/lib.rs`):
 
 - `(schema cap)` returns the cap's canonical `Schema.Node` bytes as
@@ -289,16 +289,6 @@ registered by the kernel after graft (`std/kernel/src/lib.rs`):
 All three reject non-cap arguments via `:glia.error/type-mismatch` and
 unknown caps via `:glia.error/permission-denied`, propagating typed
 errors end-to-end.
-
-Static authoring discovery is deliberately separate:
-
-- `(capabilities)` returns the generated capability catalog as JSON text.
-- `(capabilities :host)` describes one known interface by inert label.
-
-Catalog entries describe repository schemas and policy; they do not imply
-runtime availability or possession and cannot resolve a live reference. See
-[`capability-catalog.md`](capability-catalog.md) for the generated/manual
-boundary and [`grant-lint.md`](grant-lint.md) for the focused review rules.
 
 ## MCP = Glia eval
 
