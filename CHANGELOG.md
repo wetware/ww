@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Cell values are ordinary tagged data.** `Val::Cell` is removed; `(cell ...)`
+  keeps its syntax and early grant validation but now returns an immutable
+  tagged map `{:ww/type :cell, :wasm <bytes>, :grants {...}}`. Both host
+  listener paths validate the full spec through one canonical activation
+  parser strictly before any WASM load, rejecting malformed or forged specs
+  with a structured `glia.error/invalid-cell-spec` error while preserving
+  alphabetical grant wire order. A tag-only `cell?` predicate is added, and
+  the MCP adapter emits structured JSON for cell specs. Deliberate
+  user-visible changes: `(type cell-spec)` is `:map`, cell specs are
+  inspectable and transformable as ordinary data, and zero-grant specs are
+  authority-free.
+
 ### Removed
 - **Speculative capability discovery and grant review tooling.** Removed the
   static capability catalog and syntax-based grant linter before adoption.
