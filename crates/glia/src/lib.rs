@@ -110,6 +110,46 @@ pub fn make_cap(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cell specs — tagged ordinary data
+// ---------------------------------------------------------------------------
+
+/// Keys of the tagged map produced by the `cell` builtin:
+/// `{:ww/type :cell, :wasm <bytes>, :grants {<keyword> <cap>}}`.
+///
+/// A cell spec is ordinary immutable Glia data — inspectable and
+/// transformable like any map. Authority flows only through the caps held
+/// in `:grants`; the authority-bearing consumer (`host :listen` /
+/// `:listen-stream`) re-validates the full spec at activation, so a forged
+/// or transformed map cannot forward anything its holder does not already
+/// possess.
+pub mod cell_spec {
+    /// Tag key: `:ww/type`.
+    pub const TYPE_KEY: &str = "ww/type";
+    /// Tag value: `:cell`.
+    pub const TYPE_TAG: &str = "cell";
+    /// WASM image key: `:wasm` (bytes).
+    pub const WASM_KEY: &str = "wasm";
+    /// Grants key: `:grants` (map of keyword name to capability).
+    pub const GRANTS_KEY: &str = "grants";
+}
+
+/// True iff `v` carries the cell tag: a map whose `:ww/type` is `:cell`.
+///
+/// Tag test only — this is the `cell?` builtin's whole contract. A tagged
+/// map may still be malformed; complete validation happens exclusively at
+/// activation (`host :listen` / `:listen-stream`), which rejects bad specs
+/// with a `glia.error/invalid-cell-spec` error.
+pub fn is_cell_tagged(v: &Val) -> bool {
+    let Val::Map(map) = v else {
+        return false;
+    };
+    matches!(
+        map.get(&Val::Keyword(cell_spec::TYPE_KEY.into())),
+        Some(Val::Keyword(tag)) if tag == cell_spec::TYPE_TAG
+    )
+}
+
 #[cfg(test)]
 mod banner_tests {
     use super::*;
@@ -251,16 +291,6 @@ pub enum Val {
         cap_id: u64,
         inner: std::rc::Rc<dyn std::any::Any>,
     },
-    /// A cell definition: WASM binary + explicitly granted capabilities.
-    ///
-    /// Created by `(cell wasm :grants {...})`. Omitting `:grants` produces an
-    /// intentionally zero-authority cell; lexical bindings are never captured.
-    /// When the cell is registered with a byte adapter, the host forwards only
-    /// these named grants to spawned children.
-    Cell {
-        wasm: Vec<u8>,
-        caps: Vec<(String, Val)>,
-    },
 }
 
 impl core::fmt::Debug for Val {
@@ -294,9 +324,6 @@ impl core::fmt::Debug for Val {
             Val::AsyncNativeFn { name, .. } => write!(f, "AsyncNativeFn({name})"),
             Val::Resume(v) => f.debug_tuple("Resume").field(v).finish(),
             Val::Cap { name, .. } => write!(f, "Cap({name})"),
-            Val::Cell { wasm, caps } => {
-                write!(f, "Cell({} bytes, {} caps)", wasm.len(), caps.len())
-            }
         }
     }
 }
@@ -371,8 +398,6 @@ impl PartialEq for Val {
             }
             // Caps match by instance identity.
             (Val::Cap { cap_id: a, .. }, Val::Cap { cap_id: b, .. }) => a == b,
-            // Cells are equal if wasm matches (caps are opaque).
-            (Val::Cell { wasm: wa, .. }, Val::Cell { wasm: wb, .. }) => wa == wb,
             // Atoms compare by identity: same cell, not same contents.
             (Val::Atom(a), Val::Atom(b)) => std::rc::Rc::ptr_eq(a, b),
             // Recur, Effect, and Resume are internal sentinels — never equal.
@@ -419,9 +444,6 @@ impl std::hash::Hash for Val {
             Val::Cap { cap_id, .. } => cap_id.hash(state),
             // Identity hash, consistent with identity equality.
             Val::Atom(a) => (std::rc::Rc::as_ptr(a) as usize).hash(state),
-            Val::Cell { wasm, .. } => {
-                wasm.hash(state);
-            }
             // Sentinels: hash by discriminant only (already done above).
             Val::Recur(_) | Val::Effect { .. } | Val::Resume(_) => {}
         }
@@ -476,14 +498,6 @@ impl core::fmt::Display for Val {
             Val::NativeFn { name, .. } => write!(f, "#<native-fn {name}>"),
             Val::AsyncNativeFn { name, .. } => write!(f, "#<async-native-fn {name}>"),
             Val::Cap { name, .. } => write!(f, "#<cap {name}>"),
-            Val::Cell { wasm, caps } => {
-                write!(f, "#<cell {} bytes", wasm.len())?;
-                if !caps.is_empty() {
-                    let names: Vec<&str> = caps.iter().map(|(n, _)| n.as_str()).collect();
-                    write!(f, ", caps [{}]", names.join(" "))?;
-                }
-                write!(f, ">")
-            }
             Val::Resume(val) => write!(f, "#<resume {val}>"),
         }
     }

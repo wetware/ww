@@ -225,18 +225,132 @@ fn collect_forwardable_caps(
     caps.iter()
         .map(|(name, val)| {
             let Val::Cap { inner, .. } = val else {
-                return Err(glia::error::internal(context, format!(
+                return Err(glia::error::invalid_cell_spec(context, format!(
                     "{context} — grant \"{name}\" expected a capability, got {val}"
                 )));
             };
             let client = extract_capnp_client(inner).ok_or_else(|| {
-                glia::error::internal(context, format!(
+                glia::error::invalid_cell_spec(context, format!(
                     "{context} — grant \"{name}\" is not backed by an exportable Cap'n Proto capability; use a Cap'n Proto-backed capability or follow the defcap-export work"
                 ))
             })?;
             Ok((name.clone(), client))
         })
         .collect()
+}
+
+/// A validated cell registration, ready for wire encoding.
+///
+/// Produced only by [`parse_cell_spec`]; `grants` is sorted by name so the
+/// guest-visible grant order stays alphabetic and deterministic.
+struct CellSpec {
+    wasm: Vec<u8>,
+    grants: Vec<(String, capnp::capability::Client)>,
+}
+
+/// Canonical parser for the tagged cell-spec map produced by `(cell ...)`:
+/// `{:ww/type :cell, :wasm <bytes>, :grants {<keyword> <cap>}}`.
+///
+/// Both `host :listen` and `host :listen-stream` funnel through here, and
+/// the full spec is validated strictly before `runtime.load_request()` is
+/// called. A cell spec is ordinary data, so this is the authority boundary:
+/// exactly the documented fields are required, unknown fields are rejected,
+/// grant keys must be keywords, and every granted value must pass the
+/// forwardable-capability rules. A forged or transformed map therefore
+/// cannot forward anything beyond capabilities its holder already has.
+fn parse_cell_spec(spec: &Val, context: &str) -> Result<CellSpec, Val> {
+    let Val::Map(map) = spec else {
+        return Err(glia::error::invalid_cell_spec(
+            context,
+            format!("{context} — expected a cell spec map from (cell ...), got {spec}"),
+        ));
+    };
+
+    let known = [
+        glia::cell_spec::TYPE_KEY,
+        glia::cell_spec::WASM_KEY,
+        glia::cell_spec::GRANTS_KEY,
+    ];
+    let mut unknown: Vec<String> = map
+        .iter()
+        .filter_map(|(k, _)| match k {
+            Val::Keyword(name) if known.contains(&name.as_str()) => None,
+            other => Some(format!("{other}")),
+        })
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort();
+        return Err(glia::error::invalid_cell_spec(
+            context,
+            format!(
+                "{context} — unknown cell spec field(s) {}; a cell spec holds exactly :ww/type, :wasm, and :grants",
+                unknown.join(", ")
+            ),
+        ));
+    }
+
+    match map.get(&Val::Keyword(glia::cell_spec::TYPE_KEY.into())) {
+        Some(Val::Keyword(tag)) if tag == glia::cell_spec::TYPE_TAG => {}
+        Some(other) => {
+            return Err(glia::error::invalid_cell_spec(
+                context,
+                format!("{context} — :ww/type must be :cell, got {other}"),
+            ))
+        }
+        None => {
+            return Err(glia::error::invalid_cell_spec(
+                context,
+                format!("{context} — cell spec is missing :ww/type :cell"),
+            ))
+        }
+    }
+
+    let wasm = match map.get(&Val::Keyword(glia::cell_spec::WASM_KEY.into())) {
+        Some(Val::Bytes(bytes)) => bytes.clone(),
+        Some(other) => {
+            return Err(glia::error::invalid_cell_spec(
+                context,
+                format!("{context} — :wasm must be bytes, got {other}"),
+            ))
+        }
+        None => {
+            return Err(glia::error::invalid_cell_spec(
+                context,
+                format!("{context} — cell spec is missing :wasm bytes"),
+            ))
+        }
+    };
+
+    let grants_map = match map.get(&Val::Keyword(glia::cell_spec::GRANTS_KEY.into())) {
+        Some(Val::Map(grants)) => grants.clone(),
+        Some(other) => {
+            return Err(glia::error::invalid_cell_spec(
+                context,
+                format!("{context} — :grants must be a map, got {other}"),
+            ))
+        }
+        None => {
+            return Err(glia::error::invalid_cell_spec(
+                context,
+                format!("{context} — cell spec is missing :grants (use {{}} for none)"),
+            ))
+        }
+    };
+
+    let mut named: Vec<(String, Val)> = Vec::with_capacity(grants_map.len());
+    for (key, value) in grants_map.iter() {
+        let Val::Keyword(name) = key else {
+            return Err(glia::error::invalid_cell_spec(
+                context,
+                format!("{context} — grant names must be keywords, got {key}"),
+            ));
+        };
+        named.push((name.clone(), value.clone()));
+    }
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    let grants = collect_forwardable_caps(&named, context)?;
+
+    Ok(CellSpec { wasm, grants })
 }
 
 fn make_generic_cap(cap: capnp::capability::Client) -> Val {
@@ -988,9 +1102,9 @@ fn make_host_handler(
                         Val::List(items)
                     }
                     "listen" => {
-                        let (cell, prefix) = match rest {
-                            [Val::Cell { wasm, caps }, Val::Str(prefix)] => ((wasm, caps), prefix),
-                            [Val::Cell { .. }] => {
+                        let (spec, prefix) = match rest {
+                            [spec, Val::Str(prefix)] => (spec, prefix),
+                            [spec] if glia::is_cell_tagged(spec) => {
                                 return Err(Val::from(
                                     "host :listen — vat cell listen was removed; spawn the service, obtain its bootstrap capability, then publish it with (perform host :serve-vat <cap> \"service\" :auth <policy>)",
                                 ))
@@ -1007,9 +1121,11 @@ fn make_host_handler(
                             }
                         };
 
-                        let (wasm, caps) = cell;
+                        // Full spec validation before runtime.load_request().
+                        let spec = parse_cell_spec(spec, "host :listen")?;
+
                         let mut load_req = runtime.load_request();
-                        load_req.get().set_wasm(wasm);
+                        load_req.get().set_wasm(&spec.wasm);
                         let executor = load_req.send().pipeline.get_executor();
 
                         let network_resp = host
@@ -1026,10 +1142,9 @@ fn make_host_handler(
                         req.get().set_executor(executor);
                         req.get().set_prefix(prefix);
 
-                        let valid_caps = collect_forwardable_caps(caps, "host :listen")?;
-                        if !valid_caps.is_empty() {
-                            let mut caps_builder = req.get().init_caps(valid_caps.len() as u32);
-                            for (i, (name, client)) in valid_caps.into_iter().enumerate() {
+                        if !spec.grants.is_empty() {
+                            let mut caps_builder = req.get().init_caps(spec.grants.len() as u32);
+                            for (i, (name, client)) in spec.grants.into_iter().enumerate() {
                                 let mut entry = caps_builder.reborrow().get(i as u32);
                                 entry.set_name(&name);
                                 write_cap(entry.init_cap(), client);
@@ -1044,10 +1159,8 @@ fn make_host_handler(
                         Val::Nil
                     }
                     "listen-stream" => {
-                        let (wasm, caps, protocol) = match rest {
-                            [Val::Cell { wasm, caps }, Val::Str(protocol)] => {
-                                (wasm, caps, protocol)
-                            }
+                        let (spec, protocol) = match rest {
+                            [spec, Val::Str(protocol)] => (spec, protocol),
                             [] | [_] => {
                                 return Err(Val::from(
                                     "host :listen-stream — usage: (perform host :listen-stream <cell> \"protocol\")",
@@ -1060,8 +1173,11 @@ fn make_host_handler(
                             }
                         };
 
+                        // Full spec validation before runtime.load_request().
+                        let spec = parse_cell_spec(spec, "host :listen-stream")?;
+
                         let mut load_req = runtime.load_request();
-                        load_req.get().set_wasm(wasm);
+                        load_req.get().set_wasm(&spec.wasm);
                         let executor = load_req.send().pipeline.get_executor();
 
                         let network_resp = host
@@ -1078,10 +1194,9 @@ fn make_host_handler(
                         req.get().set_executor(executor);
                         req.get().set_protocol(protocol);
 
-                        let valid_caps = collect_forwardable_caps(caps, "host :listen-stream")?;
-                        if !valid_caps.is_empty() {
-                            let mut caps_builder = req.get().init_caps(valid_caps.len() as u32);
-                            for (i, (name, client)) in valid_caps.into_iter().enumerate() {
+                        if !spec.grants.is_empty() {
+                            let mut caps_builder = req.get().init_caps(spec.grants.len() as u32);
+                            for (i, (name, client)) in spec.grants.into_iter().enumerate() {
                                 let mut entry = caps_builder.reborrow().get(i as u32);
                                 entry.set_name(&name);
                                 write_cap(entry.init_cap(), client);
@@ -3311,11 +3426,29 @@ mod tests {
 
     // --- host listen / serve tests ---
 
+    fn test_cell_with_caps(caps: Vec<(String, Val)>) -> Val {
+        Val::Map(glia::ValMap::from_pairs(vec![
+            (
+                Val::Keyword(glia::cell_spec::TYPE_KEY.into()),
+                Val::Keyword(glia::cell_spec::TYPE_TAG.into()),
+            ),
+            (
+                Val::Keyword(glia::cell_spec::WASM_KEY.into()),
+                Val::Bytes(b"fake-wasm".to_vec()),
+            ),
+            (
+                Val::Keyword(glia::cell_spec::GRANTS_KEY.into()),
+                Val::Map(glia::ValMap::from_pairs(
+                    caps.into_iter()
+                        .map(|(n, v)| (Val::Keyword(n), v))
+                        .collect(),
+                )),
+            ),
+        ]))
+    }
+
     fn test_cell() -> Val {
-        Val::Cell {
-            wasm: b"fake-wasm".to_vec(),
-            caps: vec![],
-        }
+        test_cell_with_caps(vec![])
     }
 
     #[tokio::test]
@@ -3451,6 +3584,476 @@ mod tests {
                 .is_err());
             assert!(call_handler(&handler, "serve-vat", &[]).await.is_err());
             assert!(call_handler(&handler, "serve-raw-vat", &[]).await.is_err());
+        })
+        .await;
+    }
+
+    // --- parse_cell_spec (canonical cell-spec parser) tests ---
+
+    /// TestRuntime variant that counts load() calls, to pin that spec
+    /// validation happens strictly before runtime.load_request().
+    struct CountingRuntime {
+        loads: Rc<std::cell::Cell<u32>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::runtime::Server for CountingRuntime {
+        fn load(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::runtime::LoadParams,
+            mut results: system_capnp::runtime::LoadResults,
+        ) -> Promise<(), capnp::Error> {
+            self.loads.set(self.loads.get() + 1);
+            results
+                .get()
+                .set_executor(capnp_rpc::new_client(TestExecutor));
+            Promise::ok(())
+        }
+
+        fn shutdown(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::runtime::ShutdownParams,
+            _results: system_capnp::runtime::ShutdownResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::ok(())
+        }
+    }
+
+    fn assoc_spec(spec: &Val, key: &str, value: Val) -> Val {
+        let Val::Map(map) = spec else {
+            panic!("expected map spec");
+        };
+        Val::Map(map.assoc(Val::Keyword(key.into()), value))
+    }
+
+    fn dissoc_spec(spec: &Val, key: &str) -> Val {
+        let Val::Map(map) = spec else {
+            panic!("expected map spec");
+        };
+        Val::Map(map.dissoc(&Val::Keyword(key.into())))
+    }
+
+    /// parse_cell_spec must reject `spec`; returns the error.
+    /// (CellSpec holds capnp clients, so Result::unwrap_err is unavailable.)
+    fn parse_err(spec: &Val) -> Val {
+        match parse_cell_spec(spec, "host :listen") {
+            Ok(_) => panic!("expected parse_cell_spec to reject {spec}"),
+            Err(err) => err,
+        }
+    }
+
+    /// Grant names in deliberately non-alphabetical order. Enough entries
+    /// that the unordered grants map's incidental iteration order being
+    /// alphabetical by chance is negligible — deleting the production sort
+    /// makes tests using this set fail.
+    const UNSORTED_GRANT_NAMES: [&str; 8] = [
+        "zeta", "mike", "alpha", "quux", "echo", "tango", "bravo", "kilo",
+    ];
+
+    fn sorted_grant_names() -> Vec<String> {
+        let mut names: Vec<String> = UNSORTED_GRANT_NAMES.iter().map(|s| s.to_string()).collect();
+        names.sort();
+        names
+    }
+
+    fn many_grant_cell(s: &Session) -> Val {
+        let http = s.http_client.clone().unwrap();
+        test_cell_with_caps(
+            UNSORTED_GRANT_NAMES
+                .iter()
+                .map(|name| {
+                    (
+                        name.to_string(),
+                        make_cap("http", "test-http-cid", Rc::new(http.clone())),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn parse_cell_spec_sorts_grants_alphabetically() {
+        run_local(async {
+            let s = test_session();
+            let spec = parse_cell_spec(&many_grant_cell(&s), "host :listen").expect("valid spec");
+            assert_eq!(spec.wasm, b"fake-wasm".to_vec());
+            assert_eq!(
+                spec.grants
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>(),
+                sorted_grant_names(),
+                "wire grant order must stay alphabetic/deterministic"
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn parse_cell_spec_rejects_non_map_and_missing_fields() {
+        let err = parse_err(&Val::Int(42));
+        assert_eq!(
+            glia::error::type_tag(&err),
+            Some(glia::error::tag::INVALID_CELL_SPEC)
+        );
+
+        let cell = test_cell();
+        for (missing, expect) in [
+            ("ww/type", ":ww/type"),
+            ("wasm", ":wasm"),
+            ("grants", ":grants"),
+        ] {
+            let err = parse_err(&dissoc_spec(&cell, missing));
+            let msg = glia::error::message(&err).expect("structured diagnostic");
+            assert!(msg.contains("missing"), "got: {msg}");
+            assert!(msg.contains(expect), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn parse_cell_spec_rejects_unknown_fields_with_structured_error() {
+        let forged = assoc_spec(&test_cell(), "env", Val::Str("prod".into()));
+        // Tag-only cell? accepts this map; activation is where it fails.
+        assert!(glia::is_cell_tagged(&forged));
+        let err = parse_err(&forged);
+        assert_eq!(
+            glia::error::type_tag(&err),
+            Some(glia::error::tag::INVALID_CELL_SPEC)
+        );
+        let msg = glia::error::message(&err).expect("structured diagnostic");
+        assert!(msg.contains("unknown cell spec field"), "got: {msg}");
+        assert!(msg.contains(":env"), "got: {msg}");
+        assert!(
+            msg.contains("exactly :ww/type, :wasm, and :grants"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_cell_spec_rejects_wrong_tag_and_wrong_field_types() {
+        let wrong_tag = assoc_spec(&test_cell(), "ww/type", Val::Keyword("atom".into()));
+        let msg = glia::error::message(&parse_err(&wrong_tag))
+            .unwrap()
+            .to_string();
+        assert!(msg.contains(":ww/type must be :cell"), "got: {msg}");
+
+        let wrong_wasm = assoc_spec(&test_cell(), "wasm", Val::Str("not-bytes".into()));
+        let err = parse_err(&wrong_wasm);
+        assert_eq!(
+            glia::error::type_tag(&err),
+            Some(glia::error::tag::INVALID_CELL_SPEC)
+        );
+        let msg = glia::error::message(&err).unwrap();
+        assert!(msg.contains(":wasm must be bytes"), "got: {msg}");
+
+        let wrong_grants = assoc_spec(&test_cell(), "grants", Val::Int(1));
+        let msg = glia::error::message(&parse_err(&wrong_grants))
+            .unwrap()
+            .to_string();
+        assert!(msg.contains(":grants must be a map"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_cell_spec_rejects_non_keyword_grant_names_and_forged_grants() {
+        let Val::Map(map) = test_cell() else {
+            unreachable!()
+        };
+        let string_key = Val::Map(map.assoc(
+            Val::Keyword("grants".into()),
+            Val::Map(glia::ValMap::from_pairs(vec![(
+                Val::Str("db".into()),
+                Val::Int(1),
+            )])),
+        ));
+        let msg = glia::error::message(&parse_err(&string_key))
+            .unwrap()
+            .to_string();
+        assert!(msg.contains("grant names must be keywords"), "got: {msg}");
+
+        // A forged map can only carry values the forger already holds; a
+        // non-capability value fails the forwardable-capability rules.
+        let forged = test_cell_with_caps(vec![("db".to_string(), Val::Int(42))]);
+        let msg = glia::error::message(&parse_err(&forged))
+            .unwrap()
+            .to_string();
+        assert!(
+            msg.contains("grant \"db\" expected a capability"),
+            "got: {msg}"
+        );
+
+        // Non-exportable cap: possessed, but not forwardable across the boundary.
+        let local = test_cell_with_caps(vec![(
+            "logger".to_string(),
+            make_cap("local", "glia:local", Rc::new(42i32)),
+        )]);
+        let msg = glia::error::message(&parse_err(&local))
+            .unwrap()
+            .to_string();
+        assert!(
+            msg.contains("not backed by an exportable Cap'n Proto capability"),
+            "got: {msg}"
+        );
+    }
+
+    /// Serve `CountingRuntime` over a real in-process twoparty RPC
+    /// connection.
+    ///
+    /// A plain `capnp_rpc::new_client` local client only dispatches calls
+    /// whose promises are driven, so a regression that sent
+    /// `load_request()` before parsing and then dropped the promise on the
+    /// parse error would be invisible to a local server-side counter. Over
+    /// a real connection the Call message is transmitted as soon as the RPC
+    /// system polls, and the server dispatches it (bumping the counter)
+    /// whether or not the caller ever awaits the answer or the listener
+    /// request is ever sent.
+    fn rpc_counting_runtime(loads: Rc<std::cell::Cell<u32>>) -> system_capnp::runtime::Client {
+        use futures::AsyncReadExt as _;
+        use tokio_util::compat::TokioAsyncReadCompatExt as _;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let (server_reader, server_writer) = server_io.compat().split();
+        let server_network = capnp_rpc::twoparty::VatNetwork::new(
+            server_reader,
+            server_writer,
+            capnp_rpc::rpc_twoparty_capnp::Side::Server,
+            Default::default(),
+        );
+        let counting: system_capnp::runtime::Client =
+            capnp_rpc::new_client(CountingRuntime { loads });
+        let server_rpc = capnp_rpc::RpcSystem::new(Box::new(server_network), Some(counting.client));
+        tokio::task::spawn_local(async move {
+            let _ = server_rpc.await;
+        });
+
+        let (client_reader, client_writer) = client_io.compat().split();
+        let client_network = capnp_rpc::twoparty::VatNetwork::new(
+            client_reader,
+            client_writer,
+            capnp_rpc::rpc_twoparty_capnp::Side::Client,
+            Default::default(),
+        );
+        let mut client_rpc = capnp_rpc::RpcSystem::new(Box::new(client_network), None);
+        let runtime: system_capnp::runtime::Client =
+            client_rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+        tokio::task::spawn_local(async move {
+            let _ = client_rpc.await;
+        });
+        runtime
+    }
+
+    /// Every malformed-spec category `parse_cell_spec` must reject.
+    fn malformed_cell_specs() -> Vec<Val> {
+        let Val::Map(base) = test_cell() else {
+            unreachable!()
+        };
+        vec![
+            // Non-map candidates (still correctly arity-shaped for listen).
+            Val::Int(42),
+            Val::Str("cell".into()),
+            // Missing fields.
+            dissoc_spec(&test_cell(), "ww/type"),
+            dissoc_spec(&test_cell(), "wasm"),
+            dissoc_spec(&test_cell(), "grants"),
+            // Unknown field.
+            assoc_spec(&test_cell(), "extra", Val::Int(1)),
+            // Wrong tag.
+            assoc_spec(&test_cell(), "ww/type", Val::Keyword("atom".into())),
+            // Non-bytes wasm.
+            assoc_spec(&test_cell(), "wasm", Val::Str("not-bytes".into())),
+            // Non-map grants.
+            assoc_spec(&test_cell(), "grants", Val::Int(1)),
+            // Non-keyword grant key.
+            Val::Map(base.assoc(
+                Val::Keyword("grants".into()),
+                Val::Map(glia::ValMap::from_pairs(vec![(
+                    Val::Str("db".into()),
+                    Val::Int(1),
+                )])),
+            )),
+            // Forged grant value (not a capability).
+            test_cell_with_caps(vec![("db".to_string(), Val::Int(42))]),
+            // Possessed but non-forwardable capability.
+            test_cell_with_caps(vec![(
+                "logger".to_string(),
+                make_cap("local", "glia:local", Rc::new(42i32)),
+            )]),
+        ]
+    }
+
+    #[tokio::test]
+    async fn listeners_do_not_load_before_spec_validation() {
+        run_local(async {
+            let s = test_session();
+            let loads = Rc::new(std::cell::Cell::new(0));
+            let runtime = rpc_counting_runtime(loads.clone());
+            let handler = make_host_handler(s.host.clone(), runtime, s.http_client.clone());
+
+            for spec in malformed_cell_specs() {
+                for (method, arg) in [("listen", "/x"), ("listen-stream", "proto")] {
+                    let err = call_handler(&handler, method, &[spec.clone(), Val::Str(arg.into())])
+                        .await
+                        .unwrap_err();
+                    let inner = glia::error::unwrap_thrown(&err).unwrap_or(&err);
+                    assert_eq!(
+                        glia::error::type_tag(inner),
+                        Some(glia::error::tag::INVALID_CELL_SPEC),
+                        "host :{method} with {spec}: got {err}"
+                    );
+                }
+            }
+            // Drain the connection before checking: if any malformed case
+            // had initiated a load — even one whose promise was dropped —
+            // the Call message would arrive and bump the counter here.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                loads.get(),
+                0,
+                "malformed specs must never initiate runtime.load()"
+            );
+
+            // The same instrumentation observes loads for valid specs,
+            // proving the counter would have caught a pre-parse load.
+            for (i, (method, arg)) in [("listen", "/x"), ("listen-stream", "proto")]
+                .into_iter()
+                .enumerate()
+            {
+                let ok = call_handler(&handler, method, &[test_cell(), Val::Str(arg.into())]).await;
+                assert!(ok.is_ok(), "valid {method} failed: {:?}", ok.err());
+                let want = (i + 1) as u32;
+                for _ in 0..256 {
+                    if loads.get() >= want {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    loads.get(),
+                    want,
+                    "load must be observed for valid {method}"
+                );
+            }
+        })
+        .await;
+    }
+
+    // --- wire grant-order tests (recording listeners) ---
+
+    struct RecordingHttpListener {
+        names: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::http_listener::Server for RecordingHttpListener {
+        fn listen(
+            self: capnp::capability::Rc<Self>,
+            params: system_capnp::http_listener::ListenParams,
+            _results: system_capnp::http_listener::ListenResults,
+        ) -> Promise<(), capnp::Error> {
+            let params = capnp_rpc::pry!(params.get());
+            let caps = capnp_rpc::pry!(params.get_caps());
+            let mut names = Vec::new();
+            for i in 0..caps.len() {
+                let entry = caps.get(i);
+                names.push(
+                    capnp_rpc::pry!(entry.get_name())
+                        .to_str()
+                        .expect("utf8 grant name")
+                        .to_string(),
+                );
+            }
+            *self.names.borrow_mut() = names;
+            Promise::ok(())
+        }
+    }
+
+    struct RecordingStreamListener {
+        names: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::stream_listener::Server for RecordingStreamListener {
+        fn listen(
+            self: capnp::capability::Rc<Self>,
+            params: system_capnp::stream_listener::ListenParams,
+            _results: system_capnp::stream_listener::ListenResults,
+        ) -> Promise<(), capnp::Error> {
+            let params = capnp_rpc::pry!(params.get());
+            let caps = capnp_rpc::pry!(params.get_caps());
+            let mut names = Vec::new();
+            for i in 0..caps.len() {
+                let entry = caps.get(i);
+                names.push(
+                    capnp_rpc::pry!(entry.get_name())
+                        .to_str()
+                        .expect("utf8 grant name")
+                        .to_string(),
+                );
+            }
+            *self.names.borrow_mut() = names;
+            Promise::ok(())
+        }
+    }
+
+    /// TestHost variant whose network hands out recording listeners so
+    /// tests can capture the grant names actually encoded on the wire.
+    struct RecordingHost {
+        http_names: Rc<RefCell<Vec<String>>>,
+        stream_names: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::host::Server for RecordingHost {
+        fn network(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::host::NetworkParams,
+            mut results: system_capnp::host::NetworkResults,
+        ) -> Promise<(), capnp::Error> {
+            let mut r = results.get();
+            r.set_stream_listener(capnp_rpc::new_client(RecordingStreamListener {
+                names: self.stream_names.clone(),
+            }));
+            r.set_stream_dialer(capnp_rpc::new_client(TestStreamDialer));
+            r.set_vat_listener(capnp_rpc::new_client(TestVatListener));
+            r.set_vat_client(capnp_rpc::new_client(TestVatClient));
+            r.set_http_listener(capnp_rpc::new_client(RecordingHttpListener {
+                names: self.http_names.clone(),
+            }));
+            Promise::ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn listeners_encode_grants_in_alphabetical_wire_order() {
+        run_local(async {
+            let s = test_session();
+            let http_names = Rc::new(RefCell::new(Vec::new()));
+            let stream_names = Rc::new(RefCell::new(Vec::new()));
+            let host: system_capnp::host::Client = capnp_rpc::new_client(RecordingHost {
+                http_names: http_names.clone(),
+                stream_names: stream_names.clone(),
+            });
+            let handler = make_host_handler(host, s.runtime.clone(), s.http_client.clone());
+
+            let cell = many_grant_cell(&s);
+            let ok = call_handler(&handler, "listen", &[cell.clone(), Val::Str("/x".into())]).await;
+            assert!(ok.is_ok(), "listen failed: {:?}", ok.err());
+            assert_eq!(
+                *http_names.borrow(),
+                sorted_grant_names(),
+                "HTTP listener must receive grants in alphabetical order"
+            );
+
+            let ok =
+                call_handler(&handler, "listen-stream", &[cell, Val::Str("proto".into())]).await;
+            assert!(ok.is_ok(), "listen-stream failed: {:?}", ok.err());
+            assert_eq!(
+                *stream_names.borrow(),
+                sorted_grant_names(),
+                "stream listener must receive grants in alphabetical order"
+            );
         })
         .await;
     }
@@ -4272,10 +4875,7 @@ mod tests {
                 "test-http-cid",
                 Rc::new(s.http_client.clone().unwrap()),
             );
-            let cell = Val::Cell {
-                wasm: b"fake-wasm".to_vec(),
-                caps: vec![("http".to_string(), http_cap)],
-            };
+            let cell = test_cell_with_caps(vec![("http".to_string(), http_cap)]);
             let result = call_handler(&handler, "listen", &[cell, Val::Str("/demo".into())]).await;
             assert!(
                 result.is_ok(),
@@ -4292,10 +4892,7 @@ mod tests {
             let s = test_session();
             let handler =
                 make_host_handler(s.host.clone(), s.runtime.clone(), s.http_client.clone());
-            let cell = Val::Cell {
-                wasm: b"fake-wasm".to_vec(),
-                caps: vec![],
-            };
+            let cell = test_cell();
             let result = call_handler(&handler, "listen", &[cell, Val::Str("/demo".into())]).await;
             assert!(
                 result.is_ok(),

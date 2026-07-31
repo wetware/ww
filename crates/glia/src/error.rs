@@ -65,6 +65,7 @@ pub mod tag {
     pub const INTERNAL: &str = "glia.error/internal";
     pub const CONTINUATION_ABANDONED: &str = "glia.error/continuation-abandoned";
     pub const CONTINUATION_ALREADY_RESUMED: &str = "glia.error/continuation-already-resumed";
+    pub const INVALID_CELL_SPEC: &str = "glia.error/invalid-cell-spec";
 }
 
 // ----- Schema-key constants -----------------------------------------------
@@ -155,6 +156,11 @@ pub enum GliaError {
     /// once. Continuations captured by `with-effect-handler` are
     /// one-shot; a second `resume` is a protocol violation.
     ContinuationAlreadyResumed,
+    /// Invalid cell spec — a cell-shaped value failed activation
+    /// validation (`host :listen` / `:listen-stream`). Cell specs are
+    /// ordinary data, so malformed or forged maps are *expected*
+    /// untrusted input, not internal invariant violations.
+    InvalidCellSpec { context: String, message: String },
     /// User-thrown error, constructed via the `ex-info` Glia builtin.
     /// The user's `:type` becomes the canonical dispatch tag; other
     /// user fields are carried in `extras`.
@@ -183,6 +189,7 @@ impl GliaError {
             Self::Internal { .. } => tag::INTERNAL.into(),
             Self::ContinuationAbandoned => tag::CONTINUATION_ABANDONED.into(),
             Self::ContinuationAlreadyResumed => tag::CONTINUATION_ALREADY_RESUMED.into(),
+            Self::InvalidCellSpec { .. } => tag::INVALID_CELL_SPEC.into(),
             Self::User { type_tag, .. } => match type_tag {
                 Val::Keyword(s) | Val::Str(s) | Val::Sym(s) => s.clone(),
                 _ => String::new(),
@@ -301,6 +308,10 @@ impl From<GliaError> for Val {
                         "continuation already resumed — one-shot continuation may only be resumed once".into(),
                     ),
                 ));
+            }
+            GliaError::InvalidCellSpec { context, message } => {
+                pairs.push((kw(key::MESSAGE), Val::Str(message)));
+                pairs.push((kw(key::CONTEXT), Val::Str(context)));
             }
             GliaError::User {
                 type_tag,
@@ -434,6 +445,17 @@ pub fn internal(context: &str, message: impl Into<String>) -> Val {
     .into()
 }
 
+/// Invalid cell spec — expected malformed/forged cell-spec input
+/// rejected at activation. `message` should carry the field-specific
+/// diagnostic; `context` names the activation site (e.g. "host :listen").
+pub fn invalid_cell_spec(context: &str, message: impl Into<String>) -> Val {
+    GliaError::InvalidCellSpec {
+        context: context.into(),
+        message: message.into(),
+    }
+    .into()
+}
+
 /// Continuation abandoned — a handler returned without resuming, so
 /// the suspended body was discarded (handler-abort cleanup path).
 pub fn continuation_abandoned() -> Val {
@@ -551,7 +573,6 @@ pub(crate) fn val_type_name(v: &Val) -> &'static str {
         Val::AsyncNativeFn { .. } => "async-native-fn",
         Val::Resume(_) => "resume",
         Val::Cap { .. } => "cap",
-        Val::Cell { .. } => "cell",
     }
 }
 
@@ -871,6 +892,10 @@ mod tests {
             },
             GliaError::ContinuationAbandoned,
             GliaError::ContinuationAlreadyResumed,
+            GliaError::InvalidCellSpec {
+                context: "x".into(),
+                message: "y".into(),
+            },
             GliaError::User {
                 type_tag: Val::Keyword("x".into()),
                 message: "y".into(),
