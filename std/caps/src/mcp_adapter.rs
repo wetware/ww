@@ -426,4 +426,32 @@ mod tests {
             serde_json::json!({ "items": [1, true, "<3 bytes>"] })
         );
     }
+
+    #[test]
+    fn val_to_json_renders_cell_specs_as_structured_maps() {
+        // PR-0: a cell spec is an ordinary tagged map, so MCP conversion
+        // yields structured data instead of the old opaque #<cell ...> string.
+        let cell = Val::Map(glia::ValMap::from_pairs(vec![
+            (
+                Val::Keyword(glia::cell_spec::TYPE_KEY.into()),
+                Val::Keyword(glia::cell_spec::TYPE_TAG.into()),
+            ),
+            (
+                Val::Keyword(glia::cell_spec::WASM_KEY.into()),
+                Val::Bytes(vec![0, 97, 115, 109]),
+            ),
+            (
+                Val::Keyword(glia::cell_spec::GRANTS_KEY.into()),
+                Val::Map(glia::ValMap::new()),
+            ),
+        ]));
+        assert_eq!(
+            val_to_json(&cell),
+            serde_json::json!({
+                "ww/type": "cell",
+                "wasm": "<4 bytes>",
+                "grants": {},
+            })
+        );
+    }
 }

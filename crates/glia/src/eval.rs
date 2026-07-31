@@ -380,10 +380,7 @@ fn is_authority_free(value: &Val) -> bool {
                 .iter()
                 .all(|(k, v)| walk(k, visiting) && walk(v, visiting)),
             Val::Fn { is_cap_free, .. } | Val::Macro { is_cap_free, .. } => *is_cap_free,
-            Val::Cell { .. }
-            | Val::NativeFn { .. }
-            | Val::AsyncNativeFn { .. }
-            | Val::Cap { .. } => false,
+            Val::NativeFn { .. } | Val::AsyncNativeFn { .. } | Val::Cap { .. } => false,
             Val::Recur(_) | Val::Effect { .. } | Val::Resume(_) => false,
         }
     }
@@ -517,10 +514,26 @@ fn build_explicit_cell<D: Dispatch>(
         dispatch.validate_cell_grant(&name, &value)?;
         grants.insert(name, value);
     }
-    Ok(Val::Cell {
-        wasm,
-        caps: grants.into_iter().collect(),
-    })
+    let grants = ValMap::from_pairs(
+        grants
+            .into_iter()
+            .map(|(name, value)| (Val::Keyword(name), value))
+            .collect(),
+    );
+    Ok(Val::Map(ValMap::from_pairs(vec![
+        (
+            Val::Keyword(crate::cell_spec::TYPE_KEY.into()),
+            Val::Keyword(crate::cell_spec::TYPE_TAG.into()),
+        ),
+        (
+            Val::Keyword(crate::cell_spec::WASM_KEY.into()),
+            Val::Bytes(wasm),
+        ),
+        (
+            Val::Keyword(crate::cell_spec::GRANTS_KEY.into()),
+            Val::Map(grants),
+        ),
+    ])))
 }
 
 fn report_legacy_cell_capture<D: Dispatch>(env: &Env, dispatch: &D) {
@@ -1394,7 +1407,6 @@ fn eval_builtin(name: &str, args: &[Val]) -> Option<Result<Val, Val>> {
                 Val::NativeFn { .. } => "native-fn",
                 Val::AsyncNativeFn { .. } => "async-native-fn",
                 Val::Cap { .. } => "cap",
-                Val::Cell { .. } => "cell",
                 Val::Resume(_) => "resume",
             };
             Some(Ok(Val::Keyword(kw.into())))
@@ -1416,6 +1428,12 @@ fn eval_builtin(name: &str, args: &[Val]) -> Option<Result<Val, Val>> {
                 return Some(Err(error::arity("map?", "1", args.len())));
             }
             Some(Ok(Val::Bool(matches!(args[0], Val::Map(_)))))
+        }
+        "cell?" => {
+            if args.len() != 1 {
+                return Some(Err(error::arity("cell?", "1", args.len())));
+            }
+            Some(Ok(Val::Bool(crate::is_cell_tagged(&args[0]))))
         }
         "empty?" => {
             if args.len() != 1 {
@@ -4133,16 +4151,23 @@ mod tests {
     }
 
     #[test]
-    fn fn_cap_status_cell_capture() {
-        let mut env = Env::new();
+    fn fn_cap_status_zero_grant_cell_capture_is_authority_free() {
+        // Deliberate PR-0 flip: a zero-grant cell spec is ordinary data and
+        // carries no authority (same classification as the bytes it wraps).
+        let mut env = cell_test_env();
         let d = RecordingDispatch::new();
-        env.set(
-            "c".into(),
-            Val::Cell {
-                wasm: vec![],
-                caps: vec![],
-            },
-        );
+        let cell = eval_str("(cell image)", &mut env, &d).unwrap();
+        env.set("c".into(), cell);
+        let status = fn_cap_status(eval_str("(fn [] c)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn fn_cap_status_cap_bearing_cell_capture() {
+        let mut env = cell_test_env();
+        let d = RecordingDispatch::new();
+        let cell = eval_str("(cell image :grants {:db db})", &mut env, &d).unwrap();
+        env.set("c".into(), cell);
         let status = fn_cap_status(eval_str("(fn [] c)", &mut env, &d).unwrap());
         assert_eq!(status, (false, Some("c".into())));
     }
@@ -4239,16 +4264,25 @@ mod tests {
     }
 
     #[test]
-    fn macro_cap_status_cell_capture() {
-        let mut env = Env::new();
+    fn macro_cap_status_zero_grant_cell_capture_is_authority_free() {
+        // Deliberate PR-0 flip, mirroring the fn cap-status change. The cell
+        // is built in a scratch env so the macro's env snapshot holds only
+        // the (authority-free) spec, not the builder caps.
+        let mut scratch = cell_test_env();
         let d = RecordingDispatch::new();
-        env.set(
-            "c".into(),
-            Val::Cell {
-                wasm: vec![],
-                caps: vec![],
-            },
-        );
+        let cell = eval_str("(cell image)", &mut scratch, &d).unwrap();
+        let mut env = Env::new();
+        env.set("c".into(), cell);
+        let status = macro_cap_status(eval_str("(defmacro m [] c)", &mut env, &d).unwrap());
+        assert_eq!(status, (true, None));
+    }
+
+    #[test]
+    fn macro_cap_status_cap_bearing_cell_capture() {
+        let mut env = cell_test_env();
+        let d = RecordingDispatch::new();
+        let cell = eval_str("(cell image :grants {:db db})", &mut env, &d).unwrap();
+        env.set("c".into(), cell);
         let status = macro_cap_status(eval_str("(defmacro m [] c)", &mut env, &d).unwrap());
         assert_eq!(status, (false, Some("c".into())));
     }
@@ -4579,11 +4613,30 @@ mod tests {
         eval_blocking(&expr, env, d)
     }
 
+    /// Extract the grant entries of a cell-spec map, sorted by name for
+    /// deterministic assertions (the spec's grants map is unordered; wire
+    /// ordering is pinned at the kernel boundary).
     fn cell_caps(value: Val) -> Vec<(String, Val)> {
-        match value {
-            Val::Cell { caps, .. } => caps,
-            other => panic!("expected cell, got {other}"),
-        }
+        assert!(
+            crate::is_cell_tagged(&value),
+            "expected cell-tagged map, got {value}"
+        );
+        let Val::Map(map) = value else {
+            unreachable!("is_cell_tagged accepted a non-map");
+        };
+        let Some(Val::Map(grants)) = map.get(&Val::Keyword(crate::cell_spec::GRANTS_KEY.into()))
+        else {
+            panic!("cell builtin produced a spec without a grants map");
+        };
+        let mut caps: Vec<(String, Val)> = grants
+            .iter()
+            .map(|(k, v)| match k {
+                Val::Keyword(name) => (name.clone(), v.clone()),
+                other => panic!("non-keyword grant key {other}"),
+            })
+            .collect();
+        caps.sort_by(|a, b| a.0.cmp(&b.0));
+        caps
     }
 
     fn cell_test_env() -> Env {
@@ -4623,7 +4676,10 @@ mod tests {
     }
 
     #[test]
-    fn cell_explicit_grants_are_renamed_and_deterministically_sorted() {
+    fn cell_explicit_grants_are_renamed() {
+        // Deterministic (alphabetic) wire ordering is now pinned at the
+        // kernel boundary by parse_cell_spec; here the spec's grants map
+        // just carries the renamed entries.
         let mut env = cell_test_env();
         let d = RecordingDispatch::new();
         let caps = cell_caps(
@@ -4644,6 +4700,78 @@ mod tests {
             &caps[0].1,
             Val::Cap { name, .. } if name == "database"
         ));
+    }
+
+    #[test]
+    fn cell_returns_tagged_map_data() {
+        // PR-0: (cell ...) returns ordinary tagged immutable data.
+        let mut env = cell_test_env();
+        let d = RecordingDispatch::new();
+        let cell = eval_str("(cell image :grants {:db db})", &mut env, &d).unwrap();
+        env.set("c".into(), cell.clone());
+
+        assert!(crate::is_cell_tagged(&cell));
+        assert_eq!(
+            eval_str("(type c)", &mut env, &d).unwrap(),
+            Val::Keyword("map".into())
+        );
+        assert_eq!(
+            eval_str("(get c :ww/type)", &mut env, &d).unwrap(),
+            Val::Keyword("cell".into())
+        );
+        assert_eq!(
+            eval_str("(type (get c :wasm))", &mut env, &d).unwrap(),
+            Val::Keyword("bytes".into())
+        );
+        // Transformable as ordinary data; the tag survives transformation
+        // (cell? is tag-only) and activation re-validates the full spec.
+        assert_eq!(
+            eval_str("(cell? (assoc c :extra 1))", &mut env, &d).unwrap(),
+            Val::Bool(true)
+        );
+    }
+
+    #[test]
+    fn cell_predicate_accepts_cell_specs_and_rejects_non_cells() {
+        let mut env = cell_test_env();
+        let d = RecordingDispatch::new();
+        let cell = eval_str("(cell image)", &mut env, &d).unwrap();
+        env.set("c".into(), cell);
+
+        // cell? is a tag-only predicate: a map whose :ww/type is :cell.
+        // Malformed-but-tagged specs satisfy it; activation is where they
+        // fail (pinned kernel-side in parse_cell_spec tests).
+        for accepted in [
+            "(cell? c)",
+            "(cell? {:ww/type :cell :wasm (get c :wasm) :grants {}})",
+            "(cell? {:ww/type :cell})",
+            "(cell? {:ww/type :cell :wasm \"not-bytes\" :grants {}})",
+            "(cell? {:ww/type :cell :wasm (get c :wasm) :grants {\"db\" 1}})",
+            "(cell? {:ww/type :cell :wasm (get c :wasm) :grants {} :extra 1})",
+            "(cell? (assoc c :anything 42))",
+        ] {
+            assert_eq!(
+                eval_str(accepted, &mut env, &d).unwrap(),
+                Val::Bool(true),
+                "should accept: {accepted}"
+            );
+        }
+        for rejected in [
+            "(cell? nil)",
+            "(cell? 42)",
+            "(cell? {})",
+            "(cell? [:ww/type :cell])",
+            "(cell? {:ww/type :atom :wasm (get c :wasm) :grants {}})",
+            "(cell? {:ww/type \"cell\"})",
+        ] {
+            assert_eq!(
+                eval_str(rejected, &mut env, &d).unwrap(),
+                Val::Bool(false),
+                "should reject: {rejected}"
+            );
+        }
+        let arity_err = eval_str("(cell?)", &mut env, &d).unwrap_err();
+        assert_eq!(error::type_tag(&arity_err), Some(error::tag::ARITY));
     }
 
     #[test]
@@ -7575,9 +7703,7 @@ mod tests {
         )
         .unwrap();
         let result = pollster_eval(eval_toplevel(&expr, &mut env, &d)).unwrap();
-        let Val::Cell { caps, .. } = result else {
-            panic!("expected cell");
-        };
+        let caps = cell_caps(result);
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].0, "restricted");
         match &caps[0].1 {
