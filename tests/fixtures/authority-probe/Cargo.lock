@@ -660,6 +660,7 @@ version = "0.1.0"
 dependencies = [
  "capnp",
  "capnp-rpc",
+ "capnpc",
  "futures",
  "log",
  "wasip2",

@@ -54,6 +54,80 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
+pub mod membrane_capnp {
+    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
+}
+
+/// The named capability list returned by `Membrane.graft`.
+pub type Caps<'a> = capnp::struct_list::Reader<'a, membrane_capnp::export::Owned>;
+
+/// A typed failure to read or resolve one capability from a graft response.
+#[derive(Debug)]
+pub enum GraftError {
+    InvalidResponse(capnp::Error),
+    InvalidName(capnp::Error),
+    InvalidCapability(capnp::Error),
+    NotFound { name: String },
+}
+
+impl std::fmt::Display for GraftError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidResponse(error)
+            | Self::InvalidName(error)
+            | Self::InvalidCapability(error) => error.fmt(f),
+            Self::NotFound { name } => {
+                write!(f, "capability '{name}' not found in graft response")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GraftError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidResponse(error)
+            | Self::InvalidName(error)
+            | Self::InvalidCapability(error) => Some(error),
+            Self::NotFound { .. } => None,
+        }
+    }
+}
+
+impl From<GraftError> for capnp::Error {
+    fn from(error: GraftError) -> Self {
+        match error {
+            GraftError::InvalidResponse(error)
+            | GraftError::InvalidName(error)
+            | GraftError::InvalidCapability(error) => error,
+            GraftError::NotFound { name } => {
+                capnp::Error::failed(format!("capability '{name}' not found in graft response"))
+            }
+        }
+    }
+}
+
+/// Look up a typed capability by name from a graft response.
+pub fn get_graft_cap<C: FromClientHook>(caps: &Caps<'_>, name: &str) -> Result<C, GraftError> {
+    for index in 0..caps.len() {
+        let entry = caps.get(index);
+        let entry_name = entry.get_name().map_err(GraftError::InvalidResponse)?;
+        let entry_name = entry_name
+            .to_str()
+            .map_err(|error| GraftError::InvalidName(capnp::Error::failed(error.to_string())))?;
+        if entry_name == name {
+            return entry
+                .get_cap()
+                .get_as_capability::<C>()
+                .map_err(GraftError::InvalidCapability);
+        }
+    }
+    Err(GraftError::NotFound {
+        name: name.to_string(),
+    })
+}
+
 // Tracks whether any data was written during the current poll cycle.
 // Single-threaded WASM, so a thread-local Cell<bool> is race-free.
 thread_local! {
@@ -670,4 +744,80 @@ where
     drop(pollables);
     std::mem::forget(session.client);
     std::mem::forget(session.rpc_system);
+}
+
+#[cfg(test)]
+mod graft_tests {
+    use capnp::traits::{Imbue, ImbueMut};
+
+    use super::*;
+
+    struct TestMembrane;
+
+    #[allow(refining_impl_trait)]
+    impl membrane_capnp::membrane::Server for TestMembrane {
+        fn graft(
+            self: capnp::capability::Rc<Self>,
+            _params: membrane_capnp::membrane::GraftParams,
+            _results: membrane_capnp::membrane::GraftResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::ok(())
+        }
+    }
+
+    #[test]
+    fn resolves_a_named_capability() {
+        let client: membrane_capnp::membrane::Client = capnp_rpc::new_client(TestMembrane);
+        let expected_ptr = client.client.hook.get_ptr();
+        let mut message = capnp::message::Builder::new_default();
+        let mut cap_table = Vec::new();
+        {
+            let mut results =
+                message.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
+            results.imbue_mut(&mut cap_table);
+            let mut entry = results.reborrow().init_caps(1).get(0);
+            entry.set_name("host");
+            entry.init_cap().set_as_capability(client.client.hook);
+        }
+        let mut results = message
+            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
+            .unwrap();
+        results.imbue(&cap_table);
+        let caps = results.get_caps().unwrap();
+
+        let found: capnp::capability::Client =
+            get_graft_cap(&caps, "host").expect("named capability");
+        assert_eq!(found.hook.get_ptr(), expected_ptr);
+    }
+
+    #[test]
+    fn missing_names_return_a_typed_error() {
+        let mut message = capnp::message::Builder::new_default();
+        let _: capnp::struct_list::Builder<'_, membrane_capnp::export::Owned> =
+            message.initn_root(0);
+        let caps = message.get_root_as_reader::<Caps<'_>>().unwrap();
+
+        assert!(matches!(
+            get_graft_cap::<capnp::capability::Client>(&caps, "runtime"),
+            Err(GraftError::NotFound { name }) if name == "runtime"
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_names_fail_closed() {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut caps: capnp::struct_list::Builder<'_, membrane_capnp::export::Owned> =
+                message.initn_root(1);
+            caps.reborrow()
+                .get(0)
+                .set_name(capnp::text::Reader(&[0xff]));
+        }
+        let caps = message.get_root_as_reader::<Caps<'_>>().unwrap();
+
+        assert!(matches!(
+            get_graft_cap::<capnp::capability::Client>(&caps, "host"),
+            Err(GraftError::InvalidName(_))
+        ));
+    }
 }

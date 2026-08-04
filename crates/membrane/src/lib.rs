@@ -45,6 +45,8 @@ use capnp::traits::{Imbue, ImbueMut};
 use capnp::{Error, MessageSize};
 use futures::channel::oneshot;
 
+pub mod schema;
+
 type CapTable = Vec<Option<Box<dyn ClientHook>>>;
 
 // Toy `Thing` interface for the crate's own integration tests (cast-bypass,

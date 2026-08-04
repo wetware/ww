@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Glia-free kernel substrate helpers.** Cap'n Proto schema-to-allowlist
+  resolution now lives in `wetware-membrane`, and typed named-capability graft
+  lookup now lives in `std/system`, ready for reuse by the replacement kernel
+  without changing current kernel behavior.
 - **Cell values are ordinary tagged data.** `Val::Cell` is removed; `(cell ...)`
   keeps its syntax and early grant validation but now returns an immutable
   tagged map `{:ww/type :cell, :wasm <bytes>, :grants {...}}`. Both host
