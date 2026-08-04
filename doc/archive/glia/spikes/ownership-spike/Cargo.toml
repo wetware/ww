@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "ownership-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+proptest = "1"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[profile.release]
+debug = true

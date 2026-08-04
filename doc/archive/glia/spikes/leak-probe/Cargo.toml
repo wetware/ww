@@ -1,0 +1,12 @@
+# THROWAWAY probe: reproduces Sol Review 2's two P1 ownership leaks against
+# the UNMODIFIED production glia crate through public API only.
+[workspace]
+
+[package]
+name = "leak-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+glia = { path = "../../../../../crates/glia" }

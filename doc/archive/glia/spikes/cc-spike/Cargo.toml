@@ -1,0 +1,21 @@
+# STANDALONE workspace — Cargo must never auto-add this to the repo workspace.
+[workspace]
+
+[package]
+name = "cc-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ownership-spike = { path = "../ownership-spike" }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+proptest = "1"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[profile.release]
+debug = true

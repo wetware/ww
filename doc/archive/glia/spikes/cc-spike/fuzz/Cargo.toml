@@ -1,0 +1,44 @@
+[package]
+name = "cc-spike-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cc-spike = { path = ".." }
+
+[[bin]]
+name = "operation_sequence"
+path = "fuzz_targets/operation_sequence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_state"
+path = "fuzz_targets/metadata_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trace_contract"
+path = "fuzz_targets/trace_contract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "panic_path"
+path = "fuzz_targets/panic_path.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
