@@ -82,6 +82,8 @@ impl RunningNode {
                 &format!("http://{proxy_addr}"),
             ])
             .env("HOME", home)
+            // Captured logs are asserted as plain text; CI may force ANSI colors.
+            .env("NO_COLOR", "1")
             .env("WW_TTY", "1")
             .env("WW_KUBO_WAIT_MAX_SECS", "30")
             .env("WW_CWASM_DIR", home.join("cwasm"))
