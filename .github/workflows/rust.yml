@@ -206,6 +206,13 @@ jobs:
         fi
         ipfs daemon --enable-gc &
         for _ in $(seq 1 30); do ipfs id >/dev/null 2>&1 && break; sleep 0.5; done
+        ipfs id >/dev/null
+        KUBO_API_MULTIADDR="$(cat "${IPFS_PATH:-$HOME/.ipfs}/api")"
+        KUBO_API_PORT="${KUBO_API_MULTIADDR##*/tcp/}"
+        case "$KUBO_API_PORT" in
+          ''|*[!0-9]*) echo "Invalid Kubo API address: $KUBO_API_MULTIADDR" >&2; exit 1 ;;
+        esac
+        echo "WW_TEST_KUBO_ADDR=127.0.0.1:$KUBO_API_PORT" >> "$GITHUB_ENV"
       env:
         IPFS_PEER_ADDR: ${{ secrets.IPFS_PEER_ADDR }}
 
@@ -213,10 +220,10 @@ jobs:
       with:
         key: build-test
 
-    - name: Build WASI test fixtures
+    - name: Build embedded WASI std and test fixtures
       run: |
+        make std
         make -C examples/echo
-        make shell
 
     - name: Run host workspace tests (hot cache from build job)
       run: cargo test --workspace

@@ -26,6 +26,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   confinement are unchanged.
 
 ### Added
+- **Current embedded pid0 lifecycle baseline.** Host integration CI now builds
+  the standard WASI artifacts before launching the real `ww` binary with its
+  embedded Glia kernel. The baseline pins cold-boot readiness transitions,
+  `/status`, TTY stdin EOF, and clean pid0 exit propagation, while missing or
+  empty standard artifacts fail instead of silently skipping.
 - **Child-authority lifecycle and substrate scenarios.** Trusted pid0 services
   now re-graft and rerun init after structured epoch staleness; epoch-owned HTTP
   route leases clean up by identity, and readiness reflects live current-epoch
