@@ -26,6 +26,12 @@ const KUBO_ADDR_ENV: &str = "WW_TEST_KUBO_ADDR";
 const BOOT_TIMEOUT: Duration = Duration::from_secs(60);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn e2e_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    E2E_LOCK.lock().await
+}
+
 fn ww_bin() -> PathBuf {
     PathBuf::from(std::env::var_os("CARGO_BIN_EXE_ww").expect("CARGO_BIN_EXE_ww missing"))
 }
@@ -56,36 +62,72 @@ struct RunningNode {
     stderr: tempfile::NamedTempFile,
 }
 
+struct NodeOptions {
+    image: PathBuf,
+    kernel_cli: Option<String>,
+    kernel_env: Option<String>,
+    http_addr: Option<SocketAddr>,
+    route_ready_timeout_secs: u64,
+}
+
+impl NodeOptions {
+    fn embedded(http_addr: Option<SocketAddr>) -> Self {
+        Self {
+            image: PathBuf::from(STATUS_LAYER),
+            kernel_cli: None,
+            kernel_env: None,
+            http_addr,
+            route_ready_timeout_secs: 30,
+        }
+    }
+}
+
 impl RunningNode {
     fn spawn(
         home: &Path,
         admin_addr: SocketAddr,
-        http_addr: SocketAddr,
-        proxy_addr: SocketAddr,
+        kubo_addr: SocketAddr,
+        options: &NodeOptions,
     ) -> Self {
         let stdout = tempfile::NamedTempFile::new().expect("create stdout capture");
         let stderr = tempfile::NamedTempFile::new().expect("create stderr capture");
-        let mut child = Command::new(ww_bin())
+        let mut command = Command::new(ww_bin());
+        command
+            .arg("run")
+            .arg(&options.image)
             .args([
-                "run",
-                STATUS_LAYER,
                 "--insecure-ephemeral",
                 "--listen",
                 "/ip4/127.0.0.1/tcp/0",
                 "--executor-threads",
                 "1",
-                "--http-listen",
-                &http_addr.to_string(),
                 "--with-http-admin",
-                &admin_addr.to_string(),
-                "--ipfs-url",
-                &format!("http://{proxy_addr}"),
             ])
+            .arg(admin_addr.to_string())
+            .arg("--ipfs-url")
+            .arg(format!("http://{kubo_addr}"));
+        if let Some(http_addr) = options.http_addr {
+            command.arg("--http-listen").arg(http_addr.to_string());
+        }
+        if let Some(kernel) = options.kernel_cli.as_ref() {
+            command.arg("--kernel").arg(kernel);
+        }
+        if let Some(kernel) = options.kernel_env.as_ref() {
+            command.env("WW_KERNEL", kernel);
+        } else {
+            command.env_remove("WW_KERNEL");
+        }
+
+        let mut child = command
             .env("HOME", home)
             // Captured logs are asserted as plain text; CI may force ANSI colors.
             .env("NO_COLOR", "1")
             .env("WW_TTY", "1")
             .env("WW_KUBO_WAIT_MAX_SECS", "30")
+            .env(
+                "WW_KERNEL_ROUTE_READY_TIMEOUT_SECS",
+                options.route_ready_timeout_secs.to_string(),
+            )
             .env("WW_CWASM_DIR", home.join("cwasm"))
             .env_remove("WW_IDENTITY")
             .env_remove("WW_HTTP_ADMIN")
@@ -138,6 +180,60 @@ impl RunningNode {
             read_capture(&self.stderr)
         )
     }
+}
+
+async fn require_kubo() -> (SocketAddr, reqwest::Client) {
+    let kubo_addr: SocketAddr = std::env::var(KUBO_ADDR_ENV)
+        .unwrap_or_else(|_| DEFAULT_KUBO_ADDR.to_string())
+        .parse()
+        .expect("WW_TEST_KUBO_ADDR must be host:port");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("build HTTP client");
+    let kubo_id = client
+        .post(format!("http://{kubo_addr}/api/v0/id"))
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("Kubo is required at {kubo_addr} for pid0 E2E tests: {error}")
+        });
+    assert!(kubo_id.status().is_success(), "Kubo /api/v0/id failed");
+    (kubo_addr, client)
+}
+
+async fn version(client: &reqwest::Client, admin_addr: SocketAddr) -> Value {
+    client
+        .get(format!("http://{admin_addr}/version"))
+        .send()
+        .await
+        .expect("query /version")
+        .error_for_status()
+        .expect("/version should succeed")
+        .json()
+        .await
+        .expect("parse /version JSON")
+}
+
+async fn assert_status_route(client: &reqwest::Client, http_addr: SocketAddr) {
+    let status: Value = client
+        .get(format!("http://{http_addr}/status"))
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .expect("query real Glia-registered /status route")
+        .error_for_status()
+        .expect("/status should return HTTP 200")
+        .json()
+        .await
+        .expect("parse /status JSON");
+    assert_eq!(status["status"], "ok");
+    assert!(
+        status["peer_id"]
+            .as_str()
+            .is_some_and(|peer| !peer.is_empty()),
+        "real status cell must receive the host grant: {status}"
+    );
 }
 
 impl Drop for RunningNode {
@@ -260,6 +356,7 @@ fn start_kubo_proxy(listener: TcpListener, target: SocketAddr) -> tokio::task::J
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn current_embedded_glia_pid0_lifecycle_baseline() {
+    let _guard = e2e_lock().await;
     let kernel_wasm = required_artifact(KERNEL_WASM_PATH);
     required_artifact(STATUS_WASM_PATH);
     assert!(
@@ -267,22 +364,7 @@ async fn current_embedded_glia_pid0_lifecycle_baseline() {
         "status layer must not shadow the embedded pid0 artifact"
     );
 
-    let kubo_addr: SocketAddr = std::env::var(KUBO_ADDR_ENV)
-        .unwrap_or_else(|_| DEFAULT_KUBO_ADDR.to_string())
-        .parse()
-        .expect("WW_TEST_KUBO_ADDR must be host:port");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("build HTTP client");
-    let kubo_id = client
-        .post(format!("http://{kubo_addr}/api/v0/id"))
-        .send()
-        .await
-        .unwrap_or_else(|error| {
-            panic!("Kubo is required at {kubo_addr} for the real pid0 baseline: {error}")
-        });
-    assert!(kubo_id.status().is_success(), "Kubo /api/v0/id failed");
+    let (kubo_addr, client) = require_kubo().await;
 
     let admin_addr = unused_addr().await;
     let http_addr = unused_addr().await;
@@ -291,7 +373,8 @@ async fn current_embedded_glia_pid0_lifecycle_baseline() {
         .expect("bind delayed Kubo proxy");
     let proxy_addr = proxy_listener.local_addr().expect("read proxy address");
     let home = tempfile::tempdir().expect("create isolated HOME");
-    let mut node = RunningNode::spawn(home.path(), admin_addr, http_addr, proxy_addr);
+    let options = NodeOptions::embedded(Some(http_addr));
+    let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
 
     let health_url = format!("http://{admin_addr}/healthz");
     let ready_url = format!("http://{admin_addr}/readyz");
@@ -303,46 +386,28 @@ async fn current_embedded_glia_pid0_lifecycle_baseline() {
     let initial_ready = wait_for_phase(&client, &ready_url, "waiting-for-kubo", &mut node).await;
     assert_eq!(initial_ready["ready"], false);
     assert_eq!(initial_ready["phase"], "waiting-for-kubo");
+    let pending_version = version(&client, admin_addr).await;
+    assert_eq!(pending_version["kernel_cid"], Value::Null);
+    assert_eq!(pending_version["kernel_source"], "<pending: embedded:main>");
 
     let proxy_task = start_kubo_proxy(proxy_listener, kubo_addr);
     let final_ready = wait_for_ready(&client, &ready_url, &mut node).await;
     assert_eq!(final_ready["ready"], true);
     assert_eq!(final_ready["phase"], "ready");
 
-    let version: Value = client
-        .get(format!("http://{admin_addr}/version"))
-        .send()
-        .await
-        .expect("query /version")
-        .error_for_status()
-        .expect("/version should succeed")
-        .json()
-        .await
-        .expect("parse /version JSON");
+    let version = version(&client, admin_addr).await;
+    assert_eq!(version["kernel_source"], "embedded:main");
+    assert_eq!(
+        version["kernel_cid"],
+        ww::kernel::runtime_cid(&kernel_wasm).to_string()
+    );
     assert_eq!(
         version["kernel_wasm_blake3"],
         blake3::hash(&kernel_wasm).to_hex().to_string(),
         "host binary must embed the exact current std/kernel artifact"
     );
 
-    let status: Value = client
-        .get(format!("http://{http_addr}/status"))
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await
-        .expect("query real Glia-registered /status route")
-        .error_for_status()
-        .expect("/status should return HTTP 200")
-        .json()
-        .await
-        .expect("parse /status JSON");
-    assert_eq!(status["status"], "ok");
-    assert!(
-        status["peer_id"]
-            .as_str()
-            .is_some_and(|peer| !peer.is_empty()),
-        "real status cell must receive the host grant: {status}"
-    );
+    assert_status_route(&client, http_addr).await;
 
     // WW_TTY pins today's truthiness-based TTY mode. EOF closes the kernel
     // shell, the WASM command returns 0, and the host propagates that exact
@@ -360,4 +425,211 @@ async fn current_embedded_glia_pid0_lifecycle_baseline() {
         logs.contains("Kernel exited") && logs.contains("code=0"),
         "host did not report the propagated pid0 exit code\n{logs}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_kernel_path_reaches_ready_and_cli_overrides_env() {
+    let _guard = e2e_lock().await;
+    let kernel_wasm = required_artifact(KERNEL_WASM_PATH);
+    required_artifact(STATUS_WASM_PATH);
+    let kernel_path = Path::new(KERNEL_WASM_PATH)
+        .canonicalize()
+        .expect("canonicalize kernel artifact");
+    let (kubo_addr, client) = require_kubo().await;
+    let admin_addr = unused_addr().await;
+    let http_addr = unused_addr().await;
+    let home = tempfile::tempdir().expect("create isolated HOME");
+    let mut options = NodeOptions::embedded(Some(http_addr));
+    options.kernel_cli = Some(format!("file:{}", kernel_path.display()));
+    options.kernel_env = Some("file:/definitely/missing/env-kernel.wasm".to_string());
+    let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+
+    let ready = wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
+    assert_eq!(ready["ready"], true);
+    let identity = version(&client, admin_addr).await;
+    assert_eq!(
+        identity["kernel_source"],
+        format!("file:{}", kernel_path.display())
+    );
+    assert_eq!(
+        identity["kernel_cid"],
+        ww::kernel::runtime_cid(&kernel_wasm).to_string()
+    );
+    assert_eq!(
+        identity["kernel_wasm_blake3"],
+        blake3::hash(&kernel_wasm).to_hex().to_string()
+    );
+    assert_status_route(&client, http_addr).await;
+
+    node.close_stdin();
+    let exit = node.wait(EXIT_TIMEOUT).await;
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "unexpected host exit\n{}",
+        node.logs()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn env_kernel_path_overrides_embedded_and_no_http_reaches_ready() {
+    let _guard = e2e_lock().await;
+    let kernel_wasm = required_artifact(KERNEL_WASM_PATH);
+    required_artifact(STATUS_WASM_PATH);
+    let kernel_path = Path::new(KERNEL_WASM_PATH)
+        .canonicalize()
+        .expect("canonicalize kernel artifact");
+    let (kubo_addr, client) = require_kubo().await;
+    let admin_addr = unused_addr().await;
+    let home = tempfile::tempdir().expect("create isolated HOME");
+    let mut options = NodeOptions::embedded(None);
+    options.kernel_env = Some(format!("file:{}", kernel_path.display()));
+    let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+
+    let ready = wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
+    assert_eq!(ready["ready"], true);
+    let identity = version(&client, admin_addr).await;
+    assert_eq!(
+        identity["kernel_source"],
+        format!("file:{}", kernel_path.display())
+    );
+    assert_eq!(
+        identity["kernel_cid"],
+        ww::kernel::runtime_cid(&kernel_wasm).to_string()
+    );
+
+    node.close_stdin();
+    let exit = node.wait(EXIT_TIMEOUT).await;
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "unexpected host exit\n{}",
+        node.logs()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kubo_cid_kernel_reaches_ready_and_reports_source_and_runtime_cids() {
+    let _guard = e2e_lock().await;
+    let kernel_wasm = required_artifact(KERNEL_WASM_PATH);
+    required_artifact(STATUS_WASM_PATH);
+    let (kubo_addr, client) = require_kubo().await;
+    let source_cid = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"))
+        .add_bytes(&kernel_wasm)
+        .await
+        .expect("add pid0 bytes to the CI-pinned Kubo");
+    let admin_addr = unused_addr().await;
+    let http_addr = unused_addr().await;
+    let home = tempfile::tempdir().expect("create isolated HOME");
+    let mut options = NodeOptions::embedded(Some(http_addr));
+    options.kernel_cli = Some(format!("cid:{source_cid}"));
+    let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+
+    let ready = wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
+    assert_eq!(ready["ready"], true);
+    let identity = version(&client, admin_addr).await;
+    assert_eq!(identity["kernel_source"], format!("cid:{source_cid}"));
+    assert_eq!(identity["kernel_source_cid"], source_cid);
+    assert_eq!(
+        identity["kernel_cid"],
+        ww::kernel::runtime_cid(&kernel_wasm).to_string()
+    );
+    assert_status_route(&client, http_addr).await;
+
+    node.close_stdin();
+    let exit = node.wait(EXIT_TIMEOUT).await;
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "unexpected host exit\n{}",
+        node.logs()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incompatible_path_selected_component_fails_clearly() {
+    let _guard = e2e_lock().await;
+    required_artifact(STATUS_WASM_PATH);
+    let (kubo_addr, _client) = require_kubo().await;
+    let bad_kernel = tempfile::NamedTempFile::new().expect("create invalid pid0 component");
+    std::fs::write(bad_kernel.path(), b"not a WebAssembly component")
+        .expect("write invalid pid0 component");
+    let admin_addr = unused_addr().await;
+    let home = tempfile::tempdir().expect("create isolated HOME");
+    let mut options = NodeOptions::embedded(None);
+    options.kernel_cli = Some(format!("file:{}", bad_kernel.path().display()));
+    let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+
+    let exit = node.wait(EXIT_TIMEOUT).await;
+    let logs = node.logs();
+    assert_eq!(
+        exit.code(),
+        Some(1),
+        "invalid pid0 must fail closed\n{logs}"
+    );
+    assert!(
+        logs.contains("failed to parse WebAssembly module")
+            || logs.contains("failed to compile")
+            || logs.contains("magic header"),
+        "failure must name component compilation/parsing\n{logs}"
+    );
+    assert!(
+        !logs.contains("kernel_source=embedded:main"),
+        "explicit invalid path must not fall back to embedded pid0\n{logs}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_and_corrupt_status_artifacts_fail_within_route_timeout() {
+    let _guard = e2e_lock().await;
+    required_artifact(KERNEL_WASM_PATH);
+    let (kubo_addr, _client) = require_kubo().await;
+
+    for corrupt in [false, true] {
+        let image = tempfile::tempdir().expect("create isolated image");
+        let init_dir = image.path().join("etc/init.d");
+        std::fs::create_dir_all(&init_dir).expect("create init.d");
+        std::fs::copy(
+            "std/status/etc/init.d/05-status.glia",
+            init_dir.join("05-status.glia"),
+        )
+        .expect("copy status boot policy");
+        if corrupt {
+            let bin_dir = image.path().join("bin");
+            std::fs::create_dir_all(&bin_dir).expect("create image bin");
+            std::fs::write(bin_dir.join("status.wasm"), b"corrupt status component")
+                .expect("write corrupt status component");
+        }
+
+        let admin_addr = unused_addr().await;
+        let http_addr = unused_addr().await;
+        let home = tempfile::tempdir().expect("create isolated HOME");
+        let mut options = NodeOptions::embedded(Some(http_addr));
+        options.image = image.path().to_owned();
+        options.route_ready_timeout_secs = 5;
+        let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+        let started = Instant::now();
+        let exit = node.wait(EXIT_TIMEOUT).await;
+        let logs = node.logs();
+        assert_eq!(
+            exit.code(),
+            Some(1),
+            "status failure must fail host\n{logs}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "route readiness did not honor its bound: {:?}\n{logs}",
+            started.elapsed()
+        );
+        assert!(
+            logs.contains(
+                "kernel did not complete reverse graft and register an HTTP route within 5s"
+            ),
+            "failure must name the bounded route gate\n{logs}"
+        );
+        assert!(
+            logs.contains("$WW_ROOT/bin/status.wasm"),
+            "failure must name the required image artifact\n{logs}"
+        );
+    }
 }

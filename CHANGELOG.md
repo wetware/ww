@@ -30,6 +30,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   confinement are unchanged.
 
 ### Added
+- **Explicit pid0 kernel source resolution.** `ww run --kernel` and
+  `WW_KERNEL` select a local path, Kubo CID, or the unchanged embedded default
+  with CLI-first precedence and no fallback after explicit failures. The host
+  resolves exact bytes once, reports their runtime CID through a late-bound
+  `/version`, injects a schema-and-capnp-rpc ABI fingerprint into pid0, and
+  fails HTTP startup within a named bound when the mounted status route is
+  missing or unusable.
 - **Current embedded pid0 lifecycle baseline.** Host integration CI now builds
   the standard WASI artifacts before launching the real `ww` binary with its
   embedded Glia kernel. The baseline pins cold-boot readiness transitions,

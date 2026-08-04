@@ -17,6 +17,8 @@
 use authority::EpochGuard;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::{fmt, time::Duration};
 use tokio::sync::mpsc;
 
@@ -75,9 +77,11 @@ struct RouteRegistration {
     registry: RouteRegistry,
     prefix: String,
     id: RegistrationId,
+    target_ready: Arc<AtomicBool>,
 }
 
 impl RouteRegistration {
+    #[cfg(test)]
     fn install(
         registry: RouteRegistry,
         prefix: String,
@@ -85,21 +89,68 @@ impl RouteRegistration {
         epoch_guard: EpochGuard,
         registration_scope: Option<tokio::sync::watch::Receiver<()>>,
     ) -> Result<Self, capnp::Error> {
+        Self::install_with_target_state(
+            registry,
+            prefix,
+            sender,
+            epoch_guard,
+            registration_scope,
+            true,
+        )
+    }
+
+    fn install_pending(
+        registry: RouteRegistry,
+        prefix: String,
+        sender: tokio::sync::mpsc::Sender<CgiRequest>,
+        epoch_guard: EpochGuard,
+        registration_scope: Option<tokio::sync::watch::Receiver<()>>,
+    ) -> Result<Self, capnp::Error> {
+        Self::install_with_target_state(
+            registry,
+            prefix,
+            sender,
+            epoch_guard,
+            registration_scope,
+            false,
+        )
+    }
+
+    fn install_with_target_state(
+        registry: RouteRegistry,
+        prefix: String,
+        sender: tokio::sync::mpsc::Sender<CgiRequest>,
+        epoch_guard: EpochGuard,
+        registration_scope: Option<tokio::sync::watch::Receiver<()>>,
+        target_ready: bool,
+    ) -> Result<Self, capnp::Error> {
         let id = RegistrationId::next();
+        let target_ready = Arc::new(AtomicBool::new(target_ready));
         {
             let mut routes = registry
                 .write()
                 .map_err(|_| capnp::Error::failed("route registry lock poisoned".into()))?;
             routes.insert(
                 prefix.clone(),
-                RouteEntry::new(id, sender, epoch_guard, registration_scope),
+                RouteEntry::new(
+                    id,
+                    sender,
+                    epoch_guard,
+                    registration_scope,
+                    target_ready.clone(),
+                ),
             );
         }
         Ok(Self {
             registry,
             prefix,
             id,
+            target_ready,
         })
+    }
+
+    fn mark_target_ready(&self) {
+        self.target_ready.store(true, Ordering::Release);
     }
 
     fn remove_if_owned(&self) -> bool {
@@ -166,7 +217,7 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
         // Install before starting the task. Replacing an existing path drops
         // its sender, but that old task's late cleanup cannot remove this
         // entry because each registration has a distinct identity.
-        let registration = pry!(RouteRegistration::install(
+        let registration = pry!(RouteRegistration::install_pending(
             self.registry.clone(),
             prefix.clone(),
             tx,
@@ -202,7 +253,7 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
 
 /// Receive HTTP requests from the channel, spawn cells, send responses back.
 async fn dispatch_loop(
-    _registration: RouteRegistration,
+    registration: RouteRegistration,
     issued_seq: u64,
     mut epoch_rx: tokio::sync::watch::Receiver<authority::Epoch>,
     mut registration_scope: Option<tokio::sync::watch::Receiver<()>>,
@@ -240,9 +291,10 @@ async fn dispatch_loop(
         },
         Err(e) => {
             tracing::warn!("failed to fetch cell CID: {e}");
-            "unknown".to_string()
+            return;
         }
     };
+    registration.mark_target_ready();
 
     loop {
         let req = tokio::select! {
@@ -553,6 +605,24 @@ mod tests {
         });
     }
 
+    async fn wait_for_live_route_count(registry: &RouteRegistry, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if dispatch::live_route_count(registry) == Ok(expected) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "live route count did not reach {expected}; current count is {:?}",
+                dispatch::live_route_count(registry)
+            )
+        });
+    }
+
     /// Stub Executor that errors on spawn — fine for tests that only verify
     /// `listen` accepts caps + registers the route. Per-request cap propagation
     /// (caps reaching `executor.spawn`) needs the kernel/cell-builder integration
@@ -567,6 +637,15 @@ mod tests {
             _results: system_capnp::executor::SpawnResults,
         ) -> Promise<(), capnp::Error> {
             Promise::err(capnp::Error::failed("stub executor".into()))
+        }
+
+        fn cid(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::executor::CidParams,
+            mut results: system_capnp::executor::CidResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_cid("route-registration-test");
+            Promise::ok(())
         }
     }
 
@@ -1224,6 +1303,7 @@ mod tests {
                     .await
                     .expect("replacement registers before later init failure");
 
+                wait_for_live_route_count(&registry, 1).await;
                 assert_eq!(dispatch::live_route_count(&registry), Ok(1));
                 drop(session_tx);
                 assert_eq!(

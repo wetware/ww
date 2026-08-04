@@ -30,6 +30,8 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=WW_BUILD_GIT_SHA={git_sha}");
 
+    emit_kernel_abi_fingerprint(manifest_path);
+
     // Compile example schemas so integration tests get typed access.
     let greeter_schema = manifest_path.join("examples/discovery/greeter.capnp");
     if greeter_schema.exists() {
@@ -153,6 +155,98 @@ fn main() {
         } else {
             println!("cargo:warning={msg}");
         }
+    }
+}
+
+fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
+    const KERNEL_ABI_VERSION: &str = "1";
+    let capnp_dir = manifest_path.join("capnp");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let raw_request = out_dir.join("kernel_abi_schema_request.bin");
+    capnpc::CompilerCommand::new()
+        .src_prefix(&capnp_dir)
+        .crate_provides("capnp", [0xa93fc509624c72d9])
+        .file(capnp_dir.join("system.capnp"))
+        .file(capnp_dir.join("routing.capnp"))
+        .file(capnp_dir.join("auth.capnp"))
+        .file(capnp_dir.join("stem.capnp"))
+        .file(capnp_dir.join("http.capnp"))
+        .raw_code_generator_request_path(&raw_request)
+        .run()
+        .expect("failed to compile schemas for kernel ABI fingerprint");
+
+    // Fingerprint every generated schema node, not a hand-maintained subset.
+    // This covers interface method ordinals plus referenced structs/enums such
+    // as membrane exports, process handles, and HTTP request data.
+    let request_data = fs::read(&raw_request).expect("read kernel ABI schema request");
+    let message = capnp::serialize::read_message(
+        &mut request_data.as_slice(),
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("decode kernel ABI schema request");
+    let request: capnp::schema_capnp::code_generator_request::Reader = message
+        .get_root()
+        .expect("read kernel ABI code generator request");
+    let mut schema_ids: Vec<u64> = request
+        .get_nodes()
+        .expect("read kernel ABI schema nodes")
+        .iter()
+        .map(|node| node.get_id())
+        .collect();
+    schema_ids.sort_unstable();
+    schema_ids.dedup();
+    let schema_names: Vec<String> = schema_ids
+        .iter()
+        .map(|type_id| format!("NODE_{type_id:016X}"))
+        .collect();
+    let requested_schemas: Vec<(&str, u64)> = schema_names
+        .iter()
+        .zip(schema_ids.iter().copied())
+        .map(|(name, type_id)| (name.as_str(), type_id))
+        .collect();
+    let mut schemas = schema_id::extract_schemas(&raw_request, &requested_schemas)
+        .expect("extract schemas for kernel ABI fingerprint");
+    schemas.sort_by_key(|schema| schema.type_id);
+
+    let lock_path = manifest_path.join("Cargo.lock");
+    let lock = fs::read_to_string(&lock_path).expect("read Cargo.lock for kernel ABI fingerprint");
+    let capnp_rpc_source = lock
+        .split("[[package]]")
+        .find(|package| {
+            package
+                .lines()
+                .any(|line| line.trim() == "name = \"capnp-rpc\"")
+        })
+        .and_then(|package| {
+            package.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("source = \"")
+                    .and_then(|value| value.strip_suffix('"'))
+            })
+        })
+        .filter(|source| {
+            source.starts_with("git+https://github.com/wetware/capnproto-rust?")
+                && source.rsplit_once('#').is_some_and(|(_, revision)| {
+                    revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        })
+        .expect("patched capnp-rpc source missing from Cargo.lock");
+
+    let mut material = format!("kernel-abi={KERNEL_ABI_VERSION}\n");
+    for schema in schemas {
+        material.push_str(&format!("schema-{:016x}={}\n", schema.type_id, schema.cid));
+    }
+    material.push_str(&format!("capnp-rpc={capnp_rpc_source}\n"));
+    let fingerprint = blake3::hash(material.as_bytes()).to_hex();
+
+    println!("cargo:rustc-env=WW_KERNEL_ABI={KERNEL_ABI_VERSION}");
+    println!("cargo:rustc-env=WW_KERNEL_ABI_FPR={fingerprint}");
+    println!("cargo:rerun-if-changed={}", lock_path.display());
+    for schema in &["system", "routing", "auth", "membrane", "stem", "http"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            capnp_dir.join(format!("{schema}.capnp")).display()
+        );
     }
 }
 
