@@ -213,10 +213,10 @@ jobs:
       with:
         key: build-test
 
-    - name: Build WASI test fixtures
+    - name: Build embedded WASI std and test fixtures
       run: |
+        make std
         make -C examples/echo
-        make shell
 
     - name: Run host workspace tests (hot cache from build job)
       run: cargo test --workspace
