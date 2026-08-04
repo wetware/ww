@@ -114,6 +114,9 @@ jobs:
     - name: cargo clippy (host workspace)
       run: cargo clippy --workspace --all-targets -- -D warnings
 
+    - name: Check membrane substrate builds for WASI
+      run: cargo check -p wetware-membrane --target wasm32-wasip2
+
   solidity:
     name: Solidity (Foundry)
     runs-on: ubuntu-latest

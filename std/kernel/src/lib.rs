@@ -12,6 +12,8 @@ use glia::{extract_method, make_cap, read, read_many, AttenuatedCapInner, GliaCa
 
 use std::rc::Rc;
 
+use system::{get_graft_cap, membrane_capnp};
+
 use wasip2::cli::stderr::get_stderr;
 use wasip2::cli::stdin::get_stdin;
 use wasip2::cli::stdout::get_stdout;
@@ -34,11 +36,6 @@ mod stem_capnp {
 )]
 mod auth_capnp {
     include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
-}
-
-#[allow(dead_code, clippy::extra_unused_type_parameters)]
-mod membrane_capnp {
-    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
 }
 
 #[allow(dead_code)]
@@ -1918,30 +1915,6 @@ async fn run_shell(
     }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Graft helpers: name-based lookup in parallel lists
-// ---------------------------------------------------------------------------
-
-/// Look up a typed capability by name from the graft caps list.
-fn get_graft_cap<T: capnp::capability::FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
-    name: &str,
-) -> Result<T, capnp::Error> {
-    for i in 0..caps.len() {
-        let entry = caps.get(i);
-        let n = entry
-            .get_name()?
-            .to_str()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        if n == name {
-            return entry.get_cap().get_as_capability::<T>();
-        }
-    }
-    Err(capnp::Error::failed(format!(
-        "capability '{name}' not found in graft response"
-    )))
 }
 
 // ---------------------------------------------------------------------------

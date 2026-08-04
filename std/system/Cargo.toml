@@ -10,3 +10,6 @@ futures = { workspace = true }
 log = { workspace = true }
 wasip2 = { workspace = true }
 wit-bindgen = "0.41.0"
+
+[build-dependencies]
+capnpc = { workspace = true }

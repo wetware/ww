@@ -26,7 +26,8 @@ use std::rc::Rc;
 
 use capnp::capability::FromClientHook;
 use glia::{extract_method, make_cap, HandledCapInner, Val};
-use membrane::{Allowlist, DENIED_MARKER};
+use membrane::schema::{resolve_allowlist, CompiledSchema, ResolveError};
+use membrane::DENIED_MARKER;
 
 use crate::{
     extract_capnp_client, make_host_handler, make_routing_handler, make_runtime_handler,
@@ -50,81 +51,14 @@ pub fn membraned_cap_of(inner: &Rc<dyn std::any::Any>) -> Option<&MembranedCap> 
         .and_then(|h| h.export.downcast_ref::<MembranedCap>())
 }
 
-/// Convert a Glia kebab-case method keyword to a capnp camelCase method name.
-fn to_capnp_method_name(glia_name: &str) -> String {
-    let mut out = String::with_capacity(glia_name.len());
-    let mut upper_next = false;
-    for c in glia_name.chars() {
-        if c == '-' {
-            upper_next = true;
-        } else if upper_next {
-            out.extend(c.to_uppercase());
-            upper_next = false;
-        } else {
-            out.push(c);
-        }
+fn map_resolve_error(error: ResolveError) -> Val {
+    match error {
+        ResolveError::UnknownMethod { method, available } => glia::error::permission_denied(
+            &format!("attenuate: method :{method} not found on interface"),
+            Some(&format!("schema methods: {}", available.join(", "))),
+        ),
+        error => glia::error::internal("attenuate schema", error.to_string()),
     }
-    out
-}
-
-/// Resolve glia method names against a canonical `schema.Node` (single raw
-/// segment, as produced by the schema-id build step). Returns the interface
-/// type id plus `(glia_name, ordinal)` for each requested method. Unknown
-/// method names fail closed with the schema's available methods in the hint.
-fn resolve_method_keys(
-    schema: &[u8],
-    allow: &BTreeSet<String>,
-) -> Result<(u64, Vec<(String, u16)>), Val> {
-    // Schemas are embedded as byte slices, whose link-time alignment is not
-    // guaranteed to meet Cap'n Proto's eight-byte segment requirement. Copy
-    // them into Cap'n Proto's aligned Word storage before creating a reader.
-    let mut words = capnp::Word::allocate_zeroed_vec(schema.len().div_ceil(8));
-    capnp::Word::words_to_bytes_mut(&mut words)[..schema.len()].copy_from_slice(schema);
-    let segments = [&capnp::Word::words_to_bytes(&words)[..schema.len()]];
-    let segment_array = capnp::message::SegmentArray::new(&segments);
-    let reader = capnp::message::Reader::new(segment_array, capnp::message::ReaderOptions::new());
-    let node: capnp::schema_capnp::node::Reader = reader
-        .get_root()
-        .map_err(|e| glia::error::internal("attenuate schema", e.to_string()))?;
-
-    let interface_id = node.get_id();
-    let iface = match node.which() {
-        Ok(capnp::schema_capnp::node::Which::Interface(i)) => i,
-        _ => {
-            return Err(glia::error::internal(
-                "attenuate schema",
-                "schema node is not an interface",
-            ))
-        }
-    };
-    let methods = iface
-        .get_methods()
-        .map_err(|e| glia::error::internal("attenuate schema", e.to_string()))?;
-
-    let mut names: Vec<String> = Vec::with_capacity(methods.len() as usize);
-    for m in methods.iter() {
-        let n = m
-            .get_name()
-            .and_then(|n| n.to_str().map_err(|e| capnp::Error::failed(e.to_string())))
-            .map_err(|e| glia::error::internal("attenuate schema", e.to_string()))?;
-        names.push(n.to_string());
-    }
-
-    let mut resolved = Vec::with_capacity(allow.len());
-    for glia_name in allow {
-        let capnp_name = to_capnp_method_name(glia_name);
-        match names.iter().position(|n| *n == capnp_name) {
-            // Method ordinals are list positions in the interface node.
-            Some(ordinal) => resolved.push((glia_name.clone(), ordinal as u16)),
-            None => {
-                return Err(glia::error::permission_denied(
-                    &format!("attenuate: method :{glia_name} not found on interface"),
-                    Some(&format!("schema methods: {}", names.join(", "))),
-                ))
-            }
-        }
-    }
-    Ok((interface_id, resolved))
 }
 
 /// Map an error produced behind the membrane into the structured Glia
@@ -252,15 +186,28 @@ pub fn reify(
         )));
     };
 
-    let (interface_id, resolved) = match resolve_method_keys(schema, &effective_allow) {
-        Ok(v) => v,
-        Err(e) => return Some(Err(e)),
+    let compiled_schema = match CompiledSchema::from_node_bytes(schema) {
+        Ok(schema) => schema,
+        Err(error) => return Some(Err(map_resolve_error(error))),
     };
-
-    let mut allowlist = Allowlist::new();
-    for (_, ordinal) in &resolved {
-        allowlist = allowlist.allow(interface_id, *ordinal);
-    }
+    let methods = effective_allow
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let allowlist = match resolve_allowlist(&compiled_schema, &methods) {
+        Ok(allowlist) => allowlist,
+        Err(error) => return Some(Err(map_resolve_error(error))),
+    };
+    let interface_id = compiled_schema.interface_id();
+    let resolved = methods
+        .iter()
+        .map(|method| {
+            let key = compiled_schema
+                .method_key(method)
+                .expect("resolved allowlist method must retain its schema key");
+            ((*method).to_string(), key.method_id)
+        })
+        .collect::<Vec<_>>();
     let membraned_hook = membrane::attenuate_hook(client.hook, Rc::new(allowlist));
     let export_client = capnp::capability::Client::new(membraned_hook.add_ref());
 
@@ -310,21 +257,4 @@ pub fn reify(
             descriptor,
         }),
     )))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_method_keys_accepts_unaligned_schema_bytes() {
-        let schema = schema_bytes_for_cap("host").expect("host schema");
-        let mut unaligned = vec![0_u8; schema.len() + 1];
-        unaligned[1..].copy_from_slice(schema);
-        let allow = BTreeSet::from(["id".to_string()]);
-
-        let (_, methods) = resolve_method_keys(&unaligned[1..], &allow)
-            .expect("an aligned copy must make schema parsing independent of source alignment");
-        assert_eq!(methods, vec![("id".to_string(), 0)]);
-    }
 }
