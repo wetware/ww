@@ -9,7 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
-use glia::{make_cap, Val};
+use glia::{make_cap, NativeSignal, Val};
 
 pub mod mcp_adapter;
 
@@ -240,10 +240,14 @@ pub fn eval_load(args: &[Val]) -> Result<Val, Val> {
 // Cap handler helpers
 // ---------------------------------------------------------------------------
 
-pub fn call_resume(resume: &Val, val: Val) -> Result<Val, Val> {
+pub fn call_resume(resume: &Val, val: Val) -> Result<Val, NativeSignal> {
     match resume {
         Val::NativeFn { func, .. } => func(&[val]),
-        _ => Err(Val::from("cap handler: invalid resume function")),
+        // Protocol invariant: the evaluator always supplies a NativeFn
+        // resume. Anything else is a runtime fault, not a catchable error.
+        _ => Err(NativeSignal::fault(Val::from(
+            "cap handler: invalid resume function",
+        ))),
     }
 }
 
@@ -323,16 +327,16 @@ pub fn make_import_handler(load_runtime: LoadRuntime) -> Val {
                                 Some(v) => format!("{v}"),
                                 None => "nothing".into(),
                             };
-                            return Err(Val::from(format!(
+                            return Err(NativeSignal::throw(Val::from(format!(
                                 "import: expected string path, got {desc}"
-                            )));
+                            ))));
                         }
                     },
                     Val::Str(s) => s.clone(),
                     other => {
-                        return Err(Val::from(format!(
+                        return Err(NativeSignal::throw(Val::from(format!(
                             "import: expected path string, got {other}"
-                        )));
+                        ))));
                     }
                 };
 
@@ -354,9 +358,9 @@ pub fn make_import_handler(load_runtime: LoadRuntime) -> Val {
                         .to_string(),
                     Val::Str(s) => s.clone(),
                     other => {
-                        return Err(Val::from(format!(
+                        return Err(NativeSignal::throw(Val::from(format!(
                             "import: load returned {other}, expected bytes or string"
-                        )));
+                        ))));
                     }
                 };
 
@@ -366,10 +370,11 @@ pub fn make_import_handler(load_runtime: LoadRuntime) -> Val {
 
                 // Evaluate in a fresh Env (isolated scope)
                 let mut import_env = glia::eval::Env::new();
-                // Load prelude so imported modules can use `defn`, `when`, etc.
+                // Canonical prelude lifecycle: the module inherits the
+                // shared frozen prelude owner and defines into its OWN
+                // child owner — prelude names resolve during evaluation
+                // but never appear in the module's exports.
                 {
-                    let prelude_forms = glia::read_many(glia::PRELUDE)
-                        .map_err(|e| Val::from(format!("import: prelude parse: {e}")))?;
                     struct NoopDispatch;
                     impl glia::eval::Dispatch for NoopDispatch {
                         fn call<'a>(
@@ -378,28 +383,32 @@ pub fn make_import_handler(load_runtime: LoadRuntime) -> Val {
                             _args: &'a [glia::Val],
                         ) -> std::pin::Pin<
                             Box<
-                                dyn std::future::Future<Output = Result<glia::Val, glia::Val>> + 'a,
+                                dyn std::future::Future<
+                                        Output = Result<glia::Val, glia::NativeSignal>,
+                                    > + 'a,
                             >,
                         > {
-                            Box::pin(std::future::ready(Err(glia::Val::from(format!(
+                            Box::pin(std::future::ready(Err(glia::NativeSignal::throw(format!(
                                 "{name}: not available during import"
                             )))))
                         }
                     }
-                    let noop = NoopDispatch;
-                    for form in &prelude_forms {
-                        // Prelude forms are synchronous (macros only), so poll once.
-                        let mut fut =
-                            Box::pin(glia::eval::eval_toplevel(form, &mut import_env, &noop));
+                    let mut noop = NoopDispatch;
+                    {
+                        // load_prelude is synchronous in practice (macros
+                        // only, no dispatch), so poll once.
+                        let mut fut = Box::pin(glia::load_prelude(&mut import_env, &mut noop));
                         let waker = std::task::Waker::noop();
                         let mut cx = std::task::Context::from_waker(waker);
                         match fut.as_mut().poll(&mut cx) {
-                            std::task::Poll::Ready(Ok(_)) => {}
-                            std::task::Poll::Ready(Err(e)) => {
-                                return Err(Val::from(format!("import: prelude error: {e}")));
-                            }
+                            // Prelude errors are fatal by load_prelude's
+                            // contract (it panics), so Ready is success.
+                            std::task::Poll::Ready(()) => {}
                             std::task::Poll::Pending => {
-                                return Err(Val::from("import: prelude unexpectedly pending"));
+                                // Single-poll invariant violated — runtime fault.
+                                return Err(NativeSignal::fault(Val::from(
+                                    "import: prelude unexpectedly pending",
+                                )));
                             }
                         }
                     }
@@ -415,10 +424,12 @@ pub fn make_import_handler(load_runtime: LoadRuntime) -> Val {
                             _args: &'a [glia::Val],
                         ) -> std::pin::Pin<
                             Box<
-                                dyn std::future::Future<Output = Result<glia::Val, glia::Val>> + 'a,
+                                dyn std::future::Future<
+                                        Output = Result<glia::Val, glia::NativeSignal>,
+                                    > + 'a,
                             >,
                         > {
-                            Box::pin(std::future::ready(Err(glia::Val::from(format!(
+                            Box::pin(std::future::ready(Err(glia::NativeSignal::throw(format!(
                                 "{name}: not available during import"
                             )))))
                         }
@@ -437,22 +448,43 @@ pub fn make_import_handler(load_runtime: LoadRuntime) -> Val {
                         let mut cx = std::task::Context::from_waker(waker);
                         match fut.as_mut().poll(&mut cx) {
                             std::task::Poll::Ready(Ok(_)) => {}
-                            std::task::Poll::Ready(Err(e)) => {
-                                return Err(Val::from(format!(
-                                    "import: eval error in {resolved}: {e}"
-                                )));
+                            // Preserve the module's error channels: a
+                            // thrown exception rethrows its ORIGINAL
+                            // payload (stable tags stay catchable by tag);
+                            // an evaluator fault stays a fault (never
+                            // laundered into a catchable guest exception).
+                            std::task::Poll::Ready(Err(glia::eval::EvalError::Fault(fault))) => {
+                                return Err(NativeSignal::fault(fault.payload().clone()));
+                            }
+                            std::task::Poll::Ready(Err(
+                                err @ glia::eval::EvalError::Unhandled(_),
+                            )) => {
+                                return Err(match err.thrown() {
+                                    Some(payload) => NativeSignal::throw(payload.clone()),
+                                    // Non-exception unhandled effect from a
+                                    // legacy import: keep the descriptive
+                                    // throw (B3 in PR-1b gives these full
+                                    // propagation semantics).
+                                    None => NativeSignal::throw(Val::from(format!(
+                                        "import: eval error in {resolved}: {err}"
+                                    ))),
+                                });
                             }
                             std::task::Poll::Pending => {
-                                return Err(Val::from(format!(
+                                // Single-poll invariant violated — runtime fault.
+                                return Err(NativeSignal::fault(Val::from(format!(
                                     "import: eval unexpectedly pending in {resolved}"
-                                )));
+                                ))));
                             }
                         }
                     }
                 }
 
-                // Collect bindings as a Val::Map
-                let bindings = import_env.bindings();
+                // Collect bindings as a Val::Map. An export-time ownership
+                // fault stays on the uncatchable fault lane.
+                let bindings = import_env
+                    .local_bindings()
+                    .map_err(|fault| NativeSignal::fault(fault.payload().clone()))?;
                 let map_entries: Vec<(Val, Val)> = bindings
                     .into_iter()
                     .map(|(name, val)| (Val::Keyword(name), val))
@@ -560,7 +592,9 @@ pub fn make_host_handler(host: system_capnp::host::Client) -> Val {
                             .collect();
                         call_resume(resume, Val::List(items))
                     }
-                    other => Err(Val::from(format!("host: unknown method :{other}"))),
+                    other => Err(NativeSignal::throw(Val::from(format!(
+                        "host: unknown method :{other}"
+                    )))),
                 }
             })
         }),
@@ -580,7 +614,11 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                     "provide" => {
                         let key = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :provide — expected key string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :provide — expected key string",
+                                )))
+                            }
                         };
                         let mut req = routing.provide_request();
                         req.get().set_key(&key);
@@ -593,7 +631,11 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                     "resolve" => {
                         let name = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :resolve — expected name string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :resolve — expected name string",
+                                )))
+                            }
                         };
                         let mut req = routing.resolve_request();
                         req.get().set_name(&name);
@@ -615,12 +657,18 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                         let base_cid = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
                             _ => {
-                                return Err(Val::from("routing :mkdir — expected base CID string"));
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :mkdir — expected base CID string",
+                                )));
                             }
                         };
                         let path = match rest.get(1) {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :mkdir — expected path string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :mkdir — expected path string",
+                                )))
+                            }
                         };
                         let parents = match rest.get(2) {
                             Some(Val::Bool(b)) => *b,
@@ -649,26 +697,26 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                         let base_cid = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "routing :write-file — expected base CID string",
-                                ));
+                                )));
                             }
                         };
                         let path = match rest.get(1) {
                             Some(Val::Str(s)) => s.clone(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "routing :write-file — expected path string",
-                                ));
+                                )));
                             }
                         };
                         let data = match rest.get(2) {
                             Some(Val::Bytes(b)) => b.clone(),
                             Some(Val::Str(s)) => s.as_bytes().to_vec(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "routing :write-file — expected bytes or string data",
-                                ));
+                                )));
                             }
                         };
                         let create_parents = match rest.get(3) {
@@ -699,14 +747,18 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                         let base_cid = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "routing :remove — expected base CID string",
-                                ));
+                                )));
                             }
                         };
                         let path = match rest.get(1) {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :remove — expected path string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :remove — expected path string",
+                                )))
+                            }
                         };
                         let recursive = match rest.get(2) {
                             Some(Val::Bool(b)) => *b,
@@ -734,19 +786,27 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                     "publish" => {
                         let name = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :publish — expected name string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :publish — expected name string",
+                                )))
+                            }
                         };
                         let cid = match rest.get(1) {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :publish — expected CID string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :publish — expected CID string",
+                                )))
+                            }
                         };
                         let expected = match rest.get(2) {
                             Some(Val::Str(s)) => s.clone(),
                             Some(Val::Nil) | None => String::new(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "routing :publish — expected current path string or nil",
-                                ));
+                                )));
                             }
                         };
                         let mut req = routing.publish_request();
@@ -772,7 +832,11 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                         let data = match rest.first() {
                             Some(Val::Str(s)) => s.as_bytes().to_vec(),
                             Some(Val::Bytes(b)) => b.clone(),
-                            _ => return Err(Val::from("routing :hash — expected string or bytes")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :hash — expected string or bytes",
+                                )))
+                            }
                         };
                         let mut req = routing.hash_request();
                         req.get().set_data(&data);
@@ -791,7 +855,9 @@ pub fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                         call_resume(resume, Val::Str(key))
                     }
                     // findProviders uses streaming sink — deferred to follow-up.
-                    other => Err(Val::from(format!("routing: unknown method :{other}"))),
+                    other => Err(NativeSignal::throw(Val::from(format!(
+                        "routing: unknown method :{other}"
+                    )))),
                 }
             })
         }),
@@ -954,7 +1020,7 @@ mod tests {
                 let mut pinned = fut;
                 match std::pin::Pin::new(&mut pinned).poll(&mut cx) {
                     std::task::Poll::Ready(Ok(_)) => {}
-                    std::task::Poll::Ready(Err(e)) => panic!("import handler failed: {e}"),
+                    std::task::Poll::Ready(Err(e)) => panic!("import handler failed: {e:?}"),
                     std::task::Poll::Pending => panic!("import handler unexpectedly pending"),
                 }
 
@@ -1070,7 +1136,7 @@ mod tests {
             func: std::rc::Rc::new(|args: &[Val]| Ok(args[0].clone())),
         };
         let result = call_resume(&resume, Val::Int(42));
-        assert_eq!(result, Ok(Val::Int(42)));
+        assert_eq!(result.unwrap(), Val::Int(42));
     }
 
     #[test]
@@ -1151,5 +1217,124 @@ mod tests {
             }
             other => panic!("expected list, got {other:?}"),
         }
+    }
+
+    // ── PR-1b.0 Sol R1 import tests (changes 3 + 4) ──────────────────────
+
+    /// In-memory module source backend for uncached-import tests.
+    struct MemBackend(std::collections::HashMap<String, String>);
+    impl LoadBackend for MemBackend {
+        fn load<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Val>> + 'a>> {
+            Box::pin(std::future::ready(
+                self.0
+                    .get(path)
+                    .map(|s| s.clone().into_bytes())
+                    .ok_or_else(|| Val::from(format!("not found: {path}"))),
+            ))
+        }
+    }
+
+    /// Drive one uncached `(perform import <module>)` through the handler.
+    fn import_call(source: &str, module: &str) -> Result<Option<Val>, glia::NativeSignal> {
+        clear_import_cache();
+        let mut sources = std::collections::HashMap::new();
+        sources.insert(format!("/lib/{module}.glia"), source.to_string());
+        let handler = make_import_handler(LoadRuntime::new("/", Rc::new(MemBackend(sources))));
+        let func = match &handler {
+            Val::AsyncNativeFn { func, .. } => func.clone(),
+            _ => panic!("expected AsyncNativeFn"),
+        };
+        let data = Val::List(vec![Val::Str(module.into())]);
+        let result = Rc::new(RefCell::new(None));
+        let result_clone = result.clone();
+        let resume = Val::NativeFn {
+            name: "test-resume".into(),
+            func: Rc::new(move |args: &[Val]| {
+                *result_clone.borrow_mut() = Some(args[0].clone());
+                Ok(Val::Nil)
+            }),
+        };
+        let fut = func(vec![data, resume]);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut pinned = fut;
+        let out = match std::pin::Pin::new(&mut pinned).poll(&mut cx) {
+            std::task::Poll::Ready(Ok(_)) => Ok(result.borrow().clone()),
+            std::task::Poll::Ready(Err(e)) => Err(e),
+            std::task::Poll::Pending => panic!("import handler unexpectedly pending"),
+        };
+        clear_import_cache();
+        out
+    }
+
+    // SEMANTIC — an uncached module exports ONLY its own definitions:
+    // prelude macros resolve during evaluation but never leak into the map.
+    #[test]
+    fn uncached_import_exports_module_defs_only() {
+        // The module body uses a PRELUDE MACRO (`when`) so this test fails
+        // if the canonical prelude is not loaded — proving both inherited
+        // usability and the exact-export boundary in one assertion set.
+        let map = import_call("(def answer (when true 42))", "answer-mod")
+            .expect("import succeeds")
+            .expect("resume called");
+        let Val::Map(entries) = &map else {
+            panic!("expected module map, got {map}");
+        };
+        assert_eq!(
+            entries.get(&Val::Keyword("answer".into())),
+            Some(&Val::Int(42)),
+            "module's own definition exported"
+        );
+        for prelude_name in ["defn", "when", "cond", "try"] {
+            assert_eq!(
+                entries.get(&Val::Keyword(prelude_name.into())),
+                None,
+                "prelude macro '{prelude_name}' must not leak into exports"
+            );
+        }
+        assert_eq!(entries.len(), 1, "exactly the module's definitions");
+    }
+
+    // SEMANTIC — module definition errors keep their ORIGINAL stable tag
+    // through import (catchable as :glia.error/def-not-top-level, not a
+    // flattened generic throw).
+    #[test]
+    fn import_preserves_def_not_top_level_payload() {
+        let err = import_call("(defn install [] (def hidden 1))\n(install)", "bad-def-mod")
+            .expect_err("import must propagate the module's exception");
+        let payload = err
+            .thrown()
+            .expect("definition error is a catchable exception, not a fault");
+        // Exact structured assertions (a formatted/laundered wrapper would
+        // contain the substring but NOT the structured tag/symbol fields).
+        assert_eq!(
+            glia::error::type_tag(payload),
+            Some(glia::error::tag::DEF_NOT_TOP_LEVEL),
+            "original stable tag preserved exactly, got: {payload}"
+        );
+        let Val::Map(m) = payload else {
+            panic!("structured error map expected, got: {payload}");
+        };
+        assert_eq!(
+            m.get(&Val::Keyword("glia.error/symbol".into())),
+            Some(&Val::Sym("hidden".into())),
+            "original symbol payload preserved"
+        );
+    }
+
+    // SEMANTIC — evaluator faults in a module stay FAULTS through import
+    // (never laundered into catchable guest exceptions; wildcard try must
+    // not see them).
+    #[test]
+    fn import_fault_stays_fault() {
+        let err = import_call("(loop [] [(recur)])", "fault-mod")
+            .expect_err("import must propagate the module's fault");
+        assert!(
+            err.thrown().is_none(),
+            "evaluator fault must not become a catchable throw"
+        );
     }
 }

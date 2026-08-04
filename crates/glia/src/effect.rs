@@ -54,16 +54,19 @@ pub(crate) fn format_unhandled_diagnostic(
 // =========================================================================
 
 /// The target of a `perform` — either a keyword (environmental) or a Cap (object-scoped).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EffectTarget {
-    /// `(perform :keyword data)` — global/environmental effect.
+    /// `(perform :keyword data)` — global/environmental effect. Freely
+    /// constructible (embedders install host frames by keyword).
     Keyword(String),
     /// `(perform cap :method args...)` — object-scoped capability effect.
-    /// Matched by instance identity (`cap_id`).
+    /// Matched by instance identity. Constructing one requires a
+    /// [`crate::CapId`], obtainable only from a capability you hold
+    /// ([`crate::CapHandle::effect_target`]), so targeting cannot be forged.
     Cap {
         name: String,
         schema_cid: String,
-        cap_id: u64,
+        id: crate::CapId,
     },
 }
 
@@ -74,8 +77,27 @@ impl EffectTarget {
     pub fn matches(&self, other: &EffectTarget) -> bool {
         match (self, other) {
             (EffectTarget::Keyword(a), EffectTarget::Keyword(b)) => a == b,
-            (EffectTarget::Cap { cap_id: a, .. }, EffectTarget::Cap { cap_id: b, .. }) => a == b,
+            (EffectTarget::Cap { id: a, .. }, EffectTarget::Cap { id: b, .. }) => a == b,
             _ => false,
+        }
+    }
+}
+
+/// An effect and its payload, as carried to the embedder boundary when no
+/// handler matched. This is boundary data, not a Glia value: guest code can
+/// neither construct nor store it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectRequest {
+    pub target: EffectTarget,
+    pub data: Val,
+}
+
+impl EffectRequest {
+    /// Legacy wire/display tag: the keyword, or `"cap:{name}"`.
+    pub fn effect_type(&self) -> String {
+        match &self.target {
+            EffectTarget::Keyword(s) => s.clone(),
+            EffectTarget::Cap { name, .. } => format!("cap:{name}"),
         }
     }
 }
@@ -157,8 +179,8 @@ pub fn new_handler_stack() -> HandlerStack {
 // =========================================================================
 
 /// Create a Glia-callable `resume` function that sends a value through the
-/// oneshot channel and returns `Err(Val::Resume(val))` to short-circuit
-/// the handler's eval chain.
+/// oneshot channel and returns a resume signal to short-circuit the
+/// handler's eval chain.
 ///
 /// The OneshotSender is moved into `Rc<RefCell<Option<...>>>` so the closure
 /// (behind `Rc<dyn Fn>`) can take ownership on the first call.
@@ -168,21 +190,29 @@ pub fn make_resume_fn(tx: oneshot::Sender) -> Val {
         name: "resume".into(),
         func: Rc::new(move |args: &[Val]| {
             if args.len() != 1 {
-                return Err(error::arity("resume", "1", args.len()));
+                return Err(crate::NativeSignal::throw(error::arity(
+                    "resume",
+                    "1",
+                    args.len(),
+                )));
             }
             // One-shot: a second `resume` finds the sender already taken and
-            // surfaces a structured :glia.error/continuation-already-resumed
-            // carrier rather than a bare string.
-            let tx = tx_cell
-                .borrow_mut()
-                .take()
-                .ok_or_else(error::continuation_already_resumed)?;
+            // raises a structured :glia.error/continuation-already-resumed
+            // exception (catchable protocol misuse, not a fault).
+            let tx = match tx_cell.borrow_mut().take() {
+                Some(tx) => tx,
+                None => {
+                    return Err(crate::NativeSignal::throw(
+                        error::continuation_already_resumed(),
+                    ))
+                }
+            };
             let val = args[0].clone();
             if trace_enabled() {
                 eprintln!("[glia:effect] resume <- {val}");
             }
             tx.send(val.clone());
-            Err(Val::Resume(Box::new(val)))
+            Err(crate::NativeSignal::resume(val))
         }),
     }
 }
@@ -224,6 +254,15 @@ mod trace_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NativeSignal, NativeSignalKind};
+
+    /// Extract the thrown exception payload from a native signal.
+    fn thrown_payload(sig: &NativeSignal) -> &Val {
+        match &sig.0 {
+            NativeSignalKind::Throw(v) => v,
+            other => panic!("expected throw signal, got {other:?}"),
+        }
+    }
 
     #[test]
     fn make_resume_fn_first_call() {
@@ -231,7 +270,10 @@ mod tests {
         let resume = make_resume_fn(tx);
         if let Val::NativeFn { func, .. } = &resume {
             let result = func(&[Val::Int(42)]);
-            assert!(matches!(result, Err(Val::Resume(v)) if *v == Val::Int(42)));
+            assert!(matches!(
+                result,
+                Err(NativeSignal(NativeSignalKind::Resume(v))) if v == Val::Int(42)
+            ));
         } else {
             panic!("expected NativeFn");
         }
@@ -245,8 +287,11 @@ mod tests {
             let _ = func(&[Val::Int(1)]); // first call — ok
             let result = func(&[Val::Int(2)]); // second call — error
             assert!(result.is_err());
-            // Should NOT be a Resume sentinel — should be a regular error
-            assert!(!matches!(result, Err(Val::Resume(_))));
+            // Should NOT be a resume signal — should be a thrown exception
+            assert!(!matches!(
+                result,
+                Err(NativeSignal(NativeSignalKind::Resume(_)))
+            ));
         } else {
             panic!("expected NativeFn");
         }
@@ -261,7 +306,7 @@ mod tests {
         if let Val::NativeFn { func, .. } = &resume {
             let _ = func(&[Val::Int(1)]); // first call — consumes the sender
             let err = func(&[Val::Int(2)]).unwrap_err(); // second call — violation
-            let msg = format!("{err}");
+            let msg = format!("{}", thrown_payload(&err));
             assert!(
                 msg.contains("twice") || msg.contains("one-shot"),
                 "expected a one-shot violation message, got: {msg}"
@@ -282,7 +327,7 @@ mod tests {
             let _ = func(&[Val::Int(1)]); // first call — consumes the sender
             let err = func(&[Val::Int(2)]).unwrap_err(); // second call — violation
             assert_eq!(
-                error::type_tag(&err),
+                error::type_tag(thrown_payload(&err)),
                 Some(error::tag::CONTINUATION_ALREADY_RESUMED)
             );
         } else {
@@ -298,7 +343,10 @@ mod tests {
         let resume = make_resume_fn(tx);
         if let Val::NativeFn { func, .. } = &resume {
             let err = func(&[]).unwrap_err();
-            assert_eq!(error::type_tag(&err), Some(error::tag::ARITY));
+            assert_eq!(
+                error::type_tag(thrown_payload(&err)),
+                Some(error::tag::ARITY)
+            );
         } else {
             panic!("expected NativeFn");
         }

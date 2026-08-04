@@ -145,10 +145,19 @@ pub fn val_to_json(v: &Val) -> serde_json::Value {
     }
 }
 
-/// Convert a Glia error value into MCP human-readable error text.
-pub fn val_to_mcp_error_text(err: &Val) -> String {
-    let inner = glia::error::unwrap_thrown(err).unwrap_or(err);
+/// Convert a boundary evaluation error into MCP human-readable error text.
+/// Unhandled exceptions and faults render their structured payload; other
+/// escaped effects fall back to the boundary display form.
+pub fn val_to_mcp_error_text(err: &glia::eval::EvalError) -> String {
+    match err.payload() {
+        Some(inner) => payload_to_mcp_error_text(inner),
+        None => format!("{err}"),
+    }
+}
 
+/// Payload-level formatter shared by the boundary path and callers that
+/// already hold a structured error value.
+pub fn payload_to_mcp_error_text(inner: &Val) -> String {
     let msg = glia::error::message(inner)
         .map(str::to_string)
         .unwrap_or_else(|| format!("{inner}"));
@@ -165,9 +174,16 @@ pub fn val_to_mcp_error_text(err: &Val) -> String {
     text
 }
 
-/// Convert a Glia error value into MCP structured error data.
-pub fn val_to_mcp_error_data(err: &Val) -> serde_json::Value {
-    let inner = glia::error::unwrap_thrown(err).unwrap_or(err);
+/// Convert a boundary evaluation error into MCP structured error data.
+pub fn val_to_mcp_error_data(err: &glia::eval::EvalError) -> serde_json::Value {
+    match err.payload() {
+        Some(inner) => payload_to_mcp_error_data(inner),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Payload-level structured-data formatter.
+pub fn payload_to_mcp_error_data(inner: &Val) -> serde_json::Value {
     let Some(data) = glia::error::data(inner) else {
         return serde_json::Value::Null;
     };
@@ -320,7 +336,7 @@ mod tests {
             glia::error::type_tag(&err),
             Some("glia.error/protocol-mode-unavailable")
         );
-        let data = val_to_mcp_error_data(&err);
+        let data = payload_to_mcp_error_data(&err);
         assert_eq!(data.get("mode").and_then(|v| v.as_str()), Some("mcp"));
         assert_eq!(data.get("effect").and_then(|v| v.as_str()), Some("stdout"));
     }
@@ -331,7 +347,7 @@ mod tests {
 
     #[test]
     fn envelope_text_includes_tag_and_message_for_structured_error() {
-        let text = val_to_mcp_error_text(&unbound_err());
+        let text = payload_to_mcp_error_text(&unbound_err());
         assert!(
             text.starts_with("[glia.error/unbound-symbol]"),
             "got: {text}"
@@ -343,14 +359,14 @@ mod tests {
     #[test]
     fn envelope_text_falls_back_to_plain_string_for_legacy_errors() {
         assert_eq!(
-            val_to_mcp_error_text(&Val::Str("legacy plain error".into())),
+            payload_to_mcp_error_text(&Val::Str("legacy plain error".into())),
             "legacy plain error"
         );
     }
 
     #[test]
     fn envelope_data_carries_full_structured_map() {
-        let data = val_to_mcp_error_data(&unbound_err());
+        let data = payload_to_mcp_error_data(&unbound_err());
         let object = data.as_object().expect("structured data should be object");
         assert_eq!(
             object.get("glia.error/type").and_then(|v| v.as_str()),
@@ -373,15 +389,15 @@ mod tests {
 
     #[test]
     fn envelope_data_returns_null_for_legacy_string_errors() {
-        assert!(val_to_mcp_error_data(&Val::Str("legacy".into())).is_null());
+        assert!(payload_to_mcp_error_data(&Val::Str("legacy".into())).is_null());
     }
 
     #[test]
     fn envelope_peels_glia_exception_carrier() {
-        let carrier = Val::Effect {
-            effect_type: "glia.exception".into(),
-            data: Box::new(unbound_err()),
-        };
+        let carrier = glia::eval::EvalError::Unhandled(glia::effect::EffectRequest {
+            target: glia::effect::EffectTarget::Keyword("glia.exception".into()),
+            data: unbound_err(),
+        });
         let text = val_to_mcp_error_text(&carrier);
         assert!(
             text.starts_with("[glia.error/unbound-symbol]"),
@@ -404,9 +420,9 @@ mod tests {
                 Val::Str("QmFoo".into()),
             )]),
         );
-        let text = val_to_mcp_error_text(&err);
+        let text = payload_to_mcp_error_text(&err);
         assert!(text.starts_with("[network]"), "got: {text}");
-        let data = val_to_mcp_error_data(&err);
+        let data = payload_to_mcp_error_data(&err);
         let object = data.as_object().unwrap();
         assert_eq!(object.get("peer").and_then(|v| v.as_str()), Some("QmFoo"));
     }

@@ -49,9 +49,147 @@ pub fn banner() -> String {
 /// Process-local monotonic counter for capability instance identity.
 static CAP_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Opaque capability instance identity. Minted only by [`make_cap`]; there is
+/// no public constructor and no access to the raw counter value, so neither
+/// Glia code nor embedders can forge the identity of a capability they do
+/// not hold. Cloning an id requires holding a value that already carries it,
+/// which is exactly the authority the id represents.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct CapId(u64);
+
 /// Allocate a fresh capability instance identifier.
-pub fn next_cap_id() -> u64 {
-    CAP_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+fn next_cap_id() -> CapId {
+    CapId(CAP_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+// ---------------------------------------------------------------------------
+// Faults and native signaling
+// ---------------------------------------------------------------------------
+
+/// Category of an uncatchable [`Fault`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FaultKind {
+    /// Structurally invalid program control — e.g. `recur` outside tail
+    /// position.
+    Language,
+    /// Evaluator/continuation invariant failure or embedder/host failure.
+    Runtime,
+}
+
+/// Unrecoverable runtime failure. Bypasses all Glia handlers — `try` cannot
+/// catch it and guest code cannot observe it. The payload is a structured
+/// error map (same schema as exception payloads) so boundary formatting is
+/// uniform across the three failure layers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fault {
+    kind: FaultKind,
+    payload: Val,
+}
+
+impl Fault {
+    pub(crate) fn language(payload: Val) -> Self {
+        Self {
+            kind: FaultKind::Language,
+            payload,
+        }
+    }
+
+    pub(crate) fn runtime(payload: Val) -> Self {
+        Self {
+            kind: FaultKind::Runtime,
+            payload,
+        }
+    }
+
+    pub fn kind(&self) -> FaultKind {
+        self.kind
+    }
+
+    pub fn payload(&self) -> &Val {
+        &self.payload
+    }
+}
+
+impl core::fmt::Display for Fault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.payload)
+    }
+}
+
+/// What a native function, [`eval::Dispatch::call`], or embedder callback
+/// signals instead of returning a value. Opaque: constructed only through
+/// the semantic constructors, so native code can raise catchable exceptions,
+/// declare runtime faults, and propagate resumptions — but can never
+/// synthesize lexical `recur` or forge effect dispatch.
+#[derive(Clone, Debug)]
+pub struct NativeSignal(pub(crate) NativeSignalKind);
+
+#[derive(Clone, Debug)]
+pub(crate) enum NativeSignalKind {
+    Throw(Val),
+    Resume(Val),
+    Fault(Fault),
+}
+
+impl NativeSignal {
+    /// Raise a recoverable exception: dispatched through `:glia.exception`,
+    /// catchable by `try`, resumable by `try-resume`.
+    pub fn throw(err: impl Into<Val>) -> Self {
+        NativeSignal(NativeSignalKind::Throw(err.into()))
+    }
+
+    /// Declare an unrecoverable [`FaultKind::Runtime`] fault. For trusted
+    /// runtime/embedder invariant violations only; bypasses all Glia
+    /// handlers and reaches the embedder boundary directly.
+    pub fn fault(err: impl Into<Val>) -> Self {
+        NativeSignal(NativeSignalKind::Fault(Fault::runtime(err.into())))
+    }
+
+    /// Resume short-circuit minted by the effect system (`make_resume_fn`).
+    /// Deliberately not public: natives propagate resumption by returning
+    /// the resume function's own signal, never by constructing one.
+    pub(crate) fn resume(val: Val) -> Self {
+        NativeSignal(NativeSignalKind::Resume(val))
+    }
+
+    /// The thrown exception payload, if this signal is a throw. Read-only:
+    /// useful to embedder tests and wrappers; grants no ability to construct
+    /// or forge control signals.
+    pub fn thrown(&self) -> Option<&Val> {
+        match &self.0 {
+            NativeSignalKind::Throw(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Transform the payload of a thrown exception, passing resume and
+    /// fault signals through untouched. Lets trusted wrappers (e.g. the
+    /// kernel's membrane gate) rewrite inner-handler errors without gaining
+    /// the ability to inspect or forge control signals.
+    pub fn map_throw(self, f: impl FnOnce(Val) -> Val) -> Self {
+        match self.0 {
+            NativeSignalKind::Throw(v) => NativeSignal(NativeSignalKind::Throw(f(v))),
+            other => NativeSignal(other),
+        }
+    }
+}
+
+impl From<Val> for NativeSignal {
+    fn from(v: Val) -> Self {
+        NativeSignal::throw(v)
+    }
+}
+
+impl From<String> for NativeSignal {
+    fn from(s: String) -> Self {
+        NativeSignal::throw(Val::from(s))
+    }
+}
+
+impl From<&str> for NativeSignal {
+    fn from(s: &str) -> Self {
+        NativeSignal::throw(Val::from(s))
+    }
 }
 
 /// Internal representation for Glia-native capability servers created by `defcap`.
@@ -96,18 +234,65 @@ pub struct HandledCapInner {
     pub descriptor: Vec<u8>,
 }
 
+/// Payload of [`Val::Cap`]. Fields are private and [`make_cap`] is the only
+/// mint, so a capability's identity cannot be forged: holding a `CapHandle`
+/// is itself the authority its identity confers. Accessors cover exactly
+/// what current embedders need (display, wire typing, downcast/export,
+/// effect targeting).
+#[derive(Clone)]
+pub struct CapHandle {
+    name: String,
+    schema_cid: String,
+    id: CapId,
+    inner: Rc<dyn std::any::Any>,
+}
+
+impl CapHandle {
+    /// Display label (e.g. "executor").
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Content-addressed type identity: CIDv1(raw, BLAKE3(canonical schema)).
+    pub fn schema_cid(&self) -> &str {
+        &self.schema_cid
+    }
+
+    /// Opaque instance identity used for effect-handler matching.
+    pub fn id(&self) -> &CapId {
+        &self.id
+    }
+
+    /// Type-erased embedder payload. Read-only: downcast by the kernel to
+    /// capnp clients, [`GliaCapInner`], [`AttenuatedCapInner`], or
+    /// [`HandledCapInner`]; reading confers no minting power.
+    pub fn inner(&self) -> &Rc<dyn std::any::Any> {
+        &self.inner
+    }
+
+    /// The controlled path into effect targeting: the only way to obtain a
+    /// cap-targeted [`effect::EffectTarget`].
+    pub fn effect_target(&self) -> effect::EffectTarget {
+        effect::EffectTarget::Cap {
+            name: self.name.clone(),
+            schema_cid: self.schema_cid.clone(),
+            id: self.id.clone(),
+        }
+    }
+}
+
 /// Construct a capability value with a fresh instance identity.
 pub fn make_cap(
     name: impl Into<String>,
     schema_cid: impl Into<String>,
     inner: Rc<dyn std::any::Any>,
 ) -> Val {
-    Val::Cap {
+    Val::Cap(CapHandle {
         name: name.into(),
         schema_cid: schema_cid.into(),
-        cap_id: next_cap_id(),
+        id: next_cap_id(),
         inner,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -201,14 +386,45 @@ pub struct FnArity {
 }
 
 /// Shared pointer to a native (Rust-side) function callable from Glia.
-pub type NativeFnImpl = std::rc::Rc<dyn Fn(&[Val]) -> Result<Val, Val>>;
+/// The error channel carries a [`NativeSignal`]: a catchable exception, a
+/// propagated resumption, or a trusted runtime fault. `Err(Val::from(..))`
+/// and `?` on `Result<_, Val>` keep working via `From<Val> for NativeSignal`
+/// (which raises a catchable exception).
+pub type NativeFnImpl = std::rc::Rc<dyn Fn(&[Val]) -> Result<Val, NativeSignal>>;
 
 /// Shared pointer to an async native function callable from Glia.
-/// Returns a boxed future that resolves to `Result<Val, Val>`.
+/// Returns a boxed future that resolves to `Result<Val, NativeSignal>`.
 /// The future is `'static` (no borrows from args — clone what you need).
 pub type AsyncNativeFnImpl = std::rc::Rc<
-    dyn Fn(Vec<Val>) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Val, Val>>>>,
+    dyn Fn(
+        Vec<Val>,
+    )
+        -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Val, NativeSignal>>>>,
 >;
+
+/// Opaque closure payload for `Val::Fn` / `Val::Macro` (wired in PR-1b.0
+/// Stage C).
+///
+/// Public only because the `Val` enum is public; it exposes NO API. All
+/// fields are crate-private: the lexical capture snapshot (which is also the
+/// closure's identity anchor — equality/hash by pointer, same granularity as
+/// today's captured-env `Rc`) and the private definition-owner reference.
+/// `Debug` is deliberately opaque.
+#[derive(Clone)]
+pub struct Closure {
+    /// Lexical capture snapshot — also the closure's identity anchor
+    /// (equality/hash by pointer; never replaced by the ownership
+    /// transforms).
+    pub(crate) captured: std::rc::Rc<eval::CapturedEnv>,
+    /// Private definition-owner reference (RC-specific; see eval::own).
+    pub(crate) owner: eval::OwnerRef,
+}
+
+impl core::fmt::Debug for Closure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Closure")
+    }
+}
 
 /// A Clojure-like value.
 #[derive(Clone)]
@@ -240,25 +456,16 @@ pub enum Val {
     /// then `fn` captures that env). Cloning an `Rc<Env>` is O(1).
     Fn {
         arities: Vec<FnArity>,
-        env: std::rc::Rc<eval::Env>,
+        closure: Closure,
         is_cap_free: bool,
         cap_violation: Option<String>,
     },
-    /// Internal sentinel returned by `recur` — never escapes `loop`.
-    Recur(Vec<Val>),
     /// A macro: like a fn but receives unevaluated args and its result is re-evaluated.
     Macro {
         arities: Vec<FnArity>,
-        env: std::rc::Rc<eval::Env>,
+        closure: Closure,
         is_cap_free: bool,
         cap_violation: Option<String>,
-    },
-    /// Internal sentinel returned by `perform` — caught by `with-handler`.
-    /// Propagates up the eval stack until a matching handler is found.
-    /// Used as fallback when no handler context exists (unhandled effect).
-    Effect {
-        effect_type: String,
-        data: Box<Val>,
     },
     /// A Rust-side function callable from Glia. Used for `resume` and future
     /// stdlib builtins. The closure is behind Rc for Clone support.
@@ -273,24 +480,13 @@ pub enum Val {
         name: String,
         func: AsyncNativeFnImpl,
     },
-    /// Internal sentinel returned by `resume` — short-circuits the handler's
-    /// eval chain. Propagates via Err like Effect and Recur. Must NOT be caught
-    /// by nested `with-handler` — always re-propagated.
-    Resume(Box<Val>),
     /// An opaque capability reference — a value the script can pass around but
     /// not inspect. The kernel creates these (e.g. executor, host) and dispatch
     /// handlers downcast them back to typed Cap'n Proto clients.
     ///
-    /// `name` is the display label (e.g. "executor").
-    /// `schema_cid` is the content-addressed type identity: CIDv1(raw, BLAKE3(canonical schema)).
-    /// `cap_id` is a unique instance identity used for authority matching.
-    /// `inner` is the type-erased capability, downcasted by the kernel.
-    Cap {
-        name: String,
-        schema_cid: String,
-        cap_id: u64,
-        inner: std::rc::Rc<dyn std::any::Any>,
-    },
+    /// The payload is a [`CapHandle`] with private fields: identity is minted
+    /// exclusively by [`make_cap`] and read through semantic accessors.
+    Cap(CapHandle),
 }
 
 impl core::fmt::Debug for Val {
@@ -313,17 +509,10 @@ impl core::fmt::Debug for Val {
             Val::Set(v) => f.debug_tuple("Set").field(v).finish(),
             Val::Bytes(b) => write!(f, "Bytes({} bytes)", b.len()),
             Val::Fn { arities, .. } => write!(f, "Fn({} arities)", arities.len()),
-            Val::Recur(v) => f.debug_tuple("Recur").field(v).finish(),
             Val::Macro { arities, .. } => write!(f, "Macro({} arities)", arities.len()),
-            Val::Effect { effect_type, data } => f
-                .debug_struct("Effect")
-                .field("effect_type", effect_type)
-                .field("data", data)
-                .finish(),
             Val::NativeFn { name, .. } => write!(f, "NativeFn({name})"),
             Val::AsyncNativeFn { name, .. } => write!(f, "AsyncNativeFn({name})"),
-            Val::Resume(v) => f.debug_tuple("Resume").field(v).finish(),
-            Val::Cap { name, .. } => write!(f, "Cap({name})"),
+            Val::Cap(h) => write!(f, "Cap({})", h.name),
         }
     }
 }
@@ -387,8 +576,12 @@ impl PartialEq for Val {
             (Val::Bytes(a), Val::Bytes(b)) => a == b,
             // Closures and macros: identity equality via Rc pointer comparison.
             // Same Rc allocation = same closure instance.
-            (Val::Fn { env: a, .. }, Val::Fn { env: b, .. }) => std::rc::Rc::ptr_eq(a, b),
-            (Val::Macro { env: a, .. }, Val::Macro { env: b, .. }) => std::rc::Rc::ptr_eq(a, b),
+            (Val::Fn { closure: a, .. }, Val::Fn { closure: b, .. }) => {
+                std::rc::Rc::ptr_eq(&a.captured, &b.captured)
+            }
+            (Val::Macro { closure: a, .. }, Val::Macro { closure: b, .. }) => {
+                std::rc::Rc::ptr_eq(&a.captured, &b.captured)
+            }
             // Closures, native fns, and macros are never equal (identity semantics).
             (Val::NativeFn { func: a, .. }, Val::NativeFn { func: b, .. }) => {
                 std::rc::Rc::ptr_eq(a, b)
@@ -397,13 +590,9 @@ impl PartialEq for Val {
                 std::rc::Rc::ptr_eq(a, b)
             }
             // Caps match by instance identity.
-            (Val::Cap { cap_id: a, .. }, Val::Cap { cap_id: b, .. }) => a == b,
+            (Val::Cap(a), Val::Cap(b)) => a.id == b.id,
             // Atoms compare by identity: same cell, not same contents.
             (Val::Atom(a), Val::Atom(b)) => std::rc::Rc::ptr_eq(a, b),
-            // Recur, Effect, and Resume are internal sentinels — never equal.
-            (Val::Recur(_), _) | (_, Val::Recur(_)) => false,
-            (Val::Effect { .. }, _) | (_, Val::Effect { .. }) => false,
-            (Val::Resume(_), _) | (_, Val::Resume(_)) => false,
             _ => false,
         }
     }
@@ -412,7 +601,6 @@ impl PartialEq for Val {
 /// Eq is safe because PartialEq is reflexive for all variants:
 /// - Floats use to_bits() (reflexive; NOTE: 0.0 != -0.0, deliberate deviation from Clojure)
 /// - Fn/Macro use Rc::ptr_eq (reflexive: same pointer = true)
-/// - Sentinels (Recur/Effect/Resume) return false (these are never used as map keys)
 impl Eq for Val {}
 
 impl std::hash::Hash for Val {
@@ -433,19 +621,21 @@ impl std::hash::Hash for Val {
             Val::Set(items) => items.hash(state),
             Val::Bytes(b) => b.hash(state),
             // Identity hash via Rc pointer (consistent with Rc::ptr_eq PartialEq).
-            Val::Fn { env, .. } => (std::rc::Rc::as_ptr(env) as *const () as usize).hash(state),
-            Val::Macro { env, .. } => (std::rc::Rc::as_ptr(env) as *const () as usize).hash(state),
+            Val::Fn { closure, .. } => {
+                (std::rc::Rc::as_ptr(&closure.captured) as *const () as usize).hash(state)
+            }
+            Val::Macro { closure, .. } => {
+                (std::rc::Rc::as_ptr(&closure.captured) as *const () as usize).hash(state)
+            }
             Val::NativeFn { func, .. } => {
                 (std::rc::Rc::as_ptr(func) as *const () as usize).hash(state)
             }
             Val::AsyncNativeFn { func, .. } => {
                 (std::rc::Rc::as_ptr(func) as *const () as usize).hash(state)
             }
-            Val::Cap { cap_id, .. } => cap_id.hash(state),
+            Val::Cap(h) => h.id.hash(state),
             // Identity hash, consistent with identity equality.
             Val::Atom(a) => (std::rc::Rc::as_ptr(a) as usize).hash(state),
-            // Sentinels: hash by discriminant only (already done above).
-            Val::Recur(_) | Val::Effect { .. } | Val::Resume(_) => {}
         }
     }
 }
@@ -485,20 +675,15 @@ impl core::fmt::Display for Val {
             }
             Val::Set(items) => fmt_seq(f, "#{", "}", items),
             Val::Bytes(b) => write!(f, "<{} bytes>", b.len()),
-            Val::Recur(_) => write!(f, "#<recur>"),
             Val::Fn { arities, .. } => {
                 write!(f, "#<fn [{}]>", fmt_arity_desc(arities))
             }
             Val::Macro { arities, .. } => {
                 write!(f, "#<macro [{}]>", fmt_arity_desc(arities))
             }
-            Val::Effect { effect_type, data } => {
-                write!(f, "#<effect :{effect_type} {data}>")
-            }
             Val::NativeFn { name, .. } => write!(f, "#<native-fn {name}>"),
             Val::AsyncNativeFn { name, .. } => write!(f, "#<async-native-fn {name}>"),
-            Val::Cap { name, .. } => write!(f, "#<cap {name}>"),
-            Val::Resume(val) => write!(f, "#<resume {val}>"),
+            Val::Cap(h) => write!(f, "#<cap {}>", h.name),
         }
     }
 }
@@ -644,17 +829,82 @@ fn validate_source_grant_maps(value: &Val) -> Result<(), String> {
 /// The Glia prelude: standard derived forms (when, and, or, defn, cond, not).
 pub const PRELUDE: &str = include_str!("prelude.glia");
 
+thread_local! {
+    /// Memoized shared prelude definition owner.
+    ///
+    /// Guarantee: PUBLISH ONCE / ADOPT WINNER. The first initializer to
+    /// complete publishes its frozen owner; any other initializer discards
+    /// its candidate and adopts the winner, so every consumer inherits the
+    /// same owner and no partial state is ever published. This does NOT
+    /// claim single construction under reentrant or interleaved
+    /// initialization: two initializers that both observe an empty cell
+    /// both build (one build is then discarded). That is sound today
+    /// because the bundled prelude evaluates synchronously (macros only,
+    /// no dispatch, no yield points); revisit with an initializing guard
+    /// if the prelude ever gains suspension points.
+    static PRELUDE_DEFS: std::cell::OnceCell<std::rc::Rc<eval::Defs>> =
+        const { std::cell::OnceCell::new() };
+}
+
 /// Load the prelude macros into the given environment.
 ///
 /// Parses and evaluates each form in `prelude.glia`. This should be called
 /// once at boot before init.d or shell evaluation. Prelude errors are fatal.
+///
+/// The prelude is built into a shared, frozen definition owner published
+/// with publish-once/adopt-winner semantics (see [`PRELUDE_DEFS`] for the
+/// exact — deliberately narrow — initialization contract); `env` then
+/// adopts a fresh definition owner inheriting it. Prelude names resolve
+/// through inherited lookup, are shadowable locally, never mutate the
+/// shared owner, and never appear in `Env::local_bindings`.
 pub async fn load_prelude<D: eval::Dispatch>(env: &mut eval::Env, dispatch: &mut D) {
-    let forms = read_many(PRELUDE).expect("prelude: parse error");
-    for form in &forms {
-        eval::eval_toplevel(form, env, dispatch)
-            .await
-            .expect("prelude: eval error");
-    }
+    let prelude = match PRELUDE_DEFS.with(|cell| cell.get().cloned()) {
+        Some(prelude) => prelude,
+        None => {
+            let mut prelude_env = eval::Env::new();
+            let forms = read_many(PRELUDE).expect("prelude: parse error");
+            for form in &forms {
+                eval::eval_toplevel(form, &mut prelude_env, dispatch)
+                    .await
+                    .expect("prelude: eval error");
+            }
+            let prelude = std::rc::Rc::clone(prelude_env.defs());
+            // Shareability certification: the shared owner may hold ONLY
+            // macros (authority-free, immutable). Anything else here means
+            // the prelude changed character and sharing must be redesigned.
+            for (name, val) in prelude_env
+                .local_bindings()
+                .expect("prelude export cannot fault (boot-fatal contract)")
+            {
+                assert!(
+                    matches!(val, Val::Macro { .. }),
+                    "prelude must be macro-only to be shared+frozen; '{name}' is not a macro"
+                );
+            }
+            prelude.freeze();
+            publish_or_adopt_prelude(prelude)
+        }
+    };
+    env.adopt_inherited_defs(prelude);
+}
+
+/// Publish a freshly-built prelude owner, or adopt the already-published
+/// winner if another initializer got there first.
+///
+/// PUBLISH ONCE / ADOPT WINNER: every consumer inherits the SAME owner; a
+/// losing candidate is discarded, never returned. Publication happens only
+/// after successful construction + freeze, so a failed or cancelled
+/// initialization leaves the cell empty for the next caller. This function
+/// does not prevent duplicate BUILDS under interleaved initialization — it
+/// only guarantees a single published winner (see [`PRELUDE_DEFS`]).
+fn publish_or_adopt_prelude(candidate: std::rc::Rc<eval::Defs>) -> std::rc::Rc<eval::Defs> {
+    PRELUDE_DEFS.with(|cell| match cell.set(std::rc::Rc::clone(&candidate)) {
+        Ok(()) => candidate,
+        Err(_) => cell
+            .get()
+            .cloned()
+            .expect("OnceCell::set failed, so a winner must be present"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,7 +1474,7 @@ fn transform_syntax_quote(val: &Val, depth: usize) -> Result<Val, String> {
         }
         Val::Set(_) => Err("syntax-quote of sets not yet supported".into()),
 
-        // Fn/Macro/Recur/Bytes — shouldn't appear in parsed forms
+        // Fn/Macro/Bytes — shouldn't appear in parsed forms
         other => Err(format!("syntax-quote: unexpected value {other}")),
     }
 }
@@ -2611,5 +2861,87 @@ mod tests {
         ] {
             read_many(source).unwrap_or_else(|error| panic!("{name} does not parse: {error}"));
         }
+    }
+}
+
+/// PR-1b.0 prelude-lifecycle tests (Sol R1 change 6): publish-once/
+/// adopt-winner publication. (These prove loser adoption and shared
+/// inheritance — NOT single construction under interleaved
+/// initialization, which the contract deliberately does not claim.)
+#[cfg(test)]
+mod prelude_lifecycle_tests {
+    use super::*;
+
+    // SEMANTIC — every consumer on a thread shares ONE frozen prelude
+    // owner (publish-once), and consumers get independent child owners.
+    #[test]
+    fn consumers_share_one_frozen_prelude() {
+        struct Noop;
+        impl eval::Dispatch for Noop {
+            fn call<'a>(
+                &'a self,
+                name: &'a str,
+                _args: &'a [Val],
+            ) -> core::pin::Pin<
+                Box<dyn core::future::Future<Output = Result<Val, NativeSignal>> + 'a>,
+            > {
+                Box::pin(core::future::ready(Err(NativeSignal::throw(format!(
+                    "{name}: unavailable"
+                )))))
+            }
+        }
+        fn block_on<T>(
+            mut fut: core::pin::Pin<Box<dyn core::future::Future<Output = T> + '_>>,
+        ) -> T {
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            loop {
+                if let core::task::Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                    return v;
+                }
+            }
+        }
+
+        let mut d = Noop;
+        let mut env_a = eval::Env::new();
+        block_on(Box::pin(load_prelude(&mut env_a, &mut d)));
+        let mut env_b = eval::Env::new();
+        block_on(Box::pin(load_prelude(&mut env_b, &mut d)));
+
+        // Child owners are distinct...
+        assert!(!Rc::ptr_eq(env_a.defs(), env_b.defs()));
+        // ...and their definitions are isolated.
+        env_a.defs().define("only-a".into(), Val::Int(1)).unwrap();
+        assert_eq!(env_b.defs().lookup("only-a").unwrap(), None);
+        // The shared prelude resolves identically through both.
+        assert!(env_a.defs().lookup("when").unwrap().is_some());
+        assert!(env_b.defs().lookup("when").unwrap().is_some());
+    }
+
+    // RC-MECHANISM — losing publication adopts the winner: the candidate is
+    // discarded, never returned, so all consumers converge on one owner.
+    #[test]
+    fn losing_publication_adopts_winner() {
+        // Isolated thread: this test seeds the thread-local prelude cell
+        // with a non-prelude owner and must not poison sibling tests under
+        // --test-threads=1.
+        std::thread::spawn(losing_publication_adopts_winner_body)
+            .join()
+            .expect("isolated body");
+    }
+
+    fn losing_publication_adopts_winner_body() {
+        // Seed the thread-local cell with a winner.
+        let winner = eval::Defs::new(None);
+        winner.freeze();
+        let published = super::publish_or_adopt_prelude(Rc::clone(&winner));
+        assert!(Rc::ptr_eq(&published, &winner));
+
+        // A late candidate loses and must adopt the winner.
+        let candidate = eval::Defs::new(None);
+        candidate.freeze();
+        let adopted = super::publish_or_adopt_prelude(Rc::clone(&candidate));
+        assert!(Rc::ptr_eq(&adopted, &winner), "loser adopts the winner");
+        assert!(!Rc::ptr_eq(&adopted, &candidate));
     }
 }

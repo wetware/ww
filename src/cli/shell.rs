@@ -11,7 +11,7 @@ use caps::{
 };
 use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
 use glia::eval::{self, Dispatch, Env, EvalOutcome};
-use glia::{make_cap, Val};
+use glia::{make_cap, NativeSignal, Val};
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use libp2p_core::SignedEnvelope;
@@ -150,7 +150,9 @@ struct GraftedShellCaps {
 }
 
 type HandlerFn =
-    for<'a> fn(&'a [Val]) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + 'a>>;
+    for<'a> fn(
+        &'a [Val],
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, NativeSignal>> + 'a>>;
 
 struct LocalShellDispatch<'a> {
     table: &'a HashMap<&'static str, HandlerFn>,
@@ -161,11 +163,11 @@ impl<'a> Dispatch for LocalShellDispatch<'a> {
         &'b self,
         name: &'b str,
         args: &'b [Val],
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + 'b>> {
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, NativeSignal>> + 'b>> {
         Box::pin(async move {
             match self.table.get(name) {
                 Some(handler) => handler(args).await,
-                None => Err(Val::from(format!("{name}: command not found"))),
+                None => Err(NativeSignal::throw(format!("{name}: command not found"))),
             }
         })
     }
@@ -492,8 +494,8 @@ async fn run_mcp_stdio(runtime: &mut LocalShellRuntime) -> Result<()> {
                         let err = mcp_adapter::protocol_mode_unavailable("exit");
                         write_mcp_tool_error(
                             &id,
-                            &mcp_adapter::val_to_mcp_error_text(&err),
-                            &mcp_adapter::val_to_mcp_error_data(&err),
+                            &mcp_adapter::payload_to_mcp_error_text(&err),
+                            &mcp_adapter::payload_to_mcp_error_data(&err),
                         );
                     }
                     Err(err) => {
@@ -713,7 +715,7 @@ async fn build_local_shell_runtime(caps: GraftedShellCaps) -> LocalShellRuntime 
 fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
     fn help_handler(
         _args: &[Val],
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, Val>> + '_>> {
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<Val, NativeSignal>> + '_>> {
         Box::pin(std::future::ready(Ok(Val::Str(HELP_TEXT.to_string()))))
     }
 
@@ -771,10 +773,14 @@ impl LoadBackend for ShellLoadBackend {
     }
 }
 
-fn call_resume_local(resume: &Val, val: Val) -> Result<Val, Val> {
+fn call_resume_local(resume: &Val, val: Val) -> Result<Val, NativeSignal> {
     match resume {
         Val::NativeFn { func, .. } => func(&[val]),
-        _ => Err(Val::from("cap handler: invalid resume function")),
+        // Protocol invariant: the evaluator always supplies a NativeFn
+        // resume. Anything else is a runtime fault, not a catchable error.
+        _ => Err(NativeSignal::fault(Val::from(
+            "cap handler: invalid resume function",
+        ))),
     }
 }
 
@@ -866,7 +872,9 @@ fn make_host_handler_local(host: ww::system_capnp::host::Client) -> Val {
                             .collect();
                         call_resume_local(resume, Val::List(items))
                     }
-                    other => Err(Val::from(format!("host: unknown method :{other}"))),
+                    other => Err(NativeSignal::throw(Val::from(format!(
+                        "host: unknown method :{other}"
+                    )))),
                 }
             })
         }),
@@ -886,7 +894,11 @@ fn make_routing_handler_local(routing: ww::routing_capnp::routing::Client) -> Va
                     "provide" => {
                         let key = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :provide — expected key string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :provide — expected key string",
+                                )))
+                            }
                         };
                         let mut req = routing.provide_request();
                         req.get().set_key(&key);
@@ -899,7 +911,11 @@ fn make_routing_handler_local(routing: ww::routing_capnp::routing::Client) -> Va
                     "resolve" => {
                         let name = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :resolve — expected name string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :resolve — expected name string",
+                                )))
+                            }
                         };
                         let mut req = routing.resolve_request();
                         req.get().set_name(&name);
@@ -921,12 +937,18 @@ fn make_routing_handler_local(routing: ww::routing_capnp::routing::Client) -> Va
                         let base_cid = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
                             _ => {
-                                return Err(Val::from("routing :mkdir — expected base CID string"));
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :mkdir — expected base CID string",
+                                )));
                             }
                         };
                         let path = match rest.get(1) {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :mkdir — expected path string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :mkdir — expected path string",
+                                )))
+                            }
                         };
                         let parents = match rest.get(2) {
                             Some(Val::Bool(b)) => *b,
@@ -955,26 +977,26 @@ fn make_routing_handler_local(routing: ww::routing_capnp::routing::Client) -> Va
                         let base_cid = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "routing :write-file — expected base CID string",
-                                ));
+                                )));
                             }
                         };
                         let path = match rest.get(1) {
                             Some(Val::Str(s)) => s.clone(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "routing :write-file — expected path string",
-                                ));
+                                )));
                             }
                         };
                         let data = match rest.get(2) {
                             Some(Val::Bytes(b)) => b.clone(),
                             Some(Val::Str(s)) => s.as_bytes().to_vec(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "routing :write-file — expected bytes or string data",
-                                ));
+                                )));
                             }
                         };
                         let create_parents = match rest.get(3) {
@@ -1005,14 +1027,18 @@ fn make_routing_handler_local(routing: ww::routing_capnp::routing::Client) -> Va
                         let base_cid = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "routing :remove — expected base CID string",
-                                ));
+                                )));
                             }
                         };
                         let path = match rest.get(1) {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :remove — expected path string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :remove — expected path string",
+                                )))
+                            }
                         };
                         let recursive = match rest.get(2) {
                             Some(Val::Bool(b)) => *b,
@@ -1040,19 +1066,27 @@ fn make_routing_handler_local(routing: ww::routing_capnp::routing::Client) -> Va
                     "publish" => {
                         let name = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :publish — expected name string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :publish — expected name string",
+                                )))
+                            }
                         };
                         let cid = match rest.get(1) {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :publish — expected CID string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :publish — expected CID string",
+                                )))
+                            }
                         };
                         let expected = match rest.get(2) {
                             Some(Val::Str(s)) => s.clone(),
                             Some(Val::Nil) | None => String::new(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "routing :publish — expected current path string or nil",
-                                ));
+                                )));
                             }
                         };
                         let mut req = routing.publish_request();
@@ -1078,7 +1112,11 @@ fn make_routing_handler_local(routing: ww::routing_capnp::routing::Client) -> Va
                         let data = match rest.first() {
                             Some(Val::Str(s)) => s.as_bytes().to_vec(),
                             Some(Val::Bytes(b)) => b.clone(),
-                            _ => return Err(Val::from("routing :hash — expected string or bytes")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :hash — expected string or bytes",
+                                )))
+                            }
                         };
                         let mut req = routing.hash_request();
                         req.get().set_data(&data);
@@ -1096,7 +1134,9 @@ fn make_routing_handler_local(routing: ww::routing_capnp::routing::Client) -> Va
                             .map_err(|e| Val::from(format!("{e}")))?;
                         call_resume_local(resume, Val::Str(key))
                     }
-                    other => Err(Val::from(format!("routing: unknown method :{other}"))),
+                    other => Err(NativeSignal::throw(Val::from(format!(
+                        "routing: unknown method :{other}"
+                    )))),
                 }
             })
         }),
@@ -1109,13 +1149,18 @@ async fn shell_eval(runtime: &mut LocalShellRuntime, text: &str) -> Result<Shell
         Ok(EvalOutcome::Value(result)) => Ok(ShellEvalResult::Value(format!("{result}"))),
         Ok(EvalOutcome::Exit) => Ok(ShellEvalResult::Exit),
         Err(err) => {
-            let inner = glia::error::unwrap_thrown(&err).unwrap_or(&err);
-            let msg = glia::error::message(inner)
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{inner}"));
-            let formatted = match glia::error::type_tag(inner) {
-                Some(tag) => format!("[{tag}] {msg}"),
-                None => msg,
+            let formatted = match err.payload() {
+                Some(inner) => {
+                    let msg = glia::error::message(inner)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{inner}"));
+                    match glia::error::type_tag(inner) {
+                        Some(tag) => format!("[{tag}] {msg}"),
+                        None => msg,
+                    }
+                }
+                // Non-exception escaped effect: legacy carrier display.
+                None => format!("{err}"),
             };
             Ok(ShellEvalResult::Error(formatted))
         }
@@ -1126,14 +1171,25 @@ async fn shell_eval_raw(
     runtime: &mut LocalShellRuntime,
     text: &str,
     mode: ShellEffectMode,
-) -> Result<std::result::Result<EvalOutcome, Val>> {
+) -> Result<std::result::Result<EvalOutcome, glia::eval::EvalError>> {
     if text.trim().is_empty() {
         return Ok(Ok(EvalOutcome::Value(Val::Nil)));
     }
 
     let expr = match glia::read(text) {
         Ok(expr) => expr,
-        Err(e) => return Ok(Err(glia::error::parse(None, e))),
+        // Read failures surface as the boundary form of an unhandled
+        // exception so formatters peel to the same [tag] msg as before.
+        Err(e) => {
+            return Ok(Err(glia::eval::EvalError::Unhandled(
+                glia::effect::EffectRequest {
+                    target: glia::effect::EffectTarget::Keyword(
+                        glia::error::EXCEPTION_EFFECT.into(),
+                    ),
+                    data: glia::error::parse(None, e),
+                },
+            )))
+        }
     };
 
     let dispatch = LocalShellDispatch {
@@ -2169,8 +2225,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap_err();
+            let payload = err.payload().expect("fault carries payload");
+            assert!(
+                matches!(&err, glia::eval::EvalError::Fault(f)
+                    if f.kind() == glia::FaultKind::Runtime),
+                "host refusal must be a runtime fault, got {err:?}"
+            );
             assert_eq!(
-                glia::error::type_tag(&err),
+                glia::error::type_tag(payload),
                 Some("glia.error/protocol-mode-unavailable")
             );
             assert_eq!(

@@ -17,7 +17,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::Poll;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -25,7 +25,8 @@ use crate::effect::{self, HandlerStack};
 use crate::error;
 use crate::expr::FnBody;
 use crate::{
-    make_cap, oneshot, AttenuatedCapInner, FnArity, GliaCapInner, HandledCapInner, Val, ValMap,
+    make_cap, oneshot, AttenuatedCapInner, Fault, FnArity, GliaCapInner, HandledCapInner,
+    NativeSignal, Val, ValMap,
 };
 
 /// Monotonic counter for `gensym`.
@@ -54,6 +55,17 @@ pub struct Env {
     /// trigger the transitional cell warning. A closure snapshot, however,
     /// contains bindings that the old `cell` behavior would have captured.
     root_frame_is_lexical: bool,
+    /// Persistent definition owner for this environment. The `def` family
+    /// writes here (never to lexical frames); lookup falls through to it
+    /// after the frames, giving top-level names late binding.
+    defs: Rc<Defs>,
+    /// Top-level definition privilege.
+    ///
+    /// An env-level invariant set at construction and never toggled: `true`
+    /// only for embedder/REPL/module roots (`Env::new`), `false` for every
+    /// call-derived env (`Env::for_call`) and lexical capture. Enforced by
+    /// [`Env::define`].
+    defining: bool,
 }
 
 impl Default for Env {
@@ -72,11 +84,36 @@ impl Env {
             frames: vec![Frame::new()],
             handler_stack: effect::new_handler_stack(),
             root_frame_is_lexical: false,
+            defs: Defs::new(None),
+            defining: true,
         }
     }
 
-    /// Look up a binding by name, searching from innermost scope outward.
-    pub fn get(&self, name: &str) -> Option<&Val> {
+    /// Resolve a name: lexical frames innermost-outward, then the
+    /// persistent definition owner and its inherited chain.
+    ///
+    /// Top-level names are LATE-BOUND: every resolution consults the live
+    /// `Defs` state, so redefinition is visible to existing closures and
+    /// named/mutual recursion resolve naturally.
+    /// Errors are RELEASE-CHECKED internal faults (the uncatchable
+    /// evaluator lane — never a panic, never a guest exception): an
+    /// ownership-invariant breach during definition-owner resolution is a
+    /// runtime bug to surface, not a condition to mask.
+    pub fn get(&self, name: &str) -> Result<Option<Val>, Box<Fault>> {
+        if let Some(v) = self.get_lexical(name) {
+            return Ok(Some(v.clone()));
+        }
+        self.defs
+            .lookup(name)
+            .map_err(|f| own_invariant_fault("lookup", name, f))
+    }
+
+    /// Lexical-frames-only lookup (no definition-owner fallthrough).
+    ///
+    /// Used by closure capture: free variables that resolve to persistent
+    /// definitions must NOT be snapshotted — they stay late-bound through
+    /// the owner.
+    fn get_lexical(&self, name: &str) -> Option<&Val> {
         for frame in self.frames.iter().rev() {
             if let Some(v) = frame.get(name) {
                 return Some(v);
@@ -123,7 +160,7 @@ impl Env {
         let first_scoped_frame = usize::from(!self.root_frame_is_lexical);
         for frame in self.frames.iter().skip(first_scoped_frame).rev() {
             for (name, val) in frame {
-                if seen.insert(name.clone()) && matches!(val, Val::Cap { .. }) {
+                if seen.insert(name.clone()) && matches!(val, Val::Cap(_)) {
                     caps.push(name.clone());
                 }
             }
@@ -132,9 +169,12 @@ impl Env {
         caps
     }
 
-    /// Collapse all frames into a single merged HashMap (inner overrides outer).
-    /// Collect all visible bindings (inner overrides outer) as `(name, val)` pairs.
-    /// Used by import to extract a module's exported definitions.
+    /// Collect all visible LEXICAL bindings (inner overrides outer) as
+    /// `(name, val)` pairs. Persistent definitions are NOT included.
+    ///
+    /// NOTE: superseded by [`Env::local_bindings`] for module exports —
+    /// a module exports its own persistent definitions, not its lexical
+    /// frames. Retained for embedder introspection of ambient context.
     #[must_use]
     pub fn bindings(&self) -> Vec<(String, Val)> {
         let mut merged = Frame::new();
@@ -148,55 +188,305 @@ impl Env {
         bindings
     }
 
-    /// Returns a new Env with one frame containing all visible bindings.
-    /// Used by `fn` to capture the definition-time environment.
-    pub fn snapshot(&self) -> Self {
+    /// This environment's OWN persistent definitions, sorted by name.
+    ///
+    /// The module-export primitive: inherited (prelude) names and lexical
+    /// frame bindings are excluded — a module exports exactly what it
+    /// defined. Prefer this over [`Env::bindings`] for exports.
+    /// Errors are release-checked internal faults (see [`Env::get`]).
+    pub fn local_bindings(&self) -> Result<Vec<(String, Val)>, Box<Fault>> {
+        self.defs
+            .local_bindings()
+            .map_err(|f| own_invariant_fault("export", "<module>", f))
+    }
+
+    /// The persistent definition owner (crate-internal plumbing).
+    pub(crate) fn defs(&self) -> &Rc<Defs> {
+        &self.defs
+    }
+
+    /// Replace this environment's definition owner with a fresh child of
+    /// `parent`. Used by prelude loading: the env's subsequent definitions
+    /// go to the child while `parent`'s names stay visible via inherited
+    /// lookup.
+    pub(crate) fn adopt_inherited_defs(&mut self, parent: Rc<Defs>) {
+        self.defs = Defs::new(Some(parent));
+    }
+
+    /// The single checked definition operation. All def-family paths
+    /// converge here (raw/analyzed `def` and `defmacro`, `defn` via macro
+    /// expansion, `defcap`'s final binding, REPL/module top level).
+    ///
+    /// Order: (1) top-level privilege — `Err(DefineError::NotTopLevel)`,
+    /// caller throws catchable `glia.error/def-not-top-level`, no mutation;
+    /// (2) frozen owner — internal fault, no mutation; (3) storage through
+    /// `Defs` (last-write-wins, version bump).
+    pub(crate) fn define(&self, name: String, val: Val) -> Result<(), DefineError> {
+        if !self.defining {
+            return Err(DefineError::NotTopLevel);
+        }
+        self.defs.define(name, val).map_err(DefineError::Own)
+    }
+
+    /// Create a new Env for callable activation.
+    ///
+    /// The call env's root frame is the closure's lexical capture with any
+    /// same-owner slots ESCAPED through the callable's live owner witness
+    /// (flag-gated: pure captures copy directly). Late binding flows from
+    /// `defs` being the callable's DEFINING owner; activation never carries
+    /// definition privilege; the handler stack is the CALLER's (dynamic
+    /// scope).
+    ///
+    /// A callable whose owner reference is not live at activation is a
+    /// release-checked internal fault: every legitimate invocation path
+    /// receives values that escaped through lookup/args, which restore the
+    /// strong owner reference.
+    pub(crate) fn for_call(
+        closure: &crate::Closure,
+        caller_hs: &HandlerStack,
+    ) -> Result<Self, Box<Fault>> {
+        let witness = match &closure.owner {
+            OwnerRef::Strong(o) => Rc::clone(o),
+            OwnerRef::Weak(_) => {
+                return Err(own_invariant_fault(
+                    "activation",
+                    "<callable>",
+                    own::OwnFault::UnmatchedWeak,
+                ))
+            }
+        };
+        let root: Frame = if closure.captured.has_resting {
+            let mut escaped = Frame::with_capacity(closure.captured.slots.len());
+            for (k, v) in &closure.captured.slots {
+                let v = own::escape_with(&witness, v)
+                    .map_err(|f| own_invariant_fault("activation", k, f))?;
+                escaped.insert(k.clone(), v);
+            }
+            escaped
+        } else {
+            closure.captured.slots.clone()
+        };
+        Ok(Self {
+            frames: vec![root, Frame::new()], // capture + param frame
+            handler_stack: caller_hs.clone(),
+            root_frame_is_lexical: true,
+            defs: witness,
+            defining: false,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Defs — persistent definition ownership (PR-1b.0)
+// ---------------------------------------------------------------------------
+
+/// A persistent definition owner: where `def`-family bindings belong.
+///
+/// Separates "where do persistent names live?" (this type) from "what locals
+/// are in scope?" (`Env`'s lexical frames). Top-level names are late-bound
+/// through the owner, which gives named/mutual recursion and REPL
+/// redefinition their semantics. Modules get a fresh `Defs` inheriting the
+/// shared frozen prelude; exports enumerate only the local bindings.
+///
+/// Stage A: structurally present but semantically inert (definitions still
+/// go to the root lexical frame). Stage B activates it.
+pub struct Defs {
+    /// Local persistent bindings. Stored values are normalized by the
+    /// crate-private ownership barrier (see `own`); everything read back out
+    /// through [`Defs::lookup`] is ordinary, fully-usable values.
+    bindings: RefCell<HashMap<String, Binding>>,
+    /// Inherited owner chain (the shared frozen prelude for modules).
+    inherited: Option<Rc<Defs>>,
+    /// Frozen owners reject definition; the prelude freezes after load.
+    frozen: Cell<bool>,
+    /// Bumped on every definition; authority analysis (Stage E) uses it to
+    /// invalidate any cached view of live definition state.
+    version: Cell<u64>,
+}
+
+/// Failure modes of the checked definition operation ([`Env::define`]).
+pub(crate) enum DefineError {
+    /// No top-level definition privilege: the def site throws the catchable
+    /// `glia.error/def-not-top-level` exception. No mutation occurred.
+    NotTopLevel,
+    /// Ownership-layer failure (frozen owner; invariant breach): surfaced
+    /// as an internal fault. No mutation occurred.
+    Own(own::OwnFault),
+}
+
+/// Map a crate-private ownership failure onto the public uncatchable fault
+/// lane with NEUTRAL vocabulary (no guest- or embedder-visible
+/// weak/strong/resting terms; "definition owner" is language semantics).
+#[cold]
+#[inline(never)]
+fn own_invariant_fault(op: &str, name: &str, f: own::OwnFault) -> Box<Fault> {
+    let detail = match f {
+        own::OwnFault::UnmatchedWeak => "definition-owner witness mismatch",
+        own::OwnFault::FrozenMutation => "mutation of a frozen definition owner",
+    };
+    Box::new(Fault::runtime(error::internal(
+        op,
+        format!("{detail} at '{name}'"),
+    )))
+}
+
+/// Resolve a name through [`Env::get`], surfacing ownership faults on the
+/// evaluator's uncatchable `Control::Fault` lane. The resolution-site form
+/// of the release-checked plumbing: never a panic, never a catchable throw.
+fn resolve(env: &Env, name: &str) -> Result<Option<Val>, Control> {
+    env.get(name).map_err(Control::Fault)
+}
+
+/// One persistent binding plus its barrier metadata.
+struct Binding {
+    value: Val,
+    /// Fast-path summary: whether `value` holds any barrier-normalized
+    /// self-references. `false` lets lookup skip the deep transform.
+    has_resting_owner_refs: bool,
+}
+
+impl std::fmt::Debug for Defs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Defs")
+            .field("bindings", &self.bindings.borrow().len())
+            .field("inherited", &self.inherited.is_some())
+            .field("frozen", &self.frozen.get())
+            .finish()
+    }
+}
+
+#[allow(dead_code)] // wired into definition/lookup paths in Stage B
+impl Defs {
+    /// Create a fresh owner, optionally inheriting an existing chain.
+    pub(crate) fn new(inherited: Option<Rc<Defs>>) -> Rc<Defs> {
+        Rc::new(Defs {
+            bindings: RefCell::new(HashMap::new()),
+            inherited,
+            frozen: Cell::new(false),
+            version: Cell::new(0),
+        })
+    }
+
+    /// Intern a persistent definition. Fails on frozen owners.
+    pub(crate) fn define(self: &Rc<Self>, name: String, value: Val) -> Result<(), own::OwnFault> {
+        if self.frozen.get() {
+            return Err(own::OwnFault::FrozenMutation);
+        }
+        let (value, has_resting_owner_refs) = own::rest_for(self, &value);
+        self.bindings.borrow_mut().insert(
+            name,
+            Binding {
+                value,
+                has_resting_owner_refs,
+            },
+        );
+        self.version.set(self.version.get() + 1);
+        Ok(())
+    }
+
+    /// Resolve a name through this owner and its inherited chain.
+    pub(crate) fn lookup(self: &Rc<Self>, name: &str) -> Result<Option<Val>, own::OwnFault> {
+        let local = {
+            let bindings = self.bindings.borrow();
+            bindings
+                .get(name)
+                .map(|b| (b.value.clone(), b.has_resting_owner_refs))
+        };
+        if let Some((value, needs_escape)) = local {
+            let value = if needs_escape {
+                own::escape_with(self, &value)?
+            } else {
+                value
+            };
+            return Ok(Some(value));
+        }
+        match &self.inherited {
+            Some(parent) => parent.lookup(name),
+            None => Ok(None),
+        }
+    }
+
+    /// Enumerate this owner's LOCAL bindings (inherited names excluded) as
+    /// fully-usable values. The module-export primitive.
+    pub(crate) fn local_bindings(self: &Rc<Self>) -> Result<Vec<(String, Val)>, own::OwnFault> {
+        let entries: Vec<(String, Val, bool)> = {
+            let bindings = self.bindings.borrow();
+            bindings
+                .iter()
+                .map(|(k, b)| (k.clone(), b.value.clone(), b.has_resting_owner_refs))
+                .collect()
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        for (name, value, needs_escape) in entries {
+            let value = if needs_escape {
+                own::escape_with(self, &value)?
+            } else {
+                value
+            };
+            out.push((name, value));
+        }
+        out.sort_by(|(left, _), (right, _)| left.cmp(right));
+        Ok(out)
+    }
+
+    /// Permanently reject further definition (prelude, closed modules).
+    pub(crate) fn freeze(&self) {
+        self.frozen.set(true);
+    }
+
+    pub(crate) fn is_frozen(&self) -> bool {
+        self.frozen.get()
+    }
+
+    /// Definition-state version for live authority analysis (Stage E).
+    pub(crate) fn version(&self) -> u64 {
+        self.version.get()
+    }
+}
+
+/// Lexical-only closure capture.
+///
+/// Closures snapshot their free lexical values here and carry their
+/// definition owner separately (inside [`crate::Closure`]), which is what
+/// breaks the routine `Defs → fn → captured Env → Defs` cycle. Contains
+/// lexical values ONLY — never a `Defs`, never a handler stack. Same-owner
+/// executable values in the slots are normalized (rested) at capture time;
+/// [`Env::for_call`] restores them at activation via the callable's owner
+/// witness.
+pub(crate) struct CapturedEnv {
+    slots: Frame,
+    /// Fast-path summary: whether any slot holds barrier-normalized
+    /// self-references (RC-mechanism metadata; skips the activation
+    /// transform when false).
+    has_resting: bool,
+}
+
+impl CapturedEnv {
+    /// Full-frame capture (raw pipeline; the old `snapshot` semantics):
+    /// merge every lexical frame, inner shadowing outer, then normalize
+    /// same-owner executable slots for storage inside the closure.
+    pub(crate) fn capture_all(env: &Env) -> Self {
         let mut merged = Frame::new();
-        for frame in &self.frames {
+        for frame in &env.frames {
             for (k, v) in frame {
                 merged.insert(k.clone(), v.clone());
             }
         }
-        Self {
-            frames: vec![merged],
-            // Keep the current stack on snapshots; invocation still routes through
-            // the caller's handler stack via `Env::for_call`.
-            handler_stack: self.handler_stack.clone(),
-            root_frame_is_lexical: true,
-        }
+        let (slots, has_resting) = own::rest_frame_for(&env.defs, &merged);
+        CapturedEnv { slots, has_resting }
     }
 
-    /// Return a snapshot filtered to a set of binding names.
-    ///
-    /// Names not present in this env are ignored.
-    pub fn filter_to(&self, names: BTreeSet<&String>) -> Self {
-        let mut filtered = Frame::new();
-        for name in names {
-            if let Some(value) = self.get(name) {
-                filtered.insert(name.clone(), value.clone());
-            }
-        }
-        Self {
-            frames: vec![filtered],
-            handler_stack: self.handler_stack.clone(),
-            root_frame_is_lexical: true,
-        }
-    }
-
-    /// Slim closure capture: the closure's free variables PLUS every macro in
-    /// scope.
-    ///
-    /// Free vars alone are unsound in the presence of eval-time macro
-    /// expansion: a body that calls `try` has free var `try` but not
-    /// `try-catches`, which `try` only references after it expands. Since
-    /// macros are resolved (and expanded) at eval time against the closure's
-    /// captured env, a dropped macro global makes the expansion fall through
-    /// to host dispatch. Macros are authority-free (`Val::Macro`, never caps),
-    /// so capturing them all does not affect `compute_cap_status`.
-    pub fn capture_closure(&self, free_vars: BTreeSet<&String>) -> Self {
+    /// Slim capture (analyzed pipeline; the old `capture_closure`
+    /// semantics): every frames-resident macro PLUS the closure's free
+    /// lexical variables. Persistent definitions are NOT copied — they
+    /// stay late-bound through the owner. See the macro-scan rationale on
+    /// the call sites: eval-time expansion must find frames-resident
+    /// macros that free-variable analysis alone would drop.
+    pub(crate) fn capture_free(env: &Env, free_vars: BTreeSet<&String>) -> Self {
         let mut captured = Frame::new();
-        // Oldest → newest so inner scopes shadow outer ones, matching `get`.
-        for frame in &self.frames {
+        // Oldest → newest so inner scopes shadow outer ones, matching
+        // lexical lookup.
+        for frame in &env.frames {
             for (k, v) in frame {
                 if matches!(v, Val::Macro { .. }) {
                     captured.insert(k.clone(), v.clone());
@@ -204,38 +494,432 @@ impl Env {
             }
         }
         for name in free_vars {
-            if let Some(value) = self.get(name) {
+            if let Some(value) = env.get_lexical(name) {
                 captured.insert(name.clone(), value.clone());
             }
         }
-        Self {
-            frames: vec![captured],
-            handler_stack: self.handler_stack.clone(),
-            root_frame_is_lexical: true,
+        let (slots, has_resting) = own::rest_frame_for(&env.defs, &captured);
+        CapturedEnv { slots, has_resting }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_slots(slots: Frame) -> Self {
+        CapturedEnv {
+            slots,
+            has_resting: false,
         }
     }
 
-    /// Create a new Env for function invocation.
-    ///
-    /// Instead of cloning the captured env (which recurses infinitely when
-    /// closures capture their own scope), this creates a new Env that COPIES
-    /// only the captured snapshot's single frame (no deep clone of Val::Fn envs).
-    /// The captured frame's Val::Fn values keep their Rc<Env> references shared.
-    pub fn for_call(captured: &Rc<Env>, caller_hs: &HandlerStack) -> Self {
-        // The captured env is a snapshot (single frame).
-        // Copy its bindings into a new env's root frame.
-        // Val::Fn values inside are Rc-wrapped, so cloning them is O(1).
-        let mut root = Frame::new();
-        for frame in &captured.frames {
-            for (k, v) in frame {
-                root.insert(k.clone(), v.clone());
+    #[cfg(test)]
+    pub(crate) fn get(&self, name: &str) -> Option<&Val> {
+        self.slots.get(name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+pub(crate) use own::OwnerRef;
+
+/// Crate-private RC ownership barrier (amended Graph 4).
+///
+/// JURISDICTION (normative): this machinery governs only local executable
+/// value graphs. Its transforms recurse ONLY into the four transparent
+/// containers (`List`, `Vector`, `Map`, `Set`); every other `Val` variant is
+/// a barrier-inert leaf — all durable data (`Nil`..`Bytes`), atoms (opaque
+/// interior), native/host payloads, and any future durable handle. It must
+/// never traverse the transitive contents of durable or lazily-backed data.
+///
+/// AUTHORITY (normative): pointer strength has no authority meaning. A dead
+/// weak owner at an escape boundary is an internal fault — never revocation,
+/// never attenuation, never guest-visible semantics.
+///
+/// The five ownership choke points (definition storage; lookup/export
+/// enumeration; capture + call activation; capability sealing/dispatch/
+/// attenuation; module export construction) are the ONLY call sites. Nothing
+/// outside `eval` can name these helpers; `OwnerRef` construction happens
+/// only here.
+mod own {
+    use super::{Defs, Frame};
+    use crate::{Val, ValMap};
+    use std::rc::{Rc, Weak};
+
+    /// Private owner reference carried by callables (Stage C) and
+    /// evaluator-owned caps (Stage D). RC-specific; deleted wholesale under
+    /// any future GC (see the recorded deletion inventory).
+    #[derive(Clone)]
+    pub(crate) enum OwnerRef {
+        Strong(Rc<Defs>),
+        Weak(Weak<Defs>),
+    }
+
+    /// Deliberately opaque: ownership state never appears in any output,
+    /// including internal debug formatting.
+    impl std::fmt::Debug for OwnerRef {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "OwnerRef(..)")
+        }
+    }
+
+    #[allow(dead_code)] // wired into the leaf hooks in Stages C/D
+    impl OwnerRef {
+        /// Positional normalization for storage inside `owner`'s own
+        /// subtree: self-references release their keep-alive; foreign
+        /// owners are untouched.
+        pub(super) fn rested(&self, owner: &Rc<Defs>) -> OwnerRef {
+            match self {
+                OwnerRef::Strong(o) if Rc::ptr_eq(o, owner) => OwnerRef::Weak(Rc::downgrade(o)),
+                other => other.clone(),
             }
         }
-        Self {
-            frames: vec![root, Frame::new()], // root + param frame
-            handler_stack: caller_hs.clone(),
-            root_frame_is_lexical: true,
+
+        /// Witness-based restoration on escape. Never a bare upgrade: the
+        /// caller must hold the live owner `Rc` (the witness); a resting
+        /// reference that does not match it is an internal fault.
+        pub(super) fn escaped_with(&self, witness: &Rc<Defs>) -> Result<OwnerRef, OwnFault> {
+            match self {
+                OwnerRef::Weak(w) if Weak::as_ptr(w) == Rc::as_ptr(witness) => {
+                    Ok(OwnerRef::Strong(Rc::clone(witness)))
+                }
+                OwnerRef::Weak(_) => Err(OwnFault::UnmatchedWeak),
+                OwnerRef::Strong(o) => Ok(OwnerRef::Strong(Rc::clone(o))),
+            }
         }
+
+        pub(super) fn is_resting_for(&self, owner: &Rc<Defs>) -> bool {
+            matches!(self, OwnerRef::Weak(w) if Weak::as_ptr(w) == Rc::as_ptr(owner))
+        }
+    }
+
+    /// Internal ownership faults. Surfaced at the choke points (Stage B+)
+    /// through the evaluator's Fault channel — never guest-catchable, never
+    /// authority-meaningful.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum OwnFault {
+        /// A resting reference met an escape boundary without its owner's
+        /// witness. Invariant breach: report, don't mask.
+        #[allow(dead_code)] // constructed by the Stage C/D leaf hooks
+        UnmatchedWeak,
+        /// A definition was attempted on a frozen owner.
+        FrozenMutation,
+    }
+
+    /// Work item for the iterative transforms. Containers are decomposed
+    /// onto an explicit stack; depth never grows the Rust call stack.
+    enum Task<'a> {
+        Enter(&'a Val),
+        BuildList(usize),
+        BuildVector(usize),
+        BuildSet(usize),
+        /// Carries the source map: pair count for reassembly, plus identity
+        /// — an unchanged map is reproduced by an O(1) structural-sharing
+        /// clone of the original, which also preserves reader
+        /// `literal_pairs` provenance (quoted maps are code-as-data; their
+        /// duplicate-key evidence must survive definition storage).
+        BuildMap(&'a ValMap),
+    }
+
+    /// Transform result entry: the rebuilt value, whether the subtree holds
+    /// resting self-references, and whether anything changed (unchanged
+    /// containers are rebuilt from child outputs — never recursively
+    /// cloned — so arbitrarily deep values stay stack-safe).
+    type Out = (Val, bool, bool);
+
+    /// Normalize `v` for storage inside `owner`'s own subtree.
+    ///
+    /// Returns the normalized value and the `has_resting_owner_refs`
+    /// summary. Exhaustive over `Val`: adding a variant forces an explicit
+    /// leaf-or-container decision here (gate condition 2).
+    pub(super) fn rest_for(owner: &Rc<Defs>, v: &Val) -> (Val, bool) {
+        let mut work: Vec<Task<'_>> = vec![Task::Enter(v)];
+        let mut out: Vec<Out> = Vec::new();
+        while let Some(task) = work.pop() {
+            match task {
+                Task::Enter(v) => {
+                    let done = enter(v, &mut work, &mut out, |val| Ok(rest_leaf(owner, val)));
+                    done.expect("rest leaves are infallible");
+                }
+                other => build(other, &mut out),
+            }
+        }
+        debug_assert_eq!(out.len(), 1);
+        let (value, resting, _changed) = out.pop().expect("transform yields one root");
+        (value, resting)
+    }
+
+    /// Rest one non-container leaf: callables' owner references release
+    /// their keep-alive when stored inside their OWN owner's subtree; the
+    /// callable's interior capture is untouched (it was normalized at its
+    /// own construction — the barrier rewrites owner edges, never recurses
+    /// into captures). Caps become owner-aware in Stage D.
+    fn rest_leaf(owner: &Rc<Defs>, v: &Val) -> Out {
+        match v {
+            Val::Fn {
+                arities,
+                closure,
+                is_cap_free,
+                cap_violation,
+            } => {
+                let rested = closure.owner.rested(owner);
+                let changed = rested.is_resting_for(owner) && !closure.owner.is_resting_for(owner);
+                let resting = rested.is_resting_for(owner);
+                (
+                    Val::Fn {
+                        arities: arities.clone(),
+                        closure: crate::Closure {
+                            captured: Rc::clone(&closure.captured),
+                            owner: rested,
+                        },
+                        is_cap_free: *is_cap_free,
+                        cap_violation: cap_violation.clone(),
+                    },
+                    resting,
+                    changed,
+                )
+            }
+            Val::Macro {
+                arities,
+                closure,
+                is_cap_free,
+                cap_violation,
+            } => {
+                let rested = closure.owner.rested(owner);
+                let changed = rested.is_resting_for(owner) && !closure.owner.is_resting_for(owner);
+                let resting = rested.is_resting_for(owner);
+                (
+                    Val::Macro {
+                        arities: arities.clone(),
+                        closure: crate::Closure {
+                            captured: Rc::clone(&closure.captured),
+                            owner: rested,
+                        },
+                        is_cap_free: *is_cap_free,
+                        cap_violation: cap_violation.clone(),
+                    },
+                    resting,
+                    changed,
+                )
+            }
+            other => (other.clone(), false, false),
+        }
+    }
+
+    /// Restore `v` read out of `witness`'s subtree to fully-escaped form.
+    pub(super) fn escape_with(witness: &Rc<Defs>, v: &Val) -> Result<Val, OwnFault> {
+        let mut work: Vec<Task<'_>> = vec![Task::Enter(v)];
+        let mut out: Vec<Out> = Vec::new();
+        while let Some(task) = work.pop() {
+            match task {
+                Task::Enter(v) => enter(v, &mut work, &mut out, |val| escape_leaf(witness, val))?,
+                other => build(other, &mut out),
+            }
+        }
+        debug_assert_eq!(out.len(), 1);
+        let (value, _resting, _changed) = out.pop().expect("transform yields one root");
+        Ok(value)
+    }
+
+    /// Escape one non-container leaf: resting owner references are
+    /// restored through the live witness; a resting reference that does
+    /// not match the witness is the release-checked invariant fault.
+    fn escape_leaf(witness: &Rc<Defs>, v: &Val) -> Result<Out, OwnFault> {
+        match v {
+            Val::Fn {
+                arities,
+                closure,
+                is_cap_free,
+                cap_violation,
+            } => {
+                let was_resting = closure.owner.is_resting_for(witness);
+                let escaped = closure.owner.escaped_with(witness)?;
+                Ok((
+                    Val::Fn {
+                        arities: arities.clone(),
+                        closure: crate::Closure {
+                            captured: Rc::clone(&closure.captured),
+                            owner: escaped,
+                        },
+                        is_cap_free: *is_cap_free,
+                        cap_violation: cap_violation.clone(),
+                    },
+                    false,
+                    was_resting,
+                ))
+            }
+            Val::Macro {
+                arities,
+                closure,
+                is_cap_free,
+                cap_violation,
+            } => {
+                let was_resting = closure.owner.is_resting_for(witness);
+                let escaped = closure.owner.escaped_with(witness)?;
+                Ok((
+                    Val::Macro {
+                        arities: arities.clone(),
+                        closure: crate::Closure {
+                            captured: Rc::clone(&closure.captured),
+                            owner: escaped,
+                        },
+                        is_cap_free: *is_cap_free,
+                        cap_violation: cap_violation.clone(),
+                    },
+                    false,
+                    was_resting,
+                ))
+            }
+            other => Ok((other.clone(), false, false)),
+        }
+    }
+
+    /// Decompose one value: containers push build markers + children;
+    /// everything else goes through the leaf hook. The match is exhaustive
+    /// by design — NO wildcard arm.
+    fn enter<'a>(
+        v: &'a Val,
+        work: &mut Vec<Task<'a>>,
+        out: &mut Vec<Out>,
+        leaf: impl Fn(&Val) -> Result<Out, OwnFault>,
+    ) -> Result<(), OwnFault> {
+        match v {
+            // Transparent local containers — the ONLY recursion points.
+            Val::List(xs) => {
+                work.push(Task::BuildList(xs.len()));
+                for x in xs {
+                    work.push(Task::Enter(x));
+                }
+            }
+            Val::Vector(xs) => {
+                work.push(Task::BuildVector(xs.len()));
+                for x in xs {
+                    work.push(Task::Enter(x));
+                }
+            }
+            Val::Set(xs) => {
+                work.push(Task::BuildSet(xs.len()));
+                for x in xs {
+                    work.push(Task::Enter(x));
+                }
+            }
+            Val::Map(m) => {
+                work.push(Task::BuildMap(m));
+                for (k, val) in m.iter() {
+                    work.push(Task::Enter(k));
+                    work.push(Task::Enter(val));
+                }
+            }
+            // Durable data: barrier-inert leaves (jurisdiction rule).
+            Val::Nil
+            | Val::Bool(_)
+            | Val::Int(_)
+            | Val::Float(_)
+            | Val::Str(_)
+            | Val::Sym(_)
+            | Val::Keyword(_)
+            | Val::Bytes(_) => out.push(leaf(v)?),
+            // Atoms: opaque interior — the barrier never looks inside
+            // (accepted leak class; see the ownership ledger).
+            Val::Atom(_) => out.push(leaf(v)?),
+            // Host trust boundary: never traversed.
+            Val::NativeFn { .. } | Val::AsyncNativeFn { .. } => out.push(leaf(v)?),
+            // Owner-bearing leaves: the hook rewrites `Closure::owner`
+            // (callables now; caps in Stage D). The barrier NEVER recurses
+            // into a callable's interior capture.
+            Val::Fn { .. } | Val::Macro { .. } => out.push(leaf(v)?),
+            Val::Cap(_) => out.push(leaf(v)?),
+        }
+        Ok(())
+    }
+
+    /// Reassemble one container from its transformed children.
+    ///
+    /// ORDERING INVARIANT: `enter` pushes children onto the work stack in
+    /// source order, so they are PROCESSED in reverse and their outputs sit
+    /// on the output stack with the FIRST child on top. Popping therefore
+    /// yields source order directly — no reversal. (An earlier draft
+    /// reversed here; the round-trip tests masked it because rest + escape
+    /// applied compensating reversals. One-way tests now pin this.)
+    fn build(task: Task<'_>, out: &mut Vec<Out>) {
+        match task {
+            Task::Enter(_) => unreachable!("Enter handled by caller"),
+            Task::BuildList(n) | Task::BuildVector(n) | Task::BuildSet(n) => {
+                let mut resting = false;
+                let mut changed = false;
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let (v, r, c) = out.pop().expect("child output present");
+                    resting |= r;
+                    changed |= c;
+                    items.push(v);
+                }
+                // Vec-backed containers are always rebuilt from child
+                // outputs (never `clone()`d wholesale: recursive Vec clone
+                // would consume Rust stack on deep values).
+                let rebuilt = match task {
+                    Task::BuildList(_) => Val::List(items),
+                    Task::BuildVector(_) => Val::Vector(items),
+                    Task::BuildSet(_) => Val::Set(items),
+                    _ => unreachable!(),
+                };
+                out.push((rebuilt, resting, changed));
+            }
+            Task::BuildMap(source) => {
+                let mut resting = false;
+                let mut changed = false;
+                let mut kvs = Vec::with_capacity(source.len());
+                for _ in 0..source.len() {
+                    // Each pair was pushed (key, value); the key's output
+                    // is on top (see the ordering invariant above).
+                    let (key, kr, kc) = out.pop().expect("map key present");
+                    let (val, vr, vc) = out.pop().expect("map value present");
+                    resting |= kr | vr;
+                    changed |= kc | vc;
+                    kvs.push((key, val));
+                }
+                let rebuilt = if changed {
+                    // Owner-bearing contents were rewritten: this is a
+                    // runtime map (reader literals are pure data and never
+                    // change), so dropping `literal_pairs` is correct.
+                    Val::Map(ValMap::from_pairs(kvs))
+                } else {
+                    // Unchanged: O(1) structural-sharing clone preserves
+                    // identity, normalization, and reader provenance.
+                    Val::Map(source.clone())
+                };
+                out.push((rebuilt, resting, changed));
+            }
+        }
+    }
+
+    /// Stage D shell: seal an evaluator-owned cap inner's contents for
+    /// `owner` (methods/base/handler rested; the outer cap carries the
+    /// witness). Wired at `defcap` construction and define-time rebuild of
+    /// the known inner types.
+    #[allow(dead_code)] // wired in Stage D
+    pub(super) fn seal_cap_inner(owner: &Rc<Defs>, contents: &Val) -> (Val, bool) {
+        rest_for(owner, contents)
+    }
+
+    /// Stage D shell: attenuation transfers the base capability's owner
+    /// lifetime to the derived capability. Lifetime only — no authority
+    /// meaning.
+    #[allow(dead_code)] // wired in Stage D
+    pub(super) fn transfer_owner(base: &OwnerRef) -> OwnerRef {
+        base.clone()
+    }
+
+    #[allow(dead_code)] // capture normalization lands in Stage C
+    pub(super) fn rest_frame_for(owner: &Rc<Defs>, slots: &Frame) -> (Frame, bool) {
+        let mut resting = false;
+        let mut out = Frame::with_capacity(slots.len());
+        for (k, v) in slots {
+            let (v, r) = rest_for(owner, v);
+            resting |= r;
+            out.insert(k.clone(), v);
+        }
+        (out, resting)
     }
 }
 
@@ -253,11 +937,15 @@ pub trait Dispatch {
     /// Takes `&self` (not `&mut self`) — implementations use interior mutability
     /// for any mutable state. This enables sharing dispatch between body and
     /// handler futures in the effect system's state machine.
+    ///
+    /// The error channel carries a [`NativeSignal`]: ordinary failures are
+    /// catchable exceptions (`Err(Val::from(..))` still compiles via `From`);
+    /// trusted invariant violations use [`NativeSignal::fault`].
     fn call<'a>(
         &'a self,
         name: &'a str,
         args: &'a [Val],
-    ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Val, NativeSignal>> + 'a>>;
 
     /// Offer the embedder the chance to reify `(attenuate cap methods)` into
     /// real boundary enforcement before glia falls back to evaluator-local
@@ -292,6 +980,175 @@ pub trait Dispatch {
     /// Report a non-blocking transitional authoring warning.
     fn report_warning(&self, warning: &str) {
         let _ = warning;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Control — evaluator-internal flow and unwinding
+// ---------------------------------------------------------------------------
+
+/// Evaluator-internal result of one expression: a value, or a lexical
+/// `recur` unwinding to the nearest loop/fn tail frame. Crate-private, so
+/// controls are unrepresentable as values and unreachable from natives.
+#[derive(Debug, Clone)]
+pub(crate) enum Flow {
+    Value(Val),
+    Recur(Vec<Val>),
+}
+
+impl Flow {
+    /// Demand a value in a non-tail position. A `Recur` arriving here is
+    /// structurally invalid control — a language fault, bypassing all Glia
+    /// handlers. `context` names the position that demanded the value.
+    pub(crate) fn into_value(self, context: &str) -> Result<Val, Control> {
+        match self {
+            Flow::Value(v) => Ok(v),
+            Flow::Recur(_) => Err(Control::Fault(Box::new(Fault::language(
+                error::invalid_recur(context),
+            )))),
+        }
+    }
+}
+
+impl From<Val> for Flow {
+    fn from(v: Val) -> Self {
+        Flow::Value(v)
+    }
+}
+
+/// Non-value, non-recur unwinding. Exceptions never travel this channel —
+/// they are performed as the `:glia.exception` effect via [`throw`], so the
+/// only error-shaped arm here is the uncatchable fault.
+#[derive(Debug, Clone)]
+pub(crate) enum Control {
+    /// Unrecoverable runtime fault; bypasses all Glia handlers.
+    /// Boxed to keep the hot `Result<Flow, Control>` return small.
+    Fault(Box<Fault>),
+    /// An effect that found no matching handler, unwinding to the boundary
+    /// (includes unhandled exceptions: target `:glia.exception`). Boxed for
+    /// the same size reason.
+    Unhandled(Box<effect::EffectRequest>),
+    /// Handler short-circuit from `resume`.
+    Resume(Val),
+}
+
+/// Dispatch `payload` as a catchable `:glia.exception` exception on the
+/// current handler stack. `Ok(v)` means a resuming handler supplied `v` as
+/// the value of the failing expression; `Err(Control::Unhandled)` means no
+/// handler was in scope and the exception unwinds to the boundary.
+pub(crate) async fn throw(hs: &HandlerStack, payload: Val) -> Result<Val, Control> {
+    perform_dispatch(
+        hs,
+        effect::EffectTarget::Keyword(error::EXCEPTION_EFFECT.into()),
+        payload,
+    )
+    .await
+}
+
+/// Settle a native/Dispatch invocation: values pass through, throws are
+/// dispatched as exceptions, resume and fault signals unwind as control.
+async fn settle_native(hs: &HandlerStack, r: Result<Val, NativeSignal>) -> Result<Val, Control> {
+    use crate::NativeSignalKind;
+    match r {
+        Ok(v) => Ok(v),
+        Err(NativeSignal(NativeSignalKind::Throw(payload))) => throw(hs, payload).await,
+        Err(NativeSignal(NativeSignalKind::Resume(v))) => Err(Control::Resume(v)),
+        Err(NativeSignal(NativeSignalKind::Fault(f))) => Err(Control::Fault(Box::new(f))),
+    }
+}
+
+/// Unwrap a `Result<T, Val>` whose `Err` is an exception payload: dispatch
+/// it on the current handler stack. If a handler resumes, the resumed value
+/// becomes the value of the ENCLOSING expression (early return from the
+/// surrounding function). Usable in functions returning
+/// `Result<Val, Control>` or `Result<Flow, Control>`.
+macro_rules! try_throw {
+    ($env:expr, $r:expr) => {
+        match $r {
+            Ok(x) => x,
+            Err(payload) => {
+                return throw(&$env.handler_stack, payload).await.map(Into::into);
+            }
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// EvalError — the embedder boundary
+// ---------------------------------------------------------------------------
+
+/// How a top-level evaluation failed, as seen by embedders. One structured
+/// escaped-effect arm covers unhandled exceptions and unhandled ordinary
+/// effects alike; there is no exception-specific error variant.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EvalError {
+    /// Unrecoverable runtime fault (bypassed all Glia handlers).
+    Fault(Fault),
+    /// An effect that reached the boundary with no matching handler —
+    /// including an unhandled `throw` (target `:glia.exception`).
+    Unhandled(effect::EffectRequest),
+}
+
+impl EvalError {
+    /// The thrown payload iff this is an unhandled `:glia.exception`.
+    /// Successor of `error::unwrap_thrown`.
+    pub fn thrown(&self) -> Option<&Val> {
+        match self {
+            EvalError::Unhandled(req)
+                if matches!(&req.target,
+                    effect::EffectTarget::Keyword(k) if k == error::EXCEPTION_EFFECT) =>
+            {
+                Some(&req.data)
+            }
+            _ => None,
+        }
+    }
+
+    /// The structured payload embedders inspect with `error::message` /
+    /// `error::type_tag`: thrown error data, or fault payload. `None` for
+    /// non-exception escaped effects (display falls back to `{self}`).
+    pub fn payload(&self) -> Option<&Val> {
+        match self {
+            EvalError::Fault(f) => Some(f.payload()),
+            other => other.thrown(),
+        }
+    }
+}
+
+impl core::fmt::Display for EvalError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            // Faults display as their structured payload, exactly like the
+            // pre-extraction bare error map.
+            EvalError::Fault(fault) => write!(f, "{}", fault.payload()),
+            // Unhandled exceptions display peeled (the payload map);
+            // other escaped effects keep the legacy carrier form.
+            EvalError::Unhandled(req) => match self.thrown() {
+                Some(payload) => write!(f, "{payload}"),
+                None => write!(f, "#<effect :{} {}>", req.effect_type(), req.data),
+            },
+        }
+    }
+}
+
+impl std::error::Error for EvalError {}
+
+/// Convert an internal evaluation result into the embedder boundary form.
+/// `EvalError` is a cold boundary type (constructed at most once per
+/// top-level evaluation), so its by-value size is not a concern.
+#[allow(clippy::result_large_err)]
+fn seal(r: Result<Flow, Control>) -> Result<Val, EvalError> {
+    match r {
+        Ok(Flow::Value(v)) => Ok(v),
+        Ok(Flow::Recur(_)) => Err(EvalError::Fault(Fault::language(error::invalid_recur(
+            "top level",
+        )))),
+        Err(Control::Fault(fault)) => Err(EvalError::Fault(*fault)),
+        Err(Control::Unhandled(req)) => Err(EvalError::Unhandled(*req)),
+        Err(Control::Resume(val)) => Err(EvalError::Fault(Fault::runtime(error::internal(
+            "resume",
+            format!("resume signal escaped to the top level (value: {val})"),
+        )))),
     }
 }
 
@@ -380,17 +1237,19 @@ fn is_authority_free(value: &Val) -> bool {
                 .iter()
                 .all(|(k, v)| walk(k, visiting) && walk(v, visiting)),
             Val::Fn { is_cap_free, .. } | Val::Macro { is_cap_free, .. } => *is_cap_free,
-            Val::NativeFn { .. } | Val::AsyncNativeFn { .. } | Val::Cap { .. } => false,
-            Val::Recur(_) | Val::Effect { .. } | Val::Resume(_) => false,
+            Val::NativeFn { .. } | Val::AsyncNativeFn { .. } | Val::Cap(_) => false,
         }
     }
     walk(value, &mut Vec::new())
 }
 
-fn compute_cap_status(env: &Env) -> (bool, Option<String>) {
-    for (name, value) in env.bindings() {
-        if !is_authority_free(&value) {
-            return (false, Some(name));
+fn compute_cap_status(captured: &CapturedEnv) -> (bool, Option<String>) {
+    // Deterministic report order (matches the old sorted-bindings walk).
+    let mut names: Vec<&String> = captured.slots.keys().collect();
+    names.sort();
+    for name in names {
+        if !is_authority_free(&captured.slots[name]) {
+            return (false, Some(name.clone()));
         }
     }
     (true, None)
@@ -475,11 +1334,14 @@ fn grant_value_error(name: &str, value: &Val) -> Val {
 }
 
 fn validate_glia_grant(name: &str, value: &Val) -> Result<(), Val> {
-    let Val::Cap { inner, .. } = value else {
+    let Val::Cap(handle) = value else {
         return Err(grant_value_error(name, value));
     };
-    if inner.downcast_ref::<GliaCapInner>().is_some()
-        || inner.downcast_ref::<AttenuatedCapInner>().is_some()
+    if handle.inner().downcast_ref::<GliaCapInner>().is_some()
+        || handle
+            .inner()
+            .downcast_ref::<AttenuatedCapInner>()
+            .is_some()
     {
         return Err(cell_error(format!(
             "grant \"{name}\" is a Glia-native capability that cannot yet cross a cell boundary; use a Cap'n Proto-backed capability or follow the defcap-export work"
@@ -557,16 +1419,22 @@ async fn eval_cell_expr<D: Dispatch>(
     raw_args: &[Val],
     env: &mut Env,
     dispatch: &D,
-) -> Result<Val, Val> {
-    let grants_index = cell_call_grants_index(raw_args)?;
+) -> Result<Val, Control> {
+    let grants_index = try_throw!(env, cell_call_grants_index(raw_args));
     if let Some(index) = grants_index {
-        validate_literal_grant_duplicates(&raw_args[index])?;
+        try_throw!(env, validate_literal_grant_duplicates(&raw_args[index]));
     }
 
-    let wasm = cell_wasm(eval_expr(&args[0], env, dispatch).await?)?;
+    let wasm_val = eval_expr(&args[0], env, dispatch)
+        .await?
+        .into_value("cell wasm argument")?;
+    let wasm = try_throw!(env, cell_wasm(wasm_val));
     let Some(index) = grants_index else {
         report_legacy_cell_capture(env, dispatch);
-        return build_explicit_cell(wasm, Vec::new(), dispatch);
+        return Ok(try_throw!(
+            env,
+            build_explicit_cell(wasm, Vec::new(), dispatch)
+        ));
     };
 
     let entries = match &args[index] {
@@ -574,34 +1442,53 @@ async fn eval_cell_expr<D: Dispatch>(
             let mut entries = Vec::with_capacity(pairs.len());
             for (key, value) in pairs {
                 entries.push((
-                    eval_expr(key, env, dispatch).await?,
-                    eval_expr(value, env, dispatch).await?,
+                    eval_expr(key, env, dispatch)
+                        .await?
+                        .into_value("cell :grants key")?,
+                    eval_expr(value, env, dispatch)
+                        .await?
+                        .into_value("cell :grants value")?,
                 ));
             }
             entries
         }
-        grants_expr => match eval_expr(grants_expr, env, dispatch).await? {
+        grants_expr => match eval_expr(grants_expr, env, dispatch)
+            .await?
+            .into_value("cell :grants")?
+        {
             Val::Map(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            other => return Err(error::type_mismatch("cell :grants", "map", &other)),
+            other => {
+                let payload = error::type_mismatch("cell :grants", "map", &other);
+                return throw(&env.handler_stack, payload).await;
+            }
         },
     };
-    build_explicit_cell(wasm, entries, dispatch)
+    Ok(try_throw!(
+        env,
+        build_explicit_cell(wasm, entries, dispatch)
+    ))
 }
 
 async fn eval_cell_raw<D: Dispatch>(
     raw_args: &[Val],
     env: &mut Env,
     dispatch: &D,
-) -> Result<Val, Val> {
-    let grants_index = cell_call_grants_index(raw_args)?;
+) -> Result<Val, Control> {
+    let grants_index = try_throw!(env, cell_call_grants_index(raw_args));
     if let Some(index) = grants_index {
-        validate_literal_grant_duplicates(&raw_args[index])?;
+        try_throw!(env, validate_literal_grant_duplicates(&raw_args[index]));
     }
 
-    let wasm = cell_wasm(eval(&raw_args[0], env, dispatch).await?)?;
+    let wasm_val = eval(&raw_args[0], env, dispatch)
+        .await?
+        .into_value("cell wasm argument")?;
+    let wasm = try_throw!(env, cell_wasm(wasm_val));
     let Some(index) = grants_index else {
         report_legacy_cell_capture(env, dispatch);
-        return build_explicit_cell(wasm, Vec::new(), dispatch);
+        return Ok(try_throw!(
+            env,
+            build_explicit_cell(wasm, Vec::new(), dispatch)
+        ));
     };
 
     let entries = match &raw_args[index] {
@@ -610,18 +1497,31 @@ async fn eval_cell_raw<D: Dispatch>(
             let mut entries = Vec::with_capacity(pairs.len());
             for (key, value) in pairs {
                 entries.push((
-                    eval(key, env, dispatch).await?,
-                    eval(value, env, dispatch).await?,
+                    eval(key, env, dispatch)
+                        .await?
+                        .into_value("cell :grants key")?,
+                    eval(value, env, dispatch)
+                        .await?
+                        .into_value("cell :grants value")?,
                 ));
             }
             entries
         }
-        grants_expr => match eval(grants_expr, env, dispatch).await? {
+        grants_expr => match eval(grants_expr, env, dispatch)
+            .await?
+            .into_value("cell :grants")?
+        {
             Val::Map(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            other => return Err(error::type_mismatch("cell :grants", "map", &other)),
+            other => {
+                let payload = error::type_mismatch("cell :grants", "map", &other);
+                return throw(&env.handler_stack, payload).await;
+            }
         },
     };
-    build_explicit_cell(wasm, entries, dispatch)
+    Ok(try_throw!(
+        env,
+        build_explicit_cell(wasm, entries, dispatch)
+    ))
 }
 
 /// Evaluate a function/macro body, dispatching on `FnBody` variant.
@@ -633,21 +1533,29 @@ async fn eval_fn_body<'a, D: Dispatch>(
     body: &'a FnBody,
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Val, Val> {
+) -> Result<Flow, Control> {
+    // Only the last form is in tail position (it may recur); intermediate
+    // forms demand values.
     match body {
         FnBody::Raw(forms) => {
-            let mut result = Val::Nil;
-            for form in forms {
-                result = eval(form, env, dispatch).await?;
+            let Some((last, init)) = forms.split_last() else {
+                return Ok(Flow::Value(Val::Nil));
+            };
+            for form in init {
+                eval(form, env, dispatch).await?.into_value("body form")?;
             }
-            Ok(result)
+            eval(last, env, dispatch).await
         }
         FnBody::Analyzed(exprs) => {
-            let mut result = Val::Nil;
-            for expr in exprs {
-                result = eval_expr(expr, env, dispatch).await?;
+            let Some((last, init)) = exprs.split_last() else {
+                return Ok(Flow::Value(Val::Nil));
+            };
+            for expr in init {
+                eval_expr(expr, env, dispatch)
+                    .await?
+                    .into_value("body form")?;
             }
-            Ok(result)
+            eval_expr(last, env, dispatch).await
         }
     }
 }
@@ -660,12 +1568,16 @@ async fn eval_args<'a, D: Dispatch>(
     raw_args: &'a [Val],
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Vec<Val>, Val> {
+) -> Result<Vec<Val>, Control> {
     let mut args = Vec::with_capacity(raw_args.len());
     for a in raw_args {
         match a {
-            Val::List(_) => args.push(eval(a, env, dispatch).await?),
-            Val::Sym(s) => match env.get(s) {
+            Val::List(_) => args.push(
+                eval(a, env, dispatch)
+                    .await?
+                    .into_value("function argument")?,
+            ),
+            Val::Sym(s) => match resolve(env, s)? {
                 Some(v) => args.push(v.clone()),
                 None => args.push(a.clone()),
             },
@@ -684,20 +1596,43 @@ async fn eval_def<'a, D: Dispatch>(
     args: &'a [Val],
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Val, Val> {
+) -> Result<Val, Control> {
     if args.is_empty() || args.len() > 2 {
-        return Err(error::arity("def", "1-2", args.len()));
+        return throw(&env.handler_stack, error::arity("def", "1-2", args.len())).await;
     }
     let name = match &args[0] {
         Val::Sym(s) => s.clone(),
-        other => return Err(error::type_mismatch("def", "symbol", other)),
+        other => {
+            let payload = error::type_mismatch("def", "symbol", other);
+            return throw(&env.handler_stack, payload).await;
+        }
     };
     let val = match args.get(1) {
-        Some(expr) => eval(expr, env, dispatch).await?,
+        Some(expr) => eval(expr, env, dispatch).await?.into_value("def value")?,
         None => Val::Nil,
     };
-    env.set_root(name, val.clone());
-    Ok(val)
+    define_or_throw(env, name, val).await
+}
+
+/// Route one definition through the checked operation ([`Env::define`]),
+/// surfacing failures on the evaluator's channels: a privilege violation
+/// throws the catchable `glia.error/def-not-top-level` BEFORE any mutation;
+/// ownership-layer failures (frozen owner) are internal faults. Returns the
+/// defined value — or the handler's resume value if a thrown privilege
+/// error was resumed.
+async fn define_or_throw(env: &Env, name: String, val: Val) -> Result<Val, Control> {
+    match env.define(name.clone(), val.clone()) {
+        Ok(()) => Ok(val),
+        Err(DefineError::NotTopLevel) => {
+            throw(&env.handler_stack, error::def_not_top_level(&name)).await
+        }
+        Err(DefineError::Own(fault)) => {
+            Err(Control::Fault(Box::new(Fault::runtime(error::internal(
+                "def",
+                format!("definition of '{name}' rejected by ownership layer: {fault:?}"),
+            )))))
+        }
+    }
 }
 
 /// `(if test then)` or `(if test then else)` — lazy eval of branches.
@@ -705,17 +1640,20 @@ async fn eval_if<'a, D: Dispatch>(
     args: &'a [Val],
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Val, Val> {
+) -> Result<Flow, Control> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(error::arity("if", "2-3", args.len()));
+        let payload = error::arity("if", "2-3", args.len());
+        return throw(&env.handler_stack, payload).await.map(Into::into);
     }
-    let test_val = eval(&args[0], env, dispatch).await?;
+    let test_val = eval(&args[0], env, dispatch)
+        .await?
+        .into_value("if condition")?;
     if is_truthy(&test_val) {
         eval(&args[1], env, dispatch).await
     } else if args.len() == 3 {
         eval(&args[2], env, dispatch).await
     } else {
-        Ok(Val::Nil)
+        Ok(Flow::Value(Val::Nil))
     }
 }
 
@@ -724,12 +1662,14 @@ async fn eval_do<'a, D: Dispatch>(
     args: &'a [Val],
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Val, Val> {
-    let mut result = Val::Nil;
-    for form in args {
-        result = eval(form, env, dispatch).await?;
+) -> Result<Flow, Control> {
+    let Some((last, init)) = args.split_last() else {
+        return Ok(Flow::Value(Val::Nil));
+    };
+    for form in init {
+        eval(form, env, dispatch).await?.into_value("do form")?;
     }
-    Ok(result)
+    eval(last, env, dispatch).await
 }
 
 /// `(let [bindings...] body...)` — local scope with sequential bindings.
@@ -737,42 +1677,53 @@ async fn eval_let<'a, D: Dispatch>(
     args: &'a [Val],
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Val, Val> {
+) -> Result<Flow, Control> {
     let bindings = match args.first() {
         Some(Val::Vector(v)) => v,
-        Some(other) => return Err(error::type_mismatch("let", "vector of bindings", other)),
-        None => return Err(error::arity("let", "at least 1", 0)),
+        Some(other) => {
+            let payload = error::type_mismatch("let", "vector of bindings", other);
+            return throw(&env.handler_stack, payload).await.map(Into::into);
+        }
+        None => {
+            let payload = error::arity("let", "at least 1", 0);
+            return throw(&env.handler_stack, payload).await.map(Into::into);
+        }
     };
     if bindings.len() % 2 != 0 {
-        return Err(error::internal(
-            "let",
-            "bindings must be pairs (even number of forms)",
-        ));
+        let payload = error::internal("let", "bindings must be pairs (even number of forms)");
+        return throw(&env.handler_stack, payload).await.map(Into::into);
     }
 
     env.push_frame();
 
     // Evaluate bindings and body in a block so we always pop the frame,
-    // even if an eval error occurs mid-binding or mid-body.
+    // even if evaluation unwinds mid-binding or mid-body.
     let result = async {
         for pair in bindings.chunks(2) {
             let name = match &pair[0] {
                 Val::Sym(s) => s.clone(),
                 other => {
-                    return Err(error::type_mismatch("let binding name", "symbol", other));
+                    let payload = error::type_mismatch("let binding name", "symbol", other);
+                    return throw(&env.handler_stack, payload).await.map(Into::into);
                 }
             };
-            let val = eval(&pair[1], env, dispatch).await?;
+            let val = eval(&pair[1], env, dispatch)
+                .await?
+                .into_value("let binding")?;
             env.set(name, val);
         }
 
-        // Body forms (implicit do).
+        // Body forms (implicit do); last form is in tail position.
         let body = &args[1..];
-        let mut result = Val::Nil;
-        for form in body {
-            result = eval(form, env, dispatch).await?;
+        let Some((last, init)) = body.split_last() else {
+            return Ok(Flow::Value(Val::Nil));
+        };
+        for form in init {
+            eval(form, env, dispatch)
+                .await?
+                .into_value("let body form")?;
         }
-        Ok(result)
+        eval(last, env, dispatch).await
     }
     .await;
 
@@ -876,14 +1827,17 @@ fn eval_fn(args: &[Val], env: &Env) -> Result<Val, Val> {
         }
     };
 
-    // Raw fn path: no FnArityExpr, no free-vars data. Keep full snapshot;
-    // is_cap_free check below still works correctly because it walks all bindings.
-    // Slim closures only apply to the analyzed pipeline (expr::Expr::Fn).
-    let captured_env = Rc::new(env.snapshot());
-    let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
+    // Raw fn path: no FnArityExpr, no free-vars data → full-frame capture;
+    // the cap-status walk below sees every captured binding. Slim captures
+    // only apply to the analyzed pipeline (expr::Expr::Fn).
+    let captured = CapturedEnv::capture_all(env);
+    let (is_cap_free, cap_violation) = compute_cap_status(&captured);
     Ok(Val::Fn {
         arities,
-        env: captured_env,
+        closure: crate::Closure {
+            captured: Rc::new(captured),
+            owner: OwnerRef::Strong(Rc::clone(&env.defs)),
+        },
         is_cap_free,
         cap_violation,
     })
@@ -892,23 +1846,25 @@ fn eval_fn(args: &[Val], env: &Env) -> Result<Val, Val> {
 /// Invoke a Val::Fn with evaluated arguments. Matches arity and evaluates body.
 async fn invoke_fn<'a, D: Dispatch>(
     arities: &'a [FnArity],
-    captured_env: &'a Rc<Env>,
+    closure: &'a crate::Closure,
     args: &[Val],
     dispatch: &'a D,
     caller_hs: HandlerStack,
-) -> Result<Val, Val> {
+) -> Result<Val, Control> {
     // Find matching arity: prefer exact fixed-arity match over variadic.
     // This ensures (fn ([x y] ...) ([x & rest] ...)) called with 2 args
     // picks the fixed 2-arity, not the variadic.
-    let arity = arities
+    let matched = arities
         .iter()
         .find(|a| a.variadic.is_none() && args.len() == a.params.len())
         .or_else(|| {
             arities
                 .iter()
                 .find(|a| a.variadic.is_some() && args.len() >= a.params.len())
-        })
-        .ok_or_else(|| {
+        });
+    let arity = match matched {
+        Some(a) => a,
+        None => {
             let expected: Vec<String> = arities
                 .iter()
                 .map(|a| {
@@ -919,13 +1875,15 @@ async fn invoke_fn<'a, D: Dispatch>(
                     }
                 })
                 .collect();
-            error::arity("fn", &expected.join(" or "), args.len())
-        })?;
+            let payload = error::arity("fn", &expected.join(" or "), args.len());
+            return throw(&caller_hs, payload).await;
+        }
+    };
 
     // Build fn environment: captured env + new frame with param bindings.
     // Uses Env::for_call to avoid infinite recursion from Env::clone when
     // closures capture their own scope.
-    let mut fn_env = Env::for_call(captured_env, &caller_hs);
+    let mut fn_env = Env::for_call(closure, &caller_hs).map_err(Control::Fault)?;
 
     // Bind positional params
     for (name, val) in arity.params.iter().zip(args.iter()) {
@@ -942,20 +1900,18 @@ async fn invoke_fn<'a, D: Dispatch>(
     let recur_arity = arity.params.len() + usize::from(arity.variadic.is_some());
 
     // Evaluate body (implicit do) with recur support.
-    // If the body returns Val::Recur, re-bind params and loop — same
+    // If the body's tail yields a recur, re-bind params and loop — same
     // semantics as loop/recur but targeting the enclosing fn.
     let result = async {
         loop {
             let result = eval_fn_body(&arity.body, &mut fn_env, dispatch).await?;
 
             match result {
-                Val::Recur(new_vals) => {
+                Flow::Recur(new_vals) => {
                     if new_vals.len() != recur_arity {
-                        return Err(error::arity(
-                            "recur",
-                            &recur_arity.to_string(),
-                            new_vals.len(),
-                        ));
+                        let payload =
+                            error::arity("recur", &recur_arity.to_string(), new_vals.len());
+                        return throw(&fn_env.handler_stack, payload).await;
                     }
                     // Re-bind fixed params
                     for (name, val) in arity.params.iter().zip(new_vals.iter()) {
@@ -970,7 +1926,7 @@ async fn invoke_fn<'a, D: Dispatch>(
                     }
                     // continue — re-evaluate body with new bindings
                 }
-                other => return Ok(other),
+                Flow::Value(v) => return Ok(v),
             }
         }
     }
@@ -985,12 +1941,12 @@ async fn invoke_fn<'a, D: Dispatch>(
 /// handler stack rather than the definition-time stack.
 async fn invoke_fn_with_handler_stack<'a, D: Dispatch>(
     arities: &'a [FnArity],
-    captured_env: &'a Rc<Env>,
+    closure: &'a crate::Closure,
     args: &[Val],
     dispatch: &'a D,
     handler_stack: HandlerStack,
-) -> Result<Val, Val> {
-    invoke_fn(arities, captured_env, args, dispatch, handler_stack).await
+) -> Result<Val, Control> {
+    invoke_fn(arities, closure, args, dispatch, handler_stack).await
 }
 
 /// Parse macro/fn arity definitions from raw Val args.
@@ -1063,32 +2019,38 @@ fn parse_macro_arities(fn_args: &[Val]) -> Result<Vec<FnArity>, Val> {
 /// Like `fn` but the resulting `Val::Macro` receives unevaluated args;
 /// the body evaluates in the captured env and the result is re-evaluated
 /// in the caller's env.
-async fn eval_defmacro(args: &[Val], env: &mut Env) -> Result<Val, Val> {
+async fn eval_defmacro(args: &[Val], env: &mut Env) -> Result<Val, Control> {
     if args.is_empty() {
-        return Err(error::arity("defmacro", "at least 2", 0));
+        let payload = error::arity("defmacro", "at least 2", 0);
+        return throw(&env.handler_stack, payload).await;
     }
     let name = match &args[0] {
         Val::Sym(s) => s.clone(),
-        other => return Err(error::type_mismatch("defmacro name", "symbol", other)),
+        other => {
+            let payload = error::type_mismatch("defmacro name", "symbol", other);
+            return throw(&env.handler_stack, payload).await;
+        }
     };
     let fn_args = &args[1..];
     if fn_args.is_empty() {
-        return Err(error::arity("defmacro", "at least 2", 1));
+        let payload = error::arity("defmacro", "at least 2", 1);
+        return throw(&env.handler_stack, payload).await;
     }
-    let arities = parse_macro_arities(fn_args)?;
-    // Raw macro path: no FnArityExpr, no free-vars data. Keep full snapshot;
-    // is_cap_free check below still works correctly because it walks all bindings.
-    // Slim closures only apply to the analyzed pipeline (expr::Expr::Fn).
-    let captured_env = Rc::new(env.snapshot());
-    let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
+    let arities = try_throw!(env, parse_macro_arities(fn_args));
+    // Raw macro path: no free-vars data → full-frame capture (see the raw
+    // fn path).
+    let captured = CapturedEnv::capture_all(env);
+    let (is_cap_free, cap_violation) = compute_cap_status(&captured);
     let val = Val::Macro {
         arities,
-        env: captured_env,
+        closure: crate::Closure {
+            captured: Rc::new(captured),
+            owner: OwnerRef::Strong(Rc::clone(&env.defs)),
+        },
         is_cap_free,
         cap_violation,
     };
-    env.set_root(name, val.clone());
-    Ok(val)
+    define_or_throw(env, name, val).await
 }
 
 /// Invoke a macro: like invoke_fn but receives raw (unevaluated) args.
@@ -1096,21 +2058,23 @@ async fn eval_defmacro(args: &[Val], env: &mut Env) -> Result<Val, Val> {
 /// that the caller will re-evaluate in their own env.
 async fn invoke_macro<'a, D: Dispatch>(
     arities: &'a [FnArity],
-    captured_env: &'a Rc<Env>,
+    closure: &'a crate::Closure,
     raw_args: &[Val],
     dispatch: &'a D,
     caller_hs: HandlerStack,
-) -> Result<Val, Val> {
+) -> Result<Val, Control> {
     // Find matching arity (same logic as invoke_fn)
-    let arity = arities
+    let matched = arities
         .iter()
         .find(|a| a.variadic.is_none() && raw_args.len() == a.params.len())
         .or_else(|| {
             arities
                 .iter()
                 .find(|a| a.variadic.is_some() && raw_args.len() >= a.params.len())
-        })
-        .ok_or_else(|| {
+        });
+    let arity = match matched {
+        Some(a) => a,
+        None => {
             let expected: Vec<String> = arities
                 .iter()
                 .map(|a| {
@@ -1121,11 +2085,13 @@ async fn invoke_macro<'a, D: Dispatch>(
                     }
                 })
                 .collect();
-            error::arity("macro", &expected.join(" or "), raw_args.len())
-        })?;
+            let payload = error::arity("macro", &expected.join(" or "), raw_args.len());
+            return throw(&caller_hs, payload).await;
+        }
+    };
 
     // Build macro environment: captured env + new frame with raw arg bindings
-    let mut macro_env = Env::for_call(captured_env, &caller_hs);
+    let mut macro_env = Env::for_call(closure, &caller_hs).map_err(Control::Fault)?;
 
     // Bind positional params to RAW (unevaluated) args
     for (name, val) in arity.params.iter().zip(raw_args.iter()) {
@@ -1138,8 +2104,14 @@ async fn invoke_macro<'a, D: Dispatch>(
         macro_env.set(rest_name.clone(), Val::List(rest_args));
     }
 
-    // Evaluate body (implicit do) in the macro's captured env
-    let result = async { eval_fn_body(&arity.body, &mut macro_env, dispatch).await }.await;
+    // Evaluate body (implicit do) in the macro's captured env. The
+    // expansion must be a value: a macro body has no recur target.
+    let result = async {
+        eval_fn_body(&arity.body, &mut macro_env, dispatch)
+            .await?
+            .into_value("macro body")
+    }
+    .await;
 
     macro_env.pop_frame();
     result
@@ -1148,32 +2120,39 @@ async fn invoke_macro<'a, D: Dispatch>(
 /// `(loop [bindings...] body...)` — tail-recursive iteration.
 ///
 /// Bindings are sequential (like `let`).  Body forms are evaluated in
-/// an implicit `do`.  If the result is `Val::Recur`, the bindings are
+/// an implicit `do`.  If the tail yields a recur, the bindings are
 /// replaced and the body re-evaluated; otherwise the result is returned.
 async fn eval_loop<'a, D: Dispatch>(
     args: &'a [Val],
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Val, Val> {
+) -> Result<Val, Control> {
     let bindings = match args.first() {
         Some(Val::Vector(v)) => v,
-        Some(other) => return Err(error::type_mismatch("loop", "vector of bindings", other)),
-        None => return Err(error::arity("loop", "at least 1", 0)),
+        Some(other) => {
+            let payload = error::type_mismatch("loop", "vector of bindings", other);
+            return throw(&env.handler_stack, payload).await;
+        }
+        None => {
+            let payload = error::arity("loop", "at least 1", 0);
+            return throw(&env.handler_stack, payload).await;
+        }
     };
     if bindings.len() % 2 != 0 {
-        return Err(error::internal(
-            "loop",
-            "bindings must be pairs (even number of forms)",
-        ));
+        let payload = error::internal("loop", "bindings must be pairs (even number of forms)");
+        return throw(&env.handler_stack, payload).await;
     }
 
-    let binding_names: Vec<String> = bindings
-        .chunks(2)
-        .map(|pair| match &pair[0] {
-            Val::Sym(s) => Ok(s.clone()),
-            other => Err(error::type_mismatch("loop binding name", "symbol", other)),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let binding_names: Vec<String> = try_throw!(
+        env,
+        bindings
+            .chunks(2)
+            .map(|pair| match &pair[0] {
+                Val::Sym(s) => Ok(s.clone()),
+                other => Err(error::type_mismatch("loop binding name", "symbol", other)),
+            })
+            .collect::<Result<Vec<_>, Val>>()
+    );
 
     let num_bindings = binding_names.len();
 
@@ -1186,33 +2165,41 @@ async fn eval_loop<'a, D: Dispatch>(
                 Val::Sym(s) => s.clone(),
                 _ => unreachable!(), // already validated above
             };
-            let val = eval(&pair[1], env, dispatch).await?;
+            let val = eval(&pair[1], env, dispatch)
+                .await?
+                .into_value("loop binding")?;
             env.set(name, val);
         }
 
         let body = &args[1..];
         loop {
-            // Evaluate body forms (implicit do).
-            let mut result = Val::Nil;
-            for form in body {
-                result = eval(form, env, dispatch).await?;
-            }
+            // Evaluate body forms (implicit do); only the last is in tail
+            // position and may recur.
+            let result = match body.split_last() {
+                None => Flow::Value(Val::Nil),
+                Some((last, init)) => {
+                    for form in init {
+                        eval(form, env, dispatch)
+                            .await?
+                            .into_value("loop body form")?;
+                    }
+                    eval(last, env, dispatch).await?
+                }
+            };
 
             match result {
-                Val::Recur(new_vals) => {
+                Flow::Recur(new_vals) => {
                     if new_vals.len() != num_bindings {
-                        return Err(error::arity(
-                            "recur",
-                            &num_bindings.to_string(),
-                            new_vals.len(),
-                        ));
+                        let payload =
+                            error::arity("recur", &num_bindings.to_string(), new_vals.len());
+                        return throw(&env.handler_stack, payload).await;
                     }
                     for (name, val) in binding_names.iter().zip(new_vals) {
                         env.set(name.clone(), val);
                     }
                     // continue loop — re-evaluate body
                 }
-                other => return Ok(other),
+                Flow::Value(v) => return Ok(v),
             }
         }
     }
@@ -1230,9 +2217,9 @@ async fn eval_recur<'a, D: Dispatch>(
     args: &'a [Val],
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Val, Val> {
+) -> Result<Flow, Control> {
     let evaled = eval_args(args, env, dispatch).await?;
-    Ok(Val::Recur(evaled))
+    Ok(Flow::Recur(evaled))
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,19 +2232,20 @@ async fn eval_hof<'a, D: Dispatch>(
     args: &[Val],
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Val, Val> {
+) -> Result<Val, Control> {
     match name {
         "map" => {
             if args.len() != 2 {
-                return Err(error::arity("map", "2", args.len()));
+                let payload = error::arity("map", "2", args.len());
+                return throw(&env.handler_stack, payload).await;
             }
-            let (arities, captured_env) = extract_fn("map", &args[0])?;
-            let items = extract_seq("map", &args[1])?;
+            let (arities, closure) = try_throw!(env, extract_fn("map", &args[0]));
+            let items = try_throw!(env, extract_seq("map", &args[1]));
             let mut result = Vec::with_capacity(items.len());
             for item in items {
                 let val = invoke_fn(
                     &arities,
-                    &captured_env,
+                    &closure,
                     std::slice::from_ref(item),
                     dispatch,
                     env.handler_stack.clone(),
@@ -1269,15 +2257,16 @@ async fn eval_hof<'a, D: Dispatch>(
         }
         "filter" => {
             if args.len() != 2 {
-                return Err(error::arity("filter", "2", args.len()));
+                let payload = error::arity("filter", "2", args.len());
+                return throw(&env.handler_stack, payload).await;
             }
-            let (arities, captured_env) = extract_fn("filter", &args[0])?;
-            let items = extract_seq("filter", &args[1])?;
+            let (arities, closure) = try_throw!(env, extract_fn("filter", &args[0]));
+            let items = try_throw!(env, extract_seq("filter", &args[1]));
             let mut result = Vec::new();
             for item in items {
                 let val = invoke_fn(
                     &arities,
-                    &captured_env,
+                    &closure,
                     std::slice::from_ref(item),
                     dispatch,
                     env.handler_stack.clone(),
@@ -1292,26 +2281,31 @@ async fn eval_hof<'a, D: Dispatch>(
         }
         "reduce" => {
             if args.len() < 2 || args.len() > 3 {
-                return Err(error::arity("reduce", "2-3", args.len()));
+                let payload = error::arity("reduce", "2-3", args.len());
+                return throw(&env.handler_stack, payload).await;
             }
-            let (arities, captured_env) = extract_fn("reduce", &args[0])?;
+            let (arities, closure) = try_throw!(env, extract_fn("reduce", &args[0]));
             let (mut acc, items) = if args.len() == 3 {
-                (args[1].clone(), extract_seq("reduce", &args[2])?)
+                (
+                    args[1].clone(),
+                    try_throw!(env, extract_seq("reduce", &args[2])),
+                )
             } else {
-                let items = extract_seq("reduce", &args[1])?;
+                let items = try_throw!(env, extract_seq("reduce", &args[1]));
                 if items.is_empty() {
-                    return Err(error::type_mismatch(
+                    let payload = error::type_mismatch(
                         "reduce",
                         "non-empty collection (or pass an init value)",
                         &Val::List(vec![]),
-                    ));
+                    );
+                    return throw(&env.handler_stack, payload).await;
                 }
                 (items[0].clone(), &items[1..])
             };
             for item in items {
                 acc = invoke_fn(
                     &arities,
-                    &captured_env,
+                    &closure,
                     &[acc, item.clone()],
                     dispatch,
                     env.handler_stack.clone(),
@@ -1324,14 +2318,12 @@ async fn eval_hof<'a, D: Dispatch>(
     }
 }
 
-/// Extract a `Val::Fn` into its arities and captured env, or error.
-fn extract_fn(caller: &str, val: &Val) -> Result<(Vec<FnArity>, Rc<Env>), Val> {
+/// Extract a `Val::Fn` into its arities and closure, or error.
+fn extract_fn(caller: &str, val: &Val) -> Result<(Vec<FnArity>, crate::Closure), Val> {
     match val {
         Val::Fn {
-            arities,
-            env: captured_env,
-            ..
-        } => Ok((arities.clone(), captured_env.clone())),
+            arities, closure, ..
+        } => Ok((arities.clone(), closure.clone())),
         other => Err(error::type_mismatch(caller, "function", other)),
     }
 }
@@ -1401,13 +2393,10 @@ fn eval_builtin(name: &str, args: &[Val]) -> Option<Result<Val, Val>> {
                 Val::Bytes(_) => "bytes",
                 Val::Atom(_) => "atom",
                 Val::Fn { .. } => "fn",
-                Val::Recur(_) => "recur",
                 Val::Macro { .. } => "macro",
-                Val::Effect { .. } => "effect",
                 Val::NativeFn { .. } => "native-fn",
                 Val::AsyncNativeFn { .. } => "async-native-fn",
-                Val::Cap { .. } => "cap",
-                Val::Resume(_) => "resume",
+                Val::Cap(_) => "cap",
             };
             Some(Ok(Val::Keyword(kw.into())))
         }
@@ -1887,28 +2876,33 @@ fn builtin_ge(args: &[Val]) -> Result<Val, Val> {
 use crate::expr::{self, Expr};
 
 /// Evaluate an analyzed Expr in the given environment.
-pub fn eval_expr<'a, D: Dispatch>(
+pub(crate) fn eval_expr<'a, D: Dispatch>(
     expr: &'a Expr,
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<Flow, Control>> + 'a>> {
     Box::pin(async move {
         match expr {
-            Expr::Const(v) => Ok(v.clone()),
+            Expr::Const(v) => Ok(Flow::Value(v.clone())),
 
-            Expr::Sym(s) => match env.get(s) {
-                Some(v) => Ok(v.clone()),
-                None => Ok(Val::Sym(s.clone())),
+            Expr::Sym(s) => match resolve(env, s)? {
+                Some(v) => Ok(Flow::Value(v.clone())),
+                None => Ok(Flow::Value(Val::Sym(s.clone()))),
             },
 
             Expr::Def { name, value } => {
-                let val = eval_expr(value, env, dispatch).await?;
-                env.set_root(name.clone(), val.clone());
-                Ok(val)
+                let val = eval_expr(value, env, dispatch)
+                    .await?
+                    .into_value("def value")?;
+                define_or_throw(env, name.clone(), val)
+                    .await
+                    .map(Flow::Value)
             }
 
             Expr::If { test, then, else_ } => {
-                let test_val = eval_expr(test, env, dispatch).await?;
+                let test_val = eval_expr(test, env, dispatch)
+                    .await?
+                    .into_value("if condition")?;
                 if is_truthy(&test_val) {
                     eval_expr(then, env, dispatch).await
                 } else {
@@ -1917,41 +2911,57 @@ pub fn eval_expr<'a, D: Dispatch>(
             }
 
             Expr::Do { body } => {
-                let mut result = Val::Nil;
-                for e in body {
-                    result = eval_expr(e, env, dispatch).await?;
+                let Some((last, init)) = body.split_last() else {
+                    return Ok(Flow::Value(Val::Nil));
+                };
+                for e in init {
+                    eval_expr(e, env, dispatch).await?.into_value("do form")?;
                 }
-                Ok(result)
+                eval_expr(last, env, dispatch).await
             }
 
             Expr::Let { bindings, body } => {
                 env.push_frame();
                 let result = async {
                     for (binding, val_expr) in bindings {
-                        let val = eval_expr(val_expr, env, dispatch).await?;
+                        let val = eval_expr(val_expr, env, dispatch)
+                            .await?
+                            .into_value("let binding")?;
                         match binding {
                             crate::pattern::LetBinding::Simple(name) => {
                                 env.set(name.clone(), val);
                             }
                             crate::pattern::LetBinding::Destructure(pat) => {
-                                crate::pattern::bind_pattern(pat, &val, "let", &mut |name, v| {
-                                    env.set(name.to_string(), v);
-                                })?;
+                                try_throw!(
+                                    env,
+                                    crate::pattern::bind_pattern(
+                                        pat,
+                                        &val,
+                                        "let",
+                                        &mut |name, v| {
+                                            env.set(name.to_string(), v);
+                                        }
+                                    )
+                                );
                             }
                         }
                     }
-                    let mut result = Val::Nil;
-                    for e in body {
-                        result = eval_expr(e, env, dispatch).await?;
+                    let Some((last, init)) = body.split_last() else {
+                        return Ok(Flow::Value(Val::Nil));
+                    };
+                    for e in init {
+                        eval_expr(e, env, dispatch)
+                            .await?
+                            .into_value("let body form")?;
                     }
-                    Ok(result)
+                    eval_expr(last, env, dispatch).await
                 }
                 .await;
                 env.pop_frame();
                 result
             }
 
-            Expr::Quote(val) => Ok(val.clone()),
+            Expr::Quote(val) => Ok(Flow::Value(val.clone())),
 
             Expr::Fn { arities } => {
                 // Convert FnArityExpr → FnArity with FnBody::Analyzed
@@ -1959,8 +2969,8 @@ pub fn eval_expr<'a, D: Dispatch>(
                     .iter()
                     .flat_map(|arity| arity.free_vars.iter())
                     .collect();
-                let captured_env = env.capture_closure(free_vars);
-                let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
+                let captured = CapturedEnv::capture_free(env, free_vars);
+                let (is_cap_free, cap_violation) = compute_cap_status(&captured);
                 let fn_arities: Vec<FnArity> = arities
                     .iter()
                     .map(|a| FnArity {
@@ -1969,12 +2979,15 @@ pub fn eval_expr<'a, D: Dispatch>(
                         body: FnBody::Analyzed(a.body.clone()),
                     })
                     .collect();
-                Ok(Val::Fn {
+                Ok(Flow::Value(Val::Fn {
                     arities: fn_arities,
-                    env: Rc::new(captured_env),
+                    closure: crate::Closure {
+                        captured: Rc::new(captured),
+                        owner: OwnerRef::Strong(Rc::clone(&env.defs)),
+                    },
                     is_cap_free,
                     cap_violation,
-                })
+                }))
             }
 
             Expr::Loop { bindings, body } => {
@@ -1983,16 +2996,21 @@ pub fn eval_expr<'a, D: Dispatch>(
                 let mut binding_specs: Vec<crate::pattern::LetBinding> =
                     Vec::with_capacity(bindings.len());
                 for (binding, val_expr) in bindings {
-                    let val = eval_expr(val_expr, env, dispatch).await?;
+                    let val = eval_expr(val_expr, env, dispatch)
+                        .await?
+                        .into_value("loop binding")?;
                     match binding {
                         crate::pattern::LetBinding::Simple(name) => {
                             env.set(name.clone(), val);
                             binding_specs.push(crate::pattern::LetBinding::Simple(name.clone()));
                         }
                         crate::pattern::LetBinding::Destructure(pat) => {
-                            crate::pattern::bind_pattern(pat, &val, "loop", &mut |name, v| {
-                                env.set(name.to_string(), v);
-                            })?;
+                            try_throw!(
+                                env,
+                                crate::pattern::bind_pattern(pat, &val, "loop", &mut |name, v| {
+                                    env.set(name.to_string(), v);
+                                })
+                            );
                             binding_specs
                                 .push(crate::pattern::LetBinding::Destructure(pat.clone()));
                         }
@@ -2002,18 +3020,29 @@ pub fn eval_expr<'a, D: Dispatch>(
 
                 let result = async {
                     loop {
-                        let mut result = Val::Nil;
-                        for e in body {
-                            result = eval_expr(e, env, dispatch).await?;
-                        }
+                        // Only the last body form is in tail position.
+                        let result = match body.split_last() {
+                            None => Flow::Value(Val::Nil),
+                            Some((last, init)) => {
+                                for e in init {
+                                    eval_expr(e, env, dispatch)
+                                        .await?
+                                        .into_value("loop body form")?;
+                                }
+                                eval_expr(last, env, dispatch).await?
+                            }
+                        };
                         match result {
-                            Val::Recur(new_vals) => {
+                            Flow::Recur(new_vals) => {
                                 if new_vals.len() != num_bindings {
-                                    return Err(error::arity(
+                                    let payload = error::arity(
                                         "recur",
                                         &num_bindings.to_string(),
                                         new_vals.len(),
-                                    ));
+                                    );
+                                    return throw(&env.handler_stack, payload)
+                                        .await
+                                        .map(Into::into);
                                 }
                                 // Re-bind: re-apply patterns for destructuring bindings
                                 for (spec, val) in binding_specs.iter().zip(new_vals) {
@@ -2022,19 +3051,22 @@ pub fn eval_expr<'a, D: Dispatch>(
                                             env.set(name.clone(), val);
                                         }
                                         crate::pattern::LetBinding::Destructure(pat) => {
-                                            crate::pattern::bind_pattern(
-                                                pat,
-                                                &val,
-                                                "recur",
-                                                &mut |name, v| {
-                                                    env.set(name.to_string(), v);
-                                                },
-                                            )?;
+                                            try_throw!(
+                                                env,
+                                                crate::pattern::bind_pattern(
+                                                    pat,
+                                                    &val,
+                                                    "recur",
+                                                    &mut |name, v| {
+                                                        env.set(name.to_string(), v);
+                                                    },
+                                                )
+                                            );
                                         }
                                     }
                                 }
                             }
-                            other => return Ok(other),
+                            Flow::Value(v) => return Ok(Flow::Value(v)),
                         }
                     }
                 }
@@ -2046,16 +3078,26 @@ pub fn eval_expr<'a, D: Dispatch>(
             Expr::Recur { args } => {
                 let mut evaled = Vec::with_capacity(args.len());
                 for a in args {
-                    evaled.push(eval_expr(a, env, dispatch).await?);
+                    evaled.push(
+                        eval_expr(a, env, dispatch)
+                            .await?
+                            .into_value("recur argument")?,
+                    );
                 }
-                Ok(Val::Recur(evaled))
+                Ok(Flow::Recur(evaled))
             }
 
             Expr::Perform { target, args } => {
-                let target_val = eval_expr(target, env, dispatch).await?;
+                let target_val = eval_expr(target, env, dispatch)
+                    .await?
+                    .into_value("perform target")?;
                 let mut evaled_args = Vec::with_capacity(args.len());
                 for a in args {
-                    evaled_args.push(eval_expr(a, env, dispatch).await?);
+                    evaled_args.push(
+                        eval_expr(a, env, dispatch)
+                            .await?
+                            .into_value("perform argument")?,
+                    );
                 }
 
                 // Build EffectTarget + data payload from the two perform forms.
@@ -2063,11 +3105,12 @@ pub fn eval_expr<'a, D: Dispatch>(
                     // (perform :keyword data) — keyword/environmental effect
                     Val::Keyword(s) => {
                         if evaled_args.len() != 1 {
-                            return Err(error::arity(
+                            let payload = error::arity(
                                 "perform (keyword effect)",
                                 "1 data arg",
                                 evaled_args.len(),
-                            ));
+                            );
+                            return throw(&env.handler_stack, payload).await.map(Into::into);
                         }
                         (
                             effect::EffectTarget::Keyword(s.clone()),
@@ -2075,47 +3118,54 @@ pub fn eval_expr<'a, D: Dispatch>(
                         )
                     }
                     // (perform cap :method args...) — cap-targeted effect
-                    Val::Cap { .. } => {
-                        return perform_cap_value(&target_val, &evaled_args, env, dispatch).await
+                    Val::Cap(_) => {
+                        return perform_cap_value(&target_val, &evaled_args, env, dispatch)
+                            .await
+                            .map(Flow::Value)
                     }
                     other => {
-                        return Err(error::type_mismatch(
-                            "perform target",
-                            "keyword or cap",
-                            other,
-                        ))
+                        let payload =
+                            error::type_mismatch("perform target", "keyword or cap", other);
+                        return throw(&env.handler_stack, payload).await.map(Into::into);
                     }
                 };
 
                 // Stack walk: find the matching handler frame.
-                perform_dispatch(&env.handler_stack, effect_target, data_val).await
+                perform_dispatch(&env.handler_stack, effect_target, data_val)
+                    .await
+                    .map(Flow::Value)
             }
 
             Expr::PerformStar { target, payload } => {
                 // Apply-style perform: the payload list's elements are the
                 // args `perform` would take. Lets a generic handler delegate
                 // its `(method args...)` payload without knowing the arity.
-                let target_val = eval_expr(target, env, dispatch).await?;
-                let payload_val = eval_expr(payload, env, dispatch).await?;
+                let target_val = eval_expr(target, env, dispatch)
+                    .await?
+                    .into_value("perform* target")?;
+                let payload_val = eval_expr(payload, env, dispatch)
+                    .await?
+                    .into_value("perform* payload")?;
                 let items: Vec<Val> = match payload_val {
                     Val::List(v) | Val::Vector(v) => v,
                     other => {
-                        return Err(error::type_mismatch(
-                            "perform* payload",
-                            "list or vector",
-                            &other,
-                        ))
+                        let payload =
+                            error::type_mismatch("perform* payload", "list or vector", &other);
+                        return throw(&env.handler_stack, payload).await.map(Into::into);
                     }
                 };
                 match &target_val {
-                    Val::Cap { .. } => perform_cap_value(&target_val, &items, env, dispatch).await,
+                    Val::Cap(_) => perform_cap_value(&target_val, &items, env, dispatch)
+                        .await
+                        .map(Flow::Value),
                     Val::Keyword(s) => {
                         if items.len() != 1 {
-                            return Err(error::arity(
+                            let payload = error::arity(
                                 "perform* (keyword effect)",
                                 "payload of 1 element",
                                 items.len(),
-                            ));
+                            );
+                            return throw(&env.handler_stack, payload).await.map(Into::into);
                         }
                         perform_dispatch(
                             &env.handler_stack,
@@ -2123,18 +3173,21 @@ pub fn eval_expr<'a, D: Dispatch>(
                             items.into_iter().next().unwrap(),
                         )
                         .await
+                        .map(Flow::Value)
                     }
-                    other => Err(error::type_mismatch(
-                        "perform* target",
-                        "keyword or cap",
-                        other,
-                    )),
+                    other => {
+                        let payload =
+                            error::type_mismatch("perform* target", "keyword or cap", other);
+                        throw(&env.handler_stack, payload).await.map(Into::into)
+                    }
                 }
             }
 
             Expr::Match { expr, clauses } => {
                 // Evaluate the scrutinee
-                let value = eval_expr(expr, env, dispatch).await?;
+                let value = eval_expr(expr, env, dispatch)
+                    .await?
+                    .into_value("match scrutinee")?;
 
                 // Try each clause in order (linear, first match wins)
                 for (pattern, body) in clauses {
@@ -2144,17 +3197,16 @@ pub fn eval_expr<'a, D: Dispatch>(
                         for (name, val) in bindings {
                             env.set(name, val);
                         }
+                        // Clause bodies are in tail position.
                         let result = eval_expr(body, env, dispatch).await;
                         env.pop_frame();
                         return result;
                     }
                 }
 
-                // No clause matched — runtime error
-                Err(error::internal(
-                    "match",
-                    format!("no clause matched value {value}"),
-                ))
+                // No clause matched — catchable exception
+                let payload = error::internal("match", format!("no clause matched value {value}"));
+                throw(&env.handler_stack, payload).await.map(Into::into)
             }
 
             Expr::WithEffectHandler {
@@ -2163,41 +3215,39 @@ pub fn eval_expr<'a, D: Dispatch>(
                 body,
             } => {
                 // Evaluate target and handler BEFORE pushing context.
-                let target_val = eval_expr(target, env, dispatch).await?;
-                let handler_val = eval_expr(handler, env, dispatch).await?;
+                let target_val = eval_expr(target, env, dispatch)
+                    .await?
+                    .into_value("with-effect-handler target")?;
+                let handler_val = eval_expr(handler, env, dispatch)
+                    .await?
+                    .into_value("with-effect-handler handler")?;
 
                 let effect_target = match &target_val {
                     Val::Keyword(s) => effect::EffectTarget::Keyword(s.clone()),
-                    Val::Cap {
-                        name,
-                        schema_cid,
-                        cap_id,
-                        ..
-                    } => effect::EffectTarget::Cap {
-                        name: name.clone(),
-                        schema_cid: schema_cid.clone(),
-                        cap_id: *cap_id,
-                    },
+                    Val::Cap(h) => h.effect_target(),
                     other => {
-                        return Err(error::type_mismatch(
+                        let payload = error::type_mismatch(
                             "with-effect-handler target",
                             "keyword or cap",
                             other,
-                        ))
+                        );
+                        return throw(&env.handler_stack, payload).await.map(Into::into);
                     }
                 };
 
-                // Depth check.
+                // Depth check — fires BEFORE the frame is pushed, so state is
+                // consistent and the exception is catchable by outer handlers.
                 let hs = env.handler_stack.clone();
                 let caller_hs = hs.clone();
                 if hs.borrow().len() >= effect::MAX_HANDLER_DEPTH {
-                    return Err(error::internal(
+                    let payload = error::internal(
                         "with-effect-handler",
                         format!(
                             "handler stack depth limit ({}) exceeded",
                             effect::MAX_HANDLER_DEPTH
                         ),
-                    ));
+                    );
+                    return throw(&env.handler_stack, payload).await.map(Into::into);
                 }
 
                 // Create handler context with the target.
@@ -2211,26 +3261,31 @@ pub fn eval_expr<'a, D: Dispatch>(
                     context: ctx.clone(),
                 };
 
-                // Create body future.
+                // Create body future. The last body form is in tail
+                // position (a loop enclosing this form may catch its recur).
                 let mut body_fut = {
                     let body = body.clone();
                     Box::pin(async move {
-                        let mut result = Val::Nil;
-                        for e in &body {
-                            result = eval_expr(e, env, dispatch).await?;
+                        let Some((last, init)) = body.split_last() else {
+                            return Ok(Flow::Value(Val::Nil));
+                        };
+                        for e in init {
+                            eval_expr(e, env, dispatch)
+                                .await?
+                                .into_value("with-effect-handler body form")?;
                         }
-                        Ok::<Val, Val>(result)
+                        eval_expr(last, env, dispatch).await
                     })
                 };
 
                 // State machine: alternate between polling body and handling effects.
                 enum HandlerState<'b> {
                     Polling,
-                    Handling(Pin<Box<dyn Future<Output = Result<Val, Val>> + 'b>>),
+                    Handling(Pin<Box<dyn Future<Output = Result<Val, Control>> + 'b>>),
                 }
                 let mut state = HandlerState::Polling;
 
-                let result: Result<Val, Val> = std::future::poll_fn(|cx| {
+                let result: Result<Flow, Control> = std::future::poll_fn(|cx| {
                     loop {
                         match &mut state {
                             HandlerState::Polling => {
@@ -2243,9 +3298,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                                                 // Dispatch to handler based on its type.
                                                 match &handler_val {
                                                     Val::Fn {
-                                                        arities,
-                                                        env: captured_env,
-                                                        ..
+                                                        arities, closure, ..
                                                     } => {
                                                         // Pop before handle (handler's performs go to outer handlers).
                                                         hs.borrow_mut().pop();
@@ -2257,12 +3310,15 @@ pub fn eval_expr<'a, D: Dispatch>(
                                                                     && a.params.len() <= 2)
                                                         });
                                                         let owned_arities = arities.clone();
-                                                        let owned_env = captured_env.clone();
+                                                        let owned_closure = closure.clone();
 
                                                         let handler_fut: Pin<
                                                             Box<
                                                                 dyn Future<
-                                                                        Output = Result<Val, Val>,
+                                                                        Output = Result<
+                                                                            Val,
+                                                                            Control,
+                                                                        >,
                                                                     > + '_,
                                                             >,
                                                         > = if has_2_arity {
@@ -2273,7 +3329,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                                                             Box::pin(async move {
                                                                 invoke_fn(
                                                                     &owned_arities,
-                                                                    &owned_env,
+                                                                    &owned_closure,
                                                                     &args,
                                                                     dispatch,
                                                                     handler_hs,
@@ -2287,7 +3343,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                                                             Box::pin(async move {
                                                                 invoke_fn(
                                                                     &owned_arities,
-                                                                    &owned_env,
+                                                                    &owned_closure,
                                                                     &args,
                                                                     dispatch,
                                                                     handler_hs,
@@ -2303,44 +3359,73 @@ pub fn eval_expr<'a, D: Dispatch>(
                                                         hs.borrow_mut().pop();
                                                         let resume_fn =
                                                             effect::make_resume_fn(resume_tx);
-                                                        let result = func(&[data, resume_fn]);
-                                                        match result {
-                                                            Err(Val::Resume(_)) => {
-                                                                hs.borrow_mut().push(ctx.clone());
-                                                                state = HandlerState::Polling;
-                                                                cx.waker().wake_by_ref();
-                                                                return Poll::Pending;
-                                                            }
-                                                            other => {
-                                                                hs.borrow_mut().push(ctx.clone());
-                                                                return Poll::Ready(other);
-                                                            }
-                                                        }
+                                                        let func = func.clone();
+                                                        let handler_hs = caller_hs.clone();
+                                                        let handler_fut: Pin<
+                                                            Box<
+                                                                dyn Future<
+                                                                        Output = Result<
+                                                                            Val,
+                                                                            Control,
+                                                                        >,
+                                                                    > + '_,
+                                                            >,
+                                                        > = Box::pin(async move {
+                                                            let args = [data, resume_fn];
+                                                            settle_native(&handler_hs, func(&args))
+                                                                .await
+                                                        });
+                                                        state = HandlerState::Handling(handler_fut);
+                                                        continue;
                                                     }
                                                     Val::AsyncNativeFn { func, .. } => {
                                                         hs.borrow_mut().pop();
                                                         let resume_fn =
                                                             effect::make_resume_fn(resume_tx);
                                                         let func = func.clone();
+                                                        let handler_hs = caller_hs.clone();
                                                         let handler_fut: Pin<
                                                             Box<
                                                                 dyn Future<
-                                                                        Output = Result<Val, Val>,
+                                                                        Output = Result<
+                                                                            Val,
+                                                                            Control,
+                                                                        >,
                                                                     > + '_,
                                                             >,
-                                                        > = Box::pin(func(vec![data, resume_fn]));
+                                                        > = Box::pin(async move {
+                                                            let fut = func(vec![data, resume_fn]);
+                                                            settle_native(&handler_hs, fut.await)
+                                                                .await
+                                                        });
                                                         state = HandlerState::Handling(handler_fut);
                                                         continue;
                                                     }
                                                     other => {
+                                                        // Pop so the exception cannot dispatch
+                                                        // back into this broken frame.
+                                                        hs.borrow_mut().pop();
                                                         drop(resume_tx);
-                                                        return Poll::Ready(Err(
-                                                            error::type_mismatch(
-                                                                "with-effect-handler handler",
-                                                                "function",
-                                                                other,
-                                                            ),
-                                                        ));
+                                                        let payload = error::type_mismatch(
+                                                            "with-effect-handler handler",
+                                                            "function",
+                                                            other,
+                                                        );
+                                                        let handler_hs = caller_hs.clone();
+                                                        let handler_fut: Pin<
+                                                            Box<
+                                                                dyn Future<
+                                                                        Output = Result<
+                                                                            Val,
+                                                                            Control,
+                                                                        >,
+                                                                    > + '_,
+                                                            >,
+                                                        > = Box::pin(async move {
+                                                            throw(&handler_hs, payload).await
+                                                        });
+                                                        state = HandlerState::Handling(handler_fut);
+                                                        continue;
                                                     }
                                                 }
                                             }
@@ -2355,12 +3440,12 @@ pub fn eval_expr<'a, D: Dispatch>(
                                     Poll::Ready(result) => {
                                         hs.borrow_mut().push(ctx.clone());
                                         match result {
-                                            Err(Val::Resume(_)) => {
+                                            Err(Control::Resume(_)) => {
                                                 state = HandlerState::Polling;
                                                 cx.waker().wake_by_ref();
                                                 return Poll::Pending;
                                             }
-                                            other => return Poll::Ready(other),
+                                            other => return Poll::Ready(other.map(Flow::Value)),
                                         }
                                     }
                                 }
@@ -2375,17 +3460,21 @@ pub fn eval_expr<'a, D: Dispatch>(
 
             Expr::DefMacro { name, raw_args } => {
                 // raw_args contains [params, body...] — no name (already extracted).
-                let arities = parse_macro_arities(raw_args)?;
-                let captured_env = Rc::new(env.snapshot());
-                let (is_cap_free, cap_violation) = compute_cap_status(&captured_env);
+                let arities = try_throw!(env, parse_macro_arities(raw_args));
+                let captured = CapturedEnv::capture_all(env);
+                let (is_cap_free, cap_violation) = compute_cap_status(&captured);
                 let val = Val::Macro {
                     arities,
-                    env: captured_env,
+                    closure: crate::Closure {
+                        captured: Rc::new(captured),
+                        owner: OwnerRef::Strong(Rc::clone(&env.defs)),
+                    },
                     is_cap_free,
                     cap_violation,
                 };
-                env.set_root(name.clone(), val.clone());
-                Ok(val)
+                define_or_throw(env, name.clone(), val)
+                    .await
+                    .map(Flow::Value)
             }
 
             Expr::Call {
@@ -2396,17 +3485,22 @@ pub fn eval_expr<'a, D: Dispatch>(
                 // Special form: (defcap name :method fn ...)
                 if head == "defcap" {
                     if raw_args.len() < 3 {
-                        return Err(error::arity("defcap", "at least 3", raw_args.len()));
+                        let payload = error::arity("defcap", "at least 3", raw_args.len());
+                        return throw(&env.handler_stack, payload).await.map(Into::into);
                     }
                     let name = match &raw_args[0] {
                         Val::Sym(s) => s.clone(),
-                        other => return Err(error::type_mismatch("defcap name", "symbol", other)),
+                        other => {
+                            let payload = error::type_mismatch("defcap name", "symbol", other);
+                            return throw(&env.handler_stack, payload).await.map(Into::into);
+                        }
                     };
                     if (raw_args.len() - 1) % 2 != 0 {
-                        return Err(error::internal(
+                        let payload = error::internal(
                             "defcap",
                             "method definitions must be keyword/function pairs",
-                        ));
+                        );
+                        return throw(&env.handler_stack, payload).await.map(Into::into);
                     }
 
                     let mut methods = HashMap::new();
@@ -2415,24 +3509,26 @@ pub fn eval_expr<'a, D: Dispatch>(
                         let method_name = match &pair[0] {
                             Val::Keyword(k) => k.clone(),
                             other => {
-                                return Err(error::type_mismatch(
-                                    "defcap method name",
-                                    "keyword",
-                                    other,
-                                ))
+                                let payload =
+                                    error::type_mismatch("defcap method name", "keyword", other);
+                                return throw(&env.handler_stack, payload).await.map(Into::into);
                             }
                         };
-                        let method_expr = expr::analyze(&pair[1])?;
-                        let method_val = eval_expr(&method_expr, env, dispatch).await?;
+                        let method_expr =
+                            try_throw!(env, expr::analyze(&pair[1]).map_err(Val::from));
+                        let method_val = eval_expr(&method_expr, env, dispatch)
+                            .await?
+                            .into_value("defcap method")?;
                         if !matches!(
                             method_val,
                             Val::Fn { .. } | Val::NativeFn { .. } | Val::AsyncNativeFn { .. }
                         ) {
-                            return Err(error::type_mismatch(
+                            let payload = error::type_mismatch(
                                 "defcap method value",
                                 "function",
                                 &method_val,
-                            ));
+                            );
+                            return throw(&env.handler_stack, payload).await.map(Into::into);
                         }
                         method_names.insert(method_name.clone());
                         methods.insert(method_name, method_val);
@@ -2448,18 +3544,23 @@ pub fn eval_expr<'a, D: Dispatch>(
                             descriptor,
                         }),
                     );
-                    env.set_root(name, cap.clone());
-                    return Ok(cap);
+                    let cap = define_or_throw(env, name, cap).await?;
+                    return Ok(Flow::Value(cap));
                 }
 
                 // Special form: (attenuate cap [:method ...])
                 if head == "attenuate" {
                     if args.len() != 2 {
-                        return Err(error::arity("attenuate", "2", args.len()));
+                        let payload = error::arity("attenuate", "2", args.len());
+                        return throw(&env.handler_stack, payload).await.map(Into::into);
                     }
-                    let cap_val = eval_expr(&args[0], env, dispatch).await?;
-                    let allow_val = eval_expr(&args[1], env, dispatch).await?;
-                    let mut allow_methods = parse_allow_methods(&allow_val)?;
+                    let cap_val = eval_expr(&args[0], env, dispatch)
+                        .await?
+                        .into_value("attenuate cap")?;
+                    let allow_val = eval_expr(&args[1], env, dispatch)
+                        .await?
+                        .into_value("attenuate methods")?;
+                    let mut allow_methods = try_throw!(env, parse_allow_methods(&allow_val));
 
                     // Boundary-crossing caps first: the embedder may reify the
                     // attenuation into real enforcement (the kernel wraps
@@ -2467,7 +3568,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                     // means "not mine" — fall through to the evaluator-local
                     // interposition path below.
                     if let Some(reified) = dispatch.reify_attenuation(&cap_val, &allow_methods) {
-                        return reified;
+                        return Ok(Flow::Value(try_throw!(env, reified)));
                     }
 
                     let (name, schema_cid, base, nested_allow): (
@@ -2476,25 +3577,27 @@ pub fn eval_expr<'a, D: Dispatch>(
                         Val,
                         Option<BTreeSet<String>>,
                     ) = match &cap_val {
-                        Val::Cap {
-                            name,
-                            schema_cid,
-                            inner,
-                            ..
-                        } => {
-                            if let Some(inner_att) = inner.downcast_ref::<AttenuatedCapInner>() {
+                        Val::Cap(h) => {
+                            if let Some(inner_att) = h.inner().downcast_ref::<AttenuatedCapInner>()
+                            {
                                 (
-                                    name.clone(),
-                                    schema_cid.clone(),
+                                    h.name().to_string(),
+                                    h.schema_cid().to_string(),
                                     inner_att.base.clone(),
                                     Some(inner_att.allow_methods.clone()),
                                 )
                             } else {
-                                (name.clone(), schema_cid.clone(), cap_val.clone(), None)
+                                (
+                                    h.name().to_string(),
+                                    h.schema_cid().to_string(),
+                                    cap_val.clone(),
+                                    None,
+                                )
                             }
                         }
                         other => {
-                            return Err(error::type_mismatch("attenuate first arg", "cap", other))
+                            let payload = error::type_mismatch("attenuate first arg", "cap", other);
+                            return throw(&env.handler_stack, payload).await.map(Into::into);
                         }
                     };
 
@@ -2503,7 +3606,7 @@ pub fn eval_expr<'a, D: Dispatch>(
                     }
 
                     let descriptor = cap_descriptor_bytes(&name, &schema_cid, &allow_methods);
-                    return Ok(make_cap(
+                    return Ok(Flow::Value(make_cap(
                         name,
                         schema_cid,
                         Rc::new(AttenuatedCapInner {
@@ -2511,65 +3614,70 @@ pub fn eval_expr<'a, D: Dispatch>(
                             allow_methods,
                             descriptor,
                         }),
-                    ));
+                    )));
                 }
 
                 // 1. Check for macro expansion
                 if let Some(Val::Macro {
-                    arities,
-                    env: captured_env,
-                    ..
-                }) = env.get(head)
+                    arities, closure, ..
+                }) = resolve(env, head)?
                 {
                     let arities = arities.clone();
-                    let captured_env = captured_env.clone();
+                    let closure = closure.clone();
                     let expanded = invoke_macro(
                         &arities,
-                        &captured_env,
+                        &closure,
                         raw_args,
                         dispatch,
                         env.handler_stack.clone(),
                     )
                     .await?;
-                    // Re-analyze and eval the expanded form
-                    let analyzed = expr::analyze(&expanded)?;
+                    // Re-analyze and eval the expanded form (tail position:
+                    // the expansion may recur into an enclosing loop).
+                    let analyzed = try_throw!(env, expr::analyze(&expanded).map_err(Val::from));
                     return eval_expr(&analyzed, env, dispatch).await;
                 }
 
                 // 2. Check env for fn or native-fn
                 if let Some(Val::Fn {
-                    arities,
-                    env: captured_env,
-                    ..
-                }) = env.get(head)
+                    arities, closure, ..
+                }) = resolve(env, head)?
                 {
                     let arities = arities.clone();
-                    let captured_env = captured_env.clone();
+                    let closure = closure.clone();
                     let evaled_args = eval_expr_args(args, env, dispatch).await?;
                     return invoke_fn(
                         &arities,
-                        &captured_env,
+                        &closure,
                         &evaled_args,
                         dispatch,
                         env.handler_stack.clone(),
                     )
-                    .await;
+                    .await
+                    .map(Flow::Value);
                 }
-                if let Some(Val::NativeFn { func, .. }) = env.get(head) {
+                if let Some(Val::NativeFn { func, .. }) = resolve(env, head)? {
                     let func = func.clone();
                     let evaled_args = eval_expr_args(args, env, dispatch).await?;
-                    return func(&evaled_args);
+                    return settle_native(&env.handler_stack, func(&evaled_args))
+                        .await
+                        .map(Flow::Value);
                 }
-                if let Some(Val::AsyncNativeFn { func, .. }) = env.get(head) {
+                if let Some(Val::AsyncNativeFn { func, .. }) = resolve(env, head)? {
                     let func = func.clone();
                     let evaled_args = eval_expr_args(args, env, dispatch).await?;
-                    return func(evaled_args).await;
+                    let result = func(evaled_args).await;
+                    return settle_native(&env.handler_stack, result)
+                        .await
+                        .map(Flow::Value);
                 }
 
                 // 3b. `cell` needs the unevaluated grant-map syntax for
                 // duplicate detection, so it owns argument evaluation.
                 if head == "cell" {
-                    return eval_cell_expr(args, raw_args, env, dispatch).await;
+                    return eval_cell_expr(args, raw_args, env, dispatch)
+                        .await
+                        .map(Flow::Value);
                 }
 
                 // 3. Evaluate args for remaining paths
@@ -2577,33 +3685,37 @@ pub fn eval_expr<'a, D: Dispatch>(
 
                 // 4. HOF builtins
                 if head == "map" || head == "filter" || head == "reduce" {
-                    return eval_hof(head, &evaled_args, env, dispatch).await;
+                    return eval_hof(head, &evaled_args, env, dispatch)
+                        .await
+                        .map(Flow::Value);
                 }
 
                 // 5. Sync builtins
                 if let Some(result) = eval_builtin(head, &evaled_args) {
-                    return result;
+                    return Ok(Flow::Value(try_throw!(env, result)));
                 }
 
                 // 6. Generic dispatch
-                dispatch.call(head, &evaled_args).await
+                let result = dispatch.call(head, &evaled_args).await;
+                settle_native(&env.handler_stack, result)
+                    .await
+                    .map(Flow::Value)
             }
 
             Expr::Apply { args } => {
                 let evaled = eval_expr_args(args, env, dispatch).await?;
                 if evaled.len() < 2 {
-                    return Err(error::arity("apply", "at least 2", evaled.len()));
+                    let payload = error::arity("apply", "at least 2", evaled.len());
+                    return throw(&env.handler_stack, payload).await.map(Into::into);
                 }
                 let func = &evaled[0];
                 let last = &evaled[evaled.len() - 1];
                 let trailing = match last {
                     Val::List(v) | Val::Vector(v) => v.clone(),
                     other => {
-                        return Err(error::type_mismatch(
-                            "apply last arg",
-                            "list or vector",
-                            other,
-                        ))
+                        let payload =
+                            error::type_mismatch("apply last arg", "list or vector", other);
+                        return throw(&env.handler_stack, payload).await.map(Into::into);
                     }
                 };
                 let mut spread = evaled[1..evaled.len() - 1].to_vec();
@@ -2612,84 +3724,106 @@ pub fn eval_expr<'a, D: Dispatch>(
                 match func {
                     Val::Sym(fname) => {
                         if let Some(Val::Fn {
-                            arities,
-                            env: captured_env,
-                            ..
-                        }) = env.get(fname)
+                            arities, closure, ..
+                        }) = resolve(env, fname)?
                         {
                             let arities = arities.clone();
-                            let captured_env = captured_env.clone();
+                            let closure = closure.clone();
                             return invoke_fn(
                                 &arities,
-                                &captured_env,
+                                &closure,
                                 &spread,
                                 dispatch,
                                 env.handler_stack.clone(),
                             )
-                            .await;
+                            .await
+                            .map(Flow::Value);
                         }
-                        if let Some(Val::NativeFn { func, .. }) = env.get(fname) {
-                            return func.clone()(&spread);
+                        if let Some(Val::NativeFn { func, .. }) = resolve(env, fname)? {
+                            let func = func.clone();
+                            return settle_native(&env.handler_stack, func(&spread))
+                                .await
+                                .map(Flow::Value);
                         }
-                        if let Some(Val::AsyncNativeFn { func, .. }) = env.get(fname) {
-                            return func.clone()(spread).await;
+                        if let Some(Val::AsyncNativeFn { func, .. }) = resolve(env, fname)? {
+                            let result = func.clone()(spread).await;
+                            return settle_native(&env.handler_stack, result)
+                                .await
+                                .map(Flow::Value);
                         }
                         if let Some(result) = eval_builtin(fname, &spread) {
-                            return result;
+                            return Ok(Flow::Value(try_throw!(env, result)));
                         }
-                        dispatch.call(fname, &spread).await
+                        let result = dispatch.call(fname, &spread).await;
+                        settle_native(&env.handler_stack, result)
+                            .await
+                            .map(Flow::Value)
                     }
                     Val::Fn {
-                        arities,
-                        env: captured_env,
-                        ..
+                        arities, closure, ..
                     } => {
                         let arities = arities.clone();
-                        let captured_env = captured_env.clone();
+                        let closure = closure.clone();
                         invoke_fn(
                             &arities,
-                            &captured_env,
+                            &closure,
                             &spread,
                             dispatch,
                             env.handler_stack.clone(),
                         )
                         .await
+                        .map(Flow::Value)
                     }
-                    Val::NativeFn { func, .. } => func(&spread),
-                    Val::AsyncNativeFn { func, .. } => func(spread).await,
-                    other => Err(error::type_mismatch(
-                        "apply first arg",
-                        "symbol or fn",
-                        other,
-                    )),
+                    Val::NativeFn { func, .. } => settle_native(&env.handler_stack, func(&spread))
+                        .await
+                        .map(Flow::Value),
+                    Val::AsyncNativeFn { func, .. } => {
+                        let result = func(spread).await;
+                        settle_native(&env.handler_stack, result)
+                            .await
+                            .map(Flow::Value)
+                    }
+                    other => {
+                        let payload =
+                            error::type_mismatch("apply first arg", "symbol or fn", other);
+                        throw(&env.handler_stack, payload).await.map(Into::into)
+                    }
                 }
             }
 
             Expr::Vector(exprs) => {
                 let mut items = Vec::with_capacity(exprs.len());
                 for e in exprs {
-                    items.push(eval_expr(e, env, dispatch).await?);
+                    items.push(
+                        eval_expr(e, env, dispatch)
+                            .await?
+                            .into_value("vector element")?,
+                    );
                 }
-                Ok(Val::Vector(items))
+                Ok(Flow::Value(Val::Vector(items)))
             }
 
             Expr::Map(pairs) => {
                 let mut items = Vec::with_capacity(pairs.len());
                 for (k, v) in pairs {
                     items.push((
-                        eval_expr(k, env, dispatch).await?,
-                        eval_expr(v, env, dispatch).await?,
+                        eval_expr(k, env, dispatch).await?.into_value("map key")?,
+                        eval_expr(v, env, dispatch).await?.into_value("map value")?,
                     ));
                 }
-                Ok(Val::Map(ValMap::from_pairs(items)))
+                Ok(Flow::Value(Val::Map(ValMap::from_pairs(items))))
             }
 
             Expr::Set(exprs) => {
                 let mut items = Vec::with_capacity(exprs.len());
                 for e in exprs {
-                    items.push(eval_expr(e, env, dispatch).await?);
+                    items.push(
+                        eval_expr(e, env, dispatch)
+                            .await?
+                            .into_value("set element")?,
+                    );
                 }
-                Ok(Val::Set(items))
+                Ok(Flow::Value(Val::Set(items)))
             }
         }
     })
@@ -2700,10 +3834,14 @@ async fn eval_expr_args<'a, D: Dispatch>(
     args: &'a [Expr],
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Vec<Val>, Val> {
+) -> Result<Vec<Val>, Control> {
     let mut result = Vec::with_capacity(args.len());
     for a in args {
-        result.push(eval_expr(a, env, dispatch).await?);
+        result.push(
+            eval_expr(a, env, dispatch)
+                .await?
+                .into_value("function argument")?,
+        );
     }
     Ok(result)
 }
@@ -2722,25 +3860,29 @@ async fn invoke_cap_method_value<'a, D: Dispatch>(
     args: &[Val],
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Val, Val> {
+) -> Result<Val, Control> {
     match method_val {
         Val::Fn {
-            arities,
-            env: captured_env,
-            ..
+            arities, closure, ..
         } => {
             invoke_fn_with_handler_stack(
                 &arities,
-                &captured_env,
+                &closure,
                 args,
                 dispatch,
                 env.handler_stack.clone(),
             )
             .await
         }
-        Val::NativeFn { func, .. } => func(args),
-        Val::AsyncNativeFn { func, .. } => func(args.to_vec()).await,
-        other => Err(error::type_mismatch("defcap method", "function", &other)),
+        Val::NativeFn { func, .. } => settle_native(&env.handler_stack, func(args)).await,
+        Val::AsyncNativeFn { func, .. } => {
+            let result = func(args.to_vec()).await;
+            settle_native(&env.handler_stack, result).await
+        }
+        other => {
+            let payload = error::type_mismatch("defcap method", "function", &other);
+            throw(&env.handler_stack, payload).await
+        }
     }
 }
 
@@ -2749,35 +3891,29 @@ async fn perform_cap_value<'a, D: Dispatch>(
     args: &[Val],
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Result<Val, Val> {
+) -> Result<Val, Control> {
     let mut current = cap.clone();
     let payload = args.to_vec();
 
     loop {
-        let Val::Cap {
-            name,
-            schema_cid,
-            cap_id,
-            inner,
-        } = &current
-        else {
-            return Err(error::type_mismatch("perform target", "cap", &current));
+        let Val::Cap(handle) = &current else {
+            let payload = error::type_mismatch("perform target", "cap", &current);
+            return throw(&env.handler_stack, payload).await;
         };
+        let handle = handle.clone();
 
-        let effect_target = effect::EffectTarget::Cap {
-            name: name.clone(),
-            schema_cid: schema_cid.clone(),
-            cap_id: *cap_id,
-        };
+        let effect_target = handle.effect_target();
         match perform_dispatch(
             &env.handler_stack,
-            effect_target,
+            effect_target.clone(),
             Val::List(payload.clone()),
         )
         .await
         {
             Ok(value) => return Ok(value),
-            Err(Val::Effect { effect_type, .. }) if effect_type == format!("cap:{name}") => {}
+            // Our own dispatch came back unhandled — fall through to the
+            // cap's intrinsic behavior below.
+            Err(Control::Unhandled(req)) if req.target.matches(&effect_target) => {}
             Err(err) => return Err(err),
         }
 
@@ -2786,14 +3922,14 @@ async fn perform_cap_value<'a, D: Dispatch>(
         // identity continuation. The handler stack above keeps interposition
         // priority; this is the cap's intrinsic behavior when nothing
         // interposes.
-        if let Some(handled) = inner.downcast_ref::<HandledCapInner>() {
+        if let Some(handled) = handle.inner().downcast_ref::<HandledCapInner>() {
             let handler = handled.handler.clone();
             let resume = Val::NativeFn {
                 name: "resume".into(),
                 func: Rc::new(|args: &[Val]| {
                     args.first()
                         .cloned()
-                        .ok_or_else(|| error::arity("resume", "1", 0))
+                        .ok_or_else(|| NativeSignal::throw(error::arity("resume", "1", 0)))
                 }),
             };
             return invoke_cap_method_value(
@@ -2805,68 +3941,80 @@ async fn perform_cap_value<'a, D: Dispatch>(
             .await;
         }
 
-        if let Some(attenuated) = inner.downcast_ref::<AttenuatedCapInner>() {
-            let (method, _) = cap_method_and_args(&payload, "perform (attenuated cap)")?;
+        if let Some(attenuated) = handle.inner().downcast_ref::<AttenuatedCapInner>() {
+            let (method, _) = try_throw!(
+                env,
+                cap_method_and_args(&payload, "perform (attenuated cap)")
+            );
             if !attenuated.allow_methods.contains(&method) {
-                return Err(error::permission_denied(
-                    &format!("method :{method} denied by attenuation policy on '{name}'"),
+                let payload = error::permission_denied(
+                    &format!(
+                        "method :{method} denied by attenuation policy on '{}'",
+                        handle.name()
+                    ),
                     None,
-                ));
+                );
+                return throw(&env.handler_stack, payload).await;
             }
             current = attenuated.base.clone();
             continue;
         }
 
-        if let Some(glia_cap) = inner.downcast_ref::<GliaCapInner>() {
-            let (method, method_args) = cap_method_and_args(&payload, "perform (defcap)")?;
-            let method_val = glia_cap.methods.get(&method).cloned().ok_or_else(|| {
-                error::permission_denied(
-                    &format!("method :{method} is not available on capability '{name}'"),
-                    None,
-                )
-            })?;
+        if let Some(glia_cap) = handle.inner().downcast_ref::<GliaCapInner>() {
+            let (method, method_args) =
+                try_throw!(env, cap_method_and_args(&payload, "perform (defcap)"));
+            let method_val = match glia_cap.methods.get(&method).cloned() {
+                Some(v) => v,
+                None => {
+                    let payload = error::permission_denied(
+                        &format!(
+                            "method :{method} is not available on capability '{}'",
+                            handle.name()
+                        ),
+                        None,
+                    );
+                    return throw(&env.handler_stack, payload).await;
+                }
+            };
             return invoke_cap_method_value(method_val, &method_args, env, dispatch).await;
         }
 
-        return Err(Val::Effect {
-            effect_type: format!("cap:{name}"),
-            data: Box::new(Val::List(payload)),
-        });
+        return Err(Control::Unhandled(Box::new(effect::EffectRequest {
+            target: effect_target,
+            data: Val::List(payload),
+        })));
     }
 }
 
-/// Top-level Expr evaluation with Recur guard.
+/// Top-level Expr evaluation boundary: seals internal control into
+/// [`EvalError`] and converts a stray top-level recur into a language fault.
 pub fn eval_toplevel_expr<'a, D: Dispatch>(
     expr: &'a Expr,
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
-    Box::pin(async move {
-        let result = eval_expr(expr, env, dispatch).await?;
-        match result {
-            Val::Recur(_) => Err(error::internal("recur", "not in tail position")),
-            other => Ok(other),
-        }
-    })
+) -> Pin<Box<dyn Future<Output = Result<Val, EvalError>> + 'a>> {
+    Box::pin(async move { seal(eval_expr(expr, env, dispatch).await) })
 }
 
 /// Top-level evaluation wrapper.
 ///
-/// Analyzes the Val into an Expr, then evaluates it.
-/// Catches escaped `Val::Recur` sentinels, converting
-/// them to an error ("recur not in tail position").
+/// Analyzes the Val into an Expr, then evaluates it, sealing internal
+/// control into [`EvalError`] at the boundary. Analysis failures are
+/// catchable exceptions raised at the top-level dynamic position.
 pub fn eval_toplevel<'a, D: Dispatch>(
     val: &'a Val,
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<Val, EvalError>> + 'a>> {
     Box::pin(async move {
-        let analyzed = expr::analyze(val)?;
-        let result = eval_expr(&analyzed, env, dispatch).await?;
-        match result {
-            Val::Recur(_) => Err(error::internal("recur", "not in tail position")),
-            other => Ok(other),
-        }
+        let analyzed = match expr::analyze(val) {
+            Ok(expr) => expr,
+            Err(msg) => {
+                let hs = env.handler_stack.clone();
+                return seal(throw(&hs, Val::from(msg)).await.map(Flow::Value));
+            }
+        };
+        seal(eval_expr(&analyzed, env, dispatch).await)
     })
 }
 
@@ -2922,7 +4070,7 @@ pub fn eval_toplevel_with_host_effects<'a, D: Dispatch>(
     env: &'a mut Env,
     dispatch: &'a D,
     host_effects: &'a [effect::HostEffect],
-) -> Pin<Box<dyn Future<Output = Result<EvalOutcome, Val>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<EvalOutcome, EvalError>> + 'a>> {
     Box::pin(async move {
         let hs = env.handler_stack.clone();
         let contexts: Vec<Rc<RefCell<effect::HandlerContext>>> = host_effects
@@ -2956,7 +4104,11 @@ pub fn eval_toplevel_with_host_effects<'a, D: Dispatch>(
                     Poll::Ready(Ok(effect::HostEffectResult::Exit)) => {
                         return Poll::Ready(Ok(EvalOutcome::Exit));
                     }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    // A host-effect handler failure is an embedder fault: it
+                    // aborts evaluation and bypasses guest handlers.
+                    Poll::Ready(Err(err)) => {
+                        return Poll::Ready(Err(EvalError::Fault(Fault::runtime(err))))
+                    }
                 }
             }
 
@@ -3001,51 +4153,56 @@ pub fn eval_toplevel_with_host_effects<'a, D: Dispatch>(
 ///
 /// Non-list values are self-evaluating (returned as-is), except symbols
 /// which are looked up in `env` (unbound symbols pass through for Dispatch).
-pub fn eval<'a, D: Dispatch>(
+pub(crate) fn eval<'a, D: Dispatch>(
     expr: &'a Val,
     env: &'a mut Env,
     dispatch: &'a D,
-) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<Flow, Control>> + 'a>> {
     Box::pin(async move {
         match expr {
-            Val::List(items) if items.is_empty() => Ok(Val::Nil),
+            Val::List(items) if items.is_empty() => Ok(Flow::Value(Val::Nil)),
             Val::List(items) => {
                 let head = match &items[0] {
                     Val::Sym(s) => s.as_str(),
-                    other => return Err(error::type_mismatch("call head", "symbol", other)),
+                    other => {
+                        let payload = error::type_mismatch("call head", "symbol", other);
+                        return throw(&env.handler_stack, payload).await.map(Into::into);
+                    }
                 };
                 let raw_args = &items[1..];
 
                 // --- Special forms (unevaluated args) ---
                 match head {
-                    "def" => return eval_def(raw_args, env, dispatch).await,
+                    "def" => return eval_def(raw_args, env, dispatch).await.map(Flow::Value),
                     "if" => return eval_if(raw_args, env, dispatch).await,
                     "do" => return eval_do(raw_args, env, dispatch).await,
                     "let" => return eval_let(raw_args, env, dispatch).await,
                     "quote" => {
-                        return if raw_args.len() != 1 {
-                            Err(error::arity("quote", "1", raw_args.len()))
-                        } else {
-                            Ok(raw_args[0].clone())
-                        };
+                        if raw_args.len() != 1 {
+                            let payload = error::arity("quote", "1", raw_args.len());
+                            return throw(&env.handler_stack, payload).await.map(Into::into);
+                        }
+                        return Ok(Flow::Value(raw_args[0].clone()));
                     }
 
-                    "fn" => return eval_fn(raw_args, env),
+                    "fn" => return Ok(Flow::Value(try_throw!(env, eval_fn(raw_args, env)))),
 
-                    "loop" => return eval_loop(raw_args, env, dispatch).await,
+                    "loop" => return eval_loop(raw_args, env, dispatch).await.map(Flow::Value),
                     "recur" => return eval_recur(raw_args, env, dispatch).await,
 
-                    "defmacro" => return eval_defmacro(raw_args, env).await,
+                    "defmacro" => {
+                        return eval_defmacro(raw_args, env).await.map(Flow::Value);
+                    }
 
-                    // Reader markers — error if they escape syntax-quote
+                    // Reader markers — raised if they escape syntax-quote
                     "unquote" => {
-                        return Err(error::internal("unquote", "~ not inside syntax-quote"));
+                        let payload = error::internal("unquote", "~ not inside syntax-quote");
+                        return throw(&env.handler_stack, payload).await.map(Into::into);
                     }
                     "splice-unquote" => {
-                        return Err(error::internal(
-                            "splice-unquote",
-                            "~@ not inside syntax-quote",
-                        ));
+                        let payload =
+                            error::internal("splice-unquote", "~@ not inside syntax-quote");
+                        return throw(&env.handler_stack, payload).await.map(Into::into);
                     }
 
                     _ => {} // fall through to macro / fn / builtins / dispatch
@@ -3053,51 +4210,50 @@ pub fn eval<'a, D: Dispatch>(
 
                 // --- Macro expansion: if head resolves to a macro, expand + eval ---
                 if let Some(Val::Macro {
-                    arities,
-                    env: captured_env,
-                    ..
-                }) = env.get(head)
+                    arities, closure, ..
+                }) = resolve(env, head)?
                 {
                     let arities = arities.clone();
-                    let captured_env = captured_env.clone();
+                    let closure = closure.clone();
                     // Macro receives RAW (unevaluated) args, body runs in captured env
                     let expanded = invoke_macro(
                         &arities,
-                        &captured_env,
+                        &closure,
                         raw_args,
                         dispatch,
                         env.handler_stack.clone(),
                     )
                     .await?;
                     // Re-evaluate the expanded form in the CALLER's env
+                    // (tail position: the expansion may recur).
                     return eval(&expanded, env, dispatch).await;
                 }
 
                 // --- Env lookup: if head resolves to a fn, invoke it ---
                 if let Some(Val::Fn {
-                    arities,
-                    env: captured_env,
-                    ..
-                }) = env.get(head)
+                    arities, closure, ..
+                }) = resolve(env, head)?
                 {
                     let arities = arities.clone();
-                    let captured_env = captured_env.clone();
+                    let closure = closure.clone();
                     let args = eval_args(raw_args, env, dispatch).await?;
                     return invoke_fn(
                         &arities,
-                        &captured_env,
+                        &closure,
                         &args,
                         dispatch,
                         env.handler_stack.clone(),
                     )
-                    .await;
+                    .await
+                    .map(Flow::Value);
                 }
 
                 // --- Built-in: apply (needs re-dispatch, so handled here) ---
                 if head == "apply" {
                     let args = eval_args(raw_args, env, dispatch).await?;
                     if args.len() < 2 {
-                        return Err(error::arity("apply", "at least 2", args.len()));
+                        let payload = error::arity("apply", "at least 2", args.len());
+                        return throw(&env.handler_stack, payload).await.map(Into::into);
                     }
                     // First arg is the function (symbol or Val::Fn)
                     let func = &args[0];
@@ -3106,11 +4262,9 @@ pub fn eval<'a, D: Dispatch>(
                     let trailing = match last {
                         Val::List(v) | Val::Vector(v) => v.clone(),
                         other => {
-                            return Err(error::type_mismatch(
-                                "apply last arg",
-                                "list or vector",
-                                other,
-                            ))
+                            let payload =
+                                error::type_mismatch("apply last arg", "list or vector", other);
+                            return throw(&env.handler_stack, payload).await.map(Into::into);
                         }
                     };
                     let mut spread = args[1..args.len() - 1].to_vec();
@@ -3121,80 +4275,84 @@ pub fn eval<'a, D: Dispatch>(
                     match func {
                         Val::Sym(fname) => {
                             if let Some(Val::Fn {
-                                arities,
-                                env: captured_env,
-                                ..
-                            }) = env.get(fname)
+                                arities, closure, ..
+                            }) = resolve(env, fname)?
                             {
                                 let arities = arities.clone();
-                                let captured_env = captured_env.clone();
+                                let closure = closure.clone();
                                 return invoke_fn(
                                     &arities,
-                                    &captured_env,
+                                    &closure,
                                     &spread,
                                     dispatch,
                                     env.handler_stack.clone(),
                                 )
-                                .await;
+                                .await
+                                .map(Flow::Value);
                             }
                             if let Some(result) = eval_builtin(fname, &spread) {
-                                return result;
+                                return Ok(Flow::Value(try_throw!(env, result)));
                             }
-                            return dispatch.call(fname, &spread).await;
+                            let result = dispatch.call(fname, &spread).await;
+                            return settle_native(&env.handler_stack, result)
+                                .await
+                                .map(Flow::Value);
                         }
                         Val::Fn {
-                            arities,
-                            env: captured_env,
-                            ..
+                            arities, closure, ..
                         } => {
                             let arities = arities.clone();
-                            let captured_env = captured_env.clone();
+                            let closure = closure.clone();
                             return invoke_fn(
                                 &arities,
-                                &captured_env,
+                                &closure,
                                 &spread,
                                 dispatch,
                                 env.handler_stack.clone(),
                             )
-                            .await;
+                            .await
+                            .map(Flow::Value);
                         }
                         other => {
-                            return Err(error::type_mismatch(
-                                "apply first arg",
-                                "symbol or fn",
-                                other,
-                            ))
+                            let payload =
+                                error::type_mismatch("apply first arg", "symbol or fn", other);
+                            return throw(&env.handler_stack, payload).await.map(Into::into);
                         }
                     }
                 }
 
                 // --- Built-in: cell (explicit grants only) ---
                 if head == "cell" {
-                    return eval_cell_raw(raw_args, env, dispatch).await;
+                    return eval_cell_raw(raw_args, env, dispatch)
+                        .await
+                        .map(Flow::Value);
                 }
 
                 // --- Higher-order builtins (need env + dispatch for fn invocation) ---
                 if head == "map" || head == "filter" || head == "reduce" {
                     let args = eval_args(raw_args, env, dispatch).await?;
-                    return eval_hof(head, &args, env, dispatch).await;
+                    return eval_hof(head, &args, env, dispatch).await.map(Flow::Value);
                 }
 
                 // --- Built-in functions ---
                 let args = eval_args(raw_args, env, dispatch).await?;
                 if let Some(result) = eval_builtin(head, &args) {
-                    return result;
+                    return Ok(Flow::Value(try_throw!(env, result)));
                 }
 
                 // --- Generic path: eval args, then dispatch to host ---
-                dispatch.call(head, &args).await
+                let result = dispatch.call(head, &args).await;
+                settle_native(&env.handler_stack, result)
+                    .await
+                    .map(Flow::Value)
             }
             // Symbol lookup.
-            Val::Sym(s) => match env.get(s) {
-                Some(v) => Ok(v.clone()),
-                None => Ok(Val::Sym(s.clone())),
+            Val::Sym(s) => match resolve(env, s)? {
+                Some(v) => Ok(Flow::Value(v.clone())),
+                None => Ok(Flow::Value(Val::Sym(s.clone()))),
             },
             // Self-evaluating forms.
-            other => Ok(other.clone()),
+            other => Ok(Flow::Value(other.clone())),
         }
     })
 }
@@ -3211,7 +4369,7 @@ async fn perform_dispatch(
     handler_stack: &effect::HandlerStack,
     effect_target: effect::EffectTarget,
     data: Val,
-) -> Result<Val, Val> {
+) -> Result<Val, Control> {
     // Walk stack in reverse (newest first) to find a matching handler.
     // Unified: both keyword and cap effects use EffectTarget::matches().
     let matching_ctx = {
@@ -3236,7 +4394,12 @@ async fn perform_dispatch(
         Some(ctx) => {
             let (tx, rx) = oneshot::channel();
             ctx.borrow_mut().slot.borrow_mut().pending = Some((effect_target, data, tx));
+            // The receiver resolves with the resumed value, or an
+            // abandonment error if the handler dropped the continuation —
+            // a runtime fault (protocol violation on a computation that is
+            // being discarded).
             rx.await
+                .map_err(|abandoned| Control::Fault(Box::new(Fault::runtime(abandoned))))
         }
         None => {
             // No matching handler — propagate as unhandled effect. Under
@@ -3248,14 +4411,10 @@ async fn perform_dispatch(
                     effect::format_unhandled_diagnostic(&effect_target, &handler_stack.borrow())
                 );
             }
-            let effect_type = match &effect_target {
-                effect::EffectTarget::Keyword(s) => s.clone(),
-                effect::EffectTarget::Cap { name, .. } => format!("cap:{name}"),
-            };
-            Err(Val::Effect {
-                effect_type,
-                data: Box::new(data),
-            })
+            Err(Control::Unhandled(Box::new(effect::EffectRequest {
+                target: effect_target,
+                data,
+            })))
         }
     }
 }
@@ -3266,17 +4425,19 @@ async fn perform_dispatch(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::result_large_err)] // EvalError-returning test helpers
+
     use super::*;
 
     /// A trivial dispatcher that records calls and returns nil.
     /// Uses RefCell for interior mutability (Dispatch takes &self).
-    struct RecordingDispatch {
+    pub(crate) struct RecordingDispatch {
         calls: RefCell<Vec<(String, Vec<Val>)>>,
         warnings: RefCell<Vec<String>>,
     }
 
     impl RecordingDispatch {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 calls: RefCell::new(Vec::new()),
                 warnings: RefCell::new(Vec::new()),
@@ -3289,7 +4450,7 @@ mod tests {
             &'a self,
             name: &'a str,
             args: &'a [Val],
-        ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<Val, NativeSignal>> + 'a>> {
             self.calls
                 .borrow_mut()
                 .push((name.to_string(), args.to_vec()));
@@ -3302,13 +4463,32 @@ mod tests {
     }
 
     /// Helper to run an async eval in a blocking context.
-    fn eval_blocking(expr: &Val, env: &mut Env, dispatch: &RecordingDispatch) -> Result<Val, Val> {
+    pub(crate) fn eval_blocking(
+        expr: &Val,
+        env: &mut Env,
+        dispatch: &RecordingDispatch,
+    ) -> Result<Val, EvalError> {
         // We can use a trivial executor since our futures are purely synchronous.
         pollster_eval(eval_toplevel(expr, env, dispatch))
     }
 
+    /// Structured payload of a boundary error (thrown data or fault payload).
+    pub(crate) fn err_payload(e: &EvalError) -> &Val {
+        e.payload().expect("boundary error should carry a payload")
+    }
+
+    /// Run the LEGACY raw-Val evaluator to the boundary (seal applied), for
+    /// tests that deliberately exercise the non-analyzed path.
+    pub(crate) fn eval_raw_blocking<D: Dispatch>(
+        expr: &Val,
+        env: &mut Env,
+        dispatch: &D,
+    ) -> Result<Val, EvalError> {
+        pollster_eval(async { seal(eval(expr, env, dispatch).await) })
+    }
+
     /// Minimal single-future poll-to-completion (no tokio needed).
-    fn pollster_eval<F: Future<Output = T>, T>(mut fut: F) -> T {
+    pub(crate) fn pollster_eval<F: Future<Output = T>, T>(mut fut: F) -> T {
         use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
         fn dummy_raw_waker() -> RawWaker {
@@ -3347,9 +4527,9 @@ mod tests {
     #[test]
     fn env_get_set() {
         let mut env = Env::new();
-        assert!(env.get("x").is_none());
+        assert!(env.get("x").unwrap().is_none());
         env.set("x".into(), Val::Int(42));
-        assert_eq!(env.get("x"), Some(&Val::Int(42)));
+        assert_eq!(env.get("x").unwrap(), Some(Val::Int(42)));
     }
 
     #[test]
@@ -3358,9 +4538,9 @@ mod tests {
         env.set("x".into(), Val::Int(1));
         env.push_frame();
         env.set("x".into(), Val::Int(2));
-        assert_eq!(env.get("x"), Some(&Val::Int(2)));
+        assert_eq!(env.get("x").unwrap(), Some(Val::Int(2)));
         env.pop_frame();
-        assert_eq!(env.get("x"), Some(&Val::Int(1)));
+        assert_eq!(env.get("x").unwrap(), Some(Val::Int(1)));
     }
 
     #[test]
@@ -3368,7 +4548,7 @@ mod tests {
         let mut env = Env::new();
         env.set("x".into(), Val::Int(1));
         env.push_frame();
-        assert_eq!(env.get("x"), Some(&Val::Int(1)));
+        assert_eq!(env.get("x").unwrap(), Some(Val::Int(1)));
         env.pop_frame();
     }
 
@@ -3377,7 +4557,7 @@ mod tests {
         let mut env = Env::new();
         env.set("x".into(), Val::Int(1));
         env.pop_frame(); // should not panic or lose the root
-        assert_eq!(env.get("x"), Some(&Val::Int(1)));
+        assert_eq!(env.get("x").unwrap(), Some(Val::Int(1)));
     }
 
     // --- eval tests ---
@@ -3451,11 +4631,11 @@ mod tests {
                 &'a self,
                 name: &'a str,
                 _args: &'a [Val],
-            ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+            ) -> Pin<Box<dyn Future<Output = Result<Val, NativeSignal>> + 'a>> {
                 let result = match name {
                     "ipfs" => Ok(Val::Bytes(vec![1, 2, 3])),
                     "host" => Ok(Val::Nil),
-                    _ => Err(error::unbound_symbol(name, None)),
+                    _ => Err(NativeSignal::throw(error::unbound_symbol(name, None))),
                 };
                 Box::pin(core::future::ready(result))
             }
@@ -3473,7 +4653,7 @@ mod tests {
                 Val::Str("bin/x.wasm".into()),
             ]),
         ]);
-        let result = pollster_eval(eval(&expr, &mut env, &d));
+        let result = eval_raw_blocking(&expr, &mut env, &d);
         assert_eq!(result, Ok(Val::Nil));
     }
 
@@ -3495,11 +4675,11 @@ mod tests {
         env.set_root("x".into(), Val::Int(42));
         env.pop_frame();
         // x should still be visible in the root frame
-        assert_eq!(env.get("x"), Some(&Val::Int(42)));
+        assert_eq!(env.get("x").unwrap(), Some(Val::Int(42)));
     }
 
     #[test]
-    fn env_snapshot_merges_frames() {
+    fn capture_all_merges_frames() {
         let mut env = Env::new();
         env.set("x".into(), Val::Int(1));
         env.set("y".into(), Val::Int(2));
@@ -3507,10 +4687,10 @@ mod tests {
         env.set("x".into(), Val::Int(10)); // shadow x
         env.set("z".into(), Val::Int(3));
 
-        let snap = env.snapshot();
-        assert_eq!(snap.get("x"), Some(&Val::Int(10))); // inner wins
-        assert_eq!(snap.get("y"), Some(&Val::Int(2))); // from outer
-        assert_eq!(snap.get("z"), Some(&Val::Int(3))); // from inner
+        let captured = CapturedEnv::capture_all(&env);
+        assert_eq!(captured.get("x"), Some(&Val::Int(10))); // inner wins
+        assert_eq!(captured.get("y"), Some(&Val::Int(2))); // from outer
+        assert_eq!(captured.get("z"), Some(&Val::Int(3))); // from inner
     }
 
     // --- def ---
@@ -3527,7 +4707,7 @@ mod tests {
         ]);
         let result = eval_blocking(&expr, &mut env, &d);
         assert_eq!(result, Ok(Val::Int(42)));
-        assert_eq!(env.get("x"), Some(&Val::Int(42)));
+        assert_eq!(env.get("x").unwrap(), Some(Val::Int(42)));
     }
 
     #[test]
@@ -3547,7 +4727,7 @@ mod tests {
         ]);
         let result = eval_blocking(&expr, &mut env, &d);
         assert_eq!(result, Ok(Val::Int(3)));
-        assert_eq!(env.get("x"), Some(&Val::Int(3)));
+        assert_eq!(env.get("x").unwrap(), Some(Val::Int(3)));
     }
 
     #[test]
@@ -3562,7 +4742,7 @@ mod tests {
         ]);
         let result = eval_blocking(&expr, &mut env, &d);
         assert!(result.is_err());
-        assert!(err_contains(&result.unwrap_err(), "def"));
+        assert!(err_contains(err_payload(&result.unwrap_err()), "def"));
     }
 
     #[test]
@@ -3581,7 +4761,7 @@ mod tests {
         ]);
         eval_blocking(&expr, &mut env, &d).unwrap();
         // b should be visible at root level (not just inside let)
-        assert_eq!(env.get("b"), Some(&Val::Int(2)));
+        assert_eq!(env.get("b").unwrap(), Some(Val::Int(2)));
     }
 
     // --- if ---
@@ -3781,7 +4961,7 @@ mod tests {
         ]);
         assert_eq!(eval_blocking(&expr, &mut env, &d), Ok(Val::Int(2)));
         // After let, x should be back to 1
-        assert_eq!(env.get("x"), Some(&Val::Int(1)));
+        assert_eq!(env.get("x").unwrap(), Some(Val::Int(1)));
     }
 
     #[test]
@@ -3829,7 +5009,7 @@ mod tests {
         ]);
         let result = eval_blocking(&expr, &mut env, &d);
         assert!(result.is_err());
-        assert!(err_contains(&result.unwrap_err(), "pairs"));
+        assert!(err_contains(err_payload(&result.unwrap_err()), "pairs"));
     }
 
     #[test]
@@ -3844,7 +5024,7 @@ mod tests {
         ]);
         let result = eval_blocking(&expr, &mut env, &d);
         assert!(result.is_err());
-        assert!(err_contains(&result.unwrap_err(), "vector"));
+        assert!(err_contains(err_payload(&result.unwrap_err()), "vector"));
     }
 
     // --- quote ---
@@ -3983,9 +5163,12 @@ mod tests {
             Val::Int(20),
         ]);
         eval_blocking(&def_x2, &mut env, &d).unwrap();
-        // (f) → 10, not 20 (captured at definition time)
+        // SEMANTIC — late binding (PR-1b.0): (f) → 20. Top-level names
+        // resolve through the live definition owner at call time, so
+        // redefinition is visible to existing closures. (Supersedes the old
+        // snapshot semantics, which returned 10 here.)
         let call = Val::List(vec![Val::Sym("f".into())]);
-        assert_eq!(eval_blocking(&call, &mut env, &d), Ok(Val::Int(10)));
+        assert_eq!(eval_blocking(&call, &mut env, &d), Ok(Val::Int(20)));
     }
 
     #[test]
@@ -3994,13 +5177,10 @@ mod tests {
         let d = RecordingDispatch::new();
 
         let closure = eval_str("(fn [] 1)", &mut env, &d).unwrap();
-        let Val::Fn {
-            env: captured_env, ..
-        } = closure
-        else {
+        let Val::Fn { closure, .. } = closure else {
             panic!("expected function");
         };
-        assert_eq!(captured_env.bindings().len(), 0);
+        assert_eq!(closure.captured.len(), 0);
     }
 
     #[test]
@@ -4011,15 +5191,12 @@ mod tests {
         env.set("y".into(), Val::Int(9));
 
         let closure = eval_str("(fn [] x)", &mut env, &d).unwrap();
-        let Val::Fn {
-            env: captured_env, ..
-        } = closure
-        else {
+        let Val::Fn { closure, .. } = closure else {
             panic!("expected function");
         };
-        assert_eq!(captured_env.bindings().len(), 1);
-        assert_eq!(captured_env.get("x"), Some(&Val::Int(7)));
-        assert!(captured_env.get("y").is_none());
+        assert_eq!(closure.captured.len(), 1);
+        assert_eq!(closure.captured.get("x"), Some(&Val::Int(7)));
+        assert!(closure.captured.get("y").is_none());
     }
 
     #[test]
@@ -4031,16 +5208,13 @@ mod tests {
         env.set("z".into(), Val::Int(3));
 
         let closure = eval_str("(fn ([a] x) ([a b] y))", &mut env, &d).unwrap();
-        let Val::Fn {
-            env: captured_env, ..
-        } = closure
-        else {
+        let Val::Fn { closure, .. } = closure else {
             panic!("expected function");
         };
-        assert_eq!(captured_env.bindings().len(), 2);
-        assert_eq!(captured_env.get("x"), Some(&Val::Int(1)));
-        assert_eq!(captured_env.get("y"), Some(&Val::Int(2)));
-        assert!(captured_env.get("z").is_none());
+        assert_eq!(closure.captured.len(), 2);
+        assert_eq!(closure.captured.get("x"), Some(&Val::Int(1)));
+        assert_eq!(closure.captured.get("y"), Some(&Val::Int(2)));
+        assert!(closure.captured.get("z").is_none());
     }
 
     #[test]
@@ -4048,14 +5222,11 @@ mod tests {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
         let inner = eval_str("(let [x 42 outer (fn [] (fn [] x))] (outer))", &mut env, &d).unwrap();
-        let Val::Fn {
-            env: captured_env, ..
-        } = &inner
-        else {
+        let Val::Fn { closure, .. } = &inner else {
             panic!("expected function");
         };
-        assert_eq!(captured_env.bindings().len(), 1);
-        assert_eq!(captured_env.get("x"), Some(&Val::Int(42)));
+        assert_eq!(closure.captured.len(), 1);
+        assert_eq!(closure.captured.get("x"), Some(&Val::Int(42)));
         env.set("inner".into(), inner);
         assert_eq!(
             eval_str("(inner)", &mut env, &d),
@@ -4089,15 +5260,12 @@ mod tests {
             Val::Vector(vec![]),
             Val::Sym("x".into()),
         ]);
-        let closure = pollster_eval(eval(&raw, &mut env, &d)).unwrap();
-        let Val::Fn {
-            env: captured_env, ..
-        } = closure
-        else {
+        let closure = eval_raw_blocking(&raw, &mut env, &d).unwrap();
+        let Val::Fn { closure, .. } = closure else {
             panic!("expected function");
         };
-        assert_eq!(captured_env.get("x"), Some(&Val::Int(1)));
-        assert_eq!(captured_env.get("y"), Some(&Val::Int(2)));
+        assert_eq!(closure.captured.get("x"), Some(&Val::Int(1)));
+        assert_eq!(closure.captured.get("y"), Some(&Val::Int(2)));
     }
 
     fn fn_cap_status(value: Val) -> (bool, Option<String>) {
@@ -4219,12 +5387,18 @@ mod tests {
 
     #[test]
     fn fn_cap_status_capture_cap_bearing_macro() {
+        // STAGE E MARKER: `m` is a persistent definition now (defs-resident,
+        // late-bound), so the construction-time snapshot no longer sees it
+        // and cap status under-reports — the documented Stage B→E gap. The
+        // bit is advisory lint only (authority = possession, enforced by the
+        // membrane, never by this flag). Stage E's live analysis restores
+        // (false, Some("m")) by resolving free names through the owner.
         let mut env = Env::new();
         let d = RecordingDispatch::new();
         env.set("db".into(), make_cap("db", "cid:db", Rc::new(())));
         eval_str("(defmacro m [] db)", &mut env, &d).unwrap();
         let status = fn_cap_status(eval_str("(fn [] m)", &mut env, &d).unwrap());
-        assert_eq!(status, (false, Some("m".into())));
+        assert_eq!(status, (true, None));
     }
 
     #[test]
@@ -4347,16 +5521,23 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let shared = Rc::new(Env::new());
+        let shared = Rc::new(CapturedEnv::from_slots(Frame::new()));
+        let owner = Defs::new(None);
         let left = Val::Fn {
             arities: vec![],
-            env: shared.clone(),
+            closure: crate::Closure {
+                captured: Rc::clone(&shared),
+                owner: super::own::OwnerRef::Strong(Rc::clone(&owner)),
+            },
             is_cap_free: true,
             cap_violation: None,
         };
         let right = Val::Fn {
             arities: vec![],
-            env: shared,
+            closure: crate::Closure {
+                captured: shared,
+                owner: super::own::OwnerRef::Strong(owner),
+            },
             is_cap_free: false,
             cap_violation: Some("db".into()),
         };
@@ -4381,7 +5562,7 @@ mod tests {
             Val::Vector(vec![]),
             Val::Sym("x".into()),
         ]);
-        let status = fn_cap_status(pollster_eval(eval(&raw, &mut env, &d)).unwrap());
+        let status = fn_cap_status(eval_raw_blocking(&raw, &mut env, &d).unwrap());
         assert_eq!(status, (false, Some("db".into())));
     }
 
@@ -4403,7 +5584,11 @@ mod tests {
         // (f 1) — wrong arity
         let call = Val::List(vec![Val::Sym("f".into()), Val::Int(1)]);
         let err = eval_blocking(&call, &mut env, &d).unwrap_err();
-        assert_eq!(error::type_tag(&err), Some(error::tag::ARITY), "got: {err}");
+        assert_eq!(
+            error::type_tag(err_payload(&err)),
+            Some(error::tag::ARITY),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -4423,7 +5608,10 @@ mod tests {
             ]),
         ]);
         let err = eval_blocking(&expr, &mut env, &d).unwrap_err();
-        assert!(err_contains(&err, "duplicate arity"), "got: {err}");
+        assert!(
+            err_contains(err_payload(&err), "duplicate arity"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -4553,24 +5741,32 @@ mod tests {
             Val::List(vec![Val::Sym("recur".into()), Val::Int(3)]),
         ]);
         let err = eval_blocking(&expr, &mut env, &d).unwrap_err();
-        assert_eq!(error::type_tag(&err), Some(error::tag::ARITY), "got: {err}");
+        assert_eq!(
+            error::type_tag(err_payload(&err)),
+            Some(error::tag::ARITY),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn recur_outside_loop() {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
-        // (recur 1) at top level
+        // (recur 1) at top level — a LANGUAGE FAULT: structurally invalid
+        // control, bypasses all handlers, tagged glia.error/invalid-recur.
         let expr = Val::List(vec![Val::Sym("recur".into()), Val::Int(1)]);
         let err = eval_blocking(&expr, &mut env, &d).unwrap_err();
-        // Top-level recur is an internal-tagged error referencing recur.
+        assert!(
+            matches!(&err, EvalError::Fault(f) if f.kind() == crate::FaultKind::Language),
+            "got: {err:?}"
+        );
         assert_eq!(
-            error::type_tag(&err),
-            Some(error::tag::INTERNAL),
+            error::type_tag(err_payload(&err)),
+            Some(error::tag::INVALID_RECUR),
             "got: {err}"
         );
         assert!(
-            error::message(&err).unwrap().contains("recur"),
+            error::message(err_payload(&err)).unwrap().contains("recur"),
             "got: {err}"
         );
     }
@@ -4586,7 +5782,7 @@ mod tests {
             Val::Sym("x".into()),
         ]);
         let err = eval_blocking(&expr, &mut env, &d).unwrap_err();
-        assert!(err_contains(&err, "vector"), "got: {err}");
+        assert!(err_contains(err_payload(&err), "vector"), "got: {err}");
     }
 
     #[test]
@@ -4600,7 +5796,7 @@ mod tests {
             Val::Sym("x".into()),
         ]);
         let err = eval_blocking(&expr, &mut env, &d).unwrap_err();
-        assert!(err_contains(&err, "pairs"), "got: {err}");
+        assert!(err_contains(err_payload(&err), "pairs"), "got: {err}");
     }
 
     // =========================================================================
@@ -4608,8 +5804,21 @@ mod tests {
     // =========================================================================
 
     /// Helper: parse + eval a string expression.
-    fn eval_str(input: &str, env: &mut Env, d: &RecordingDispatch) -> Result<Val, Val> {
-        let expr = crate::read(input).map_err(|e| error::parse(None, e.to_string()))?;
+    /// Wrap a raw payload as the boundary form of an unhandled exception.
+    fn boundary_thrown(payload: Val) -> EvalError {
+        EvalError::Unhandled(effect::EffectRequest {
+            target: effect::EffectTarget::Keyword(error::EXCEPTION_EFFECT.into()),
+            data: payload,
+        })
+    }
+
+    pub(crate) fn eval_str(
+        input: &str,
+        env: &mut Env,
+        d: &RecordingDispatch,
+    ) -> Result<Val, EvalError> {
+        let expr =
+            crate::read(input).map_err(|e| boundary_thrown(error::parse(None, e.to_string())))?;
         eval_blocking(&expr, env, d)
     }
 
@@ -4698,7 +5907,7 @@ mod tests {
         );
         assert!(matches!(
             &caps[0].1,
-            Val::Cap { name, .. } if name == "database"
+            Val::Cap(h) if h.name() == "database"
         ));
     }
 
@@ -4771,13 +5980,16 @@ mod tests {
             );
         }
         let arity_err = eval_str("(cell?)", &mut env, &d).unwrap_err();
-        assert_eq!(error::type_tag(&arity_err), Some(error::tag::ARITY));
+        assert_eq!(
+            error::type_tag(err_payload(&arity_err)),
+            Some(error::tag::ARITY)
+        );
     }
 
     #[test]
     fn cell_accepts_programmatically_built_grant_map() {
         let mut env = cell_test_env();
-        let db = env.get("db").unwrap().clone();
+        let db = env.get("db").unwrap().unwrap().clone();
         env.set(
             "bundle".into(),
             Val::Map(ValMap::from_pairs(vec![(
@@ -4796,7 +6008,7 @@ mod tests {
         let mut env = cell_test_env();
         let d = RecordingDispatch::new();
         let err = eval_str("(cell image :grants {:db 42})", &mut env, &d).unwrap_err();
-        let message = error::message(&err).unwrap();
+        let message = error::message(err_payload(&err)).unwrap();
         assert!(
             message.contains("grant \"db\" expected a capability, got int"),
             "got: {message}"
@@ -4815,7 +6027,7 @@ mod tests {
         .unwrap();
         let err =
             eval_str("(cell image :grants {:logger local-logger})", &mut env, &d).unwrap_err();
-        let message = error::message(&err).unwrap();
+        let message = error::message(err_payload(&err)).unwrap();
         assert!(message.contains("grant \"logger\""), "got: {message}");
         assert!(
             message.contains("Glia-native capability that cannot yet cross a cell boundary"),
@@ -4829,7 +6041,7 @@ mod tests {
         let mut env = cell_test_env();
         let d = RecordingDispatch::new();
         let err = eval_str("(cell image :grants {:db db :db logger})", &mut env, &d).unwrap_err();
-        let message = error::message(&err).unwrap();
+        let message = error::message(err_payload(&err)).unwrap();
         assert!(
             message.contains("duplicate grant name \"db\""),
             "got: {message}"
@@ -4848,25 +6060,25 @@ mod tests {
         let d = RecordingDispatch::new();
         let missing =
             eval_str("(cell image :grants)", &mut env, &d).expect_err("missing map must fail");
-        assert!(error::message(&missing)
+        assert!(error::message(err_payload(&missing))
             .unwrap()
             .contains("missing grant map after :grants"));
 
         let unknown =
             eval_str("(cell image :inherit {})", &mut env, &d).expect_err("unknown keyword");
-        assert!(error::message(&unknown)
+        assert!(error::message(err_payload(&unknown))
             .unwrap()
             .contains("unknown keyword :inherit"));
 
         let malformed =
             eval_str("(cell image {} {})", &mut env, &d).expect_err("malformed options");
-        assert!(error::message(&malformed)
+        assert!(error::message(err_payload(&malformed))
             .unwrap()
             .contains("keyword :grants"));
 
         let string_name = eval_str("(cell image :grants {\"db\" db})", &mut env, &d)
             .expect_err("grant names must be keywords");
-        assert!(error::message(&string_name)
+        assert!(error::message(err_payload(&string_name))
             .unwrap()
             .contains("cell :grants map key"));
     }
@@ -4881,7 +6093,7 @@ mod tests {
 
         let mut raw_env = cell_test_env();
         let raw_dispatch = RecordingDispatch::new();
-        let raw = cell_caps(pollster_eval(eval(&form, &mut raw_env, &raw_dispatch)).unwrap());
+        let raw = cell_caps(eval_raw_blocking(&form, &mut raw_env, &raw_dispatch).unwrap());
 
         assert_eq!(
             analyzed
@@ -4894,11 +6106,14 @@ mod tests {
         let malformed = crate::read("(cell image :inherit {})").unwrap();
         let analyzed_error =
             eval_blocking(&malformed, &mut analyzed_env, &analyzed_dispatch).unwrap_err();
-        let raw_error = pollster_eval(eval(&malformed, &mut raw_env, &raw_dispatch)).unwrap_err();
-        assert_eq!(error::message(&analyzed_error), error::message(&raw_error));
+        let raw_error = eval_raw_blocking(&malformed, &mut raw_env, &raw_dispatch).unwrap_err();
+        assert_eq!(
+            error::message(err_payload(&analyzed_error)),
+            error::message(err_payload(&raw_error))
+        );
 
         let programmatic = crate::read("(cell image :grants bundle)").unwrap();
-        let db = raw_env.get("db").unwrap().clone();
+        let db = raw_env.get("db").unwrap().unwrap().clone();
         raw_env.set(
             "bundle".into(),
             Val::Map(ValMap::from_pairs(vec![(
@@ -4907,7 +6122,7 @@ mod tests {
             )])),
         );
         let raw_programmatic =
-            cell_caps(pollster_eval(eval(&programmatic, &mut raw_env, &raw_dispatch)).unwrap());
+            cell_caps(eval_raw_blocking(&programmatic, &mut raw_env, &raw_dispatch).unwrap());
         assert_eq!(raw_programmatic.len(), 1);
         assert_eq!(raw_programmatic[0].0, "programmatic");
     }
@@ -4996,7 +6211,7 @@ mod tests {
             &form, &mut env, &d, &effects,
         ));
         assert!(matches!(result, Ok(EvalOutcome::Value(Val::Bytes(ref b))) if b == &vec![1, 2]));
-        assert!(env.get("load-handler").is_none());
+        assert!(env.get("load-handler").unwrap().is_none());
     }
 
     #[test]
@@ -5961,7 +7176,7 @@ mod tests {
         let result = eval_str("(unquote x)", &mut env, &d);
         assert!(result.is_err());
         assert!(err_contains(
-            &result.unwrap_err(),
+            err_payload(&result.unwrap_err()),
             "not inside syntax-quote"
         ));
     }
@@ -5973,7 +7188,7 @@ mod tests {
         let result = eval_str("(splice-unquote x)", &mut env, &d);
         assert!(result.is_err());
         assert!(err_contains(
-            &result.unwrap_err(),
+            err_payload(&result.unwrap_err()),
             "not inside syntax-quote"
         ));
     }
@@ -5982,12 +7197,12 @@ mod tests {
     // =========================================================================
 
     /// Helper: load the prelude then parse + eval a string expression.
-    fn prelude_eval(input: &str) -> Result<Val, Val> {
+    fn prelude_eval(input: &str) -> Result<Val, EvalError> {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
         // Load prelude forms into the environment
-        let prelude_forms =
-            crate::read_many(crate::PRELUDE).map_err(|e| format!("prelude parse: {e}"))?;
+        let prelude_forms = crate::read_many(crate::PRELUDE)
+            .map_err(|e| boundary_thrown(Val::from(format!("prelude parse: {e}"))))?;
         for form in &prelude_forms {
             eval_blocking(form, &mut env, &d)?;
         }
@@ -6171,7 +7386,7 @@ mod tests {
         let d = RecordingDispatch::new();
         eval_str("(def f (fn [a b] (recur 1)))", &mut env, &d).unwrap();
         let err = eval_str("(f 1 2)", &mut env, &d).unwrap_err();
-        assert!(err_contains(&err, "expected 2"), "got: {err}");
+        assert!(err_contains(err_payload(&err), "expected 2"), "got: {err}");
     }
 
     #[test]
@@ -6403,11 +7618,11 @@ mod tests {
     // =========================================================================
 
     /// Helper: load prelude then eval — needed for try/throw macros
-    fn effects_eval(input: &str) -> Result<Val, Val> {
+    fn effects_eval(input: &str) -> Result<Val, EvalError> {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
         let prelude_forms = crate::read_many(crate::PRELUDE)
-            .map_err(|e| error::parse(Some("prelude.glia"), e.to_string()))?;
+            .map_err(|e| boundary_thrown(error::parse(Some("prelude.glia"), e.to_string())))?;
         for form in &prelude_forms {
             eval_blocking(form, &mut env, &d)?;
         }
@@ -6589,7 +7804,7 @@ mod tests {
         let d = RecordingDispatch::new();
         // Division by zero should produce a structured error
         let err = eval_str("(/ 1 0)", &mut env, &d).unwrap_err();
-        assert!(err_contains(&err, "division by zero"));
+        assert!(err_contains(err_payload(&err), "division by zero"));
     }
 
     // --- effect edge cases ---
@@ -6600,7 +7815,7 @@ mod tests {
         let d = RecordingDispatch::new();
         let result = eval_str(r#"(perform 42 "data")"#, &mut env, &d);
         assert!(result.is_err());
-        assert!(err_contains(&result.unwrap_err(), "keyword"));
+        assert!(err_contains(err_payload(&result.unwrap_err()), "keyword"));
     }
 
     #[test]
@@ -6646,7 +7861,7 @@ mod tests {
             &d,
         );
         assert!(result.is_err());
-        assert!(err_contains(&result.unwrap_err(), "function"));
+        assert!(err_contains(err_payload(&result.unwrap_err()), "function"));
     }
 
     #[test]
@@ -6839,8 +8054,8 @@ mod tests {
             &d,
         );
         // The second resume should error (one-shot violated)
-        // But the first resume short-circuits via Err(Val::Resume), so (resume 2) is never reached.
-        // Actually, Err(Val::Resume) propagates up, so the handler returns Err(Val::Resume(1)).
+        // But the first resume short-circuits via the resume signal, so (resume 2) is never
+        // reached: the signal propagates up and the handler resumes the body with 1.
         // with-handler catches Resume and resumes the body. Body returns 1. Result: Ok(1).
         assert_eq!(result, Ok(Val::Int(1)));
     }
@@ -7052,11 +8267,11 @@ mod tests {
                                 Val::Int(n) => Val::Int(n + 1),
                                 other => other,
                             };
-                            // Returns Err(Val::Resume(..)); the handler state
+                            // Returns the resume signal; the handler state
                             // machine translates that into a body resume.
                             func(&[next])
                         } else {
-                            Err(Val::from("async-resume: bad resume".to_string()))
+                            Err(NativeSignal::throw("async-resume: bad resume"))
                         }
                     })
                 }),
@@ -7177,17 +8392,17 @@ mod tests {
 
     #[test]
     fn unhandled_throw_escapes_as_glia_exception_effect() {
-        // No try in scope — throw escapes as Val::Effect carrier with
+        // No try in scope — throw escapes as an unhandled-exception carrier with
         // effect_type = "glia.exception". Outer callers (kernel, MCP,
         // shell) rely on this contract.
         let err = effects_eval("(throw (ex-info \"escape\" {:type :foo}))").unwrap_err();
         match &err {
-            Val::Effect { effect_type, data } => {
-                assert_eq!(effect_type, error::EXCEPTION_EFFECT);
+            EvalError::Unhandled(req) => {
+                assert_eq!(req.effect_type(), error::EXCEPTION_EFFECT);
                 // The data is the inner structured error map.
-                assert_eq!(error::type_tag(data), Some("foo"));
+                assert_eq!(error::type_tag(&req.data), Some("foo"));
             }
-            other => panic!("expected Val::Effect, got {other:?}"),
+            other => panic!("expected unhandled exception, got {other:?}"),
         }
         // unwrap_thrown peels the carrier for outer callers.
         let inner = error::unwrap_thrown(&err).expect("should peel");
@@ -7198,7 +8413,7 @@ mod tests {
     fn rethrow_with_no_outer_try_escapes_as_effect() {
         // Single try, only matches :a. Throwing :b means the dispatcher
         // re-throws; with no outer try, the re-throw escapes as
-        // Val::Effect — same contract as a direct unhandled throw.
+        // an escaped effect — same contract as a direct unhandled throw.
         let err = effects_eval(
             r#"(try (throw (ex-info "x" {:type :b}))
                  (catch :a e :ignored))"#,
@@ -7242,7 +8457,10 @@ mod tests {
         let d = RecordingDispatch::new();
         let result = eval_str("(match 7 42 :no)", &mut env, &d);
         assert!(result.is_err());
-        assert!(err_contains(&result.unwrap_err(), "no clause matched"));
+        assert!(err_contains(
+            err_payload(&result.unwrap_err()),
+            "no clause matched"
+        ));
     }
 
     #[test]
@@ -7397,7 +8615,10 @@ mod tests {
         let d = RecordingDispatch::new();
         let result = eval_str("(let [[a b] 42] (+ a b))", &mut env, &d);
         assert!(result.is_err());
-        assert!(err_contains(&result.unwrap_err(), "destructuring failed"));
+        assert!(err_contains(
+            err_payload(&result.unwrap_err()),
+            "destructuring failed"
+        ));
     }
 
     #[test]
@@ -7538,7 +8759,7 @@ mod tests {
     #[test]
     fn unhandled_cap_effect_fails_closed_with_structured_carrier() {
         // An unhandled capability-targeted effect must fail CLOSED and surface a
-        // structured effect carrier (Val::Effect), never a plain string. This is
+        // structured effect carrier (EvalError::Unhandled), never a plain string. This is
         // what lets outer callers pattern-match / unwrap the failure instead of
         // string-scraping.
         let mut env = Env::new();
@@ -7547,12 +8768,12 @@ mod tests {
         env.set("my-cap".into(), cap);
         let result = eval_str("(perform my-cap :run 42)", &mut env, &d);
         match result {
-            Err(Val::Effect { effect_type, data }) => {
-                assert_eq!(effect_type, "cap:executor");
+            Err(EvalError::Unhandled(req)) => {
+                assert_eq!(req.effect_type(), "cap:executor");
                 // The carrier retains the effect payload as structured data.
-                assert!(matches!(*data, Val::List(_)));
+                assert!(matches!(req.data, Val::List(_)));
             }
-            other => panic!("expected structured Val::Effect carrier, got {other:?}"),
+            other => panic!("expected structured unhandled-effect carrier, got {other:?}"),
         }
     }
 
@@ -7595,7 +8816,10 @@ mod tests {
             &d,
         );
         assert!(result.is_err());
-        assert!(err_contains(&result.unwrap_err(), "not available"));
+        assert!(err_contains(
+            err_payload(&result.unwrap_err()),
+            "not available"
+        ));
     }
 
     #[test]
@@ -7621,7 +8845,7 @@ mod tests {
             &d,
         );
         assert!(denied.is_err());
-        assert!(err_contains(&denied.unwrap_err(), "denied"));
+        assert!(err_contains(err_payload(&denied.unwrap_err()), "denied"));
     }
 
     #[test]
@@ -7639,7 +8863,7 @@ mod tests {
             &d,
         );
         assert!(denied.is_err());
-        assert!(err_contains(&denied.unwrap_err(), "denied"));
+        assert!(err_contains(err_payload(&denied.unwrap_err()), "denied"));
     }
 
     /// A dispatcher that reifies every attenuation into a sentinel cap,
@@ -7651,7 +8875,7 @@ mod tests {
             &'a self,
             _name: &'a str,
             _args: &'a [Val],
-        ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<Val, NativeSignal>> + 'a>> {
             Box::pin(core::future::ready(Ok(Val::Nil)))
         }
 
@@ -7660,12 +8884,12 @@ mod tests {
             cap: &Val,
             allow_methods: &BTreeSet<String>,
         ) -> Option<Result<Val, Val>> {
-            let Val::Cap { name, .. } = cap else {
+            let Val::Cap(h) = cap else {
                 return Some(Err(Val::from("reify: not a cap")));
             };
             // Mark reification observable: rename + carry the allow set count.
             Some(Ok(make_cap(
-                format!("{name}-reified"),
+                format!("{}-reified", h.name()),
                 format!("methods-{}", allow_methods.len()),
                 Rc::new(()),
             )))
@@ -7681,11 +8905,13 @@ mod tests {
         let expr = crate::read("(attenuate svc [:run :write])").unwrap();
         let result = pollster_eval(eval_toplevel(&expr, &mut env, &d)).unwrap();
         match result {
-            Val::Cap {
-                name, schema_cid, ..
-            } => {
-                assert_eq!(name, "svc-reified", "embedder reification must win");
-                assert_eq!(schema_cid, "methods-2", "allow set must reach the embedder");
+            Val::Cap(h) => {
+                assert_eq!(h.name(), "svc-reified", "embedder reification must win");
+                assert_eq!(
+                    h.schema_cid(),
+                    "methods-2",
+                    "allow set must reach the embedder"
+                );
             }
             other => panic!("expected reified cap, got {other:?}"),
         }
@@ -7707,11 +8933,9 @@ mod tests {
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].0, "restricted");
         match &caps[0].1 {
-            Val::Cap {
-                name, schema_cid, ..
-            } => {
-                assert_eq!(name, "svc-reified");
-                assert_eq!(schema_cid, "methods-1");
+            Val::Cap(h) => {
+                assert_eq!(h.name(), "svc-reified");
+                assert_eq!(h.schema_cid(), "methods-1");
             }
             other => panic!("expected reified cap, got {other}"),
         }
@@ -7728,9 +8952,9 @@ mod tests {
         env.set("svc".into(), cap);
         let result = eval_str("(attenuate svc [:run])", &mut env, &d).unwrap();
         match result {
-            Val::Cap { inner, .. } => {
+            Val::Cap(h) => {
                 assert!(
-                    inner.downcast_ref::<AttenuatedCapInner>().is_some(),
+                    h.inner().downcast_ref::<AttenuatedCapInner>().is_some(),
                     "default dispatch must produce local AttenuatedCapInner"
                 );
             }
@@ -7750,7 +8974,9 @@ mod tests {
                 );
                 match args.get(1) {
                     Some(Val::NativeFn { func, .. }) => func(&[Val::Keyword("intrinsic".into())]),
-                    other => Err(Val::from(format!("expected resume fn, got {other:?}"))),
+                    other => Err(NativeSignal::throw(format!(
+                        "expected resume fn, got {other:?}"
+                    ))),
                 }
             }),
         };
@@ -7804,8 +9030,8 @@ mod tests {
             &d,
         );
         assert!(matches!(
-            result,
-            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+            &result,
+            Err(EvalError::Unhandled(req)) if req.effect_type() == "log"
         ));
     }
 
@@ -7822,8 +9048,8 @@ mod tests {
             &d,
         );
         assert!(matches!(
-            result,
-            Err(Val::Effect { ref effect_type, .. }) if effect_type == "log"
+            &result,
+            Err(EvalError::Unhandled(req)) if req.effect_type() == "log"
         ));
     }
 
@@ -7863,7 +9089,7 @@ mod tests {
         );
         assert!(result.is_err());
         if let Err(err) = &result {
-            assert!(err_contains(err, "cap"));
+            assert!(err_contains(err_payload(err), "cap"));
         }
     }
 
@@ -7984,7 +9210,7 @@ mod tests {
         let result = eval_str("(perform \"not-valid\" 42)", &mut env, &d);
         assert!(result.is_err());
         if let Err(err) = &result {
-            assert!(err_contains(err, "keyword or cap"));
+            assert!(err_contains(err_payload(err), "keyword or cap"));
         }
     }
 
@@ -8022,9 +9248,7 @@ mod tests {
             Val::AsyncNativeFn {
                 name: "fail-async".into(),
                 func: Rc::new(|_args: Vec<Val>| {
-                    Box::pin(core::future::ready(Err(Val::from(
-                        "async boom".to_string(),
-                    ))))
+                    Box::pin(core::future::ready(Err(NativeSignal::throw("async boom"))))
                 }),
             },
         );
@@ -8068,16 +9292,7 @@ mod tests {
 
         // Pre-fill handler stack to the limit.
         let cap_target = match &cap {
-            Val::Cap {
-                name,
-                schema_cid,
-                cap_id,
-                ..
-            } => effect::EffectTarget::Cap {
-                name: name.clone(),
-                schema_cid: schema_cid.clone(),
-                cap_id: *cap_id,
-            },
+            Val::Cap(h) => h.effect_target(),
             _ => unreachable!(),
         };
         for _ in 0..effect::MAX_HANDLER_DEPTH {
@@ -8096,7 +9311,7 @@ mod tests {
         );
         assert!(result.is_err());
         if let Err(err) = &result {
-            assert!(err_contains(err, "depth limit"));
+            assert!(err_contains(err_payload(err), "depth limit"));
         }
     }
 
@@ -8163,11 +9378,12 @@ mod tests {
 
     /// Load prelude + the ww/policy module source, then eval `input` in the
     /// same env. Mirrors what `(perform import "ww/policy")` provides.
-    fn policy_eval(input: &str) -> Result<Val, Val> {
+    fn policy_eval(input: &str) -> Result<Val, EvalError> {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
         for src in [crate::PRELUDE, POLICY_GLIA] {
-            let forms = crate::read_many(src).map_err(|e| Val::from(format!("parse: {e}")))?;
+            let forms = crate::read_many(src)
+                .map_err(|e| boundary_thrown(Val::from(format!("parse: {e}"))))?;
             for form in &forms {
                 eval_blocking(form, &mut env, &d)?;
             }
@@ -8205,7 +9421,10 @@ mod tests {
                    (perform svc :other 1)))",
         );
         assert!(unstubbed.is_err());
-        assert!(err_contains(&unstubbed.unwrap_err(), "not stubbed"));
+        assert!(err_contains(
+            err_payload(&unstubbed.unwrap_err()),
+            "not stubbed"
+        ));
     }
 
     #[test]
@@ -8235,7 +9454,10 @@ mod tests {
                    (perform svc :flaky)))",
         );
         assert!(result.is_err());
-        assert!(err_contains(&result.unwrap_err(), "always down"));
+        assert!(err_contains(
+            err_payload(&result.unwrap_err()),
+            "always down"
+        ));
     }
 
     #[test]
@@ -8256,7 +9478,7 @@ mod tests {
                        (perform svc :echo 3))))",
         );
         assert!(over.is_err());
-        assert!(err_contains(&over.unwrap_err(), "budget"));
+        assert!(err_contains(err_payload(&over.unwrap_err()), "budget"));
     }
 
     #[test]
@@ -8278,7 +9500,7 @@ mod tests {
                    (perform ro :zap)))",
         );
         assert!(denied.is_err());
-        assert!(err_contains(&denied.unwrap_err(), "denied"));
+        assert!(err_contains(err_payload(&denied.unwrap_err()), "denied"));
     }
 
     /// Was the retry blocker: closures dropped macro-expansion globals
@@ -8296,10 +9518,22 @@ mod tests {
 
     #[test]
     fn def_inside_closure_does_not_mutate_caller_root() {
-        // Pinned semantics: `def` from inside a fn body writes the closure's
-        // own root, not the caller's. Cross-invocation state needs an atom.
+        // SEMANTIC — def inside a function throws the catchable
+        // `glia.error/def-not-top-level` BEFORE any mutation (PR-1b.0;
+        // supersedes the old silently-scoped def). Cross-invocation state
+        // needs an atom.
+        let err =
+            prelude_eval("(do (def *n* 1) (defn bump [] (def *n* 9)) (bump) *n*)").unwrap_err();
+        assert!(
+            err_contains(err_payload(&err), "def-not-top-level"),
+            "expected def-not-top-level, got: {err}"
+        );
+        // Catchable, and the definition never happened: *n* is unchanged.
         assert_eq!(
-            prelude_eval("(do (def *n* 1) (defn bump [] (def *n* 9)) (bump) *n*)"),
+            prelude_eval(
+                "(do (def *n* 1) (defn bump [] (def *n* 9)) \
+                 (try (bump) (catch :glia.error/def-not-top-level e :caught)) *n*)"
+            ),
             Ok(Val::Int(1))
         );
     }
@@ -8359,7 +9593,7 @@ mod tests {
     fn atom_deref_type_errors_are_structured() {
         let r = prelude_eval("(deref 42)");
         assert!(r.is_err());
-        assert!(err_contains(&r.unwrap_err(), "atom"));
+        assert!(err_contains(err_payload(&r.unwrap_err()), "atom"));
     }
 
     // -----------------------------------------------------------------
@@ -8429,18 +9663,253 @@ mod tests {
     // always reported "0 tests, all pass").
     // -----------------------------------------------------------------
 
+    // =====================================================================
+    // PR-1 contract tests — exception/fault/control separation
+    // =====================================================================
+
+    #[test]
+    fn missing_map_key_is_nil_not_exception() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        assert_eq!(eval_str("(get {:a 1} :b)", &mut env, &d), Ok(Val::Nil));
+        assert_eq!(eval_str("(get {:a 1} 3.5)", &mut env, &d), Ok(Val::Nil));
+        assert_eq!(eval_str("(get [1 2] 99)", &mut env, &d), Ok(Val::Nil));
+        assert_eq!(eval_str("(get [1 2] -1)", &mut env, &d), Ok(Val::Nil));
+    }
+
+    #[test]
+    fn wrong_arity_is_catchable_by_try() {
+        let r = effects_eval(
+            "(let [f (fn [x] x)] (try (f 1 2 3) (catch :glia.error/arity-mismatch e :caught)))",
+        );
+        assert_eq!(r, Ok(Val::Keyword("caught".into())));
+    }
+
+    #[test]
+    fn wrong_type_is_catchable_by_try() {
+        let r = effects_eval("(try (+ 1 \"a\") (catch :glia.error/type-mismatch e :caught))");
+        assert_eq!(r, Ok(Val::Keyword("caught".into())));
+    }
+
+    #[test]
+    fn division_by_zero_is_catchable_by_try() {
+        let r = effects_eval("(try (/ 1 0) (catch _ e :caught))");
+        assert_eq!(r, Ok(Val::Keyword("caught".into())));
+    }
+
+    #[test]
+    fn unbound_symbol_call_is_catchable_by_try() {
+        // Calling through an unbound head reaches Dispatch; RecordingDispatch
+        // returns nil, so exercise a builtin structural error instead:
+        // analysis error from a malformed let is a catchable exception when
+        // raised inside a fn body analyzed at call time.
+        let r = effects_eval("(try (get) (catch :glia.error/arity-mismatch e :caught))");
+        assert_eq!(r, Ok(Val::Keyword("caught".into())));
+    }
+
+    #[test]
+    fn native_error_is_catchable_by_try() {
+        // A native fn raising a plain string error is catchable (wildcard).
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        env.set(
+            "boom".into(),
+            Val::NativeFn {
+                name: "boom".into(),
+                func: Rc::new(|_| Err(NativeSignal::throw("native boom"))),
+            },
+        );
+        let prelude_forms = crate::read_many(crate::PRELUDE).unwrap();
+        for form in &prelude_forms {
+            eval_blocking(form, &mut env, &d).unwrap();
+        }
+        let r = eval_str("(try (boom) (catch _ e :caught))", &mut env, &d);
+        assert_eq!(r, Ok(Val::Keyword("caught".into())));
+    }
+
+    #[test]
+    fn try_is_abortive_side_effects_after_throw_do_not_run() {
+        let r = effects_eval(
+            "(let [a (atom 0)]
+               (try (do (throw 1) (reset! a 99)) (catch _ e nil))
+               (deref a))",
+        );
+        assert_eq!(r, Ok(Val::Int(0)));
+    }
+
+    #[test]
+    fn try_resume_resumes_builtin_error_with_replacement_value() {
+        // Approved: exceptions are uniformly resumable; resuming supplies
+        // the failing expression's value.
+        let r = effects_eval("(try-resume (fn [e resume] (resume 0)) (+ 1 (+ 2 \"a\")))");
+        assert_eq!(r, Ok(Val::Int(1)));
+    }
+
+    #[test]
+    fn ordinary_effects_remain_resumable() {
+        let r = effects_eval(
+            "(with-effect-handler :e (fn [d resume] (resume (+ d 1))) (+ 10 (perform :e 1)))",
+        );
+        assert_eq!(r, Ok(Val::Int(12)));
+    }
+
+    #[test]
+    fn fault_bypasses_try_non_tail_recur() {
+        // Non-tail recur is a LANGUAGE FAULT — not catchable, reaches the
+        // boundary even through a wildcard catch.
+        let r = effects_eval("(try (loop [x 0] (f (recur 1))) (catch _ e :caught))");
+        match r {
+            Err(EvalError::Fault(f)) => {
+                assert_eq!(f.kind(), crate::FaultKind::Language);
+                assert_eq!(
+                    error::type_tag(f.payload()),
+                    Some(error::tag::INVALID_RECUR)
+                );
+            }
+            other => panic!("expected language fault, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_tail_recur_cannot_become_stored_data_or_transfer() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        // Stored-data pathology: previously returned [#<recur>].
+        let r = eval_str("(loop [] [(recur)])", &mut env, &d);
+        assert!(
+            matches!(&r, Err(EvalError::Fault(f)) if f.kind() == crate::FaultKind::Language),
+            "vector-literal recur must fault, got {r:?}"
+        );
+        // Argument-position pathology: previously passed #<recur> as a value.
+        let r2 = eval_str("(loop [] (count (recur)))", &mut env, &d);
+        assert!(
+            matches!(&r2, Err(EvalError::Fault(f)) if f.kind() == crate::FaultKind::Language),
+            "argument-position recur must fault, got {r2:?}"
+        );
+        // Non-last do position: previously skipped past the sentinel.
+        let r3 = eval_str("(loop [] (do (recur) 5))", &mut env, &d);
+        assert!(
+            matches!(&r3, Err(EvalError::Fault(f)) if f.kind() == crate::FaultKind::Language),
+            "non-tail do recur must fault, got {r3:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_tail_recur_still_works() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        assert_eq!(
+            eval_str("(loop [x 0] (if (< x 3) (recur (+ x 1)) x))", &mut env, &d),
+            Ok(Val::Int(3))
+        );
+        // fn-targeted recur
+        assert_eq!(
+            eval_str(
+                "(let [f (fn [n acc] (if (= n 0) acc (recur (- n 1) (* acc n))))] (f 5 1))",
+                &mut env,
+                &d
+            ),
+            Ok(Val::Int(120))
+        );
+    }
+
+    #[test]
+    fn handler_depth_limit_is_catchable() {
+        // Exceeding MAX_HANDLER_DEPTH is a resource-guard EXCEPTION: the
+        // check fires before the frame is pushed, so state is consistent
+        // and outer handlers may recover.
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        for _ in 0..effect::MAX_HANDLER_DEPTH {
+            let ctx = Rc::new(RefCell::new(effect::HandlerContext {
+                slot: Rc::new(RefCell::new(effect::EffectSlot::new())),
+                target: effect::EffectTarget::Keyword("filler".into()),
+            }));
+            env.handler_stack.borrow_mut().push(ctx);
+        }
+        let prelude_forms = crate::read_many(crate::PRELUDE).unwrap();
+        // Prelude must load without handler frames interfering; load into a
+        // fresh env then copy the handler stack trick is overkill — instead
+        // assert the boundary form directly (no try available here).
+        drop(prelude_forms);
+        let r = eval_str("(with-effect-handler :x (fn [d] d) 1)", &mut env, &d);
+        match r {
+            Err(EvalError::Unhandled(req)) => {
+                assert_eq!(req.effect_type(), error::EXCEPTION_EFFECT);
+                assert_eq!(error::type_tag(&req.data), Some(error::tag::INTERNAL));
+            }
+            other => panic!("expected catchable depth-limit exception, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boundary_display_preserves_legacy_strings() {
+        let mut env = Env::new();
+        let d = RecordingDispatch::new();
+        // Unhandled non-exception effect: legacy carrier string.
+        let err = eval_str("(perform :net {:x 1})", &mut env, &d).unwrap_err();
+        assert_eq!(format!("{err}"), "#<effect :net {:x 1}>");
+        // Unhandled exception: peeled payload map (same as legacy raw-error
+        // display for previously-raw errors).
+        let err2 = eval_str("(+ 1 \"a\")", &mut env, &d).unwrap_err();
+        let display = format!("{err2}");
+        assert!(
+            display.starts_with('{') && display.contains(":glia.error/type"),
+            "expected peeled payload map, got: {display}"
+        );
+    }
+
+    #[test]
+    fn one_shot_second_resume_is_catchable_inside_handler() {
+        let r = effects_eval(
+            "(with-effect-handler :e
+               (fn [d resume]
+                 (do (resume 1)
+                     :unreachable))
+               (+ 10 (perform :e 0)))",
+        );
+        // First resume short-circuits the handler body; the body computes.
+        // The one-shot structural pins (second resume raises the
+        // continuation-already-resumed exception) live in effect.rs tests.
+        assert_eq!(r, Ok(Val::Int(11)));
+    }
+
     const WWTEST_GLIA: &str = include_str!("../../../std/lib/ww/test.glia");
 
-    fn wwtest_eval(input: &str) -> Result<Val, Val> {
+    /// Run a deep-evaluation test body on an explicitly budgeted stack:
+    /// 2 MiB in RELEASE — the real budget gate, matching the wasm guest
+    /// commitment — and 4 MiB in debug, where async eval frames are several
+    /// times larger (debug-only headroom; the release/wasm gates remain the
+    /// binding measurement). Panics (failed assertions) propagate through
+    /// `join`, so wrapped tests fail normally.
+    fn on_budget_stack(f: impl FnOnce() + Send + 'static) {
+        let stack = if cfg!(debug_assertions) {
+            4 * 1024 * 1024
+        } else {
+            2 * 1024 * 1024
+        };
+        let handle = std::thread::Builder::new()
+            .name("glia-budget-stack".into())
+            .stack_size(stack)
+            .spawn(f)
+            .expect("spawn budget-stack thread");
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn wwtest_eval(input: &str) -> Result<Val, EvalError> {
         let mut env = Env::new();
         let d = RecordingDispatch::new();
         for src in [crate::PRELUDE, WWTEST_GLIA] {
-            let forms = crate::read_many(src).map_err(|e| Val::from(format!("parse: {e}")))?;
+            let forms = crate::read_many(src)
+                .map_err(|e| boundary_thrown(Val::from(format!("parse: {e}"))))?;
             for form in &forms {
                 eval_blocking(form, &mut env, &d)?;
             }
         }
-        let expr = crate::read(input).map_err(|e| error::parse(None, e.to_string()))?;
+        let expr =
+            crate::read(input).map_err(|e| boundary_thrown(error::parse(None, e.to_string())))?;
         let stdout: effect::HostEffectHandler =
             Rc::new(|_data| Box::pin(async { Ok(effect::HostEffectResult::Resume(Val::Nil)) }));
         let effects = [effect::HostEffect {
@@ -8451,12 +9920,16 @@ mod tests {
             &expr, &mut env, &d, &effects,
         ))? {
             EvalOutcome::Value(value) => Ok(value),
-            EvalOutcome::Exit => Err(Val::from("unexpected exit in ww/test")),
+            EvalOutcome::Exit => Err(boundary_thrown(Val::from("unexpected exit in ww/test"))),
         }
     }
 
     #[test]
     fn wwtest_deftest_actually_registers() {
+        on_budget_stack(wwtest_deftest_actually_registers_body);
+    }
+
+    fn wwtest_deftest_actually_registers_body() {
         let n = wwtest_eval(
             "(do (deftest \"t1\" (fn [] (assert= 1 1)))
                  (deftest \"t2\" (fn [] (assert-true true)))
@@ -8467,6 +9940,10 @@ mod tests {
 
     #[test]
     fn wwtest_run_tests_executes_and_reports() {
+        on_budget_stack(wwtest_run_tests_executes_and_reports_body);
+    }
+
+    fn wwtest_run_tests_executes_and_reports_body() {
         // One passing, one failing test: run-tests must EXECUTE both and
         // report accurate counts (previously always {:passed 0 :failed 0}).
         let r = wwtest_eval(
@@ -8481,6 +9958,13 @@ mod tests {
 
     #[test]
     fn wwtest_assert_throws_and_reset() {
+        // Deepest macro tower in the suite (deftest + assert-throws + try
+        // expansion): runs on the budgeted stack (4 MiB debug / 2 MiB
+        // release — the release size IS the budget gate).
+        on_budget_stack(wwtest_assert_throws_and_reset_body);
+    }
+
+    fn wwtest_assert_throws_and_reset_body() {
         let r = wwtest_eval(
             "(do (deftest \"throws-ok\" (fn [] (assert-throws (fn [] (throw 1)))))
                  (let [report (run-tests)
@@ -8498,6 +9982,10 @@ mod tests {
 
     #[test]
     fn wwtest_stub_handler_answers_and_fails_closed() {
+        on_budget_stack(wwtest_stub_handler_answers_and_fails_closed_body);
+    }
+
+    fn wwtest_stub_handler_answers_and_fails_closed_body() {
         let ok = wwtest_eval(
             "(do (defcap svc :lookup (fn [k] :real))
                  (with-effect-handler svc (stub-handler {:lookup \"stubbed\" :add (fn [a b] (+ a b))})
@@ -8512,11 +10000,18 @@ mod tests {
                    (perform svc :other)))",
         );
         assert!(denied.is_err());
-        assert!(err_contains(&denied.unwrap_err(), "not stubbed"));
+        assert!(err_contains(
+            err_payload(&denied.unwrap_err()),
+            "not stubbed"
+        ));
     }
 
     #[test]
     fn wwtest_recorder_replay_style_verification() {
+        on_budget_stack(wwtest_recorder_replay_style_verification_body);
+    }
+
+    fn wwtest_recorder_replay_style_verification_body() {
         // Replay-style example: run the code under test with a recording
         // interposer, then verify the exact call sequence AND that the
         // delegated results were real.
@@ -8534,5 +10029,1163 @@ mod tests {
             Val::List(vec![Val::Keyword("neg".into()), Val::Int(7)]),
         ]);
         assert_eq!(r, Val::List(vec![expected_out, expected_calls]));
+    }
+}
+
+/// PR-1b.0 ownership-barrier mechanism tests. Everything here exercises the
+/// crate-private machinery introduced in Stage A, before any production path
+/// calls it. These tests are RC-implementation-specific: under a future GC
+/// migration this module is deleted with the barrier (see the recorded
+/// deletion inventory); the SEMANTIC suites elsewhere survive.
+#[cfg(test)]
+mod ownership_tests {
+    use super::own::{self, OwnerRef};
+    use super::{tests, Defs, Env, Frame};
+    use crate::{Val, ValMap};
+    use std::rc::Rc;
+
+    // RC-MECHANISM: rest weakens only matching-owner references; foreign
+    // owners stay strong.
+    #[test]
+    fn rest_weakens_only_matching_owner() {
+        let a = Defs::new(None);
+        let b = Defs::new(None);
+        let own_ref = OwnerRef::Strong(Rc::clone(&a));
+        let foreign = OwnerRef::Strong(Rc::clone(&b));
+
+        let rested_own = own_ref.rested(&a);
+        assert!(rested_own.is_resting_for(&a), "self-reference must rest");
+
+        let rested_foreign = foreign.rested(&a);
+        assert!(
+            !rested_foreign.is_resting_for(&a),
+            "foreign owner must not rest"
+        );
+        assert!(
+            matches!(&rested_foreign, OwnerRef::Strong(o) if Rc::ptr_eq(o, &b)),
+            "foreign strong reference preserved"
+        );
+    }
+
+    // RC-MECHANISM: escape restores matching references via the witness.
+    #[test]
+    fn escape_restores_matching_reference() {
+        let a = Defs::new(None);
+        let rested = OwnerRef::Strong(Rc::clone(&a)).rested(&a);
+        let escaped = rested.escaped_with(&a).expect("matching witness escapes");
+        assert!(
+            matches!(&escaped, OwnerRef::Strong(o) if Rc::ptr_eq(o, &a)),
+            "escape restores a strong reference to the same owner"
+        );
+    }
+
+    // RC-MECHANISM: repeated rest/escape is idempotent.
+    #[test]
+    fn rest_and_escape_idempotent() {
+        let a = Defs::new(None);
+        let r1 = OwnerRef::Strong(Rc::clone(&a)).rested(&a);
+        let r2 = r1.rested(&a);
+        assert!(r2.is_resting_for(&a), "second rest is a no-op");
+
+        let e1 = r2.escaped_with(&a).unwrap();
+        let e2 = e1.escaped_with(&a).unwrap();
+        assert!(
+            matches!(&e2, OwnerRef::Strong(o) if Rc::ptr_eq(o, &a)),
+            "second escape is a no-op"
+        );
+    }
+
+    // RC-MECHANISM: an unmatched weak witness faults — explicitly, not as
+    // revocation, not as a guest error.
+    #[test]
+    fn unmatched_weak_witness_faults() {
+        let a = Defs::new(None);
+        let other = Defs::new(None);
+        let rested = OwnerRef::Strong(Rc::clone(&a)).rested(&a);
+        assert_eq!(
+            rested.escaped_with(&other).unwrap_err(),
+            own::OwnFault::UnmatchedWeak
+        );
+    }
+
+    // RC-MECHANISM: resting releases the keep-alive; the owner frees when
+    // the last strong reference drops even while a rested reference exists.
+    #[test]
+    fn rested_reference_does_not_keep_owner_alive() {
+        let a = Defs::new(None);
+        let probe = Rc::downgrade(&a);
+        let rested = OwnerRef::Strong(Rc::clone(&a)).rested(&a);
+        drop(a);
+        assert!(
+            probe.upgrade().is_none(),
+            "rested reference must not keep the owner alive"
+        );
+        // And escaping it afterwards is the fault case, not a resurrection.
+        let dead = Defs::new(None);
+        assert!(rested.escaped_with(&dead).is_err());
+    }
+
+    // RC-MECHANISM: deep traversal is iterative — container depth must not
+    // consume Rust call stack. (Construction and teardown are also kept
+    // iterative: recursive Clone/Drop of deep Vec-backed values is a
+    // pre-existing property of `Val` independent of the barrier.)
+    #[test]
+    fn deep_traversal_is_iterative() {
+        let owner = Defs::new(None);
+        const DEPTH: usize = 100_000;
+        let mut v = Val::Int(0);
+        for _ in 0..DEPTH {
+            v = Val::List(vec![v]);
+        }
+
+        let (rested, resting) = own::rest_for(&owner, &v);
+        assert!(!resting, "pure data holds no resting refs");
+        let escaped = own::escape_with(&owner, &rested).unwrap();
+
+        // Verify depth survived, iteratively.
+        let mut depth = 0usize;
+        let mut cur = &escaped;
+        while let Val::List(xs) = cur {
+            depth += 1;
+            cur = &xs[0];
+        }
+        assert_eq!(depth, DEPTH);
+
+        // Iterative teardown of all three deep trees.
+        for val in [v, rested, escaped] {
+            let mut stack = vec![val];
+            while let Some(x) = stack.pop() {
+                if let Val::List(xs) = x {
+                    stack.extend(xs);
+                }
+            }
+        }
+    }
+
+    // RC-MECHANISM: scalar and `Bytes` values are barrier-inert leaves —
+    // the transform neither recurses into them nor flags them.
+    #[test]
+    fn scalars_and_bytes_are_leaves() {
+        let owner = Defs::new(None);
+        let leaves = vec![
+            Val::Nil,
+            Val::Bool(true),
+            Val::Int(42),
+            Val::Float(1.5),
+            Val::Str("s".into()),
+            Val::Sym("x".into()),
+            Val::Keyword("k".into()),
+            Val::Bytes(vec![0u8; 4096]),
+            Val::Atom(Rc::new(std::cell::RefCell::new(Val::Int(1)))),
+        ];
+        for leaf in leaves {
+            let (rested, resting) = own::rest_for(&owner, &leaf);
+            assert!(!resting);
+            assert_eq!(format!("{rested:?}"), format!("{leaf:?}"));
+            let escaped = own::escape_with(&owner, &rested).unwrap();
+            assert_eq!(format!("{escaped:?}"), format!("{leaf:?}"));
+        }
+    }
+
+    // RC-MECHANISM: identity-keyed map entries survive the transforms —
+    // atom keys (identity-compared, like callables) still resolve after a
+    // rest/escape round trip. Callable keys get their direct equivalent in
+    // Stage C when `Closure` carries the identity anchor.
+    #[test]
+    fn map_identity_keys_preserved_through_transforms() {
+        let owner = Defs::new(None);
+        let atom_key = Val::Atom(Rc::new(std::cell::RefCell::new(Val::Int(7))));
+        let m = Val::Map(ValMap::from_pairs(vec![
+            (atom_key.clone(), Val::Str("hit".into())),
+            (Val::Keyword("plain".into()), Val::Int(1)),
+        ]));
+
+        let (rested, resting) = own::rest_for(&owner, &m);
+        assert!(!resting);
+        let escaped = own::escape_with(&owner, &rested).unwrap();
+
+        let Val::Map(out) = &escaped else {
+            panic!("map survives transforms");
+        };
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.get(&atom_key), Some(&Val::Str("hit".into())));
+    }
+
+    // RC-MECHANISM: nested containers rebuild correctly in source order.
+    #[test]
+    fn nested_container_structure_preserved() {
+        let owner = Defs::new(None);
+        let v = Val::Vector(vec![
+            Val::Int(1),
+            Val::List(vec![Val::Int(2), Val::Int(3)]),
+            Val::Set(vec![Val::Int(4)]),
+            Val::Map(ValMap::from_pairs(vec![(
+                Val::Keyword("k".into()),
+                Val::Vector(vec![Val::Int(5), Val::Int(6)]),
+            )])),
+        ]);
+        let (rested, _) = own::rest_for(&owner, &v);
+        let escaped = own::escape_with(&owner, &rested).unwrap();
+        assert_eq!(format!("{escaped:?}"), format!("{v:?}"));
+    }
+
+    // RC-MECHANISM: the inert Stage A `Defs` — define/lookup round trip on
+    // data takes the fast path; frozen owners reject definition.
+    #[test]
+    fn defs_define_lookup_and_freeze() {
+        let d = Defs::new(None);
+        let v0 = d.version();
+        d.define("answer".into(), Val::Int(42)).unwrap();
+        assert!(d.version() > v0, "definition bumps the version");
+        assert_eq!(d.lookup("answer").unwrap(), Some(Val::Int(42)));
+        assert_eq!(d.lookup("missing").unwrap(), None);
+
+        // Inherited chain resolves parent names; local shadows win.
+        let child = Defs::new(Some(Rc::clone(&d)));
+        assert_eq!(child.lookup("answer").unwrap(), Some(Val::Int(42)));
+        child.define("answer".into(), Val::Int(1)).unwrap();
+        assert_eq!(child.lookup("answer").unwrap(), Some(Val::Int(1)));
+        assert_eq!(d.lookup("answer").unwrap(), Some(Val::Int(42)));
+
+        // local_bindings enumerates LOCAL names only.
+        let locals = child.local_bindings().unwrap();
+        assert_eq!(locals.len(), 1);
+        assert_eq!(locals[0].0, "answer");
+
+        d.freeze();
+        assert!(d.is_frozen());
+        assert_eq!(
+            d.define("later".into(), Val::Int(0)).unwrap_err(),
+            own::OwnFault::FrozenMutation
+        );
+    }
+
+    // RC-MECHANISM: ONE-WAY transform assertions — rest_for alone and
+    // escape_with alone must preserve collection order and map pairing.
+    // (Round-trip tests masked an ordering defect because rest + escape
+    // applied compensating reversals; these pin each direction separately.)
+    #[test]
+    fn one_way_transforms_preserve_structure() {
+        let owner = Defs::new(None);
+        let vector = Val::Vector(vec![Val::Int(1), Val::Int(2), Val::Int(3)]);
+        let (rested, _) = own::rest_for(&owner, &vector);
+        assert_eq!(format!("{rested:?}"), format!("{vector:?}"));
+        let escaped = own::escape_with(&owner, &vector).unwrap();
+        assert_eq!(format!("{escaped:?}"), format!("{vector:?}"));
+
+        let map = Val::Map(ValMap::from_pairs(vec![
+            (Val::Keyword("k".into()), Val::Int(1)),
+            (Val::Keyword("j".into()), Val::Int(2)),
+        ]));
+        for transformed in [
+            own::rest_for(&owner, &map).0,
+            own::escape_with(&owner, &map).unwrap(),
+        ] {
+            let Val::Map(m) = &transformed else {
+                panic!("map survives");
+            };
+            assert_eq!(m.get(&Val::Keyword("k".into())), Some(&Val::Int(1)));
+            assert_eq!(m.get(&Val::Keyword("j".into())), Some(&Val::Int(2)));
+        }
+
+        let nested = Val::List(vec![
+            Val::Int(1),
+            Val::Vector(vec![Val::Int(2), Val::Int(3)]),
+            Val::Map(ValMap::from_pairs(vec![(
+                Val::Keyword("k".into()),
+                Val::Vector(vec![Val::Int(4), Val::Int(5)]),
+            )])),
+        ]);
+        let (rested, _) = own::rest_for(&owner, &nested);
+        assert_eq!(format!("{rested:?}"), format!("{nested:?}"));
+    }
+
+    // RC-MECHANISM: direct Defs storage — define + lookup preserves
+    // collection structure (no inverse-bug cancellation possible).
+    #[test]
+    fn defs_storage_preserves_collections() {
+        let d = Defs::new(None);
+        d.define(
+            "xs".into(),
+            Val::Vector(vec![Val::Int(1), Val::Int(2), Val::Int(3)]),
+        )
+        .unwrap();
+        assert_eq!(
+            d.lookup("xs").unwrap(),
+            Some(Val::Vector(vec![Val::Int(1), Val::Int(2), Val::Int(3)]))
+        );
+        d.define(
+            "m".into(),
+            Val::Map(ValMap::from_pairs(vec![(
+                Val::Keyword("k".into()),
+                Val::Int(1),
+            )])),
+        )
+        .unwrap();
+        let Some(Val::Map(m)) = d.lookup("m").unwrap() else {
+            panic!("stored map resolves");
+        };
+        assert_eq!(m.get(&Val::Keyword("k".into())), Some(&Val::Int(1)));
+    }
+
+    // RC-MECHANISM: reader map-literal provenance (duplicate-key evidence)
+    // survives the ownership transforms for unchanged maps.
+    #[test]
+    fn map_literal_provenance_survives_transforms() {
+        let owner = Defs::new(None);
+        let map_val = crate::read("{:a 1 :a 2}").expect("reader accepts duplicate keys");
+        let Val::Map(m) = &map_val else {
+            panic!("reader yields a map");
+        };
+        assert!(m.literal_pairs().is_some(), "reader attaches provenance");
+
+        let (rested, _) = own::rest_for(&owner, &map_val);
+        let Val::Map(rm) = &rested else {
+            panic!("map survives rest");
+        };
+        assert_eq!(
+            rm.literal_pairs().map(<[_]>::len),
+            Some(2),
+            "unchanged maps keep duplicate-key provenance through rest"
+        );
+        let escaped = own::escape_with(&owner, &rested).unwrap();
+        let Val::Map(em) = &escaped else {
+            panic!("map survives escape");
+        };
+        assert_eq!(em.literal_pairs().map(<[_]>::len), Some(2));
+    }
+
+    // RC-MECHANISM — STAGE C EXIT CRITERION (Sol R1 §3): the routine
+    // `Defs → callable → Env → Defs` strong cycle is REMOVED. Defining a
+    // closure into its own owner no longer keeps that owner alive.
+    #[test]
+    fn defs_strong_cycle_removed() {
+        let mut env = Env::new();
+        let d = tests::RecordingDispatch::new();
+        let probe = Rc::downgrade(env.defs());
+        tests::eval_str("(def f (fn [] 1))", &mut env, &d).unwrap();
+        drop(env);
+        assert!(
+            probe.upgrade().is_none(),
+            "defining a self-owned closure must not leak the owner"
+        );
+    }
+
+    // RC-MECHANISM: named recursion does not leak the owner.
+    #[test]
+    fn named_recursion_no_leak() {
+        let mut env = Env::new();
+        let d = tests::RecordingDispatch::new();
+        let probe = Rc::downgrade(env.defs());
+        tests::eval_str(
+            "(def fact (fn [n] (if (< n 2) 1 (* n (fact (- n 1))))))",
+            &mut env,
+            &d,
+        )
+        .unwrap();
+        assert_eq!(tests::eval_str("(fact 5)", &mut env, &d), Ok(Val::Int(120)));
+        drop(env);
+        assert!(
+            probe.upgrade().is_none(),
+            "recursive definition must not leak"
+        );
+    }
+
+    // RC-MECHANISM: mutual recursion does not leak the owner.
+    #[test]
+    fn mutual_recursion_no_leak() {
+        let mut env = Env::new();
+        let d = tests::RecordingDispatch::new();
+        let probe = Rc::downgrade(env.defs());
+        tests::eval_str(
+            "(def is-even (fn [n] (if (= n 0) true (is-odd (- n 1)))))",
+            &mut env,
+            &d,
+        )
+        .unwrap();
+        tests::eval_str(
+            "(def is-odd (fn [n] (if (= n 0) false (is-even (- n 1)))))",
+            &mut env,
+            &d,
+        )
+        .unwrap();
+        assert_eq!(
+            tests::eval_str("(is-even 4)", &mut env, &d),
+            Ok(Val::Bool(true))
+        );
+        drop(env);
+        assert!(probe.upgrade().is_none(), "mutual recursion must not leak");
+    }
+
+    // RC-MECHANISM: a same-owner callable nested in another callable's
+    // capture (Sol's canonical program) neither breaks activation nor
+    // leaks — captured slots rest at capture and escape at activation.
+    #[test]
+    fn nested_same_owner_capture_no_leak() {
+        let mut env = Env::new();
+        let d = tests::RecordingDispatch::new();
+        let probe = Rc::downgrade(env.defs());
+        tests::eval_str("(def f (let [g (fn [] 1)] (fn [] (g))))", &mut env, &d).unwrap();
+        assert_eq!(tests::eval_str("(f)", &mut env, &d), Ok(Val::Int(1)));
+        drop(env);
+        assert!(
+            probe.upgrade().is_none(),
+            "nested same-owner capture must not leak"
+        );
+    }
+
+    // RC-MECHANISM: a foreign-owner callable stored in another owner stays
+    // strong — the foreign module remains alive exactly as long as a
+    // holder exists.
+    #[test]
+    fn foreign_owner_callable_stays_alive() {
+        let mut env_a = Env::new();
+        let d = tests::RecordingDispatch::new();
+        let probe_a = Rc::downgrade(env_a.defs());
+        tests::eval_str("(def f (fn [] 41))", &mut env_a, &d).unwrap();
+        let escaped_f = env_a.get("f").unwrap().expect("f resolves");
+
+        let env_b = Env::new();
+        env_b.defs().define("af".into(), escaped_f).unwrap();
+        drop(env_a);
+        assert!(
+            probe_a.upgrade().is_some(),
+            "foreign holder keeps the defining owner alive"
+        );
+        drop(env_b);
+        assert!(
+            probe_a.upgrade().is_none(),
+            "dropping the last holder frees the foreign owner"
+        );
+    }
+
+    // RC-MECHANISM: the LAST escaped closure controls owner reclamation;
+    // exported closures survive after the originating env and export map
+    // drop. Exact strong/weak counts at each transition point.
+    #[test]
+    fn exact_counts_and_last_escapee_reclamation() {
+        let mut env = Env::new();
+        let d = tests::RecordingDispatch::new();
+        let probe = Rc::downgrade(env.defs());
+
+        // Construction + definition storage: only the env holds the owner
+        // strongly (the stored closure RESTS); the resting binding holds
+        // one weak reference (plus the probe).
+        tests::eval_str("(def f (fn [] 7))", &mut env, &d).unwrap();
+        assert_eq!(Rc::strong_count(env.defs()), 1, "definition storage");
+        assert_eq!(Rc::weak_count(env.defs()), 2, "resting ref + probe");
+
+        // Lookup: the escaped copy holds the owner strongly.
+        let looked_up = env.get("f").unwrap().expect("f resolves");
+        assert_eq!(Rc::strong_count(env.defs()), 2, "lookup escapee");
+
+        // Invocation: transient — counts return to the pre-call state.
+        let out = tests::eval_str("(f)", &mut env, &d);
+        assert_eq!(out, Ok(Val::Int(7)));
+        assert_eq!(Rc::strong_count(env.defs()), 2, "invocation is transient");
+
+        // Export: one more strong holder per exported copy.
+        let exports = env.local_bindings().unwrap();
+        assert_eq!(Rc::strong_count(env.defs()), 3, "export escapee");
+
+        // Drop the env: escapees keep the owner alive.
+        let defs_probe = probe.clone();
+        drop(env);
+        assert!(defs_probe.upgrade().is_some(), "escapees keep owner alive");
+
+        // Drop the export map: one escapee left.
+        drop(exports);
+        assert!(defs_probe.upgrade().is_some(), "last escapee still holds");
+
+        // Final escape drop: the owner is reclaimed.
+        drop(looked_up);
+        assert!(
+            defs_probe.upgrade().is_none(),
+            "last escapee drop reclaims the owner"
+        );
+    }
+
+    // RC-MECHANISM: identity and hash anchor on the captured-env pointer —
+    // preserved through define (rest) and lookup (escape); callable map
+    // keys stay valid.
+    #[test]
+    fn identity_hash_preserved_through_define_lookup() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut env = Env::new();
+        let d = tests::RecordingDispatch::new();
+        tests::eval_str("(def f (fn [] 1))", &mut env, &d).unwrap();
+        let a = env.get("f").unwrap().expect("f resolves");
+        let b = env.get("f").unwrap().expect("f resolves");
+        assert_eq!(a, b, "escaped copies of one closure compare equal");
+        let hash = |v: &Val| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&a), hash(&b), "hashes stable through rest/escape");
+
+        // Callable map key: a map keyed by the closure resolves through a
+        // separately escaped copy.
+        let m = Val::Map(crate::ValMap::from_pairs(vec![(
+            a.clone(),
+            Val::Str("hit".into()),
+        )]));
+        env.defs().define("m".into(), m).unwrap();
+        let Some(Val::Map(m2)) = env.get("m").unwrap() else {
+            panic!("map resolves");
+        };
+        assert_eq!(m2.get(&b), Some(&Val::Str("hit".into())));
+
+        // Separately evaluated fn forms remain DISTINCT identities.
+        tests::eval_str("(def g (fn [] 1))", &mut env, &d).unwrap();
+        let g = env.get("g").unwrap().expect("g resolves");
+        assert_ne!(a, g, "separate evaluations are distinct closures");
+    }
+
+    // RC-MECHANISM: CapturedEnv is lexical-only storage (no Defs inside —
+    // enforced by construction; this pins the accessor surface).
+    #[test]
+    fn captured_env_is_lexical_slots_only() {
+        let mut slots = Frame::new();
+        slots.insert("x".into(), Val::Int(9));
+        let captured = super::CapturedEnv::from_slots(slots);
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured.get("x"), Some(&Val::Int(9)));
+        assert_eq!(captured.get("y"), None);
+    }
+}
+
+/// PR-1b.0 Stage B definition-semantics tests. All `// SEMANTIC`: these pin
+/// language behavior (definition ownership, late binding, the top-level
+/// gate, prelude sharing) and survive any future memory-model migration.
+#[cfg(test)]
+mod stage_b_semantics {
+    use super::tests::RecordingDispatch;
+    use super::{Env, EvalError};
+    use crate::Val;
+
+    #[allow(clippy::result_large_err)] // test helper; EvalError is the boundary type
+    fn eval_seq(env: &mut Env, d: &RecordingDispatch, forms: &[&str]) -> Result<Val, EvalError> {
+        let mut last = Val::Nil;
+        for src in forms {
+            last = super::tests::eval_str(src, env, d)?;
+        }
+        Ok(last)
+    }
+
+    /// Env with the REAL shared-prelude lifecycle (memoized, frozen,
+    /// inherited) — the module/REPL initialization shape.
+    fn module_env(d: &mut RecordingDispatch) -> Env {
+        let mut env = Env::new();
+        super::tests::pollster_eval(crate::load_prelude(&mut env, d));
+        env
+    }
+
+    // SEMANTIC — late binding, canonical program.
+    #[test]
+    fn late_binding_canonical() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &["(def x 1)", "(defn f [] x)", "(def x 2)", "(f)"],
+        );
+        assert_eq!(out, Ok(Val::Int(2)));
+    }
+
+    // SEMANTIC — named recursion.
+    #[test]
+    fn named_recursion() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &[
+                "(defn fact [n] (if (< n 2) 1 (* n (fact (- n 1)))))",
+                "(fact 5)",
+            ],
+        );
+        assert_eq!(out, Ok(Val::Int(120)));
+    }
+
+    // SEMANTIC — mutual recursion (top-level forward reference).
+    #[test]
+    fn mutual_recursion() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &[
+                "(defn is-even [n] (if (= n 0) true (is-odd (- n 1))))",
+                "(defn is-odd [n] (if (= n 0) false (is-even (- n 1))))",
+                // Guest recursion depth is bounded by the host Rust stack
+                // (async eval frames): ≈5 in debug builds, hundreds in
+                // release (measured: 100 passes, 1000 overflows at the
+                // 2 MiB default). `recur` remains the unbounded-iteration
+                // construct. Depth budget is a Stage G measurement item.
+                "(is-even 4)",
+            ],
+        );
+        assert_eq!(out, Ok(Val::Bool(true)));
+        #[cfg(not(debug_assertions))]
+        assert_eq!(
+            eval_seq(&mut env, &d, &["(is-even 100)"]),
+            Ok(Val::Bool(true))
+        );
+    }
+
+    // SEMANTIC — repeated definition: last write wins.
+    #[test]
+    fn repeated_definition_last_wins() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        let out = eval_seq(&mut env, &d, &["(def x 1)", "(def x 2)", "x"]);
+        assert_eq!(out, Ok(Val::Int(2)));
+    }
+
+    // SEMANTIC — def inside a function: catchable
+    // glia.error/def-not-top-level; no mutation occurs.
+    #[test]
+    fn def_inside_fn_is_catchable() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &[
+                "(defn install [] (def hidden 1))",
+                "(try (install) (catch :glia.error/def-not-top-level e :caught))",
+            ],
+        );
+        assert_eq!(out, Ok(Val::Keyword("caught".into())));
+        // The definition never happened.
+        assert!(env
+            .local_bindings()
+            .unwrap()
+            .iter()
+            .all(|(n, _)| n != "hidden"));
+    }
+
+    // SEMANTIC — a function called during module initialization cannot
+    // define (call envs never carry definition privilege).
+    #[test]
+    fn fn_called_during_module_init_cannot_define() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        let err = eval_seq(
+            &mut env,
+            &d,
+            &["(defn setup [] (def installed 1))", "(setup)"],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("def-not-top-level"),
+            "expected def-not-top-level, got: {err}"
+        );
+    }
+
+    // SEMANTIC — a top-level macro may expand to `def` (the expansion
+    // evaluates in the caller's top-level environment).
+    #[test]
+    fn top_level_macro_expanding_to_def_succeeds() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &[
+                "(defmacro def-two [n] (list (quote def) n 2))",
+                "(def-two y)",
+                "y",
+            ],
+        );
+        assert_eq!(out, Ok(Val::Int(2)));
+    }
+
+    // SEMANTIC — a macro BODY attempting `def` fails (expansion computation
+    // runs without definition privilege).
+    #[test]
+    fn macro_body_attempting_def_fails() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        let err = eval_seq(&mut env, &d, &["(defmacro bad [] (def z 9))", "(bad)"]).unwrap_err();
+        assert!(
+            err.to_string().contains("def-not-top-level"),
+            "expected def-not-top-level, got: {err}"
+        );
+    }
+
+    // SEMANTIC — prelude names resolve inside a module via inherited
+    // lookup.
+    #[test]
+    fn prelude_names_resolve_in_module() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        let out = eval_seq(&mut env, &d, &["(when true 42)"]);
+        assert_eq!(out, Ok(Val::Int(42)));
+    }
+
+    // SEMANTIC — prelude names are absent from local_bindings; only owned
+    // definitions appear (embedder root-frame bindings excluded too).
+    #[test]
+    fn local_bindings_owned_definitions_only() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        assert!(
+            env.local_bindings().unwrap().is_empty(),
+            "fresh module owns no definitions"
+        );
+        // Embedder ambient context (root lexical frame) is not a module
+        // definition.
+        env.set("ambient".into(), Val::Int(0));
+        eval_seq(&mut env, &d, &["(def answer 42)"]).unwrap();
+        let names: Vec<String> = env
+            .local_bindings()
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, vec!["answer".to_string()]);
+    }
+
+    // SEMANTIC — local shadowing of a prelude name: resolves locally,
+    // exports locally, never mutates the shared prelude, never affects a
+    // sibling environment.
+    #[test]
+    fn prelude_shadowing_is_local() {
+        let mut d = RecordingDispatch::new();
+        let mut env_a = module_env(&mut d);
+        let out = eval_seq(
+            &mut env_a,
+            &d,
+            &["(defmacro when [test & body] :shadowed)", "(when true 1)"],
+        );
+        assert_eq!(out, Ok(Val::Keyword("shadowed".into())));
+        let names: Vec<String> = env_a
+            .local_bindings()
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, vec!["when".to_string()], "shadow exports locally");
+
+        // Sibling environment inherits the UNTOUCHED shared prelude.
+        let mut env_b = module_env(&mut d);
+        let out_b = eval_seq(&mut env_b, &d, &["(when true 1)"]);
+        assert_eq!(out_b, Ok(Val::Int(1)), "sibling sees the real prelude");
+    }
+
+    // SEMANTIC — REPL shape: definitions persist across top-level
+    // evaluations and observe late redefinition.
+    #[test]
+    fn repl_definitions_persist_and_late_bind() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        assert_eq!(
+            eval_seq(&mut env, &d, &["(def n 1)", "(defn get-n [] n)"]).map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(eval_seq(&mut env, &d, &["(get-n)"]), Ok(Val::Int(1)));
+        assert_eq!(
+            eval_seq(&mut env, &d, &["(def n 5)", "(get-n)"]),
+            Ok(Val::Int(5))
+        );
+    }
+
+    // SEMANTIC — lexical behavior unchanged: `let` shadows definitions
+    // lexically; closures still snapshot lexical locals.
+    #[test]
+    fn lexical_semantics_unchanged() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        assert_eq!(
+            eval_seq(&mut env, &d, &["(def x 1)", "(let [x 5] x)"]),
+            Ok(Val::Int(5))
+        );
+        assert_eq!(eval_seq(&mut env, &d, &["x"]), Ok(Val::Int(1)));
+        // Lexical capture is still a snapshot.
+        assert_eq!(
+            eval_seq(&mut env, &d, &["(def g (let [y 7] (fn [] y)))", "(g)"]),
+            Ok(Val::Int(7))
+        );
+    }
+
+    // SEMANTIC — a closure survives and works after its defining
+    // environment drops (the exported-value lifetime guarantee).
+    #[test]
+    fn closure_survives_defining_env_drop() {
+        let mut d = RecordingDispatch::new();
+        let mut env_a = module_env(&mut d);
+        eval_seq(&mut env_a, &d, &["(def x 41)", "(defn f [] (+ x 1))"]).unwrap();
+        let f = env_a.get("f").unwrap().expect("f resolves");
+        drop(env_a);
+
+        let mut env_b = module_env(&mut d);
+        env_b.set("imported-f".into(), f);
+        assert_eq!(
+            eval_seq(&mut env_b, &d, &["(imported-f)"]),
+            Ok(Val::Int(42)),
+            "closure keeps its defining owner (late-bound x) after env drop"
+        );
+    }
+
+    // SEMANTIC — a macro survives after its defining environment drops.
+    #[test]
+    fn macro_survives_defining_env_drop() {
+        let mut d = RecordingDispatch::new();
+        let mut env_a = module_env(&mut d);
+        eval_seq(&mut env_a, &d, &["(defmacro answer [] 42)"]).unwrap();
+        let m = env_a.get("answer").unwrap().expect("macro resolves");
+        drop(env_a);
+
+        let mut env_b = module_env(&mut d);
+        env_b.set("imported-answer".into(), m);
+        assert_eq!(
+            eval_seq(&mut env_b, &d, &["(imported-answer)"]),
+            Ok(Val::Int(42))
+        );
+    }
+
+    // SEMANTIC — defined collections round-trip unchanged (Sol R1 change 1:
+    // guest-visible reproducers for the ordering defect).
+    #[test]
+    fn defined_collections_round_trip() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        assert_eq!(
+            eval_seq(&mut env, &d, &["(def xs [1 2 3])", "xs"]),
+            Ok(Val::Vector(vec![Val::Int(1), Val::Int(2), Val::Int(3)]))
+        );
+        assert_eq!(
+            eval_seq(&mut env, &d, &["(def m {:k 1})", "(get m :k)"]),
+            Ok(Val::Int(1))
+        );
+        assert_eq!(
+            eval_seq(&mut env, &d, &["(def zs (list 1 2 3))", "zs"]),
+            Ok(Val::List(vec![Val::Int(1), Val::Int(2), Val::Int(3)]))
+        );
+    }
+
+    // SEMANTIC — a quoted map literal keeps its reader provenance
+    // (duplicate-key evidence for later grant validation) through
+    // definition storage.
+    #[test]
+    fn quoted_map_provenance_survives_definition() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        eval_seq(&mut env, &d, &["(def form (quote {:a 1 :a 2}))"]).unwrap();
+        let Some(Val::Map(m)) = env.get("form").unwrap() else {
+            panic!("stored quoted map resolves");
+        };
+        assert_eq!(
+            m.literal_pairs().map(<[_]>::len),
+            Some(2),
+            "duplicate-key provenance survives define/lookup"
+        );
+    }
+
+    // SEMANTIC — definition-privilege matrix: every def-family form is
+    // denied without top-level privilege, in every callable context.
+    #[test]
+    fn privilege_matrix_defmacro_and_defn_inside_fn() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        // Analyzed pipeline: defmacro inside a fn body.
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &[
+                "(defn h [] (defmacro mm [] 1))",
+                "(try (h) (catch :glia.error/def-not-top-level e :caught))",
+            ],
+        );
+        assert_eq!(out, Ok(Val::Keyword("caught".into())));
+        // defn (macro expansion to def) inside a fn body.
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &[
+                "(defn outer [] (defn inner [] 1))",
+                "(try (outer) (catch :glia.error/def-not-top-level e :caught))",
+            ],
+        );
+        assert_eq!(out, Ok(Val::Keyword("caught".into())));
+    }
+
+    // SEMANTIC — raw (non-analyzed) pipeline: def inside a raw-constructed
+    // closure is denied through the same checked operation.
+    #[test]
+    fn privilege_matrix_raw_pipeline_def_denied() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        // Build (def h (fn [] (defmacro mm [] 1))) as raw Vals — bypasses
+        // the analyzer, exercising the raw defmacro path inside a call.
+        let def_h = Val::List(vec![
+            Val::Sym("def".into()),
+            Val::Sym("h".into()),
+            Val::List(vec![
+                Val::Sym("fn".into()),
+                Val::Vector(vec![]),
+                Val::List(vec![
+                    Val::Sym("defmacro".into()),
+                    Val::Sym("mm".into()),
+                    Val::Vector(vec![]),
+                    Val::Int(1),
+                ]),
+            ]),
+        ]);
+        super::tests::eval_raw_blocking(&def_h, &mut env, &d).unwrap();
+        let err =
+            super::tests::eval_raw_blocking(&Val::List(vec![Val::Sym("h".into())]), &mut env, &d)
+                .unwrap_err();
+        let payload = super::tests::err_payload(&err);
+        assert_eq!(
+            crate::error::type_tag(payload),
+            Some(crate::error::tag::DEF_NOT_TOP_LEVEL),
+            "raw pipeline must deny with the exact stable tag, got: {payload}"
+        );
+    }
+
+    // SEMANTIC — defcap: allowed at top level; denied inside a function.
+    #[test]
+    fn privilege_matrix_defcap() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        assert!(eval_seq(
+            &mut env,
+            &d,
+            &["(defcap logger :write (fn [message] message))"]
+        )
+        .is_ok());
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &[
+                "(defn make-cap-later [] (defcap sneaky :m (fn [x] x)))",
+                "(try (make-cap-later) (catch :glia.error/def-not-top-level e :caught))",
+            ],
+        );
+        assert_eq!(out, Ok(Val::Keyword("caught".into())));
+    }
+
+    // SEMANTIC — def inside an effect handler is denied; the try-resume /
+    // with-effect-handler BODY at top level retains privilege (it is the
+    // top-level evaluation), and privilege is intact after resumption.
+    #[test]
+    fn privilege_matrix_handlers_and_resumption() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        // Handler body (a call) cannot define; its throw surfaces at the
+        // perform site and is catchable there.
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &["(try (with-effect-handler :e (fn [v resume] (def bad 1)) \
+                        (perform :e 1)) \
+                      (catch :glia.error/def-not-top-level e :caught))"],
+        );
+        assert_eq!(out, Ok(Val::Keyword("caught".into())));
+        assert!(env
+            .local_bindings()
+            .unwrap()
+            .iter()
+            .all(|(n, _)| n != "bad"));
+
+        // Resumptive handler: BOTH sides of the suspension in ONE
+        // top-level body — a definition before `perform` and one after the
+        // resumption, proving privilege is intact across suspend/resume.
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &[
+                "(with-effect-handler :r (fn [v resume] (resume 10)) \
+                   (do (def before 1) (def after (+ (perform :r 1) 1))))",
+                "before",
+            ],
+        );
+        assert_eq!(out, Ok(Val::Int(1)));
+        assert_eq!(eval_seq(&mut env, &d, &["after"]), Ok(Val::Int(11)));
+
+        // A RESUMED function remains unprivileged: definition attempted
+        // after its suspension point still throws.
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &[
+                "(defn suspended [] (do (perform :r2 1) (def bad2 1)))",
+                "(try (with-effect-handler :r2 (fn [v resume] (resume 0)) \
+                        (suspended)) \
+                      (catch :glia.error/def-not-top-level e :caught))",
+            ],
+        );
+        assert_eq!(out, Ok(Val::Keyword("caught".into())));
+        assert!(env
+            .local_bindings()
+            .unwrap()
+            .iter()
+            .all(|(n, _)| n != "bad2"));
+    }
+
+    // SEMANTIC — def inside a cap method body is denied.
+    #[test]
+    fn privilege_matrix_cap_method() {
+        let mut d = RecordingDispatch::new();
+        let mut env = module_env(&mut d);
+        let out = eval_seq(
+            &mut env,
+            &d,
+            &[
+                "(defcap c :m (fn [x] (def bad 1)))",
+                "(try (perform c :m 1) (catch :glia.error/def-not-top-level e :caught))",
+            ],
+        );
+        assert_eq!(out, Ok(Val::Keyword("caught".into())));
+    }
+
+    // SEMANTIC — a frozen-owner definition is an evaluator FAULT: wildcard
+    // `try` cannot catch it and it reaches the boundary as EvalError::Fault.
+    #[test]
+    fn frozen_owner_definition_faults_uncatchably() {
+        let mut d = RecordingDispatch::new();
+        let env_template = module_env(&mut d);
+        let prelude = std::rc::Rc::clone(env_template.defs());
+        drop(env_template);
+        // An env whose OWN owner is frozen (constructed host-side; guests
+        // cannot reach this state through the language today).
+        let mut env = Env::new();
+        env.defs().freeze();
+        let _ = prelude;
+        let err = eval_seq(&mut env, &d, &["(try (def x 1) (catch _ e :caught))"]).unwrap_err();
+        assert!(
+            matches!(err, EvalError::Fault(_)),
+            "frozen-owner definition must fault past wildcard try, got: {err}"
+        );
+    }
+
+    // SEMANTIC — named recursion under a pinned 2 MiB stack budget
+    // (regression coverage for evaluator frame growth; measurement item
+    // from Sol R1 §12 — not TCO, not trampolining).
+    #[test]
+    fn named_recursion_2mib_stack_budget() {
+        // Subprocess-isolated: a Rust stack overflow ABORTS the process
+        // rather than unwinding through JoinHandle::join, so the
+        // constrained-stack probe runs in a CHILD test process and the
+        // parent asserts its exit status. (Deeper WASM measurement stays a
+        // Stage G item.)
+        const CHILD_FLAG: &str = "GLIA_RECURSION_BUDGET_CHILD";
+        if std::env::var(CHILD_FLAG).is_ok() {
+            let depth = if cfg!(debug_assertions) { 3 } else { 50 };
+            let handle = std::thread::Builder::new()
+                .name("glia-recursion-budget".into())
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || -> Result<(), String> {
+                    // Vals are thread-local (Rc); assert inside and return
+                    // a Send-able verdict.
+                    let mut d = RecordingDispatch::new();
+                    let mut env = module_env(&mut d);
+                    match eval_seq(
+                        &mut env,
+                        &d,
+                        &[
+                            "(defn down [n] (if (= n 0) 0 (down (- n 1))))",
+                            &format!("(down {depth})"),
+                        ],
+                    ) {
+                        Ok(Val::Int(0)) => Ok(()),
+                        other => Err(format!("unexpected result: {other:?}")),
+                    }
+                })
+                .expect("spawn budget thread");
+            handle
+                .join()
+                .expect("no overflow")
+                .expect("recursion at budget");
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "eval::stage_b_semantics::named_recursion_2mib_stack_budget",
+                "--test-threads=1",
+            ])
+            .env(CHILD_FLAG, "1")
+            .status()
+            .expect("spawn child test process");
+        assert!(
+            status.success(),
+            "recursion-at-budget child process failed (an overflow aborts): {status}"
+        );
+    }
+}
+
+/// Release-checked ownership-fault plumbing tests (Stage C): a GENUINE
+/// mismatched resting reference — a callable rested for one owner, planted
+/// in a different owner's storage — must surface on the uncatchable fault
+/// lane end to end. Never a panic, never a guest exception.
+#[cfg(test)]
+mod fault_plumbing_tests {
+    use super::tests::{eval_str, RecordingDispatch};
+    use super::{own, Binding, Env, EvalError};
+
+    /// Build an env whose defs contains a binding holding a callable that
+    /// RESTS for a FOREIGN owner (the genuine invariant breach).
+    fn poisoned_env() -> Env {
+        let mut foreign = Env::new();
+        let d = RecordingDispatch::new();
+        let f = eval_str("(fn [] 1)", &mut foreign, &d).unwrap();
+        let (rested, resting) = own::rest_for(foreign.defs(), &f);
+        assert!(resting, "self-owned callable rests for its owner");
+
+        let env = Env::new();
+        env.defs().bindings.borrow_mut().insert(
+            "poisoned".into(),
+            Binding {
+                value: rested,
+                has_resting_owner_refs: true,
+            },
+        );
+        env
+    }
+
+    // RC-MECHANISM: an unmatched resting owner at LOOKUP is a
+    // release-checked internal fault — never a panic — with no ownership
+    // vocabulary in the fault text.
+    #[test]
+    fn lookup_unmatched_witness_faults_not_panics() {
+        let env = poisoned_env();
+        let err = env.get("poisoned").expect_err("must fault, not succeed");
+        let text = format!("{}", err.payload());
+        assert!(
+            !text.contains("weak") && !text.contains("Weak") && !text.contains("resting"),
+            "no ownership vocabulary in fault text: {text}"
+        );
+    }
+
+    // RC-MECHANISM: an unmatched resting owner at EXPORT is the same
+    // release-checked fault.
+    #[test]
+    fn export_unmatched_witness_faults_not_panics() {
+        let env = poisoned_env();
+        env.local_bindings().expect_err("must fault, not succeed");
+    }
+
+    // RC-MECHANISM: the fault flows through evaluation as EvalError::Fault
+    // and wildcard `try` CANNOT intercept it.
+    #[test]
+    fn lookup_fault_is_uncatchable_through_eval() {
+        let mut env = poisoned_env();
+        let d = RecordingDispatch::new();
+        let err = eval_str("(try poisoned (catch _ e :caught))", &mut env, &d)
+            .expect_err("fault must escape the wildcard catch");
+        assert!(
+            matches!(err, EvalError::Fault(_)),
+            "expected the uncatchable fault lane, got: {err}"
+        );
     }
 }

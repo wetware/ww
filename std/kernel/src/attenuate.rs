@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use capnp::capability::FromClientHook;
-use glia::{extract_method, make_cap, HandledCapInner, Val};
+use glia::{extract_method, make_cap, HandledCapInner, NativeSignal, Val};
 use membrane::{Allowlist, DENIED_MARKER};
 
 use crate::{
@@ -163,15 +163,15 @@ fn make_gated_handler(
             let inner = inner.clone();
             Box::pin(async move {
                 if args.len() != 2 {
-                    return Err(glia::error::arity(
+                    return Err(NativeSignal::throw(glia::error::arity(
                         "attenuated cap handler",
                         "2",
                         args.len(),
-                    ));
+                    )));
                 }
                 let (method, _) = extract_method(&args[0])?;
                 if !allowed.iter().any(|(n, _)| n == method) {
-                    return Err(glia::error::permission_denied(
+                    return Err(NativeSignal::throw(glia::error::permission_denied(
                         &format!("method :{method} denied by attenuation policy on '{cap_name}'"),
                         Some(&format!(
                             "interface 0x{interface_id:016x}; allowed: {}",
@@ -181,23 +181,23 @@ fn make_gated_handler(
                                 .collect::<Vec<_>>()
                                 .join(" ")
                         )),
-                    ));
+                    )));
                 }
                 let Some(handler) = inner else {
-                    return Err(glia::error::permission_denied(
+                    return Err(NativeSignal::throw(glia::error::permission_denied(
                         &format!("no local dispatch for attenuated capability '{cap_name}'"),
                         Some("the cap is still enforceable across boundaries (export/serve)"),
-                    ));
+                    )));
                 };
                 let result = match &handler {
                     Val::AsyncNativeFn { func, .. } => func(args).await,
                     Val::NativeFn { func, .. } => func(&args),
-                    other => Err(glia::error::internal(
+                    other => Err(NativeSignal::throw(glia::error::internal(
                         "attenuated cap handler",
                         format!("inner handler is not callable: {other}"),
-                    )),
+                    ))),
                 };
-                result.map_err(|e| map_membrane_denial(e, &cap_name))
+                result.map_err(|sig| sig.map_throw(|e| map_membrane_denial(e, &cap_name)))
             })
         }),
     }
@@ -210,15 +210,10 @@ pub fn reify(
     cap: &Val,
     allow: &BTreeSet<String>,
 ) -> Option<Result<Val, Val>> {
-    let Val::Cap {
-        name,
-        schema_cid,
-        inner,
-        ..
-    } = cap
-    else {
+    let Val::Cap(handle) = cap else {
         return None;
     };
+    let (name, schema_cid, inner) = (handle.name(), handle.schema_cid(), handle.inner());
 
     // Re-attenuation of one of our membraned caps intersects the name sets;
     // the hook-level wrap below folds into a single membrane layer via
@@ -267,7 +262,7 @@ pub fn reify(
     // Rebuild the cap's local dispatch over the MEMBRANED client, so local
     // perform routes through the same enforcement as remote callers. Caps
     // without a kernel handler stay export-enforceable only.
-    let typed_handler = match name.as_str() {
+    let typed_handler = match name {
         "host" => {
             let s = ctx.borrow();
             Some(make_host_handler(
@@ -299,8 +294,8 @@ pub fn reify(
     .into_bytes();
 
     Some(Ok(make_cap(
-        name.clone(),
-        schema_cid.clone(),
+        name,
+        schema_cid,
         Rc::new(HandledCapInner {
             handler,
             export: Rc::new(MembranedCap {

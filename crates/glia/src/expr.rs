@@ -160,13 +160,10 @@ impl Expr {
                 | Val::Keyword(_)
                 | Val::Bytes(_)
                 | Val::Fn { .. }
-                | Val::Recur(_)
                 | Val::Macro { .. }
-                | Val::Effect { .. }
                 | Val::NativeFn { .. }
                 | Val::AsyncNativeFn { .. }
-                | Val::Resume(_)
-                | Val::Cap { .. } => BTreeSet::new(),
+                | Val::Cap(_) => BTreeSet::new(),
             }
         }
 
@@ -349,12 +346,9 @@ pub fn analyze(val: &Val) -> Result<Expr, String> {
         // Runtime-only values (shouldn't appear in source but handle gracefully)
         Val::Fn { .. }
         | Val::Macro { .. }
-        | Val::Recur(_)
-        | Val::Effect { .. }
         | Val::NativeFn { .. }
         | Val::AsyncNativeFn { .. }
-        | Val::Resume(_)
-        | Val::Cap { .. } => Ok(Expr::Const(val.clone())),
+        | Val::Cap(_) => Ok(Expr::Const(val.clone())),
     }
 }
 

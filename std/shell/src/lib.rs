@@ -18,7 +18,7 @@ use capnp_rpc::pry;
 
 use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
 use glia::eval::{self, Dispatch, Env, EvalOutcome};
-use glia::{make_cap, HandledCapInner, Val};
+use glia::{make_cap, HandledCapInner, NativeSignal, Val};
 
 use wasip2::exports::cli::run::Guest;
 
@@ -59,7 +59,7 @@ struct ShellSession {
 type HandlerFn = for<'a> fn(
     &'a [Val],
     &'a RefCell<ShellSession>,
-) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>>;
+) -> Pin<Box<dyn Future<Output = Result<Val, NativeSignal>> + 'a>>;
 
 struct ShellDispatch<'s> {
     ctx: &'s RefCell<ShellSession>,
@@ -71,11 +71,11 @@ impl<'s> Dispatch for ShellDispatch<'s> {
         &'a self,
         name: &'a str,
         args: &'a [Val],
-    ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Val, NativeSignal>> + 'a>> {
         Box::pin(async move {
             match self.table.get(name) {
                 Some(handler) => handler(args, self.ctx).await,
-                None => Err(Val::from(format!("{name}: command not found"))),
+                None => Err(NativeSignal::throw(format!("{name}: command not found"))),
             }
         })
     }
@@ -112,7 +112,10 @@ fn host_effects(load_runtime: LoadRuntime, output: Rc<RefCell<String>>) -> Vec<H
     let stdout = Rc::new(move |data: Val| {
         let output = output.clone();
         Box::pin(async move {
-            let text = match data { Val::Str(s) => s, other => format!("{other}") };
+            let text = match data {
+                Val::Str(s) => s,
+                other => format!("{other}"),
+            };
             let mut sink = output.borrow_mut();
             sink.push_str(&text);
             sink.push('\n');
@@ -124,9 +127,18 @@ fn host_effects(load_runtime: LoadRuntime, output: Rc<RefCell<String>>) -> Vec<H
             as Pin<Box<dyn Future<Output = Result<HostEffectResult, Val>>>>
     });
     vec![
-        HostEffect { target: EffectTarget::Keyword("load".into()), handler: load },
-        HostEffect { target: EffectTarget::Keyword("stdout".into()), handler: stdout },
-        HostEffect { target: EffectTarget::Keyword("exit".into()), handler: exit },
+        HostEffect {
+            target: EffectTarget::Keyword("load".into()),
+            handler: load,
+        },
+        HostEffect {
+            target: EffectTarget::Keyword("stdout".into()),
+            handler: stdout,
+        },
+        HostEffect {
+            target: EffectTarget::Keyword("exit".into()),
+            handler: exit,
+        },
     ]
 }
 
@@ -207,7 +219,9 @@ impl shell_capnp::shell::Server for ShellImpl {
                 &mut self.env.borrow_mut(),
                 &dispatch,
                 &effects,
-            ).await {
+            )
+            .await
+            {
                 Ok(EvalOutcome::Exit) => {
                     results.get().set_result("");
                     results.get().set_is_error(false);
@@ -222,17 +236,21 @@ impl shell_capnp::shell::Server for ShellImpl {
                     results.get().set_is_error(false);
                 }
                 Err(e) => {
-                    // Unhandled `(throw ...)` arrives as Val::Effect{
-                    // effect_type: "glia.exception", data: <err> } —
-                    // peel before formatting so the user sees the inner
-                    // structured error map.
-                    let inner = glia::error::unwrap_thrown(&e).unwrap_or(&e);
-                    let msg = glia::error::message(inner)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("{inner}"));
-                    let formatted = match glia::error::type_tag(inner) {
-                        Some(tag) => format!("[{tag}] {msg}"),
-                        None => msg,
+                    // An unhandled `(throw ...)` or fault carries a
+                    // structured payload; peel before formatting so the
+                    // user sees the inner error map. Other escaped effects
+                    // fall back to the boundary display form.
+                    let formatted = match e.payload() {
+                        Some(inner) => {
+                            let msg = glia::error::message(inner)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("{inner}"));
+                            match glia::error::type_tag(inner) {
+                                Some(tag) => format!("[{tag}] {msg}"),
+                                None => msg,
+                            }
+                        }
+                        None => format!("{e}"),
                     };
                     results.get().set_result(&formatted);
                     results.get().set_is_error(true);
@@ -308,42 +326,44 @@ fn run_impl() {
             for (name, handler) in caps {
                 env.set(
                     name.to_string(),
-                    make_cap(name, format!("shell:{name}"), std::rc::Rc::new(HandledCapInner {
-                        handler,
-                        export: std::rc::Rc::new(()),
-                        descriptor: Vec::new(),
-                    })),
+                    make_cap(
+                        name,
+                        format!("shell:{name}"),
+                        std::rc::Rc::new(HandledCapInner {
+                            handler,
+                            export: std::rc::Rc::new(()),
+                            descriptor: Vec::new(),
+                        }),
+                    ),
                 );
             }
         }
 
-        // 3. Load the prelude (macro definitions only, no capability calls).
+        // 3. Load the prelude through the canonical lifecycle (shared,
+        // frozen, macro-only-certified owner; shell definitions go to a
+        // fresh child owner). Prelude errors are fatal by `load_prelude`'s
+        // contract — the task dies before `ready` is ever set, so readiness
+        // can never be reached on a failed or partial initialization.
         {
-            let mut env = env.borrow_mut();
-            let prelude_forms = glia::read_many(glia::PRELUDE).expect("prelude: parse error");
             struct NoopDispatch;
             impl Dispatch for NoopDispatch {
                 fn call<'a>(
                     &'a self,
                     name: &'a str,
                     _args: &'a [Val],
-                ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
-                    Box::pin(std::future::ready(Err(Val::from(format!(
+                ) -> Pin<Box<dyn Future<Output = Result<Val, NativeSignal>> + 'a>> {
+                    Box::pin(std::future::ready(Err(NativeSignal::throw(format!(
                         "{name}: not available"
                     )))))
                 }
             }
-            let noop = NoopDispatch;
-            for form in &prelude_forms {
-                let mut fut = Box::pin(eval::eval_toplevel(form, &mut env, &noop));
-                let waker = std::task::Waker::noop();
-                let mut cx = std::task::Context::from_waker(&waker);
-                match fut.as_mut().poll(&mut cx) {
-                    std::task::Poll::Ready(Ok(_)) => {}
-                    std::task::Poll::Ready(Err(e)) => log::error!("prelude: {e}"),
-                    std::task::Poll::Pending => log::error!("prelude: unexpected pending"),
-                }
-            }
+            let mut noop = NoopDispatch;
+            // No RefCell borrow across the await: initialize an owned copy
+            // and write it back (cheap Rc-bump clone; init runs before any
+            // concurrent eval can observe the env).
+            let mut owned = env.borrow().clone();
+            glia::load_prelude(&mut owned, &mut noop).await;
+            *env.borrow_mut() = owned;
         }
 
         ready.set(true);

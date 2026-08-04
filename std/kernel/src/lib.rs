@@ -7,8 +7,10 @@ use std::pin::Pin;
 use caps::eval_load;
 use caps::{make_import_cap, make_import_handler};
 use glia::effect::{EffectTarget, HostEffect, HostEffectResult};
-use glia::eval::{self, Dispatch, Env, EvalOutcome};
-use glia::{extract_method, make_cap, read, read_many, AttenuatedCapInner, GliaCapInner, Val};
+use glia::eval::{self, Dispatch, Env, EvalError, EvalOutcome};
+use glia::{
+    extract_method, make_cap, read, read_many, AttenuatedCapInner, GliaCapInner, NativeSignal, Val,
+};
 
 use std::rc::Rc;
 
@@ -224,12 +226,12 @@ fn collect_forwardable_caps(
 ) -> Result<Vec<(String, capnp::capability::Client)>, Val> {
     caps.iter()
         .map(|(name, val)| {
-            let Val::Cap { inner, .. } = val else {
+            let Val::Cap(handle) = val else {
                 return Err(glia::error::invalid_cell_spec(context, format!(
                     "{context} — grant \"{name}\" expected a capability, got {val}"
                 )));
             };
-            let client = extract_capnp_client(inner).ok_or_else(|| {
+            let client = extract_capnp_client(handle.inner()).ok_or_else(|| {
                 glia::error::invalid_cell_spec(context, format!(
                     "{context} — grant \"{name}\" is not backed by an exportable Cap'n Proto capability; use a Cap'n Proto-backed capability or follow the defcap-export work"
                 ))
@@ -369,7 +371,11 @@ fn make_process_cap(process: system_capnp::process::Client) -> Val {
                 let process = bootstrap_process.clone();
                 Box::pin(async move {
                     if !args.is_empty() {
-                        return Err(glia::error::arity("process :bootstrap", "0", args.len()));
+                        return Err(NativeSignal::throw(glia::error::arity(
+                            "process :bootstrap",
+                            "0",
+                            args.len(),
+                        )));
                     }
                     let resp = process
                         .bootstrap_request()
@@ -398,7 +404,11 @@ fn make_process_cap(process: system_capnp::process::Client) -> Val {
                 let process = wait_process.clone();
                 Box::pin(async move {
                     if !args.is_empty() {
-                        return Err(glia::error::arity("process :wait", "0", args.len()));
+                        return Err(NativeSignal::throw(glia::error::arity(
+                            "process :wait",
+                            "0",
+                            args.len(),
+                        )));
                     }
                     let resp = process
                         .wait_request()
@@ -424,7 +434,11 @@ fn make_process_cap(process: system_capnp::process::Client) -> Val {
                 let process = process.clone();
                 Box::pin(async move {
                     if !args.is_empty() {
-                        return Err(glia::error::arity("process :kill", "0", args.len()));
+                        return Err(NativeSignal::throw(glia::error::arity(
+                            "process :kill",
+                            "0",
+                            args.len(),
+                        )));
                     }
                     process
                         .kill_request()
@@ -466,11 +480,11 @@ fn make_executor_cap(executor: system_capnp::executor::Client) -> Val {
                         let key = match &args[i] {
                             Val::Keyword(k) => k.as_str(),
                             other => {
-                                return Err(glia::error::type_mismatch(
+                                return Err(NativeSignal::throw(glia::error::type_mismatch(
                                     "executor :spawn option",
                                     "keyword",
                                     other,
-                                ))
+                                )))
                             }
                         };
                         i += 1;
@@ -484,20 +498,20 @@ fn make_executor_cap(executor: system_capnp::executor::Client) -> Val {
                                         .iter()
                                         .map(|v| match v {
                                             Val::Str(s) | Val::Sym(s) => Ok(s.clone()),
-                                            other => Err(glia::error::type_mismatch(
+                                            other => Err(NativeSignal::throw(glia::error::type_mismatch(
                                                 "executor :spawn :args item",
                                                 "string",
                                                 other,
-                                            )),
+                                            ))),
                                         })
                                         .collect::<Result<Vec<_>, _>>()?;
                                 }
                                 other => {
-                                    return Err(glia::error::type_mismatch(
+                                    return Err(NativeSignal::throw(glia::error::type_mismatch(
                                         "executor :spawn :args",
                                         "list or vector",
                                         other,
-                                    ))
+                                    )))
                                 }
                             },
                             "env" => match value {
@@ -518,11 +532,11 @@ fn make_executor_cap(executor: system_capnp::executor::Client) -> Val {
                                         .collect();
                                 }
                                 other => {
-                                    return Err(glia::error::type_mismatch(
+                                    return Err(NativeSignal::throw(glia::error::type_mismatch(
                                         "executor :spawn :env",
                                         "map",
                                         other,
-                                    ))
+                                    )))
                                 }
                             },
                             "caps" => match value {
@@ -531,21 +545,21 @@ fn make_executor_cap(executor: system_capnp::executor::Client) -> Val {
                                         let name = match name_val {
                                             Val::Str(s) | Val::Sym(s) => s.clone(),
                                             other => {
-                                                return Err(glia::error::type_mismatch(
+                                                return Err(NativeSignal::throw(glia::error::type_mismatch(
                                                     "executor :spawn :caps key",
                                                     "string",
                                                     other,
-                                                ))
+                                                )))
                                             }
                                         };
-                                        let Val::Cap { inner, .. } = cap_val else {
-                                            return Err(glia::error::type_mismatch(
+                                        let Val::Cap(handle) = cap_val else {
+                                            return Err(NativeSignal::throw(glia::error::type_mismatch(
                                                 "executor :spawn :caps value",
                                                 "cap",
                                                 cap_val,
-                                            ));
+                                            )));
                                         };
-                                        let client = extract_capnp_client(inner).ok_or_else(|| {
+                                        let client = extract_capnp_client(handle.inner()).ok_or_else(|| {
                                             glia::error::internal("executor :spawn :caps", format!(
                                                 "executor :spawn :caps grant \"{name}\" is not backed by an exportable Cap'n Proto capability"
                                             ))
@@ -554,17 +568,17 @@ fn make_executor_cap(executor: system_capnp::executor::Client) -> Val {
                                     }
                                 }
                                 other => {
-                                    return Err(glia::error::type_mismatch(
+                                    return Err(NativeSignal::throw(glia::error::type_mismatch(
                                         "executor :spawn :caps",
                                         "map",
                                         other,
-                                    ))
+                                    )))
                                 }
                             },
                             other => {
-                                return Err(Val::from(format!(
+                                return Err(NativeSignal::throw(Val::from(format!(
                                     "executor :spawn — unknown option :{other}"
-                                )))
+                                ))))
                             }
                         }
                         i += 1;
@@ -628,13 +642,17 @@ fn make_executor_cap(executor: system_capnp::executor::Client) -> Val {
 type HandlerFn = for<'a> fn(
     &'a [Val],
     &'a RefCell<Session>,
-) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>>;
+) -> Pin<Box<dyn Future<Output = Result<Val, NativeSignal>> + 'a>>;
 
 /// Build the dispatch table for builtins only. Capability verbs (host, runtime,
 /// ipfs, routing) are handled via cap-targeted perform + with-effect-handler.
 fn build_dispatch() -> HashMap<&'static str, HandlerFn> {
     let mut t: HashMap<&'static str, HandlerFn> = HashMap::new();
-    t.insert("cd", |a, c| Box::pin(std::future::ready(eval_cd(a, c))));
+    t.insert("cd", |a, c| {
+        Box::pin(std::future::ready(
+            eval_cd(a, c).map_err(NativeSignal::throw),
+        ))
+    });
     t.insert("help", |_, _| {
         Box::pin(std::future::ready(Ok(Val::Str(HELP_TEXT.to_string()))))
     });
@@ -668,11 +686,11 @@ impl<'k> Dispatch for KernelDispatch<'k> {
         &'a self,
         name: &'a str,
         args: &'a [Val],
-    ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Val, NativeSignal>> + 'a>> {
         Box::pin(async move {
             match self.table.get(name) {
                 Some(handler) => handler(args, self.ctx).await,
-                None => Err(Val::from(format!("command not found: {name}"))),
+                None => Err(NativeSignal::throw(format!("command not found: {name}"))),
             }
         })
     }
@@ -686,13 +704,13 @@ impl<'k> Dispatch for KernelDispatch<'k> {
     }
 
     fn validate_cell_grant(&self, name: &str, cap: &Val) -> Result<(), Val> {
-        let Val::Cap { inner, .. } = cap else {
+        let Val::Cap(handle) = cap else {
             return Err(glia::error::internal(
                 "cell :grants",
                 format!("grant \"{name}\" expected a capability, got {cap}"),
             ));
         };
-        extract_capnp_client(inner).map(|_| ()).ok_or_else(|| {
+        extract_capnp_client(handle.inner()).map(|_| ()).ok_or_else(|| {
             glia::error::internal("cell :grants", format!(
                 "grant \"{name}\" is not backed by an exportable Cap'n Proto capability; use a Cap'n Proto-backed capability or follow the defcap-export work"
             ))
@@ -713,7 +731,7 @@ fn eval_outcome<'a>(
     env: &'a mut Env,
     ctx: &'a RefCell<Session>,
     dispatch: &'a HashMap<&'static str, HandlerFn>,
-) -> Pin<Box<dyn Future<Output = Result<EvalOutcome, Val>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<EvalOutcome, EvalError>> + 'a>> {
     Box::pin(async move {
         let kd = KernelDispatch {
             ctx,
@@ -770,7 +788,12 @@ fn eval<'a>(
     dispatch: &'a HashMap<&'static str, HandlerFn>,
 ) -> Pin<Box<dyn Future<Output = Result<Val, Val>> + 'a>> {
     Box::pin(async move {
-        match eval_outcome(expr, env, ctx, dispatch).await? {
+        let outcome = eval_outcome(expr, env, ctx, dispatch).await.map_err(|e| {
+            e.payload()
+                .cloned()
+                .unwrap_or_else(|| Val::from(format!("{e}")))
+        })?;
+        match outcome {
             EvalOutcome::Value(value) => Ok(value),
             EvalOutcome::Exit => Err(glia::error::internal(
                 "kernel eval",
@@ -805,15 +828,19 @@ fn stdout_chunks(text: &str) -> impl Iterator<Item = &[u8]> {
 // Each handler receives (data, resume) where data = (:method args...).
 // The handler makes the RPC call and calls resume(result) to continue the body.
 //
-// Pattern: handler calls resume → returns Err(Val::Resume(val)) → poll_fn
+// Pattern: handler calls resume → returns the resume signal → poll_fn
 // catches it → body future resumes with the value from the oneshot channel.
 
 /// Call the resume function with a result value.
 /// Returns the Resume sentinel that the poll_fn state machine expects.
-fn call_resume(resume: &Val, val: Val) -> Result<Val, Val> {
+fn call_resume(resume: &Val, val: Val) -> Result<Val, NativeSignal> {
     match resume {
         Val::NativeFn { func, .. } => func(&[val]),
-        _ => Err(Val::from("cap handler: invalid resume function")),
+        // Protocol invariant: the evaluator always supplies a NativeFn
+        // resume. Anything else is a runtime fault, not a catchable error.
+        _ => Err(NativeSignal::fault(Val::from(
+            "cap handler: invalid resume function",
+        ))),
     }
 }
 
@@ -971,8 +998,8 @@ fn make_authority_handler(authority: auth_capnp::authority::Client) -> Val {
                 let result = match method {
                     "guard" => {
                         let (session, policy) = match rest {
-                            [Val::Cap { inner, .. }, policy] => {
-                                let session = extract_capnp_client(inner).ok_or_else(|| {
+                            [Val::Cap(handle), policy] => {
+                                let session = extract_capnp_client(handle.inner()).ok_or_else(|| {
                                     Val::from(
                                         "authority :guard — session is not backed by a Cap'n Proto client",
                                     )
@@ -980,9 +1007,9 @@ fn make_authority_handler(authority: auth_capnp::authority::Client) -> Val {
                                 (session, policy)
                             }
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "authority :guard — usage: (perform authority :guard <cap> <policy-map>)",
-                                ))
+                                )))
                             }
                         };
                         let mut request = authority.guard_request();
@@ -1002,7 +1029,11 @@ fn make_authority_handler(authority: auth_capnp::authority::Client) -> Val {
                             .map_err(|error| Val::from(error.to_string()))?;
                         make_generic_cap(terminal.client)
                     }
-                    _ => return Err(Val::from(format!("authority: unknown method :{method}"))),
+                    _ => {
+                        return Err(NativeSignal::throw(Val::from(format!(
+                            "authority: unknown method :{method}"
+                        ))))
+                    }
                 };
                 call_resume(resume, result)
             })
@@ -1105,19 +1136,19 @@ fn make_host_handler(
                         let (spec, prefix) = match rest {
                             [spec, Val::Str(prefix)] => (spec, prefix),
                             [spec] if glia::is_cell_tagged(spec) => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "host :listen — vat cell listen was removed; spawn the service, obtain its bootstrap capability, then publish it with (perform host :serve-vat <cap> \"service\" :auth <policy>)",
-                                ))
+                                )))
                             }
                             [] => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "host :listen — usage: (perform host :listen <cell> \"/path\") for HTTP cells",
-                                ))
+                                )))
                             }
                             [other, ..] => {
-                                return Err(Val::from(format!(
+                                return Err(NativeSignal::throw(Val::from(format!(
                                     "host :listen — expected cell and HTTP path string, got {other}"
-                                )))
+                                ))))
                             }
                         };
 
@@ -1162,14 +1193,14 @@ fn make_host_handler(
                         let (spec, protocol) = match rest {
                             [spec, Val::Str(protocol)] => (spec, protocol),
                             [] | [_] => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "host :listen-stream — usage: (perform host :listen-stream <cell> \"protocol\")",
-                                ))
+                                )))
                             }
                             [other, ..] => {
-                                return Err(Val::from(format!(
+                                return Err(NativeSignal::throw(Val::from(format!(
                                     "host :listen-stream — expected cell and protocol string, got {other}"
-                                )))
+                                ))))
                             }
                         };
 
@@ -1215,12 +1246,12 @@ fn make_host_handler(
                     "serve-vat" => {
                         let (cap, protocol, policy) = match rest {
                             [
-                                Val::Cap { inner, .. },
+                                Val::Cap(handle),
                                 Val::Str(protocol),
                                 Val::Keyword(auth),
                                 policy,
                             ] if auth == "auth" => {
-                                let cap = extract_capnp_client(inner).ok_or_else(|| {
+                                let cap = extract_capnp_client(handle.inner()).ok_or_else(|| {
                                     Val::from(
                                         "host :serve-vat — cap is not backed by a Cap'n Proto client",
                                     )
@@ -1228,9 +1259,9 @@ fn make_host_handler(
                                 (cap, protocol, policy)
                             }
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "host :serve-vat — usage: (perform host :serve-vat <exported-cap> \"service\" :auth <policy-map>)",
-                                ))
+                                )))
                             }
                         };
 
@@ -1259,8 +1290,8 @@ fn make_host_handler(
                     }
                     "serve-raw-vat" => {
                         let (cap, protocol) = match rest {
-                            [Val::Cap { inner, .. }, Val::Str(protocol)] => {
-                                let cap = extract_capnp_client(inner).ok_or_else(|| {
+                            [Val::Cap(handle), Val::Str(protocol)] => {
+                                let cap = extract_capnp_client(handle.inner()).ok_or_else(|| {
                                     Val::from(
                                         "host :serve-raw-vat — cap is not backed by a Cap'n Proto client",
                                     )
@@ -1268,9 +1299,9 @@ fn make_host_handler(
                                 (cap, protocol)
                             }
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "host :serve-raw-vat — usage: (perform host :serve-raw-vat <exported-cap> \"service\")",
-                                ))
+                                )))
                             }
                         };
 
@@ -1306,13 +1337,17 @@ fn make_host_handler(
                                 Rc::new(c.clone()),
                             ),
                             None => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "http-client not available (node started without --http-dial)",
-                                ))
+                                )))
                             }
                         }
                     }
-                    _ => return Err(Val::from(format!("host: unknown method :{method}"))),
+                    _ => {
+                        return Err(NativeSignal::throw(Val::from(format!(
+                            "host: unknown method :{method}"
+                        ))))
+                    }
                 };
                 call_resume(resume, result)
             })
@@ -1333,13 +1368,17 @@ fn make_runtime_handler(runtime: system_capnp::runtime::Client) -> Val {
                         let wasm = match rest.first() {
                             Some(Val::Bytes(b)) => b.clone(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "runtime :load — first arg must be wasm bytes",
-                                ))
+                                )))
                             }
                         };
                         if rest.len() != 1 {
-                            return Err(glia::error::arity("runtime :load", "1", rest.len()));
+                            return Err(NativeSignal::throw(glia::error::arity(
+                                "runtime :load",
+                                "1",
+                                rest.len(),
+                            )));
                         }
 
                         let mut load_req = runtime.load_request();
@@ -1352,9 +1391,9 @@ fn make_runtime_handler(runtime: system_capnp::runtime::Client) -> Val {
                         let wasm = match rest.first() {
                             Some(Val::Bytes(b)) => b.clone(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "runtime :run — first arg must be wasm bytes",
-                                ))
+                                )))
                             }
                         };
                         // Parse optional keyword args: :env {map}, :args [list]
@@ -1386,10 +1425,12 @@ fn make_runtime_handler(runtime: system_capnp::runtime::Client) -> Val {
                                             .iter()
                                             .map(|v| match v {
                                                 Val::Str(s) | Val::Sym(s) => Ok(s.clone()),
-                                                other => Err(glia::error::type_mismatch(
-                                                    "runtime :run :args item",
-                                                    "string",
-                                                    other,
+                                                other => Err(NativeSignal::throw(
+                                                    glia::error::type_mismatch(
+                                                        "runtime :run :args item",
+                                                        "string",
+                                                        other,
+                                                    ),
                                                 )),
                                             })
                                             .collect::<Result<Vec<_>, _>>()?;
@@ -1452,7 +1493,11 @@ fn make_runtime_handler(runtime: system_capnp::runtime::Client) -> Val {
                         log::info!("runtime :run — process exited ({})", exit_code);
                         Val::Int(exit_code as i64)
                     }
-                    _ => return Err(Val::from(format!("runtime: unknown method :{method}"))),
+                    _ => {
+                        return Err(NativeSignal::throw(Val::from(format!(
+                            "runtime: unknown method :{method}"
+                        ))))
+                    }
                 };
                 call_resume(resume, result)
             })
@@ -1520,7 +1565,11 @@ fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                     "provide" => {
                         let name = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :provide — expected string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :provide — expected string",
+                                )))
+                            }
                         };
                         let cid = routing_hash(&routing, &name).await?;
                         let mut req = routing.provide_request();
@@ -1534,7 +1583,11 @@ fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                     "find" => {
                         let name = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
-                            _ => return Err(Val::from("routing :find — expected string")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :find — expected string",
+                                )))
+                            }
                         };
                         // Parse optional :count keyword.
                         let mut count: u32 = 20;
@@ -1585,7 +1638,11 @@ fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                         let data = match rest.first() {
                             Some(Val::Str(s)) => s.as_bytes().to_vec(),
                             Some(Val::Bytes(b)) => b.clone(),
-                            _ => return Err(Val::from("routing :hash — expected string or bytes")),
+                            _ => {
+                                return Err(NativeSignal::throw(Val::from(
+                                    "routing :hash — expected string or bytes",
+                                )))
+                            }
                         };
                         let mut req = routing.hash_request();
                         req.get().set_data(&data);
@@ -1607,9 +1664,9 @@ fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                         let name = match rest.first() {
                             Some(Val::Str(s)) => s.clone(),
                             _ => {
-                                return Err(Val::from(
+                                return Err(NativeSignal::throw(Val::from(
                                     "routing :resolve — expected IPNS name string",
-                                ))
+                                )))
                             }
                         };
                         let mut req = routing.resolve_request();
@@ -1628,7 +1685,11 @@ fn make_routing_handler(routing: routing_capnp::routing::Client) -> Val {
                             .map_err(|e| Val::from(e.to_string()))?;
                         Val::Str(path.to_string())
                     }
-                    _ => return Err(Val::from(format!("routing: unknown method :{method}"))),
+                    _ => {
+                        return Err(NativeSignal::throw(Val::from(format!(
+                            "routing: unknown method :{method}"
+                        ))))
+                    }
                 };
                 call_resume(resume, result)
             })
@@ -1892,16 +1953,20 @@ async fn run_shell(
                         }
                         Ok(EvalOutcome::Exit) => break 'outer,
                         Err(e) => {
-                            // Unhandled (throw ...) arrives as
-                            // Val::Effect{effect_type:"glia.exception",..};
-                            // peel so the structured error fields are visible.
-                            let inner = glia::error::unwrap_thrown(&e).unwrap_or(&e);
-                            let msg = glia::error::message(inner)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| format!("{inner}"));
-                            let line = match glia::error::type_tag(inner) {
-                                Some(tag) => format!("error: [{tag}] {msg}\n"),
-                                None => format!("error: {msg}\n"),
+                            // Unhandled throws and faults carry a structured
+                            // payload; peel so the error fields are visible.
+                            // Other escaped effects use the boundary display.
+                            let line = match e.payload() {
+                                Some(inner) => {
+                                    let msg = glia::error::message(inner)
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| format!("{inner}"));
+                                    match glia::error::type_tag(inner) {
+                                        Some(tag) => format!("error: [{tag}] {msg}\n"),
+                                        None => format!("error: {msg}\n"),
+                                    }
+                                }
+                                None => format!("error: {e}\n"),
                             };
                             let _ = stderr.blocking_write_and_flush(line.as_bytes());
                         }
@@ -1985,12 +2050,7 @@ fn unwrap_cap_arg<'a>(
         return Err(glia::error::arity(builtin, "1", args.len()));
     }
     match &args[0] {
-        Val::Cap {
-            name,
-            schema_cid,
-            inner,
-            ..
-        } => Ok((name.as_str(), schema_cid.as_str(), inner)),
+        Val::Cap(handle) => Ok((handle.name(), handle.schema_cid(), handle.inner())),
         other => Err(glia::error::type_mismatch(builtin, "cap", other)),
     }
 }
@@ -1998,7 +2058,7 @@ fn unwrap_cap_arg<'a>(
 fn make_schema_builtin() -> Val {
     Val::NativeFn {
         name: "schema".into(),
-        func: Rc::new(|args: &[Val]| -> Result<Val, Val> {
+        func: Rc::new(|args: &[Val]| -> Result<Val, NativeSignal> {
             let (cap_name, _schema_cid, inner) = unwrap_cap_arg("schema", args)?;
             match schema_bytes_for_cap(cap_name) {
                 Some(bytes) => Ok(Val::Bytes(bytes.to_vec())),
@@ -2012,10 +2072,10 @@ fn make_schema_builtin() -> Val {
                     if let Some(handled) = inner.downcast_ref::<glia::HandledCapInner>() {
                         return Ok(Val::Bytes(handled.descriptor.clone()));
                     }
-                    Err(glia::error::permission_denied(
+                    Err(NativeSignal::throw(glia::error::permission_denied(
                         &format!("schema for cap '{cap_name}' not registered"),
                         Some("schemas registered for: host, runtime, routing, identity, http"),
-                    ))
+                    )))
                 }
             }
         }),
@@ -2025,7 +2085,7 @@ fn make_schema_builtin() -> Val {
 fn make_doc_builtin() -> Val {
     Val::NativeFn {
         name: "doc".into(),
-        func: Rc::new(|args: &[Val]| -> Result<Val, Val> {
+        func: Rc::new(|args: &[Val]| -> Result<Val, NativeSignal> {
             let (cap_name, schema_cid, inner) = unwrap_cap_arg("doc", args)?;
             // Human-readable summary. `(schema cap)` is the source of
             // truth for machine-readable interface introspection; `doc`
@@ -2057,10 +2117,10 @@ fn make_doc_builtin() -> Val {
                             m.allow.len()
                         )));
                     }
-                    return Err(glia::error::permission_denied(
+                    return Err(NativeSignal::throw(glia::error::permission_denied(
                         &format!("docs for cap '{cap_name}' not available"),
                         None,
-                    ));
+                    )));
                 }
             };
             Ok(Val::Str(format!(
@@ -2073,7 +2133,7 @@ fn make_doc_builtin() -> Val {
 fn make_help_builtin() -> Val {
     Val::NativeFn {
         name: "help".into(),
-        func: Rc::new(|args: &[Val]| -> Result<Val, Val> {
+        func: Rc::new(|args: &[Val]| -> Result<Val, NativeSignal> {
             let (cap_name, schema_cid, inner) = unwrap_cap_arg("help", args)?;
             let mut text = String::new();
             text.push_str(&format!("== {cap_name} ==\n"));
@@ -2995,24 +3055,26 @@ mod tests {
         data_items.extend_from_slice(rest);
         let data = Val::List(data_items);
 
-        // Create a resume function that captures the value.
-        let captured: Rc<RefCell<Option<Val>>> = Rc::new(RefCell::new(None));
-        let cap = captured.clone();
-        let resume = Val::NativeFn {
-            name: "test-resume".into(),
-            func: Rc::new(move |args: &[Val]| {
-                *cap.borrow_mut() = Some(args[0].clone());
-                Err(Val::Resume(Box::new(args[0].clone())))
-            }),
-        };
+        // Use the evaluator's real one-shot resume: the sent value lands in
+        // the receiver, and the handler returns the resume signal.
+        let (tx, rx) = glia::oneshot::channel();
+        let resume = glia::effect::make_resume_fn(tx);
 
         match func(vec![data, resume]).await {
-            Err(Val::Resume(_)) => {
-                // Handler called resume — extract the value.
-                Ok(captured.borrow().clone().unwrap())
-            }
-            Err(e) => Err(e),
             Ok(v) => Ok(v), // Handler returned directly without resume.
+            Err(sig) => {
+                if let Some(payload) = sig.thrown() {
+                    return Err(payload.clone());
+                }
+                // Resume signal — the resumed value is in the oneshot.
+                let mut rx = Box::pin(rx);
+                let waker = std::task::Waker::noop();
+                let mut cx = std::task::Context::from_waker(waker);
+                match rx.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(Ok(v)) => Ok(v),
+                    other => panic!("resume signal without resumed value: {other:?}"),
+                }
+            }
         }
     }
 
@@ -3894,7 +3956,7 @@ mod tests {
                     let err = call_handler(&handler, method, &[spec.clone(), Val::Str(arg.into())])
                         .await
                         .unwrap_err();
-                    let inner = glia::error::unwrap_thrown(&err).unwrap_or(&err);
+                    let inner = &err;
                     assert_eq!(
                         glia::error::type_tag(inner),
                         Some(glia::error::tag::INVALID_CELL_SPEC),
@@ -4399,11 +4461,11 @@ mod tests {
             let form = read("(attenuate host [:id])").unwrap();
             let cap = eval(&form, &mut env, &ctx, &dispatch).await.unwrap();
 
-            let Val::Cap { inner, .. } = &cap else {
+            let Val::Cap(handle) = &cap else {
                 panic!("expected cap, got {cap:?}");
             };
-            let client =
-                extract_capnp_client(inner).expect("attenuated cap must export a capnp client");
+            let client = extract_capnp_client(handle.inner())
+                .expect("attenuated cap must export a capnp client");
             let host: system_capnp::host::Client =
                 capnp::capability::FromClientHook::new(client.hook);
 
@@ -4498,10 +4560,10 @@ mod tests {
             // Depth-2 delegation: {id, addrs} ∩ {id} = {id}.
             let form = read("(attenuate (attenuate host [:id :addrs]) [:id])").unwrap();
             let cap = eval(&form, &mut env, &ctx, &dispatch).await.unwrap();
-            let Val::Cap { inner, .. } = &cap else {
+            let Val::Cap(handle) = &cap else {
                 panic!("expected cap, got {cap:?}");
             };
-            let served = extract_capnp_client(inner).expect("attenuated cap must export");
+            let served = extract_capnp_client(handle.inner()).expect("attenuated cap must export");
 
             // Serve it as the bootstrap of a twoparty connection (what
             // VatListener.serve does per accepted libp2p stream).
@@ -4987,7 +5049,11 @@ mod tests {
     /// builtin is the wrong variant.
     fn call_builtin(builtin: &Val, args: &[Val]) -> Result<Val, Val> {
         match builtin {
-            Val::NativeFn { func, .. } => func(args),
+            Val::NativeFn { func, .. } => func(args).map_err(|sig| {
+                sig.thrown()
+                    .cloned()
+                    .expect("builtin signals are always thrown errors")
+            }),
             other => panic!("expected NativeFn, got {other:?}"),
         }
     }

@@ -2,8 +2,8 @@
 //!
 //! Errors are carried over the existing effect machinery: `(throw err)`
 //! desugars to `(perform :glia.exception err)`, and an unhandled throw
-//! escapes `eval` as `Err(Val::Effect { effect_type: "glia.exception",
-//! data: <err> })`. The data shape is a `Val::Map` keyed by namespaced
+//! reaches the embedder as `EvalError::Unhandled` with target
+//! `:glia.exception`. The data shape is a `Val::Map` keyed by namespaced
 //! `:glia.error/...` keywords, defined here.
 //!
 //! # Construction
@@ -41,9 +41,9 @@
 //! # Inspection
 //!
 //! `data`, `message`, `type_tag`, `hint` mirror Clojure's `ex-data` /
-//! `ex-message`. `unwrap_thrown` peels the `Val::Effect` carrier when
-//! an unhandled throw arrives at an outer caller (kernel REPL, MCP
-//! cell, shell session).
+//! `ex-message`. `unwrap_thrown` peels the unhandled-exception boundary
+//! carrier when an unhandled throw arrives at an outer caller (kernel
+//! REPL, MCP cell, shell session).
 
 use crate::{Val, ValMap};
 
@@ -66,6 +66,8 @@ pub mod tag {
     pub const CONTINUATION_ABANDONED: &str = "glia.error/continuation-abandoned";
     pub const CONTINUATION_ALREADY_RESUMED: &str = "glia.error/continuation-already-resumed";
     pub const INVALID_CELL_SPEC: &str = "glia.error/invalid-cell-spec";
+    pub const INVALID_RECUR: &str = "glia.error/invalid-recur";
+    pub const DEF_NOT_TOP_LEVEL: &str = "glia.error/def-not-top-level";
 }
 
 // ----- Schema-key constants -----------------------------------------------
@@ -88,6 +90,14 @@ pub mod key {
 
 /// Effect target carrying a thrown error.
 pub const EXCEPTION_EFFECT: &str = "glia.exception";
+
+/// Every structured error converts into a catchable-exception signal by
+/// default; faults are opt-in via [`crate::NativeSignal::fault`].
+impl From<GliaError> for crate::NativeSignal {
+    fn from(e: GliaError) -> Self {
+        crate::NativeSignal::throw(Val::from(e))
+    }
+}
 
 // ----- Typed error enum ---------------------------------------------------
 
@@ -161,6 +171,14 @@ pub enum GliaError {
     /// ordinary data, so malformed or forged maps are *expected*
     /// untrusted input, not internal invariant violations.
     InvalidCellSpec { context: String, message: String },
+    /// Invalid `recur` — a `recur` form outside tail position. This is a
+    /// language fault: structurally invalid control that bypasses Glia
+    /// handlers. `context` names the position that demanded a value.
+    InvalidRecur { context: String },
+    /// `def`-family form evaluated without top-level definition privilege
+    /// (inside a function or macro body). Definitions are module/REPL
+    /// top-level only.
+    DefNotTopLevel { name: String },
     /// User-thrown error, constructed via the `ex-info` Glia builtin.
     /// The user's `:type` becomes the canonical dispatch tag; other
     /// user fields are carried in `extras`.
@@ -190,6 +208,8 @@ impl GliaError {
             Self::ContinuationAbandoned => tag::CONTINUATION_ABANDONED.into(),
             Self::ContinuationAlreadyResumed => tag::CONTINUATION_ALREADY_RESUMED.into(),
             Self::InvalidCellSpec { .. } => tag::INVALID_CELL_SPEC.into(),
+            Self::InvalidRecur { .. } => tag::INVALID_RECUR.into(),
+            Self::DefNotTopLevel { .. } => tag::DEF_NOT_TOP_LEVEL.into(),
             Self::User { type_tag, .. } => match type_tag {
                 Val::Keyword(s) | Val::Str(s) | Val::Sym(s) => s.clone(),
                 _ => String::new(),
@@ -312,6 +332,25 @@ impl From<GliaError> for Val {
             GliaError::InvalidCellSpec { context, message } => {
                 pairs.push((kw(key::MESSAGE), Val::Str(message)));
                 pairs.push((kw(key::CONTEXT), Val::Str(context)));
+            }
+            GliaError::InvalidRecur { context } => {
+                pairs.push((
+                    kw(key::MESSAGE),
+                    Val::Str("recur not in tail position".into()),
+                ));
+                pairs.push((kw(key::CONTEXT), Val::Str(context)));
+            }
+            GliaError::DefNotTopLevel { name } => {
+                pairs.push((
+                    kw(key::MESSAGE),
+                    Val::Str(format!(
+                        "def of '{name}' outside top level: definitions are \
+                         module/REPL top-level only"
+                    )),
+                ));
+                // Contract: `:glia.error/symbol` carries a Sym, not a Str
+                // (matches UnboundSymbol).
+                pairs.push((kw(key::SYMBOL), Val::Sym(name)));
             }
             GliaError::User {
                 type_tag,
@@ -456,6 +495,21 @@ pub fn invalid_cell_spec(context: &str, message: impl Into<String>) -> Val {
     .into()
 }
 
+/// Invalid `recur` — outside tail position. Payload of a language
+/// [`crate::Fault`]; never dispatched as a catchable exception.
+pub fn invalid_recur(context: &str) -> Val {
+    GliaError::InvalidRecur {
+        context: context.into(),
+    }
+    .into()
+}
+
+/// `def`-family form without top-level definition privilege — a catchable
+/// exception (`glia.error/def-not-top-level`), thrown before any mutation.
+pub fn def_not_top_level(name: &str) -> Val {
+    GliaError::DefNotTopLevel { name: name.into() }.into()
+}
+
 /// Continuation abandoned — a handler returned without resuming, so
 /// the suspended body was discarded (handler-abort cleanup path).
 pub fn continuation_abandoned() -> Val {
@@ -527,18 +581,14 @@ pub fn hint(err: &Val) -> Option<&str> {
     }
 }
 
-/// If `err` is the `Val::Effect` carrier produced by an unhandled
-/// throw (`(perform :glia.exception ...)`), return a reference to
-/// the inner error data. Otherwise return `None`.
+/// If `err` is an unhandled `:glia.exception` (an escaped throw), return a
+/// reference to the thrown error data. Otherwise return `None`.
 ///
 /// Outer callers (kernel REPL, MCP cell, shell) call this once at
 /// the eval boundary so downstream code only needs to know about
-/// the structured error map shape.
-pub fn unwrap_thrown(err: &Val) -> Option<&Val> {
-    match err {
-        Val::Effect { effect_type, data } if effect_type == EXCEPTION_EFFECT => Some(data),
-        _ => None,
-    }
+/// the structured error map shape. Shim over [`EvalError::thrown`].
+pub fn unwrap_thrown(err: &crate::eval::EvalError) -> Option<&Val> {
+    err.thrown()
 }
 
 // ----- Internal helpers ---------------------------------------------------
@@ -566,13 +616,10 @@ pub(crate) fn val_type_name(v: &Val) -> &'static str {
         Val::Set(_) => "set",
         Val::Bytes(_) => "bytes",
         Val::Fn { .. } => "fn",
-        Val::Recur(_) => "recur",
         Val::Macro { .. } => "macro",
-        Val::Effect { .. } => "effect",
         Val::NativeFn { .. } => "native-fn",
         Val::AsyncNativeFn { .. } => "async-native-fn",
-        Val::Resume(_) => "resume",
-        Val::Cap { .. } => "cap",
+        Val::Cap(_) => "cap",
     }
 }
 
@@ -821,29 +868,30 @@ mod tests {
     #[test]
     fn unwrap_thrown_returns_inner_for_glia_exception() {
         let inner = unbound_symbol("foo", None);
-        let carrier = Val::Effect {
-            effect_type: EXCEPTION_EFFECT.into(),
-            data: Box::new(inner.clone()),
-        };
+        let carrier = crate::eval::EvalError::Unhandled(crate::effect::EffectRequest {
+            target: crate::effect::EffectTarget::Keyword(EXCEPTION_EFFECT.into()),
+            data: inner.clone(),
+        });
         let unwrapped = unwrap_thrown(&carrier).unwrap();
         assert_eq!(type_tag(unwrapped), Some(tag::UNBOUND_SYMBOL));
     }
 
     #[test]
     fn unwrap_thrown_returns_none_for_other_effects() {
-        let carrier = Val::Effect {
-            effect_type: "fail".into(), // legacy effect target
-            data: Box::new(Val::Str("legacy".into())),
-        };
+        let carrier = crate::eval::EvalError::Unhandled(crate::effect::EffectRequest {
+            target: crate::effect::EffectTarget::Keyword("fail".into()),
+            data: Val::Str("legacy".into()),
+        });
         assert!(unwrap_thrown(&carrier).is_none());
     }
 
     #[test]
-    fn unwrap_thrown_returns_none_for_non_effect() {
+    fn unwrap_thrown_returns_none_for_faults() {
         let direct = unbound_symbol("foo", None);
-        // A direct error map (not wrapped in Val::Effect) returns None;
-        // outer callers should treat this as "already inner data."
-        assert!(unwrap_thrown(&direct).is_none());
+        // A fault payload is not a thrown exception; outer callers reach it
+        // via EvalError::payload instead.
+        let fault = crate::eval::EvalError::Fault(crate::Fault::runtime(direct));
+        assert!(unwrap_thrown(&fault).is_none());
     }
 
     // ----- Enum exhaustiveness regression --------------------------------
@@ -896,6 +944,10 @@ mod tests {
                 context: "x".into(),
                 message: "y".into(),
             },
+            GliaError::InvalidRecur {
+                context: "x".into(),
+            },
+            GliaError::DefNotTopLevel { name: "x".into() },
             GliaError::User {
                 type_tag: Val::Keyword("x".into()),
                 message: "y".into(),
@@ -913,6 +965,17 @@ mod tests {
                     )
             );
         }
+
+        // Payload-typing contract: `:glia.error/symbol` carries a Sym.
+        let def_err: Val = GliaError::DefNotTopLevel { name: "f".into() }.into();
+        let Val::Map(m) = &def_err else {
+            panic!("structured error map expected");
+        };
+        assert_eq!(
+            m.get(&Val::Keyword(key::SYMBOL.into())),
+            Some(&Val::Sym("f".into())),
+            ":glia.error/symbol must be a Sym"
+        );
     }
 
     // ----- val_type_name -------------------------------------------------
