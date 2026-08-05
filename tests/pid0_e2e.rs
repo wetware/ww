@@ -46,6 +46,33 @@ fn required_artifact(path: &str) -> Vec<u8> {
     bytes
 }
 
+fn append_test_custom_section(component: &mut Vec<u8>) {
+    fn push_uleb128(output: &mut Vec<u8>, mut value: usize) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            output.push(byte);
+            if value == 0 {
+                return;
+            }
+        }
+    }
+
+    const NAME: &[u8] = b"ww.test.distinct-kernel";
+    const PAYLOAD: &[u8] = b"pr2-path-source";
+    let mut contents = Vec::with_capacity(NAME.len() + PAYLOAD.len() + 1);
+    push_uleb128(&mut contents, NAME.len());
+    contents.extend_from_slice(NAME);
+    contents.extend_from_slice(PAYLOAD);
+
+    component.push(0); // Component-model custom section.
+    push_uleb128(component, contents.len());
+    component.extend_from_slice(&contents);
+}
+
 async fn unused_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -430,11 +457,22 @@ async fn current_embedded_glia_pid0_lifecycle_baseline() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_kernel_path_reaches_ready_and_cli_overrides_env() {
     let _guard = e2e_lock().await;
-    let kernel_wasm = required_artifact(KERNEL_WASM_PATH);
+    let embedded_kernel = required_artifact(KERNEL_WASM_PATH);
     required_artifact(STATUS_WASM_PATH);
-    let kernel_path = Path::new(KERNEL_WASM_PATH)
+    let embedded_cid = ww::kernel::runtime_cid(&embedded_kernel);
+    let mut selected_kernel = embedded_kernel.clone();
+    append_test_custom_section(&mut selected_kernel);
+    let selected_cid = ww::kernel::runtime_cid(&selected_kernel);
+    assert_ne!(
+        selected_cid, embedded_cid,
+        "test fixture must differ from the embedded kernel"
+    );
+    let selected_file = tempfile::NamedTempFile::new().expect("create distinct pid0 component");
+    std::fs::write(selected_file.path(), &selected_kernel).expect("write distinct pid0 component");
+    let kernel_path = selected_file
+        .path()
         .canonicalize()
-        .expect("canonicalize kernel artifact");
+        .expect("canonicalize distinct pid0 component");
     let (kubo_addr, client) = require_kubo().await;
     let admin_addr = unused_addr().await;
     let http_addr = unused_addr().await;
@@ -451,23 +489,26 @@ async fn local_kernel_path_reaches_ready_and_cli_overrides_env() {
         identity["kernel_source"],
         format!("file:{}", kernel_path.display())
     );
-    assert_eq!(
-        identity["kernel_cid"],
-        ww::kernel::runtime_cid(&kernel_wasm).to_string()
-    );
+    assert_eq!(identity["kernel_cid"], selected_cid.to_string());
+    assert_ne!(identity["kernel_cid"], embedded_cid.to_string());
     assert_eq!(
         identity["kernel_wasm_blake3"],
-        blake3::hash(&kernel_wasm).to_hex().to_string()
+        blake3::hash(&selected_kernel).to_hex().to_string()
     );
     assert_status_route(&client, http_addr).await;
 
     node.close_stdin();
     let exit = node.wait(EXIT_TIMEOUT).await;
-    assert_eq!(
-        exit.code(),
-        Some(0),
-        "unexpected host exit\n{}",
-        node.logs()
+    let logs = node.logs();
+    assert_eq!(exit.code(), Some(0), "unexpected host exit\n{logs}");
+    assert!(
+        logs.contains("Kernel source resolved")
+            && logs.contains(&kernel_path.display().to_string()),
+        "kernel resolution logs must identify the selected path\n{logs}"
+    );
+    assert!(
+        !logs.contains("kernel_source=embedded:main"),
+        "explicit path selection must not fall back to embedded pid0\n{logs}"
     );
 }
 

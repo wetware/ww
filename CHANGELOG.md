@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   resolution now lives in `wetware-membrane`, and typed named-capability graft
   lookup now lives in `std/system`, ready for reuse by the replacement kernel
   without changing current kernel behavior.
+- **HttpListener routes require target preflight before becoming live.** Newly
+  registered routes remain pending until `executor.cid()` succeeds. A failed
+  preflight removes the route instead of exposing it as live with an unknown
+  CID, and pid0 readiness now relies on this stronger live-route definition.
 - **Cell values are ordinary tagged data.** `Val::Cell` is removed; `(cell ...)`
   keeps its syntax and early grant validation but now returns an immutable
   tagged map `{:ww/type :cell, :wasm <bytes>, :grants {...}}`. Both host

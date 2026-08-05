@@ -160,17 +160,25 @@ fn main() {
 
 fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
     const KERNEL_ABI_VERSION: &str = "1";
+    const SCHEMA_ROOTS: &[&str] = &[
+        "system.capnp",
+        "routing.capnp",
+        "auth.capnp",
+        "membrane.capnp",
+        "stem.capnp",
+        "http.capnp",
+    ];
     let capnp_dir = manifest_path.join("capnp");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let raw_request = out_dir.join("kernel_abi_schema_request.bin");
-    capnpc::CompilerCommand::new()
+    let mut compiler = capnpc::CompilerCommand::new();
+    compiler
         .src_prefix(&capnp_dir)
-        .crate_provides("capnp", [0xa93fc509624c72d9])
-        .file(capnp_dir.join("system.capnp"))
-        .file(capnp_dir.join("routing.capnp"))
-        .file(capnp_dir.join("auth.capnp"))
-        .file(capnp_dir.join("stem.capnp"))
-        .file(capnp_dir.join("http.capnp"))
+        .crate_provides("capnp", [0xa93fc509624c72d9]);
+    for schema in SCHEMA_ROOTS {
+        compiler.file(capnp_dir.join(schema));
+    }
+    compiler
         .raw_code_generator_request_path(&raw_request)
         .run()
         .expect("failed to compile schemas for kernel ABI fingerprint");
@@ -233,6 +241,9 @@ fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
         .expect("patched capnp-rpc source missing from Cargo.lock");
 
     let mut material = format!("kernel-abi={KERNEL_ABI_VERSION}\n");
+    for schema in SCHEMA_ROOTS {
+        material.push_str(&format!("schema-root={schema}\n"));
+    }
     for schema in schemas {
         material.push_str(&format!("schema-{:016x}={}\n", schema.type_id, schema.cid));
     }
@@ -242,10 +253,10 @@ fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
     println!("cargo:rustc-env=WW_KERNEL_ABI={KERNEL_ABI_VERSION}");
     println!("cargo:rustc-env=WW_KERNEL_ABI_FPR={fingerprint}");
     println!("cargo:rerun-if-changed={}", lock_path.display());
-    for schema in &["system", "routing", "auth", "membrane", "stem", "http"] {
+    for schema in SCHEMA_ROOTS {
         println!(
             "cargo:rerun-if-changed={}",
-            capnp_dir.join(format!("{schema}.capnp")).display()
+            capnp_dir.join(schema).display()
         );
     }
 }
