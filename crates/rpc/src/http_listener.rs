@@ -276,21 +276,15 @@ async fn dispatch_loop(
         result = executor.cid_request().send().promise => result,
     };
     let cell_cid = match cell_cid_result {
-        Ok(resp) => match resp.get().and_then(|reader| reader.get_cid()) {
-            Ok(reader) => match reader.to_str() {
-                Ok(cid) => cid.to_string(),
-                Err(e) => {
-                    tracing::warn!("failed to decode cell CID: {e}");
-                    "unknown".to_string()
-                }
-            },
-            Err(e) => {
-                tracing::warn!("failed to read cell CID response: {e}");
-                "unknown".to_string()
+        Ok(response) => match read_preflight_cid(&response) {
+            Ok(cid) => cid,
+            Err(error) => {
+                tracing::warn!("{error}");
+                return;
             }
         },
-        Err(e) => {
-            tracing::warn!("failed to fetch cell CID: {e}");
+        Err(error) => {
+            tracing::warn!("failed to fetch cell CID: {error}");
             return;
         }
     };
@@ -324,6 +318,24 @@ async fn dispatch_loop(
             let _ = req.response_tx.send(response);
         });
     }
+}
+
+fn read_preflight_cid(
+    response: &capnp::capability::Response<system_capnp::executor::cid_results::Owned>,
+) -> Result<String, String> {
+    let results = response
+        .get()
+        .map_err(|error| format!("failed to read cell CID response: {error}"))?;
+    let reader = results
+        .get_cid()
+        .map_err(|error| format!("failed to read cell CID: {error}"))?;
+    let value = reader
+        .to_str()
+        .map_err(|error| format!("failed to decode cell CID: {error}"))?;
+    let cid = value
+        .parse::<cid::Cid>()
+        .map_err(|error| format!("failed to parse cell CID: {error}"))?;
+    Ok(cid.to_string())
 }
 
 async fn wait_for_registration_expiry(
@@ -524,10 +536,13 @@ mod tests {
     use super::*;
     use crate::dispatch::new_registry;
     use crate::{ByteStreamImpl, ProcessImpl, StreamMode};
+    use capnp::private::capability::ResponseHook;
     use std::cell::RefCell;
     use std::rc::Rc;
     use tokio::io::{self, AsyncWriteExt};
     use tokio::sync::{oneshot, watch};
+
+    const TEST_CELL_CID: &str = "bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a";
 
     /// Build an EpochGuard at seq=1 paired with its sender.
     fn test_epoch_guard() -> (
@@ -644,7 +659,7 @@ mod tests {
             _params: system_capnp::executor::CidParams,
             mut results: system_capnp::executor::CidResults,
         ) -> Promise<(), capnp::Error> {
-            results.get().set_cid("route-registration-test");
+            results.get().set_cid(TEST_CELL_CID);
             Promise::ok(())
         }
     }
@@ -690,9 +705,146 @@ mod tests {
             _params: system_capnp::executor::CidParams,
             mut results: system_capnp::executor::CidResults,
         ) -> Promise<(), capnp::Error> {
-            results.get().set_cid("fixed-template-test");
+            results.get().set_cid(TEST_CELL_CID);
             Promise::ok(())
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CidPreflightOutcome {
+        RpcFailure,
+        InvalidUtf8,
+        InvalidCid,
+    }
+
+    struct GatedCidExecutor {
+        outcome: CidPreflightOutcome,
+        gate: RefCell<Option<oneshot::Receiver<()>>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::executor::Server for GatedCidExecutor {
+        fn cid(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::executor::CidParams,
+            mut results: system_capnp::executor::CidResults,
+        ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+            let gate = self.gate.borrow_mut().take().expect("single CID request");
+            let outcome = self.outcome;
+            async move {
+                gate.await
+                    .map_err(|_| capnp::Error::failed("CID test gate dropped".into()))?;
+                match outcome {
+                    CidPreflightOutcome::RpcFailure => {
+                        Err(capnp::Error::failed("CID preflight failed".into()))
+                    }
+                    CidPreflightOutcome::InvalidUtf8 => {
+                        results.get().set_cid(capnp::text::Reader(&[0xff]));
+                        Ok(())
+                    }
+                    CidPreflightOutcome::InvalidCid => {
+                        results.get().set_cid("not-a-cid");
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
+    struct UnreadableCidResponse;
+
+    impl ResponseHook for UnreadableCidResponse {
+        fn get(&self) -> capnp::Result<capnp::any_pointer::Reader<'_>> {
+            Err(capnp::Error::failed("unreadable CID response".into()))
+        }
+    }
+
+    async fn assert_failed_cid_preflight_is_removed(outcome: CidPreflightOutcome) {
+        let (_epoch_tx, guard) = test_epoch_guard();
+        let registry = new_registry();
+        let listener: system_capnp::http_listener::Client =
+            capnp_rpc::new_client(HttpListenerImpl::new(guard, registry.clone()));
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let executor: system_capnp::executor::Client = capnp_rpc::new_client(GatedCidExecutor {
+            outcome,
+            gate: RefCell::new(Some(gate_rx)),
+        });
+        let mut request = listener.listen_request();
+        request.get().set_executor(executor);
+        request.get().set_prefix("/preflight");
+        request
+            .send()
+            .promise
+            .await
+            .expect("listen installs a pending route");
+
+        let pending = registry
+            .read()
+            .expect("registry lock")
+            .get("/preflight")
+            .cloned()
+            .expect("pending route");
+        assert_eq!(dispatch::live_route_count(&registry), Ok(0));
+        assert!(!pending.is_live());
+
+        gate_tx.send(()).expect("release CID preflight");
+        wait_for_route_count(&registry, 0).await;
+        assert_eq!(dispatch::live_route_count(&registry), Ok(0));
+        assert!(
+            !pending.is_live(),
+            "failed {outcome:?} preflight must never mark its route live"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cid_preflights_never_become_live_and_release_their_routes() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for outcome in [
+                    CidPreflightOutcome::RpcFailure,
+                    CidPreflightOutcome::InvalidUtf8,
+                    CidPreflightOutcome::InvalidCid,
+                ] {
+                    assert_failed_cid_preflight_is_removed(outcome).await;
+                }
+            })
+            .await;
+    }
+
+    #[test]
+    fn unreadable_cid_response_fails_without_marking_the_route_live() {
+        let registry = new_registry();
+        let (_epoch_tx, guard) = test_epoch_guard();
+        let (tx, _rx) = mpsc::channel(1);
+        let registration = RouteRegistration::install_pending(
+            registry.clone(),
+            "/unreadable".into(),
+            tx,
+            guard,
+            None,
+        )
+        .expect("install pending route");
+        let pending = registry
+            .read()
+            .expect("registry lock")
+            .get("/unreadable")
+            .cloned()
+            .expect("pending route");
+        let response =
+            capnp::capability::Response::<system_capnp::executor::cid_results::Owned>::new(
+                Box::new(UnreadableCidResponse),
+            );
+
+        let error = read_preflight_cid(&response).expect_err("response read must fail");
+        assert!(
+            error.contains("failed to read cell CID response"),
+            "{error}"
+        );
+        assert!(!pending.is_live());
+        drop(registration);
+        assert!(registry.read().expect("registry lock").is_empty());
+        assert!(!pending.is_live());
     }
 
     struct ProcessExecutor {
@@ -1071,6 +1223,9 @@ mod tests {
                         .expect("dispatch fixed-template request");
                     let response = response_rx.await.expect("CGI response");
                     assert_eq!(response.status, 200);
+                    assert!(response.headers.iter().any(|(name, value)| {
+                        name == "X-Wetware-Cell" && value == TEST_CELL_CID
+                    }));
                 }
 
                 assert_eq!(

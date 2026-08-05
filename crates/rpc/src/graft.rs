@@ -569,7 +569,9 @@ mod tests {
             _params: system_capnp::executor::CidParams,
             mut results: system_capnp::executor::CidResults,
         ) -> capnp::capability::Promise<(), capnp::Error> {
-            results.get().set_cid("graft-route-test");
+            results
+                .get()
+                .set_cid("bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a");
             capnp::capability::Promise::ok(())
         }
     }
