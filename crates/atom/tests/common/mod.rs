@@ -8,7 +8,7 @@ use capnp_rpc::pry;
 use serde_json::{json, Value};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use atom::auth_capnp;
 use atom::system_capnp;
@@ -401,6 +401,15 @@ pub fn foundry_available() -> bool {
 
 /// Spawn Anvil on a dynamic port and wait until ready.
 pub async fn spawn_anvil() -> Result<(Child, String)> {
+    spawn_anvil_configured(None).await
+}
+
+/// Spawn Anvil with interval mining so tests can exercise pending transactions.
+pub async fn spawn_anvil_with_block_time(block_time_secs: u64) -> Result<(Child, String)> {
+    spawn_anvil_configured(Some(block_time_secs)).await
+}
+
+async fn spawn_anvil_configured(block_time_secs: Option<u64>) -> Result<(Child, String)> {
     let port = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind for port")?;
         listener.local_addr()?.port()
@@ -411,10 +420,23 @@ pub async fn spawn_anvil() -> Result<(Child, String)> {
         .arg(port.to_string())
         .arg("--host")
         .arg("127.0.0.1");
+    if let Some(seconds) = block_time_secs {
+        cmd.arg("--block-time").arg(seconds.to_string());
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let process = cmd.spawn().context("spawn anvil")?;
     wait_for_rpc(&rpc_url).await?;
     Ok((process, rpc_url))
+}
+
+/// Enable or disable Anvil automining.
+pub async fn evm_set_automine(http_url: &str, enabled: bool) -> Result<()> {
+    let client = http_client();
+    let result = http_json_rpc(&client, http_url, "evm_setAutomine", json!([enabled]), 15).await?;
+    if result == Value::Bool(true) || result.is_null() {
+        return Ok(());
+    }
+    anyhow::bail!("unexpected evm_setAutomine result: {}", result)
 }
 
 async fn wait_for_rpc(url: &str) -> Result<()> {
@@ -571,8 +593,54 @@ fn trim_leading_zeros(b: &[u8; 32]) -> &[u8] {
     }
 }
 
+/// Wait until a transaction is mined and require its receipt to report success.
+async fn wait_for_successful_receipt(
+    client: &reqwest::Client,
+    http_url: &str,
+    tx_hash: &str,
+) -> Result<()> {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let receipt = http_json_rpc(
+                client,
+                http_url,
+                "eth_getTransactionReceipt",
+                json!([tx_hash]),
+                22,
+            )
+            .await?;
+            if receipt.is_null() {
+                sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+
+            let block_number = receipt
+                .get("blockNumber")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("transaction receipt missing blockNumber"))?;
+            let status = receipt
+                .get("status")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("transaction receipt missing status"))?;
+            let status = u64::from_str_radix(status.strip_prefix("0x").unwrap_or(status), 16)
+                .context("parse transaction receipt status")?;
+            if status != 1 {
+                anyhow::bail!(
+                    "transaction {} failed in block {} with status {}",
+                    tx_hash,
+                    block_number,
+                    status
+                );
+            }
+            return Ok(());
+        }
+    })
+    .await
+    .with_context(|| format!("timed out waiting for transaction receipt: {}", tx_hash))?
+}
+
 /// Send a raw EIP-155 legacy transaction via eth_sendRawTransaction. Signs in-process with Anvil default key.
-/// Ensures exact calldata is sent without node/JSON interpretation.
+/// Ensures exact calldata is sent without node/JSON interpretation and waits for a successful receipt.
 pub async fn send_raw_transaction(http_url: &str, to: &str, calldata: &[u8]) -> Result<()> {
     use k256::ecdsa::SigningKey;
     use rlp::RlpStream;
@@ -635,10 +703,10 @@ pub async fn send_raw_transaction(http_url: &str, to: &str, calldata: &[u8]) -> 
     let params = json!([format!("0x{}", hex::encode(&raw_tx))]);
     let tx_hash_value =
         http_json_rpc(&client, http_url, "eth_sendRawTransaction", params, 21).await?;
-    let _tx_hash = tx_hash_value
+    let tx_hash = tx_hash_value
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("tx hash not string"))?;
-    Ok(())
+    wait_for_successful_receipt(&client, http_url, tx_hash).await
 }
 
 /// Send a transaction using eth_sendTransaction (kept for reference; set_head_bytes uses send_raw_transaction). Anvil signs for its default unlocked account (ANVIL_DEFAULT_FROM).
@@ -675,7 +743,7 @@ pub async fn send_transaction(http_url: &str, to: &str, calldata: &[u8]) -> Resu
 }
 
 /// Call setHead with raw CID bytes. Builds calldata in Rust (see build_set_head_bytes_calldata) and sends via eth_sendRawTransaction
-/// with in-process EIP-155 signing so encoding is exact. Anvil auto-mines the tx immediately.
+/// with in-process EIP-155 signing so encoding is exact, then waits for a successful receipt.
 pub async fn set_head_bytes(
     _repo_root: &std::path::Path,
     rpc_url: &str,
