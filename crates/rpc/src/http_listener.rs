@@ -713,9 +713,13 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum CidPreflightOutcome {
         RpcFailure,
+        UnreadableField,
         InvalidUtf8,
         InvalidCid,
     }
+
+    struct UnreadableCidFieldProcess;
+    impl system_capnp::process::Server for UnreadableCidFieldProcess {}
 
     struct GatedCidExecutor {
         outcome: CidPreflightOutcome,
@@ -737,6 +741,15 @@ mod tests {
                 match outcome {
                     CidPreflightOutcome::RpcFailure => {
                         Err(capnp::Error::failed("CID preflight failed".into()))
+                    }
+                    CidPreflightOutcome::UnreadableField => {
+                        // Keep the result root readable while placing a capability
+                        // pointer where the CID text pointer belongs.
+                        let root = results.hook.get()?;
+                        let mut malformed =
+                            root.get_as::<system_capnp::executor::spawn_results::Builder<'_>>()?;
+                        malformed.set_process(capnp_rpc::new_client(UnreadableCidFieldProcess));
+                        Ok(())
                     }
                     CidPreflightOutcome::InvalidUtf8 => {
                         results.get().set_cid(capnp::text::Reader(&[0xff]));
@@ -794,6 +807,25 @@ mod tests {
             !pending.is_live(),
             "failed {outcome:?} preflight must never mark its route live"
         );
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let failed_request = pending
+            .sender()
+            .send(CgiRequest {
+                method: "GET".into(),
+                path: "/preflight".into(),
+                query: String::new(),
+                headers: Vec::new(),
+                body: Vec::new(),
+                response_tx,
+            })
+            .await
+            .expect_err("failed preflight must terminate the dispatch future");
+        drop(failed_request);
+        assert!(
+            response_rx.await.is_err(),
+            "failed preflight must not expose an identity response"
+        );
     }
 
     #[tokio::test]
@@ -809,6 +841,16 @@ mod tests {
                     assert_failed_cid_preflight_is_removed(outcome).await;
                 }
             })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn unreadable_cid_field_never_becomes_live_and_releases_its_route() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(assert_failed_cid_preflight_is_removed(
+                CidPreflightOutcome::UnreadableField,
+            ))
             .await;
     }
 
