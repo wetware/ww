@@ -6,6 +6,7 @@
 //! these types.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::{mpsc, oneshot};
@@ -58,6 +59,7 @@ pub struct RouteEntry {
     sender: RequestSender,
     epoch_guard: authority::EpochGuard,
     registration_scope: Option<tokio::sync::watch::Receiver<()>>,
+    target_ready: Arc<AtomicBool>,
 }
 
 impl RouteEntry {
@@ -66,12 +68,14 @@ impl RouteEntry {
         sender: RequestSender,
         epoch_guard: authority::EpochGuard,
         registration_scope: Option<tokio::sync::watch::Receiver<()>>,
+        target_ready: Arc<AtomicBool>,
     ) -> Self {
         Self {
             registration_id,
             sender,
             epoch_guard,
             registration_scope,
+            target_ready,
         }
     }
 
@@ -83,9 +87,10 @@ impl RouteEntry {
         self.sender.clone()
     }
 
-    /// Whether this registration's issuing epoch is still current.
+    /// Whether the target preflight passed and its issuing scope is current.
     pub fn is_live(&self) -> bool {
-        self.epoch_guard.check().is_ok()
+        self.target_ready.load(Ordering::Acquire)
+            && self.epoch_guard.check().is_ok()
             && self
                 .registration_scope
                 .as_ref()

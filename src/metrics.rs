@@ -22,7 +22,7 @@ use crate::cell::engine::{WasmtimeCacheMetrics, WasmtimeCacheSnapshot, WasmtimeC
 pub struct VersionInfo {
     pub git_sha: String,
     pub oci_image_id: Option<String>,
-    pub kernel_wasm_blake3: Option<String>,
+    pub kernel_identity: crate::kernel::KernelIdentityState,
     pub shell_wasm_blake3: Option<String>,
 }
 
@@ -463,10 +463,20 @@ async fn readyz_handler(State(state): State<AdminState>) -> impl IntoResponse {
 async fn version_handler(State(state): State<AdminState>) -> impl IntoResponse {
     let runtime = state.runtime_status.snapshot();
     let cache = state.wasmtime_cache_metrics.snapshot();
+    let kernel_identity = state.version_info.kernel_identity.get();
+    let kernel_source = kernel_identity
+        .map(|identity| identity.source.clone())
+        .unwrap_or_else(|| state.version_info.kernel_identity.pending_source());
     let payload = serde_json::json!({
         "git_sha": state.version_info.git_sha,
         "oci_image_id": state.version_info.oci_image_id,
-        "kernel_wasm_blake3": state.version_info.kernel_wasm_blake3,
+        "kernel_cid": kernel_identity.map(|identity| identity.cid.as_str()),
+        "kernel_source": kernel_source,
+        "kernel_source_cid": kernel_identity.and_then(|identity| identity.source_cid.as_deref()),
+        "kernel_wasm_blake3": kernel_identity.map(|identity| identity.wasm_blake3.as_str()),
+        "kernel_size": kernel_identity.map(|identity| identity.size),
+        "kernel_abi": crate::kernel::KERNEL_ABI_VERSION,
+        "kernel_abi_fingerprint": crate::kernel::KERNEL_ABI_FINGERPRINT,
         "shell_wasm_blake3": state.version_info.shell_wasm_blake3,
         "degraded": runtime.degraded || cache.state == WasmtimeCacheState::Fallback,
         "degraded_reasons": runtime.degraded_reasons,
@@ -616,13 +626,26 @@ mod tests {
     use capnp::capability::Promise;
 
     fn test_state() -> AdminState {
+        let source = crate::kernel::KernelSource::Embedded("main");
+        let kernel_identity = crate::kernel::KernelIdentityState::pending(&source);
+        kernel_identity
+            .publish(crate::kernel::KernelIdentity {
+                cid: "kernel-cid".to_string(),
+                source: "embedded:main".to_string(),
+                wasm_blake3: "kernel".to_string(),
+                source_cid: None,
+                size: 42,
+                abi: crate::kernel::KERNEL_ABI_VERSION.to_string(),
+                abi_fingerprint: crate::kernel::KERNEL_ABI_FINGERPRINT.to_string(),
+            })
+            .unwrap();
         AdminState {
             peer_id: "12D3KooWTestPeerId".to_string(),
             network_state: rpc::NetworkState::new(),
             version_info: VersionInfo {
                 git_sha: "0123456789abcdef".to_string(),
                 oci_image_id: Some("sha256:image".to_string()),
-                kernel_wasm_blake3: Some("kernel".to_string()),
+                kernel_identity,
                 shell_wasm_blake3: Some("shell".to_string()),
             },
             runtime_status: RuntimeStatus::starting(),
@@ -654,7 +677,9 @@ mod tests {
             _params: system_capnp::executor::CidParams,
             mut results: system_capnp::executor::CidResults,
         ) -> Promise<(), capnp::Error> {
-            results.get().set_cid("readiness-test");
+            results
+                .get()
+                .set_cid("bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a");
             Promise::ok(())
         }
     }
@@ -703,6 +728,13 @@ mod tests {
             .promise
             .await
             .expect("install readiness route");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while rpc::dispatch::live_route_count(registry) != Ok(1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("route target readiness preflight");
     }
 
     async fn assert_readyz(state: &AdminState, expected: StatusCode) {
@@ -807,11 +839,36 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("version JSON");
         assert_eq!(value["git_sha"], "0123456789abcdef");
         assert_eq!(value["oci_image_id"], "sha256:image");
+        assert_eq!(value["kernel_cid"], "kernel-cid");
+        assert_eq!(value["kernel_source"], "embedded:main");
         assert_eq!(value["kernel_wasm_blake3"], "kernel");
+        assert_eq!(value["kernel_size"], 42);
+        assert_eq!(value["kernel_abi"], crate::kernel::KERNEL_ABI_VERSION);
+        assert_eq!(
+            value["kernel_abi_fingerprint"],
+            crate::kernel::KERNEL_ABI_FINGERPRINT
+        );
         assert_eq!(value["shell_wasm_blake3"], "shell");
         assert!(value["wasmtime_cache_hits_total"].is_u64());
         assert!(value["wasmtime_cache_stores_total"].is_u64());
         assert!(value["wasmtime_component_compilations_total"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn version_remains_available_while_kernel_identity_is_pending() {
+        let mut state = test_state();
+        state.version_info.kernel_identity = crate::kernel::KernelIdentityState::pending(
+            &crate::kernel::KernelSource::Path("/tmp/pid0.wasm".into()),
+        );
+        let response = version_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("version response body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("version JSON");
+        assert_eq!(value["kernel_cid"], serde_json::Value::Null);
+        assert_eq!(value["kernel_wasm_blake3"], serde_json::Value::Null);
+        assert_eq!(value["kernel_source"], "<pending: file:/tmp/pid0.wasm>");
     }
 
     #[test]

@@ -139,6 +139,7 @@ name = "kernel_dispatch"
 harness = false
 
 [build-dependencies]
+blake3 = { workspace = true }
 capnpc = { workspace = true }
 capnp = { workspace = true }
 schema-id = { path = "crates/schema-id" }

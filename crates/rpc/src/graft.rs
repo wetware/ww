@@ -562,7 +562,19 @@ mod tests {
     impl system_capnp::runtime::Server for RuntimeStub {}
 
     struct ExecutorStub;
-    impl system_capnp::executor::Server for ExecutorStub {}
+    #[allow(refining_impl_trait)]
+    impl system_capnp::executor::Server for ExecutorStub {
+        fn cid(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::executor::CidParams,
+            mut results: system_capnp::executor::CidResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            results
+                .get()
+                .set_cid("bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a");
+            capnp::capability::Promise::ok(())
+        }
+    }
 
     /// Generate a random Ed25519 signing key (compatible with the rand version
     /// used by the root crate, which may differ from ed25519_dalek's rand_core).
@@ -745,6 +757,13 @@ mod tests {
                     .promise
                     .await
                     .expect("register first graft route");
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while crate::dispatch::live_route_count(&registry) != Ok(1) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("route target readiness preflight");
                 assert_eq!(crate::dispatch::live_route_count(&registry), Ok(1));
 
                 // Readiness probes and external clients may perform additional
