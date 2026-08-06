@@ -6,6 +6,7 @@ use authority::{Epoch, Provenance};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::VerifyingKey;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 
 use libp2p::Multiaddr;
@@ -1613,6 +1614,12 @@ wasip2::cli::command::export!({iface_name}Guest);
         let peer_id = keypair.public().to_peer_id();
         let network_state = ww::rpc::NetworkState::from_peer_id(peer_id.to_bytes());
         let runtime_status = ww::metrics::RuntimeStatus::starting();
+        let (epoch_tx, epoch_rx) = watch::channel(Epoch {
+            seq: 0,
+            head: Vec::new(),
+            provenance: Provenance::Block(0),
+        });
+        let activated_seq = std::sync::Arc::new(AtomicU64::new(0));
         // Allocate the WAGI route map before the admin plane so `/readyz`
         // observes the exact same registration lifecycle as HTTP dispatch.
         let route_registry = http_listen
@@ -1658,6 +1665,8 @@ wasip2::cli::command::export!({iface_name}Guest);
                     version_info,
                     runtime_status: runtime_status.clone(),
                     route_registry: route_registry.clone(),
+                    epoch_rx: epoch_rx.clone(),
+                    activated_seq: activated_seq.clone(),
                     fuel_registry: fuel_registry.clone(),
                     rpc_metrics: rpc_metrics.clone(),
                     cache_metrics: cache_metrics.clone(),
@@ -1732,7 +1741,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         // If --stem is provided, read the on-chain head and prepend it
         // as a base root mount.
         let mut all_mounts: Vec<ww::cell::mount::Mount> = Vec::new();
-        let mut epoch_channel: Option<(watch::Sender<Epoch>, watch::Receiver<Epoch>)> = None;
         let stem_config = if let Some(ref stem_addr) = stem {
             let contract = parse_contract_address(stem_addr)?;
             let head = image::read_contract_head(&rpc_url, &contract).await?;
@@ -1760,7 +1768,11 @@ wasip2::cli::command::export!({iface_name}Guest);
                 provenance: Provenance::Block(0),
             };
 
-            epoch_channel = Some(watch::channel(initial_epoch));
+            // Gen-0 readiness remains compatible with the pre-replacement
+            // lifecycle. Replacement epochs must be committed by their
+            // generation-scoped activator before readiness can reopen.
+            activated_seq.store(initial_epoch.seq, Ordering::Release);
+            epoch_tx.send_replace(initial_epoch);
 
             Some(atom::IndexerConfig {
                 ws_url: ws_url.clone(),
@@ -1949,24 +1961,19 @@ wasip2::cli::command::export!({iface_name}Guest);
         };
 
         // Epoch thread: on-chain watcher (only when --stem is provided).
-        let epoch_channel_rx = if let Some((epoch_tx, epoch_rx)) = epoch_channel {
-            if let Some(config) = stem_config {
-                supervisor.try_spawn(
-                    "epoch",
-                    ww::services::EpochService {
-                        config,
-                        epoch_tx,
-                        confirmation_depth,
-                        ipfs_client: ipfs_client.clone(),
-                        cid_tree: Some(cid_tree.clone()),
-                        drain_duration: std::time::Duration::from_secs(epoch_drain_secs),
-                    },
-                )?;
-            }
-            Some(epoch_rx)
-        } else {
-            None
-        };
+        if let Some(config) = stem_config {
+            supervisor.try_spawn(
+                "epoch",
+                ww::services::EpochService {
+                    config,
+                    epoch_tx,
+                    confirmation_depth,
+                    ipfs_client: ipfs_client.clone(),
+                    cid_tree: Some(cid_tree.clone()),
+                    drain_duration: std::time::Duration::from_secs(epoch_drain_secs),
+                },
+            )?;
+        }
 
         // Executor pool: M:N cell scheduling across N worker threads.
         let executor_pool =
@@ -2046,9 +2053,9 @@ wasip2::cli::command::export!({iface_name}Guest);
             builder = builder.with_route_registry(registry.clone());
         }
 
-        if let Some(epoch_rx) = epoch_channel_rx {
-            builder = builder.with_epoch_rx(epoch_rx);
-        }
+        builder = builder
+            .with_epoch_rx(epoch_rx)
+            .with_activated_seq(activated_seq);
 
         let cell = builder.build();
 
