@@ -175,6 +175,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`wetware-membrane`: production membrane recursion (identity, flush, reentry, collapse, bench).** The membrane now preserves capability identity across round-trips and folds stacked attenuations. A data-segment sentinel `get_brand` plus a `get_ptr`-keyed registry lets it recognise its own membranes without `Any` (and without colliding with capnp-rpc connection brands, so caps can't tunnel through the filter). A call parameter that is one of our own membranes is unwrapped to the bare backing cap before reaching the backend, restoring the identity the backend exported (foreign params pass through). Results-copy failures mid-answer now surface as the call's error via an explicit flush outcome instead of a silent empty result. Attenuating an already-membraned cap collapses to a single layer when both policies are static allowlists (intersection of key sets via the new `Policy::allowlist_keys`); stateful policies stack so their per-call state survives. Adds `benches/membrane.rs`: per-call overhead is sub-microsecond and constant per hop (ping +~357 ns, cap-returning child +~437 ns), so upstream capnp cap-table work stays deferred.
 
 ### Fixed
+- **Atom finalizer integration setup now waits for mined transactions.** The
+  shared raw-transaction helper waits for a successful receipt before tests
+  read contract state, and the finalizer integration test separates acceptance
+  from mining so slower CI scheduling cannot observe a stale head.
 - **Namespace bootstrap configuration now fails closed.** Namespace bootstrap
   values are validated as a single CID when written or scanned, canonicalized
   to `/ipfs/<cid>`, and reject malformed CIDs and accidental subpaths before
