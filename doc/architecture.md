@@ -12,10 +12,16 @@ explicit delegation of a Cap'n Proto capability reference. A grant name is a
 parent-chosen local label; it is neither an authorization key nor a service
 lookup mechanism.
 
-The important distinction is between the trusted root and ordinary children:
+The important distinction is between the trusted root, the membrane it may
+publish, and ordinary children:
 
-- **pid0** is trusted by construction. It alone receives the graft-capable
-  host `Membrane` and calls `Membrane.graft()`.
+- **pid0** is trusted by construction. It alone receives the process-local
+  root `Membrane` and calls `Membrane.graft()`. That graft records the current
+  generation in trusted host state and includes a distinct ordinary
+  `Membrane` that pid0 may publish.
+- A **network client** may receive the published `Membrane`. Its grafts
+  provision ordinary epoch-guarded capabilities but cannot bind or commit
+  PID0 readiness.
 - An **ordinary child** receives `InitialGrants`, a host-provided,
   grants-only bootstrap. `InitialGrants.get()` returns exactly the immutable
   `InitialAuthorityRecord` selected by its parent.
@@ -29,8 +35,12 @@ the parent-held capability exported by a guest that uses `system::serve()`.
 HOST PROCESS
 │
 ├─ pid0 boot
-│  HostGraftBuilder → graft-capable Membrane → trusted pid0
-│                                           └─ Membrane.graft() → host grants
+│  process-local root Membrane → trusted pid0
+│       ├─ Membrane.graft() → host grants + publishable Membrane
+│       └─ private WIT kernel-ready() → commit bound generation
+│
+├─ network export
+│  publishable Membrane → ordinary epoch-guarded grafts
 │
 └─ ordinary child spawn
    Executor.spawn(explicit named grants)
@@ -41,9 +51,11 @@ HOST PROCESS
 
 The host graft contains the host-provided capabilities appropriate for the
 node configuration, including identity, host, runtime, routing, authority,
-IPFS, and optional HTTP client. Local pid0 grafting has no `AuthPolicy`.
-Remote authenticated issuance remains separate: a `Terminal` verifies a login
-identity and returns the policy-selected session authority.
+IPFS, and optional HTTP client. PID0's process-local graft also contains the
+ordinary membrane handoff, whose internal name is part of the private PID0 ABI.
+Local pid0 grafting has no `AuthPolicy`. Remote authenticated issuance remains
+separate: a `Terminal` verifies a login identity and returns the
+policy-selected session authority.
 
 ## Boot and child creation
 
@@ -108,9 +120,14 @@ explicitly re-delegates fresh references or replaces children.
 
 Route registrations are epoch-scoped and identity-owned. A stale registration
 stops contributing to readiness immediately, and cleanup from an old
-registration cannot delete a fresh replacement. Readiness means that a live,
-current-epoch HTTP route is registered. It is not a general supervisor signal,
-desired-state report, or proof that every init script has completed.
+registration cannot delete a fresh replacement. Readiness requires both a
+live current-generation HTTP route and a readiness commit from trusted PID0
+after init/init.d. PID0 commits through the argument-free private Component
+Model import `wetware:kernel-runtime/readiness@1.0.0` function `kernel-ready`;
+the host derives the generation from the process-local graft and rejects a
+stale generation. The import is installed only on PID0's linker, is not a
+Cap'n Proto capability value, and therefore cannot be delegated to children or
+transferred over the network.
 
 ## Fixed execution substrate
 
