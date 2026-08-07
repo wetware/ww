@@ -8214,6 +8214,8 @@ dependencies = [
  "wasmtime",
  "wetware-authority",
  "wetware-membrane",
+ "wit-component 0.244.0",
+ "wit-parser 0.244.0",
  "ww-cache",
 ]
 

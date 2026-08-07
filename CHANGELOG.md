@@ -38,7 +38,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `WW_KERNEL` select a local path, Kubo CID, or the unchanged embedded default
   with CLI-first precedence and no fallback after explicit failures. The host
   resolves exact bytes once, reports their runtime CID through a late-bound
-  `/version`, injects a schema-and-capnp-rpc ABI fingerprint into pid0, and
+  `/version`, injects a native/PID0 WIT-and-Cap'n-Proto ABI fingerprint, and
   fails HTTP startup within a named bound when the mounted status route is
   missing or unusable.
 - **Current embedded pid0 lifecycle baseline.** Host integration CI now builds
