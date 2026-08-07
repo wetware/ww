@@ -9,6 +9,7 @@ use libp2p::StreamProtocol;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{stderr, stdout, AsyncWriteExt};
@@ -79,6 +80,7 @@ pub struct CellBuilder {
     cid_tree: Option<Arc<cell::vfs::CidTree>>,
     initial_epoch: Option<Epoch>,
     epoch_rx: Option<watch::Receiver<Epoch>>,
+    activated_seq: Option<Arc<AtomicU64>>,
     signing_key: Option<Arc<SigningKey>>,
     route_registry: Option<crate::dispatcher::server::RouteRegistry>,
     cache_policy: rpc::CachePolicy,
@@ -111,6 +113,7 @@ impl CellBuilder {
             cid_tree: None,
             initial_epoch: None,
             epoch_rx: None,
+            activated_seq: None,
             signing_key: None,
             route_registry: None,
             cache_policy: rpc::CachePolicy::default(),
@@ -221,6 +224,12 @@ impl CellBuilder {
         self
     }
 
+    /// Share the pid0 generation activation marker with admin readiness.
+    pub fn with_activated_seq(mut self, activated_seq: Arc<AtomicU64>) -> Self {
+        self.activated_seq = Some(activated_seq);
+        self
+    }
+
     /// Set the Ed25519 signing key for the node identity.
     ///
     /// When set:
@@ -297,6 +306,7 @@ impl CellBuilder {
             cid_tree: self.cid_tree,
             initial_epoch: self.initial_epoch,
             epoch_rx: self.epoch_rx,
+            activated_seq: self.activated_seq,
             signing_key: self.signing_key,
             route_registry: self.route_registry,
             cache_policy: self.cache_policy,
@@ -332,6 +342,8 @@ pub struct Cell {
     pub cid_tree: Option<Arc<cell::vfs::CidTree>>,
     pub initial_epoch: Option<Epoch>,
     pub epoch_rx: Option<watch::Receiver<Epoch>>,
+    /// Last pid0 generation whose initialization completed successfully.
+    pub activated_seq: Option<Arc<AtomicU64>>,
     pub signing_key: Option<Arc<SigningKey>>,
     pub route_registry: Option<crate::dispatcher::server::RouteRegistry>,
     pub cache_policy: rpc::CachePolicy,
@@ -411,6 +423,7 @@ impl Cell {
             cid_tree,
             initial_epoch: _,
             epoch_rx: _,
+            activated_seq: _,
             signing_key: _,
             route_registry: _,
             cache_policy: _,
@@ -563,6 +576,7 @@ impl Cell {
         // Terminal-gated network accept loop.
         let terminal_signing_key = signing_key.clone();
         let pre_epoch_rx = self.epoch_rx.take();
+        let configured_activated_seq = self.activated_seq.take();
         let route_registry = self.route_registry.take();
         let cache_policy = self.cache_policy;
         let compile_tx = self.compile_tx.clone();
@@ -589,6 +603,10 @@ impl Cell {
             let (tx, rx) = watch::channel(initial_epoch);
             (Some(tx), rx)
         };
+        let activated_seq = configured_activated_seq.unwrap_or_else(|| {
+            let current = epoch_rx.borrow();
+            Arc::new(AtomicU64::new(current.seq))
+        });
 
         // Clone the stream control for the membrane RPC layer (Server capability).
         // If no stream_control is provided (non-serving mode), create a dummy one.
@@ -621,6 +639,7 @@ impl Cell {
             swarm_cmd_tx,
             wasm_debug,
             epoch_rx,
+            activated_seq,
             signing_key,
             membrane_stream_control,
             route_registry,
