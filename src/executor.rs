@@ -411,6 +411,13 @@ impl Cell {
     /// RPC to the guest over in-memory duplex pipes, while the guest's WASI stdio
     /// is bound to the host process's stdin/stdout/stderr.
     pub async fn spawn_with_streams(self) -> Result<(JoinHandle<Result<()>>, DataStreamHandles)> {
+        self.spawn_with_streams_inner(None).await
+    }
+
+    async fn spawn_with_streams_inner(
+        self,
+        kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
+    ) -> Result<(JoinHandle<Result<()>>, DataStreamHandles)> {
         let Cell {
             path,
             args,
@@ -549,6 +556,14 @@ impl Cell {
         if let Some(pinset) = pinset_cache {
             builder = builder.with_cache(cache::CacheMode::Shared(pinset));
         }
+        if let Some(gate) = kernel_ready_gate {
+            if !is_kernel {
+                return Err(anyhow::anyhow!(
+                    "private kernel readiness import cannot be installed for an ordinary cell"
+                ));
+            }
+            builder = builder.with_kernel_ready_gate(gate);
+        }
         let (builder, handles) = builder.with_data_streams();
 
         let proc = builder.build().await?;
@@ -568,6 +583,7 @@ impl Cell {
         stream_control: Option<libp2p_stream::Control>,
         serving_ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<SpawnResult> {
+        let install_kernel_ready = self.resolved_kernel.is_some();
         let wasm_debug = self.wasm_debug;
         let network_state = self.network_state.clone();
         let swarm_cmd_tx = self.swarm_cmd_tx.clone();
@@ -589,12 +605,6 @@ impl Cell {
             head: vec![],
             provenance: Provenance::Block(0),
         });
-        let (join, handles) = self.spawn_with_streams().await?;
-        let mut handles = handles;
-        let (reader, writer) = handles
-            .take_host_split()
-            .ok_or_else(|| anyhow::anyhow!("host stream missing; RPC streams already consumed"))?;
-
         // Use the externally-provided epoch receiver if available,
         // otherwise create a new channel.
         let (epoch_tx, epoch_rx) = if let Some(rx) = pre_epoch_rx {
@@ -607,6 +617,20 @@ impl Cell {
             let current = epoch_rx.borrow();
             Arc::new(AtomicU64::new(current.seq))
         });
+        let readiness_gate = Arc::new(authority::KernelReadyGate::new(
+            epoch_rx.clone(),
+            activated_seq,
+        ));
+
+        // The private host import must exist before Wasmtime instantiates PID0.
+        // Ordinary child construction continues through the default linker.
+        let (join, handles) = self
+            .spawn_with_streams_inner(install_kernel_ready.then(|| readiness_gate.clone()))
+            .await?;
+        let mut handles = handles;
+        let (reader, writer) = handles
+            .take_host_split()
+            .ok_or_else(|| anyhow::anyhow!("host stream missing; RPC streams already consumed"))?;
 
         // Clone the stream control for the membrane RPC layer (Server capability).
         // If no stream_control is provided (non-serving mode), create a dummy one.
@@ -639,7 +663,7 @@ impl Cell {
             swarm_cmd_tx,
             wasm_debug,
             epoch_rx,
-            activated_seq,
+            readiness_gate,
             signing_key,
             membrane_stream_control,
             route_registry,

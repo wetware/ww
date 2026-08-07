@@ -136,8 +136,10 @@ than a readiness interval.
 invocation fails clearly when Kubo is absent. A production deployment that
 must survive a sustained Kubo outage must set `WW_KUBO_WAIT_MAX_SECS=0`; the
 reviewed `ww-master` manifest does so. This keeps `/healthz` available while
-`/readyz` remains closed until a live current-epoch route is registered.
-Readiness is intentionally neither a general init-completion signal nor a
+`/readyz` remains closed until a live current-epoch route is registered and
+trusted PID0 has committed that generation after init/init.d. The commit uses a
+private Wasm host import installed only for PID0; it is not a Cap'n Proto
+capability and cannot be delegated over the network. Readiness is not a
 continuous Kubo availability probe after startup; liveness remains the
 process-level signal during a later dependency outage.
 

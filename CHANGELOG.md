@@ -177,10 +177,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - **Replacement pid0 generations cannot become ready before successful
   initialization.** Readiness now requires both a live HTTP route and explicit
-  activation by the current epoch-scoped pid0 membrane. Each graft carries an
-  immutable activation capability bound to the same epoch as its guarded
-  capabilities, so stale or failed generations cannot activate or reactivate
-  `/readyz`; generation 0 and static no-stem behavior are unchanged.
+  commit by the trusted PID0 kernel through its private Component Model host
+  import. The host binds that call to PID0's process-local graft generation;
+  the separate network-exportable Membrane never touches readiness state, so
+  stale, failed, or foreign grafts cannot activate or reactivate `/readyz`.
+  Generation 0 and static no-stem behavior are unchanged.
 - **Atom finalizer integration setup now waits for mined transactions.** The
   shared raw-transaction helper waits for a successful receipt before tests
   read contract state, and the finalizer integration test separates acceptance

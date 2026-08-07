@@ -191,23 +191,6 @@ mod tests {
         let _client = membrane_client(rx);
     }
 
-    #[tokio::test]
-    async fn ordinary_membrane_cannot_mint_pid0_generation_activator() {
-        let (_tx, rx) = watch::channel(test_epoch(1));
-        let client = membrane_client(rx);
-        let error = match client.graft_pid0_request().send().promise.await {
-            Ok(_) => panic!("non-pid0 membrane must leave pid0 graft unimplemented"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("unimplemented"),
-            "unexpected pid0 graft rejection: {error}"
-        );
-    }
-
     #[test]
     fn no_extension_build_succeeds() {
         let (_tx, rx) = watch::channel(test_epoch(1));

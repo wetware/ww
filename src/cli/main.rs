@@ -1770,7 +1770,7 @@ wasip2::cli::command::export!({iface_name}Guest);
 
             // Gen-0 readiness remains compatible with the pre-replacement
             // lifecycle. Replacement epochs must be committed by their
-            // generation-scoped activator before readiness can reopen.
+            // PID0-only kernel_ready host call before readiness can reopen.
             activated_seq.store(initial_epoch.seq, Ordering::Release);
             epoch_tx.send_replace(initial_epoch);
 

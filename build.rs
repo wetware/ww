@@ -159,7 +159,8 @@ fn main() {
 }
 
 fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
-    const KERNEL_ABI_VERSION: &str = "1";
+    const KERNEL_ABI_VERSION: &str = "2";
+    const KERNEL_RUNTIME_WIT: &str = "std/kernel/wit/kernel.wit";
     const SCHEMA_ROOTS: &[&str] = &[
         "system.capnp",
         "routing.capnp",
@@ -241,6 +242,13 @@ fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
         .expect("patched capnp-rpc source missing from Cargo.lock");
 
     let mut material = format!("kernel-abi={KERNEL_ABI_VERSION}\n");
+    let kernel_runtime_wit_path = manifest_path.join(KERNEL_RUNTIME_WIT);
+    let kernel_runtime_wit =
+        fs::read(&kernel_runtime_wit_path).expect("read private kernel runtime WIT");
+    material.push_str(&format!(
+        "kernel-runtime-wit={}\n",
+        blake3::hash(&kernel_runtime_wit).to_hex()
+    ));
     for schema in SCHEMA_ROOTS {
         material.push_str(&format!("schema-root={schema}\n"));
     }
@@ -253,6 +261,10 @@ fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
     println!("cargo:rustc-env=WW_KERNEL_ABI={KERNEL_ABI_VERSION}");
     println!("cargo:rustc-env=WW_KERNEL_ABI_FPR={fingerprint}");
     println!("cargo:rerun-if-changed={}", lock_path.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernel_runtime_wit_path.display()
+    );
     for schema in SCHEMA_ROOTS {
         println!(
             "cargo:rerun-if-changed={}",

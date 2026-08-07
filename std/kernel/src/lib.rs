@@ -58,8 +58,15 @@ mod attenuate;
 
 /// Bootstrap capability: the concrete Membrane defined in membrane.capnp.
 type Membrane = membrane_capnp::membrane::Client;
-/// Generation-local readiness commit capability minted by pid0 graft.
-type GenerationActivator = membrane_capnp::generation_activator::Client;
+
+mod kernel_runtime {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "pid0",
+    });
+}
+
+use kernel_runtime::wetware::kernel_runtime::readiness::{kernel_ready, ReadyError};
 
 /// Write a capability into an `Export`/params `cap` slot (an AnyPointer that
 /// holds the capability directly).
@@ -2110,6 +2117,7 @@ fn publish_bootstrap_membrane(
 
 const EPOCH_STALE_PROBE_INTERVAL_NS: u64 = 5_000_000_000;
 const EPOCH_RESTART_INIT_FAILED: &str = "EPOCH_RESTART_INIT_FAILED";
+const PID0_EXPORT_MEMBRANE_CAP: &str = "pid0-export-membrane";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerationAction {
@@ -2152,29 +2160,24 @@ fn kernel_completion(replacement_init_failed: bool) -> Result<(), ()> {
     }
 }
 
-async fn activate_generation(
-    activator: &GenerationActivator,
-) -> Result<GenerationActivation, capnp::Error> {
-    match activator.activate_request().send().promise.await {
-        Ok(_) => Ok(GenerationActivation::Committed),
-        Err(error)
-            if membrane::call_failure_code(&error)
-                == Some(membrane::CallFailureCode::StaleEpoch) =>
-        {
-            Ok(GenerationActivation::Stale)
-        }
-        Err(error) => Err(error),
+fn generation_activation(result: Result<(), ReadyError>) -> GenerationActivation {
+    match result {
+        Ok(()) => GenerationActivation::Committed,
+        Err(ReadyError::StaleGeneration) => GenerationActivation::Stale,
     }
 }
 
-async fn complete_generation_initialization(
-    activator: &GenerationActivator,
+fn complete_generation_initialization<F>(
     is_replacement: bool,
     is_tty: bool,
     outcome: InitdOutcome,
-) -> Result<(GenerationAction, GenerationActivation), capnp::Error> {
+    readiness: F,
+) -> Result<(GenerationAction, GenerationActivation), capnp::Error>
+where
+    F: FnOnce() -> Result<(), ReadyError>,
+{
     let action = generation_action(is_replacement, is_tty, outcome)?;
-    let activation = activate_generation(activator).await?;
+    let activation = generation_activation(readiness());
     Ok((action, activation))
 }
 
@@ -2245,13 +2248,13 @@ fn run_impl() -> Result<(), ()> {
         async move {
             let mut generation_index = 0_u64;
             loop {
-                let graft_resp = membrane.graft_pid0_request().send().promise.await?;
+                let graft_resp = membrane.graft_request().send().promise.await?;
                 let results = graft_resp.get()?;
-                let activator = results.get_activator()?;
 
                 // Iterate the caps list to find capabilities by name.
                 let caps = results.get_caps()?;
 
+                let export_membrane: Membrane = get_graft_cap(&caps, PID0_EXPORT_MEMBRANE_CAP)?;
                 let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
                 let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
                 let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
@@ -2375,7 +2378,7 @@ fn run_impl() -> Result<(), ()> {
                 // until the host observes a registered HTTP route. Publish before
                 // init.d so a slow (or foreground-blocking) script cannot consume
                 // the host's export-policy timeout and abort the kernel.
-                publish_bootstrap_membrane(&exported_membrane, &membrane);
+                publish_bootstrap_membrane(&exported_membrane, &export_membrane);
 
                 // Run init.d scripts. If a foreground process blocked
                 // (e.g. `(runtime run ...)` in the script), we're done.
@@ -2395,12 +2398,11 @@ fn run_impl() -> Result<(), ()> {
                 }
 
                 let (action, activation) = complete_generation_initialization(
-                    &activator,
                     generation_index > 0,
                     is_tty,
                     init_outcome,
-                )
-                .await?;
+                    kernel_ready,
+                )?;
                 match activation {
                     GenerationActivation::Committed => match action {
                         GenerationAction::Stop => return Ok(()),
@@ -2891,56 +2893,6 @@ mod tests {
         }
     }
 
-    struct TestGenerationActivator {
-        seq: u64,
-        current: Rc<std::cell::Cell<u64>>,
-        activations: Rc<std::cell::Cell<u32>>,
-    }
-
-    #[allow(refining_impl_trait)]
-    impl membrane_capnp::generation_activator::Server for TestGenerationActivator {
-        fn activate(
-            self: capnp::capability::Rc<Self>,
-            _params: membrane_capnp::generation_activator::ActivateParams,
-            _results: membrane_capnp::generation_activator::ActivateResults,
-        ) -> Promise<(), capnp::Error> {
-            self.activations.set(self.activations.get() + 1);
-            if self.seq != self.current.get() {
-                return Promise::err(membrane::stale_epoch_error(
-                    "test generation activator expired",
-                ));
-            }
-            Promise::ok(())
-        }
-    }
-
-    struct ActivationMembrane {
-        current: Rc<std::cell::Cell<u64>>,
-        pid0_grafts: Rc<std::cell::Cell<u32>>,
-        activations: Rc<std::cell::Cell<u32>>,
-    }
-
-    #[allow(refining_impl_trait)]
-    impl membrane_capnp::membrane::Server for ActivationMembrane {
-        fn graft_pid0(
-            self: capnp::capability::Rc<Self>,
-            _params: membrane_capnp::membrane::GraftPid0Params,
-            mut results: membrane_capnp::membrane::GraftPid0Results,
-        ) -> Promise<(), capnp::Error> {
-            self.pid0_grafts.set(self.pid0_grafts.get() + 1);
-            let seq = self.current.get();
-            let activator: GenerationActivator = capnp_rpc::new_client(TestGenerationActivator {
-                seq,
-                current: self.current.clone(),
-                activations: self.activations.clone(),
-            });
-            let mut builder = results.get();
-            builder.reborrow().init_caps(0);
-            builder.set_activator(activator);
-            Promise::ok(())
-        }
-    }
-
     struct EpochHost {
         issued: u64,
         current: Rc<std::cell::Cell<u64>>,
@@ -3146,34 +3098,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kernel_bootstrap_does_not_forward_pid0_graft() {
-        run_local(async {
-            let pid0_grafts = Rc::new(std::cell::Cell::new(0));
-            let upstream: Membrane = capnp_rpc::new_client(ActivationMembrane {
-                current: Rc::new(std::cell::Cell::new(1)),
-                pid0_grafts: pid0_grafts.clone(),
-                activations: Rc::new(std::cell::Cell::new(0)),
-            });
-            let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(Some(upstream)));
-            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap { membrane: state });
-
-            let error = match bootstrap.graft_pid0_request().send().promise.await {
-                Ok(_) => panic!("reverse-graft bootstrap must not mint pid0 activators"),
-                Err(error) => error,
-            };
-            assert!(
-                error
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains("unimplemented"),
-                "unexpected pid0 graft rejection: {error}"
-            );
-            assert_eq!(pid0_grafts.get(), 0);
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn test_bootstrap_is_published_before_initd_work() {
         run_local(async {
             let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(TestRuntime);
@@ -3236,79 +3160,35 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn kernel_retains_generation_activator_through_init_and_calls_once() {
-        run_local(async {
-            let pid0_grafts = Rc::new(std::cell::Cell::new(0));
-            let activations = Rc::new(std::cell::Cell::new(0));
-            let membrane: Membrane = capnp_rpc::new_client(ActivationMembrane {
-                current: Rc::new(std::cell::Cell::new(1)),
-                pid0_grafts: pid0_grafts.clone(),
-                activations: activations.clone(),
-            });
-            let response = membrane
-                .graft_pid0_request()
-                .send()
-                .promise
-                .await
-                .expect("generation graft");
-            let activator = response
-                .get()
-                .expect("generation graft results")
-                .get_activator()
-                .expect("generation-local activator");
-
-            tokio::task::yield_now().await;
-            assert_eq!(
-                complete_generation_initialization(
-                    &activator,
-                    false,
-                    false,
-                    InitdOutcome::default(),
-                )
-                .await
-                .unwrap(),
-                (
-                    GenerationAction::WatchEpoch,
-                    GenerationActivation::Committed
-                )
-            );
-            assert_eq!(pid0_grafts.get(), 1);
-            assert_eq!(activations.get(), 1);
-        })
-        .await;
+    #[test]
+    fn kernel_calls_private_readiness_once_after_successful_init() {
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            complete_generation_initialization(false, false, InitdOutcome::default(), || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap(),
+            (
+                GenerationAction::WatchEpoch,
+                GenerationActivation::Committed
+            )
+        );
+        assert_eq!(calls.get(), 1);
     }
 
-    #[tokio::test]
-    async fn stale_generation_activation_restarts_without_retry() {
-        run_local(async {
-            let current = Rc::new(std::cell::Cell::new(1));
-            let pid0_grafts = Rc::new(std::cell::Cell::new(0));
-            let activations = Rc::new(std::cell::Cell::new(0));
-            let membrane: Membrane = capnp_rpc::new_client(ActivationMembrane {
-                current: current.clone(),
-                pid0_grafts: pid0_grafts.clone(),
-                activations: activations.clone(),
-            });
-            let response = membrane.graft_pid0_request().send().promise.await.unwrap();
-            let activator = response.get().unwrap().get_activator().unwrap();
-            current.set(2);
-
-            assert_eq!(
-                complete_generation_initialization(
-                    &activator,
-                    true,
-                    false,
-                    InitdOutcome::default(),
-                )
-                .await
-                .unwrap(),
-                (GenerationAction::WatchEpoch, GenerationActivation::Stale)
-            );
-            assert_eq!(activations.get(), 1, "stale activation is not retried");
-            assert_eq!(pid0_grafts.get(), 1, "restart is owned by outer loop");
-        })
-        .await;
+    #[test]
+    fn stale_kernel_ready_result_restarts_without_retry() {
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            complete_generation_initialization(true, false, InitdOutcome::default(), || {
+                calls.set(calls.get() + 1);
+                Err(ReadyError::StaleGeneration)
+            })
+            .unwrap(),
+            (GenerationAction::WatchEpoch, GenerationActivation::Stale)
+        );
+        assert_eq!(calls.get(), 1, "stale readiness commit is not retried");
     }
 
     #[tokio::test]
@@ -3376,30 +3256,24 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn failed_replacement_never_invokes_generation_activator() {
-        run_local(async {
-            let activations = Rc::new(std::cell::Cell::new(0));
-            let activator: GenerationActivator = capnp_rpc::new_client(TestGenerationActivator {
-                seq: 2,
-                current: Rc::new(std::cell::Cell::new(2)),
-                activations: activations.clone(),
-            });
-            let error = complete_generation_initialization(
-                &activator,
-                true,
-                false,
-                InitdOutcome {
-                    blocked: false,
-                    failures: 1,
-                },
-            )
-            .await
-            .expect_err("replacement init failure must precede activation");
-            assert!(error.to_string().contains(EPOCH_RESTART_INIT_FAILED));
-            assert_eq!(activations.get(), 0);
-        })
-        .await;
+    #[test]
+    fn failed_replacement_never_invokes_kernel_ready() {
+        let calls = std::cell::Cell::new(0);
+        let error = complete_generation_initialization(
+            true,
+            false,
+            InitdOutcome {
+                blocked: false,
+                failures: 1,
+            },
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("replacement init failure must precede readiness commit");
+        assert!(error.to_string().contains(EPOCH_RESTART_INIT_FAILED));
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]

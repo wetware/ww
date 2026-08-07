@@ -33,3 +33,5 @@ ipfs = { path = "../ipfs" }
 
 [dev-dependencies]
 wat = "1"
+wit-component = { version = "0.244", features = ["dummy-module"] }
+wit-parser = "0.244"
