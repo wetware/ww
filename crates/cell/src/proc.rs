@@ -219,17 +219,24 @@ impl pid0_runtime::wetware::kernel_runtime::readiness::Host for ComponentRunStat
     fn kernel_ready(
         &mut self,
     ) -> Result<(), pid0_runtime::wetware::kernel_runtime::readiness::ReadyError> {
-        use authority::KernelReadyError;
-        use pid0_runtime::wetware::kernel_runtime::readiness::ReadyError;
-
         let gate = self
             .kernel_ready_gate
             .as_ref()
             .expect("kernel readiness import installed without gate");
-        match gate.kernel_ready() {
-            Ok(()) => Ok(()),
-            Err(KernelReadyError::StaleGeneration) => Err(ReadyError::StaleGeneration),
-            Err(KernelReadyError::NotBound) => Err(ReadyError::StaleGeneration),
+        commit_kernel_ready(gate)
+    }
+}
+
+fn commit_kernel_ready(
+    gate: &authority::KernelReadyGate,
+) -> Result<(), pid0_runtime::wetware::kernel_runtime::readiness::ReadyError> {
+    use authority::KernelReadyError;
+    use pid0_runtime::wetware::kernel_runtime::readiness::ReadyError;
+
+    match gate.kernel_ready() {
+        Ok(()) => Ok(()),
+        Err(KernelReadyError::StaleGeneration | KernelReadyError::NotBound) => {
+            Err(ReadyError::StaleGeneration)
         }
     }
 }
@@ -1009,6 +1016,39 @@ mod tests {
         .expect("install private PID0 import");
         pid0.instantiate_pre(&component)
             .expect("PID0 linker satisfies private readiness import");
+    }
+
+    #[test]
+    fn private_kernel_import_maps_gate_results_fail_closed() {
+        use authority::{Epoch, Provenance};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        fn epoch(seq: u64) -> Epoch {
+            Epoch {
+                seq,
+                head: Vec::new(),
+                provenance: Provenance::Block(0),
+            }
+        }
+
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch(1));
+        let activated = Arc::new(AtomicU64::new(0));
+        let gate = authority::KernelReadyGate::new(epoch_rx, activated.clone());
+
+        assert!(matches!(
+            commit_kernel_ready(&gate),
+            Err(pid0_runtime::wetware::kernel_runtime::readiness::ReadyError::StaleGeneration)
+        ));
+        gate.bind_generation(1);
+        assert_eq!(commit_kernel_ready(&gate), Ok(()));
+        assert_eq!(activated.load(Ordering::Acquire), 1);
+
+        epoch_tx.send_replace(epoch(2));
+        assert!(matches!(
+            commit_kernel_ready(&gate),
+            Err(pid0_runtime::wetware::kernel_runtime::readiness::ReadyError::StaleGeneration)
+        ));
+        assert_eq!(activated.load(Ordering::Acquire), 1);
     }
 
     #[test]

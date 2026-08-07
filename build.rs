@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod kernel_abi_fingerprint;
+
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
@@ -242,21 +244,17 @@ fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
         })
         .expect("patched capnp-rpc source missing from Cargo.lock");
 
-    let mut material = format!("kernel-abi={KERNEL_ABI_VERSION}\n");
     let kernel_runtime_wit_path = manifest_path.join(KERNEL_RUNTIME_WIT);
     let kernel_runtime_wit =
         fs::read(&kernel_runtime_wit_path).expect("read private kernel runtime WIT");
-    material.push_str(&format!(
-        "kernel-runtime-wit={}\n",
-        blake3::hash(&kernel_runtime_wit).to_hex()
-    ));
     let pid0_export_membrane_abi_path = manifest_path.join(PID0_EXPORT_MEMBRANE_ABI);
     let pid0_export_membrane_abi = fs::read(&pid0_export_membrane_abi_path)
         .expect("read PID0 export membrane private ABI definition");
-    material.push_str(&format!(
-        "pid0-export-membrane-abi={}\n",
-        blake3::hash(&pid0_export_membrane_abi).to_hex()
-    ));
+    let mut material = kernel_abi_fingerprint::private_pid0_abi_material(
+        KERNEL_ABI_VERSION,
+        &kernel_runtime_wit,
+        &pid0_export_membrane_abi,
+    );
     for schema in SCHEMA_ROOTS {
         material.push_str(&format!("schema-root={schema}\n"));
     }

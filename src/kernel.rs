@@ -11,6 +11,10 @@ use cid::Cid;
 use crate::cell::loaders::{HostPathLoader, IpfsLoader};
 use crate::cell::Loader;
 
+#[cfg(test)]
+#[path = "../kernel_abi_fingerprint.rs"]
+mod kernel_abi_fingerprint;
+
 /// Version of the native host ↔ pid0 component contract.
 pub const KERNEL_ABI_VERSION: &str = env!("WW_KERNEL_ABI");
 

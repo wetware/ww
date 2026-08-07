@@ -2123,6 +2123,10 @@ fn publish_bootstrap_membrane(
     *exported_membrane.borrow_mut() = Some(membrane.clone());
 }
 
+fn get_pid0_export_membrane(caps: &system::Caps<'_>) -> Result<Membrane, capnp::Error> {
+    get_graft_cap(caps, PID0_EXPORT_MEMBRANE_CAP).map_err(Into::into)
+}
+
 const EPOCH_STALE_PROBE_INTERVAL_NS: u64 = 5_000_000_000;
 const EPOCH_RESTART_INIT_FAILED: &str = "EPOCH_RESTART_INIT_FAILED";
 
@@ -2261,7 +2265,7 @@ fn run_impl() -> Result<(), ()> {
                 // Iterate the caps list to find capabilities by name.
                 let caps = results.get_caps()?;
 
-                let export_membrane: Membrane = get_graft_cap(&caps, PID0_EXPORT_MEMBRANE_CAP)?;
+                let export_membrane = get_pid0_export_membrane(&caps)?;
                 let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
                 let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
                 let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
@@ -3100,6 +3104,31 @@ mod tests {
                     );
                 }
             }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pid0_graft_without_private_export_membrane_fails_closed() {
+        run_local(async {
+            let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(TestRuntime);
+            let membrane: Membrane = capnp_rpc::new_client(TestMembrane { runtime });
+            let response = membrane
+                .graft_request()
+                .send()
+                .promise
+                .await
+                .expect("test graft response");
+            let caps = response.get().unwrap().get_caps().unwrap();
+
+            let error = match get_pid0_export_membrane(&caps) {
+                Ok(_) => panic!("PID0 must reject a graft without its private membrane handoff"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(PID0_EXPORT_MEMBRANE_CAP),
+                "missing private handoff must name the absent capability: {error}"
+            );
         })
         .await;
     }

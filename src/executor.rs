@@ -556,12 +556,8 @@ impl Cell {
         if let Some(pinset) = pinset_cache {
             builder = builder.with_cache(cache::CacheMode::Shared(pinset));
         }
+        validate_kernel_ready_installation(is_kernel, kernel_ready_gate.is_some())?;
         if let Some(gate) = kernel_ready_gate {
-            if !is_kernel {
-                return Err(anyhow::anyhow!(
-                    "private kernel readiness import cannot be installed for an ordinary cell"
-                ));
-            }
             builder = builder.with_kernel_ready_gate(gate);
         }
         let (builder, handles) = builder.with_data_streams();
@@ -734,6 +730,15 @@ impl Cell {
             epoch_tx,
         })
     }
+}
+
+fn validate_kernel_ready_installation(is_kernel: bool, gate_present: bool) -> Result<()> {
+    if gate_present && !is_kernel {
+        return Err(anyhow::anyhow!(
+            "private kernel readiness import cannot be installed for an ordinary cell"
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_guest_env(
@@ -1036,6 +1041,19 @@ mod tests {
         assert!(!env
             .iter()
             .any(|value| value.starts_with("WW_KERNEL_ABI_FPR=")));
+    }
+
+    #[test]
+    fn ordinary_cells_reject_private_kernel_readiness_installation() {
+        assert!(validate_kernel_ready_installation(true, true).is_ok());
+        assert!(validate_kernel_ready_installation(true, false).is_ok());
+        assert!(validate_kernel_ready_installation(false, false).is_ok());
+
+        let error = validate_kernel_ready_installation(false, true)
+            .expect_err("ordinary cells must reject the private readiness gate");
+        assert!(error
+            .to_string()
+            .contains("cannot be installed for an ordinary cell"));
     }
 
     #[tokio::test]

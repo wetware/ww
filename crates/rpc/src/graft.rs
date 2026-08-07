@@ -898,6 +898,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn pid0_root_graft_rejects_reserved_membrane_handoff_collision() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
+                let guard = EpochGuard {
+                    issued_seq: 1,
+                    receiver: epoch_rx.clone(),
+                };
+                let activated_seq = Arc::new(AtomicU64::new(0));
+                let readiness_gate = Arc::new(authority::KernelReadyGate::new(
+                    epoch_rx.clone(),
+                    activated_seq,
+                ));
+                let grafts = Rc::new(Cell::new(0));
+                let export_membrane: GuestMembrane = capnp_rpc::new_client(MembraneServer::new(
+                    epoch_rx,
+                    CountingGraftBuilder { grafts },
+                ));
+                let reserved = NamedCapabilities::try_from_pairs([(
+                    PID0_EXPORT_MEMBRANE_CAP,
+                    export_membrane.clone().client,
+                )])
+                .expect("construct colliding test extra");
+                let (swarm_tx, _swarm_rx) = mpsc::channel(1);
+                let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
+                let inner = HostGraftBuilder::new(
+                    NetworkState::from_peer_id(vec![1, 2, 3]),
+                    swarm_tx,
+                    false,
+                    None,
+                    libp2p_stream::Behaviour::new().new_control(),
+                    Vec::new(),
+                    runtime,
+                    ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+                )
+                .with_extras(reserved);
+                let root = Pid0RootGraftBuilder {
+                    inner,
+                    readiness_gate: readiness_gate.clone(),
+                    export_membrane,
+                };
+
+                let mut message = capnp::message::Builder::new_default();
+                let mut cap_table = Vec::new();
+                let error = {
+                    let mut results =
+                        message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                    results.imbue_mut(&mut cap_table);
+                    root.build(&guard, results)
+                        .expect_err("reserved handoff collision must fail closed")
+                };
+                assert!(error.to_string().contains("duplicate capability name"));
+                assert!(error.to_string().contains(PID0_EXPORT_MEMBRANE_CAP));
+                assert_eq!(
+                    readiness_gate.kernel_ready(),
+                    Err(KernelReadyError::NotBound),
+                    "a failed root graft must not bind readiness"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn foreign_export_graft_cannot_retarget_pid0_readiness() {
         tokio::task::LocalSet::new()
             .run_until(async {
