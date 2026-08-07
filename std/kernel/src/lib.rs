@@ -66,7 +66,15 @@ mod kernel_runtime {
     });
 }
 
+mod pid0_runtime_abi {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/abi/pid0_export_membrane_cap.rs"
+    ));
+}
+
 use kernel_runtime::wetware::kernel_runtime::readiness::{kernel_ready, ReadyError};
+use pid0_runtime_abi::PID0_EXPORT_MEMBRANE_CAP;
 
 /// Write a capability into an `Export`/params `cap` slot (an AnyPointer that
 /// holds the capability directly).
@@ -2117,7 +2125,6 @@ fn publish_bootstrap_membrane(
 
 const EPOCH_STALE_PROBE_INTERVAL_NS: u64 = 5_000_000_000;
 const EPOCH_RESTART_INIT_FAILED: &str = "EPOCH_RESTART_INIT_FAILED";
-const PID0_EXPORT_MEMBRANE_CAP: &str = "pid0-export-membrane";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerationAction {

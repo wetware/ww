@@ -514,7 +514,14 @@ impl Pid0RegistrationScope {
     }
 }
 
-const PID0_EXPORT_MEMBRANE_CAP: &str = "pid0-export-membrane";
+mod pid0_runtime_abi {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../std/kernel/abi/pid0_export_membrane_cap.rs"
+    ));
+}
+
+use pid0_runtime_abi::PID0_EXPORT_MEMBRANE_CAP;
 
 /// Process-local graft wrapper. Only the trusted PID0 bootstrap receives a
 /// client for this server; the separately constructed export membrane never

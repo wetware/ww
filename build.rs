@@ -161,6 +161,7 @@ fn main() {
 fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
     const KERNEL_ABI_VERSION: &str = "2";
     const KERNEL_RUNTIME_WIT: &str = "std/kernel/wit/kernel.wit";
+    const PID0_EXPORT_MEMBRANE_ABI: &str = "std/kernel/abi/pid0_export_membrane_cap.rs";
     const SCHEMA_ROOTS: &[&str] = &[
         "system.capnp",
         "routing.capnp",
@@ -249,6 +250,13 @@ fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
         "kernel-runtime-wit={}\n",
         blake3::hash(&kernel_runtime_wit).to_hex()
     ));
+    let pid0_export_membrane_abi_path = manifest_path.join(PID0_EXPORT_MEMBRANE_ABI);
+    let pid0_export_membrane_abi = fs::read(&pid0_export_membrane_abi_path)
+        .expect("read PID0 export membrane private ABI definition");
+    material.push_str(&format!(
+        "pid0-export-membrane-abi={}\n",
+        blake3::hash(&pid0_export_membrane_abi).to_hex()
+    ));
     for schema in SCHEMA_ROOTS {
         material.push_str(&format!("schema-root={schema}\n"));
     }
@@ -264,6 +272,10 @@ fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
     println!(
         "cargo:rerun-if-changed={}",
         kernel_runtime_wit_path.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        pid0_export_membrane_abi_path.display()
     );
     for schema in SCHEMA_ROOTS {
         println!(
