@@ -21,6 +21,12 @@ interface InitialGrants @0xae9edc968ee787fe {
   # exposes no graft, lookup, refresh, append, policy, or parent-channel API.
 }
 
+interface GenerationActivator @0x94945a0fc6d68018 {
+  activate @0 () -> ();
+  # Commits the single pid0 generation captured when this capability was
+  # minted. The caller supplies no epoch; stale generations fail closed.
+}
+
 interface Membrane @0xdb52c25106bc2c5e {
   graft @0 () -> (
     caps :List(Export)
@@ -35,4 +41,12 @@ interface Membrane @0xdb52c25106bc2c5e {
   # WASI guests resolve content via the virtual filesystem (CidTree).
   # Non-WASI clients (for example process-local `ww shell`) may also receive
   # the `ipfs` cap and call `system.Ipfs.read` for `/ipfs`/`/ipns`/`/ipld`.
+
+  graftPid0 @1 () -> (
+    caps :List(Export),
+    activator :GenerationActivator
+  );
+  # Trusted pid0-only provisioning. Each call returns a fresh activator bound
+  # immutably to the same authoritative epoch as the returned capabilities.
+  # Non-pid0 membrane servers intentionally leave this method unimplemented.
 }

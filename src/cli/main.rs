@@ -6,6 +6,7 @@ use authority::{Epoch, Provenance};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::VerifyingKey;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 
 use libp2p::Multiaddr;
@@ -153,6 +154,11 @@ enum Commands {
         /// Enable WASM debug info for guest processes
         #[arg(long)]
         wasm_debug: bool,
+
+        /// Select pid0 by local path, CID, or explicit file:/cid:/embedded: prefix.
+        /// CLI overrides WW_KERNEL; absent both, the embedded kernel is used.
+        #[arg(long, value_name = "PATH|CID")]
+        kernel: Option<String>,
 
         /// Path to an Ed25519 identity file (host-side only; not a guest mount).
         /// Works well with direnv: `export WW_IDENTITY=~/.ww/identity` in .envrc.
@@ -589,6 +595,14 @@ const KUBO_BOOT_OPERATION_TIMEOUT_SECS_ENV: &str = "WW_KUBO_BOOT_OPERATION_TIMEO
 /// liveness-green, readiness-closed process.
 const KUBO_BOOT_OPERATION_TIMEOUT_DEFAULT_SECS: u64 = 90;
 
+/// Environment override for the maximum time pid0 may take to complete its
+/// reverse graft and register its first live HTTP route.
+const KERNEL_ROUTE_READY_TIMEOUT_SECS_ENV: &str = "WW_KERNEL_ROUTE_READY_TIMEOUT_SECS";
+
+/// Production-safe bound for a missing, corrupt, or non-registering
+/// `$WW_ROOT/bin/status.wasm` boot artifact.
+const KERNEL_ROUTE_READY_TIMEOUT_DEFAULT_SECS: u64 = 120;
+
 fn kubo_env_u64(name: &str, default: u64) -> Result<u64> {
     match std::env::var(name) {
         Ok(value) => value
@@ -621,6 +635,47 @@ fn kubo_boot_operation_timeout_secs() -> Result<u64> {
         );
     }
     Ok(secs)
+}
+
+fn kernel_route_ready_timeout_secs() -> Result<u64> {
+    let secs = kubo_env_u64(
+        KERNEL_ROUTE_READY_TIMEOUT_SECS_ENV,
+        KERNEL_ROUTE_READY_TIMEOUT_DEFAULT_SECS,
+    )?;
+    if secs == 0 {
+        bail!(
+            "{KERNEL_ROUTE_READY_TIMEOUT_SECS_ENV}=0 would permit an unbounded kernel route-readiness wait; use a positive number"
+        );
+    }
+    Ok(secs)
+}
+
+async fn wait_for_kernel_http_readiness(
+    serving_ready_rx: tokio::sync::oneshot::Receiver<()>,
+    registry: &ww::dispatcher::server::RouteRegistry,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let readiness = async {
+        serving_ready_rx
+            .await
+            .context("kernel reverse graft readiness signal was dropped")?;
+        loop {
+            match ww::rpc::dispatch::live_route_count(registry) {
+                Ok(count) if count > 0 => return Ok(()),
+                Ok(_) => {}
+                Err(error) => bail!("kernel HTTP route registry unavailable: {error}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+
+    match tokio::time::timeout(timeout, readiness).await {
+        Ok(result) => result,
+        Err(_) => bail!(
+            "kernel did not complete reverse graft and register an HTTP route within {}s; the mounted image must provide a valid $WW_ROOT/bin/status.wasm",
+            timeout.as_secs()
+        ),
+    }
 }
 
 /// Core of [`wait_for_kubo_ready`] with an explicit deadline (`max_secs`; `0` =
@@ -709,6 +764,7 @@ impl Commands {
                 mounts: mount_args,
                 listen,
                 wasm_debug,
+                kernel,
                 identity,
                 insecure_ephemeral,
                 stem,
@@ -725,6 +781,13 @@ impl Commands {
             } => {
                 let mounts = ww::cell::mount::parse_args(&mount_args)?;
                 Self::validate_backend_mount_policy(&mounts)?;
+                let env_kernel = match std::env::var("WW_KERNEL") {
+                    Ok(value) => Some(value),
+                    Err(std::env::VarError::NotPresent) => None,
+                    Err(error) => return Err(anyhow::anyhow!("failed to read WW_KERNEL: {error}")),
+                };
+                let kernel_source =
+                    ww::kernel::select_kernel_source(kernel.as_deref(), env_kernel.as_deref())?;
                 // Identity is passed separately — NOT as a mount.
                 // The host reads it to create the signing key for the Membrane.
                 // It must never enter the merged FHS tree (which is preopened
@@ -745,6 +808,7 @@ impl Commands {
                     insecure_ephemeral,
                     listen,
                     wasm_debug,
+                    kernel_source,
                     stem,
                     rpc_url,
                     ws_url,
@@ -1486,6 +1550,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         insecure_ephemeral: bool,
         listen: Vec<Multiaddr>,
         wasm_debug: bool,
+        kernel_source: ww::kernel::KernelSource,
         stem: Option<String>,
         rpc_url: String,
         ws_url: String,
@@ -1549,6 +1614,12 @@ wasip2::cli::command::export!({iface_name}Guest);
         let peer_id = keypair.public().to_peer_id();
         let network_state = ww::rpc::NetworkState::from_peer_id(peer_id.to_bytes());
         let runtime_status = ww::metrics::RuntimeStatus::starting();
+        let (epoch_tx, epoch_rx) = watch::channel(Epoch {
+            seq: 0,
+            head: Vec::new(),
+            provenance: Provenance::Block(0),
+        });
+        let activated_seq = std::sync::Arc::new(AtomicU64::new(0));
         // Allocate the WAGI route map before the admin plane so `/readyz`
         // observes the exact same registration lifecycle as HTTP dispatch.
         let route_registry = http_listen
@@ -1562,9 +1633,10 @@ wasip2::cli::command::export!({iface_name}Guest);
             oci_image_id: std::env::var("WW_OCI_IMAGE_ID")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            kernel_wasm_blake3: embedded_blake3(EMBEDDED_KERNEL),
+            kernel_identity: ww::kernel::KernelIdentityState::pending(&kernel_source),
             shell_wasm_blake3: embedded_blake3(EMBEDDED_SHELL),
         };
+        let kernel_identity = version_info.kernel_identity.clone();
 
         let mut supervisor = ww::services::Host::new();
         let fuel_registry = ww::metrics::new_fuel_registry();
@@ -1593,6 +1665,8 @@ wasip2::cli::command::export!({iface_name}Guest);
                     version_info,
                     runtime_status: runtime_status.clone(),
                     route_registry: route_registry.clone(),
+                    epoch_rx: epoch_rx.clone(),
+                    activated_seq: activated_seq.clone(),
                     fuel_registry: fuel_registry.clone(),
                     rpc_metrics: rpc_metrics.clone(),
                     cache_metrics: cache_metrics.clone(),
@@ -1631,6 +1705,27 @@ wasip2::cli::command::export!({iface_name}Guest);
                 return Err(service_exit_error(service_exit));
             }
         }
+        runtime_status.set_phase("resolving-kernel");
+        let resolved_kernel = kernel_source
+            .resolve(ipfs_client.clone(), EMBEDDED_KERNEL)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to resolve kernel source '{}'",
+                    kernel_source.record()
+                )
+            })?;
+        let resolved_identity = resolved_kernel.identity();
+        tracing::info!(
+            kernel_source = %resolved_kernel.source.log_value(),
+            kernel_cid = %resolved_identity.cid,
+            source_cid = ?resolved_identity.source_cid,
+            bytes = resolved_identity.size,
+            abi = %resolved_identity.abi,
+            abi_fingerprint = %resolved_identity.abi_fingerprint,
+            "Kernel source resolved"
+        );
+        kernel_identity.publish(resolved_identity)?;
         // Cleanup is deliberately detached: it may use at most a short,
         // internal deadline, but boot must not wait for best-effort hygiene.
         let sweep_ipfs_client = boot_ipfs_client.clone();
@@ -1646,7 +1741,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         // If --stem is provided, read the on-chain head and prepend it
         // as a base root mount.
         let mut all_mounts: Vec<ww::cell::mount::Mount> = Vec::new();
-        let mut epoch_channel: Option<(watch::Sender<Epoch>, watch::Receiver<Epoch>)> = None;
         let stem_config = if let Some(ref stem_addr) = stem {
             let contract = parse_contract_address(stem_addr)?;
             let head = image::read_contract_head(&rpc_url, &contract).await?;
@@ -1674,7 +1768,11 @@ wasip2::cli::command::export!({iface_name}Guest);
                 provenance: Provenance::Block(0),
             };
 
-            epoch_channel = Some(watch::channel(initial_epoch));
+            // Gen-0 readiness remains compatible with the pre-replacement
+            // lifecycle. Replacement epochs must be committed by their
+            // generation-scoped activator before readiness can reopen.
+            activated_seq.store(initial_epoch.seq, Ordering::Release);
+            epoch_tx.send_replace(initial_epoch);
 
             Some(atom::IndexerConfig {
                 ws_url: ws_url.clone(),
@@ -1863,24 +1961,19 @@ wasip2::cli::command::export!({iface_name}Guest);
         };
 
         // Epoch thread: on-chain watcher (only when --stem is provided).
-        let epoch_channel_rx = if let Some((epoch_tx, epoch_rx)) = epoch_channel {
-            if let Some(config) = stem_config {
-                supervisor.try_spawn(
-                    "epoch",
-                    ww::services::EpochService {
-                        config,
-                        epoch_tx,
-                        confirmation_depth,
-                        ipfs_client: ipfs_client.clone(),
-                        cid_tree: Some(cid_tree.clone()),
-                        drain_duration: std::time::Duration::from_secs(epoch_drain_secs),
-                    },
-                )?;
-            }
-            Some(epoch_rx)
-        } else {
-            None
-        };
+        if let Some(config) = stem_config {
+            supervisor.try_spawn(
+                "epoch",
+                ww::services::EpochService {
+                    config,
+                    epoch_tx,
+                    confirmation_depth,
+                    ipfs_client: ipfs_client.clone(),
+                    cid_tree: Some(cid_tree.clone()),
+                    drain_duration: std::time::Duration::from_secs(epoch_drain_secs),
+                },
+            )?;
+        }
 
         // Executor pool: M:N cell scheduling across N worker threads.
         let executor_pool =
@@ -1942,6 +2035,7 @@ wasip2::cli::command::export!({iface_name}Guest);
 
         let mut builder = CellBuilder::new(image_path.clone())
             .with_loader(Box::new(loader))
+            .with_resolved_kernel(resolved_kernel)
             .with_network_state(network_state.clone())
             .with_swarm_cmd_tx(swarm_cmd_tx.clone())
             .with_wasm_debug(wasm_debug)
@@ -1959,15 +2053,22 @@ wasip2::cli::command::export!({iface_name}Guest);
             builder = builder.with_route_registry(registry.clone());
         }
 
-        if let Some(epoch_rx) = epoch_channel_rx {
-            builder = builder.with_epoch_rx(epoch_rx);
-        }
+        builder = builder
+            .with_epoch_rx(epoch_rx)
+            .with_activated_seq(activated_seq);
 
         let cell = builder.build();
 
         // Spawn the kernel cell into the executor pool. The kernel's exit
         // code flows back through the oneshot channel.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (startup_failure_tx, mut startup_failure_rx) =
+            tokio::sync::mpsc::unbounded_channel::<anyhow::Error>();
+        // Keep the receiver pending after successful readiness; the worker
+        // clone sends only named startup failures.
+        let _startup_failure_guard = startup_failure_tx.clone();
+        let route_ready_timeout =
+            std::time::Duration::from_secs(kernel_route_ready_timeout_secs()?);
         runtime_status.set_phase("starting-kernel");
         let kernel_runtime_status = runtime_status.clone();
         let readiness_route_registry = route_registry.clone();
@@ -1977,25 +2078,23 @@ wasip2::cli::command::export!({iface_name}Guest);
                 factory: Box::new(move |_shutdown| {
                     Box::pin(async move {
                         let (serving_ready_tx, serving_ready_rx) = tokio::sync::oneshot::channel();
+                        let startup_failure_tx = startup_failure_tx.clone();
                         tokio::task::spawn_local(async move {
-                            if serving_ready_rx.await.is_ok() {
-                                if let Some(registry) = readiness_route_registry {
-                                    kernel_runtime_status.set_phase("waiting-for-http-route");
-                                    loop {
-                                        match registry.read() {
-                                            Ok(routes) if !routes.is_empty() => break,
-                                            Ok(_) => {}
-                                            Err(_) => {
-                                                kernel_runtime_status.mark_degraded(
-                                                    "HTTP route registry lock poisoned",
-                                                );
-                                                return;
-                                            }
-                                        }
-                                        tokio::time::sleep(std::time::Duration::from_millis(100))
-                                            .await;
-                                    }
+                            if let Some(registry) = readiness_route_registry {
+                                kernel_runtime_status.set_phase("waiting-for-http-route");
+                                if let Err(error) = wait_for_kernel_http_readiness(
+                                    serving_ready_rx,
+                                    &registry,
+                                    route_ready_timeout,
+                                )
+                                .await
+                                {
+                                    kernel_runtime_status.mark_degraded(error.to_string());
+                                    let _ = startup_failure_tx.send(error);
+                                    return;
                                 }
+                                kernel_runtime_status.set_ready();
+                            } else if serving_ready_rx.await.is_ok() {
                                 kernel_runtime_status.set_ready();
                             }
                         });
@@ -2033,6 +2132,10 @@ wasip2::cli::command::export!({iface_name}Guest);
             },
             service_exit = supervisor.next_service_exit() => {
                 tracing::error!(error = %service_exit_error(service_exit), "runtime supervision failed");
+                1
+            },
+            Some(error) = startup_failure_rx.recv() => {
+                tracing::error!(error = %error, "kernel startup readiness failed");
                 1
             }
         };
@@ -2987,6 +3090,23 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn kernel_http_route_readiness_is_bounded() {
+        let registry = ww::dispatcher::server::new_registry();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        ready_tx.send(()).unwrap();
+        let err = wait_for_kernel_http_readiness(
+            ready_rx,
+            &registry,
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .expect_err("an empty route registry must fail within the bound");
+        let message = err.to_string();
+        assert!(message.contains("register an HTTP route"), "{message}");
+        assert!(message.contains("$WW_ROOT/bin/status.wasm"), "{message}");
+    }
+
+    #[tokio::test]
     async fn wait_for_kubo_ready_times_out_against_unreachable_node() {
         // Point at a closed port; a finite deadline must surface an error
         // (dev fail-fast) rather than hanging, and the message must name the
@@ -3100,6 +3220,7 @@ mod tests {
             mounts: vec![".".to_string(), "~/.ww/identity:/etc/identity".to_string()],
             listen: Vec::new(),
             wasm_debug: false,
+            kernel: None,
             identity: None,
             insecure_ephemeral: false,
             stem: None,
@@ -3153,6 +3274,30 @@ mod tests {
         for value in ["off", "OFF", " Off "] {
             let configured = parse_run_admin_addr(&["ww", "run", "--with-http-admin", value]);
             assert_eq!(admin_listen_addr(configured), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn run_cli_accepts_explicit_kernel_source() {
+        let command = Cli::try_parse_from([
+            "ww",
+            "run",
+            "std/status",
+            "--kernel",
+            "cid:bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a",
+        ])
+        .expect("parse --kernel")
+        .command;
+
+        match command {
+            Commands::Run { mounts, kernel, .. } => {
+                assert_eq!(mounts, vec!["std/status"]);
+                assert_eq!(
+                    kernel.as_deref(),
+                    Some("cid:bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a")
+                );
+            }
+            _ => panic!("expected run command"),
         }
     }
 

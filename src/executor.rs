@@ -9,6 +9,7 @@ use libp2p::StreamProtocol;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{stderr, stdout, AsyncWriteExt};
@@ -79,6 +80,7 @@ pub struct CellBuilder {
     cid_tree: Option<Arc<cell::vfs::CidTree>>,
     initial_epoch: Option<Epoch>,
     epoch_rx: Option<watch::Receiver<Epoch>>,
+    activated_seq: Option<Arc<AtomicU64>>,
     signing_key: Option<Arc<SigningKey>>,
     route_registry: Option<crate::dispatcher::server::RouteRegistry>,
     cache_policy: rpc::CachePolicy,
@@ -90,6 +92,7 @@ pub struct CellBuilder {
     suppress_stdin: bool,
     ipfs_client: Option<crate::ipfs::HttpClient>,
     http_dial: Vec<String>,
+    resolved_kernel: Option<crate::kernel::ResolvedKernel>,
 }
 
 impl CellBuilder {
@@ -110,6 +113,7 @@ impl CellBuilder {
             cid_tree: None,
             initial_epoch: None,
             epoch_rx: None,
+            activated_seq: None,
             signing_key: None,
             route_registry: None,
             cache_policy: rpc::CachePolicy::default(),
@@ -118,6 +122,7 @@ impl CellBuilder {
             suppress_stdin: false,
             ipfs_client: None,
             http_dial: Vec::new(),
+            resolved_kernel: None,
         }
     }
 
@@ -139,6 +144,15 @@ impl CellBuilder {
     /// Set the loader used to resolve `<image>/bin/main.wasm` to bytes.
     pub fn with_loader(mut self, loader: Box<dyn Loader>) -> Self {
         self.loader = Some(loader);
+        self
+    }
+
+    /// Supply exact, already-resolved pid0 bytes and identity.
+    ///
+    /// This is deliberately separate from the image loader: `--kernel`
+    /// replaces pid0, not the mounted image used by its boot policy.
+    pub fn with_resolved_kernel(mut self, kernel: crate::kernel::ResolvedKernel) -> Self {
+        self.resolved_kernel = Some(kernel);
         self
     }
 
@@ -207,6 +221,12 @@ impl CellBuilder {
     /// and is responsible for advancing epochs (e.g. via the epoch pipeline).
     pub fn with_epoch_rx(mut self, rx: watch::Receiver<Epoch>) -> Self {
         self.epoch_rx = Some(rx);
+        self
+    }
+
+    /// Share the pid0 generation activation marker with admin readiness.
+    pub fn with_activated_seq(mut self, activated_seq: Arc<AtomicU64>) -> Self {
+        self.activated_seq = Some(activated_seq);
         self
     }
 
@@ -286,6 +306,7 @@ impl CellBuilder {
             cid_tree: self.cid_tree,
             initial_epoch: self.initial_epoch,
             epoch_rx: self.epoch_rx,
+            activated_seq: self.activated_seq,
             signing_key: self.signing_key,
             route_registry: self.route_registry,
             cache_policy: self.cache_policy,
@@ -296,6 +317,7 @@ impl CellBuilder {
                 .ipfs_client
                 .unwrap_or_else(|| crate::ipfs::HttpClient::new("http://localhost:5001".into())),
             http_dial: self.http_dial,
+            resolved_kernel: self.resolved_kernel,
         }
     }
 }
@@ -320,6 +342,8 @@ pub struct Cell {
     pub cid_tree: Option<Arc<cell::vfs::CidTree>>,
     pub initial_epoch: Option<Epoch>,
     pub epoch_rx: Option<watch::Receiver<Epoch>>,
+    /// Last pid0 generation whose initialization completed successfully.
+    pub activated_seq: Option<Arc<AtomicU64>>,
     pub signing_key: Option<Arc<SigningKey>>,
     pub route_registry: Option<crate::dispatcher::server::RouteRegistry>,
     pub cache_policy: rpc::CachePolicy,
@@ -335,6 +359,8 @@ pub struct Cell {
     pub ipfs_client: crate::ipfs::HttpClient,
     /// Allowed outbound HTTP hosts. Non-empty enables the http-client capability.
     pub http_dial: Vec<String>,
+    /// Exact pid0 bytes selected by the native bootstrap boundary.
+    pub resolved_kernel: Option<crate::kernel::ResolvedKernel>,
 }
 
 /// Result of spawning a cell with RPC: exit code, guest membrane, and optional epoch sender.
@@ -397,6 +423,7 @@ impl Cell {
             cid_tree,
             initial_epoch: _,
             epoch_rx: _,
+            activated_seq: _,
             signing_key: _,
             route_registry: _,
             cache_policy: _,
@@ -405,6 +432,7 @@ impl Cell {
             suppress_stdin,
             ipfs_client: _,
             http_dial: _,
+            resolved_kernel,
         } = self;
 
         // Defensive guard: every cell needs a CidTree. The pre-#416
@@ -425,16 +453,28 @@ impl Cell {
 
         info!(binary = %path, "Starting cell execution");
 
-        // FHS convention: <image>/bin/main.wasm
-        let wasm_path = format!("{}/bin/main.wasm", path.trim_end_matches('/'));
-        let bytecode = loader.load(&wasm_path).await.with_context(|| {
-            format!("Failed to load bin/main.wasm from image: {path} (resolved to: {wasm_path})")
-        })?;
-        let wasm_cid = {
-            let digest = blake3::hash(&bytecode);
-            let mh = cid::multihash::Multihash::<64>::wrap(0x1e, digest.as_bytes())
-                .expect("blake3 digest always fits in 64-byte multihash");
-            cid::Cid::new_v1(0x55, mh) // raw codec
+        let is_kernel = resolved_kernel.is_some();
+        let (bytecode, wasm_cid) = if let Some(kernel) = resolved_kernel {
+            tracing::info!(
+                kernel_source = %kernel.source.log_value(),
+                kernel_cid = %kernel.cid,
+                source_cid = ?kernel.metadata.source_cid,
+                bytes = kernel.metadata.size,
+                load_ms = kernel.metadata.load_duration.as_millis(),
+                embedded = matches!(kernel.source, crate::kernel::KernelSourceRecord::Embedded { .. }),
+                "Loaded selected pid0 kernel"
+            );
+            (kernel.bytes, kernel.cid)
+        } else {
+            // FHS convention for ordinary cells: <image>/bin/main.wasm
+            let wasm_path = format!("{}/bin/main.wasm", path.trim_end_matches('/'));
+            let bytecode = loader.load(&wasm_path).await.with_context(|| {
+                format!(
+                    "Failed to load bin/main.wasm from image: {path} (resolved to: {wasm_path})"
+                )
+            })?;
+            let wasm_cid = crate::kernel::runtime_cid(&bytecode);
+            (bytecode, wasm_cid)
         };
         tracing::info!(cid = %wasm_cid, bytes = bytecode.len(), "Loaded guest bytecode");
 
@@ -496,20 +536,7 @@ impl Cell {
             ProcBuilder::new()
         };
 
-        // Inject host-side environment signals for the guest.
-        let mut guest_env = env.unwrap_or_default();
-        if interactive {
-            guest_env.push("WW_TTY=1".to_string());
-        }
-        if !guest_env.iter().any(|v| v.starts_with("PATH=")) {
-            guest_env.push("PATH=/bin".to_string());
-        }
-        if !guest_env.iter().any(|v| v.starts_with("WW_ROOT=")) {
-            guest_env.push(format!("WW_ROOT={}", path));
-        }
-        if !guest_env.iter().any(|v| v.starts_with("WW_CELL_CID=")) {
-            guest_env.push(format!("WW_CELL_CID={}", wasm_cid));
-        }
+        let guest_env = prepare_guest_env(env, interactive, &path, &wasm_cid, is_kernel);
 
         let mut builder = builder
             .with_wasm_debug(wasm_debug)
@@ -549,6 +576,7 @@ impl Cell {
         // Terminal-gated network accept loop.
         let terminal_signing_key = signing_key.clone();
         let pre_epoch_rx = self.epoch_rx.take();
+        let configured_activated_seq = self.activated_seq.take();
         let route_registry = self.route_registry.take();
         let cache_policy = self.cache_policy;
         let compile_tx = self.compile_tx.clone();
@@ -575,6 +603,10 @@ impl Cell {
             let (tx, rx) = watch::channel(initial_epoch);
             (Some(tx), rx)
         };
+        let activated_seq = configured_activated_seq.unwrap_or_else(|| {
+            let current = epoch_rx.borrow();
+            Arc::new(AtomicU64::new(current.seq))
+        });
 
         // Clone the stream control for the membrane RPC layer (Server capability).
         // If no stream_control is provided (non-serving mode), create a dummy one.
@@ -607,6 +639,7 @@ impl Cell {
             swarm_cmd_tx,
             wasm_debug,
             epoch_rx,
+            activated_seq,
             signing_key,
             membrane_stream_control,
             route_registry,
@@ -677,6 +710,47 @@ impl Cell {
             epoch_tx,
         })
     }
+}
+
+fn prepare_guest_env(
+    env: Option<Vec<String>>,
+    interactive: bool,
+    path: &str,
+    wasm_cid: &cid::Cid,
+    is_kernel: bool,
+) -> Vec<String> {
+    let mut guest_env = env.unwrap_or_default();
+    if interactive {
+        guest_env.push("WW_TTY=1".to_string());
+    }
+    if !guest_env.iter().any(|value| value.starts_with("PATH=")) {
+        guest_env.push("PATH=/bin".to_string());
+    }
+    if !guest_env.iter().any(|value| value.starts_with("WW_ROOT=")) {
+        guest_env.push(format!("WW_ROOT={path}"));
+    }
+    if !guest_env
+        .iter()
+        .any(|value| value.starts_with("WW_CELL_CID="))
+    {
+        guest_env.push(format!("WW_CELL_CID={wasm_cid}"));
+    }
+    if is_kernel {
+        // The host owns this contract. Caller-provided values must not spoof
+        // the build-locked compatibility boundary seen by pid0.
+        guest_env.retain(|value| {
+            !value.starts_with("WW_KERNEL_ABI=") && !value.starts_with("WW_KERNEL_ABI_FPR=")
+        });
+        guest_env.push(format!(
+            "WW_KERNEL_ABI={}",
+            crate::kernel::KERNEL_ABI_VERSION
+        ));
+        guest_env.push(format!(
+            "WW_KERNEL_ABI_FPR={}",
+            crate::kernel::KERNEL_ABI_FINGERPRINT
+        ));
+    }
+    guest_env
 }
 
 async fn wait_for_export_policy_ready(
@@ -905,6 +979,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_abi_environment_is_host_owned_and_injected() {
+        let cid = crate::kernel::runtime_cid(b"pid0");
+        let env = prepare_guest_env(
+            Some(vec![
+                "WW_KERNEL_ABI=spoofed".to_string(),
+                "WW_KERNEL_ABI_FPR=spoofed".to_string(),
+            ]),
+            false,
+            "/image",
+            &cid,
+            true,
+        );
+        assert!(env.contains(&format!(
+            "WW_KERNEL_ABI={}",
+            crate::kernel::KERNEL_ABI_VERSION
+        )));
+        assert!(env.contains(&format!(
+            "WW_KERNEL_ABI_FPR={}",
+            crate::kernel::KERNEL_ABI_FINGERPRINT
+        )));
+        assert!(!env.iter().any(|value| value.ends_with("=spoofed")));
+    }
+
+    #[test]
+    fn ordinary_cells_do_not_receive_kernel_abi_environment() {
+        let cid = crate::kernel::runtime_cid(b"cell");
+        let env = prepare_guest_env(None, false, "/image", &cid, false);
+        assert!(!env.iter().any(|value| value.starts_with("WW_KERNEL_ABI=")));
+        assert!(!env
+            .iter()
+            .any(|value| value.starts_with("WW_KERNEL_ABI_FPR=")));
+    }
 
     #[tokio::test]
     async fn terminal_login_supervision_is_deterministic() {

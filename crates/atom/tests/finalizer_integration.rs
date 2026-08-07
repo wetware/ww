@@ -4,7 +4,8 @@ mod common;
 
 use atom::{AtomIndexer, FinalizerBuilder, IndexerConfig};
 use common::{
-    atom_head_http, deploy_atom, eth_block_number, evm_mine, set_head_bytes, spawn_anvil,
+    atom_head_http, deploy_atom, eth_block_number, evm_mine, evm_set_automine, set_head_bytes,
+    spawn_anvil_with_block_time,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -45,7 +46,9 @@ async fn test_finalizer_confirmation_depth_gates_and_adopts() {
         .ancestors()
         .nth(2)
         .unwrap();
-    let (anvil_process, rpc_url) = spawn_anvil().await.expect("spawn anvil");
+    // Interval mining makes transaction acceptance observably distinct from a mined receipt.
+    // The setHead helper must not return during that pending interval.
+    let (anvil_process, rpc_url) = spawn_anvil_with_block_time(1).await.expect("spawn anvil");
     let contract_addr = deploy_atom(repo_root, &rpc_url).expect("deploy Atom");
     let addr_bytes =
         hex::decode(contract_addr.strip_prefix("0x").unwrap_or(&contract_addr)).expect("hex");
@@ -109,6 +112,9 @@ async fn test_finalizer_confirmation_depth_gates_and_adopts() {
         "contract head().cid after setHead (got {:?})",
         head_after_set.cid
     );
+    evm_set_automine(&rpc_url, true)
+        .await
+        .expect("restore automining after receipt check");
 
     // Wait until an observed event matches (seq, cid); ignore unrelated/replayed events.
     let ev = match timeout(Duration::from_secs(15), async {
@@ -169,5 +175,30 @@ async fn test_finalizer_confirmation_depth_gates_and_adopts() {
         finalized[0].cid.as_slice(),
         CID_1_BYTES,
         "finalized event cid must match"
+    );
+
+    // A mined revert is not successful merely because the node accepted the transaction.
+    let err = set_head_bytes(
+        repo_root,
+        &rpc_url,
+        &contract_addr,
+        "setHead(bytes)",
+        CID_1_BYTES,
+        None,
+    )
+    .await
+    .expect_err("unchanged head must return a failed receipt");
+    assert!(
+        err.to_string().contains("status 0"),
+        "failed receipt must report its status: {err:#}"
+    );
+    let head_after_revert = atom_head_http(&rpc_url, &contract_address)
+        .await
+        .expect("head after reverted setHead");
+    assert_eq!(head_after_revert.seq, 1, "reverted setHead changed seq");
+    assert_eq!(
+        head_after_revert.cid.as_slice(),
+        CID_1_BYTES,
+        "reverted setHead changed cid"
     );
 }

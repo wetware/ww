@@ -9,9 +9,10 @@
 //! This module provides the `GraftBuilder` impl that injects wetware-specific
 //! capabilities into the graft response, plus the epoch-guarded identity wrapper.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use authority::{auth_capnp, membrane_capnp, Epoch, EpochGuard, GraftBuilder, MembraneServer};
+use authority::{auth_capnp, membrane_capnp, stale_epoch_error, Epoch, EpochGuard, GraftBuilder};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -306,12 +307,11 @@ impl HostGraftBuilder {
     }
 }
 
-impl GraftBuilder for HostGraftBuilder {
-    fn build(
+impl HostGraftBuilder {
+    fn build_named_capabilities(
         &self,
         guard: &EpochGuard,
-        mut builder: membrane_capnp::membrane::graft_results::Builder<'_>,
-    ) -> Result<(), capnp::Error> {
+    ) -> Result<NamedCapabilities, capnp::Error> {
         // Build the core capabilities.
         let mut host_impl = super::HostImpl::new(
             self.network_state.clone(),
@@ -375,21 +375,62 @@ impl GraftBuilder for HostGraftBuilder {
         // Keep ambient graft entries and parent extras as independently
         // validated sets. Collision policy between those sets remains a graft
         // concern until the T3 bootstrap cutover.
-        let ambient = NamedCapabilities::try_from_iter(entries)?;
-        let count = ambient
-            .len()
-            .checked_add(self.extras.len())
-            .and_then(|len| len.try_into().ok())
-            .ok_or_else(|| {
-                capnp::Error::failed("too many capability exports for Cap'n Proto".into())
-            })?;
-        let mut caps_builder = builder.reborrow().init_caps(count);
-        for (index, capability) in ambient.iter().chain(self.extras.iter()).enumerate() {
-            crate::named_capability::encode_export(
-                capability,
-                caps_builder.reborrow().get(index as u32),
-            );
-        }
+        NamedCapabilities::try_from_iter(entries)
+    }
+}
+
+fn export_count(
+    ambient: &NamedCapabilities,
+    extras: &NamedCapabilities,
+) -> Result<u32, capnp::Error> {
+    ambient
+        .len()
+        .checked_add(extras.len())
+        .ok_or_else(|| capnp::Error::failed("too many capability exports for Cap'n Proto".into()))?
+        .try_into()
+        .map_err(|_| capnp::Error::failed("too many capability exports for Cap'n Proto".into()))
+}
+
+fn encode_graft_capabilities(
+    ambient: &NamedCapabilities,
+    extras: &NamedCapabilities,
+    mut builder: capnp::struct_list::Builder<'_, membrane_capnp::export::Owned>,
+) {
+    for (index, capability) in ambient.iter().chain(extras.iter()).enumerate() {
+        crate::named_capability::encode_export(capability, builder.reborrow().get(index as u32));
+    }
+}
+
+impl GraftBuilder for HostGraftBuilder {
+    fn build(
+        &self,
+        guard: &EpochGuard,
+        mut builder: membrane_capnp::membrane::graft_results::Builder<'_>,
+    ) -> Result<(), capnp::Error> {
+        let ambient = self.build_named_capabilities(guard)?;
+        let count = export_count(&ambient, &self.extras)?;
+        encode_graft_capabilities(&ambient, &self.extras, builder.reborrow().init_caps(count));
+        Ok(())
+    }
+}
+
+trait Pid0GraftBuilder: GraftBuilder {
+    fn build_pid0(
+        &self,
+        guard: &EpochGuard,
+        builder: membrane_capnp::membrane::graft_pid0_results::Builder<'_>,
+    ) -> Result<(), capnp::Error>;
+}
+
+impl Pid0GraftBuilder for HostGraftBuilder {
+    fn build_pid0(
+        &self,
+        guard: &EpochGuard,
+        mut builder: membrane_capnp::membrane::graft_pid0_results::Builder<'_>,
+    ) -> Result<(), capnp::Error> {
+        let ambient = self.build_named_capabilities(guard)?;
+        let count = export_count(&ambient, &self.extras)?;
+        encode_graft_capabilities(&ambient, &self.extras, builder.reborrow().init_caps(count));
         Ok(())
     }
 }
@@ -494,6 +535,116 @@ impl Pid0RegistrationScope {
     }
 }
 
+/// One immutable readiness-commit capability for one pid0 graft generation.
+struct GenerationActivatorServer {
+    seq: u64,
+    activated_seq: Arc<AtomicU64>,
+    epoch_rx: watch::Receiver<Epoch>,
+}
+
+#[allow(refining_impl_trait)]
+impl membrane_capnp::generation_activator::Server for GenerationActivatorServer {
+    fn activate(
+        self: capnp::capability::Rc<Self>,
+        _params: membrane_capnp::generation_activator::ActivateParams,
+        _results: membrane_capnp::generation_activator::ActivateResults,
+    ) -> Promise<(), capnp::Error> {
+        let current = self.epoch_rx.borrow();
+        if self.seq != current.seq {
+            return Promise::err(stale_epoch_error(
+                "pid0 generation activator no longer matches the current epoch",
+            ));
+        }
+        self.activated_seq.store(self.seq, Ordering::Release);
+        drop(current);
+        Promise::ok(())
+    }
+}
+
+/// The only membrane server allowed to mint pid0 generation activators.
+///
+/// Ordinary `graft()` remains stateless. Each `graftPid0()` response receives
+/// a fresh activator that captures the same authoritative epoch borrow used to
+/// guard every capability in that response.
+struct Pid0MembraneServer<F: Pid0GraftBuilder> {
+    epoch_rx: watch::Receiver<Epoch>,
+    graft_builder: F,
+    activated_seq: Arc<AtomicU64>,
+}
+
+impl<F: Pid0GraftBuilder> Pid0MembraneServer<F> {
+    fn new(
+        epoch_rx: watch::Receiver<Epoch>,
+        graft_builder: F,
+        activated_seq: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            epoch_rx,
+            graft_builder,
+            activated_seq,
+        }
+    }
+
+    fn build_graft(
+        &self,
+        results: &mut membrane_capnp::membrane::GraftResults,
+    ) -> Result<(), capnp::Error> {
+        let current = self.epoch_rx.borrow();
+        let guard = EpochGuard {
+            issued_seq: current.seq,
+            receiver: self.epoch_rx.clone(),
+        };
+        self.graft_builder.build(&guard, results.get())
+    }
+
+    fn build_pid0_graft(
+        &self,
+        results: &mut membrane_capnp::membrane::GraftPid0Results,
+    ) -> Result<(), capnp::Error> {
+        let current = self.epoch_rx.borrow();
+        let guard = EpochGuard {
+            issued_seq: current.seq,
+            receiver: self.epoch_rx.clone(),
+        };
+        let mut builder = results.get();
+        self.graft_builder.build_pid0(&guard, builder.reborrow())?;
+        let activator: membrane_capnp::generation_activator::Client =
+            capnp_rpc::new_client(GenerationActivatorServer {
+                seq: current.seq,
+                activated_seq: self.activated_seq.clone(),
+                epoch_rx: self.epoch_rx.clone(),
+            });
+        builder.set_activator(activator);
+        drop(current);
+        Ok(())
+    }
+}
+
+#[allow(refining_impl_trait)]
+impl<F: Pid0GraftBuilder> membrane_capnp::membrane::Server for Pid0MembraneServer<F> {
+    fn graft(
+        self: capnp::capability::Rc<Self>,
+        _params: membrane_capnp::membrane::GraftParams,
+        mut results: membrane_capnp::membrane::GraftResults,
+    ) -> Promise<(), capnp::Error> {
+        match self.build_graft(&mut results) {
+            Ok(()) => Promise::ok(()),
+            Err(error) => Promise::err(error),
+        }
+    }
+
+    fn graft_pid0(
+        self: capnp::capability::Rc<Self>,
+        _params: membrane_capnp::membrane::GraftPid0Params,
+        mut results: membrane_capnp::membrane::GraftPid0Results,
+    ) -> Promise<(), capnp::Error> {
+        match self.build_pid0_graft(&mut results) {
+            Ok(()) => Promise::ok(()),
+            Err(error) => Promise::err(error),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_pid0_membrane_rpc<R, W>(
     reader: R,
@@ -502,6 +653,7 @@ pub fn build_pid0_membrane_rpc<R, W>(
     swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
     wasm_debug: bool,
     epoch_rx: watch::Receiver<Epoch>,
+    activated_seq: Arc<AtomicU64>,
     signing_key: Option<Arc<SigningKey>>,
     stream_control: libp2p_stream::Control,
     route_registry: Option<crate::dispatch::RouteRegistry>,
@@ -534,7 +686,7 @@ where
     }
     // The local kernel is a trusted process — no challenge-response auth needed.
     // Auth applies to external peers connecting via libp2p to the guest's exported membrane.
-    let membrane_server = MembraneServer::new(epoch_rx, sess_builder);
+    let membrane_server = Pid0MembraneServer::new(epoch_rx, sess_builder, activated_seq);
     let membrane: GuestMembrane = capnp_rpc::new_client(membrane_server);
 
     let rpc_network = VatNetwork::new(
@@ -553,16 +705,84 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use authority::{Epoch, Provenance};
+    use authority::{CallFailureCode, Epoch, Provenance};
     use capnp::traits::{Imbue, ImbueMut};
     use ed25519_dalek::Signer;
     use futures::FutureExt;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     struct RuntimeStub;
     impl system_capnp::runtime::Server for RuntimeStub {}
 
+    struct EmptyPid0GraftBuilder {
+        ordinary_grafts: Rc<Cell<u32>>,
+        pid0_grafts: Rc<Cell<u32>>,
+    }
+
+    impl GraftBuilder for EmptyPid0GraftBuilder {
+        fn build(
+            &self,
+            _guard: &EpochGuard,
+            mut builder: membrane_capnp::membrane::graft_results::Builder<'_>,
+        ) -> Result<(), capnp::Error> {
+            self.ordinary_grafts.set(self.ordinary_grafts.get() + 1);
+            builder.reborrow().init_caps(0);
+            Ok(())
+        }
+    }
+
+    impl Pid0GraftBuilder for EmptyPid0GraftBuilder {
+        fn build_pid0(
+            &self,
+            _guard: &EpochGuard,
+            mut builder: membrane_capnp::membrane::graft_pid0_results::Builder<'_>,
+        ) -> Result<(), capnp::Error> {
+            self.pid0_grafts.set(self.pid0_grafts.get() + 1);
+            builder.reborrow().init_caps(0);
+            Ok(())
+        }
+    }
+
+    fn test_epoch(seq: u64) -> Epoch {
+        Epoch {
+            seq,
+            head: seq.to_be_bytes().to_vec(),
+            provenance: Provenance::Block(seq),
+        }
+    }
+
+    fn empty_pid0_membrane(
+        epoch_rx: watch::Receiver<Epoch>,
+        activated_seq: Arc<AtomicU64>,
+    ) -> (GuestMembrane, Rc<Cell<u32>>, Rc<Cell<u32>>) {
+        let ordinary_grafts = Rc::new(Cell::new(0));
+        let pid0_grafts = Rc::new(Cell::new(0));
+        let membrane = capnp_rpc::new_client(Pid0MembraneServer::new(
+            epoch_rx,
+            EmptyPid0GraftBuilder {
+                ordinary_grafts: ordinary_grafts.clone(),
+                pid0_grafts: pid0_grafts.clone(),
+            },
+            activated_seq,
+        ));
+        (membrane, ordinary_grafts, pid0_grafts)
+    }
+
     struct ExecutorStub;
-    impl system_capnp::executor::Server for ExecutorStub {}
+    #[allow(refining_impl_trait)]
+    impl system_capnp::executor::Server for ExecutorStub {
+        fn cid(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::executor::CidParams,
+            mut results: system_capnp::executor::CidResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            results
+                .get()
+                .set_cid("bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a");
+            capnp::capability::Promise::ok(())
+        }
+    }
 
     /// Generate a random Ed25519 signing key (compatible with the rand version
     /// used by the root crate, which may differ from ed25519_dalek's rand_core).
@@ -663,6 +883,174 @@ mod tests {
         }
     }
 
+    #[test]
+    fn external_graft_names_remain_exactly_unchanged() {
+        let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(test_epoch(1));
+        let guard = EpochGuard {
+            issued_seq: 1,
+            receiver: epoch_rx,
+        };
+        let (swarm_tx, _swarm_rx) = mpsc::channel(1);
+        let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
+        let builder = HostGraftBuilder::new(
+            NetworkState::from_peer_id(vec![1, 2, 3]),
+            swarm_tx,
+            false,
+            Some(Arc::new(gen_signing_key())),
+            libp2p_stream::Behaviour::new().new_control(),
+            Vec::new(),
+            runtime,
+            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+        );
+        let mut message = capnp::message::Builder::new_default();
+        let mut cap_table = Vec::new();
+        {
+            let mut results =
+                message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+            results.imbue_mut(&mut cap_table);
+            builder
+                .build(&guard, results)
+                .expect("build external graft");
+        }
+        let mut results = message
+            .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
+            .expect("read external graft");
+        results.imbue(&cap_table);
+        let names: Vec<_> = results
+            .get_caps()
+            .expect("external caps")
+            .iter()
+            .map(|entry| {
+                entry
+                    .get_name()
+                    .expect("cap name")
+                    .to_str()
+                    .expect("UTF-8 cap name")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "identity",
+                "host",
+                "runtime",
+                "routing",
+                "authority",
+                "ipfs"
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_graft_cannot_retarget_generation_activator() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
+                let activated_seq = Arc::new(AtomicU64::new(0));
+                let (membrane, ordinary_grafts, pid0_grafts) =
+                    empty_pid0_membrane(epoch_rx, activated_seq.clone());
+
+                let generation = membrane
+                    .graft_pid0_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("mint E1 activator");
+                let e1_activator = generation
+                    .get()
+                    .expect("E1 graft results")
+                    .get_activator()
+                    .expect("E1 activator");
+                epoch_tx.send_replace(test_epoch(2));
+                membrane
+                    .graft_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("foreign ordinary E2 graft");
+
+                let error = match e1_activator.activate_request().send().promise.await {
+                    Ok(_) => panic!("E1 activator must remain stale after foreign E2 graft"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    authority::call_failure_code(&error),
+                    Some(CallFailureCode::StaleEpoch)
+                );
+                assert_eq!(activated_seq.load(Ordering::Acquire), 0);
+                assert_eq!(ordinary_grafts.get(), 1);
+                assert_eq!(pid0_grafts.get(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pid0_grafts_mint_independently_bound_idempotent_activators() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
+                let activated_seq = Arc::new(AtomicU64::new(0));
+                let (membrane, ordinary_grafts, pid0_grafts) =
+                    empty_pid0_membrane(epoch_rx, activated_seq.clone());
+
+                let e1 = membrane
+                    .graft_pid0_request()
+                    .send()
+                    .promise
+                    .await
+                    .unwrap()
+                    .get()
+                    .unwrap()
+                    .get_activator()
+                    .unwrap();
+                epoch_tx.send_replace(test_epoch(2));
+                let e2 = membrane
+                    .graft_pid0_request()
+                    .send()
+                    .promise
+                    .await
+                    .unwrap()
+                    .get()
+                    .unwrap()
+                    .get_activator()
+                    .unwrap();
+
+                let stale = match e1.activate_request().send().promise.await {
+                    Ok(_) => panic!("E1 cannot commit E2"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    authority::call_failure_code(&stale),
+                    Some(CallFailureCode::StaleEpoch)
+                );
+                assert_eq!(activated_seq.load(Ordering::Acquire), 0);
+
+                for _ in 0..2 {
+                    e2.activate_request()
+                        .send()
+                        .promise
+                        .await
+                        .expect("duplicate current E2 activation is idempotent");
+                }
+                assert_eq!(activated_seq.load(Ordering::Acquire), 2);
+
+                epoch_tx.send_replace(test_epoch(3));
+                let stale = match e2.activate_request().send().promise.await {
+                    Ok(_) => panic!("E2 cannot commit after E3 is current"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    authority::call_failure_code(&stale),
+                    Some(CallFailureCode::StaleEpoch)
+                );
+                assert_eq!(activated_seq.load(Ordering::Acquire), 2);
+                assert_eq!(ordinary_grafts.get(), 0);
+                assert_eq!(pid0_grafts.get(), 2);
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn retained_issuing_host_cannot_keep_previous_registration_live() {
         let local = tokio::task::LocalSet::new();
@@ -745,6 +1133,13 @@ mod tests {
                     .promise
                     .await
                     .expect("register first graft route");
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while crate::dispatch::live_route_count(&registry) != Ok(1) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("route target readiness preflight");
                 assert_eq!(crate::dispatch::live_route_count(&registry), Ok(1));
 
                 // Readiness probes and external clients may perform additional
@@ -805,6 +1200,7 @@ mod tests {
                 let (host_stream, guest_stream) = io::duplex(16 * 1024);
                 let (host_reader, host_writer) = io::split(host_stream);
                 let (guest_reader, guest_writer) = io::split(guest_stream);
+                let activated_seq = Arc::new(AtomicU64::new(0));
 
                 let (host_rpc, _guest_export, _registration_scope) = build_pid0_membrane_rpc(
                     host_reader,
@@ -813,6 +1209,7 @@ mod tests {
                     swarm_tx,
                     false,
                     epoch_rx,
+                    activated_seq.clone(),
                     Some(Arc::new(gen_signing_key())),
                     libp2p_stream::Behaviour::new().new_control(),
                     None,
@@ -834,11 +1231,16 @@ mod tests {
                 tokio::task::spawn_local(guest_rpc.map(|_| ()));
 
                 let response = membrane
-                    .graft_request()
+                    .graft_pid0_request()
                     .send()
                     .promise
                     .await
-                    .expect("pid0 graft RPC");
+                    .expect("pid0-only graft RPC");
+                let activator = response
+                    .get()
+                    .expect("pid0 graft results")
+                    .get_activator()
+                    .expect("pid0 generation activator");
                 let names: std::collections::HashSet<_> = response
                     .get()
                     .expect("pid0 graft results")
@@ -868,6 +1270,14 @@ mod tests {
                         "pid0 RPC bootstrap lost {expected}: {names:?}"
                     );
                 }
+                assert_eq!(names.len(), 7, "activator must not be a named export");
+                activator
+                    .activate_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("activate current pid0 generation");
+                assert_eq!(activated_seq.load(Ordering::Acquire), 1);
             })
             .await;
     }
@@ -928,6 +1338,18 @@ mod tests {
                         .to_ascii_lowercase()
                         .contains("unimplemented"),
                     "unexpected graft rejection: {error}"
+                );
+
+                let pid0_error = match membrane.graft_pid0_request().send().promise.await {
+                    Ok(_) => panic!("ordinary child bootstrap must reject Membrane.graftPid0"),
+                    Err(error) => error,
+                };
+                assert!(
+                    pid0_error
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("unimplemented"),
+                    "unexpected pid0 graft rejection: {pid0_error}"
                 );
             })
             .await;

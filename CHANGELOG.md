@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   resolution now lives in `wetware-membrane`, and typed named-capability graft
   lookup now lives in `std/system`, ready for reuse by the replacement kernel
   without changing current kernel behavior.
+- **HttpListener routes require target preflight before becoming live.** Newly
+  registered routes remain pending until `executor.cid()` succeeds. A failed
+  preflight removes the route instead of exposing it as live with an unknown
+  CID, and pid0 readiness now relies on this stronger live-route definition.
 - **Cell values are ordinary tagged data.** `Val::Cell` is removed; `(cell ...)`
   keeps its syntax and early grant validation but now returns an immutable
   tagged map `{:ww/type :cell, :wasm <bytes>, :grants {...}}`. Both host
@@ -30,6 +34,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   confinement are unchanged.
 
 ### Added
+- **Explicit pid0 kernel source resolution.** `ww run --kernel` and
+  `WW_KERNEL` select a local path, Kubo CID, or the unchanged embedded default
+  with CLI-first precedence and no fallback after explicit failures. The host
+  resolves exact bytes once, reports their runtime CID through a late-bound
+  `/version`, injects a schema-and-capnp-rpc ABI fingerprint into pid0, and
+  fails HTTP startup within a named bound when the mounted status route is
+  missing or unusable.
 - **Current embedded pid0 lifecycle baseline.** Host integration CI now builds
   the standard WASI artifacts before launching the real `ww` binary with its
   embedded Glia kernel. The baseline pins cold-boot readiness transitions,
@@ -164,6 +175,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`wetware-membrane`: production membrane recursion (identity, flush, reentry, collapse, bench).** The membrane now preserves capability identity across round-trips and folds stacked attenuations. A data-segment sentinel `get_brand` plus a `get_ptr`-keyed registry lets it recognise its own membranes without `Any` (and without colliding with capnp-rpc connection brands, so caps can't tunnel through the filter). A call parameter that is one of our own membranes is unwrapped to the bare backing cap before reaching the backend, restoring the identity the backend exported (foreign params pass through). Results-copy failures mid-answer now surface as the call's error via an explicit flush outcome instead of a silent empty result. Attenuating an already-membraned cap collapses to a single layer when both policies are static allowlists (intersection of key sets via the new `Policy::allowlist_keys`); stateful policies stack so their per-call state survives. Adds `benches/membrane.rs`: per-call overhead is sub-microsecond and constant per hop (ping +~357 ns, cap-returning child +~437 ns), so upstream capnp cap-table work stays deferred.
 
 ### Fixed
+- **Replacement pid0 generations cannot become ready before successful
+  initialization.** Readiness now requires both a live HTTP route and explicit
+  activation by the current epoch-scoped pid0 membrane. Each graft carries an
+  immutable activation capability bound to the same epoch as its guarded
+  capabilities, so stale or failed generations cannot activate or reactivate
+  `/readyz`; generation 0 and static no-stem behavior are unchanged.
+- **Atom finalizer integration setup now waits for mined transactions.** The
+  shared raw-transaction helper waits for a successful receipt before tests
+  read contract state, and the finalizer integration test separates acceptance
+  from mining so slower CI scheduling cannot observe a stale head.
 - **Namespace bootstrap configuration now fails closed.** Namespace bootstrap
   values are validated as a single CID when written or scanned, canonicalized
   to `/ipfs/<cid>`, and reject malformed CIDs and accidental subpaths before

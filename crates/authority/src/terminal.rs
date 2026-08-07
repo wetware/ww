@@ -727,6 +727,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_facing_membrane_cannot_mint_pid0_generation_activator() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let key = SigningKey::generate(&mut rand::rngs::OsRng);
+                let (terminal, _tx) = terminal_with_epoch(key.verifying_key(), test_epoch(1));
+                let signer: auth_capnp::signer::Client =
+                    capnp_rpc::new_client(TestSigner::from_ed25519(&key));
+                let mut request = terminal.login_request();
+                request.get().set_signer(signer);
+                let response = request.send().promise.await.expect("terminal login");
+                let results = response.get().expect("terminal login results");
+                let membrane = results.get_session().expect("granted membrane");
+
+                let error = match membrane.graft_pid0_request().send().promise.await {
+                    Ok(_) => panic!("Terminal-facing membrane must not mint pid0 activators"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("unimplemented"),
+                    "unexpected Terminal pid0 graft rejection: {error}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn signer_round_trip_timeout_is_typed_and_sessionless() {
         let local = tokio::task::LocalSet::new();
         local
