@@ -79,4 +79,19 @@ mod tests {
             private_pid0_abi_material("2", documented, "cap-name").unwrap()
         );
     }
+
+    #[test]
+    fn private_wit_rejects_invalid_utf8() {
+        let error = private_pid0_abi_material("2", &[0xff], "cap-name").unwrap_err();
+        assert!(error.contains("not UTF-8"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn private_wit_rejects_malformed_source() {
+        let error = private_pid0_abi_material("2", b"world {", "cap-name").unwrap_err();
+        assert!(
+            error.contains("parse private kernel runtime WIT"),
+            "unexpected error: {error}"
+        );
+    }
 }
