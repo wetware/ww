@@ -6,7 +6,6 @@ use authority::{Epoch, Provenance};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::VerifyingKey;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 
 use libp2p::Multiaddr;
@@ -595,14 +594,6 @@ const KUBO_BOOT_OPERATION_TIMEOUT_SECS_ENV: &str = "WW_KUBO_BOOT_OPERATION_TIMEO
 /// liveness-green, readiness-closed process.
 const KUBO_BOOT_OPERATION_TIMEOUT_DEFAULT_SECS: u64 = 90;
 
-/// Environment override for the maximum time pid0 may take to complete its
-/// reverse graft and register its first live HTTP route.
-const KERNEL_ROUTE_READY_TIMEOUT_SECS_ENV: &str = "WW_KERNEL_ROUTE_READY_TIMEOUT_SECS";
-
-/// Production-safe bound for a missing, corrupt, or non-registering
-/// `$WW_ROOT/bin/status.wasm` boot artifact.
-const KERNEL_ROUTE_READY_TIMEOUT_DEFAULT_SECS: u64 = 120;
-
 fn kubo_env_u64(name: &str, default: u64) -> Result<u64> {
     match std::env::var(name) {
         Ok(value) => value
@@ -635,47 +626,6 @@ fn kubo_boot_operation_timeout_secs() -> Result<u64> {
         );
     }
     Ok(secs)
-}
-
-fn kernel_route_ready_timeout_secs() -> Result<u64> {
-    let secs = kubo_env_u64(
-        KERNEL_ROUTE_READY_TIMEOUT_SECS_ENV,
-        KERNEL_ROUTE_READY_TIMEOUT_DEFAULT_SECS,
-    )?;
-    if secs == 0 {
-        bail!(
-            "{KERNEL_ROUTE_READY_TIMEOUT_SECS_ENV}=0 would permit an unbounded kernel route-readiness wait; use a positive number"
-        );
-    }
-    Ok(secs)
-}
-
-async fn wait_for_kernel_http_readiness(
-    serving_ready_rx: tokio::sync::oneshot::Receiver<()>,
-    registry: &ww::dispatcher::server::RouteRegistry,
-    timeout: std::time::Duration,
-) -> Result<()> {
-    let readiness = async {
-        serving_ready_rx
-            .await
-            .context("kernel reverse graft readiness signal was dropped")?;
-        loop {
-            match ww::rpc::dispatch::live_route_count(registry) {
-                Ok(count) if count > 0 => return Ok(()),
-                Ok(_) => {}
-                Err(error) => bail!("kernel HTTP route registry unavailable: {error}"),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    };
-
-    match tokio::time::timeout(timeout, readiness).await {
-        Ok(result) => result,
-        Err(_) => bail!(
-            "kernel did not complete reverse graft and register an HTTP route within {}s; the mounted image must provide a valid $WW_ROOT/bin/status.wasm",
-            timeout.as_secs()
-        ),
-    }
 }
 
 /// Core of [`wait_for_kubo_ready`] with an explicit deadline (`max_secs`; `0` =
@@ -1619,9 +1569,10 @@ wasip2::cli::command::export!({iface_name}Guest);
             head: Vec::new(),
             provenance: Provenance::Block(0),
         });
-        let activated_seq = std::sync::Arc::new(AtomicU64::new(0));
-        // Allocate the WAGI route map before the admin plane so `/readyz`
-        // observes the exact same registration lifecycle as HTTP dispatch.
+        let kernel_ready_gate =
+            std::sync::Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
+        // Allocate the WAGI route map before the admin plane so registrations
+        // and HTTP dispatch share one map.
         let route_registry = http_listen
             .as_ref()
             .map(|_| ww::dispatcher::server::new_registry());
@@ -1664,9 +1615,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                     network_state: network_state.clone(),
                     version_info,
                     runtime_status: runtime_status.clone(),
-                    route_registry: route_registry.clone(),
-                    epoch_rx: epoch_rx.clone(),
-                    activated_seq: activated_seq.clone(),
+                    kernel_ready_gate: kernel_ready_gate.clone(),
                     fuel_registry: fuel_registry.clone(),
                     rpc_metrics: rpc_metrics.clone(),
                     cache_metrics: cache_metrics.clone(),
@@ -1768,10 +1717,6 @@ wasip2::cli::command::export!({iface_name}Guest);
                 provenance: Provenance::Block(0),
             };
 
-            // Gen-0 readiness remains compatible with the pre-replacement
-            // lifecycle. Replacement epochs must be committed by their
-            // PID0-only kernel_ready host call before readiness can reopen.
-            activated_seq.store(initial_epoch.seq, Ordering::Release);
             epoch_tx.send_replace(initial_epoch);
 
             Some(atom::IndexerConfig {
@@ -2055,53 +2000,20 @@ wasip2::cli::command::export!({iface_name}Guest);
 
         builder = builder
             .with_epoch_rx(epoch_rx)
-            .with_activated_seq(activated_seq);
+            .with_kernel_ready_gate(kernel_ready_gate);
 
         let cell = builder.build();
 
         // Spawn the kernel cell into the executor pool. The kernel's exit
         // code flows back through the oneshot channel.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let (startup_failure_tx, mut startup_failure_rx) =
-            tokio::sync::mpsc::unbounded_channel::<anyhow::Error>();
-        // Keep the receiver pending after successful readiness; the worker
-        // clone sends only named startup failures.
-        let _startup_failure_guard = startup_failure_tx.clone();
-        let route_ready_timeout =
-            std::time::Duration::from_secs(kernel_route_ready_timeout_secs()?);
         runtime_status.set_phase("starting-kernel");
-        let kernel_runtime_status = runtime_status.clone();
-        let readiness_route_registry = route_registry.clone();
         executor_pool
             .spawn(ww::services::SpawnRequest {
                 name: "kernel".into(),
                 factory: Box::new(move |_shutdown| {
                     Box::pin(async move {
-                        let (serving_ready_tx, serving_ready_rx) = tokio::sync::oneshot::channel();
-                        let startup_failure_tx = startup_failure_tx.clone();
-                        tokio::task::spawn_local(async move {
-                            if let Some(registry) = readiness_route_registry {
-                                kernel_runtime_status.set_phase("waiting-for-http-route");
-                                if let Err(error) = wait_for_kernel_http_readiness(
-                                    serving_ready_rx,
-                                    &registry,
-                                    route_ready_timeout,
-                                )
-                                .await
-                                {
-                                    kernel_runtime_status.mark_degraded(error.to_string());
-                                    let _ = startup_failure_tx.send(error);
-                                    return;
-                                }
-                                kernel_runtime_status.set_ready();
-                            } else if serving_ready_rx.await.is_ok() {
-                                kernel_runtime_status.set_ready();
-                            }
-                        });
-                        match cell
-                            .spawn_serving_with_ready(stream_control, serving_ready_tx)
-                            .await
-                        {
+                        match cell.spawn_serving(stream_control).await {
                             Ok(result) => {
                                 let _ = result_tx.send(Ok(result.exit_code));
                             }
@@ -2132,10 +2044,6 @@ wasip2::cli::command::export!({iface_name}Guest);
             },
             service_exit = supervisor.next_service_exit() => {
                 tracing::error!(error = %service_exit_error(service_exit), "runtime supervision failed");
-                1
-            },
-            Some(error) = startup_failure_rx.recv() => {
-                tracing::error!(error = %error, "kernel startup readiness failed");
                 1
             }
         };
@@ -3088,23 +2996,6 @@ fn to_pascal_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn kernel_http_route_readiness_is_bounded() {
-        let registry = ww::dispatcher::server::new_registry();
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        ready_tx.send(()).unwrap();
-        let err = wait_for_kernel_http_readiness(
-            ready_rx,
-            &registry,
-            std::time::Duration::from_millis(10),
-        )
-        .await
-        .expect_err("an empty route registry must fail within the bound");
-        let message = err.to_string();
-        assert!(message.contains("register an HTTP route"), "{message}");
-        assert!(message.contains("$WW_ROOT/bin/status.wasm"), "{message}");
-    }
 
     #[tokio::test]
     async fn wait_for_kubo_ready_times_out_against_unreachable_node() {

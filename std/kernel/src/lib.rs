@@ -2128,6 +2128,7 @@ fn get_pid0_export_membrane(caps: &system::Caps<'_>) -> Result<Membrane, capnp::
 }
 
 const EPOCH_STALE_PROBE_INTERVAL_NS: u64 = 5_000_000_000;
+const INITIAL_INIT_FAILED: &str = "INITIAL_INIT_FAILED";
 const EPOCH_RESTART_INIT_FAILED: &str = "EPOCH_RESTART_INIT_FAILED";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2148,9 +2149,14 @@ fn generation_action(
     is_tty: bool,
     outcome: InitdOutcome,
 ) -> Result<GenerationAction, capnp::Error> {
-    if is_replacement && outcome.failures > 0 {
+    if outcome.failures > 0 {
+        let (failure_code, generation) = if is_replacement {
+            (EPOCH_RESTART_INIT_FAILED, "replacement")
+        } else {
+            (INITIAL_INIT_FAILED, "initial")
+        };
         return Err(capnp::Error::failed(format!(
-            "{EPOCH_RESTART_INIT_FAILED}: replacement init.d completed with {} failure(s)",
+            "{failure_code}: {generation} init.d completed with {} failure(s)",
             outcome.failures
         )));
     }
@@ -2163,8 +2169,8 @@ fn generation_action(
     Ok(GenerationAction::WatchEpoch)
 }
 
-fn kernel_completion(replacement_init_failed: bool) -> Result<(), ()> {
-    if replacement_init_failed {
+fn kernel_completion(initialization_failed: bool) -> Result<(), ()> {
+    if initialization_failed {
         Err(())
     } else {
         Ok(())
@@ -2246,16 +2252,16 @@ async fn wait_for_stale_epoch(
 fn run_impl() -> Result<(), ()> {
     init_logging();
 
-    let replacement_init_failed = Rc::new(std::cell::Cell::new(false));
+    let initialization_failed = Rc::new(std::cell::Cell::new(false));
     let exported_membrane: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(None));
     let bootstrap: membrane_capnp::membrane::Client = capnp_rpc::new_client(KernelBootstrap {
         membrane: Rc::clone(&exported_membrane),
     });
-    let callback_failure = Rc::clone(&replacement_init_failed);
+    let callback_failure = Rc::clone(&initialization_failed);
 
     system::serve(bootstrap.client, move |membrane: Membrane| {
         let exported_membrane = Rc::clone(&exported_membrane);
-        let replacement_init_failed = Rc::clone(&callback_failure);
+        let initialization_failed = Rc::clone(&callback_failure);
         async move {
             let mut generation_index = 0_u64;
             loop {
@@ -2383,12 +2389,10 @@ fn run_impl() -> Result<(), ()> {
                     glia::load_prelude(&mut env, &mut kd).await;
                 }
 
-                // The host uses a successful reverse graft only to complete its
-                // internal RPC bootstrap. It is deliberately independent from
-                // externally visible serving readiness: /readyz remains closed
-                // until the host observes a registered HTTP route. Publish before
-                // init.d so a slow (or foreground-blocking) script cannot consume
-                // the host's export-policy timeout and abort the kernel.
+                // Publish the network-safe membrane before init.d so remote RPC
+                // infrastructure does not depend on initialization duration.
+                // This handoff is not a readiness event: only kernel_ready()
+                // below commits the generation after init completes.
                 publish_bootstrap_membrane(&exported_membrane, &export_membrane);
 
                 // Run init.d scripts. If a foreground process blocked
@@ -2404,8 +2408,8 @@ fn run_impl() -> Result<(), ()> {
                     });
 
                 let is_tty = std::env::var("WW_TTY").is_ok();
-                if generation_index > 0 && init_outcome.failures > 0 {
-                    replacement_init_failed.set(true);
+                if init_outcome.failures > 0 {
+                    initialization_failed.set(true);
                 }
 
                 let (action, activation) = complete_generation_initialization(
@@ -2451,7 +2455,7 @@ fn run_impl() -> Result<(), ()> {
         }
     });
 
-    kernel_completion(replacement_init_failed.get())
+    kernel_completion(initialization_failed.get())
 }
 
 wasip2::cli::command::export!(Kernel);
@@ -3251,8 +3255,8 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_initial_init_failure_does_not_trigger_a_restart_loop() {
-        let action = generation_action(
+    fn initial_init_failure_is_surfaced_without_a_restart_loop() {
+        let error = generation_action(
             false,
             false,
             InitdOutcome {
@@ -3260,12 +3264,31 @@ mod tests {
                 failures: 1,
             },
         )
-        .expect("ordinary initial failure retains daemon lifecycle");
-        assert_eq!(
-            action,
-            GenerationAction::WatchEpoch,
-            "an init error alone must not be interpreted as an epoch transition"
+        .expect_err("initial init failure must fail instead of entering the epoch watch");
+        assert!(
+            error.to_string().contains(INITIAL_INIT_FAILED),
+            "initial failure must carry the stable failure marker: {error}"
         );
+    }
+
+    #[test]
+    fn failed_initial_generation_never_invokes_kernel_ready() {
+        let calls = std::cell::Cell::new(0);
+        let error = complete_generation_initialization(
+            false,
+            false,
+            InitdOutcome {
+                blocked: false,
+                failures: 1,
+            },
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("initial init failure must precede readiness commit");
+        assert!(error.to_string().contains(INITIAL_INIT_FAILED));
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]

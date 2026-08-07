@@ -119,15 +119,17 @@ them. pid0 re-grafts and reruns init for affected long-running services, then
 explicitly re-delegates fresh references or replaces children.
 
 Route registrations are epoch-scoped and identity-owned. A stale registration
-stops contributing to readiness immediately, and cleanup from an old
-registration cannot delete a fresh replacement. Readiness requires both a
-live current-generation HTTP route and a readiness commit from trusted PID0
-after init/init.d. PID0 commits through the argument-free private Component
-Model import `wetware:kernel-runtime/readiness@1.0.0` function `kernel-ready`;
-the host derives the generation from the process-local graft and rejects a
-stale generation. The import is installed only on PID0's linker, is not a
-Cap'n Proto capability value, and therefore cannot be delegated to children or
-transferred over the network.
+stops dispatching immediately, and cleanup from an old registration cannot
+delete a fresh replacement. Route liveness is not a kernel-readiness signal.
+
+Readiness has one commit event: after init/init.d, trusted PID0 calls the
+argument-free private Component Model import
+`wetware:kernel-runtime/readiness@1.0.0` function `kernel-ready`. The host
+derives the generation from the process-local graft, rejects a stale
+generation, and commits `KernelReadyGate`; `/readyz` reads that gate directly.
+The import is installed only on PID0's linker, is not a Cap'n Proto capability
+value, and therefore cannot be delegated to children or transferred over the
+network.
 
 ## Fixed execution substrate
 

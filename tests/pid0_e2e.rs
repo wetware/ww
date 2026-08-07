@@ -106,7 +106,6 @@ struct NodeOptions {
     kernel_cli: Option<String>,
     kernel_env: Option<String>,
     http_addr: Option<SocketAddr>,
-    route_ready_timeout_secs: u64,
     listen_addr: Option<SocketAddr>,
     identity_path: Option<PathBuf>,
     insecure_ephemeral: bool,
@@ -127,7 +126,6 @@ impl NodeOptions {
             kernel_cli: None,
             kernel_env: None,
             http_addr,
-            route_ready_timeout_secs: 30,
             listen_addr: None,
             identity_path: None,
             insecure_ephemeral: true,
@@ -194,10 +192,6 @@ impl RunningNode {
             // Captured logs are asserted as plain text; CI may force ANSI colors.
             .env("NO_COLOR", "1")
             .env("WW_KUBO_WAIT_MAX_SECS", "30")
-            .env(
-                "WW_KERNEL_ROUTE_READY_TIMEOUT_SECS",
-                options.route_ready_timeout_secs.to_string(),
-            )
             .env("WW_CWASM_DIR", home.join("cwasm"))
             .env_remove("WW_IDENTITY")
             .env_remove("WW_HTTP_ADMIN")
@@ -738,7 +732,7 @@ struct FailedReplacementObservation {
     exit: ExitStatus,
     readiness_samples: usize,
     saw_partial_route_live: bool,
-    saw_replacing_generation_with_live_route: bool,
+    saw_kernel_not_ready_with_live_route: bool,
     saw_partial_route_removed: bool,
 }
 
@@ -755,7 +749,7 @@ async fn wait_for_exit_while_unready(
     let partial_url = format!("http://{http_addr}{partial_route}");
     let mut readiness_samples = 0;
     let mut saw_partial_route_live = false;
-    let mut saw_replacing_generation_with_live_route = false;
+    let mut saw_kernel_not_ready_with_live_route = false;
     let mut saw_partial_route_removed = false;
     loop {
         if let Some(status) = node.try_wait() {
@@ -768,7 +762,7 @@ async fn wait_for_exit_while_unready(
                 exit: status,
                 readiness_samples,
                 saw_partial_route_live,
-                saw_replacing_generation_with_live_route,
+                saw_kernel_not_ready_with_live_route,
                 saw_partial_route_removed,
             };
         }
@@ -800,10 +794,10 @@ async fn wait_for_exit_while_unready(
             });
             if partial_is_live {
                 assert_eq!(
-                    readiness["phase"], "replacing-generation",
-                    "a live partial route must remain gated: {readiness}"
+                    readiness["phase"], "kernel-not-ready",
+                    "a live partial route must not override the kernel gate: {readiness}"
                 );
-                saw_replacing_generation_with_live_route = true;
+                saw_kernel_not_ready_with_live_route = true;
             }
         }
         assert_route_unavailable(client, http_addr, stale_route).await;
@@ -1072,7 +1066,7 @@ async fn incompatible_path_selected_component_fails_clearly() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_and_corrupt_status_artifacts_fail_with_bounded_route_error() {
+async fn missing_and_corrupt_status_artifacts_fail_before_readiness_commit() {
     let _guard = e2e_lock().await;
     required_artifact(KERNEL_WASM_PATH);
     let (kubo_addr, _client) = require_kubo().await;
@@ -1098,24 +1092,17 @@ async fn missing_and_corrupt_status_artifacts_fail_with_bounded_route_error() {
         let home = tempfile::tempdir().expect("create isolated HOME");
         let mut options = NodeOptions::embedded(Some(http_addr));
         options.mounts = vec![image.path().display().to_string()];
-        options.route_ready_timeout_secs = 5;
         let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
         let exit = node.wait(EXIT_TIMEOUT).await;
         let logs = node.logs();
         assert_eq!(
             exit.code(),
             Some(1),
-            "status failure must fail host\n{logs}"
+            "status init failure must fail the host\n{logs}"
         );
         assert!(
-            logs.contains(
-                "kernel did not complete reverse graft and register an HTTP route within 5s"
-            ),
-            "failure must name the bounded route gate\n{logs}"
-        );
-        assert!(
-            logs.contains("$WW_ROOT/bin/status.wasm"),
-            "failure must name the required image artifact\n{logs}"
+            logs.contains("INITIAL_INIT_FAILED"),
+            "the guest must fail initialization before committing readiness\n{logs}"
         );
     }
 }
@@ -1179,9 +1166,8 @@ async fn real_atom_epoch_transition_regrafts_current_embedded_glia_pid0() {
             wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
             let replacing = wait_for_not_ready(&client, admin_addr, &mut node).await;
             assert_eq!(replacing["ready"], false);
-            assert!(
-                replacing["phase"] == "waiting-for-http-route"
-                    || replacing["phase"] == "replacing-generation",
+            assert_eq!(
+                replacing["phase"], "kernel-not-ready",
                 "epoch advance must close readiness before replacement commit: {replacing}"
             );
             assert_route_unavailable(&client, http_addr, &epoch1.route).await;
@@ -1419,8 +1405,8 @@ async fn replacement_init_failure_exits_nonzero_without_stale_or_partial_routes(
                 "failure fixture registered but never preflighted a live partial route\n{logs}"
             );
             assert!(
-                observation.saw_replacing_generation_with_live_route,
-                "readiness never reported replacing-generation while the partial route was live\n{logs}"
+                observation.saw_kernel_not_ready_with_live_route,
+                "a live partial route overrode authoritative kernel readiness\n{logs}"
             );
             assert!(
                 observation.saw_partial_route_removed,
