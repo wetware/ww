@@ -46,6 +46,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   embedded Glia kernel. The baseline pins cold-boot readiness transitions,
   `/status`, TTY stdin EOF, and clean pid0 exit propagation, while missing or
   empty standard artifacts fail instead of silently skipping.
+- **Production-shaped pid0 epoch-transition coverage.** Host integration tests
+  now drive real Atom head updates through finalization, Kubo, epoch
+  invalidation, Glia re-graft, and init.d replacement. Coverage includes
+  successful, rapid, and failed replacements, structured stale authority,
+  route teardown, readiness remaining closed until activation, partial-route
+  cleanup, and nonzero replacement-init failure.
 - **Child-authority lifecycle and substrate scenarios.** Trusted pid0 services
   now re-graft and rerun init after structured epoch staleness; epoch-owned HTTP
   route leases clean up by identity, and readiness reflects live current-epoch
