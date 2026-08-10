@@ -167,15 +167,6 @@ struct Session {
     host: system_capnp::host::Client,
     runtime: system_capnp::runtime::Client,
     routing: routing_capnp::routing::Client,
-    /// Host-side node identity hub for this session.
-    ///
-    /// Call `identity.signer("ww-membrane-graft")` (or another known domain) to
-    /// obtain a domain-scoped [`auth_capnp::signer::Client`]. The legacy domain
-    /// is a stable wire identifier, independent of Rust crate naming. The
-    /// identity secret never crosses the host–guest boundary; only this
-    /// capability reference is passed.
-    #[allow(dead_code)]
-    identity: auth_capnp::identity::Client,
     /// Trusted constructor for attaching recipient policy before publication.
     authority: auth_capnp::authority::Client,
     /// Outbound HTTP capability for WASM guests.
@@ -232,21 +223,30 @@ fn extract_capnp_client(
     None
 }
 
+fn forwardable_cap_client(
+    name: &str,
+    value: &Val,
+) -> Result<capnp::capability::Client, String> {
+    let Val::Cap { inner, .. } = value else {
+        return Err(format!(
+            "grant \"{name}\" expected a capability, got {value}"
+        ));
+    };
+    extract_capnp_client(inner).ok_or_else(|| {
+        format!(
+            "grant \"{name}\" is not backed by an exportable Cap'n Proto capability; use a Cap'n Proto-backed capability or follow the defcap-export work"
+        )
+    })
+}
+
 fn collect_forwardable_caps(
     caps: &[(String, Val)],
     context: &str,
 ) -> Result<Vec<(String, capnp::capability::Client)>, Val> {
     caps.iter()
         .map(|(name, val)| {
-            let Val::Cap { inner, .. } = val else {
-                return Err(glia::error::invalid_cell_spec(context, format!(
-                    "{context} — grant \"{name}\" expected a capability, got {val}"
-                )));
-            };
-            let client = extract_capnp_client(inner).ok_or_else(|| {
-                glia::error::invalid_cell_spec(context, format!(
-                    "{context} — grant \"{name}\" is not backed by an exportable Cap'n Proto capability; use a Cap'n Proto-backed capability or follow the defcap-export work"
-                ))
+            let client = forwardable_cap_client(name, val).map_err(|reason| {
+                glia::error::invalid_cell_spec(context, format!("{context} — {reason}"))
             })?;
             Ok((name.clone(), client))
         })
@@ -700,17 +700,9 @@ impl<'k> Dispatch for KernelDispatch<'k> {
     }
 
     fn validate_cell_grant(&self, name: &str, cap: &Val) -> Result<(), Val> {
-        let Val::Cap { inner, .. } = cap else {
-            return Err(glia::error::internal(
-                "cell :grants",
-                format!("grant \"{name}\" expected a capability, got {cap}"),
-            ));
-        };
-        extract_capnp_client(inner).map(|_| ()).ok_or_else(|| {
-            glia::error::internal("cell :grants", format!(
-                "grant \"{name}\" is not backed by an exportable Cap'n Proto capability; use a Cap'n Proto-backed capability or follow the defcap-export work"
-            ))
-        })
+        forwardable_cap_client(name, cap)
+            .map(|_| ())
+            .map_err(|reason| glia::error::internal("cell :grants", reason))
     }
 
     fn report_warning(&self, warning: &str) {
@@ -1949,19 +1941,64 @@ async fn run_shell(
 // `glia::error::*` constructors so MCP / try forms can route on
 // `:glia.error/type`.
 
-/// Map a canonical cap name to its build-time schema bytes. Returns
-/// `None` for unknown names so callers can produce a structured error.
+struct SchemaCapability {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    schema: &'static [u8],
+    summary: &'static str,
+}
+
+static SCHEMA_CAPABILITIES: &[SchemaCapability] = &[
+    SchemaCapability {
+        name: "host",
+        aliases: &[],
+        schema: schema_ids::HOST_SCHEMA,
+        summary: "host — node identity, listeners, peer management",
+    },
+    SchemaCapability {
+        name: "runtime",
+        aliases: &[],
+        schema: schema_ids::RUNTIME_SCHEMA,
+        summary: "runtime — cell spawn + execution",
+    },
+    SchemaCapability {
+        name: "routing",
+        aliases: &[],
+        schema: schema_ids::ROUTING_SCHEMA,
+        summary: "routing — DHT content routing (provide / find)",
+    },
+    SchemaCapability {
+        name: "identity",
+        aliases: &[],
+        schema: schema_ids::IDENTITY_SCHEMA,
+        summary: "identity — node Ed25519 signing keys",
+    },
+    SchemaCapability {
+        name: "http-client",
+        aliases: &["http"],
+        schema: schema_ids::HTTP_CLIENT_SCHEMA,
+        summary: "http-client — outbound HTTP requests (gated by --http-dial)",
+    },
+];
+
+fn schema_capability(name: &str) -> Option<&'static SchemaCapability> {
+    SCHEMA_CAPABILITIES
+        .iter()
+        .find(|capability| capability.name == name || capability.aliases.contains(&name))
+}
+
+fn schema_capability_names() -> String {
+    SCHEMA_CAPABILITIES
+        .iter()
+        .map(|capability| capability.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Map a recognized cap name to its build-time schema bytes. Returns `None`
+/// for unknown names so callers can produce a structured error.
 fn schema_bytes_for_cap(name: &str) -> Option<&'static [u8]> {
-    match name {
-        "host" => Some(schema_ids::HOST_SCHEMA),
-        "runtime" => Some(schema_ids::RUNTIME_SCHEMA),
-        "routing" => Some(schema_ids::ROUTING_SCHEMA),
-        "identity" => Some(schema_ids::IDENTITY_SCHEMA),
-        // The cap is grafted under the name "http"; its schema is for
-        // the HttpClient interface.
-        "http" | "http-client" => Some(schema_ids::HTTP_CLIENT_SCHEMA),
-        _ => None,
-    }
+    schema_capability(name).map(|capability| capability.schema)
 }
 
 /// Single-arg helper used by all three introspection builtins. Validates
@@ -2004,7 +2041,10 @@ fn make_schema_builtin() -> Val {
                     }
                     Err(glia::error::permission_denied(
                         &format!("schema for cap '{cap_name}' not registered"),
-                        Some("schemas registered for: host, runtime, routing, identity, http"),
+                        Some(&format!(
+                            "schemas registered for: {}",
+                            schema_capability_names()
+                        )),
                     ))
                 }
             }
@@ -2020,15 +2060,9 @@ fn make_doc_builtin() -> Val {
             // Human-readable summary. `(schema cap)` is the source of
             // truth for machine-readable interface introspection; `doc`
             // is the operator-friendly view.
-            let summary = match cap_name {
-                "host" => "host — node identity, listeners, peer management",
-                "runtime" => "runtime — cell spawn + execution",
-                "routing" => "routing — DHT content routing (provide / find)",
-                "identity" => "identity — node Ed25519 signing keys",
-                "http" | "http-client" => {
-                    "http-client — outbound HTTP requests (gated by --http-dial)"
-                }
-                _ => {
+            let summary = match schema_capability(cap_name) {
+                Some(capability) => capability.summary,
+                None => {
                     if let Some(glia_cap) = inner.downcast_ref::<GliaCapInner>() {
                         return Ok(Val::Str(format!(
                             "glia capability — local method table\n  cap-name:   {cap_name}\n  schema-cid: {schema_cid}\n  methods:    {}",
@@ -2275,7 +2309,10 @@ fn run_impl() -> Result<(), ()> {
                 let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
                 let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
                 let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
-                let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
+                // Keep validating the required identity cap's concrete type even though
+                // pid0 has no Glia effect handler for it.
+                let _identity: auth_capnp::identity::Client =
+                    get_graft_cap(&caps, "identity")?;
                 let authority: auth_capnp::authority::Client = get_graft_cap(&caps, "authority")?;
                 let http_client: Option<http_capnp::http_client::Client> =
                     get_graft_cap(&caps, "http-client").ok();
@@ -2284,7 +2321,6 @@ fn run_impl() -> Result<(), ()> {
                     host: host.clone(),
                     runtime: runtime.clone(),
                     routing: routing.clone(),
-                    identity,
                     authority: authority.clone(),
                     http_client: http_client.clone(),
                     cwd: "/".to_string(),
@@ -2327,8 +2363,7 @@ fn run_impl() -> Result<(), ()> {
                                     make_routing_handler(s.routing.clone()),
                                 ),
                                 "identity" => {
-                                    // Identity is stored in the Session but has no
-                                    // Glia effect handler — skip env binding.
+                                    // Identity has no Glia effect handler — skip env binding.
                                     continue;
                                 }
                                 "authority" => (
@@ -2861,29 +2896,6 @@ mod tests {
     struct TestVatClient;
     impl system_capnp::vat_client::Server for TestVatClient {}
 
-    // --- Stub Identity (unimplemented — not under test) ---
-
-    struct TestIdentity;
-
-    #[allow(refining_impl_trait)]
-    impl auth_capnp::identity::Server for TestIdentity {
-        fn signer(
-            self: capnp::capability::Rc<Self>,
-            _p: auth_capnp::identity::SignerParams,
-            _r: auth_capnp::identity::SignerResults,
-        ) -> Promise<(), capnp::Error> {
-            Promise::err(capnp::Error::unimplemented("stub".into()))
-        }
-
-        fn verify(
-            self: capnp::capability::Rc<Self>,
-            _p: auth_capnp::identity::VerifyParams,
-            _r: auth_capnp::identity::VerifyResults,
-        ) -> Promise<(), capnp::Error> {
-            Promise::err(capnp::Error::unimplemented("stub".into()))
-        }
-    }
-
     struct TestAuthority;
     impl auth_capnp::authority::Server for TestAuthority {}
 
@@ -3011,7 +3023,6 @@ mod tests {
             host: capnp_rpc::new_client(TestHost),
             runtime: capnp_rpc::new_client(TestRuntime),
             routing: capnp_rpc::new_client(TestRouting),
-            identity: capnp_rpc::new_client(TestIdentity),
             authority: capnp_rpc::new_client(TestAuthority),
             http_client: Some(capnp_rpc::new_client(TestHttpClient)),
             cwd: "/".into(),
@@ -5134,24 +5145,23 @@ mod tests {
     #[test]
     fn schema_returns_bytes_for_each_known_cap() {
         let builtin = make_schema_builtin();
-        for name in [
-            "host",
-            "runtime",
-            "routing",
-            "identity",
-            "http",
-            "http-client",
-        ] {
-            let cap = test_cap(name, "test-cid");
-            let result = call_builtin(&builtin, &[cap]).unwrap_or_else(|e| {
-                panic!("schema for '{name}' returned error: {e}");
-            });
-            match result {
-                Val::Bytes(bytes) => assert!(
-                    !bytes.is_empty(),
-                    "schema for '{name}' returned empty bytes"
-                ),
-                other => panic!("schema for '{name}' returned {other:?}, expected Val::Bytes"),
+        for capability in SCHEMA_CAPABILITIES {
+            for name in std::iter::once(capability.name)
+                .chain(capability.aliases.iter().copied())
+            {
+                let cap = test_cap(name, "test-cid");
+                let result = call_builtin(&builtin, &[cap]).unwrap_or_else(|e| {
+                    panic!("schema for '{name}' returned error: {e}");
+                });
+                match result {
+                    Val::Bytes(bytes) => assert!(
+                        !bytes.is_empty(),
+                        "schema for '{name}' returned empty bytes"
+                    ),
+                    other => {
+                        panic!("schema for '{name}' returned {other:?}, expected Val::Bytes")
+                    }
+                }
             }
         }
     }
@@ -5166,6 +5176,16 @@ mod tests {
             Some(glia::error::tag::PERMISSION_DENIED)
         );
         assert!(glia::error::message(&err).unwrap().contains("nonexistent"));
+        assert_eq!(
+            glia::error::hint(&err),
+            Some(
+                format!(
+                    "schemas registered for: {}",
+                    schema_capability_names()
+                )
+                .as_str()
+            )
+        );
     }
 
     #[test]
@@ -5188,18 +5208,22 @@ mod tests {
     #[test]
     fn doc_returns_summary_for_each_cap() {
         let builtin = make_doc_builtin();
-        for name in ["host", "runtime", "routing", "identity", "http"] {
-            let cap = test_cap(name, "test-cid-123");
-            let result = call_builtin(&builtin, &[cap]).unwrap();
-            match result {
-                Val::Str(s) => {
-                    assert!(s.contains(name), "doc for '{name}' missing cap name: {s}");
-                    assert!(
-                        s.contains("test-cid-123"),
-                        "doc for '{name}' missing schema cid: {s}"
-                    );
+        for capability in SCHEMA_CAPABILITIES {
+            for name in std::iter::once(capability.name)
+                .chain(capability.aliases.iter().copied())
+            {
+                let cap = test_cap(name, "test-cid-123");
+                let result = call_builtin(&builtin, &[cap]).unwrap();
+                match result {
+                    Val::Str(s) => {
+                        assert!(s.contains(name), "doc for '{name}' missing cap name: {s}");
+                        assert!(
+                            s.contains("test-cid-123"),
+                            "doc for '{name}' missing schema cid: {s}"
+                        );
+                    }
+                    other => panic!("doc for '{name}' returned {other:?}, expected Val::Str"),
                 }
-                other => panic!("doc for '{name}' returned {other:?}, expected Val::Str"),
             }
         }
     }

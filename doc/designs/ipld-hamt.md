@@ -1,6 +1,8 @@
 # Design: IPLD-backed Persistent HAMT for Val::Map
 
-Status: PROPOSED
+Status: REJECTED / SUPERSEDED — this proposal did not ship. Its value-semantics
+problem statement was superseded by `value-contract.md`; the persistent
+HAMT/IPLD roadmap was not adopted.
 Date: 2026-04-04
 
 ## Problem

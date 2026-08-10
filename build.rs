@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "std/kernel/abi/kernel_abi_fingerprint.rs"]
 mod kernel_abi_fingerprint;
 
 mod pid0_runtime_abi {

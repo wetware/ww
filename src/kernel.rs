@@ -12,7 +12,7 @@ use crate::cell::loaders::{HostPathLoader, IpfsLoader};
 use crate::cell::Loader;
 
 #[cfg(test)]
-#[path = "../kernel_abi_fingerprint.rs"]
+#[path = "../std/kernel/abi/kernel_abi_fingerprint.rs"]
 mod kernel_abi_fingerprint;
 
 /// Version of the native host ↔ pid0 component contract.

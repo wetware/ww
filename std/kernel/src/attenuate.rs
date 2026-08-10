@@ -31,7 +31,7 @@ use membrane::DENIED_MARKER;
 
 use crate::{
     extract_capnp_client, make_host_handler, make_routing_handler, make_runtime_handler,
-    schema_bytes_for_cap, Session,
+    schema_bytes_for_cap, schema_capability_names, Session,
 };
 
 /// Kernel export payload for a membrane-attenuated cap, stored in
@@ -182,7 +182,10 @@ pub fn reify(
         // deferred D24 design.)
         return Some(Err(glia::error::permission_denied(
             &format!("cannot attenuate '{name}': no compiled schema for this capability"),
-            Some("only caps with build-time schemas (host, runtime, routing, identity, http-client) can be attenuated"),
+            Some(&format!(
+                "only caps with build-time schemas ({}) can be attenuated",
+                schema_capability_names()
+            )),
         )));
     };
 
