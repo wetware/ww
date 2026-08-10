@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use auth::SigningDomain;
-use capnp::capability::{FromClientHook, Promise};
+use authority::get_graft_cap;
+use capnp::capability::Promise;
 use capnp::traits::HasTypeId;
 use capnp_rpc::{new_client, pry};
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -337,34 +338,14 @@ async fn graft(membrane: &ww::membrane_capnp::membrane::Client) -> GraftCaps {
     }
     names.sort();
     GraftCaps {
-        authority: get_graft_cap(&caps, "authority"),
-        host: get_graft_cap(&caps, "host"),
-        identity: get_graft_cap(&caps, "identity"),
-        ipfs: get_graft_cap(&caps, "ipfs"),
-        routing: get_graft_cap(&caps, "routing"),
-        runtime: get_graft_cap(&caps, "runtime"),
+        authority: get_graft_cap(&caps, "authority").expect("graft authority capability"),
+        host: get_graft_cap(&caps, "host").expect("graft host capability"),
+        identity: get_graft_cap(&caps, "identity").expect("graft identity capability"),
+        ipfs: get_graft_cap(&caps, "ipfs").expect("graft ipfs capability"),
+        routing: get_graft_cap(&caps, "routing").expect("graft routing capability"),
+        runtime: get_graft_cap(&caps, "runtime").expect("graft runtime capability"),
         names,
     }
-}
-
-fn get_graft_cap<T: FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, ww::membrane_capnp::export::Owned>,
-    name: &str,
-) -> T {
-    for entry in caps.iter() {
-        let entry_name = entry
-            .get_name()
-            .expect("graft cap name")
-            .to_str()
-            .expect("graft cap name UTF-8");
-        if entry_name == name {
-            return entry
-                .get_cap()
-                .get_as_capability::<T>()
-                .expect("decode graft capability");
-        }
-    }
-    panic!("graft omitted capability {name}");
 }
 
 fn assert_exact_names(names: &[String]) {

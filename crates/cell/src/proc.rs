@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use wasmtime::component::bindgen;
 use wasmtime::component::{
-    types::ComponentItem, Component, Linker, Resource, ResourceTable, ResourceType,
+    types::ComponentItem, Component, HasSelf, Linker, Resource, ResourceTable, ResourceType,
 };
 use wasmtime::StoreContextMut;
 use wasmtime::{CallHook, Engine, Store};
@@ -27,6 +27,13 @@ bindgen!({
         "wasi:io/streams@0.2.9.output-stream": wasmtime_wasi_io::streams::DynOutputStream,
     },
 });
+
+mod pid0_runtime {
+    wasmtime::component::bindgen!({
+        world: "pid0",
+        path: "../../std/kernel/wit",
+    });
+}
 
 // Import generated types - Connection is a Resource type alias
 use exports::wetware::streams::streams::Connection;
@@ -203,6 +210,35 @@ pub struct ComponentRunStates {
     pub(crate) writable_fs_descriptors: std::collections::HashSet<u32>,
     /// EWMA fuel estimator, refuels at host call boundaries.
     pub fuel_estimator: FuelEstimator,
+    /// Present only for the trusted PID0 process. Ordinary child linkers omit
+    /// the corresponding WIT import entirely.
+    pub kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
+}
+
+impl pid0_runtime::wetware::kernel_runtime::readiness::Host for ComponentRunStates {
+    fn kernel_ready(
+        &mut self,
+    ) -> Result<(), pid0_runtime::wetware::kernel_runtime::readiness::ReadyError> {
+        let gate = self
+            .kernel_ready_gate
+            .as_ref()
+            .expect("kernel readiness import installed without gate");
+        commit_kernel_ready(gate)
+    }
+}
+
+fn commit_kernel_ready(
+    gate: &authority::KernelReadyGate,
+) -> Result<(), pid0_runtime::wetware::kernel_runtime::readiness::ReadyError> {
+    use authority::KernelReadyError;
+    use pid0_runtime::wetware::kernel_runtime::readiness::ReadyError;
+
+    match gate.kernel_ready() {
+        Ok(()) => Ok(()),
+        Err(KernelReadyError::StaleGeneration | KernelReadyError::NotBound) => {
+            Err(ReadyError::StaleGeneration)
+        }
+    }
 }
 
 // Required for WASI IO to work.
@@ -235,6 +271,7 @@ struct ProcInit {
     cache_mode: Option<cache::CacheMode>,
     cid_tree: Option<std::sync::Arc<crate::vfs::CidTree>>,
     fuel_estimator: Option<FuelEstimator>,
+    kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
 }
 
 struct ProcessFilesystem {
@@ -292,6 +329,7 @@ pub struct Builder {
     cache_mode: Option<cache::CacheMode>,
     cid_tree: Option<std::sync::Arc<crate::vfs::CidTree>>,
     fuel_estimator: Option<FuelEstimator>,
+    kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
 }
 
 /// Handles for accessing the host-side of data streams.
@@ -336,6 +374,7 @@ impl Builder {
             cache_mode: None,
             cid_tree: None,
             fuel_estimator: None,
+            kernel_ready_gate: None,
         }
     }
 
@@ -464,6 +503,16 @@ impl Builder {
         self
     }
 
+    /// Install the private PID0 readiness import for this process.
+    ///
+    /// Callers must use this only for the trusted kernel selected by the native
+    /// bootstrap boundary. The default linker used by ordinary cells omits the
+    /// interface, so components cannot acquire or delegate it.
+    pub fn with_kernel_ready_gate(mut self, gate: Arc<authority::KernelReadyGate>) -> Self {
+        self.kernel_ready_gate = Some(gate);
+        self
+    }
+
     /// Build a Proc instance. All required parameters must be supplied first.
     pub async fn build(self) -> Result<Proc> {
         let bytecode = self
@@ -493,6 +542,7 @@ impl Builder {
             cache_mode: self.cache_mode,
             cid_tree: self.cid_tree,
             fuel_estimator: self.fuel_estimator,
+            kernel_ready_gate: self.kernel_ready_gate,
         })
         .await
     }
@@ -532,6 +582,7 @@ impl Proc {
             cache_mode,
             cid_tree,
             fuel_estimator,
+            kernel_ready_gate,
         } = init;
 
         let stdin_stream = AsyncStdinStream::new(stdin);
@@ -553,6 +604,12 @@ impl Proc {
         };
         let mut linker = Linker::new(&engine);
         add_to_linker_async(&mut linker)?;
+        if kernel_ready_gate.is_some() {
+            pid0_runtime::Pid0::add_to_linker::<ComponentRunStates, HasSelf<ComponentRunStates>>(
+                &mut linker,
+                |state| state,
+            )?;
+        }
 
         // Override filesystem bindings when CidTree or cache is active.
         // CidTree mode: ALL filesystem ops resolve through the virtual tree.
@@ -609,6 +666,7 @@ impl Proc {
             cid_tree,
             writable_fs_descriptors: std::collections::HashSet::new(),
             fuel_estimator: fuel_estimator.unwrap_or_else(|| FuelEstimator::new(INITIAL_FUEL)),
+            kernel_ready_gate,
         };
 
         let mut store = Store::new(&engine, state);
@@ -906,6 +964,90 @@ fn add_loader_to_linker<T>(_linker: &mut Linker<T>) -> Result<()> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn private_kernel_import_component() -> Vec<u8> {
+        use wit_component::{ComponentEncoder, StringEncoding};
+        use wit_parser::{ManglingAndAbi, Resolve};
+
+        let mut resolve = Resolve::default();
+        let package = resolve
+            .push_str(
+                "kernel.wit",
+                include_str!("../../../std/kernel/wit/kernel.wit"),
+            )
+            .expect("parse private kernel WIT");
+        let world = resolve
+            .select_world(&[package], Some("pid0"))
+            .expect("select private PID0 world");
+        let mut module = wit_component::dummy_module(&resolve, world, ManglingAndAbi::Standard32);
+        wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+            .expect("embed private PID0 component metadata");
+        ComponentEncoder::default()
+            .module(&module)
+            .expect("encode private PID0 core module")
+            .validate(true)
+            .encode()
+            .expect("encode private PID0 component")
+    }
+
+    #[test]
+    fn private_kernel_import_is_absent_from_ordinary_child_linker() {
+        let engine = crate::engine::wasm_engine().expect("component engine");
+        let component = Component::from_binary(&engine, &private_kernel_import_component())
+            .expect("private import component");
+
+        let ordinary = Linker::<ComponentRunStates>::new(&engine);
+        let error = match ordinary.instantiate_pre(&component) {
+            Ok(_) => panic!("ordinary child linker must not satisfy private PID0 import"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("wetware:kernel-runtime/readiness@1.0.0"),
+            "unexpected missing-import error: {error}"
+        );
+
+        let mut pid0 = Linker::<ComponentRunStates>::new(&engine);
+        pid0_runtime::Pid0::add_to_linker::<ComponentRunStates, HasSelf<ComponentRunStates>>(
+            &mut pid0,
+            |state| state,
+        )
+        .expect("install private PID0 import");
+        pid0.instantiate_pre(&component)
+            .expect("PID0 linker satisfies private readiness import");
+    }
+
+    #[test]
+    fn private_kernel_import_maps_gate_results_fail_closed() {
+        use authority::{Epoch, Provenance};
+        fn epoch(seq: u64) -> Epoch {
+            Epoch {
+                seq,
+                head: Vec::new(),
+                provenance: Provenance::Block(0),
+            }
+        }
+
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch(1));
+        let gate = authority::KernelReadyGate::new(epoch_rx);
+
+        assert!(matches!(
+            commit_kernel_ready(&gate),
+            Err(pid0_runtime::wetware::kernel_runtime::readiness::ReadyError::StaleGeneration)
+        ));
+        assert!(!gate.is_ready());
+        gate.bind_generation(1);
+        assert_eq!(commit_kernel_ready(&gate), Ok(()));
+        assert!(gate.is_ready());
+
+        epoch_tx.send_replace(epoch(2));
+        assert!(matches!(
+            commit_kernel_ready(&gate),
+            Err(pid0_runtime::wetware::kernel_runtime::readiness::ReadyError::StaleGeneration)
+        ));
+        assert!(!gate.is_ready());
+    }
 
     #[test]
     fn test_proc_builder_creation() {

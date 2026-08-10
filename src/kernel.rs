@@ -11,10 +11,14 @@ use cid::Cid;
 use crate::cell::loaders::{HostPathLoader, IpfsLoader};
 use crate::cell::Loader;
 
+#[cfg(test)]
+#[path = "../std/kernel/abi/kernel_abi_fingerprint.rs"]
+mod kernel_abi_fingerprint;
+
 /// Version of the native host ↔ pid0 component contract.
 pub const KERNEL_ABI_VERSION: &str = env!("WW_KERNEL_ABI");
 
-/// Build-locked fingerprint of the Cap'n Proto schema set and capnp-rpc fork.
+/// Build-locked fingerprint of the native/PID0 WIT and Cap'n Proto ABI inputs.
 pub const KERNEL_ABI_FINGERPRINT: &str = env!("WW_KERNEL_ABI_FPR");
 
 /// Source selected for the pid0 component.

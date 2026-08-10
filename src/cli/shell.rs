@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use auth::SigningDomain;
-use capnp::capability::FromClientHook;
+use authority::get_graft_cap;
 use capnp_rpc::{new_client, pry};
 use caps::mcp_adapter::{self, ActionPolicy, ExprPart, ToolAction, ToolSpec};
 use caps::{
@@ -1194,26 +1194,6 @@ async fn shell_eval_raw(
     .context("shell eval timed out")?;
 
     Ok(eval_result)
-}
-
-fn get_graft_cap<T: FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, ww::membrane_capnp::export::Owned>,
-    name: &str,
-) -> Result<T, capnp::Error> {
-    for i in 0..caps.len() {
-        let entry = caps.get(i);
-        let n = entry
-            .get_name()?
-            .to_str()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        if n == name {
-            return entry.get_cap().get_as_capability::<T>();
-        }
-    }
-
-    Err(capnp::Error::failed(format!(
-        "capability '{name}' not found in graft response"
-    )))
 }
 
 fn shell_identity_path() -> Result<PathBuf> {

@@ -206,10 +206,6 @@ pub mod schema_registry {
                 <crate::membrane_capnp::membrane::Client as HasTypeId>::TYPE_ID,
                 0xdb52_c251_06bc_2c5e
             );
-            assert_eq!(
-                <crate::membrane_capnp::generation_activator::Client as HasTypeId>::TYPE_ID,
-                0x9494_5a0f_c6d6_8018
-            );
         }
 
         #[test]
@@ -244,13 +240,15 @@ pub mod schema_registry {
 
 pub mod epoch;
 pub mod issuer;
+mod kernel_ready;
 pub mod membrane;
 pub mod terminal;
 
 pub use call_guard::{call_failure_code, stale_epoch_error, CallFailureCode};
 pub use epoch::{Epoch, EpochGuard, Provenance};
 pub use issuer::{AuthorityServer, KeyMethodAuthorization, PolicyCompileError};
-pub use membrane::{membrane_client, GraftBuilder, MembraneServer, NoExtension};
+pub use kernel_ready::{KernelReadyError, KernelReadyGate};
+pub use membrane::{get_graft_cap, membrane_client, GraftBuilder, MembraneServer, NoExtension};
 pub use terminal::{
     AllowAllPolicy, AuthPolicy, AuthenticatedIdentity, AuthorizationError, FixedSessionPolicy,
     LocalPolicyFuture, SessionGrant, SessionTemplate, TerminalServer, DEFAULT_POLICY_TIMEOUT,

@@ -67,9 +67,11 @@ Spawner/listener state after T3:
 - `src/launcher.rs`: `ExecutorImpl::spawn` validates the wire `caps` list into
   `InitialAuthorityRecord` before process construction and builds only the
   bounded child bootstrap.
-- `crates/rpc/src/graft.rs`: `HostGraftBuilder` constructs the universal graft
-  only for trusted pid0 by inserting
-  host/runtime/routing/authority/identity/IPFS/HTTP plus extras.
+- `crates/rpc/src/graft.rs`: `HostGraftBuilder` assembles ordinary
+  epoch-guarded host/runtime/routing/authority/identity/IPFS/HTTP provisioning.
+  Trusted pid0 receives a process-local root wrapper that also binds its graft
+  generation and hands off a distinct network-exportable `Membrane`; only the
+  private PID0 host import can commit readiness.
 - `std/status/etc/init.d/05-status.glia` and
   `tests/status_cell_e2e.rs` / `tests/status_cell_http_listener_e2e.rs`
   explicitly pass the `host` grant needed by status children.

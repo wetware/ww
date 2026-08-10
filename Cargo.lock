@@ -1412,6 +1412,8 @@ dependencies = [
  "wasmtime-wasi-io",
  "wat",
  "wetware-authority",
+ "wit-component 0.244.0",
+ "wit-parser 0.244.0",
  "ww-cache",
 ]
 
@@ -8082,6 +8084,7 @@ dependencies = [
  "wasm-encoder 0.244.0",
  "wasm-metadata 0.244.0",
  "wasmparser 0.244.0",
+ "wat",
  "wit-parser 0.244.0",
 ]
 
@@ -8211,6 +8214,8 @@ dependencies = [
  "wasmtime",
  "wetware-authority",
  "wetware-membrane",
+ "wit-component 0.244.0",
+ "wit-parser 0.244.0",
  "ww-cache",
 ]
 

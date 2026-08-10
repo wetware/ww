@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use authority::{Epoch, Provenance};
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
@@ -9,9 +9,7 @@ use libp2p::StreamProtocol;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio::io::{stderr, stdout, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -80,7 +78,7 @@ pub struct CellBuilder {
     cid_tree: Option<Arc<cell::vfs::CidTree>>,
     initial_epoch: Option<Epoch>,
     epoch_rx: Option<watch::Receiver<Epoch>>,
-    activated_seq: Option<Arc<AtomicU64>>,
+    kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
     signing_key: Option<Arc<SigningKey>>,
     route_registry: Option<crate::dispatcher::server::RouteRegistry>,
     cache_policy: rpc::CachePolicy,
@@ -113,7 +111,7 @@ impl CellBuilder {
             cid_tree: None,
             initial_epoch: None,
             epoch_rx: None,
-            activated_seq: None,
+            kernel_ready_gate: None,
             signing_key: None,
             route_registry: None,
             cache_policy: rpc::CachePolicy::default(),
@@ -224,9 +222,12 @@ impl CellBuilder {
         self
     }
 
-    /// Share the pid0 generation activation marker with admin readiness.
-    pub fn with_activated_seq(mut self, activated_seq: Arc<AtomicU64>) -> Self {
-        self.activated_seq = Some(activated_seq);
+    /// Share PID0's authoritative readiness gate with host consumers.
+    pub fn with_kernel_ready_gate(
+        mut self,
+        kernel_ready_gate: Arc<authority::KernelReadyGate>,
+    ) -> Self {
+        self.kernel_ready_gate = Some(kernel_ready_gate);
         self
     }
 
@@ -306,7 +307,7 @@ impl CellBuilder {
             cid_tree: self.cid_tree,
             initial_epoch: self.initial_epoch,
             epoch_rx: self.epoch_rx,
-            activated_seq: self.activated_seq,
+            kernel_ready_gate: self.kernel_ready_gate,
             signing_key: self.signing_key,
             route_registry: self.route_registry,
             cache_policy: self.cache_policy,
@@ -342,8 +343,8 @@ pub struct Cell {
     pub cid_tree: Option<Arc<cell::vfs::CidTree>>,
     pub initial_epoch: Option<Epoch>,
     pub epoch_rx: Option<watch::Receiver<Epoch>>,
-    /// Last pid0 generation whose initialization completed successfully.
-    pub activated_seq: Option<Arc<AtomicU64>>,
+    /// PID0's authoritative, generation-scoped readiness state.
+    pub kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
     pub signing_key: Option<Arc<SigningKey>>,
     pub route_registry: Option<crate::dispatcher::server::RouteRegistry>,
     pub cache_policy: rpc::CachePolicy,
@@ -380,7 +381,7 @@ impl Cell {
     /// Returns a [`SpawnResult`] containing the guest's exit code, its exported
     /// [`GuestMembrane`], and the epoch sender for advancing epochs.
     pub async fn spawn(self) -> Result<SpawnResult> {
-        self.spawn_rpc_inner(None, None).await
+        self.spawn_rpc_inner(None).await
     }
 
     /// Like [`spawn`], but also accepts incoming libp2p streams on
@@ -391,18 +392,7 @@ impl Cell {
     /// obtain the kernel's capability surface.  Without a signing key
     /// (ephemeral node), the raw membrane is served directly.
     pub async fn spawn_serving(self, control: libp2p_stream::Control) -> Result<SpawnResult> {
-        self.spawn_rpc_inner(Some(control), None).await
-    }
-
-    /// Like [`spawn_serving`](Self::spawn_serving), but acknowledges when the
-    /// kernel has completed its export-policy boot gate and the incoming
-    /// stream acceptor has been installed.
-    pub async fn spawn_serving_with_ready(
-        self,
-        control: libp2p_stream::Control,
-        ready_tx: tokio::sync::oneshot::Sender<()>,
-    ) -> Result<SpawnResult> {
-        self.spawn_rpc_inner(Some(control), Some(ready_tx)).await
+        self.spawn_rpc_inner(Some(control)).await
     }
 
     /// Execute the cell command and return the join handle plus data stream handles.
@@ -411,6 +401,13 @@ impl Cell {
     /// RPC to the guest over in-memory duplex pipes, while the guest's WASI stdio
     /// is bound to the host process's stdin/stdout/stderr.
     pub async fn spawn_with_streams(self) -> Result<(JoinHandle<Result<()>>, DataStreamHandles)> {
+        self.spawn_with_streams_inner(None).await
+    }
+
+    async fn spawn_with_streams_inner(
+        self,
+        kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
+    ) -> Result<(JoinHandle<Result<()>>, DataStreamHandles)> {
         let Cell {
             path,
             args,
@@ -423,7 +420,7 @@ impl Cell {
             cid_tree,
             initial_epoch: _,
             epoch_rx: _,
-            activated_seq: _,
+            kernel_ready_gate: _,
             signing_key: _,
             route_registry: _,
             cache_policy: _,
@@ -549,6 +546,10 @@ impl Cell {
         if let Some(pinset) = pinset_cache {
             builder = builder.with_cache(cache::CacheMode::Shared(pinset));
         }
+        validate_kernel_ready_installation(is_kernel, kernel_ready_gate.is_some())?;
+        if let Some(gate) = kernel_ready_gate {
+            builder = builder.with_kernel_ready_gate(gate);
+        }
         let (builder, handles) = builder.with_data_streams();
 
         let proc = builder.build().await?;
@@ -560,14 +561,14 @@ impl Cell {
 
     /// Execute the cell command and serve Cap'n Proto RPC over wetware streams.
     pub async fn spawn_with_streams_rpc(self) -> Result<SpawnResult> {
-        self.spawn_rpc_inner(None, None).await
+        self.spawn_rpc_inner(None).await
     }
 
     async fn spawn_rpc_inner(
         mut self,
         stream_control: Option<libp2p_stream::Control>,
-        serving_ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<SpawnResult> {
+        let install_kernel_ready = self.resolved_kernel.is_some();
         let wasm_debug = self.wasm_debug;
         let network_state = self.network_state.clone();
         let swarm_cmd_tx = self.swarm_cmd_tx.clone();
@@ -576,7 +577,7 @@ impl Cell {
         // Terminal-gated network accept loop.
         let terminal_signing_key = signing_key.clone();
         let pre_epoch_rx = self.epoch_rx.take();
-        let configured_activated_seq = self.activated_seq.take();
+        let configured_readiness_gate = self.kernel_ready_gate.take();
         let route_registry = self.route_registry.take();
         let cache_policy = self.cache_policy;
         let compile_tx = self.compile_tx.clone();
@@ -589,12 +590,6 @@ impl Cell {
             head: vec![],
             provenance: Provenance::Block(0),
         });
-        let (join, handles) = self.spawn_with_streams().await?;
-        let mut handles = handles;
-        let (reader, writer) = handles
-            .take_host_split()
-            .ok_or_else(|| anyhow::anyhow!("host stream missing; RPC streams already consumed"))?;
-
         // Use the externally-provided epoch receiver if available,
         // otherwise create a new channel.
         let (epoch_tx, epoch_rx) = if let Some(rx) = pre_epoch_rx {
@@ -603,10 +598,18 @@ impl Cell {
             let (tx, rx) = watch::channel(initial_epoch);
             (Some(tx), rx)
         };
-        let activated_seq = configured_activated_seq.unwrap_or_else(|| {
-            let current = epoch_rx.borrow();
-            Arc::new(AtomicU64::new(current.seq))
-        });
+        let readiness_gate = configured_readiness_gate
+            .unwrap_or_else(|| Arc::new(authority::KernelReadyGate::new(epoch_rx.clone())));
+
+        // The private host import must exist before Wasmtime instantiates PID0.
+        // Ordinary child construction continues through the default linker.
+        let (join, handles) = self
+            .spawn_with_streams_inner(install_kernel_ready.then(|| readiness_gate.clone()))
+            .await?;
+        let mut handles = handles;
+        let (reader, writer) = handles
+            .take_host_split()
+            .ok_or_else(|| anyhow::anyhow!("host stream missing; RPC streams already consumed"))?;
 
         // Clone the stream control for the membrane RPC layer (Server capability).
         // If no stream_control is provided (non-serving mode), create a dummy one.
@@ -639,7 +642,7 @@ impl Cell {
             swarm_cmd_tx,
             wasm_debug,
             epoch_rx,
-            activated_seq,
+            readiness_gate.clone(),
             signing_key,
             membrane_stream_control,
             route_registry,
@@ -655,14 +658,6 @@ impl Cell {
         // worker's LocalSet, enabling M:N cooperative scheduling with
         // other cells on the same thread.
         tokio::task::spawn_local(rpc_system.map(|_| ()));
-
-        if stream_control.is_some() {
-            let timeout = export_policy_ready_timeout();
-            if let Err(e) = wait_for_export_policy_ready(&guest_membrane, timeout).await {
-                join.abort();
-                return Err(anyhow!("kernel export policy did not become ready: {e}"));
-            }
-        }
 
         if let Some(control) = stream_control {
             let membrane = guest_membrane.clone();
@@ -683,10 +678,6 @@ impl Cell {
             }
         }
 
-        if let Some(ready_tx) = serving_ready_tx {
-            let _ = ready_tx.send(());
-        }
-
         let exit_code = match join.await {
             Ok(Ok(())) => 0,
             Ok(Err(ref e)) => {
@@ -698,6 +689,7 @@ impl Cell {
                 1
             }
         };
+        readiness_gate.clear();
         // The trusted execution generation, rather than any child-visible
         // capability or individual graft call, owns HTTP registration
         // liveness. Drop it as soon as the pid0 guest exits or fails.
@@ -710,6 +702,15 @@ impl Cell {
             epoch_tx,
         })
     }
+}
+
+fn validate_kernel_ready_installation(is_kernel: bool, gate_present: bool) -> Result<()> {
+    if gate_present && !is_kernel {
+        return Err(anyhow::anyhow!(
+            "private kernel readiness import cannot be installed for an ordinary cell"
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_guest_env(
@@ -751,72 +752,6 @@ fn prepare_guest_env(
         ));
     }
     guest_env
-}
-
-async fn wait_for_export_policy_ready(
-    membrane: &GuestMembrane,
-    timeout: Duration,
-) -> std::result::Result<(), String> {
-    let started = Instant::now();
-    loop {
-        match membrane.graft_request().send().promise.await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
-                if !is_bootstrap_not_ready_error(&msg) {
-                    return Err(msg);
-                }
-                if started.elapsed() >= timeout {
-                    return Err(format!(
-                        "timeout waiting for export policy readiness: {msg}"
-                    ));
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-fn export_policy_ready_timeout() -> Duration {
-    let raw = std::env::var("WW_EXPORT_POLICY_READY_TIMEOUT_SECS").ok();
-    parse_export_policy_ready_timeout(raw.as_deref())
-}
-
-fn parse_export_policy_ready_timeout(raw: Option<&str>) -> Duration {
-    const DEFAULT_SECS: u64 = 120;
-    match raw {
-        Some(raw) => match raw.parse::<u64>() {
-            Ok(secs) if secs > 0 => Duration::from_secs(secs),
-            _ => Duration::from_secs(DEFAULT_SECS),
-        },
-        None => Duration::from_secs(DEFAULT_SECS),
-    }
-}
-
-fn is_bootstrap_not_ready_error(msg: &str) -> bool {
-    has_exact_error_code(msg, "INIT_MEMBRANE_NOT_READY")
-        || has_exact_error_code(msg, "INIT_POLICY_NOT_READY")
-}
-
-fn has_exact_error_code(msg: &str, code: &str) -> bool {
-    let mut search_start = 0usize;
-    while let Some(rel_idx) = msg[search_start..].find(code) {
-        let idx = search_start + rel_idx;
-        let end = idx + code.len();
-
-        let before_ok = idx == 0 || !is_error_code_word_char(msg.as_bytes()[idx - 1]);
-        let after_ok = end == msg.len() || !is_error_code_word_char(msg.as_bytes()[end]);
-        if before_ok && after_ok {
-            return true;
-        }
-
-        search_start = idx + 1;
-    }
-    false
-}
-
-fn is_error_code_word_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// Accept incoming libp2p streams for the capnp protocol and serve each with
@@ -1014,6 +949,19 @@ mod tests {
             .any(|value| value.starts_with("WW_KERNEL_ABI_FPR=")));
     }
 
+    #[test]
+    fn ordinary_cells_reject_private_kernel_readiness_installation() {
+        assert!(validate_kernel_ready_installation(true, true).is_ok());
+        assert!(validate_kernel_ready_installation(true, false).is_ok());
+        assert!(validate_kernel_ready_installation(false, false).is_ok());
+
+        let error = validate_kernel_ready_installation(false, true)
+            .expect_err("ordinary cells must reject the private readiness gate");
+        assert!(error
+            .to_string()
+            .contains("cannot be installed for an ordinary cell"));
+    }
+
     #[tokio::test]
     async fn terminal_login_supervision_is_deterministic() {
         let (granted_tx, granted_rx) = tokio::sync::oneshot::channel();
@@ -1075,56 +1023,6 @@ mod tests {
         assert!(
             msg.contains("doc/capabilities.md"),
             "error message should point at the architecture docs, got: {msg}",
-        );
-    }
-
-    #[test]
-    fn bootstrap_not_ready_error_matching_is_explicit() {
-        assert!(is_bootstrap_not_ready_error(
-            "rpc failure: INIT_POLICY_NOT_READY: kernel export policy not ready",
-        ));
-        assert!(is_bootstrap_not_ready_error(
-            "rpc failure: INIT_MEMBRANE_NOT_READY: kernel bootstrap membrane not ready",
-        ));
-        assert!(
-            !is_bootstrap_not_ready_error("rpc failure: stream not ready"),
-            "must not retry generic 'not ready' errors"
-        );
-        assert!(
-            !is_bootstrap_not_ready_error(
-                "rpc failure: XINIT_POLICY_NOT_READY: malformed prefixed token",
-            ),
-            "must not retry on partial-token prefix matches"
-        );
-        assert!(
-            !is_bootstrap_not_ready_error(
-                "rpc failure: INIT_POLICY_NOT_READYX: malformed suffixed token",
-            ),
-            "must not retry on partial-token suffix matches"
-        );
-    }
-
-    #[test]
-    fn export_policy_ready_timeout_prefers_valid_env_value() {
-        assert_eq!(
-            parse_export_policy_ready_timeout(Some("7")),
-            Duration::from_secs(7)
-        );
-    }
-
-    #[test]
-    fn export_policy_ready_timeout_falls_back_on_invalid_env_value() {
-        assert_eq!(
-            parse_export_policy_ready_timeout(Some("0")),
-            Duration::from_secs(120)
-        );
-        assert_eq!(
-            parse_export_policy_ready_timeout(Some("abc")),
-            Duration::from_secs(120)
-        );
-        assert_eq!(
-            parse_export_policy_ready_timeout(None),
-            Duration::from_secs(120)
         );
     }
 }

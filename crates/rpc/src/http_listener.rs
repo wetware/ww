@@ -17,7 +17,7 @@
 use authority::EpochGuard;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::{fmt, time::Duration};
 use tokio::sync::mpsc;
@@ -77,11 +77,9 @@ struct RouteRegistration {
     registry: RouteRegistry,
     prefix: String,
     id: RegistrationId,
-    target_ready: Arc<AtomicBool>,
 }
 
 impl RouteRegistration {
-    #[cfg(test)]
     fn install(
         registry: RouteRegistry,
         prefix: String,
@@ -99,6 +97,7 @@ impl RouteRegistration {
         )
     }
 
+    #[cfg(test)]
     fn install_pending(
         registry: RouteRegistry,
         prefix: String,
@@ -145,12 +144,7 @@ impl RouteRegistration {
             registry,
             prefix,
             id,
-            target_ready,
         })
-    }
-
-    fn mark_target_ready(&self) {
-        self.target_ready.store(true, Ordering::Release);
     }
 
     fn remove_if_owned(&self) -> bool {
@@ -211,104 +205,93 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
         // listener cannot widen it after registration.
         let grant_template = pry!(reader.get_caps().and_then(decode_exports));
 
-        // Create a channel for the axum handler to send requests through.
-        let (tx, rx) = mpsc::channel::<CgiRequest>(64);
-
-        // Install before starting the task. Replacing an existing path drops
-        // its sender, but that old task's late cleanup cannot remove this
-        // entry because each registration has a distinct identity.
-        let registration = pry!(RouteRegistration::install_pending(
-            self.registry.clone(),
-            prefix.clone(),
-            tx,
-            self.guard.clone(),
-            self.registration_scope.clone(),
-        ));
-        tracing::info!(
-            prefix = %prefix,
-            registration_id = ?registration.id,
-            issued_epoch = self.guard.issued_seq,
-            "registered HTTP route"
-        );
-
-        let epoch_rx = self.guard.receiver.clone();
-        let issued_seq = self.guard.issued_seq;
+        let guard = self.guard.clone();
+        let registry = self.registry.clone();
         let registration_scope = self.registration_scope.clone();
-        // The local task owns the registration lease. Its Drop path performs
-        // compare-and-remove cleanup on epoch expiry, issuing-session loss,
-        // and cancellation alike.
-        tokio::task::spawn_local(dispatch_loop(
-            registration,
-            issued_seq,
-            epoch_rx,
-            registration_scope,
-            executor,
-            grant_template,
-            rx,
-        ));
+        Promise::from_future(async move {
+            // `init.d` must not proceed to `kernel_ready()` until the target
+            // component is valid. A failed preflight is an initialization
+            // failure, not a transient unavailable route.
+            let cid_response = executor.cid_request().send().promise.await?;
+            let cell_cid = read_preflight_cid(&cid_response).map_err(capnp::Error::failed)?;
+            guard.check()?;
 
-        Promise::ok(())
+            let (tx, rx) = mpsc::channel::<CgiRequest>(64);
+            let registration = RouteRegistration::install(
+                registry,
+                prefix.clone(),
+                tx,
+                guard.clone(),
+                registration_scope.clone(),
+            )?;
+            tracing::info!(
+                prefix = %prefix,
+                registration_id = ?registration.id,
+                issued_epoch = guard.issued_seq,
+                "registered HTTP route"
+            );
+
+            let epoch_rx = guard.receiver.clone();
+            let issued_seq = guard.issued_seq;
+            // The local task owns the registration lease. Its Drop path performs
+            // compare-and-remove cleanup on epoch expiry, issuing-session loss,
+            // and cancellation alike.
+            tokio::task::spawn_local(dispatch_loop(
+                registration,
+                DispatchLoop {
+                    issued_seq,
+                    epoch_rx,
+                    registration_scope,
+                    executor,
+                    caps: grant_template,
+                    cell_cid,
+                },
+                rx,
+            ));
+
+            Ok(())
+        })
     }
 }
 
 /// Receive HTTP requests from the channel, spawn cells, send responses back.
-async fn dispatch_loop(
-    registration: RouteRegistration,
+struct DispatchLoop {
     issued_seq: u64,
-    mut epoch_rx: tokio::sync::watch::Receiver<authority::Epoch>,
-    mut registration_scope: Option<tokio::sync::watch::Receiver<()>>,
+    epoch_rx: tokio::sync::watch::Receiver<authority::Epoch>,
+    registration_scope: Option<tokio::sync::watch::Receiver<()>>,
     executor: system_capnp::executor::Client,
     caps: NamedCapabilities,
+    cell_cid: String,
+}
+
+async fn dispatch_loop(
+    _registration: RouteRegistration,
+    mut dispatch: DispatchLoop,
     mut rx: mpsc::Receiver<CgiRequest>,
 ) {
-    if epoch_rx.borrow().seq != issued_seq {
+    if dispatch.epoch_rx.borrow().seq != dispatch.issued_seq {
         return;
     }
-
-    // Fetch the cell's CID for provenance headers.
-    let cell_cid_result = tokio::select! {
-        biased;
-        _ = wait_for_registration_expiry(
-            &mut epoch_rx,
-            issued_seq,
-            &mut registration_scope,
-        ) => return,
-        result = executor.cid_request().send().promise => result,
-    };
-    let cell_cid = match cell_cid_result {
-        Ok(response) => match read_preflight_cid(&response) {
-            Ok(cid) => cid,
-            Err(error) => {
-                tracing::warn!("{error}");
-                return;
-            }
-        },
-        Err(error) => {
-            tracing::warn!("failed to fetch cell CID: {error}");
-            return;
-        }
-    };
-    registration.mark_target_ready();
 
     loop {
         let req = tokio::select! {
             biased;
             _ = wait_for_registration_expiry(
-                &mut epoch_rx,
-                issued_seq,
-                &mut registration_scope,
+                &mut dispatch.epoch_rx,
+                dispatch.issued_seq,
+                &mut dispatch.registration_scope,
             ) => break,
             req = rx.recv() => match req {
                 Some(req) => req,
                 None => break,
             },
         };
-        if epoch_rx.borrow().seq != issued_seq {
+        if dispatch.epoch_rx.borrow().seq != dispatch.issued_seq {
             break;
         }
-        let executor = executor.clone();
-        let caps = caps.clone();
-        let cell_cid = cell_cid.clone();
+        let executor = dispatch.executor.clone();
+        let caps = dispatch.caps.clone();
+        let cell_cid = dispatch.cell_cid.clone();
         // Handle each request concurrently.
         tokio::task::spawn_local(async move {
             let mut response = handle_one_request(&executor, &caps, &req).await;
@@ -772,7 +755,7 @@ mod tests {
         }
     }
 
-    async fn assert_failed_cid_preflight_is_removed(outcome: CidPreflightOutcome) {
+    async fn assert_failed_cid_preflight_rejects_listen(outcome: CidPreflightOutcome) {
         let (_epoch_tx, guard) = test_epoch_guard();
         let registry = new_registry();
         let listener: system_capnp::http_listener::Client =
@@ -785,46 +768,17 @@ mod tests {
         let mut request = listener.listen_request();
         request.get().set_executor(executor);
         request.get().set_prefix("/preflight");
-        request
-            .send()
-            .promise
-            .await
-            .expect("listen installs a pending route");
-
-        let pending = registry
-            .read()
-            .expect("registry lock")
-            .get("/preflight")
-            .cloned()
-            .expect("pending route");
-        assert_eq!(dispatch::live_route_count(&registry), Ok(0));
-        assert!(!pending.is_live());
-
         gate_tx.send(()).expect("release CID preflight");
+        let error = match request.send().promise.await {
+            Ok(_) => panic!("failed CID preflight must reject listen"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("CID") || error.to_string().contains("cid"));
         wait_for_route_count(&registry, 0).await;
         assert_eq!(dispatch::live_route_count(&registry), Ok(0));
         assert!(
-            !pending.is_live(),
-            "failed {outcome:?} preflight must never mark its route live"
-        );
-
-        let (response_tx, response_rx) = oneshot::channel();
-        let failed_request = pending
-            .sender()
-            .send(CgiRequest {
-                method: "GET".into(),
-                path: "/preflight".into(),
-                query: String::new(),
-                headers: Vec::new(),
-                body: Vec::new(),
-                response_tx,
-            })
-            .await
-            .expect_err("failed preflight must terminate the dispatch future");
-        drop(failed_request);
-        assert!(
-            response_rx.await.is_err(),
-            "failed preflight must not expose an identity response"
+            registry.read().expect("registry lock").is_empty(),
+            "failed {outcome:?} preflight must not install a route"
         );
     }
 
@@ -838,7 +792,7 @@ mod tests {
                     CidPreflightOutcome::InvalidUtf8,
                     CidPreflightOutcome::InvalidCid,
                 ] {
-                    assert_failed_cid_preflight_is_removed(outcome).await;
+                    assert_failed_cid_preflight_rejects_listen(outcome).await;
                 }
             })
             .await;
@@ -848,7 +802,7 @@ mod tests {
     async fn unreadable_cid_field_never_becomes_live_and_releases_its_route() {
         let local = tokio::task::LocalSet::new();
         local
-            .run_until(assert_failed_cid_preflight_is_removed(
+            .run_until(assert_failed_cid_preflight_rejects_listen(
                 CidPreflightOutcome::UnreadableField,
             ))
             .await;
@@ -1462,7 +1416,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_replacement_init_leaves_no_stale_readiness_route() {
+    async fn failed_replacement_init_leaves_no_stale_live_route() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {

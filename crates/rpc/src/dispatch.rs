@@ -106,10 +106,8 @@ pub fn new_registry() -> RouteRegistry {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
-/// Count registrations whose issuing epoch is still current.
-///
-/// Readiness and dispatch both derive liveness from this same route-table
-/// state; there is no separately maintained counter to reconcile.
+/// Count registrations whose target preflight passed and whose issuing epoch
+/// and process scope are still current.
 pub fn live_route_count(registry: &RouteRegistry) -> Result<usize, &'static str> {
     let routes = registry
         .read()

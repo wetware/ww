@@ -683,6 +683,7 @@ dependencies = [
  "tokio-util",
  "wasip2",
  "wetware-membrane",
+ "wit-bindgen 0.41.0",
 ]
 
 [[package]]

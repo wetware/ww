@@ -117,6 +117,20 @@ semantics on the RPC channel.
 (`Builder::with_data_streams()`). Guests spawned without data streams
 (e.g., byte-pump handlers) will get an error on `create-connection`.
 
+### wetware:kernel-runtime/readiness@1.0.0 (private PID0 ABI)
+
+This interface is installed only when the host instantiates the trusted PID0
+kernel. It is deliberately absent from ordinary-cell linkers.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `kernel-ready` (`kernel_ready()` in generated Rust) | `() -> result<_, stale-generation>` | Commit the generation bound by PID0's most recent process-local graft. The guest supplies no generation or token. |
+
+This host function is not a Cap'n Proto capability. It cannot appear in a
+`Membrane` graft or `InitialGrants`, be delegated to a child, or cross a
+network connection. A stale-generation result tells PID0 to discard the
+initialized environment and re-graft.
+
 ## Cap'n Proto RPC (over wetware:streams)
 
 Once the guest obtains input/output streams from `wetware:streams`,

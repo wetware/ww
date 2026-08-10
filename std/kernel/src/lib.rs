@@ -58,8 +58,23 @@ mod attenuate;
 
 /// Bootstrap capability: the concrete Membrane defined in membrane.capnp.
 type Membrane = membrane_capnp::membrane::Client;
-/// Generation-local readiness commit capability minted by pid0 graft.
-type GenerationActivator = membrane_capnp::generation_activator::Client;
+
+mod kernel_runtime {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "pid0",
+    });
+}
+
+mod pid0_runtime_abi {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/abi/pid0_export_membrane_cap.rs"
+    ));
+}
+
+use kernel_runtime::wetware::kernel_runtime::readiness::{kernel_ready, ReadyError};
+use pid0_runtime_abi::PID0_EXPORT_MEMBRANE_CAP;
 
 /// Write a capability into an `Export`/params `cap` slot (an AnyPointer that
 /// holds the capability directly).
@@ -152,15 +167,6 @@ struct Session {
     host: system_capnp::host::Client,
     runtime: system_capnp::runtime::Client,
     routing: routing_capnp::routing::Client,
-    /// Host-side node identity hub for this session.
-    ///
-    /// Call `identity.signer("ww-membrane-graft")` (or another known domain) to
-    /// obtain a domain-scoped [`auth_capnp::signer::Client`]. The legacy domain
-    /// is a stable wire identifier, independent of Rust crate naming. The
-    /// identity secret never crosses the host–guest boundary; only this
-    /// capability reference is passed.
-    #[allow(dead_code)]
-    identity: auth_capnp::identity::Client,
     /// Trusted constructor for attaching recipient policy before publication.
     authority: auth_capnp::authority::Client,
     /// Outbound HTTP capability for WASM guests.
@@ -217,21 +223,30 @@ fn extract_capnp_client(
     None
 }
 
+fn forwardable_cap_client(
+    name: &str,
+    value: &Val,
+) -> Result<capnp::capability::Client, String> {
+    let Val::Cap { inner, .. } = value else {
+        return Err(format!(
+            "grant \"{name}\" expected a capability, got {value}"
+        ));
+    };
+    extract_capnp_client(inner).ok_or_else(|| {
+        format!(
+            "grant \"{name}\" is not backed by an exportable Cap'n Proto capability; use a Cap'n Proto-backed capability or follow the defcap-export work"
+        )
+    })
+}
+
 fn collect_forwardable_caps(
     caps: &[(String, Val)],
     context: &str,
 ) -> Result<Vec<(String, capnp::capability::Client)>, Val> {
     caps.iter()
         .map(|(name, val)| {
-            let Val::Cap { inner, .. } = val else {
-                return Err(glia::error::invalid_cell_spec(context, format!(
-                    "{context} — grant \"{name}\" expected a capability, got {val}"
-                )));
-            };
-            let client = extract_capnp_client(inner).ok_or_else(|| {
-                glia::error::invalid_cell_spec(context, format!(
-                    "{context} — grant \"{name}\" is not backed by an exportable Cap'n Proto capability; use a Cap'n Proto-backed capability or follow the defcap-export work"
-                ))
+            let client = forwardable_cap_client(name, val).map_err(|reason| {
+                glia::error::invalid_cell_spec(context, format!("{context} — {reason}"))
             })?;
             Ok((name.clone(), client))
         })
@@ -685,17 +700,9 @@ impl<'k> Dispatch for KernelDispatch<'k> {
     }
 
     fn validate_cell_grant(&self, name: &str, cap: &Val) -> Result<(), Val> {
-        let Val::Cap { inner, .. } = cap else {
-            return Err(glia::error::internal(
-                "cell :grants",
-                format!("grant \"{name}\" expected a capability, got {cap}"),
-            ));
-        };
-        extract_capnp_client(inner).map(|_| ()).ok_or_else(|| {
-            glia::error::internal("cell :grants", format!(
-                "grant \"{name}\" is not backed by an exportable Cap'n Proto capability; use a Cap'n Proto-backed capability or follow the defcap-export work"
-            ))
-        })
+        forwardable_cap_client(name, cap)
+            .map(|_| ())
+            .map_err(|reason| glia::error::internal("cell :grants", reason))
     }
 
     fn report_warning(&self, warning: &str) {
@@ -1934,19 +1941,64 @@ async fn run_shell(
 // `glia::error::*` constructors so MCP / try forms can route on
 // `:glia.error/type`.
 
-/// Map a canonical cap name to its build-time schema bytes. Returns
-/// `None` for unknown names so callers can produce a structured error.
+struct SchemaCapability {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    schema: &'static [u8],
+    summary: &'static str,
+}
+
+static SCHEMA_CAPABILITIES: &[SchemaCapability] = &[
+    SchemaCapability {
+        name: "host",
+        aliases: &[],
+        schema: schema_ids::HOST_SCHEMA,
+        summary: "host — node identity, listeners, peer management",
+    },
+    SchemaCapability {
+        name: "runtime",
+        aliases: &[],
+        schema: schema_ids::RUNTIME_SCHEMA,
+        summary: "runtime — cell spawn + execution",
+    },
+    SchemaCapability {
+        name: "routing",
+        aliases: &[],
+        schema: schema_ids::ROUTING_SCHEMA,
+        summary: "routing — DHT content routing (provide / find)",
+    },
+    SchemaCapability {
+        name: "identity",
+        aliases: &[],
+        schema: schema_ids::IDENTITY_SCHEMA,
+        summary: "identity — node Ed25519 signing keys",
+    },
+    SchemaCapability {
+        name: "http-client",
+        aliases: &["http"],
+        schema: schema_ids::HTTP_CLIENT_SCHEMA,
+        summary: "http-client — outbound HTTP requests (gated by --http-dial)",
+    },
+];
+
+fn schema_capability(name: &str) -> Option<&'static SchemaCapability> {
+    SCHEMA_CAPABILITIES
+        .iter()
+        .find(|capability| capability.name == name || capability.aliases.contains(&name))
+}
+
+fn schema_capability_names() -> String {
+    SCHEMA_CAPABILITIES
+        .iter()
+        .map(|capability| capability.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Map a recognized cap name to its build-time schema bytes. Returns `None`
+/// for unknown names so callers can produce a structured error.
 fn schema_bytes_for_cap(name: &str) -> Option<&'static [u8]> {
-    match name {
-        "host" => Some(schema_ids::HOST_SCHEMA),
-        "runtime" => Some(schema_ids::RUNTIME_SCHEMA),
-        "routing" => Some(schema_ids::ROUTING_SCHEMA),
-        "identity" => Some(schema_ids::IDENTITY_SCHEMA),
-        // The cap is grafted under the name "http"; its schema is for
-        // the HttpClient interface.
-        "http" | "http-client" => Some(schema_ids::HTTP_CLIENT_SCHEMA),
-        _ => None,
-    }
+    schema_capability(name).map(|capability| capability.schema)
 }
 
 /// Single-arg helper used by all three introspection builtins. Validates
@@ -1989,7 +2041,10 @@ fn make_schema_builtin() -> Val {
                     }
                     Err(glia::error::permission_denied(
                         &format!("schema for cap '{cap_name}' not registered"),
-                        Some("schemas registered for: host, runtime, routing, identity, http"),
+                        Some(&format!(
+                            "schemas registered for: {}",
+                            schema_capability_names()
+                        )),
                     ))
                 }
             }
@@ -2005,15 +2060,9 @@ fn make_doc_builtin() -> Val {
             // Human-readable summary. `(schema cap)` is the source of
             // truth for machine-readable interface introspection; `doc`
             // is the operator-friendly view.
-            let summary = match cap_name {
-                "host" => "host — node identity, listeners, peer management",
-                "runtime" => "runtime — cell spawn + execution",
-                "routing" => "routing — DHT content routing (provide / find)",
-                "identity" => "identity — node Ed25519 signing keys",
-                "http" | "http-client" => {
-                    "http-client — outbound HTTP requests (gated by --http-dial)"
-                }
-                _ => {
+            let summary = match schema_capability(cap_name) {
+                Some(capability) => capability.summary,
+                None => {
                     if let Some(glia_cap) = inner.downcast_ref::<GliaCapInner>() {
                         return Ok(Val::Str(format!(
                             "glia capability — local method table\n  cap-name:   {cap_name}\n  schema-cid: {schema_cid}\n  methods:    {}",
@@ -2108,7 +2157,12 @@ fn publish_bootstrap_membrane(
     *exported_membrane.borrow_mut() = Some(membrane.clone());
 }
 
+fn get_pid0_export_membrane(caps: &system::Caps<'_>) -> Result<Membrane, capnp::Error> {
+    get_graft_cap(caps, PID0_EXPORT_MEMBRANE_CAP).map_err(Into::into)
+}
+
 const EPOCH_STALE_PROBE_INTERVAL_NS: u64 = 5_000_000_000;
+const INITIAL_INIT_FAILED: &str = "INITIAL_INIT_FAILED";
 const EPOCH_RESTART_INIT_FAILED: &str = "EPOCH_RESTART_INIT_FAILED";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2129,9 +2183,14 @@ fn generation_action(
     is_tty: bool,
     outcome: InitdOutcome,
 ) -> Result<GenerationAction, capnp::Error> {
-    if is_replacement && outcome.failures > 0 {
+    if outcome.failures > 0 {
+        let (failure_code, generation) = if is_replacement {
+            (EPOCH_RESTART_INIT_FAILED, "replacement")
+        } else {
+            (INITIAL_INIT_FAILED, "initial")
+        };
         return Err(capnp::Error::failed(format!(
-            "{EPOCH_RESTART_INIT_FAILED}: replacement init.d completed with {} failure(s)",
+            "{failure_code}: {generation} init.d completed with {} failure(s)",
             outcome.failures
         )));
     }
@@ -2144,37 +2203,32 @@ fn generation_action(
     Ok(GenerationAction::WatchEpoch)
 }
 
-fn kernel_completion(replacement_init_failed: bool) -> Result<(), ()> {
-    if replacement_init_failed {
+fn kernel_completion(initialization_failed: bool) -> Result<(), ()> {
+    if initialization_failed {
         Err(())
     } else {
         Ok(())
     }
 }
 
-async fn activate_generation(
-    activator: &GenerationActivator,
-) -> Result<GenerationActivation, capnp::Error> {
-    match activator.activate_request().send().promise.await {
-        Ok(_) => Ok(GenerationActivation::Committed),
-        Err(error)
-            if membrane::call_failure_code(&error)
-                == Some(membrane::CallFailureCode::StaleEpoch) =>
-        {
-            Ok(GenerationActivation::Stale)
-        }
-        Err(error) => Err(error),
+fn generation_activation(result: Result<(), ReadyError>) -> GenerationActivation {
+    match result {
+        Ok(()) => GenerationActivation::Committed,
+        Err(ReadyError::StaleGeneration) => GenerationActivation::Stale,
     }
 }
 
-async fn complete_generation_initialization(
-    activator: &GenerationActivator,
+fn complete_generation_initialization<F>(
     is_replacement: bool,
     is_tty: bool,
     outcome: InitdOutcome,
-) -> Result<(GenerationAction, GenerationActivation), capnp::Error> {
+    readiness: F,
+) -> Result<(GenerationAction, GenerationActivation), capnp::Error>
+where
+    F: FnOnce() -> Result<(), ReadyError>,
+{
     let action = generation_action(is_replacement, is_tty, outcome)?;
-    let activation = activate_generation(activator).await?;
+    let activation = generation_activation(readiness());
     Ok((action, activation))
 }
 
@@ -2232,30 +2286,33 @@ async fn wait_for_stale_epoch(
 fn run_impl() -> Result<(), ()> {
     init_logging();
 
-    let replacement_init_failed = Rc::new(std::cell::Cell::new(false));
+    let initialization_failed = Rc::new(std::cell::Cell::new(false));
     let exported_membrane: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(None));
     let bootstrap: membrane_capnp::membrane::Client = capnp_rpc::new_client(KernelBootstrap {
         membrane: Rc::clone(&exported_membrane),
     });
-    let callback_failure = Rc::clone(&replacement_init_failed);
+    let callback_failure = Rc::clone(&initialization_failed);
 
     system::serve(bootstrap.client, move |membrane: Membrane| {
         let exported_membrane = Rc::clone(&exported_membrane);
-        let replacement_init_failed = Rc::clone(&callback_failure);
+        let initialization_failed = Rc::clone(&callback_failure);
         async move {
             let mut generation_index = 0_u64;
             loop {
-                let graft_resp = membrane.graft_pid0_request().send().promise.await?;
+                let graft_resp = membrane.graft_request().send().promise.await?;
                 let results = graft_resp.get()?;
-                let activator = results.get_activator()?;
 
                 // Iterate the caps list to find capabilities by name.
                 let caps = results.get_caps()?;
 
+                let export_membrane = get_pid0_export_membrane(&caps)?;
                 let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
                 let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
                 let routing: routing_capnp::routing::Client = get_graft_cap(&caps, "routing")?;
-                let identity: auth_capnp::identity::Client = get_graft_cap(&caps, "identity")?;
+                // Keep validating the required identity cap's concrete type even though
+                // pid0 has no Glia effect handler for it.
+                let _identity: auth_capnp::identity::Client =
+                    get_graft_cap(&caps, "identity")?;
                 let authority: auth_capnp::authority::Client = get_graft_cap(&caps, "authority")?;
                 let http_client: Option<http_capnp::http_client::Client> =
                     get_graft_cap(&caps, "http-client").ok();
@@ -2264,7 +2321,6 @@ fn run_impl() -> Result<(), ()> {
                     host: host.clone(),
                     runtime: runtime.clone(),
                     routing: routing.clone(),
-                    identity,
                     authority: authority.clone(),
                     http_client: http_client.clone(),
                     cwd: "/".to_string(),
@@ -2307,8 +2363,7 @@ fn run_impl() -> Result<(), ()> {
                                     make_routing_handler(s.routing.clone()),
                                 ),
                                 "identity" => {
-                                    // Identity is stored in the Session but has no
-                                    // Glia effect handler — skip env binding.
+                                    // Identity has no Glia effect handler — skip env binding.
                                     continue;
                                 }
                                 "authority" => (
@@ -2369,13 +2424,11 @@ fn run_impl() -> Result<(), ()> {
                     glia::load_prelude(&mut env, &mut kd).await;
                 }
 
-                // The host uses a successful reverse graft only to complete its
-                // internal RPC bootstrap. It is deliberately independent from
-                // externally visible serving readiness: /readyz remains closed
-                // until the host observes a registered HTTP route. Publish before
-                // init.d so a slow (or foreground-blocking) script cannot consume
-                // the host's export-policy timeout and abort the kernel.
-                publish_bootstrap_membrane(&exported_membrane, &membrane);
+                // Publish the network-safe membrane before init.d so remote RPC
+                // infrastructure does not depend on initialization duration.
+                // This handoff is not a readiness event: only kernel_ready()
+                // below commits the generation after init completes.
+                publish_bootstrap_membrane(&exported_membrane, &export_membrane);
 
                 // Run init.d scripts. If a foreground process blocked
                 // (e.g. `(runtime run ...)` in the script), we're done.
@@ -2390,17 +2443,16 @@ fn run_impl() -> Result<(), ()> {
                     });
 
                 let is_tty = std::env::var("WW_TTY").is_ok();
-                if generation_index > 0 && init_outcome.failures > 0 {
-                    replacement_init_failed.set(true);
+                if init_outcome.failures > 0 {
+                    initialization_failed.set(true);
                 }
 
                 let (action, activation) = complete_generation_initialization(
-                    &activator,
                     generation_index > 0,
                     is_tty,
                     init_outcome,
-                )
-                .await?;
+                    kernel_ready,
+                )?;
                 match activation {
                     GenerationActivation::Committed => match action {
                         GenerationAction::Stop => return Ok(()),
@@ -2438,7 +2490,7 @@ fn run_impl() -> Result<(), ()> {
         }
     });
 
-    kernel_completion(replacement_init_failed.get())
+    kernel_completion(initialization_failed.get())
 }
 
 wasip2::cli::command::export!(Kernel);
@@ -2844,29 +2896,6 @@ mod tests {
     struct TestVatClient;
     impl system_capnp::vat_client::Server for TestVatClient {}
 
-    // --- Stub Identity (unimplemented — not under test) ---
-
-    struct TestIdentity;
-
-    #[allow(refining_impl_trait)]
-    impl auth_capnp::identity::Server for TestIdentity {
-        fn signer(
-            self: capnp::capability::Rc<Self>,
-            _p: auth_capnp::identity::SignerParams,
-            _r: auth_capnp::identity::SignerResults,
-        ) -> Promise<(), capnp::Error> {
-            Promise::err(capnp::Error::unimplemented("stub".into()))
-        }
-
-        fn verify(
-            self: capnp::capability::Rc<Self>,
-            _p: auth_capnp::identity::VerifyParams,
-            _r: auth_capnp::identity::VerifyResults,
-        ) -> Promise<(), capnp::Error> {
-            Promise::err(capnp::Error::unimplemented("stub".into()))
-        }
-    }
-
     struct TestAuthority;
     impl auth_capnp::authority::Server for TestAuthority {}
 
@@ -2887,56 +2916,6 @@ mod tests {
             let mut entry = caps.reborrow().get(0);
             entry.set_name("runtime");
             write_cap(entry.init_cap(), self.runtime.client.clone());
-            Promise::ok(())
-        }
-    }
-
-    struct TestGenerationActivator {
-        seq: u64,
-        current: Rc<std::cell::Cell<u64>>,
-        activations: Rc<std::cell::Cell<u32>>,
-    }
-
-    #[allow(refining_impl_trait)]
-    impl membrane_capnp::generation_activator::Server for TestGenerationActivator {
-        fn activate(
-            self: capnp::capability::Rc<Self>,
-            _params: membrane_capnp::generation_activator::ActivateParams,
-            _results: membrane_capnp::generation_activator::ActivateResults,
-        ) -> Promise<(), capnp::Error> {
-            self.activations.set(self.activations.get() + 1);
-            if self.seq != self.current.get() {
-                return Promise::err(membrane::stale_epoch_error(
-                    "test generation activator expired",
-                ));
-            }
-            Promise::ok(())
-        }
-    }
-
-    struct ActivationMembrane {
-        current: Rc<std::cell::Cell<u64>>,
-        pid0_grafts: Rc<std::cell::Cell<u32>>,
-        activations: Rc<std::cell::Cell<u32>>,
-    }
-
-    #[allow(refining_impl_trait)]
-    impl membrane_capnp::membrane::Server for ActivationMembrane {
-        fn graft_pid0(
-            self: capnp::capability::Rc<Self>,
-            _params: membrane_capnp::membrane::GraftPid0Params,
-            mut results: membrane_capnp::membrane::GraftPid0Results,
-        ) -> Promise<(), capnp::Error> {
-            self.pid0_grafts.set(self.pid0_grafts.get() + 1);
-            let seq = self.current.get();
-            let activator: GenerationActivator = capnp_rpc::new_client(TestGenerationActivator {
-                seq,
-                current: self.current.clone(),
-                activations: self.activations.clone(),
-            });
-            let mut builder = results.get();
-            builder.reborrow().init_caps(0);
-            builder.set_activator(activator);
             Promise::ok(())
         }
     }
@@ -3044,7 +3023,6 @@ mod tests {
             host: capnp_rpc::new_client(TestHost),
             runtime: capnp_rpc::new_client(TestRuntime),
             routing: capnp_rpc::new_client(TestRouting),
-            identity: capnp_rpc::new_client(TestIdentity),
             authority: capnp_rpc::new_client(TestAuthority),
             http_client: Some(capnp_rpc::new_client(TestHttpClient)),
             cwd: "/".into(),
@@ -3146,29 +3124,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kernel_bootstrap_does_not_forward_pid0_graft() {
+    async fn pid0_graft_without_private_export_membrane_fails_closed() {
         run_local(async {
-            let pid0_grafts = Rc::new(std::cell::Cell::new(0));
-            let upstream: Membrane = capnp_rpc::new_client(ActivationMembrane {
-                current: Rc::new(std::cell::Cell::new(1)),
-                pid0_grafts: pid0_grafts.clone(),
-                activations: Rc::new(std::cell::Cell::new(0)),
-            });
-            let state: Rc<RefCell<Option<Membrane>>> = Rc::new(RefCell::new(Some(upstream)));
-            let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap { membrane: state });
+            let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(TestRuntime);
+            let membrane: Membrane = capnp_rpc::new_client(TestMembrane { runtime });
+            let response = membrane
+                .graft_request()
+                .send()
+                .promise
+                .await
+                .expect("test graft response");
+            let caps = response.get().unwrap().get_caps().unwrap();
 
-            let error = match bootstrap.graft_pid0_request().send().promise.await {
-                Ok(_) => panic!("reverse-graft bootstrap must not mint pid0 activators"),
+            let error = match get_pid0_export_membrane(&caps) {
+                Ok(_) => panic!("PID0 must reject a graft without its private membrane handoff"),
                 Err(error) => error,
             };
             assert!(
-                error
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains("unimplemented"),
-                "unexpected pid0 graft rejection: {error}"
+                error.to_string().contains(PID0_EXPORT_MEMBRANE_CAP),
+                "missing private handoff must name the absent capability: {error}"
             );
-            assert_eq!(pid0_grafts.get(), 0);
         })
         .await;
     }
@@ -3236,79 +3211,35 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn kernel_retains_generation_activator_through_init_and_calls_once() {
-        run_local(async {
-            let pid0_grafts = Rc::new(std::cell::Cell::new(0));
-            let activations = Rc::new(std::cell::Cell::new(0));
-            let membrane: Membrane = capnp_rpc::new_client(ActivationMembrane {
-                current: Rc::new(std::cell::Cell::new(1)),
-                pid0_grafts: pid0_grafts.clone(),
-                activations: activations.clone(),
-            });
-            let response = membrane
-                .graft_pid0_request()
-                .send()
-                .promise
-                .await
-                .expect("generation graft");
-            let activator = response
-                .get()
-                .expect("generation graft results")
-                .get_activator()
-                .expect("generation-local activator");
-
-            tokio::task::yield_now().await;
-            assert_eq!(
-                complete_generation_initialization(
-                    &activator,
-                    false,
-                    false,
-                    InitdOutcome::default(),
-                )
-                .await
-                .unwrap(),
-                (
-                    GenerationAction::WatchEpoch,
-                    GenerationActivation::Committed
-                )
-            );
-            assert_eq!(pid0_grafts.get(), 1);
-            assert_eq!(activations.get(), 1);
-        })
-        .await;
+    #[test]
+    fn kernel_calls_private_readiness_once_after_successful_init() {
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            complete_generation_initialization(false, false, InitdOutcome::default(), || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap(),
+            (
+                GenerationAction::WatchEpoch,
+                GenerationActivation::Committed
+            )
+        );
+        assert_eq!(calls.get(), 1);
     }
 
-    #[tokio::test]
-    async fn stale_generation_activation_restarts_without_retry() {
-        run_local(async {
-            let current = Rc::new(std::cell::Cell::new(1));
-            let pid0_grafts = Rc::new(std::cell::Cell::new(0));
-            let activations = Rc::new(std::cell::Cell::new(0));
-            let membrane: Membrane = capnp_rpc::new_client(ActivationMembrane {
-                current: current.clone(),
-                pid0_grafts: pid0_grafts.clone(),
-                activations: activations.clone(),
-            });
-            let response = membrane.graft_pid0_request().send().promise.await.unwrap();
-            let activator = response.get().unwrap().get_activator().unwrap();
-            current.set(2);
-
-            assert_eq!(
-                complete_generation_initialization(
-                    &activator,
-                    true,
-                    false,
-                    InitdOutcome::default(),
-                )
-                .await
-                .unwrap(),
-                (GenerationAction::WatchEpoch, GenerationActivation::Stale)
-            );
-            assert_eq!(activations.get(), 1, "stale activation is not retried");
-            assert_eq!(pid0_grafts.get(), 1, "restart is owned by outer loop");
-        })
-        .await;
+    #[test]
+    fn stale_kernel_ready_result_restarts_without_retry() {
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            complete_generation_initialization(true, false, InitdOutcome::default(), || {
+                calls.set(calls.get() + 1);
+                Err(ReadyError::StaleGeneration)
+            })
+            .unwrap(),
+            (GenerationAction::WatchEpoch, GenerationActivation::Stale)
+        );
+        assert_eq!(calls.get(), 1, "stale readiness commit is not retried");
     }
 
     #[tokio::test]
@@ -3335,8 +3266,8 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_initial_init_failure_does_not_trigger_a_restart_loop() {
-        let action = generation_action(
+    fn initial_init_failure_is_surfaced_without_a_restart_loop() {
+        let error = generation_action(
             false,
             false,
             InitdOutcome {
@@ -3344,12 +3275,31 @@ mod tests {
                 failures: 1,
             },
         )
-        .expect("ordinary initial failure retains daemon lifecycle");
-        assert_eq!(
-            action,
-            GenerationAction::WatchEpoch,
-            "an init error alone must not be interpreted as an epoch transition"
+        .expect_err("initial init failure must fail instead of entering the epoch watch");
+        assert!(
+            error.to_string().contains(INITIAL_INIT_FAILED),
+            "initial failure must carry the stable failure marker: {error}"
         );
+    }
+
+    #[test]
+    fn failed_initial_generation_never_invokes_kernel_ready() {
+        let calls = std::cell::Cell::new(0);
+        let error = complete_generation_initialization(
+            false,
+            false,
+            InitdOutcome {
+                blocked: false,
+                failures: 1,
+            },
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("initial init failure must precede readiness commit");
+        assert!(error.to_string().contains(INITIAL_INIT_FAILED));
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]
@@ -3376,30 +3326,24 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn failed_replacement_never_invokes_generation_activator() {
-        run_local(async {
-            let activations = Rc::new(std::cell::Cell::new(0));
-            let activator: GenerationActivator = capnp_rpc::new_client(TestGenerationActivator {
-                seq: 2,
-                current: Rc::new(std::cell::Cell::new(2)),
-                activations: activations.clone(),
-            });
-            let error = complete_generation_initialization(
-                &activator,
-                true,
-                false,
-                InitdOutcome {
-                    blocked: false,
-                    failures: 1,
-                },
-            )
-            .await
-            .expect_err("replacement init failure must precede activation");
-            assert!(error.to_string().contains(EPOCH_RESTART_INIT_FAILED));
-            assert_eq!(activations.get(), 0);
-        })
-        .await;
+    #[test]
+    fn failed_replacement_never_invokes_kernel_ready() {
+        let calls = std::cell::Cell::new(0);
+        let error = complete_generation_initialization(
+            true,
+            false,
+            InitdOutcome {
+                blocked: false,
+                failures: 1,
+            },
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("replacement init failure must precede readiness commit");
+        assert!(error.to_string().contains(EPOCH_RESTART_INIT_FAILED));
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]
@@ -5201,24 +5145,23 @@ mod tests {
     #[test]
     fn schema_returns_bytes_for_each_known_cap() {
         let builtin = make_schema_builtin();
-        for name in [
-            "host",
-            "runtime",
-            "routing",
-            "identity",
-            "http",
-            "http-client",
-        ] {
-            let cap = test_cap(name, "test-cid");
-            let result = call_builtin(&builtin, &[cap]).unwrap_or_else(|e| {
-                panic!("schema for '{name}' returned error: {e}");
-            });
-            match result {
-                Val::Bytes(bytes) => assert!(
-                    !bytes.is_empty(),
-                    "schema for '{name}' returned empty bytes"
-                ),
-                other => panic!("schema for '{name}' returned {other:?}, expected Val::Bytes"),
+        for capability in SCHEMA_CAPABILITIES {
+            for name in std::iter::once(capability.name)
+                .chain(capability.aliases.iter().copied())
+            {
+                let cap = test_cap(name, "test-cid");
+                let result = call_builtin(&builtin, &[cap]).unwrap_or_else(|e| {
+                    panic!("schema for '{name}' returned error: {e}");
+                });
+                match result {
+                    Val::Bytes(bytes) => assert!(
+                        !bytes.is_empty(),
+                        "schema for '{name}' returned empty bytes"
+                    ),
+                    other => {
+                        panic!("schema for '{name}' returned {other:?}, expected Val::Bytes")
+                    }
+                }
             }
         }
     }
@@ -5233,6 +5176,16 @@ mod tests {
             Some(glia::error::tag::PERMISSION_DENIED)
         );
         assert!(glia::error::message(&err).unwrap().contains("nonexistent"));
+        assert_eq!(
+            glia::error::hint(&err),
+            Some(
+                format!(
+                    "schemas registered for: {}",
+                    schema_capability_names()
+                )
+                .as_str()
+            )
+        );
     }
 
     #[test]
@@ -5255,18 +5208,22 @@ mod tests {
     #[test]
     fn doc_returns_summary_for_each_cap() {
         let builtin = make_doc_builtin();
-        for name in ["host", "runtime", "routing", "identity", "http"] {
-            let cap = test_cap(name, "test-cid-123");
-            let result = call_builtin(&builtin, &[cap]).unwrap();
-            match result {
-                Val::Str(s) => {
-                    assert!(s.contains(name), "doc for '{name}' missing cap name: {s}");
-                    assert!(
-                        s.contains("test-cid-123"),
-                        "doc for '{name}' missing schema cid: {s}"
-                    );
+        for capability in SCHEMA_CAPABILITIES {
+            for name in std::iter::once(capability.name)
+                .chain(capability.aliases.iter().copied())
+            {
+                let cap = test_cap(name, "test-cid-123");
+                let result = call_builtin(&builtin, &[cap]).unwrap();
+                match result {
+                    Val::Str(s) => {
+                        assert!(s.contains(name), "doc for '{name}' missing cap name: {s}");
+                        assert!(
+                            s.contains("test-cid-123"),
+                            "doc for '{name}' missing schema cid: {s}"
+                        );
+                    }
+                    other => panic!("doc for '{name}' returned {other:?}, expected Val::Str"),
                 }
-                other => panic!("doc for '{name}' returned {other:?}, expected Val::Str"),
             }
         }
     }

@@ -1,7 +1,16 @@
-package wetware:kernel;
+package wetware:kernel-runtime@1.0.0;
 
-use wetware:streams/streams;
+/// Private native-host ABI installed only for the trusted PID0 component.
+interface readiness {
+    enum ready-error {
+        stale-generation,
+    }
 
-world streams-import {
-    import streams;
+    /// Commit the generation bound by PID0's most recent process-local graft.
+    /// The guest supplies no generation identifier or bearer token.
+    kernel-ready: func() -> result<_, ready-error>;
+}
+
+world pid0 {
+    import readiness;
 }

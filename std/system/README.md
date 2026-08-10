@@ -34,6 +34,9 @@ the host-provided `InitialGrants` received by the child.
 
 ## Relationship to the kernel
 
-The trusted pid0 kernel is the exception: it receives the full `Membrane` and
-uses `serve()` to re-export its membrane policy surface. Ordinary agents receive
-only `InitialGrants` and use `run()` unless they also export a capability.
+The trusted pid0 kernel is the exception: it receives a process-local root
+`Membrane`, whose graft includes a distinct ordinary `Membrane` for publication.
+PID0 uses `serve()` to export that ordinary membrane policy surface. Its private
+`kernel_ready()` host import is separate from `system`, absent from ordinary-cell
+linkers, and cannot be re-exported as a capability. Ordinary agents receive only
+`InitialGrants` and use `run()` unless they also export a capability.
