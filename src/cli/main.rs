@@ -1616,6 +1616,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                     version_info,
                     runtime_status: runtime_status.clone(),
                     kernel_ready_gate: kernel_ready_gate.clone(),
+                    route_registry: route_registry.clone(),
                     fuel_registry: fuel_registry.clone(),
                     rpc_metrics: rpc_metrics.clone(),
                     cache_metrics: cache_metrics.clone(),

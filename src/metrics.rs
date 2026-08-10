@@ -245,6 +245,7 @@ struct AdminState {
     version_info: VersionInfo,
     runtime_status: RuntimeStatus,
     kernel_ready_gate: Arc<authority::KernelReadyGate>,
+    route_registry: Option<rpc::dispatch::RouteRegistry>,
     fuel_registry: FuelRegistry,
     rpc_metrics: RpcMetricsRegistry,
     cache_metrics: CacheMetricsRegistry,
@@ -410,12 +411,20 @@ async fn healthz_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
-/// `GET /readyz` — reports trusted PID0's authoritative readiness commit.
+/// `GET /readyz` — reports the current PID0 commit and a live HTTP route.
 async fn readyz_handler(State(state): State<AdminState>) -> impl IntoResponse {
     let status = state.runtime_status.snapshot();
-    let ready = state.kernel_ready_gate.is_ready();
+    let kernel_ready = state.kernel_ready_gate.is_ready();
+    let routes_ready = state
+        .route_registry
+        .as_ref()
+        .map(|registry| matches!(rpc::dispatch::live_route_count(registry), Ok(count) if count > 0))
+        .unwrap_or(true);
+    let ready = kernel_ready && routes_ready;
     let phase = if ready {
         "ready".to_string()
+    } else if kernel_ready {
+        "waiting-for-http-route".to_string()
     } else if matches!(status.phase.as_str(), "starting-kernel" | "ready") {
         "kernel-not-ready".to_string()
     } else {
@@ -544,6 +553,8 @@ pub struct AdminService {
     pub runtime_status: RuntimeStatus,
     /// The sole host-observable PID0 readiness state.
     pub kernel_ready_gate: Arc<authority::KernelReadyGate>,
+    /// When WAGI serving is enabled, readiness also requires a live route.
+    pub route_registry: Option<rpc::dispatch::RouteRegistry>,
     pub fuel_registry: FuelRegistry,
     pub rpc_metrics: RpcMetricsRegistry,
     pub cache_metrics: CacheMetricsRegistry,
@@ -565,6 +576,7 @@ impl crate::services::Service for AdminService {
                 version_info: self.version_info,
                 runtime_status: self.runtime_status,
                 kernel_ready_gate: self.kernel_ready_gate,
+                route_registry: self.route_registry,
                 fuel_registry: self.fuel_registry,
                 rpc_metrics: self.rpc_metrics,
                 cache_metrics: self.cache_metrics,
@@ -638,6 +650,7 @@ mod tests {
             },
             runtime_status: RuntimeStatus::starting(),
             kernel_ready_gate,
+            route_registry: None,
             fuel_registry: new_fuel_registry(),
             rpc_metrics: new_rpc_metrics(),
             cache_metrics: new_cache_metrics(),
@@ -689,6 +702,19 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["ready"], true);
         assert_eq!(body["phase"], "ready");
+    }
+
+    #[tokio::test]
+    async fn readyz_waits_for_a_live_http_route_after_kernel_commits() {
+        let mut state = test_state();
+        state.route_registry = Some(rpc::dispatch::new_registry());
+        state.kernel_ready_gate.bind_generation(1);
+        state.kernel_ready_gate.kernel_ready().unwrap();
+
+        let (code, body) = readyz_json(&state).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["phase"], "waiting-for-http-route");
     }
 
     #[tokio::test]
