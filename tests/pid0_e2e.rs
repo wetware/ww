@@ -31,6 +31,7 @@ use support::atom::AtomFixture;
 use support::terminal::{expect_stale_host, TerminalSession};
 
 const KERNEL_WASM_PATH: &str = "std/kernel/bin/main.wasm";
+const KERNEL_NEXT_WASM_PATH: &str = "std/kernel-next/bin/main.wasm";
 const STATUS_WASM_PATH: &str = "std/status/bin/status.wasm";
 const STATUS_LAYER: &str = "std/status";
 const DEFAULT_KUBO_ADDR: &str = "127.0.0.1:5001";
@@ -900,6 +901,92 @@ async fn current_embedded_glia_pid0_lifecycle_baseline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kernel_next_path_boots_status_and_preserves_tty_lifecycle() {
+    let _guard = e2e_lock().await;
+    let kernel_next = required_artifact(KERNEL_NEXT_WASM_PATH);
+    required_artifact(STATUS_WASM_PATH);
+    let kernel_path = Path::new(KERNEL_NEXT_WASM_PATH)
+        .canonicalize()
+        .expect("canonicalize kernel-next artifact");
+    let (kubo_addr, client) = require_kubo().await;
+    let admin_addr = unused_addr().await;
+    let http_addr = unused_addr().await;
+    let home = tempfile::tempdir().expect("create isolated HOME");
+    let mut options = NodeOptions::embedded(Some(http_addr));
+    options.kernel_cli = Some(format!("file:{}", kernel_path.display()));
+    let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+
+    let ready = wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
+    assert_eq!(ready["phase"], "ready");
+    let identity = version(&client, admin_addr).await;
+    assert_eq!(
+        identity["kernel_source"],
+        format!("file:{}", kernel_path.display())
+    );
+    assert_eq!(
+        identity["kernel_cid"],
+        ww::kernel::runtime_cid(&kernel_next).to_string()
+    );
+    assert_status_route(&client, http_addr).await;
+
+    let live_logs = node.logs();
+    assert_eq!(
+        count_log_lines(&live_logs, "generation 0 committed readiness"),
+        1,
+        "kernel-next must commit readiness once after route initialization\n{live_logs}"
+    );
+    assert!(
+        !live_logs.contains("❯"),
+        "kernel-next must not start the Glia REPL\n{live_logs}"
+    );
+
+    node.close_stdin();
+    let exit = node.wait(EXIT_TIMEOUT).await;
+    let logs = node.logs();
+    assert_eq!(exit.code(), Some(0), "unexpected host exit\n{logs}");
+    assert!(
+        logs.contains("Kernel exited") && logs.contains("code=0"),
+        "host did not propagate kernel-next's TTY EOF exit\n{logs}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kernel_next_missing_status_fails_before_readiness_commit() {
+    let _guard = e2e_lock().await;
+    required_artifact(KERNEL_NEXT_WASM_PATH);
+    let (kubo_addr, _client) = require_kubo().await;
+    let kernel_path = Path::new(KERNEL_NEXT_WASM_PATH)
+        .canonicalize()
+        .expect("canonicalize kernel-next artifact");
+    let image = tempfile::tempdir().expect("create image without status component");
+    std::fs::write(image.path().join("generation.txt"), b"missing status\n")
+        .expect("write non-empty image marker");
+    let admin_addr = unused_addr().await;
+    let http_addr = unused_addr().await;
+    let home = tempfile::tempdir().expect("create isolated HOME");
+    let mut options = NodeOptions::embedded(Some(http_addr));
+    options.mounts = vec![image.path().display().to_string()];
+    options.kernel_cli = Some(format!("file:{}", kernel_path.display()));
+    let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+
+    let exit = node.wait(EXIT_TIMEOUT).await;
+    let logs = node.logs();
+    assert_eq!(
+        exit.code(),
+        Some(1),
+        "missing status component must fail kernel-next\n{logs}"
+    );
+    assert!(
+        logs.contains("INITIAL_INIT_FAILED"),
+        "kernel-next must identify initial composition failure\n{logs}"
+    );
+    assert!(
+        !logs.contains("committed readiness"),
+        "kernel-next committed readiness after failed initialization\n{logs}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_kernel_path_reaches_ready_and_cli_overrides_env() {
     let _guard = e2e_lock().await;
     let embedded_kernel = required_artifact(KERNEL_WASM_PATH);
@@ -1105,6 +1192,75 @@ async fn missing_and_corrupt_status_artifacts_fail_before_readiness_commit() {
             "the guest must fail initialization before committing readiness\n{logs}"
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn kernel_next_regrafts_and_rebuilds_status_after_epoch_replacement() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let _guard = e2e_lock().await;
+            required_artifact(KERNEL_NEXT_WASM_PATH);
+            let kernel_path = Path::new(KERNEL_NEXT_WASM_PATH)
+                .canonicalize()
+                .expect("canonicalize kernel-next artifact");
+            let status_wasm = required_artifact(STATUS_WASM_PATH);
+            let (kubo_addr, client) = require_kubo().await;
+            let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
+            let epoch1 = EpochRoot::valid(&ipfs, &status_wasm, 1).await;
+            let epoch2 = EpochRoot::valid(&ipfs, &status_wasm, 2).await;
+            let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
+            let initial_receipt = atom.set_head(&epoch1.cid).await;
+
+            let admin_addr = unused_addr().await;
+            let http_addr = unused_addr().await;
+            let listen_addr = unused_addr().await;
+            let home = tempfile::tempdir().expect("create isolated epoch HOME");
+            let (_signing_key, identity_path, _peer_id) = persistent_identity(home.path());
+            let mut options =
+                epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
+            options.kernel_cli = Some(format!("file:{}", kernel_path.display()));
+            let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+            let ready_url = format!("http://{admin_addr}/readyz");
+
+            let initial_ready = wait_for_ready(&client, &ready_url, &mut node).await;
+            assert_eq!(initial_ready["phase"], "ready");
+            assert_status_route(&client, http_addr).await;
+
+            let replacement_receipt = atom.set_head(&epoch2.cid).await;
+            assert!(
+                replacement_receipt.block_number > initial_receipt.block_number,
+                "Atom head updates must be mined in order"
+            );
+            wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
+            let replacing = wait_for_not_ready(&client, admin_addr, &mut node).await;
+            assert_eq!(replacing["phase"], "kernel-not-ready");
+
+            let recovered = wait_for_ready(&client, &ready_url, &mut node).await;
+            assert_eq!(recovered["phase"], "ready");
+            assert_status_route(&client, http_addr).await;
+
+            let logs = node.logs();
+            assert_eq!(
+                count_log_lines(
+                    &logs,
+                    "pid0 host authority became stale; re-grafting and rebuilding composition"
+                ),
+                1,
+                "one epoch transition must cause one kernel-next re-graft\n{logs}"
+            );
+            assert_eq!(
+                count_log_lines(&logs, "generation 0 committed readiness"),
+                1,
+                "initial generation must commit readiness once\n{logs}"
+            );
+            assert_eq!(
+                count_log_lines(&logs, "generation 1 committed readiness"),
+                1,
+                "replacement generation must commit readiness once\n{logs}"
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

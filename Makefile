@@ -5,7 +5,7 @@
 
 WASM_TARGET := wasm32-wasip2
 
-.PHONY: all host std kernel shell status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
+.PHONY: all host std kernel kernel-next shell status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
 .PHONY: publish-std try-publish-std publish test-deps test test-wasm check-glia-effects authority-probe
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
@@ -45,12 +45,18 @@ check-glia-effects:
 
 # --- Std components ----------------------------------------------------------
 
-std: kernel shell status
+std: kernel kernel-next shell status
 
 kernel:
 	cargo build -p kernel --target $(WASM_TARGET) --release --manifest-path std/kernel/Cargo.toml
 	@mkdir -p std/kernel/bin
 	cp std/kernel/target/$(WASM_TARGET)/release/kernel.wasm std/kernel/bin/main.wasm
+
+# Transitional, opt-in Rust pid0. The host does not embed or publish it.
+kernel-next:
+	cargo build -p kernel-next --target $(WASM_TARGET) --release --manifest-path std/kernel-next/Cargo.toml
+	@mkdir -p std/kernel-next/bin
+	cp std/kernel-next/target/$(WASM_TARGET)/release/kernel_next.wasm std/kernel-next/bin/main.wasm
 
 shell:
 	cargo build -p shell --target $(WASM_TARGET) --release --manifest-path std/shell/Cargo.toml
@@ -190,6 +196,7 @@ publish: host
 test-wasm: std
 	@echo "Verifying WASM artifacts..."
 	@test -f std/kernel/bin/main.wasm  || { echo "FAIL: kernel WASM missing"; exit 1; }
+	@test -f std/kernel-next/bin/main.wasm || { echo "FAIL: kernel-next WASM missing"; exit 1; }
 	@test -f std/shell/bin/shell.wasm  || { echo "FAIL: shell WASM missing"; exit 1; }
 	@test -f std/status/bin/status.wasm || { echo "FAIL: status WASM missing"; exit 1; }
 	@echo "WASM artifacts OK (no test suite yet — see Makefile for guidance)"
@@ -204,6 +211,7 @@ run-kernel: kernel
 clean:
 	cargo clean
 	rm -f std/kernel/bin/main.wasm
+	rm -f std/kernel-next/bin/main.wasm
 	rm -f std/shell/bin/shell.wasm
 	rm -f std/status/bin/status.wasm
 	$(MAKE) -C examples/chess clean

@@ -19,6 +19,7 @@ members = [
 exclude = [
     "std/caps",          # WASI guest lib — targets wasm32-wasip2, not host
     "std/kernel",        # WASI guest — targets wasm32-wasip2, not host
+    "std/kernel-next",   # Opt-in WASI pid0 guest — targets wasm32-wasip2
     "std/shell",         # WASI guest — targets wasm32-wasip2, not host
     "examples/echo",     # WASI guest — targets wasm32-wasip2, not host
     "examples/counter",  # WASI guest — targets wasm32-wasip2, not host
