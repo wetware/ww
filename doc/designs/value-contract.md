@@ -1,9 +1,9 @@
 # Glia Value Contract
 
-Status: PROPOSED — revised 2026-07-31 after /plan-eng-review with three
-adversarial outside-voice rounds. Marked ACCEPTED only after PR-4 of the
-roadmap in §11 lands (callable semantics are part of the contract and are
-settled there).
+Status: PARTIALLY SHIPPED / REMAINDER REJECTED — PR-0 shipped as #632. PR-1
+through PR-4 did not ship and were superseded by the August 2026 decision to
+archive the Glia language work on `archive/glia-2026-08`. This document is
+retained as design history, not an active roadmap.
 Scope: the invariants shared by all Glia runtime values, and the staged plan
 that makes them true. Individual collection designs (vector, seq API,
 strings, laziness, durable encoding) build on this contract and are
@@ -239,21 +239,21 @@ marshalling) is a separate surface and may diverge.
 Equal-key representative retention **matches** Clojure (deliberate
 alignment, §5).
 
-## 11. Roadmap (staged; no production code authorized by this document)
+## 11. Historical roadmap
 
 | PR | Content | Gate |
 |---|---|---|
-| **PR-0** | Remove `Val::Cell` → tagged map + kernel `CellSpec` via canonical `parse_cell_spec` (validate-before-load, unknown keys rejected, sorted wire grants); `cell?` predicate; migrate both evaluator paths (`eval_cell_expr`, `eval_cell_raw`), kernel consumers and tests; two cap-status tests flip deliberately (zero-grant cell becomes authority-free) | first; independent |
-| **PR-1** | Control-state extraction (private `Control`; narrow public native signal `Raise/Resume`; `Dispatch::call` + `unwrap_thrown` migration across the four dependent packages); `Cap` + `EffectTarget` encapsulation (opaque identity type, constructor-only minting, kernel accessor/downcast API) | before collections |
-| **PR-2** | Collections core on the final control-free `Val`: float + sequential equality with unified hashing; `Eq` removals; lawful `u64`-bucket key engine; `ValSet` + `conj`/`disj`/`contains?`/`count`/`empty?` + seam dedup; representative retention; wrapper-owned equality/hash/iterators; `nan?`/`finite?`; deterministic set/map print order + string escaping (needed by the round-trip suite); property + im-pinning tests (NaN duplicate accumulation, no-op removal, drop-count, set-op amplification, retention); NaN-flood stress and hit/miss retention benches; `im-rc = "=15.1.0"`; kernel WASM size measurement | the original Stage 1 heart |
-| **PR-3** | Printer/reader: `##` literals, numeric float grammar, recursive full-entry sort key, token-safety, `Bytes`/`Atom` forms; round-trip tests extended to non-finite floats | callable print forms stay unfrozen |
-| **PR-4** | **Callable semantics and representation.** First settle the user-visible contract: HOF admission of native callables (today `map`/`filter`/`reduce` reject them via `extract_fn`), `type` results (today four tags), sync/async observability, macro as a semantic kind, callable identity semantics (replacing incidental env-pointer identity with minted tokens), Display/error forms. Representation unification behind one sealed `Callable` is then an implementation consequence, not the premise | **gates ACCEPTED** |
+| **PR-0** | Remove `Val::Cell` → tagged map + kernel `CellSpec` via canonical `parse_cell_spec` (validate-before-load, unknown keys rejected, sorted wire grants); `cell?` predicate; migrate both evaluator paths (`eval_cell_expr`, `eval_cell_raw`), kernel consumers and tests; two cap-status tests flip deliberately (zero-grant cell becomes authority-free) | **shipped (#632)** |
+| **PR-1** | Control-state extraction (private `Control`; narrow public native signal `Raise/Resume`; `Dispatch::call` + `unwrap_thrown` migration across the four dependent packages); `Cap` + `EffectTarget` encapsulation (opaque identity type, constructor-only minting, kernel accessor/downcast API) | **rejected / archived** |
+| **PR-2** | Collections core on the final control-free `Val`: float + sequential equality with unified hashing; `Eq` removals; lawful `u64`-bucket key engine; `ValSet` + `conj`/`disj`/`contains?`/`count`/`empty?` + seam dedup; representative retention; wrapper-owned equality/hash/iterators; `nan?`/`finite?`; deterministic set/map print order + string escaping (needed by the round-trip suite); property + im-pinning tests (NaN duplicate accumulation, no-op removal, drop-count, set-op amplification, retention); NaN-flood stress and hit/miss retention benches; `im-rc = "=15.1.0"`; kernel WASM size measurement | **superseded** |
+| **PR-3** | Printer/reader: `##` literals, numeric float grammar, recursive full-entry sort key, token-safety, `Bytes`/`Atom` forms; round-trip tests extended to non-finite floats | **superseded** |
+| **PR-4** | **Callable semantics and representation.** First settle the user-visible contract: HOF admission of native callables (today `map`/`filter`/`reduce` reject them via `extract_fn`), `type` results (today four tags), sync/async observability, macro as a semantic kind, callable identity semantics (replacing incidental env-pointer identity with minted tokens), Display/error forms. Representation unification behind one sealed `Callable` is then an implementation consequence, not the premise | **superseded** |
 
-## 12. Open questions register
+## 12. Historical open questions register
 
-- PR-4 callable decisions (listed above) — settled before ACCEPTED.
-- `Bytes` readable literal; map-literal duplicate-key policy — settled
-  with the durable-encoder format decision (DAG-CBOR candidacy included).
-- NaN collision-flood cap — revisit if hostile input reaches unmetered
-  host-side evaluation (TODOS entry).
-- Map seq ordering semantics — settled in the seq-API stage.
+These remained unresolved when the roadmap was superseded:
+
+- PR-4 callable decisions (listed above).
+- `Bytes` readable literal and map-literal duplicate-key policy.
+- NaN collision-flood cap.
+- Map seq ordering semantics.
