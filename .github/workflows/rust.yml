@@ -208,9 +208,17 @@ jobs:
           ipfs bootstrap add "$IPFS_PEER_ADDR"
         fi
         ipfs daemon --enable-gc &
-        for _ in $(seq 1 30); do ipfs id >/dev/null 2>&1 && break; sleep 0.5; done
-        ipfs id >/dev/null
-        KUBO_API_MULTIADDR="$(cat "${IPFS_PATH:-$HOME/.ipfs}/api")"
+        # Plain `ipfs id` can open the repo offline and race the daemon for repo.lock.
+        KUBO_API_FILE="${IPFS_PATH:-$HOME/.ipfs}/api"
+        for _ in $(seq 1 30); do
+          if [ -s "$KUBO_API_FILE" ]; then
+            KUBO_API_MULTIADDR="$(cat "$KUBO_API_FILE")"
+            ipfs --api="$KUBO_API_MULTIADDR" id >/dev/null 2>&1 && break
+          fi
+          sleep 0.5
+        done
+        KUBO_API_MULTIADDR="$(cat "$KUBO_API_FILE")"
+        ipfs --api="$KUBO_API_MULTIADDR" id >/dev/null
         KUBO_API_PORT="${KUBO_API_MULTIADDR##*/tcp/}"
         case "$KUBO_API_PORT" in
           ''|*[!0-9]*) echo "Invalid Kubo API address: $KUBO_API_MULTIADDR" >&2; exit 1 ;;
