@@ -11,8 +11,7 @@ use atom::membrane_capnp;
 use atom::system_capnp;
 use atom::{AtomIndexer, Epoch, IndexerConfig, MembraneServer, TerminalServer};
 use auth::SigningDomain;
-use authority::http_capnp;
-use authority::routing_capnp;
+use authority::{get_graft_cap, http_capnp, routing_capnp};
 use capnp_rpc::new_client;
 use common::{deploy_atom, set_head, spawn_anvil, FullStubSessionBuilder, StubSessionBuilder};
 use ed25519_dalek::SigningKey;
@@ -22,26 +21,6 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
-
-/// Look up a typed capability by name from the graft caps list.
-fn get_graft_cap<T: capnp::capability::FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
-    name: &str,
-) -> Result<T, capnp::Error> {
-    for i in 0..caps.len() {
-        let entry = caps.get(i);
-        let n = entry
-            .get_name()?
-            .to_str()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        if n == name {
-            return entry.get_cap().get_as_capability::<T>();
-        }
-    }
-    Err(capnp::Error::failed(format!(
-        "capability '{name}' not found in graft response"
-    )))
-}
 
 /// Signer that produces libp2p SignedEnvelopes for Terminal challenge-response.
 struct TestSigner {

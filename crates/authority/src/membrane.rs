@@ -6,10 +6,30 @@
 
 use crate::epoch::{Epoch, EpochGuard};
 use crate::membrane_capnp;
-use capnp::capability::Promise;
+use capnp::capability::{FromClientHook, Promise};
 use capnp::Error;
 use capnp_rpc::new_client;
 use tokio::sync::watch;
+
+/// Look up a typed capability by name from a graft response.
+pub fn get_graft_cap<T: FromClientHook>(
+    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
+    name: &str,
+) -> Result<T, capnp::Error> {
+    for entry in caps.iter() {
+        let entry_name = entry
+            .get_name()?
+            .to_str()
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        if entry_name == name {
+            return entry.get_cap().get_as_capability::<T>();
+        }
+    }
+
+    Err(capnp::Error::failed(format!(
+        "capability '{name}' not found in graft response"
+    )))
+}
 
 /// Callback trait for populating the graft response with capabilities.
 ///

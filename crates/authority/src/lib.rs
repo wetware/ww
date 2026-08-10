@@ -248,7 +248,7 @@ pub use call_guard::{call_failure_code, stale_epoch_error, CallFailureCode};
 pub use epoch::{Epoch, EpochGuard, Provenance};
 pub use issuer::{AuthorityServer, KeyMethodAuthorization, PolicyCompileError};
 pub use kernel_ready::{KernelReadyError, KernelReadyGate};
-pub use membrane::{membrane_client, GraftBuilder, MembraneServer, NoExtension};
+pub use membrane::{get_graft_cap, membrane_client, GraftBuilder, MembraneServer, NoExtension};
 pub use terminal::{
     AllowAllPolicy, AuthPolicy, AuthenticatedIdentity, AuthorizationError, FixedSessionPolicy,
     LocalPolicyFuture, SessionGrant, SessionTemplate, TerminalServer, DEFAULT_POLICY_TIMEOUT,
