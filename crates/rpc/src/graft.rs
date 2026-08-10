@@ -639,8 +639,6 @@ mod tests {
     struct RuntimeStub;
     impl system_capnp::runtime::Server for RuntimeStub {}
 
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     #[derive(Clone)]
     struct CountingGraftBuilder {
         grafts: Rc<Cell<u32>>,
@@ -690,16 +688,10 @@ mod tests {
         export_grafts: Rc<Cell<u32>>,
     }
 
-    fn split_test_membranes(
-        epoch_rx: watch::Receiver<Epoch>,
-        activated_seq: Arc<AtomicU64>,
-    ) -> SplitTestMembranes {
+    fn split_test_membranes(epoch_rx: watch::Receiver<Epoch>) -> SplitTestMembranes {
         let root_grafts = Rc::new(Cell::new(0));
         let export_grafts = Rc::new(Cell::new(0));
-        let readiness_gate = Arc::new(authority::KernelReadyGate::new(
-            epoch_rx.clone(),
-            activated_seq,
-        ));
+        let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
         let export = capnp_rpc::new_client(MembraneServer::new(
             epoch_rx.clone(),
             CountingGraftBuilder {
@@ -906,11 +898,7 @@ mod tests {
                     issued_seq: 1,
                     receiver: epoch_rx.clone(),
                 };
-                let activated_seq = Arc::new(AtomicU64::new(0));
-                let readiness_gate = Arc::new(authority::KernelReadyGate::new(
-                    epoch_rx.clone(),
-                    activated_seq,
-                ));
+                let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
                 let grafts = Rc::new(Cell::new(0));
                 let export_membrane: GuestMembrane = capnp_rpc::new_client(MembraneServer::new(
                     epoch_rx,
@@ -965,8 +953,7 @@ mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
-                let activated_seq = Arc::new(AtomicU64::new(0));
-                let split = split_test_membranes(epoch_rx, activated_seq.clone());
+                let split = split_test_membranes(epoch_rx);
 
                 split
                     .root
@@ -988,7 +975,7 @@ mod tests {
                     split.readiness_gate.kernel_ready(),
                     Err(KernelReadyError::StaleGeneration)
                 );
-                assert_eq!(activated_seq.load(Ordering::Acquire), 0);
+                assert!(!split.readiness_gate.is_ready());
                 assert_eq!(split.root_grafts.get(), 1);
                 assert_eq!(split.export_grafts.get(), 1);
             })
@@ -1000,8 +987,7 @@ mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
-                let activated_seq = Arc::new(AtomicU64::new(0));
-                let split = split_test_membranes(epoch_rx, activated_seq.clone());
+                let split = split_test_membranes(epoch_rx);
 
                 split.root.graft_request().send().promise.await.unwrap();
                 epoch_tx.send_replace(test_epoch(2));
@@ -1011,7 +997,7 @@ mod tests {
                 );
                 split.root.graft_request().send().promise.await.unwrap();
 
-                assert_eq!(activated_seq.load(Ordering::Acquire), 0);
+                assert!(!split.readiness_gate.is_ready());
 
                 for _ in 0..2 {
                     split
@@ -1019,14 +1005,14 @@ mod tests {
                         .kernel_ready()
                         .expect("duplicate current E2 commit is idempotent");
                 }
-                assert_eq!(activated_seq.load(Ordering::Acquire), 2);
+                assert!(split.readiness_gate.is_ready());
 
                 epoch_tx.send_replace(test_epoch(3));
                 assert_eq!(
                     split.readiness_gate.kernel_ready(),
                     Err(KernelReadyError::StaleGeneration)
                 );
-                assert_eq!(activated_seq.load(Ordering::Acquire), 2);
+                assert!(!split.readiness_gate.is_ready());
                 assert_eq!(split.root_grafts.get(), 2);
                 assert_eq!(split.export_grafts.get(), 0);
             })
@@ -1121,12 +1107,12 @@ mod tests {
                     }
                 })
                 .await
-                .expect("route target readiness preflight");
+                .expect("route target preflight");
                 assert_eq!(crate::dispatch::live_route_count(&registry), Ok(1));
 
-                // Readiness probes and external clients may perform additional
-                // grafts during one pid0 generation. Those grafts must not
-                // invalidate the generation's live route.
+                // External clients may perform additional grafts during one
+                // pid0 generation. Those grafts must not invalidate the
+                // generation's live route.
                 let mut replacement_message = capnp::message::Builder::new_default();
                 let mut replacement_cap_table = Vec::new();
                 {
@@ -1147,7 +1133,7 @@ mod tests {
                 // Failed init or pid0 exit drops the execution-generation
                 // owner. The route retains its issuing Host as a grant, but
                 // that back-reference owns only a receiver and therefore
-                // cannot prolong readiness.
+                // cannot prolong route liveness.
                 drop(registration_scope);
                 assert_eq!(
                     crate::dispatch::live_route_count(&registry),
@@ -1182,11 +1168,7 @@ mod tests {
                 let (host_stream, guest_stream) = io::duplex(16 * 1024);
                 let (host_reader, host_writer) = io::split(host_stream);
                 let (guest_reader, guest_writer) = io::split(guest_stream);
-                let activated_seq = Arc::new(AtomicU64::new(0));
-                let readiness_gate = Arc::new(authority::KernelReadyGate::new(
-                    epoch_rx.clone(),
-                    activated_seq.clone(),
-                ));
+                let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
 
                 let (host_rpc, _guest_export, _registration_scope) = build_pid0_membrane_rpc(
                     host_reader,
@@ -1256,7 +1238,7 @@ mod tests {
                 readiness_gate
                     .kernel_ready()
                     .expect("commit current pid0 generation");
-                assert_eq!(activated_seq.load(Ordering::Acquire), 1);
+                assert!(readiness_gate.is_ready());
 
                 let caps = response.get().unwrap().get_caps().unwrap();
                 let export = caps
@@ -1295,6 +1277,7 @@ mod tests {
                     Err(KernelReadyError::StaleGeneration),
                     "export-safe graft must not rebind PID0 readiness"
                 );
+                assert!(!readiness_gate.is_ready());
             })
             .await;
     }

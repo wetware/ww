@@ -14,7 +14,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **HttpListener routes require target preflight before becoming live.** Newly
   registered routes remain pending until `executor.cid()` succeeds. A failed
   preflight removes the route instead of exposing it as live with an unknown
-  CID, and pid0 readiness now relies on this stronger live-route definition.
+  CID. Route liveness remains a dispatch property and no longer participates
+  in PID0 readiness.
+- **PID0 readiness has one authoritative transition.** Trusted PID0's private
+  `kernel-ready` host call commits `KernelReadyGate` after init/init.d, and
+  `/readyz` reads that same gate directly. The reverse-graft error poll,
+  bootstrap acknowledgement oneshot, CLI live-route poll, and composed
+  route/runtime readiness state have been removed. Initial and replacement
+  init.d failures exit nonzero before the commit.
 - **Cell values are ordinary tagged data.** `Val::Cell` is removed; `(cell ...)`
   keeps its syntax and early grant validation but now returns an immutable
   tagged map `{:ww/type :cell, :wasm <bytes>, :grants {...}}`. Both host
@@ -39,8 +46,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with CLI-first precedence and no fallback after explicit failures. The host
   resolves exact bytes once, reports their runtime CID through a late-bound
   `/version`, injects a native/PID0 WIT-and-Cap'n-Proto ABI fingerprint, and
-  fails HTTP startup within a named bound when the mounted status route is
-  missing or unusable.
+  fails closed when the selected component is absent, malformed, or ABI
+  incompatible.
 - **Current embedded pid0 lifecycle baseline.** Host integration CI now builds
   the standard WASI artifacts before launching the real `ww` binary with its
   embedded Glia kernel. The baseline pins cold-boot readiness transitions,
@@ -54,9 +61,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cleanup, and nonzero replacement-init failure.
 - **Child-authority lifecycle and substrate scenarios.** Trusted pid0 services
   now re-graft and rerun init after structured epoch staleness; epoch-owned HTTP
-  route leases clean up by identity, and readiness reflects live current-epoch
-  registration. Real-WASM scenarios cover explicit, attenuated, descendant,
-  and late-delegated grants without changing the immutable birth record.
+  route leases clean up by identity, while readiness reflects only the current
+  PID0 generation commit. Real-WASM scenarios cover explicit, attenuated,
+  descendant, and late-delegated grants without changing the immutable birth record.
   Byte-loaded children receive a private empty read-only root and writable
   per-child `/tmp`; optional host-wired known-CID reads expose no CAS control
   capability or fallback while retaining their network, disk, cache, and
@@ -182,8 +189,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - **Replacement pid0 generations cannot become ready before successful
-  initialization.** Readiness now requires both a live HTTP route and explicit
-  commit by the trusted PID0 kernel through its private Component Model host
+  initialization.** Readiness requires an explicit commit by the trusted PID0
+  kernel through its private Component Model host
   import. The host binds that call to PID0's process-local graft generation;
   the separate network-exportable Membrane never touches readiness state, so
   stale, failed, or foreign grafts cannot activate or reactivate `/readyz`.

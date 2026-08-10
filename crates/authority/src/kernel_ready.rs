@@ -1,11 +1,11 @@
 //! Host-local PID0 generation readiness state.
 //!
-//! This state is shared only between PID0's process-local graft server and the
-//! private Wasm host import. It is deliberately not represented by a Cap'n
-//! Proto capability and is never installed for ordinary child cells.
+//! PID0's process-local graft binds the generation, the private Wasm host
+//! import commits it, and host readiness consumers read the result. The gate
+//! is deliberately not represented by a Cap'n Proto capability and the import
+//! is never installed for ordinary child cells.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use tokio::sync::watch;
 
@@ -17,53 +17,71 @@ pub enum KernelReadyError {
     StaleGeneration,
 }
 
-/// The generation bound to trusted PID0's most recent process-local graft.
+/// Authoritative readiness for trusted PID0's current graft generation.
 pub struct KernelReadyGate {
     epoch_rx: watch::Receiver<Epoch>,
-    activated_seq: Arc<AtomicU64>,
-    bound_seq: Mutex<Option<u64>>,
+    state: Mutex<KernelReadyState>,
+}
+
+#[derive(Default)]
+struct KernelReadyState {
+    bound_seq: Option<u64>,
+    committed_seq: Option<u64>,
 }
 
 impl KernelReadyGate {
-    pub fn new(epoch_rx: watch::Receiver<Epoch>, activated_seq: Arc<AtomicU64>) -> Self {
+    pub fn new(epoch_rx: watch::Receiver<Epoch>) -> Self {
         Self {
             epoch_rx,
-            activated_seq,
-            bound_seq: Mutex::new(None),
+            state: Mutex::new(KernelReadyState::default()),
         }
     }
 
     /// Bind readiness to the authoritative generation used for one local PID0 graft.
     pub fn bind_generation(&self, issued_seq: u64) {
-        *self
-            .bound_seq
+        let mut state = self.state.lock().expect("kernel readiness gate poisoned");
+        state.bound_seq = Some(issued_seq);
+        state.committed_seq = None;
+    }
+
+    /// Close readiness when the trusted PID0 execution stops.
+    pub fn clear(&self) {
+        *self.state.lock().expect("kernel readiness gate poisoned") = KernelReadyState::default();
+    }
+
+    /// Whether trusted PID0 committed the currently authoritative generation.
+    ///
+    /// Holding the epoch borrow through the state read prevents an epoch
+    /// publisher from interleaving between the two observations.
+    pub fn is_ready(&self) -> bool {
+        let current = self.epoch_rx.borrow();
+        self.state
             .lock()
-            .expect("kernel readiness gate poisoned") = Some(issued_seq);
+            .map(|state| state.committed_seq == Some(current.seq))
+            .unwrap_or(false)
     }
 
     /// Commit the locally bound generation if it is still authoritative.
     ///
-    /// The watch borrow remains live through the comparison and Release store,
+    /// The watch borrow remains live through the comparison and state commit,
     /// preventing an epoch publisher from interleaving between those actions.
     pub fn kernel_ready(&self) -> Result<(), KernelReadyError> {
-        self.kernel_ready_with_post_store(|| {})
+        self.kernel_ready_with_post_commit(|| {})
     }
 
-    fn kernel_ready_with_post_store(
+    fn kernel_ready_with_post_commit(
         &self,
-        post_store: impl FnOnce(),
+        post_commit: impl FnOnce(),
     ) -> Result<(), KernelReadyError> {
         let current = self.epoch_rx.borrow();
-        let bound_seq = self
-            .bound_seq
-            .lock()
-            .expect("kernel readiness gate poisoned")
-            .ok_or(KernelReadyError::NotBound)?;
+        let mut state = self.state.lock().expect("kernel readiness gate poisoned");
+        let bound_seq = state.bound_seq.ok_or(KernelReadyError::NotBound)?;
         if bound_seq != current.seq {
             return Err(KernelReadyError::StaleGeneration);
         }
-        self.activated_seq.store(bound_seq, Ordering::Release);
-        post_store();
+        state.committed_seq = Some(bound_seq);
+        drop(state);
+        post_commit();
         drop(current);
         Ok(())
     }
@@ -85,33 +103,70 @@ mod tests {
     #[test]
     fn commits_only_the_bound_current_generation() {
         let (_tx, rx) = watch::channel(epoch(7));
-        let activated = Arc::new(AtomicU64::new(6));
-        let gate = KernelReadyGate::new(rx, activated.clone());
+        let gate = KernelReadyGate::new(rx);
+        assert!(!gate.is_ready());
         assert_eq!(gate.kernel_ready(), Err(KernelReadyError::NotBound));
         gate.bind_generation(7);
+        assert!(!gate.is_ready());
         assert_eq!(gate.kernel_ready(), Ok(()));
-        assert_eq!(activated.load(Ordering::Acquire), 7);
+        assert!(gate.is_ready());
     }
 
     #[test]
     fn stale_generation_fails_without_committing_and_rebind_succeeds() {
         let (tx, rx) = watch::channel(epoch(1));
-        let activated = Arc::new(AtomicU64::new(0));
-        let gate = KernelReadyGate::new(rx, activated.clone());
+        let gate = KernelReadyGate::new(rx);
         gate.bind_generation(1);
         tx.send_replace(epoch(2));
         assert_eq!(gate.kernel_ready(), Err(KernelReadyError::StaleGeneration));
-        assert_eq!(activated.load(Ordering::Acquire), 0);
+        assert!(!gate.is_ready());
         gate.bind_generation(2);
         assert_eq!(gate.kernel_ready(), Ok(()));
-        assert_eq!(activated.load(Ordering::Acquire), 2);
+        assert!(gate.is_ready());
     }
 
     #[test]
-    fn kernel_ready_holds_authoritative_borrow_through_release_store() {
+    fn binding_a_generation_closes_a_previous_commit_until_pid0_recommits() {
+        let (_tx, rx) = watch::channel(epoch(1));
+        let gate = KernelReadyGate::new(rx);
+        gate.bind_generation(1);
+        gate.kernel_ready().unwrap();
+        assert!(gate.is_ready());
+
+        gate.bind_generation(1);
+        assert!(!gate.is_ready());
+        gate.kernel_ready().unwrap();
+        assert!(gate.is_ready());
+    }
+
+    #[test]
+    fn generation_zero_is_fail_closed_until_pid0_commits() {
+        let (_tx, rx) = watch::channel(epoch(0));
+        let gate = KernelReadyGate::new(rx);
+        assert!(!gate.is_ready());
+        gate.bind_generation(0);
+        assert!(!gate.is_ready());
+        gate.kernel_ready().unwrap();
+        assert!(gate.is_ready());
+    }
+
+    #[test]
+    fn pid0_exit_clears_a_committed_generation() {
+        let (_tx, rx) = watch::channel(epoch(1));
+        let gate = KernelReadyGate::new(rx);
+        gate.bind_generation(1);
+        gate.kernel_ready().unwrap();
+        assert!(gate.is_ready());
+
+        gate.clear();
+        assert!(!gate.is_ready());
+        assert_eq!(gate.kernel_ready(), Err(KernelReadyError::NotBound));
+    }
+
+    #[test]
+    fn kernel_ready_holds_authoritative_borrow_through_commit() {
         let (tx, rx) = watch::channel(epoch(1));
-        let activated = Arc::new(AtomicU64::new(0));
-        let gate = Arc::new(KernelReadyGate::new(rx, activated.clone()));
+        let gate = std::sync::Arc::new(KernelReadyGate::new(rx));
         gate.bind_generation(1);
 
         let (stored_tx, stored_rx) = std::sync::mpsc::channel();
@@ -119,7 +174,7 @@ mod tests {
         let ready_gate = gate.clone();
         let ready = std::thread::spawn(move || {
             ready_gate
-                .kernel_ready_with_post_store(|| {
+                .kernel_ready_with_post_commit(|| {
                     stored_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                 })
@@ -127,11 +182,10 @@ mod tests {
         });
         stored_rx
             .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("kernel_ready reached its post-store hook");
-        assert_eq!(
-            activated.load(Ordering::Acquire),
-            1,
-            "kernel_ready must perform the Release store before the test hook"
+            .expect("kernel_ready reached its post-commit hook");
+        assert!(
+            gate.is_ready(),
+            "kernel_ready must commit before the test hook"
         );
 
         let (publisher_started_tx, publisher_started_rx) = std::sync::mpsc::channel();
@@ -147,7 +201,7 @@ mod tests {
         assert!(published_rx
             .recv_timeout(std::time::Duration::from_millis(25))
             .is_err(),
-            "epoch publication must remain blocked after the readiness store while kernel_ready holds the borrow"
+            "epoch publication must remain blocked after the readiness commit while kernel_ready holds the borrow"
         );
 
         release_tx.send(()).unwrap();

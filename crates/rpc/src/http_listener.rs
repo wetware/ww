@@ -1462,7 +1462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_replacement_init_leaves_no_stale_readiness_route() {
+    async fn failed_replacement_init_leaves_no_stale_live_route() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {

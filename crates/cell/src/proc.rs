@@ -1021,8 +1021,6 @@ mod tests {
     #[test]
     fn private_kernel_import_maps_gate_results_fail_closed() {
         use authority::{Epoch, Provenance};
-        use std::sync::atomic::{AtomicU64, Ordering};
-
         fn epoch(seq: u64) -> Epoch {
             Epoch {
                 seq,
@@ -1032,23 +1030,23 @@ mod tests {
         }
 
         let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch(1));
-        let activated = Arc::new(AtomicU64::new(0));
-        let gate = authority::KernelReadyGate::new(epoch_rx, activated.clone());
+        let gate = authority::KernelReadyGate::new(epoch_rx);
 
         assert!(matches!(
             commit_kernel_ready(&gate),
             Err(pid0_runtime::wetware::kernel_runtime::readiness::ReadyError::StaleGeneration)
         ));
+        assert!(!gate.is_ready());
         gate.bind_generation(1);
         assert_eq!(commit_kernel_ready(&gate), Ok(()));
-        assert_eq!(activated.load(Ordering::Acquire), 1);
+        assert!(gate.is_ready());
 
         epoch_tx.send_replace(epoch(2));
         assert!(matches!(
             commit_kernel_ready(&gate),
             Err(pid0_runtime::wetware::kernel_runtime::readiness::ReadyError::StaleGeneration)
         ));
-        assert_eq!(activated.load(Ordering::Acquire), 1);
+        assert!(!gate.is_ready());
     }
 
     #[test]
