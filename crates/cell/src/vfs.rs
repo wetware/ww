@@ -84,6 +84,8 @@ pub enum ResolvedNode {
 /// The root is swappable for epoch updates. Directory listings are cached
 /// in a 3-tier stack (memory → disk → network).
 pub struct CidTree {
+    /// The construction-time root CID used in the immutable `WW_ROOT` value.
+    boot_root: Arc<String>,
     /// The current root CID, swapped atomically on epoch updates.
     root: ArcSwap<String>,
     /// IPFS HTTP client for `ls()` calls (directory metadata).
@@ -104,8 +106,10 @@ impl CidTree {
         overrides: HashMap<PathBuf, LocalOverride>,
         staging_dir: PathBuf,
     ) -> Self {
+        let boot_root = Arc::new(root_cid);
         Self {
-            root: ArcSwap::from_pointee(root_cid),
+            root: ArcSwap::from(Arc::clone(&boot_root)),
+            boot_root,
             ipfs,
             dir_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DIR_CACHE_CAPACITY).unwrap(),
@@ -113,6 +117,11 @@ impl CidTree {
             overrides,
             staging_dir,
         }
+    }
+
+    /// The construction-time root CID used to spell deployment-root paths.
+    pub fn boot_root_cid(&self) -> &str {
+        self.boot_root.as_str()
     }
 
     /// The current root CID.
@@ -407,6 +416,7 @@ impl CidTree {
 impl std::fmt::Debug for CidTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CidTree")
+            .field("boot_root", &self.boot_root)
             .field("root", &*self.root.load())
             .field("overrides", &self.overrides.len())
             .finish()
@@ -418,6 +428,22 @@ impl std::fmt::Debug for CidTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_root_remains_immutable_when_current_root_swaps() {
+        let staging_dir = tempfile::tempdir().expect("create staging directory");
+        let tree = CidTree::new(
+            "boot-root".to_string(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
+            HashMap::new(),
+            staging_dir.path().to_path_buf(),
+        );
+
+        tree.swap_root("replacement-root".to_string());
+
+        assert_eq!(tree.boot_root_cid(), "boot-root");
+        assert_eq!(tree.root_cid().as_str(), "replacement-root");
+    }
 
     #[test]
     fn test_path_traversal_rejected() {

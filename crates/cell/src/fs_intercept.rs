@@ -63,6 +63,7 @@ fn ipfs_filesystem(state: &mut ComponentRunStates) -> IpfsFilesystemView<'_> {
 // ── CID path parsing ───────────────────────────────────────────────
 
 /// Parsed IPFS path: CID + optional subpath.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct IpfsCidPath {
     pub cid: cid::Cid,
     pub subpath: String,
@@ -88,6 +89,32 @@ pub(crate) fn parse_ipfs_path(path: &str) -> Option<IpfsCidPath> {
         cid,
         subpath: subpath.to_string(),
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CidTreePath {
+    DeploymentRoot(String),
+    ImmutableIpfs(IpfsCidPath),
+}
+
+/// Classify a guest path while a deployment `CidTree` is active.
+///
+/// Deployment-root aliases resolve relative to the active tree. Explicit paths
+/// for any other valid CID retain immutable IPFS lookup semantics. Inputs that
+/// are not valid IPFS paths continue through `CidTree`, which applies its own
+/// path validation.
+fn classify_cid_tree_path(path: &str, boot_root: &str, current_root: &str) -> CidTreePath {
+    match parse_ipfs_path(path) {
+        Some(ipfs_path) => {
+            let cid = ipfs_path.cid.to_string();
+            if cid == boot_root || cid == current_root {
+                CidTreePath::DeploymentRoot(ipfs_path.subpath)
+            } else {
+                CidTreePath::ImmutableIpfs(ipfs_path)
+            }
+        }
+        None => CidTreePath::DeploymentRoot(path.to_string()),
+    }
 }
 
 // ── CidTree-backed open ───────────────────────────────────────────
@@ -507,23 +534,17 @@ impl types::HostDescriptor for IpfsFilesystemView<'_> {
         // directory CIDs work (open_ipfs is file-only and fails loudly
         // for directories).
         if let Some(ref cid_tree) = self.cid_tree {
-            let rooted_subpath = parse_ipfs_path(&path)
-                .filter(|p| p.cid.to_string() == *cid_tree.root_cid())
-                .map(|p| p.subpath);
-            let target = rooted_subpath.unwrap_or_else(|| {
-                // Non-ipfs path: resolve directly against the CidTree root.
-                path.clone()
-            });
-            // Only skip CidTree for paths that explicitly reference a
-            // different CID — those are content-addressed leaf fetches
-            // and belong in open_ipfs.
-            let is_other_ipfs = parse_ipfs_path(&path)
-                .map(|p| p.cid.to_string() != *cid_tree.root_cid())
-                .unwrap_or(false);
-            if !is_other_ipfs {
-                let cid_tree = Arc::clone(cid_tree);
-                tracing::debug!(path = %target, "CidTree open_at");
-                return self.open_via_cid_tree(&cid_tree, &target, flags).await;
+            let current_root = cid_tree.root_cid();
+            match classify_cid_tree_path(&path, cid_tree.boot_root_cid(), current_root.as_str()) {
+                CidTreePath::DeploymentRoot(target) => {
+                    let cid_tree = Arc::clone(cid_tree);
+                    tracing::debug!(path = %target, "CidTree open_at");
+                    return self.open_via_cid_tree(&cid_tree, &target, flags).await;
+                }
+                CidTreePath::ImmutableIpfs(ipfs_path) => {
+                    tracing::debug!(cid = %ipfs_path.cid, subpath = %ipfs_path.subpath, "Intercepting IPFS open_at");
+                    return self.open_ipfs(ipfs_path, oflags, flags).await;
+                }
             }
         }
 
@@ -756,6 +777,69 @@ mod tests {
         // Valid subpaths still work
         assert!(parse_ipfs_path(&format!("ipfs/{cid_str}/sub/file.txt")).is_some());
         assert!(parse_ipfs_path(&format!("ipfs/{cid_str}/file..name")).is_some());
+    }
+
+    fn test_cid(label: &[u8]) -> String {
+        let multihash =
+            cid::multihash::Multihash::<64>::wrap(0x00, label).expect("test identity multihash");
+        cid::Cid::new_v1(0x55, multihash).to_string()
+    }
+
+    #[test]
+    fn deployment_root_path_classification() {
+        let boot_root = test_cid(b"boot-root");
+        let current_root = test_cid(b"current-root");
+        let foreign_root = test_cid(b"foreign-root");
+
+        let cases = [
+            (
+                "boot CID before swap",
+                format!("ipfs/{boot_root}/bin/status.wasm"),
+                boot_root.as_str(),
+                CidTreePath::DeploymentRoot("bin/status.wasm".to_string()),
+            ),
+            (
+                "boot CID after swap",
+                format!("ipfs/{boot_root}/bin/status.wasm"),
+                current_root.as_str(),
+                CidTreePath::DeploymentRoot("bin/status.wasm".to_string()),
+            ),
+            (
+                "current CID",
+                format!("ipfs/{current_root}/bin/status.wasm"),
+                current_root.as_str(),
+                CidTreePath::DeploymentRoot("bin/status.wasm".to_string()),
+            ),
+            (
+                "foreign CID",
+                format!("ipfs/{foreign_root}/bin/status.wasm"),
+                current_root.as_str(),
+                CidTreePath::ImmutableIpfs(IpfsCidPath {
+                    cid: foreign_root.parse().expect("foreign CID"),
+                    subpath: "bin/status.wasm".to_string(),
+                }),
+            ),
+            (
+                "ordinary path",
+                "bin/status.wasm".to_string(),
+                current_root.as_str(),
+                CidTreePath::DeploymentRoot("bin/status.wasm".to_string()),
+            ),
+            (
+                "traversal-shaped IPFS path",
+                format!("ipfs/{boot_root}/../etc/passwd"),
+                current_root.as_str(),
+                CidTreePath::DeploymentRoot(format!("ipfs/{boot_root}/../etc/passwd")),
+            ),
+        ];
+
+        for (name, path, active_root, expected) in cases {
+            assert_eq!(
+                classify_cid_tree_path(&path, &boot_root, active_root),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     // ── Mock pinner for integration tests ──────────────────────────

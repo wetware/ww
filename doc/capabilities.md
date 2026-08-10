@@ -38,7 +38,7 @@ references exist where*:
 |---------|------------------|------------------|
 | **Initial grants** | Which RPC capability references enter an ordinary child | Edit the spawning `cell :grants` map; respawn |
 | **Terminal authority policy** | Which verified login identity receives which method profile over one application capability | Publish with `host :serve-vat ... :auth policy`; the listener creates one Terminal per stream |
-| **Image root / CAS wiring** | The fixed read-only root and optional known-CID reads | Select the execution context; respawn |
+| **Image root / CAS wiring** | The active read-only deployment root and optional known-CID reads | Select the execution context; advance the epoch or respawn |
 | **Glia bindings** | Names available while trusted Glia composes an authority graph | Edit init; they do not cross a child boundary by lexical capture |
 
 Trusted pid0 receives the host graft; each ordinary child receives only its
@@ -47,7 +47,9 @@ grants and delivered through `InitialGrants.get()`. The root Atom binding flows
 through `stem::Atom` — when the Atom's value changes, `CidTree`'s root
 swaps atomically (`src/vfs.rs:CidTree::swap_root`), and old CIDs the
 cell had cached in memory still resolve to whatever they pointed to,
-but new walks see the new tree. The Glia env layer is where capabilities
+but new walks see the new tree. `$WW_ROOT` keeps its boot-time spelling and
+aliases this active tree; other explicit `/ipfs/<cid>/...` paths remain
+immutable lookups. The Glia env layer is where capabilities
 like `fs`, `routing`, and `host` are bound — restricting access at this
 layer is as simple as not installing the handler. But note the layering
 rule: env bindings and effect handlers are interposition *inside* the
