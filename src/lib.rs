@@ -78,4 +78,4 @@ pub use glia;
 #[cfg(not(target_arch = "wasm32"))]
 pub use cell::{Loader, Proc, ProcBuilder};
 #[cfg(not(target_arch = "wasm32"))]
-pub use executor::{Cell, CellBuilder, SpawnResult};
+pub use executor::{Cell, CellBuilder, KernelOutcome, SpawnResult};

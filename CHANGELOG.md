@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **PID0 lifecycle is host-owned and generation-scoped.** Each PID0 instance
+  now uses one captured filesystem root, graft epoch, and readiness generation.
+  Epoch advances terminate the old instance before a non-interactive daemon
+  starts its replacement. Interactive `ww run` exits cleanly and requires an
+  explicit restart or `ww shell` reconnection. Stable structured lifecycle
+  event codes report replacement and initialization failures.
 - **Glia-free kernel substrate helpers.** Cap'n Proto schema-to-allowlist
   resolution now lives in `wetware-membrane`, and typed named-capability graft
   lookup now lives in `std/system`, ready for reuse by the replacement kernel
@@ -43,8 +49,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - **Opt-in Rust PID0.** A standalone Glia-free `kernel-rust` component can be
   selected through the existing explicit kernel-source controls. It installs
-  the shipped `/status` composition and reinitializes it after epoch changes,
-  while the embedded Glia PID0 remains the default.
+  the shipped `/status` composition once per host-owned PID0 generation, while
+  the embedded Glia PID0 remains the default.
 - **Explicit pid0 kernel source resolution.** `ww run --kernel` and
   `WW_KERNEL` select a local path, Kubo CID, or the unchanged embedded default
   with CLI-first precedence and no fallback after explicit failures. The host

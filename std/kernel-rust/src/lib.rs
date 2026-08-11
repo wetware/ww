@@ -1,10 +1,9 @@
 //! Transitional Rust PID0 for the shipped Wetware production composition.
 //!
-//! This component is deliberately explicit. Each generation grafts the three
+//! This component is deliberately explicit. One PID0 instance grafts the three
 //! capabilities it needs, transparently republishes the temporary compatibility
 //! membrane, installs the existing status component at `/status`, and commits
-//! readiness. Non-TTY execution probes the guarded host capability for epoch
-//! replacement.
+//! readiness. The host owns deployment replacement and PID0 generation lifetime.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -53,9 +52,7 @@ type Membrane = membrane_capnp::membrane::Client;
 
 const STATUS_COMPONENT_PATH: &str = "bin/status.wasm";
 const STATUS_ROUTE: &str = "/status";
-const EPOCH_STALE_PROBE_INTERVAL_NS: u64 = 5_000_000_000;
 const INITIAL_INIT_FAILED: &str = "INITIAL_INIT_FAILED";
-const EPOCH_RESTART_INIT_FAILED: &str = "EPOCH_RESTART_INIT_FAILED";
 
 struct StderrLogger;
 
@@ -87,7 +84,7 @@ fn init_logging() {
 /// Temporary compatibility relay for the remote Glia shell/MCP capability API.
 ///
 /// Kernel-rust does not use this membrane for composition, readiness, child
-/// grants, or epoch handling. It republishes the host-provided membrane without
+/// grants, or lifecycle handling. It republishes the host-provided membrane without
 /// modification because the current host/PID0 bootstrap contract expects a
 /// guest membrane. This relay is expected to disappear with the Glia shell/MCP
 /// and `/ww/0.1.0` remote membrane API.
@@ -180,10 +177,10 @@ async fn install_status_route(
     Ok(())
 }
 
-async fn initialize_generation(
+async fn initialize(
     membrane: &Membrane,
     exported_membrane: &Rc<RefCell<Option<Membrane>>>,
-) -> Result<system_capnp::host::Client, capnp::Error> {
+) -> Result<(), capnp::Error> {
     let graft_response = membrane.graft_request().send().promise.await?;
     let caps = graft_response.get()?.get_caps()?;
 
@@ -196,43 +193,7 @@ async fn initialize_generation(
     // as a readiness commit.
     *exported_membrane.borrow_mut() = Some(export_membrane);
     install_status_route(&host, &runtime).await?;
-    Ok(host)
-}
-
-async fn wait_monotonic(duration_ns: u64) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let deadline = wasip2::clocks::monotonic_clock::now().saturating_add(duration_ns);
-        std::future::poll_fn(|_cx| {
-            if wasip2::clocks::monotonic_clock::now() >= deadline {
-                std::task::Poll::Ready(())
-            } else {
-                std::task::Poll::Pending
-            }
-        })
-        .await;
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    std::thread::sleep(std::time::Duration::from_nanos(duration_ns));
-}
-
-async fn wait_for_stale_epoch(host: &system_capnp::host::Client) -> Result<(), capnp::Error> {
-    loop {
-        wait_monotonic(EPOCH_STALE_PROBE_INTERVAL_NS).await;
-        match host.id_request().send().promise.await {
-            Ok(_) => {}
-            Err(error)
-                if membrane::call_failure_code(&error)
-                    == Some(membrane::CallFailureCode::StaleEpoch) =>
-            {
-                return Ok(());
-            }
-            Err(error) => {
-                log::warn!("epoch probe failed without stale-epoch marker; retrying: {error}");
-            }
-        }
-    }
+    Ok(())
 }
 
 fn wait_for_tty_exit() {
@@ -246,41 +207,28 @@ fn wait_for_tty_exit() {
     }
 }
 
-async fn run_generations(
+async fn run_kernel(
     membrane: Membrane,
     exported_membrane: Rc<RefCell<Option<Membrane>>>,
 ) -> Result<(), capnp::Error> {
-    let mut generation = 0_u64;
-    loop {
-        let host = initialize_generation(&membrane, &exported_membrane)
-            .await
-            .map_err(|error| {
-                let code = if generation == 0 {
-                    INITIAL_INIT_FAILED
-                } else {
-                    EPOCH_RESTART_INIT_FAILED
-                };
-                capnp::Error::failed(format!("{code}: {error}"))
-            })?;
+    initialize(&membrane, &exported_membrane)
+        .await
+        .map_err(|error| capnp::Error::failed(format!("{INITIAL_INIT_FAILED}: {error}")))?;
 
-        match kernel_ready() {
-            Ok(()) => {
-                log::info!("generation {generation} committed readiness");
-                if std::env::var("WW_TTY").is_ok() {
-                    wait_for_tty_exit();
-                    return Ok(());
-                }
-                wait_for_stale_epoch(&host).await?;
-                log::warn!(
-                    "pid0 host authority became stale; re-grafting and rebuilding composition"
-                );
-            }
-            Err(ReadyError::StaleGeneration) => {
-                log::warn!("pid0 generation became stale before activation; re-grafting");
-            }
+    match kernel_ready() {
+        Ok(()) => log::info!("committed readiness"),
+        Err(ReadyError::StaleGeneration) => {
+            return Err(capnp::Error::failed(
+                "KERNEL_READY_FAILED: stale generation".into(),
+            ));
         }
+    }
 
-        generation += 1;
+    if std::env::var("WW_TTY").is_ok() {
+        wait_for_tty_exit();
+        Ok(())
+    } else {
+        std::future::pending().await
     }
 }
 
@@ -298,7 +246,7 @@ fn run_impl() -> Result<(), ()> {
         let exported_membrane = Rc::clone(&exported_membrane);
         let callback_failed = Rc::clone(&callback_failed);
         async move {
-            match run_generations(membrane, exported_membrane).await {
+            match run_kernel(membrane, exported_membrane).await {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     callback_failed.set(true);

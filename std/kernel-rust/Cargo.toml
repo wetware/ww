@@ -12,7 +12,6 @@ log = "0.4.29"
 wasip2 = "1.0.2"
 wit-bindgen = "0.41.0"
 system = { path = "../system" }
-membrane = { package = "wetware-membrane", path = "../../crates/membrane" }
 
 [lib]
 crate-type = ["cdylib"]

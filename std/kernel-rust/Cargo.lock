@@ -380,7 +380,6 @@ dependencies = [
  "log",
  "system",
  "wasip2",
- "wetware-membrane",
  "wit-bindgen 0.41.0",
 ]
 
@@ -699,15 +698,6 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
-]
-
-[[package]]
-name = "wetware-membrane"
-version = "0.1.0"
-dependencies = [
- "capnp",
- "capnpc",
- "futures",
 ]
 
 [[package]]

@@ -7,7 +7,6 @@ use ed25519_dalek::SigningKey;
 use futures::FutureExt;
 use libp2p::StreamProtocol;
 use std::future::Future;
-use std::io::IsTerminal;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{stderr, stdout, AsyncWriteExt};
@@ -91,6 +90,10 @@ pub struct CellBuilder {
     ipfs_client: Option<crate::ipfs::HttpClient>,
     http_dial: Vec<String>,
     resolved_kernel: Option<crate::kernel::ResolvedKernel>,
+    terminate_rx: Option<watch::Receiver<()>>,
+    kernel_generation: Option<u64>,
+    #[cfg(test)]
+    execution_started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl CellBuilder {
@@ -121,6 +124,10 @@ impl CellBuilder {
             ipfs_client: None,
             http_dial: Vec::new(),
             resolved_kernel: None,
+            terminate_rx: None,
+            kernel_generation: None,
+            #[cfg(test)]
+            execution_started_tx: None,
         }
     }
 
@@ -151,6 +158,24 @@ impl CellBuilder {
     /// replaces pid0, not the mounted image used by its boot policy.
     pub fn with_resolved_kernel(mut self, kernel: crate::kernel::ResolvedKernel) -> Self {
         self.resolved_kernel = Some(kernel);
+        self
+    }
+
+    /// Install the host-owned termination signal for one PID0 generation.
+    pub fn with_terminate(mut self, terminate_rx: watch::Receiver<()>) -> Self {
+        self.terminate_rx = Some(terminate_rx);
+        self
+    }
+
+    /// Pin PID0's process-local graft to the generation selected by the host.
+    pub fn with_kernel_generation(mut self, generation: u64) -> Self {
+        self.kernel_generation = Some(generation);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_execution_started(mut self, tx: tokio::sync::oneshot::Sender<()>) -> Self {
+        self.execution_started_tx = Some(tx);
         self
     }
 
@@ -319,6 +344,10 @@ impl CellBuilder {
                 .unwrap_or_else(|| crate::ipfs::HttpClient::new("http://localhost:5001".into())),
             http_dial: self.http_dial,
             resolved_kernel: self.resolved_kernel,
+            terminate_rx: self.terminate_rx,
+            kernel_generation: self.kernel_generation,
+            #[cfg(test)]
+            execution_started_tx: self.execution_started_tx,
         }
     }
 }
@@ -362,15 +391,28 @@ pub struct Cell {
     pub http_dial: Vec<String>,
     /// Exact pid0 bytes selected by the native bootstrap boundary.
     pub resolved_kernel: Option<crate::kernel::ResolvedKernel>,
+    /// Host-owned termination signal for one PID0 generation.
+    pub terminate_rx: Option<watch::Receiver<()>>,
+    /// Epoch sequence selected by the host for this PID0 generation.
+    pub kernel_generation: Option<u64>,
+    #[cfg(test)]
+    execution_started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-/// Result of spawning a cell with RPC: exit code, guest membrane, and optional epoch sender.
+/// Outcome of one PID0 execution generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelOutcome {
+    Exited(i32),
+    Terminated,
+}
+
+/// Result of spawning a cell with RPC: outcome, guest membrane, and optional epoch sender.
 ///
 /// `epoch_tx` is `Some` when the cell created its own epoch channel (no external
 /// receiver was provided). It is `None` when the caller supplied a pre-created
 /// receiver via [`CellBuilder::with_epoch_rx`].
 pub struct SpawnResult {
-    pub exit_code: i32,
+    pub outcome: KernelOutcome,
     pub guest_membrane: GuestMembrane,
     pub epoch_tx: Option<watch::Sender<Epoch>>,
 }
@@ -378,7 +420,7 @@ pub struct SpawnResult {
 impl Cell {
     /// Execute the cell command using wetware streams for RPC transport.
     ///
-    /// Returns a [`SpawnResult`] containing the guest's exit code, its exported
+    /// Returns a [`SpawnResult`] containing the guest's outcome, its exported
     /// [`GuestMembrane`], and the epoch sender for advancing epochs.
     pub async fn spawn(self) -> Result<SpawnResult> {
         self.spawn_rpc_inner(None).await
@@ -430,6 +472,10 @@ impl Cell {
             ipfs_client: _,
             http_dial: _,
             resolved_kernel,
+            terminate_rx: _,
+            kernel_generation: _,
+            #[cfg(test)]
+            execution_started_tx,
         } = self;
 
         // Defensive guard: every cell needs a CidTree. The pre-#416
@@ -475,7 +521,7 @@ impl Cell {
         };
         tracing::info!(cid = %wasm_cid, bytes = bytecode.len(), "Loaded guest bytecode");
 
-        let interactive = std::io::stdin().is_terminal() || std::env::var("WW_TTY").is_ok();
+        let interactive = crate::kernel::is_interactive();
 
         // Bridge host stdin → guest regardless of interactive mode.
         //
@@ -554,6 +600,9 @@ impl Cell {
 
         let proc = builder.build().await?;
         tracing::debug!(binary = %path, "Guest process ready");
+        #[cfg(test)]
+        let join = tokio::spawn(signal_after_first_pending(proc.run(), execution_started_tx));
+        #[cfg(not(test))]
         let join = tokio::spawn(async move { proc.run().await });
 
         Ok((join, handles))
@@ -577,6 +626,8 @@ impl Cell {
         // Terminal-gated network accept loop.
         let terminal_signing_key = signing_key.clone();
         let pre_epoch_rx = self.epoch_rx.take();
+        let terminate_rx = self.terminate_rx.take();
+        let intended_seq = self.kernel_generation.take();
         let configured_readiness_gate = self.kernel_ready_gate.take();
         let route_registry = self.route_registry.take();
         let cache_policy = self.cache_policy;
@@ -600,10 +651,24 @@ impl Cell {
         };
         let readiness_gate = configured_readiness_gate
             .unwrap_or_else(|| Arc::new(authority::KernelReadyGate::new(epoch_rx.clone())));
+        let intended_seq = match (install_kernel_ready, intended_seq) {
+            (true, Some(seq)) => seq,
+            (true, None) => {
+                return Err(anyhow::anyhow!(
+                    "PID0 requires a host-selected kernel generation"
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(anyhow::anyhow!(
+                    "kernel generation cannot be installed for an ordinary cell"
+                ));
+            }
+            (false, None) => 0,
+        };
 
         // The private host import must exist before Wasmtime instantiates PID0.
         // Ordinary child construction continues through the default linker.
-        let (join, handles) = self
+        let (mut join, handles) = self
             .spawn_with_streams_inner(install_kernel_ready.then(|| readiness_gate.clone()))
             .await?;
         let mut handles = handles;
@@ -650,6 +715,7 @@ impl Cell {
             rpc::NamedCapabilities::default(), // pid0 gets full membrane, no extras
             ipfs_client,
             http_dial,
+            intended_seq,
         );
 
         tracing::debug!("Starting streams RPC server for guest");
@@ -657,51 +723,100 @@ impl Cell {
         // When running inside an ExecutorPool worker, this targets the
         // worker's LocalSet, enabling M:N cooperative scheduling with
         // other cells on the same thread.
-        tokio::task::spawn_local(rpc_system.map(|_| ()));
+        let rpc_task = tokio::task::spawn_local(rpc_system.map(|_| ()));
 
-        if let Some(control) = stream_control {
+        let accept_task = if let Some(control) = stream_control {
             let membrane = guest_membrane.clone();
             match terminal_signing_key {
-                Some(sk) => {
-                    tokio::task::spawn_local(accept_terminal_streams(
-                        control,
-                        membrane,
-                        sk,
-                        terminal_epoch_rx,
-                    ));
-                }
+                Some(sk) => Some(tokio::task::spawn_local(accept_terminal_streams(
+                    control,
+                    membrane,
+                    sk,
+                    terminal_epoch_rx,
+                ))),
                 None => {
                     // No signing key (ephemeral node) — serve raw membrane without
                     // Terminal auth gate.  Remote peers get full capabilities.
-                    tokio::task::spawn_local(accept_capnp_streams(control, membrane));
+                    Some(tokio::task::spawn_local(accept_capnp_streams(
+                        control, membrane,
+                    )))
                 }
             }
-        }
+        } else {
+            None
+        };
 
-        let exit_code = match join.await {
-            Ok(Ok(())) => 0,
-            Ok(Err(ref e)) => {
-                tracing::error!("Guest process error: {e:#}");
-                1
+        let outcome = if let Some(mut terminate_rx) = terminate_rx {
+            tokio::select! {
+                joined = &mut join => map_join_outcome(joined),
+                changed = terminate_rx.changed() => {
+                    if changed.is_ok() {
+                        join.abort();
+                        let _ = (&mut join).await;
+                        KernelOutcome::Terminated
+                    } else {
+                        map_join_outcome(join.await)
+                    }
+                }
             }
-            Err(ref e) => {
-                tracing::error!("Guest task join error: {e}");
-                1
-            }
+        } else {
+            map_join_outcome(join.await)
         };
         readiness_gate.clear();
         // The trusted execution generation, rather than any child-visible
         // capability or individual graft call, owns HTTP registration
         // liveness. Drop it as soon as the pid0 guest exits or fails.
         drop(registration_scope);
-        tracing::debug!(code = exit_code, "Guest exited (streams RPC)");
+        rpc_task.abort();
+        let _ = rpc_task.await;
+        if let Some(task) = accept_task {
+            task.abort();
+            let _ = task.await;
+        }
+        tracing::debug!(?outcome, "Guest exited (streams RPC)");
 
         Ok(SpawnResult {
-            exit_code,
+            outcome,
             guest_membrane,
             epoch_tx,
         })
     }
+}
+
+fn map_join_outcome(joined: Result<Result<()>, tokio::task::JoinError>) -> KernelOutcome {
+    match joined {
+        Ok(Ok(())) => KernelOutcome::Exited(0),
+        Ok(Err(ref error)) => {
+            tracing::error!("Guest process error: {error:#}");
+            KernelOutcome::Exited(1)
+        }
+        Err(ref error) => {
+            tracing::error!("Guest task join error: {error}");
+            KernelOutcome::Exited(1)
+        }
+    }
+}
+
+#[cfg(test)]
+async fn signal_after_first_pending<F>(
+    future: F,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+) -> F::Output
+where
+    F: Future,
+{
+    tokio::pin!(future);
+    let mut started = started;
+    std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
+        std::task::Poll::Pending => {
+            if let Some(started) = started.take() {
+                let _ = started.send(());
+            }
+            std::task::Poll::Pending
+        }
+        std::task::Poll::Ready(output) => std::task::Poll::Ready(output),
+    })
+    .await
 }
 
 fn validate_kernel_ready_installation(is_kernel: bool, gate_present: bool) -> Result<()> {
@@ -1024,5 +1139,53 @@ mod tests {
             msg.contains("doc/capabilities.md"),
             "error message should point at the architecture docs, got: {msg}",
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_looping_component_can_be_aborted_within_a_bound() {
+        use cell::loaders::HostPathLoader;
+
+        let bytecode = wat::parse_str(include_str!("../tests/fixtures/spinning-component.wat"))
+            .expect("parse spinning component fixture");
+        let image = tempfile::tempdir().expect("create spinning component image");
+        let cid_tree = Arc::new(cell::vfs::CidTree::new(
+            crate::kernel::runtime_cid(b"spinning-root").to_string(),
+            crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            Default::default(),
+            image.path().to_path_buf(),
+        ));
+        let component = image.path().join("bin/main.wasm");
+        std::fs::create_dir_all(component.parent().unwrap())
+            .expect("create spinning fixture bin directory");
+        std::fs::write(&component, bytecode).expect("write spinning component fixture");
+        let (swarm_tx, _swarm_rx) = mpsc::channel(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let cell = CellBuilder::new(image.path().display().to_string())
+            .with_loader(Box::new(HostPathLoader))
+            .with_network_state(NetworkState::new())
+            .with_swarm_cmd_tx(swarm_tx)
+            .with_cid_tree(cid_tree)
+            .with_suppress_stdin(true)
+            .with_execution_started(started_tx)
+            .build();
+        let (join, _handles) = cell
+            .spawn_with_streams_inner(None)
+            .await
+            .expect("spawn spinning component");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .expect("spinning guest never began execution")
+            .expect("spinning guest dropped its execution latch");
+        assert!(
+            !join.is_finished(),
+            "spinning guest exited before termination"
+        );
+        join.abort();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), join)
+            .await
+            .expect("busy-loop cancellation exceeded timeout")
+            .expect_err("aborted busy-loop task must return JoinError");
+        assert!(error.is_cancelled());
     }
 }

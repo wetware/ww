@@ -109,20 +109,29 @@ is an intentional interposition point; it restricts a granted reference rather
 than converting the child bootstrap into a forwarding membrane. Cross-node
 three-phase handoff remains an upstream limitation.
 
-## Epoch and listener lifecycle
+## Epoch and PID0 lifecycle
 
-An **epoch** is the host-issued authority timeslot (revocation generation).
-Host-issued delegated references retain their epoch guards, so an epoch advance
-makes stale references fail stale; it does not magically revoke arbitrary
-capabilities a program may hold. Ordinary children cannot re-graft to refresh
-them. pid0 re-grafts and reruns init for affected long-running services, then
-explicitly re-delegates fresh references or replaces children.
+An **epoch** is the host-issued authority timeslot and PID0 deployment
+generation. One PID0 instance belongs to one generation. An epoch advance
+closes readiness and makes stale host-issued references fail. The host then
+terminates the current PID0 instance. A non-interactive daemon starts a new
+instance after the old instance has completed teardown. An interactive
+`ww run` invocation exits successfully and requires an explicit restart or
+reconnection through `ww shell`.
+
+The host captures each generation's epoch sequence and filesystem root before
+spawn. PID0's process-local graft uses that captured sequence. The graft fails
+if the live epoch has changed. The private readiness commit also rejects a
+captured sequence that is no longer live. PID0 therefore cannot combine one
+generation's filesystem root with another generation's authority or readiness.
+Rapid advances can briefly activate a coherent intermediate generation, then
+converge to the newest epoch.
 
 Route registrations are epoch-scoped and identity-owned. A stale registration
 stops dispatching immediately, and cleanup from an old registration cannot
 delete a fresh replacement. Route liveness is not a kernel-readiness signal.
 
-Readiness has one commit event: after init/init.d, trusted PID0 calls the
+Readiness has one commit event. After init/init.d, trusted PID0 calls the
 argument-free private Component Model import
 `wetware:kernel-runtime/readiness@1.0.0` function `kernel-ready`. The host
 derives the generation from the process-local graft, rejects a stale
