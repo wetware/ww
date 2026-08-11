@@ -41,6 +41,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   confinement are unchanged.
 
 ### Added
+- **Opt-in Rust PID0.** A standalone Glia-free `kernel-next` component can be
+  selected through the existing explicit kernel-source controls. It installs
+  the shipped `/status` composition and reinitializes it after epoch changes,
+  while the embedded Glia PID0 remains the default.
 - **Explicit pid0 kernel source resolution.** `ww run --kernel` and
   `WW_KERNEL` select a local path, Kubo CID, or the unchanged embedded default
   with CLI-first precedence and no fallback after explicit failures. The host
