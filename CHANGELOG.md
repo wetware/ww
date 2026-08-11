@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **PID0 lifecycle E2E coverage is a kernel-independent parity harness.**
+  `tests/pid0_e2e.rs` now drives one shared behavioral contract — boot/serving
+  identity, host-owned replacement with replacement-byte identity via
+  `X-Wetware-Cell`, rapid-update convergence, initial and replacement
+  composition failure, and TTY process lifetime — against both the embedded
+  Glia PID0 and the explicit `file:` Rust PID0. Glia-only observables (REPL,
+  SysV init.d partial-route choreography) are quarantined in `glia_specific`,
+  and Terminal/`/ww/0.1.0` guest-membrane assertions in `ww_protocol_compat`,
+  so retiring either surface cannot weaken the shared oracle. No production
+  code changed.
 - **PID0 lifecycle is host-owned and generation-scoped.** Each PID0 instance
   now uses one captured filesystem root, graft epoch, and readiness generation.
   Epoch advances terminate the old instance before a non-interactive daemon
