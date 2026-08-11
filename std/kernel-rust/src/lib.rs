@@ -68,7 +68,7 @@ impl log::Log for StderrLogger {
         if self.enabled(record.metadata()) {
             let stderr = get_stderr();
             let _ = stderr.blocking_write_and_flush(
-                format!("[kernel-next][{}] {}\n", record.level(), record.args()).as_bytes(),
+                format!("[kernel-rust][{}] {}\n", record.level(), record.args()).as_bytes(),
             );
         }
     }
@@ -86,7 +86,7 @@ fn init_logging() {
 
 /// Temporary compatibility relay for the remote Glia shell/MCP capability API.
 ///
-/// Kernel-next does not use this membrane for composition, readiness, child
+/// Kernel-rust does not use this membrane for composition, readiness, child
 /// grants, or epoch handling. It republishes the host-provided membrane without
 /// modification because the current host/PID0 bootstrap contract expects a
 /// guest membrane. This relay is expected to disappear with the Glia shell/MCP
@@ -192,7 +192,7 @@ async fn initialize_generation(
     let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
 
     // The current host/PID0 compatibility contract requires publication before
-    // initialization. Kernel-next does not use this membrane or treat publication
+    // initialization. Kernel-rust does not use this membrane or treat publication
     // as a readiness commit.
     *exported_membrane.borrow_mut() = Some(export_membrane);
     install_status_route(&host, &runtime).await?;
@@ -315,15 +315,15 @@ fn run_impl() -> Result<(), ()> {
     }
 }
 
-struct KernelNext;
+struct KernelRust;
 
-impl Guest for KernelNext {
+impl Guest for KernelRust {
     fn run() -> Result<(), ()> {
         run_impl()
     }
 }
 
-wasip2::cli::command::export!(KernelNext);
+wasip2::cli::command::export!(KernelRust);
 
 #[cfg(test)]
 mod tests {

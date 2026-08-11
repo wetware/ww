@@ -31,7 +31,7 @@ use support::atom::AtomFixture;
 use support::terminal::{expect_stale_host, TerminalSession};
 
 const KERNEL_WASM_PATH: &str = "std/kernel/bin/main.wasm";
-const KERNEL_NEXT_WASM_PATH: &str = "std/kernel-next/bin/main.wasm";
+const KERNEL_RUST_WASM_PATH: &str = "std/kernel-rust/bin/main.wasm";
 const STATUS_WASM_PATH: &str = "std/status/bin/status.wasm";
 const STATUS_LAYER: &str = "std/status";
 const DEFAULT_KUBO_ADDR: &str = "127.0.0.1:5001";
@@ -901,13 +901,13 @@ async fn current_embedded_glia_pid0_lifecycle_baseline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kernel_next_path_boots_status_and_preserves_tty_lifecycle() {
+async fn kernel_rust_path_boots_status_and_preserves_tty_lifecycle() {
     let _guard = e2e_lock().await;
-    let kernel_next = required_artifact(KERNEL_NEXT_WASM_PATH);
+    let kernel_rust = required_artifact(KERNEL_RUST_WASM_PATH);
     required_artifact(STATUS_WASM_PATH);
-    let kernel_path = Path::new(KERNEL_NEXT_WASM_PATH)
+    let kernel_path = Path::new(KERNEL_RUST_WASM_PATH)
         .canonicalize()
-        .expect("canonicalize kernel-next artifact");
+        .expect("canonicalize kernel-rust artifact");
     let (kubo_addr, client) = require_kubo().await;
     let admin_addr = unused_addr().await;
     let http_addr = unused_addr().await;
@@ -925,7 +925,7 @@ async fn kernel_next_path_boots_status_and_preserves_tty_lifecycle() {
     );
     assert_eq!(
         identity["kernel_cid"],
-        ww::kernel::runtime_cid(&kernel_next).to_string()
+        ww::kernel::runtime_cid(&kernel_rust).to_string()
     );
     assert_status_route(&client, http_addr).await;
 
@@ -933,11 +933,11 @@ async fn kernel_next_path_boots_status_and_preserves_tty_lifecycle() {
     assert_eq!(
         count_log_lines(&live_logs, "generation 0 committed readiness"),
         1,
-        "kernel-next must commit readiness once after route initialization\n{live_logs}"
+        "kernel-rust must commit readiness once after route initialization\n{live_logs}"
     );
     assert!(
         !live_logs.contains("❯"),
-        "kernel-next must not start the Glia REPL\n{live_logs}"
+        "kernel-rust must not start the Glia REPL\n{live_logs}"
     );
 
     node.close_stdin();
@@ -946,18 +946,18 @@ async fn kernel_next_path_boots_status_and_preserves_tty_lifecycle() {
     assert_eq!(exit.code(), Some(0), "unexpected host exit\n{logs}");
     assert!(
         logs.contains("Kernel exited") && logs.contains("code=0"),
-        "host did not propagate kernel-next's TTY EOF exit\n{logs}"
+        "host did not propagate kernel-rust's TTY EOF exit\n{logs}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kernel_next_missing_status_fails_before_readiness_commit() {
+async fn kernel_rust_missing_status_fails_before_readiness_commit() {
     let _guard = e2e_lock().await;
-    required_artifact(KERNEL_NEXT_WASM_PATH);
+    required_artifact(KERNEL_RUST_WASM_PATH);
     let (kubo_addr, _client) = require_kubo().await;
-    let kernel_path = Path::new(KERNEL_NEXT_WASM_PATH)
+    let kernel_path = Path::new(KERNEL_RUST_WASM_PATH)
         .canonicalize()
-        .expect("canonicalize kernel-next artifact");
+        .expect("canonicalize kernel-rust artifact");
     let image = tempfile::tempdir().expect("create image without status component");
     std::fs::write(image.path().join("generation.txt"), b"missing status\n")
         .expect("write non-empty image marker");
@@ -974,15 +974,15 @@ async fn kernel_next_missing_status_fails_before_readiness_commit() {
     assert_eq!(
         exit.code(),
         Some(1),
-        "missing status component must fail kernel-next\n{logs}"
+        "missing status component must fail kernel-rust\n{logs}"
     );
     assert!(
         logs.contains("INITIAL_INIT_FAILED"),
-        "kernel-next must identify initial composition failure\n{logs}"
+        "kernel-rust must identify initial composition failure\n{logs}"
     );
     assert!(
         !logs.contains("committed readiness"),
-        "kernel-next committed readiness after failed initialization\n{logs}"
+        "kernel-rust committed readiness after failed initialization\n{logs}"
     );
 }
 
@@ -1195,15 +1195,15 @@ async fn missing_and_corrupt_status_artifacts_fail_before_readiness_commit() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn kernel_next_regrafts_and_rebuilds_status_after_epoch_replacement() {
+async fn kernel_rust_regrafts_and_rebuilds_status_after_epoch_replacement() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let _guard = e2e_lock().await;
-            required_artifact(KERNEL_NEXT_WASM_PATH);
-            let kernel_path = Path::new(KERNEL_NEXT_WASM_PATH)
+            required_artifact(KERNEL_RUST_WASM_PATH);
+            let kernel_path = Path::new(KERNEL_RUST_WASM_PATH)
                 .canonicalize()
-                .expect("canonicalize kernel-next artifact");
+                .expect("canonicalize kernel-rust artifact");
             let status_wasm = required_artifact(STATUS_WASM_PATH);
             let (kubo_addr, client) = require_kubo().await;
             let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
@@ -1247,7 +1247,7 @@ async fn kernel_next_regrafts_and_rebuilds_status_after_epoch_replacement() {
                     "pid0 host authority became stale; re-grafting and rebuilding composition"
                 ),
                 1,
-                "one epoch transition must cause one kernel-next re-graft\n{logs}"
+                "one epoch transition must cause one kernel-rust re-graft\n{logs}"
             );
             assert_eq!(
                 count_log_lines(&logs, "generation 0 committed readiness"),
