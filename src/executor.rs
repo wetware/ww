@@ -92,6 +92,8 @@ pub struct CellBuilder {
     resolved_kernel: Option<crate::kernel::ResolvedKernel>,
     terminate_rx: Option<watch::Receiver<()>>,
     kernel_generation: Option<u64>,
+    #[cfg(test)]
+    execution_started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl CellBuilder {
@@ -124,6 +126,8 @@ impl CellBuilder {
             resolved_kernel: None,
             terminate_rx: None,
             kernel_generation: None,
+            #[cfg(test)]
+            execution_started_tx: None,
         }
     }
 
@@ -166,6 +170,12 @@ impl CellBuilder {
     /// Pin PID0's process-local graft to the generation selected by the host.
     pub fn with_kernel_generation(mut self, generation: u64) -> Self {
         self.kernel_generation = Some(generation);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_execution_started(mut self, tx: tokio::sync::oneshot::Sender<()>) -> Self {
+        self.execution_started_tx = Some(tx);
         self
     }
 
@@ -336,6 +346,8 @@ impl CellBuilder {
             resolved_kernel: self.resolved_kernel,
             terminate_rx: self.terminate_rx,
             kernel_generation: self.kernel_generation,
+            #[cfg(test)]
+            execution_started_tx: self.execution_started_tx,
         }
     }
 }
@@ -383,6 +395,8 @@ pub struct Cell {
     pub terminate_rx: Option<watch::Receiver<()>>,
     /// Epoch sequence selected by the host for this PID0 generation.
     pub kernel_generation: Option<u64>,
+    #[cfg(test)]
+    execution_started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Outcome of one PID0 execution generation.
@@ -460,6 +474,8 @@ impl Cell {
             resolved_kernel,
             terminate_rx: _,
             kernel_generation: _,
+            #[cfg(test)]
+            execution_started_tx,
         } = self;
 
         // Defensive guard: every cell needs a CidTree. The pre-#416
@@ -584,6 +600,9 @@ impl Cell {
 
         let proc = builder.build().await?;
         tracing::debug!(binary = %path, "Guest process ready");
+        #[cfg(test)]
+        let join = tokio::spawn(signal_after_first_pending(proc.run(), execution_started_tx));
+        #[cfg(not(test))]
         let join = tokio::spawn(async move { proc.run().await });
 
         Ok((join, handles))
@@ -776,6 +795,28 @@ fn map_join_outcome(joined: Result<Result<()>, tokio::task::JoinError>) -> Kerne
             KernelOutcome::Exited(1)
         }
     }
+}
+
+#[cfg(test)]
+async fn signal_after_first_pending<F>(
+    future: F,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+) -> F::Output
+where
+    F: Future,
+{
+    tokio::pin!(future);
+    let mut started = started;
+    std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
+        std::task::Poll::Pending => {
+            if let Some(started) = started.take() {
+                let _ = started.send(());
+            }
+            std::task::Poll::Pending
+        }
+        std::task::Poll::Ready(output) => std::task::Poll::Ready(output),
+    })
+    .await
 }
 
 fn validate_kernel_ready_installation(is_kernel: bool, gate_present: bool) -> Result<()> {
@@ -1100,46 +1141,51 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn busy_looping_component_can_be_aborted_within_a_bound() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                use cell::loaders::HostPathLoader;
+        use cell::loaders::HostPathLoader;
 
-                let bytecode =
-                    wat::parse_str(include_str!("../tests/fixtures/spinning-component.wat"))
-                        .expect("parse spinning component fixture");
-                let image = tempfile::tempdir().expect("create spinning component image");
-                let cid_tree = Arc::new(cell::vfs::CidTree::new(
-                    crate::kernel::runtime_cid(b"spinning-root").to_string(),
-                    crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
-                    Default::default(),
-                    image.path().to_path_buf(),
-                ));
-                let component = image.path().join("bin/main.wasm");
-                std::fs::create_dir_all(component.parent().unwrap())
-                    .expect("create spinning fixture bin directory");
-                std::fs::write(&component, bytecode).expect("write spinning component fixture");
-                let (swarm_tx, _swarm_rx) = mpsc::channel(1);
-                let cell = CellBuilder::new(image.path().display().to_string())
-                    .with_loader(Box::new(HostPathLoader))
-                    .with_network_state(NetworkState::new())
-                    .with_swarm_cmd_tx(swarm_tx)
-                    .with_cid_tree(cid_tree)
-                    .with_suppress_stdin(true)
-                    .build();
-                let (join, _handles) = cell
-                    .spawn_with_streams_inner(None)
-                    .await
-                    .expect("spawn spinning component");
+        let bytecode = wat::parse_str(include_str!("../tests/fixtures/spinning-component.wat"))
+            .expect("parse spinning component fixture");
+        let image = tempfile::tempdir().expect("create spinning component image");
+        let cid_tree = Arc::new(cell::vfs::CidTree::new(
+            crate::kernel::runtime_cid(b"spinning-root").to_string(),
+            crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            Default::default(),
+            image.path().to_path_buf(),
+        ));
+        let component = image.path().join("bin/main.wasm");
+        std::fs::create_dir_all(component.parent().unwrap())
+            .expect("create spinning fixture bin directory");
+        std::fs::write(&component, bytecode).expect("write spinning component fixture");
+        let (swarm_tx, _swarm_rx) = mpsc::channel(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let cell = CellBuilder::new(image.path().display().to_string())
+            .with_loader(Box::new(HostPathLoader))
+            .with_network_state(NetworkState::new())
+            .with_swarm_cmd_tx(swarm_tx)
+            .with_cid_tree(cid_tree)
+            .with_suppress_stdin(true)
+            .with_execution_started(started_tx)
+            .build();
+        let (join, _handles) = cell
+            .spawn_with_streams_inner(None)
+            .await
+            .expect("spawn spinning component");
 
-                join.abort();
-                let error = tokio::time::timeout(std::time::Duration::from_secs(5), join)
-                    .await
-                    .expect("busy-loop cancellation exceeded timeout")
-                    .expect_err("aborted busy-loop task must return JoinError");
-                assert!(error.is_cancelled());
-            })
-            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .expect("spinning guest never began execution")
+            .expect("spinning guest dropped its execution latch");
+        assert!(
+            !join.is_finished(),
+            "spinning guest exited before termination"
+        );
+        join.abort();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), join)
+            .await
+            .expect("busy-loop cancellation exceeded timeout")
+            .expect_err("aborted busy-loop task must return JoinError");
+        assert!(error.is_cancelled());
     }
 }

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use libp2p::{Multiaddr, PeerId};
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
@@ -110,6 +111,7 @@ struct NodeOptions {
     insecure_ephemeral: bool,
     tty: bool,
     stem: Option<StemOptions>,
+    pid0_result_race: Option<(u64, SocketAddr)>,
 }
 
 struct StemOptions {
@@ -130,6 +132,7 @@ impl NodeOptions {
             insecure_ephemeral: true,
             tty: true,
             stem: None,
+            pid0_result_race: None,
         }
     }
 }
@@ -184,6 +187,11 @@ impl RunningNode {
                 .arg("--ws-url")
                 .arg(&stem.ws_url)
                 .args(["--confirmation-depth", "0", "--epoch-drain-secs", "0"]);
+        }
+        if let Some((seq, address)) = options.pid0_result_race {
+            command.env("WW_TEST_PID0_RESULT_RACE", format!("{seq}@{address}"));
+        } else {
+            command.env_remove("WW_TEST_PID0_RESULT_RACE");
         }
 
         command
@@ -1306,11 +1314,16 @@ async fn superseded_failing_generation_converges_to_the_newer_epoch() {
             let listen_addr = unused_addr().await;
             let home = tempfile::tempdir().expect("create isolated supersede HOME");
             let (_signing_key, identity_path, _peer_id) = persistent_identity(home.path());
-            let options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
+            let mut options =
+                epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
             let proxy_listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind sentinel-gated Kubo proxy");
             let proxy_addr = proxy_listener.local_addr().expect("read proxy address");
+            let result_race_listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind PID0 result race barrier");
+            options.pid0_result_race = Some((2, result_race_listener.local_addr().unwrap()));
             let (proxy_task, mut reached_rx, release_tx) =
                 start_gated_kubo_proxy(proxy_listener, kubo_addr, invalid.delay_cid.clone());
             let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
@@ -1326,10 +1339,35 @@ async fn superseded_failing_generation_converges_to_the_newer_epoch() {
 
             let convergence_started = Instant::now();
             atom.set_head(&epoch3.cid).await;
+            let (mut epoch_barrier, _) =
+                tokio::time::timeout(INVALIDATION_TIMEOUT, result_race_listener.accept())
+                    .await
+                    .expect("host did not observe the superseding epoch")
+                    .expect("accept host epoch barrier");
+            let mut marker = [0_u8; 1];
+            epoch_barrier
+                .read_exact(&mut marker)
+                .await
+                .expect("read host epoch marker");
+            assert_eq!(marker, *b"E");
             wait_for_log(&mut node, "Advancing epoch", "seq=3").await;
             release_tx
                 .send(true)
                 .expect("release failing generation sentinel");
+            let (mut result_ready, _) =
+                tokio::time::timeout(INVALIDATION_TIMEOUT, result_race_listener.accept())
+                    .await
+                    .expect("superseded PID0 did not produce a result")
+                    .expect("accept PID0 result-ready marker");
+            result_ready
+                .read_exact(&mut marker)
+                .await
+                .expect("read PID0 result-ready marker");
+            assert_eq!(marker, *b"R");
+            epoch_barrier
+                .write_all(b"C")
+                .await
+                .expect("release host epoch barrier");
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert!(
                 convergence_started.elapsed() < BOOT_TIMEOUT,
@@ -1343,6 +1381,11 @@ async fn superseded_failing_generation_converges_to_the_newer_epoch() {
             assert!(
                 !logs.contains("event_code=2"),
                 "superseded generation emitted an authoritative failure\n{logs}"
+            );
+            assert!(
+                logs.contains("event_code=4")
+                    && logs.contains("Kernel result superseded by newer generation"),
+                "superseded generation did not exit through result classification\n{logs}"
             );
             assert!(
                 node.try_wait().is_none(),

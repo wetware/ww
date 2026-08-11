@@ -98,11 +98,65 @@ async fn wait_for_epoch_replacement(epoch_rx: &mut watch::Receiver<Epoch>, inten
         if epoch_rx.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
-        if epoch_rx.borrow().seq != intended_seq {
+        if epoch_rx.borrow().seq > intended_seq {
             return;
         }
     }
 }
+
+fn epoch_superseded(epoch_rx: &watch::Receiver<Epoch>, intended_seq: u64) -> bool {
+    epoch_rx.borrow().seq > intended_seq
+}
+
+#[cfg(debug_assertions)]
+fn pid0_result_race_barrier(intended_seq: u64) -> Option<std::net::SocketAddr> {
+    let value = std::env::var("WW_TEST_PID0_RESULT_RACE").ok()?;
+    let (seq, address) = value.split_once('@')?;
+    (seq.parse::<u64>().ok()? == intended_seq).then(|| address.parse().ok())?
+}
+
+#[cfg(debug_assertions)]
+async fn wait_at_pid0_epoch_race_barrier(intended_seq: u64) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Some(address) = pid0_result_race_barrier(intended_seq) else {
+        return;
+    };
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect PID0 epoch race test barrier");
+    stream
+        .write_all(b"E")
+        .await
+        .expect("signal PID0 epoch observation");
+    let mut release = [0_u8; 1];
+    stream
+        .read_exact(&mut release)
+        .await
+        .expect("wait for PID0 epoch race test release");
+}
+
+#[cfg(not(debug_assertions))]
+async fn wait_at_pid0_epoch_race_barrier(_intended_seq: u64) {}
+
+#[cfg(debug_assertions)]
+async fn notify_pid0_result_ready(intended_seq: u64) {
+    use tokio::io::AsyncWriteExt;
+
+    let Some(address) = pid0_result_race_barrier(intended_seq) else {
+        return;
+    };
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect PID0 result-ready test barrier");
+    stream
+        .write_all(b"R")
+        .await
+        .expect("signal PID0 result readiness");
+}
+
+#[cfg(not(debug_assertions))]
+async fn notify_pid0_result_ready(_intended_seq: u64) {}
 
 async fn wait_for_kernel_teardown<T>(
     result_rx: &mut tokio::sync::oneshot::Receiver<T>,
@@ -2048,11 +2102,15 @@ wasip2::cli::command::export!({iface_name}Guest);
                         Box::pin(async move {
                             match cell.spawn_serving(generation_stream_control).await {
                                 Ok(result) => {
-                                    let _ = result_tx.send(Ok(result.outcome));
+                                    if result_tx.send(Ok(result.outcome)).is_ok() {
+                                        notify_pid0_result_ready(intended_seq).await;
+                                    }
                                 }
                                 Err(error) => {
                                     tracing::error!("kernel failed: {error}");
-                                    let _ = result_tx.send(Err(error));
+                                    if result_tx.send(Err(error)).is_ok() {
+                                        notify_pid0_result_ready(intended_seq).await;
+                                    }
                                 }
                             }
                         })
@@ -2064,54 +2122,38 @@ wasip2::cli::command::export!({iface_name}Guest);
             tokio::select! {
                 biased;
                 result = &mut result_rx => {
+                    if epoch_superseded(&epoch_rx, intended_seq) {
+                        let live_seq = epoch_rx.borrow().seq;
+                        tracing::info!(
+                            event_code = ww::rpc::graft::KernelEventCode::GraftSuperseded as u16,
+                            generation,
+                            intended_seq,
+                            live_seq,
+                            "Kernel result superseded by newer generation"
+                        );
+                        if interactive {
+                            tracing::info!(
+                                event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
+                                generation,
+                                "Interactive PID0 generation was replaced; restart ww run or reconnect with ww shell"
+                            );
+                            break 'generations 0;
+                        }
+                        generation += 1;
+                        continue 'generations;
+                    }
                     match result {
                         Ok(Ok(ww::executor::KernelOutcome::Exited(0))) => break 'generations 0,
                         Ok(Ok(ww::executor::KernelOutcome::Exited(code))) => {
-                            if matches!(epoch_rx.has_changed(), Ok(true)) {
-                                if interactive {
-                                    tracing::info!(
-                                        event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
-                                        generation,
-                                        "Interactive PID0 generation was replaced; restart ww run or reconnect with ww shell"
-                                    );
-                                    break 'generations 0;
-                                }
-                                generation += 1;
-                                continue 'generations;
-                            }
                             tracing::error!(code, generation, "Kernel generation exited with failure");
                         }
                         Ok(Ok(ww::executor::KernelOutcome::Terminated)) => {
                             tracing::error!(generation, "Kernel terminated without a host replacement signal");
                         }
                         Ok(Err(error)) => {
-                            if matches!(epoch_rx.has_changed(), Ok(true)) {
-                                if interactive {
-                                    tracing::info!(
-                                        event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
-                                        generation,
-                                        "Interactive PID0 generation was replaced; restart ww run or reconnect with ww shell"
-                                    );
-                                    break 'generations 0;
-                                }
-                                generation += 1;
-                                continue 'generations;
-                            }
                             tracing::error!("Kernel error: {error}");
                         }
                         Err(_) => {
-                            if matches!(epoch_rx.has_changed(), Ok(true)) {
-                                if interactive {
-                                    tracing::info!(
-                                        event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
-                                        generation,
-                                        "Interactive PID0 generation was replaced; restart ww run or reconnect with ww shell"
-                                    );
-                                    break 'generations 0;
-                                }
-                                generation += 1;
-                                continue 'generations;
-                            }
                             tracing::error!("Kernel result channel dropped");
                         }
                     }
@@ -2129,6 +2171,27 @@ wasip2::cli::command::export!({iface_name}Guest);
                 }
                 _ = wait_for_epoch_replacement(&mut epoch_rx, intended_seq) => {
                     let started = std::time::Instant::now();
+                    wait_at_pid0_epoch_race_barrier(intended_seq).await;
+                    if result_rx.try_recv().is_ok() {
+                        let live_seq = epoch_rx.borrow().seq;
+                        tracing::info!(
+                            event_code = ww::rpc::graft::KernelEventCode::GraftSuperseded as u16,
+                            generation,
+                            intended_seq,
+                            live_seq,
+                            "Kernel result superseded by newer generation"
+                        );
+                        if interactive {
+                            tracing::info!(
+                                event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
+                                generation,
+                                "Interactive PID0 generation was replaced; restart ww run or reconnect with ww shell"
+                            );
+                            break 'generations 0;
+                        }
+                        generation += 1;
+                        continue 'generations;
+                    }
                     if interactive {
                         tracing::info!(
                             event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
@@ -2147,7 +2210,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                             teardown_ms = started.elapsed().as_millis() as u64,
                             "Kernel generation teardown timed out"
                         );
-                        break 'generations 1;
+                        std::process::exit(1);
                     }
                     if interactive {
                         break 'generations 0;
@@ -3115,6 +3178,28 @@ fn to_pascal_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supersede_classification_requires_a_newer_generation() {
+        let (tx, rx) = watch::channel(Epoch {
+            seq: 7,
+            head: Vec::new(),
+            provenance: Provenance::Block(1),
+        });
+        tx.send_replace(Epoch {
+            seq: 7,
+            head: Vec::new(),
+            provenance: Provenance::Block(2),
+        });
+        assert!(!epoch_superseded(&rx, 7));
+
+        tx.send_replace(Epoch {
+            seq: 8,
+            head: Vec::new(),
+            provenance: Provenance::Block(3),
+        });
+        assert!(epoch_superseded(&rx, 7));
+    }
 
     #[tokio::test]
     async fn kernel_teardown_wait_is_bounded() {
