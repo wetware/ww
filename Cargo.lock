@@ -8212,6 +8212,7 @@ dependencies = [
  "walkdir",
  "wasm-encoder 0.243.0",
  "wasmtime",
+ "wat",
  "wetware-authority",
  "wetware-membrane",
  "wit-component 0.244.0",

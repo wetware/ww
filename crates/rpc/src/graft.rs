@@ -35,6 +35,20 @@ use authority::system_capnp;
 
 use super::NetworkState;
 
+/// Stable structured event codes for host-owned PID0 lifecycle events.
+///
+/// Integer values are an external log contract. Never renumber or reuse one.
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelEventCode {
+    InitialInitFailed = 1,
+    EpochRestartInitFailed = 2,
+    GenerationReplaced = 3,
+    GraftSuperseded = 4,
+    InteractiveReplaced = 5,
+    TeardownTimeout = 6,
+}
+
 // ---------------------------------------------------------------------------
 // EpochGuardedIdentity — host-side node identity hub
 // ---------------------------------------------------------------------------
@@ -530,6 +544,7 @@ struct Pid0RootGraftBuilder {
     inner: HostGraftBuilder,
     readiness_gate: Arc<authority::KernelReadyGate>,
     export_membrane: GuestMembrane,
+    intended_seq: u64,
 }
 
 impl GraftBuilder for Pid0RootGraftBuilder {
@@ -538,7 +553,24 @@ impl GraftBuilder for Pid0RootGraftBuilder {
         guard: &EpochGuard,
         builder: membrane_capnp::membrane::graft_results::Builder<'_>,
     ) -> Result<(), capnp::Error> {
-        let ambient = self.inner.build_named_capabilities(guard)?;
+        let live_epoch = guard.receiver.borrow();
+        if live_epoch.seq != self.intended_seq {
+            tracing::warn!(
+                event_code = KernelEventCode::GraftSuperseded as u16,
+                intended_seq = self.intended_seq,
+                live_seq = live_epoch.seq,
+                "PID0 root graft superseded before capability issuance"
+            );
+            return Err(capnp::Error::failed(format!(
+                "PID0 generation {} was superseded by generation {}",
+                self.intended_seq, live_epoch.seq
+            )));
+        }
+        let intended_guard = EpochGuard {
+            issued_seq: self.intended_seq,
+            receiver: guard.receiver.clone(),
+        };
+        let ambient = self.inner.build_named_capabilities(&intended_guard)?;
         let export_cap = NamedCapability::new(
             PID0_EXPORT_MEMBRANE_CAP,
             self.export_membrane.clone().client,
@@ -551,8 +583,9 @@ impl GraftBuilder for Pid0RootGraftBuilder {
                 .chain(std::iter::once(export_cap)),
         )?;
         let count = export_count(&ambient, &extras)?;
-        self.readiness_gate.bind_generation(guard.issued_seq);
+        self.readiness_gate.bind_generation(self.intended_seq);
         encode_graft_capabilities(&ambient, &extras, builder.init_caps(count));
+        drop(live_epoch);
         Ok(())
     }
 }
@@ -573,6 +606,7 @@ pub fn build_pid0_membrane_rpc<R, W>(
     extras: NamedCapabilities,
     ipfs_client: ipfs::HttpClient,
     http_dial: Vec<String>,
+    intended_seq: u64,
 ) -> (RpcSystem<Side>, GuestMembrane, Pid0RegistrationScope)
 where
     R: AsyncRead + Unpin + 'static,
@@ -609,6 +643,7 @@ where
         inner: export_builder,
         readiness_gate,
         export_membrane,
+        intended_seq,
     };
     let root_membrane: GuestMembrane =
         capnp_rpc::new_client(MembraneServer::new(epoch_rx, root_builder));
@@ -926,6 +961,7 @@ mod tests {
                     inner,
                     readiness_gate: readiness_gate.clone(),
                     export_membrane,
+                    intended_seq: 1,
                 };
 
                 let mut message = capnp::message::Builder::new_default();
@@ -943,6 +979,108 @@ mod tests {
                     readiness_gate.kernel_ready(),
                     Err(KernelReadyError::NotBound),
                     "a failed root graft must not bind readiness"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pid0_root_graft_keeps_readiness_bound_to_the_intended_generation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
+                let guard = EpochGuard {
+                    issued_seq: 1,
+                    receiver: epoch_rx.clone(),
+                };
+                let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
+                let export_membrane: GuestMembrane = capnp_rpc::new_client(MembraneServer::new(
+                    epoch_rx,
+                    CountingGraftBuilder {
+                        grafts: Rc::new(Cell::new(0)),
+                    },
+                ));
+                let (swarm_tx, _swarm_rx) = mpsc::channel(1);
+                let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
+                let root = Pid0RootGraftBuilder {
+                    inner: HostGraftBuilder::new(
+                        NetworkState::from_peer_id(vec![1, 2, 3]),
+                        swarm_tx,
+                        false,
+                        None,
+                        libp2p_stream::Behaviour::new().new_control(),
+                        Vec::new(),
+                        runtime,
+                        ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+                    ),
+                    readiness_gate: readiness_gate.clone(),
+                    export_membrane,
+                    intended_seq: 1,
+                };
+                let mut message = capnp::message::Builder::new_default();
+                let mut cap_table = Vec::new();
+                let mut results =
+                    message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                results.imbue_mut(&mut cap_table);
+                root.build(&guard, results)
+                    .expect("build intended PID0 root graft");
+
+                epoch_tx.send_replace(test_epoch(2));
+                assert_eq!(
+                    readiness_gate.kernel_ready(),
+                    Err(KernelReadyError::StaleGeneration)
+                );
+                assert!(!readiness_gate.is_ready());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pid0_root_graft_fails_fast_when_the_intended_generation_is_superseded() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(2));
+                let guard = EpochGuard {
+                    issued_seq: 2,
+                    receiver: epoch_rx.clone(),
+                };
+                let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
+                let export_membrane: GuestMembrane = capnp_rpc::new_client(MembraneServer::new(
+                    epoch_rx,
+                    CountingGraftBuilder {
+                        grafts: Rc::new(Cell::new(0)),
+                    },
+                ));
+                let (swarm_tx, _swarm_rx) = mpsc::channel(1);
+                let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
+                let root = Pid0RootGraftBuilder {
+                    inner: HostGraftBuilder::new(
+                        NetworkState::from_peer_id(vec![1, 2, 3]),
+                        swarm_tx,
+                        false,
+                        None,
+                        libp2p_stream::Behaviour::new().new_control(),
+                        Vec::new(),
+                        runtime,
+                        ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+                    ),
+                    readiness_gate: readiness_gate.clone(),
+                    export_membrane,
+                    intended_seq: 1,
+                };
+                let mut message = capnp::message::Builder::new_default();
+                let mut cap_table = Vec::new();
+                let error = {
+                    let mut results =
+                        message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                    results.imbue_mut(&mut cap_table);
+                    root.build(&guard, results)
+                        .expect_err("superseded PID0 root graft must fail")
+                };
+                assert!(error.to_string().contains("superseded"));
+                assert_eq!(
+                    readiness_gate.kernel_ready(),
+                    Err(KernelReadyError::NotBound)
                 );
             })
             .await;
@@ -1185,6 +1323,7 @@ mod tests {
                     NamedCapabilities::default(),
                     ipfs::HttpClient::new("http://127.0.0.1:1".into()),
                     vec!["example.com".into()],
+                    1,
                 );
                 tokio::task::spawn_local(host_rpc.map(|_| ()));
 

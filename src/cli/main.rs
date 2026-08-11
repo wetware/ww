@@ -21,6 +21,8 @@ use ww::executor::CellBuilder;
 use ww::host;
 use ww::ipfs;
 
+const KERNEL_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // Embedded WASM blobs — compiled into the binary so standard cells work
 // without requiring `make std` on the user's machine.
 // build.rs sets cfg flags (has_wasm_*) when each file exists and is non-empty.
@@ -89,6 +91,78 @@ fn service_exit_error(exit: Option<ww::services::ServiceExit>) -> anyhow::Error 
         ),
         None => anyhow::anyhow!("service supervision channel closed"),
     }
+}
+
+async fn wait_for_epoch_replacement(epoch_rx: &mut watch::Receiver<Epoch>, intended_seq: u64) {
+    loop {
+        if epoch_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        if epoch_rx.borrow().seq > intended_seq {
+            return;
+        }
+    }
+}
+
+fn epoch_superseded(epoch_rx: &watch::Receiver<Epoch>, intended_seq: u64) -> bool {
+    epoch_rx.borrow().seq > intended_seq
+}
+
+#[cfg(debug_assertions)]
+fn pid0_result_race_barrier(intended_seq: u64) -> Option<std::net::SocketAddr> {
+    let value = std::env::var("WW_TEST_PID0_RESULT_RACE").ok()?;
+    let (seq, address) = value.split_once('@')?;
+    (seq.parse::<u64>().ok()? == intended_seq).then(|| address.parse().ok())?
+}
+
+#[cfg(debug_assertions)]
+async fn wait_at_pid0_epoch_race_barrier(intended_seq: u64) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Some(address) = pid0_result_race_barrier(intended_seq) else {
+        return;
+    };
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect PID0 epoch race test barrier");
+    stream
+        .write_all(b"E")
+        .await
+        .expect("signal PID0 epoch observation");
+    let mut release = [0_u8; 1];
+    stream
+        .read_exact(&mut release)
+        .await
+        .expect("wait for PID0 epoch race test release");
+}
+
+#[cfg(not(debug_assertions))]
+async fn wait_at_pid0_epoch_race_barrier(_intended_seq: u64) {}
+
+#[cfg(debug_assertions)]
+async fn notify_pid0_result_ready(intended_seq: u64) {
+    use tokio::io::AsyncWriteExt;
+
+    let Some(address) = pid0_result_race_barrier(intended_seq) else {
+        return;
+    };
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect PID0 result-ready test barrier");
+    stream
+        .write_all(b"R")
+        .await
+        .expect("signal PID0 result readiness");
+}
+
+#[cfg(not(debug_assertions))]
+async fn notify_pid0_result_ready(_intended_seq: u64) {}
+
+async fn wait_for_kernel_teardown<T>(
+    result_rx: &mut tokio::sync::oneshot::Receiver<T>,
+    timeout: std::time::Duration,
+) -> Result<Result<T, tokio::sync::oneshot::error::RecvError>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(timeout, result_rx).await
 }
 
 #[derive(Parser)]
@@ -1542,16 +1616,7 @@ wasip2::cli::command::export!({iface_name}Guest);
 
         ww::config::init_tracing_to_stderr(false);
 
-        // Build a chain loader: HostPath > Embedded > IPFS.
-        // HostPath first so local files can override embedded WASM (enables hot-patches).
-        // Embedded second as fallback for pre-built binary distribution.
-        // IPFS last for content-addressed network resolution.
         let ipfs_client = ipfs::HttpClient::new(ipfs_url);
-        let loader = ChainLoader::new(vec![
-            Box::new(HostPathLoader),
-            Box::new(embedded_loader()),
-            Box::new(IpfsLoader::new(ipfs_client.clone())),
-        ]);
 
         // Resolve the host identity and start the local admin plane before
         // waiting on Kubo or resolving mounts. This keeps liveness and boot
@@ -1564,7 +1629,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         let peer_id = keypair.public().to_peer_id();
         let network_state = ww::rpc::NetworkState::from_peer_id(peer_id.to_bytes());
         let runtime_status = ww::metrics::RuntimeStatus::starting();
-        let (epoch_tx, epoch_rx) = watch::channel(Epoch {
+        let (epoch_tx, mut epoch_rx) = watch::channel(Epoch {
             seq: 0,
             head: Vec::new(),
             provenance: Provenance::Block(0),
@@ -1691,6 +1756,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         // If --stem is provided, read the on-chain head and prepend it
         // as a base root mount.
         let mut all_mounts: Vec<ww::cell::mount::Mount> = Vec::new();
+        let mut mounted_head_seq = 0;
         let stem_config = if let Some(ref stem_addr) = stem {
             let contract = parse_contract_address(stem_addr)?;
             let head = image::read_contract_head(&rpc_url, &contract).await?;
@@ -1719,6 +1785,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             };
 
             epoch_tx.send_replace(initial_epoch);
+            mounted_head_seq = head.seq;
 
             Some(atom::IndexerConfig {
                 ws_url: ws_url.clone(),
@@ -1731,6 +1798,9 @@ wasip2::cli::command::export!({iface_name}Guest);
         } else {
             None
         };
+        // Mark the boot seed seen once. Any later epoch advance remains
+        // pending for the generation loop and supersedes generation zero.
+        let _ = epoch_rx.borrow_and_update();
 
         // Namespace layers sit between stem (on-chain base) and user mounts.
         if !ns_configs.is_empty() {
@@ -1978,74 +2048,185 @@ wasip2::cli::command::export!({iface_name}Guest);
         };
 
         let signing_key = std::sync::Arc::new(sk);
+        let interactive = ww::kernel::is_interactive();
+        let gen0_identity = (mounted_head_seq, image_path.clone());
+        let mut generation = 0_u64;
 
-        let mut builder = CellBuilder::new(image_path.clone())
-            .with_loader(Box::new(loader))
-            .with_resolved_kernel(resolved_kernel)
-            .with_network_state(network_state.clone())
-            .with_swarm_cmd_tx(swarm_cmd_tx.clone())
-            .with_wasm_debug(wasm_debug)
-            .with_cid_tree(cid_tree.clone())
-            .with_pinset_cache(pinset_cache.clone())
-            .with_signing_key(signing_key)
-            .with_cache_policy(cache_policy)
-            .with_compile_tx(compile_tx.clone())
-            .with_wasmtime_engine(executor_pool.engine())
-            .with_suppress_stdin(false)
-            .with_ipfs_client(ipfs_client.clone())
-            .with_http_dial(http_dial);
-
-        if let Some(ref registry) = route_registry {
-            builder = builder.with_route_registry(registry.clone());
-        }
-
-        builder = builder
-            .with_epoch_rx(epoch_rx)
-            .with_kernel_ready_gate(kernel_ready_gate);
-
-        let cell = builder.build();
-
-        // Spawn the kernel cell into the executor pool. The kernel's exit
-        // code flows back through the oneshot channel.
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        runtime_status.set_phase("starting-kernel");
-        executor_pool
-            .spawn(ww::services::SpawnRequest {
-                name: "kernel".into(),
-                factory: Box::new(move |_shutdown| {
-                    Box::pin(async move {
-                        match cell.spawn_serving(stream_control).await {
-                            Ok(result) => {
-                                let _ = result_tx.send(Ok(result.exit_code));
+        let exit_code = 'generations: loop {
+            let (intended_seq, root_path) = if generation == 0 {
+                gen0_identity.clone()
+            } else {
+                let epoch = epoch_rx.borrow_and_update().clone();
+                (
+                    epoch.seq,
+                    image::cid_bytes_to_ipfs_path(&epoch.head)
+                        .context("failed to resolve replacement generation root")?,
+                )
+            };
+            let loader = ChainLoader::new(vec![
+                Box::new(HostPathLoader),
+                Box::new(embedded_loader()),
+                Box::new(IpfsLoader::new(ipfs_client.clone())),
+            ]);
+            let (terminate_tx, terminate_rx) = watch::channel(());
+            let mut builder = CellBuilder::new(root_path)
+                .with_loader(Box::new(loader))
+                .with_resolved_kernel(resolved_kernel.clone())
+                .with_kernel_generation(intended_seq)
+                .with_terminate(terminate_rx)
+                .with_network_state(network_state.clone())
+                .with_swarm_cmd_tx(swarm_cmd_tx.clone())
+                .with_wasm_debug(wasm_debug)
+                .with_cid_tree(cid_tree.clone())
+                .with_pinset_cache(pinset_cache.clone())
+                .with_signing_key(signing_key.clone())
+                .with_cache_policy(cache_policy)
+                .with_compile_tx(compile_tx.clone())
+                .with_wasmtime_engine(executor_pool.engine())
+                .with_suppress_stdin(false)
+                .with_ipfs_client(ipfs_client.clone())
+                .with_http_dial(http_dial.clone())
+                .with_epoch_rx(epoch_rx.clone())
+                .with_kernel_ready_gate(kernel_ready_gate.clone());
+            if let Some(ref registry) = route_registry {
+                builder = builder.with_route_registry(registry.clone());
+            }
+            let cell = builder.build();
+            let generation_stream_control = stream_control.clone();
+            let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+            runtime_status.set_phase("starting-kernel");
+            executor_pool
+                .spawn(ww::services::SpawnRequest {
+                    name: "kernel".into(),
+                    factory: Box::new(move |_shutdown| {
+                        Box::pin(async move {
+                            match cell.spawn_serving(generation_stream_control).await {
+                                Ok(result) => {
+                                    if result_tx.send(Ok(result.outcome)).is_ok() {
+                                        notify_pid0_result_ready(intended_seq).await;
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::error!("kernel failed: {error}");
+                                    if result_tx.send(Err(error)).is_ok() {
+                                        notify_pid0_result_ready(intended_seq).await;
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                tracing::error!("kernel failed: {}", e);
-                                let _ = result_tx.send(Err(e));
-                            }
+                        })
+                    }),
+                    result_tx: None,
+                })
+                .map_err(|_| anyhow::anyhow!("executor pool rejected kernel spawn"))?;
+
+            tokio::select! {
+                biased;
+                result = &mut result_rx => {
+                    if epoch_superseded(&epoch_rx, intended_seq) {
+                        let live_seq = epoch_rx.borrow().seq;
+                        tracing::info!(
+                            event_code = ww::rpc::graft::KernelEventCode::GraftSuperseded as u16,
+                            generation,
+                            intended_seq,
+                            live_seq,
+                            "Kernel result superseded by newer generation"
+                        );
+                        if interactive {
+                            tracing::info!(
+                                event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
+                                generation,
+                                "Interactive PID0 generation was replaced; restart ww run or reconnect with ww shell"
+                            );
+                            break 'generations 0;
                         }
-                    })
-                }),
-                // Exit code is sent explicitly by the factory above.
-                result_tx: None,
-            })
-            .map_err(|_| anyhow::anyhow!("executor pool rejected kernel spawn"))?;
-
-        let exit_code = tokio::select! {
-            biased;
-            result = result_rx => match result {
-                Ok(Ok(code)) => code,
-                Ok(Err(e)) => {
-                    tracing::error!("Kernel error: {}", e);
-                    1
+                        generation += 1;
+                        continue 'generations;
+                    }
+                    match result {
+                        Ok(Ok(ww::executor::KernelOutcome::Exited(0))) => break 'generations 0,
+                        Ok(Ok(ww::executor::KernelOutcome::Exited(code))) => {
+                            tracing::error!(code, generation, "Kernel generation exited with failure");
+                        }
+                        Ok(Ok(ww::executor::KernelOutcome::Terminated)) => {
+                            tracing::error!(generation, "Kernel terminated without a host replacement signal");
+                        }
+                        Ok(Err(error)) => {
+                            tracing::error!("Kernel error: {error}");
+                        }
+                        Err(_) => {
+                            tracing::error!("Kernel result channel dropped");
+                        }
+                    }
+                    let event_code = if generation == 0 {
+                        ww::rpc::graft::KernelEventCode::InitialInitFailed
+                    } else {
+                        ww::rpc::graft::KernelEventCode::EpochRestartInitFailed
+                    };
+                    tracing::error!(
+                        event_code = event_code as u16,
+                        generation,
+                        "Kernel generation failed to initialize"
+                    );
+                    break 'generations 1;
                 }
-                Err(_) => {
-                    tracing::error!("Kernel result channel dropped");
-                    1
+                _ = wait_for_epoch_replacement(&mut epoch_rx, intended_seq) => {
+                    let started = std::time::Instant::now();
+                    wait_at_pid0_epoch_race_barrier(intended_seq).await;
+                    if result_rx.try_recv().is_ok() {
+                        let live_seq = epoch_rx.borrow().seq;
+                        tracing::info!(
+                            event_code = ww::rpc::graft::KernelEventCode::GraftSuperseded as u16,
+                            generation,
+                            intended_seq,
+                            live_seq,
+                            "Kernel result superseded by newer generation"
+                        );
+                        if interactive {
+                            tracing::info!(
+                                event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
+                                generation,
+                                "Interactive PID0 generation was replaced; restart ww run or reconnect with ww shell"
+                            );
+                            break 'generations 0;
+                        }
+                        generation += 1;
+                        continue 'generations;
+                    }
+                    if interactive {
+                        tracing::info!(
+                            event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
+                            generation,
+                            "Interactive PID0 generation was replaced; restart ww run or reconnect with ww shell"
+                        );
+                    }
+                    let _ = terminate_tx.send(());
+                    if wait_for_kernel_teardown(&mut result_rx, KERNEL_TEARDOWN_TIMEOUT)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(
+                            event_code = ww::rpc::graft::KernelEventCode::TeardownTimeout as u16,
+                            generation,
+                            teardown_ms = started.elapsed().as_millis() as u64,
+                            "Kernel generation teardown timed out"
+                        );
+                        std::process::exit(1);
+                    }
+                    if interactive {
+                        break 'generations 0;
+                    }
+                    tracing::info!(
+                        event_code = ww::rpc::graft::KernelEventCode::GenerationReplaced as u16,
+                        generation,
+                        teardown_ms = started.elapsed().as_millis() as u64,
+                        "Kernel generation replaced"
+                    );
+                    generation += 1;
                 }
-            },
-            service_exit = supervisor.next_service_exit() => {
-                tracing::error!(error = %service_exit_error(service_exit), "runtime supervision failed");
-                1
+                service_exit = supervisor.next_service_exit() => {
+                    tracing::error!(error = %service_exit_error(service_exit), "runtime supervision failed");
+                    break 'generations 1;
+                }
             }
         };
         tracing::info!(code = exit_code, "Kernel exited");
@@ -2997,6 +3178,38 @@ fn to_pascal_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supersede_classification_requires_a_newer_generation() {
+        let (tx, rx) = watch::channel(Epoch {
+            seq: 7,
+            head: Vec::new(),
+            provenance: Provenance::Block(1),
+        });
+        tx.send_replace(Epoch {
+            seq: 7,
+            head: Vec::new(),
+            provenance: Provenance::Block(2),
+        });
+        assert!(!epoch_superseded(&rx, 7));
+
+        tx.send_replace(Epoch {
+            seq: 8,
+            head: Vec::new(),
+            provenance: Provenance::Block(3),
+        });
+        assert!(epoch_superseded(&rx, 7));
+    }
+
+    #[tokio::test]
+    async fn kernel_teardown_wait_is_bounded() {
+        let (_tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        let result = wait_for_kernel_teardown(&mut rx, std::time::Duration::from_millis(1)).await;
+        assert!(
+            result.is_err(),
+            "pending teardown must reach its timeout path"
+        );
+    }
 
     #[tokio::test]
     async fn wait_for_kubo_ready_times_out_against_unreachable_node() {
