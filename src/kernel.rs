@@ -69,12 +69,22 @@ pub struct KernelMeta {
 }
 
 /// Exact pid0 bytes and their loaded-byte runtime identity.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ResolvedKernel {
     pub bytes: Vec<u8>,
     pub cid: Cid,
     pub source: KernelSourceRecord,
     pub metadata: KernelMeta,
+}
+
+/// Whether PID0 owns an interactive terminal for this invocation.
+///
+/// `WW_TTY` remains the test and compatibility override for stdin that is not
+/// reported as a terminal by the host process.
+pub fn is_interactive() -> bool {
+    use std::io::IsTerminal;
+
+    std::io::stdin().is_terminal() || std::env::var("WW_TTY").is_ok()
 }
 
 impl ResolvedKernel {

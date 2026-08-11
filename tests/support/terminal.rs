@@ -59,7 +59,6 @@ impl ww::auth_capnp::signer::Server for LocalSigner {
 }
 
 pub struct TerminalSession {
-    membrane: ww::membrane_capnp::membrane::Client,
     pub graft: GraftCaps,
 }
 
@@ -105,13 +104,7 @@ impl TerminalSession {
         let membrane = login_membrane(&terminal, signing_key).await;
         let graft = graft(&membrane).await;
         assert_exact_names(&graft.names);
-        Self { membrane, graft }
-    }
-
-    pub async fn regraft(&self) -> GraftCaps {
-        let graft = graft(&self.membrane).await;
-        assert_exact_names(&graft.names);
-        graft
+        Self { graft }
     }
 }
 
@@ -244,7 +237,7 @@ impl GraftCaps {
     }
 }
 
-pub async fn expect_stale_host(host: &ww::system_capnp::host::Client) {
+pub async fn expect_stale_or_disconnected(host: &ww::system_capnp::host::Client) {
     let deadline = tokio::time::Instant::now() + RPC_TIMEOUT;
     loop {
         match tokio::time::timeout(Duration::from_secs(2), host.id_request().send().promise).await {
@@ -256,11 +249,13 @@ pub async fn expect_stale_host(host: &ww::system_capnp::host::Client) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             Ok(Err(error)) => {
-                assert_eq!(
-                    membrane::call_failure_code(&error),
-                    Some(membrane::CallFailureCode::StaleEpoch),
-                    "old-generation capability returned the wrong structured failure: {error}"
-                );
+                if let Some(code) = membrane::call_failure_code(&error) {
+                    assert_eq!(
+                        code,
+                        membrane::CallFailureCode::StaleEpoch,
+                        "old-generation capability returned the wrong structured failure: {error}"
+                    );
+                }
                 return;
             }
             Err(_) => {

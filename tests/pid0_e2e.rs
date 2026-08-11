@@ -21,6 +21,7 @@ use ed25519_dalek::SigningKey;
 use libp2p::{Multiaddr, PeerId};
 use serde_json::Value;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
@@ -28,7 +29,7 @@ use axum::http::{header, Response, StatusCode};
 use axum::Router;
 
 use support::atom::AtomFixture;
-use support::terminal::{expect_stale_host, TerminalSession};
+use support::terminal::{expect_stale_or_disconnected, TerminalSession};
 
 const KERNEL_WASM_PATH: &str = "std/kernel/bin/main.wasm";
 const STATUS_WASM_PATH: &str = "std/status/bin/status.wasm";
@@ -59,7 +60,7 @@ fn required_artifact(path: &str) -> Vec<u8> {
     bytes
 }
 
-fn append_test_custom_section(component: &mut Vec<u8>) {
+fn append_custom_section(component: &mut Vec<u8>, name: &[u8], payload: &[u8]) {
     fn push_uleb128(output: &mut Vec<u8>, mut value: usize) {
         loop {
             let mut byte = (value & 0x7f) as u8;
@@ -74,12 +75,10 @@ fn append_test_custom_section(component: &mut Vec<u8>) {
         }
     }
 
-    const NAME: &[u8] = b"ww.test.distinct-kernel";
-    const PAYLOAD: &[u8] = b"pr2-path-source";
-    let mut contents = Vec::with_capacity(NAME.len() + PAYLOAD.len() + 1);
-    push_uleb128(&mut contents, NAME.len());
-    contents.extend_from_slice(NAME);
-    contents.extend_from_slice(PAYLOAD);
+    let mut contents = Vec::with_capacity(name.len() + payload.len() + 1);
+    push_uleb128(&mut contents, name.len());
+    contents.extend_from_slice(name);
+    contents.extend_from_slice(payload);
 
     component.push(0); // Component-model custom section.
     push_uleb128(component, contents.len());
@@ -299,6 +298,30 @@ async fn assert_status_route(client: &reqwest::Client, http_addr: SocketAddr) {
     );
 }
 
+async fn assert_status_cell(
+    client: &reqwest::Client,
+    http_addr: SocketAddr,
+    expected_cell_cid: &cid::Cid,
+) {
+    let response = client
+        .get(format!("http://{http_addr}/status"))
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .expect("query real Glia-registered /status route")
+        .error_for_status()
+        .expect("/status should return HTTP 200");
+    let observed_cell_cid = response
+        .headers()
+        .get("X-Wetware-Cell")
+        .expect("/status response omitted X-Wetware-Cell")
+        .to_str()
+        .expect("X-Wetware-Cell must be UTF-8");
+    assert_eq!(observed_cell_cid, expected_cell_cid.to_string());
+    let status: Value = response.json().await.expect("parse /status JSON");
+    assert_eq!(status["status"], "ok");
+}
+
 impl Drop for RunningNode {
     fn drop(&mut self) {
         if matches!(self.child.try_wait(), Ok(None)) {
@@ -418,75 +441,104 @@ fn start_kubo_proxy(listener: TcpListener, target: SocketAddr) -> tokio::task::J
 }
 
 #[derive(Clone)]
-struct DelayedKuboProxy {
+struct ControlledKuboProxy {
     client: reqwest::Client,
     target: SocketAddr,
+    path_fragment: String,
+    control: ProxyControl,
+}
+
+#[derive(Clone)]
+enum ProxyControl {
+    Delay,
+    Gate {
+        reached: tokio::sync::mpsc::Sender<()>,
+        release: watch::Receiver<bool>,
+    },
+}
+
+async fn forward_controlled_kubo(
+    State(mut proxy): State<ControlledKuboProxy>,
+    request: Request,
+) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+    let uri = parts.uri.to_string();
+    if uri.contains(&proxy.path_fragment) {
+        match &mut proxy.control {
+            ProxyControl::Delay => tokio::time::sleep(Duration::from_secs(2)).await,
+            ProxyControl::Gate { reached, release } => {
+                let _ = reached.send(()).await;
+                while !*release.borrow() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let body = match to_bytes(body, 64 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(error) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(error.to_string()))
+                .expect("build proxy request-error response");
+        }
+    };
+    let mut upstream = proxy
+        .client
+        .request(parts.method, format!("http://{}{}", proxy.target, uri));
+    for (name, value) in &parts.headers {
+        if name != header::HOST {
+            upstream = upstream.header(name, value);
+        }
+    }
+    let response = match upstream.body(body).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(error.to_string()))
+                .expect("build proxy upstream-error response");
+        }
+    };
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        Err(error) => {
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(error.to_string()))
+                .expect("build proxy body-error response");
+        }
+    };
+    let mut output = Response::builder().status(status);
+    for (name, value) in &headers {
+        if name != header::TRANSFER_ENCODING && name != header::CONTENT_LENGTH {
+            output = output.header(name, value);
+        }
+    }
+    output
+        .body(Body::from(body))
+        .expect("build proxied Kubo response")
 }
 
 fn start_delayed_kubo_proxy(
     listener: TcpListener,
     target: SocketAddr,
+    delayed_path_fragment: impl Into<String>,
 ) -> tokio::task::JoinHandle<()> {
-    async fn forward(State(proxy): State<DelayedKuboProxy>, request: Request) -> Response<Body> {
-        let (parts, body) = request.into_parts();
-        let uri = parts.uri.to_string();
-        if uri.contains("delay.txt") {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-
-        let body = match to_bytes(body, 64 * 1024 * 1024).await {
-            Ok(body) => body,
-            Err(error) => {
-                return Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Body::from(error.to_string()))
-                    .expect("build proxy request-error response");
-            }
-        };
-        let mut upstream = proxy
-            .client
-            .request(parts.method, format!("http://{}{}", proxy.target, uri));
-        for (name, value) in &parts.headers {
-            if name != header::HOST {
-                upstream = upstream.header(name, value);
-            }
-        }
-        let response = match upstream.body(body).send().await {
-            Ok(response) => response,
-            Err(error) => {
-                return Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from(error.to_string()))
-                    .expect("build proxy upstream-error response");
-            }
-        };
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = match response.bytes().await {
-            Ok(body) => body,
-            Err(error) => {
-                return Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from(error.to_string()))
-                    .expect("build proxy body-error response");
-            }
-        };
-        let mut output = Response::builder().status(status);
-        for (name, value) in &headers {
-            if name != header::TRANSFER_ENCODING && name != header::CONTENT_LENGTH {
-                output = output.header(name, value);
-            }
-        }
-        output
-            .body(Body::from(body))
-            .expect("build proxied Kubo response")
-    }
-
-    let proxy = DelayedKuboProxy {
+    let proxy = ControlledKuboProxy {
         client: reqwest::Client::new(),
         target,
+        path_fragment: delayed_path_fragment.into(),
+        control: ProxyControl::Delay,
     };
-    let app = Router::new().fallback(forward).with_state(proxy);
+    let app = Router::new()
+        .fallback(forward_controlled_kubo)
+        .with_state(proxy);
     tokio::spawn(async move {
         axum::serve(listener, app)
             .await
@@ -494,9 +546,41 @@ fn start_delayed_kubo_proxy(
     })
 }
 
+fn start_gated_kubo_proxy(
+    listener: TcpListener,
+    target: SocketAddr,
+    path_fragment: impl Into<String>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Receiver<()>,
+    watch::Sender<bool>,
+) {
+    let (reached_tx, reached_rx) = tokio::sync::mpsc::channel(4);
+    let (release_tx, release_rx) = watch::channel(false);
+    let proxy = ControlledKuboProxy {
+        client: reqwest::Client::new(),
+        target,
+        path_fragment: path_fragment.into(),
+        control: ProxyControl::Gate {
+            reached: reached_tx,
+            release: release_rx,
+        },
+    };
+    let app = Router::new()
+        .fallback(forward_controlled_kubo)
+        .with_state(proxy);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve sentinel-gated Kubo proxy");
+    });
+    (task, reached_rx, release_tx)
+}
+
 struct EpochRoot {
     _directory: tempfile::TempDir,
     cid: cid::Cid,
+    delay_cid: String,
     marker: Vec<u8>,
     route: String,
 }
@@ -561,11 +645,8 @@ impl EpochRoot {
         std::fs::write(bin.join("status.wasm"), status_wasm).expect("write epoch status component");
         std::fs::write(init.join("05-status.glia"), script.as_bytes())
             .expect("write epoch init script");
-        std::fs::write(
-            directory.path().join("delay.txt"),
-            b"delay replacement init\n",
-        )
-        .expect("write replacement delay marker");
+        std::fs::write(directory.path().join("delay.txt"), &marker)
+            .expect("write replacement delay marker");
         std::fs::write(directory.path().join("generation.txt"), &marker)
             .expect("write epoch generation marker");
 
@@ -576,6 +657,14 @@ impl EpochRoot {
             .parse()
             .expect("Kubo returned a valid epoch root CID");
         let root = format!("/ipfs/{cid}");
+        let delay_cid = ipfs
+            .ls(&root)
+            .await
+            .expect("list epoch root in Kubo")
+            .into_iter()
+            .find(|entry| entry.name == "delay.txt")
+            .expect("epoch root omitted delay.txt")
+            .hash;
         assert_eq!(
             ipfs.cat(&format!("{root}/bin/status.wasm"))
                 .await
@@ -601,6 +690,7 @@ impl EpochRoot {
         Self {
             _directory: directory,
             cid,
+            delay_cid,
             marker,
             route,
         }
@@ -906,7 +996,11 @@ async fn local_kernel_path_reaches_ready_and_cli_overrides_env() {
     required_artifact(STATUS_WASM_PATH);
     let embedded_cid = ww::kernel::runtime_cid(&embedded_kernel);
     let mut selected_kernel = embedded_kernel.clone();
-    append_test_custom_section(&mut selected_kernel);
+    append_custom_section(
+        &mut selected_kernel,
+        b"ww.test.distinct-kernel",
+        b"pr2-path-source",
+    );
     let selected_cid = ww::kernel::runtime_cid(&selected_kernel);
     assert_ne!(
         selected_cid, embedded_cid,
@@ -1101,14 +1195,167 @@ async fn missing_and_corrupt_status_artifacts_fail_before_readiness_commit() {
             "status init failure must fail the host\n{logs}"
         );
         assert!(
-            logs.contains("INITIAL_INIT_FAILED"),
-            "the guest must fail initialization before committing readiness\n{logs}"
+            logs.contains("event_code=1"),
+            "the host must report the initial PID0 initialization failure\n{logs}"
         );
     }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn real_atom_epoch_transition_regrafts_current_embedded_glia_pid0() {
+async fn replacement_uses_new_status_bytes_and_keeps_daemon_alive() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let _guard = e2e_lock().await;
+            let status_wasm = required_artifact(STATUS_WASM_PATH);
+            let mut status_a = status_wasm.clone();
+            let mut status_b = status_wasm;
+            append_custom_section(&mut status_a, b"ww.test.epoch", b"variant-a");
+            append_custom_section(&mut status_b, b"ww.test.epoch", b"variant-b");
+            let status_a_cid = ww::kernel::runtime_cid(&status_a);
+            let status_b_cid = ww::kernel::runtime_cid(&status_b);
+            assert_ne!(status_a_cid, status_b_cid);
+
+            let (kubo_addr, client) = require_kubo().await;
+            let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
+            let epoch1 = EpochRoot::valid(&ipfs, &status_a, 1).await;
+            let epoch2 = EpochRoot::valid(&ipfs, &status_b, 2).await;
+            let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
+            let initial_receipt = atom.set_head(&epoch1.cid).await;
+
+            let admin_addr = unused_addr().await;
+            let http_addr = unused_addr().await;
+            let listen_addr = unused_addr().await;
+            let home = tempfile::tempdir().expect("create isolated epoch HOME");
+            let (_signing_key, identity_path, _peer_id) = persistent_identity(home.path());
+            let options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
+            let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+            let ready_url = format!("http://{admin_addr}/readyz");
+
+            wait_for_ready(&client, &ready_url, &mut node).await;
+            assert_status_cell(&client, http_addr, &status_a_cid).await;
+
+            let replacement_receipt = atom.set_head(&epoch2.cid).await;
+            assert!(replacement_receipt.block_number > initial_receipt.block_number);
+            wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
+            wait_for_ready(&client, &ready_url, &mut node).await;
+            assert_status_cell(&client, http_addr, &status_b_cid).await;
+            assert!(
+                node.try_wait().is_none(),
+                "replacement exited\n{}",
+                node.logs()
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interactive_epoch_replacement_ends_the_invocation_cleanly() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let _guard = e2e_lock().await;
+            let status_wasm = required_artifact(STATUS_WASM_PATH);
+            let (kubo_addr, client) = require_kubo().await;
+            let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
+            let epoch1 = EpochRoot::valid(&ipfs, &status_wasm, 1).await;
+            let epoch2 = EpochRoot::valid(&ipfs, &status_wasm, 2).await;
+            let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
+            atom.set_head(&epoch1.cid).await;
+
+            let admin_addr = unused_addr().await;
+            let http_addr = unused_addr().await;
+            let listen_addr = unused_addr().await;
+            let home = tempfile::tempdir().expect("create isolated interactive epoch HOME");
+            let (_signing_key, identity_path, _peer_id) = persistent_identity(home.path());
+            let mut options =
+                epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
+            options.tty = true;
+            let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+            wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
+
+            atom.set_head(&epoch2.cid).await;
+            let exit = node.wait(EXIT_TIMEOUT).await;
+            let logs = node.logs();
+            assert_eq!(
+                exit.code(),
+                Some(0),
+                "interactive replacement failed\n{logs}"
+            );
+            assert_eq!(count_log_lines(&logs, "event_code=5"), 1, "{logs}");
+            assert_eq!(count_log_lines(&logs, "event_code=3"), 0, "{logs}");
+            assert_eq!(count_log_lines(&logs, "event_code=2"), 0, "{logs}");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn superseded_failing_generation_converges_to_the_newer_epoch() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let _guard = e2e_lock().await;
+            let status_wasm = required_artifact(STATUS_WASM_PATH);
+            let (kubo_addr, client) = require_kubo().await;
+            let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
+            let epoch1 = EpochRoot::valid(&ipfs, &status_wasm, 1).await;
+            let invalid = EpochRoot::failing(&ipfs, &status_wasm).await;
+            let epoch3 = EpochRoot::valid(&ipfs, &status_wasm, 3).await;
+            let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
+            atom.set_head(&epoch1.cid).await;
+
+            let admin_addr = unused_addr().await;
+            let http_addr = unused_addr().await;
+            let listen_addr = unused_addr().await;
+            let home = tempfile::tempdir().expect("create isolated supersede HOME");
+            let (_signing_key, identity_path, _peer_id) = persistent_identity(home.path());
+            let options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
+            let proxy_listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind sentinel-gated Kubo proxy");
+            let proxy_addr = proxy_listener.local_addr().expect("read proxy address");
+            let (proxy_task, mut reached_rx, release_tx) =
+                start_gated_kubo_proxy(proxy_listener, kubo_addr, invalid.delay_cid.clone());
+            let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
+            let ready_url = format!("http://{admin_addr}/readyz");
+            wait_for_ready(&client, &ready_url, &mut node).await;
+
+            atom.set_head(&invalid.cid).await;
+            wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
+            tokio::time::timeout(INVALIDATION_TIMEOUT, reached_rx.recv())
+                .await
+                .expect("failing generation did not reach its sentinel")
+                .expect("sentinel channel closed before failing generation arrived");
+
+            let convergence_started = Instant::now();
+            atom.set_head(&epoch3.cid).await;
+            wait_for_log(&mut node, "Advancing epoch", "seq=3").await;
+            release_tx
+                .send(true)
+                .expect("release failing generation sentinel");
+            wait_for_ready(&client, &ready_url, &mut node).await;
+            assert!(
+                convergence_started.elapsed() < BOOT_TIMEOUT,
+                "superseded generation did not converge within the test bound\n{}",
+                node.logs()
+            );
+            assert_route_unavailable(&client, http_addr, &epoch1.route).await;
+            assert_route_unavailable(&client, http_addr, &invalid.route).await;
+            assert_route_available(&client, http_addr, &epoch3.route).await;
+            let logs = node.logs();
+            assert!(
+                !logs.contains("event_code=2"),
+                "superseded generation emitted an authoritative failure\n{logs}"
+            );
+            assert!(
+                node.try_wait().is_none(),
+                "daemon exited after supersede\n{logs}"
+            );
+
+            proxy_task.abort();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn real_atom_epoch_transition_replaces_current_embedded_glia_pid0() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1172,7 +1419,7 @@ async fn real_atom_epoch_transition_regrafts_current_embedded_glia_pid0() {
             );
             assert_route_unavailable(&client, http_addr, &epoch1.route).await;
             assert_route_unavailable(&client, http_addr, &epoch2.route).await;
-            expect_stale_host(&retained_old_host).await;
+            expect_stale_or_disconnected(&retained_old_host).await;
 
             let recovered = wait_for_ready(&client, &ready_url, &mut node).await;
             assert_eq!(recovered["phase"], "ready");
@@ -1180,17 +1427,6 @@ async fn real_atom_epoch_transition_regrafts_current_embedded_glia_pid0() {
             assert_route_unavailable(&client, http_addr, &epoch1.route).await;
             assert_route_available(&client, http_addr, &epoch2.route).await;
 
-            // The authenticated bootstrap membrane is intentionally stable:
-            // it may be used to obtain the current generation's exact graft.
-            let stable_regraft = terminal.regraft().await;
-            stable_regraft
-                .semantic_probes(
-                    &signing_key,
-                    &status_wasm,
-                    &epoch2.marker_path(),
-                    &epoch2.marker,
-                )
-                .await;
             let fresh_terminal =
                 TerminalSession::connect(peer_id, terminal_address(listen_addr), &signing_key)
                     .await;
@@ -1206,23 +1442,15 @@ async fn real_atom_epoch_transition_regrafts_current_embedded_glia_pid0() {
 
             let logs = node.logs();
             assert_eq!(
-                count_log_lines(
-                    &logs,
-                    "pid0 host authority became stale; re-grafting and rerunning init.d"
-                ),
+                count_log_lines(&logs, "event_code=3"),
                 1,
-                "one Atom epoch transition must cause exactly one re-graft\n{logs}"
+                "one Atom epoch transition must replace one PID0 generation\n{logs}"
             );
             let old_unregistered = log_position(&logs, "unregistered HTTP route", &epoch1.route);
-            let regraft = log_position(
-                &logs,
-                "pid0 host authority became stale; re-grafting and rerunning init.d",
-                "pid0",
-            );
             let replacement_registered =
                 log_position(&logs, "registered HTTP route", &epoch2.route);
             assert!(
-                old_unregistered < regraft && regraft < replacement_registered,
+                old_unregistered < replacement_registered,
                 "old-generation teardown must precede replacement activation\n{logs}"
             );
             assert_eq!(
@@ -1240,7 +1468,7 @@ async fn real_atom_epoch_transition_regrafts_current_embedded_glia_pid0() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rapid_atom_updates_are_serialized_and_only_final_generation_activates() {
+async fn rapid_atom_updates_converge_to_the_final_generation() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1285,7 +1513,7 @@ async fn rapid_atom_updates_are_serialized_and_only_final_generation_activates()
             assert_route_unavailable(&client, http_addr, &epoch1.route).await;
             assert_route_unavailable(&client, http_addr, &epoch2.route).await;
             assert_route_unavailable(&client, http_addr, &epoch3.route).await;
-            expect_stale_host(&retained_old_host).await;
+            expect_stale_or_disconnected(&retained_old_host).await;
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert_status_route(&client, http_addr).await;
             assert_route_unavailable(&client, http_addr, &epoch1.route).await;
@@ -1309,32 +1537,14 @@ async fn rapid_atom_updates_are_serialized_and_only_final_generation_activates()
             let seq2 = log_position(&logs, "Advancing epoch", "seq=2");
             let seq3 = log_position(&logs, "Advancing epoch", "seq=3");
             let old_unregistered = log_position(&logs, "unregistered HTTP route", &epoch1.route);
-            let regraft = log_position(
-                &logs,
-                "pid0 host authority became stale; re-grafting and rerunning init.d",
-                "pid0",
-            );
             let final_registered = log_position(&logs, "registered HTTP route", &epoch3.route);
             assert!(
-                seq2 < seq3
-                    && seq2 < old_unregistered
-                    && old_unregistered < regraft
-                    && regraft < final_registered,
+                seq2 < seq3 && seq2 < old_unregistered && old_unregistered < final_registered,
                 "host advances and the final activation must be strictly ordered\n{logs}"
             );
-            assert_eq!(
-                count_log_lines(
-                    &logs,
-                    "pid0 host authority became stale; re-grafting and rerunning init.d"
-                ),
-                1,
-                "a burst inside one stale-probe window must coalesce to one serial re-graft\n{logs}"
-            );
             assert!(
-                !logs.lines().any(|line| {
-                    line.contains("registered HTTP route") && line.contains(&epoch2.route)
-                }),
-                "superseded epoch 2 must never activate a registration\n{logs}"
+                (1..=2).contains(&count_log_lines(&logs, "event_code=3")),
+                "rapid updates must converge in one or two coherent replacements\n{logs}"
             );
         })
         .await;
@@ -1365,7 +1575,8 @@ async fn replacement_init_failure_exits_nonzero_without_stale_or_partial_routes(
                 .await
                 .expect("bind replacement-delay Kubo proxy");
             let proxy_addr = proxy_listener.local_addr().expect("read proxy address");
-            let proxy_task = start_delayed_kubo_proxy(proxy_listener, kubo_addr);
+            let proxy_task =
+                start_delayed_kubo_proxy(proxy_listener, kubo_addr, invalid.delay_cid.clone());
             let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
             wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
             assert_status_route(&client, http_addr).await;
@@ -1388,7 +1599,7 @@ async fn replacement_init_failure_exits_nonzero_without_stale_or_partial_routes(
                     &invalid.route,
                     &mut node,
                 ),
-                expect_stale_host(&retained_old_host),
+                expect_stale_or_disconnected(&retained_old_host),
             );
             let logs = node.logs();
             assert_eq!(
@@ -1413,8 +1624,8 @@ async fn replacement_init_failure_exits_nonzero_without_stale_or_partial_routes(
                 "partial replacement route was not removed after failure\n{logs}"
             );
             assert!(
-                logs.contains("EPOCH_RESTART_INIT_FAILED"),
-                "replacement failure omitted the stable named error\n{logs}"
+                logs.contains("event_code=2"),
+                "replacement failure omitted the host lifecycle event\n{logs}"
             );
             assert!(
                 logs.lines().any(|line| {

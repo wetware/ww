@@ -121,6 +121,7 @@ membrane = { package = "wetware-membrane", path = "crates/membrane" }
 wasm-encoder = "0.243"
 wit-component = "0.244"
 wit-parser = "0.244"
+wat = "1"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 reqwest = { workspace = true, features = ["rustls-tls", "json", "stream", "multipart"] }
 

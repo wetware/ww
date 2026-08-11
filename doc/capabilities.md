@@ -44,14 +44,17 @@ references exist where*:
 Trusted pid0 receives the host graft; each ordinary child receives only its
 immutable `InitialAuthorityRecord`, constructed from the parent’s explicit
 grants and delivered through `InitialGrants.get()`. The root Atom binding flows
-through `stem::Atom` — when the Atom's value changes, `CidTree`'s root
-swaps atomically (`src/vfs.rs:CidTree::swap_root`), and old CIDs the
-cell had cached in memory still resolve to whatever they pointed to,
-but new walks see the new tree. The Glia env layer is where capabilities
-like `fs`, `routing`, and `host` are bound — restricting access at this
-layer is as simple as not installing the handler. But note the layering
-rule: env bindings and effect handlers are interposition *inside* the
-cell; they are never load-bearing across a boundary. See
+through `stem::Atom`. When the Atom value changes, `CidTree::swap_root` first
+switches the host filesystem view. The host then terminates the old PID0 and
+starts a new non-interactive PID0 generation. `WW_ROOT` is fixed when that
+generation starts. The process-local graft and readiness gate use the same
+captured epoch sequence, so a PID0 generation cannot activate with a root from
+one epoch and authority from another epoch. Interactive `ww run` exits on the
+change instead of replacing the interactive process.
+
+The Glia env layer binds capabilities such as `fs`, `routing`, and `host`.
+Omitting a handler restricts access inside that cell. Env bindings and effect
+handlers are not load-bearing across a process boundary. See
 [designs/single-authority-capability-model.md](designs/single-authority-capability-model.md).
 
 ## Attenuation: `(attenuate cap [:method ...])`
