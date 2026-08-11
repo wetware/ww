@@ -1,0 +1,25 @@
+[package]
+name = "kernel-rust"
+version = "0.1.0"
+edition = "2021"
+
+[workspace] # standalone — not part of the host workspace
+
+[dependencies]
+capnp = "0.25.3"
+capnp-rpc = "0.25.0"
+log = "0.4.29"
+wasip2 = "1.0.2"
+wit-bindgen = "0.41.0"
+system = { path = "../system" }
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+capnpc = "0.25.3"
+
+# capnp-rpc 0.25.1 + import-wrapper-reuse fix (wetware/ww#586). Keep the
+# kernel component on the same transport implementation as the host and Glia pid0.
+[patch.crates-io]
+capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", branch = "ww/import-fix-0.25-consume" }
