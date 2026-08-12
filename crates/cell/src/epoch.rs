@@ -232,49 +232,108 @@ async fn prepare_effective_root(
     Ok(effective)
 }
 
-async fn next_finalized_batch(
+async fn receive_observed_event(
     events: &mut broadcast::Receiver<atom::HeadUpdatedObserved>,
-    finalizer: &mut Finalizer,
-) -> Option<Vec<StemEvent>> {
+) -> Result<atom::HeadUpdatedObserved> {
     loop {
         match events.recv().await {
-            Ok(event) => finalizer.feed(event),
+            Ok(event) => return Ok(event),
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 warn!(
                     skipped,
                     "Epoch pipeline lagged; observed events were dropped"
                 );
-                continue;
             }
-            Err(broadcast::error::RecvError::Closed) => return None,
+            Err(broadcast::error::RecvError::Closed) => {
+                anyhow::bail!(
+                    "Atom indexer event channel closed; Host can no longer reconcile authoritative epochs"
+                )
+            }
         }
+    }
+}
 
-        let tip = match finalizer.current_tip().await {
-            Ok(tip) => tip,
-            Err(error) => {
-                warn!("Failed to fetch chain tip: {error}");
-                continue;
-            }
-        };
-        let finalized = match finalizer.drain_eligible(tip).await {
-            Ok(finalized) => finalized,
-            Err(error) => {
-                warn!("Finalizer drain error: {error}");
-                continue;
-            }
-        };
+async fn reconcile_observed_event(
+    finalizer: &mut Finalizer,
+    event: atom::HeadUpdatedObserved,
+) -> Result<Vec<StemEvent>> {
+    finalizer.feed(event);
+    let tip = finalizer
+        .current_tip()
+        .await
+        .context("fetching canonical chain tip after an observed Atom event")?;
+    let finalized = finalizer
+        .drain_eligible(tip)
+        .await
+        .context("reconciling an observed Atom event against the canonical head")?;
+    Ok(finalized
+        .into_iter()
+        .map(|event| StemEvent {
+            seq: event.seq,
+            cid: event.cid,
+            provenance: Provenance::Block(event.block_number),
+        })
+        .collect())
+}
+
+async fn next_finalized_batch(
+    events: &mut broadcast::Receiver<atom::HeadUpdatedObserved>,
+    finalizer: &mut Finalizer,
+) -> Result<Vec<StemEvent>> {
+    loop {
+        let event = receive_observed_event(events).await?;
+        let finalized = reconcile_observed_event(finalizer, event).await?;
         if !finalized.is_empty() {
-            return Some(
-                finalized
-                    .into_iter()
-                    .map(|event| StemEvent {
-                        seq: event.seq,
-                        cid: event.cid,
-                        provenance: Provenance::Block(event.block_number),
-                    })
-                    .collect(),
-            );
+            return Ok(finalized);
         }
+    }
+}
+
+async fn wait_for_retry_or_finalized_batch(
+    events: &mut broadcast::Receiver<atom::HeadUpdatedObserved>,
+    finalizer: &mut Finalizer,
+    retry_delay: Duration,
+) -> Result<Option<Vec<StemEvent>>> {
+    let retry_sleep = tokio::time::sleep(retry_delay);
+    tokio::pin!(retry_sleep);
+
+    loop {
+        let event = tokio::select! {
+            _ = &mut retry_sleep => return Ok(None),
+            event = receive_observed_event(events) => event?,
+        };
+        // Reconciliation is deliberately outside the select. Once the channel
+        // yields an event, the retry timer cannot cancel and strand that event.
+        let finalized = reconcile_observed_event(finalizer, event).await?;
+        if !finalized.is_empty() {
+            return Ok(Some(finalized));
+        }
+    }
+}
+
+async fn reconcile_available_events(
+    events: &mut broadcast::Receiver<atom::HeadUpdatedObserved>,
+    finalizer: &mut Finalizer,
+) -> Result<Vec<StemEvent>> {
+    let mut finalized = Vec::new();
+    loop {
+        let event = match events.try_recv() {
+            Ok(event) => event,
+            Err(broadcast::error::TryRecvError::Empty) => return Ok(finalized),
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "Epoch pipeline lagged while checking a prepared target"
+                );
+                continue;
+            }
+            Err(broadcast::error::TryRecvError::Closed) => {
+                anyhow::bail!(
+                    "Atom indexer event channel closed before prepared epoch activation; Host can no longer reconcile authoritative epochs"
+                )
+            }
+        };
+        finalized.extend(reconcile_observed_event(finalizer, event).await?);
     }
 }
 
@@ -298,14 +357,11 @@ pub async fn run_epoch_pipeline(
 
     let indexer = Arc::new(AtomIndexer::new(config.clone()));
     let mut events = indexer.subscribe();
-    let indexer_handle = {
-        let indexer = Arc::clone(&indexer);
-        tokio::spawn(async move {
-            if let Err(error) = indexer.run().await {
-                error!("Atom indexer exited with error: {error}");
-            }
-        })
-    };
+    let indexer_handle = tokio::spawn(async move {
+        if let Err(error) = indexer.run().await {
+            error!("Atom indexer exited with error: {error}");
+        }
+    });
     let mut finalizer = FinalizerBuilder::new()
         .http_url(&config.http_url)
         .contract_address(config.contract_address)
@@ -321,9 +377,12 @@ pub async fn run_epoch_pipeline(
 
     loop {
         if pending.is_none() {
-            let Some(batch) = next_finalized_batch(&mut events, &mut finalizer).await else {
-                info!("Indexer channel closed; epoch pipeline shutting down");
-                break;
+            let batch = match next_finalized_batch(&mut events, &mut finalizer).await {
+                Ok(batch) => batch,
+                Err(error) => {
+                    indexer_handle.abort();
+                    return Err(error.context("waiting for the next finalized Atom epoch"));
+                }
             };
             for event in batch {
                 pending.take();
@@ -385,6 +444,29 @@ pub async fn run_epoch_pipeline(
 
         match attempt {
             Ok(effective) => {
+                let newer = match reconcile_available_events(&mut events, &mut finalizer).await {
+                    Ok(newer) => newer,
+                    Err(error) => {
+                        indexer_handle.abort();
+                        return Err(error.context(
+                            "checking for a newer authoritative epoch before activation",
+                        ));
+                    }
+                };
+                if !newer.is_empty() {
+                    for event in newer {
+                        pending.take();
+                        broadcast_authority(&epoch_tx, &event);
+                        info!(
+                            seq = event.seq,
+                            "Advancing epoch authority; prepared target superseded before activation"
+                        );
+                        pending = Some((event.seq, event.cid));
+                    }
+                    current_delay = EPOCH_RETRY_BASE_DELAY;
+                    continue;
+                }
+
                 let provenance = epoch_tx.borrow().provenance.clone();
                 epoch_tx.send_replace(Epoch {
                     seq,
@@ -414,19 +496,31 @@ pub async fn run_epoch_pipeline(
                         "Transient epoch preparation failure; retry scheduled: {error:#}"
                     );
 
-                    tokio::select! {
-                        _ = tokio::time::sleep(sleep_duration) => {}
-                        batch = next_finalized_batch(&mut events, &mut finalizer) => {
-                            let Some(batch) = batch else {
-                                continue;
-                            };
+                    match wait_for_retry_or_finalized_batch(
+                        &mut events,
+                        &mut finalizer,
+                        sleep_duration,
+                    )
+                    .await
+                    {
+                        Ok(None) => {}
+                        Ok(Some(batch)) => {
                             for event in batch {
                                 pending.take();
                                 broadcast_authority(&epoch_tx, &event);
-                                info!(seq = event.seq, "Advancing epoch authority; pending preparation superseded");
+                                info!(
+                                    seq = event.seq,
+                                    "Advancing epoch authority; pending preparation superseded"
+                                );
                                 pending = Some((event.seq, event.cid));
                                 current_delay = EPOCH_RETRY_BASE_DELAY;
                             }
+                        }
+                        Err(error) => {
+                            indexer_handle.abort();
+                            return Err(error.context(
+                                "monitoring authoritative Atom epochs during Host retry",
+                            ));
                         }
                     }
                 }
@@ -439,15 +533,45 @@ pub async fn run_epoch_pipeline(
             },
         }
     }
-
-    indexer_handle.abort();
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn observed_event(seq: u64, cid: &[u8]) -> atom::HeadUpdatedObserved {
+        atom::HeadUpdatedObserved {
+            seq,
+            writer: [0; 20],
+            cid: cid.to_vec(),
+            cid_hash: [seq as u8; 32],
+            block_number: seq,
+            tx_hash: [seq as u8; 32],
+            log_index: 0,
+        }
+    }
+
+    fn encode_head_result(seq: u64, cid: &[u8]) -> String {
+        let padded_len = cid.len().div_ceil(32) * 32;
+        let mut encoded = vec![0; 96 + padded_len];
+        encoded[24..32].copy_from_slice(&seq.to_be_bytes());
+        encoded[63] = 64;
+        encoded[88..96].copy_from_slice(&(cid.len() as u64).to_be_bytes());
+        encoded[96..96 + cid.len()].copy_from_slice(cid);
+        format!("0x{}", hex::encode(encoded))
+    }
+
+    async fn write_json_response(stream: &mut tokio::net::TcpStream, body: serde_json::Value) {
+        use tokio::io::AsyncWriteExt;
+
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
 
     #[test]
     fn backoff_doubles_to_cap_and_resets() {
@@ -510,6 +634,95 @@ mod tests {
         assert_eq!(epoch_rx.borrow().seq, 2);
         assert_eq!(epoch_rx.borrow().root, None);
         assert_eq!(tree.root_cid().as_ref(), "old-root");
+    }
+
+    #[tokio::test]
+    async fn received_newer_event_finishes_reconciliation_after_retry_timer_elapses() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tip_started_tx, tip_started_rx) = tokio::sync::oneshot::channel();
+        let (tip_release_tx, tip_release_rx) = tokio::sync::oneshot::channel();
+        let cid = b"newer-head".to_vec();
+        let encoded_head = encode_head_result(2, &cid);
+        let server = tokio::spawn(async move {
+            let (mut tip_stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = tip_stream.read(&mut request).await.unwrap();
+            tip_started_tx.send(()).unwrap();
+            tip_release_rx.await.unwrap();
+            write_json_response(
+                &mut tip_stream,
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": "0x2"}),
+            )
+            .await;
+
+            let (mut head_stream, _) = listener.accept().await.unwrap();
+            let _ = head_stream.read(&mut request).await.unwrap();
+            write_json_response(
+                &mut head_stream,
+                serde_json::json!({"jsonrpc": "2.0", "id": 3, "result": encoded_head}),
+            )
+            .await;
+        });
+        let mut finalizer = FinalizerBuilder::new()
+            .confirmation_depth(0)
+            .http_url(format!("http://{address}"))
+            .contract_address([0; 20])
+            .build()
+            .unwrap();
+        let (event_tx, mut events) = broadcast::channel(1);
+        event_tx.send(observed_event(2, &cid)).unwrap();
+
+        let reconciliation = wait_for_retry_or_finalized_batch(
+            &mut events,
+            &mut finalizer,
+            Duration::from_millis(20),
+        );
+        tokio::pin!(reconciliation);
+        tokio::select! {
+            result = &mut reconciliation => panic!("event reconciliation ended before the canonical-tip request was released: {result:?}"),
+            started = tip_started_rx => started.unwrap(),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tip_release_tx.send(()).unwrap();
+
+        let batch = tokio::time::timeout(Duration::from_secs(1), &mut reconciliation)
+            .await
+            .expect("received event must finish reconciliation without another chain event")
+            .unwrap()
+            .expect("an elapsed retry timer must not replace an accepted event");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].seq, 2);
+        assert_eq!(batch[0].cid, cid);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_indexer_channel_during_retry_is_terminal() {
+        let (event_tx, mut events) = broadcast::channel(1);
+        drop(event_tx);
+        let mut finalizer = FinalizerBuilder::new()
+            .confirmation_depth(0)
+            .http_url("http://127.0.0.1:1")
+            .contract_address([0; 20])
+            .build()
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_retry_or_finalized_batch(&mut events, &mut finalizer, Duration::from_secs(60)),
+        )
+        .await
+        .expect("closed indexer channel must not wait for the retry timer")
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Host can no longer reconcile authoritative epochs"),
+            "unexpected closure error: {error:#}"
+        );
     }
 
     #[tokio::test]
