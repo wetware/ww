@@ -31,7 +31,9 @@ make counter
 Start a host with HTTP enabled:
 
 ```sh
-ww run --port=2025 --http-listen 127.0.0.1:2080 std/kernel
+make kernel-glia
+ww run --port=2025 --http-listen 127.0.0.1:2080 \
+  --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
 ```
 
 Leave this process running.

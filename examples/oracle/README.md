@@ -43,7 +43,9 @@ Vat publication uses the service name `oracle`.
 Start a host with HTTP enabled:
 
 ```sh
-ww run --http-listen 127.0.0.1:2080 --listen /ip4/127.0.0.1/tcp/2025 --with-http-admin off std/kernel
+make kernel-glia
+ww run --http-listen 127.0.0.1:2080 --listen /ip4/127.0.0.1/tcp/2025 \
+  --with-http-admin off --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
 ```
 
 Leave this process running.
@@ -101,7 +103,8 @@ Open a second terminal and boot a consumer node:
 
 ```sh
 # Terminal 3 -- consumer daemon
-ww run --listen /ip4/127.0.0.1/tcp/2026 --with-http-admin off std/kernel
+ww run --listen /ip4/127.0.0.1/tcp/2026 --with-http-admin off \
+  --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
 ```
 
 From another terminal, connect to that node and run consume mode:

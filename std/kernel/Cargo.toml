@@ -3,40 +3,23 @@ name = "kernel"
 version = "0.1.0"
 edition = "2021"
 
-[workspace]  # standalone — not part of the host workspace
+[workspace] # standalone — not part of the host workspace
 
 [dependencies]
-bs58 = "0.5"
 capnp = "0.25.3"
 capnp-rpc = "0.25.0"
 log = "0.4.29"
-multiaddr = "0.18"
 wasip2 = "1.0.2"
 wit-bindgen = "0.41.0"
-hex = "0.4"
-glia = { path = "../../crates/glia" }
 system = { path = "../system" }
-caps = { path = "../caps" }
-membrane = { package = "wetware-membrane", path = "../../crates/membrane" }
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "io-util"] }
-tokio-util = { version = "0.7", features = ["compat"] }
-futures = "0.3"
-tempfile = "3"
 
 [lib]
 crate-type = ["cdylib"]
 
 [build-dependencies]
 capnpc = "0.25.3"
-schema-id = { path = "../../crates/schema-id" }
 
-# capnp-rpc 0.25.1 + import-wrapper-reuse fix (wetware/ww#586): re-importing an
-# already-held capability created a duplicate wrapper Client whose later drop
-# poisoned the RPC downcast map, panicking the kernel's event loop on the next
-# send of that cap (status-cell route registration). Drop this patch once the
-# fix is released upstream (PR pending on capnproto/capnproto-rust; the ww/ branch adds crates.io
-# dep resolution so the git patch does not drag in a second capnp).
+# capnp-rpc 0.25.1 + import-wrapper-reuse fix (wetware/ww#586). Keep the
+# kernel component on the same transport implementation as the host and Glia pid0.
 [patch.crates-io]
 capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", branch = "ww/import-fix-0.25-consume" }

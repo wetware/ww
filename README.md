@@ -30,19 +30,9 @@ curl http://localhost:2080/status
 }
 ```
 
-The second command hit a WebAssembly cell running inside the daemon. The cell
-cannot acquire node authority on its own: its parent explicitly granted only
-`host`, so it can report peer identity and connected peers. The wiring lives at
-`~/.ww/etc/init.d/05-status.glia`:
-
-```clojure
-(perform host :listen
-  (cell (perform :load "bin/status.wasm")
-    :grants {:host host})
-  "/status")
-```
-
-That's the whole registration.
+The second command hit a WebAssembly cell running inside the daemon. The
+default Rust kernel installs this composition directly. The cell receives only
+the explicit `host` grant, which lets the cell report peer identity and peers.
 
 Here is the capability surface in action, directly in the Wetware shell (Glia):
 - `defcap` defines a capability server in Glia.
@@ -109,7 +99,9 @@ HTTP/WAGI adapter. The vat path is the stateful service surface; HTTP/WAGI
 is a stateless request adapter for curl/browser infrastructure:
 
 ```bash
-ww run --http-listen 127.0.0.1:2080 --port=2025 std/kernel examples/oracle
+make kernel-glia
+ww run --http-listen 127.0.0.1:2080 --port=2025 \
+  --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia examples/oracle
 curl http://localhost:2080/oracle
 ```
 

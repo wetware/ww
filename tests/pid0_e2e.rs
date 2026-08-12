@@ -4,8 +4,8 @@
 //! contract that must hold for every PID0 implementation: boot/serving
 //! identity, host-owned generation replacement with replacement-byte identity,
 //! initialization failure, and TTY process lifetime. Each driver runs against
-//! the embedded Glia PID0 and against the explicit `file:` Rust PID0
-//! (`std/kernel-rust`). Glia-only observables live in `glia_specific`; tests
+//! the embedded Rust PID0 and against the explicit `file:` Glia PID0
+//! (`std/kernel-glia`). Glia-only observables live in `glia_specific`; tests
 //! that ride the temporary `/ww/0.1.0` guest-membrane surface live in
 //! `ww_protocol_compat`.
 //!
@@ -39,7 +39,7 @@ use support::atom::AtomFixture;
 use support::terminal::{expect_stale_or_disconnected, TerminalSession};
 
 const KERNEL_WASM_PATH: &str = "std/kernel/bin/main.wasm";
-const KERNEL_RUST_WASM_PATH: &str = "std/kernel-rust/bin/main.wasm";
+const KERNEL_GLIA_WASM_PATH: &str = "std/kernel-glia/bin/main.wasm";
 const STATUS_WASM_PATH: &str = "std/status/bin/status.wasm";
 const STATUS_LAYER: &str = "std/status";
 const DEFAULT_KUBO_ADDR: &str = "127.0.0.1:5001";
@@ -112,11 +112,11 @@ struct KernelUnderTest {
     explicit_path: Option<&'static str>,
 }
 
-const EMBEDDED_GLIA: KernelUnderTest = KernelUnderTest {
+const EMBEDDED_RUST: KernelUnderTest = KernelUnderTest {
     explicit_path: None,
 };
-const EXPLICIT_KERNEL_RUST: KernelUnderTest = KernelUnderTest {
-    explicit_path: Some(KERNEL_RUST_WASM_PATH),
+const EXPLICIT_GLIA: KernelUnderTest = KernelUnderTest {
+    explicit_path: Some(KERNEL_GLIA_WASM_PATH),
 };
 
 impl KernelUnderTest {
@@ -1153,7 +1153,6 @@ async fn assert_unready_and_old_generation_dead(
     client: &reqwest::Client,
     admin_addr: SocketAddr,
     http_addr: SocketAddr,
-    old_route: &str,
     node: &mut RunningNode,
 ) {
     assert!(
@@ -1167,7 +1166,7 @@ async fn assert_unready_and_old_generation_dead(
         .await
         .expect("read readiness during Host retry");
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert_route_unavailable(client, http_addr, old_route).await;
+    assert_route_unavailable(client, http_addr, "/status").await;
 }
 
 async fn kubo_pin_is_present(
@@ -1193,7 +1192,7 @@ async fn wait_for_pin_release(client: &reqwest::Client, kubo_addr: SocketAddr, c
 }
 
 /// The kernel-independent behavioral contract. Every driver runs against the
-/// embedded Glia PID0 and the explicit `file:` Rust PID0 through named
+/// embedded Rust PID0 and the explicit `file:` Glia PID0 through named
 /// wrappers. Drivers assert host-observable behavior (admin plane, data
 /// plane, host lifecycle events, exit codes) plus the shared
 /// `INITIAL_INIT_FAILED` failure token. They must not assert same-instance
@@ -1573,77 +1572,77 @@ mod shared_parity {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn glia_pid0_boot_and_tty_parity() {
-        boot_and_tty_driver(EMBEDDED_GLIA).await;
+        boot_and_tty_driver(EXPLICIT_GLIA).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rust_pid0_boot_and_tty_parity() {
-        boot_and_tty_driver(EXPLICIT_KERNEL_RUST).await;
+        boot_and_tty_driver(EMBEDDED_RUST).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn glia_pid0_initial_failure_parity() {
-        initial_failure_driver(EMBEDDED_GLIA).await;
+        initial_failure_driver(EXPLICIT_GLIA).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rust_pid0_initial_failure_parity() {
-        initial_failure_driver(EXPLICIT_KERNEL_RUST).await;
+        initial_failure_driver(EMBEDDED_RUST).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn glia_pid0_replacement_parity() {
         tokio::task::LocalSet::new()
-            .run_until(epoch_replacement_driver(EMBEDDED_GLIA))
+            .run_until(epoch_replacement_driver(EXPLICIT_GLIA))
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn rust_pid0_replacement_parity() {
         tokio::task::LocalSet::new()
-            .run_until(epoch_replacement_driver(EXPLICIT_KERNEL_RUST))
+            .run_until(epoch_replacement_driver(EMBEDDED_RUST))
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn glia_pid0_rapid_replacement_parity() {
         tokio::task::LocalSet::new()
-            .run_until(epoch_burst_driver(EMBEDDED_GLIA))
+            .run_until(epoch_burst_driver(EXPLICIT_GLIA))
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn rust_pid0_rapid_replacement_parity() {
         tokio::task::LocalSet::new()
-            .run_until(epoch_burst_driver(EXPLICIT_KERNEL_RUST))
+            .run_until(epoch_burst_driver(EMBEDDED_RUST))
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn glia_pid0_replacement_failure_parity() {
         tokio::task::LocalSet::new()
-            .run_until(replacement_failure_driver(EMBEDDED_GLIA))
+            .run_until(replacement_failure_driver(EXPLICIT_GLIA))
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn rust_pid0_replacement_failure_parity() {
         tokio::task::LocalSet::new()
-            .run_until(replacement_failure_driver(EXPLICIT_KERNEL_RUST))
+            .run_until(replacement_failure_driver(EMBEDDED_RUST))
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn glia_pid0_interactive_replacement_parity() {
         tokio::task::LocalSet::new()
-            .run_until(interactive_replacement_driver(EMBEDDED_GLIA))
+            .run_until(interactive_replacement_driver(EXPLICIT_GLIA))
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn rust_pid0_interactive_replacement_parity() {
         tokio::task::LocalSet::new()
-            .run_until(interactive_replacement_driver(EXPLICIT_KERNEL_RUST))
+            .run_until(interactive_replacement_driver(EMBEDDED_RUST))
             .await;
     }
 }
@@ -1857,14 +1856,8 @@ async fn host_transient_epoch_preparation_recovers_without_restoring_old_generat
             expect_stale_or_disconnected(&retained_old_host).await;
             let deadline = Instant::now() + INVALIDATION_TIMEOUT;
             while attempts.load(Ordering::SeqCst) < 2 {
-                assert_unready_and_old_generation_dead(
-                    &client,
-                    admin_addr,
-                    http_addr,
-                    &epoch1.route,
-                    &mut node,
-                )
-                .await;
+                assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node)
+                    .await;
                 assert!(
                     Instant::now() < deadline,
                     "Host did not retry twice\n{}",
@@ -1872,21 +1865,11 @@ async fn host_transient_epoch_preparation_recovers_without_restoring_old_generat
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            assert_unready_and_old_generation_dead(
-                &client,
-                admin_addr,
-                http_addr,
-                &epoch1.route,
-                &mut node,
-            )
-            .await;
-            assert_route_unavailable(&client, http_addr, &epoch2.route).await;
+            assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node).await;
 
             release_tx.send(true).unwrap();
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert_status_cell(&client, http_addr, &cid_b).await;
-            assert_route_unavailable(&client, http_addr, &epoch1.route).await;
-            assert_route_available(&client, http_addr, &epoch2.route).await;
             let logs = node.logs();
             assert!(
                 count_log_lines(&logs, "Transient epoch preparation failure") >= 2,
@@ -1907,11 +1890,14 @@ async fn host_epoch_preparation_supersession_activates_only_latest_target() {
         .run_until(async {
             let _guard = e2e_lock().await;
             let status_wasm = required_artifact(STATUS_WASM_PATH);
+            let (variant_a, cid_a) = status_variant(&status_wasm, b"supersession-a");
+            let (variant_b, _cid_b) = status_variant(&status_wasm, b"supersession-b");
+            let (variant_c, cid_c) = status_variant(&status_wasm, b"supersession-c");
             let (kubo_addr, client) = require_kubo().await;
             let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
-            let epoch1 = EpochRoot::valid(&ipfs, &status_wasm, 1).await;
-            let epoch2 = EpochRoot::valid(&ipfs, &status_wasm, 2).await;
-            let epoch3 = EpochRoot::valid(&ipfs, &status_wasm, 3).await;
+            let epoch1 = EpochRoot::valid(&ipfs, &variant_a, 1).await;
+            let epoch2 = EpochRoot::valid(&ipfs, &variant_b, 2).await;
+            let epoch3 = EpochRoot::valid(&ipfs, &variant_c, 3).await;
             let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
             atom.set_head(&epoch1.cid).await;
 
@@ -1928,19 +1914,14 @@ async fn host_epoch_preparation_supersession_activates_only_latest_target() {
             let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
             let ready_url = format!("http://{admin_addr}/readyz");
             wait_for_ready(&client, &ready_url, &mut node).await;
+            assert_status_cell(&client, http_addr, &cid_a).await;
 
             atom.set_head(&epoch2.cid).await;
             wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
             let retry_deadline = Instant::now() + INVALIDATION_TIMEOUT;
             while attempts.load(Ordering::SeqCst) < 2 {
-                assert_unready_and_old_generation_dead(
-                    &client,
-                    admin_addr,
-                    http_addr,
-                    &epoch1.route,
-                    &mut node,
-                )
-                .await;
+                assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node)
+                    .await;
                 assert!(Instant::now() < retry_deadline, "Host did not enter retry");
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -1954,9 +1935,7 @@ async fn host_epoch_preparation_supersession_activates_only_latest_target() {
                 "new target inherited the superseded backoff\n{}",
                 node.logs()
             );
-            assert_route_unavailable(&client, http_addr, &epoch1.route).await;
-            assert_route_unavailable(&client, http_addr, &epoch2.route).await;
-            assert_route_available(&client, http_addr, &epoch3.route).await;
+            assert_status_cell(&client, http_addr, &cid_c).await;
             wait_for_pin_release(&client, kubo_addr, &epoch2.cid).await;
             let logs = node.logs();
             assert_eq!(
@@ -1974,16 +1953,27 @@ async fn host_epoch_preparation_supersession_activates_only_latest_target() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn superseded_failing_generation_converges_to_the_newer_epoch() {
+async fn superseded_pending_generation_converges_to_the_newer_epoch() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let _guard = e2e_lock().await;
             let status_wasm = required_artifact(STATUS_WASM_PATH);
+            let (variant_a, _cid_a) = status_variant(&status_wasm, b"result-race-a");
+            let (variant_b, _cid_b) = status_variant(&status_wasm, b"result-race-b");
+            let (variant_c, cid_c) = status_variant(&status_wasm, b"result-race-c");
             let (kubo_addr, client) = require_kubo().await;
             let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
-            let epoch1 = EpochRoot::valid(&ipfs, &status_wasm, 1).await;
-            let invalid = EpochRoot::failing(&ipfs, &status_wasm).await;
-            let epoch3 = EpochRoot::valid(&ipfs, &status_wasm, 3).await;
+            let epoch1 = EpochRoot::valid(&ipfs, &variant_a, 1).await;
+            let pending = EpochRoot::valid(&ipfs, &variant_b, 2).await;
+            let epoch3 = EpochRoot::valid(&ipfs, &variant_c, 3).await;
+            let pending_status_cid = ipfs
+                .ls(&format!("/ipfs/{}/bin", pending.cid))
+                .await
+                .expect("list pending-generation bin directory")
+                .into_iter()
+                .find(|entry| entry.name == "status.wasm")
+                .expect("pending generation omitted status.wasm")
+                .hash;
             let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
             atom.set_head(&epoch1.cid).await;
 
@@ -2003,17 +1993,17 @@ async fn superseded_failing_generation_converges_to_the_newer_epoch() {
                 .expect("bind PID0 result race barrier");
             options.pid0_result_race = Some((2, result_race_listener.local_addr().unwrap()));
             let (proxy_task, mut reached_rx, release_tx) =
-                start_gated_kubo_proxy(proxy_listener, kubo_addr, invalid.delay_cid.clone());
+                start_gated_kubo_proxy(proxy_listener, kubo_addr, pending_status_cid);
             let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
             let ready_url = format!("http://{admin_addr}/readyz");
             wait_for_ready(&client, &ready_url, &mut node).await;
 
-            atom.set_head(&invalid.cid).await;
+            atom.set_head(&pending.cid).await;
             wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
             tokio::time::timeout(INVALIDATION_TIMEOUT, reached_rx.recv())
                 .await
-                .expect("failing generation did not reach its sentinel")
-                .expect("sentinel channel closed before failing generation arrived");
+                .expect("pending generation did not reach its sentinel")
+                .expect("sentinel channel closed before pending generation arrived");
 
             let convergence_started = Instant::now();
             atom.set_head(&epoch3.cid).await;
@@ -2031,7 +2021,7 @@ async fn superseded_failing_generation_converges_to_the_newer_epoch() {
             wait_for_log(&mut node, "Advancing epoch", "seq=3").await;
             release_tx
                 .send(true)
-                .expect("release failing generation sentinel");
+                .expect("release pending generation sentinel");
             let (mut result_ready, _) =
                 tokio::time::timeout(INVALIDATION_TIMEOUT, result_race_listener.accept())
                     .await
@@ -2052,9 +2042,7 @@ async fn superseded_failing_generation_converges_to_the_newer_epoch() {
                 "superseded generation did not converge within the test bound\n{}",
                 node.logs()
             );
-            assert_route_unavailable(&client, http_addr, &epoch1.route).await;
-            assert_route_unavailable(&client, http_addr, &invalid.route).await;
-            assert_route_available(&client, http_addr, &epoch3.route).await;
+            assert_status_cell(&client, http_addr, &cid_c).await;
             let logs = node.logs();
             assert!(
                 !logs.contains("event_code=2"),
@@ -2084,12 +2072,11 @@ mod ww_protocol_compat {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn real_atom_epoch_transition_replaces_current_embedded_glia_pid0() {
+    async fn real_atom_epoch_transition_replaces_explicit_glia_pid0() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let _guard = e2e_lock().await;
-                let kernel_wasm = required_artifact(KERNEL_WASM_PATH);
                 let status_wasm = required_artifact(STATUS_WASM_PATH);
                 let (kubo_addr, client) = require_kubo().await;
                 let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
@@ -2105,14 +2092,15 @@ mod ww_protocol_compat {
                 let listen_addr = unused_addr().await;
                 let home = tempfile::tempdir().expect("create isolated epoch HOME");
                 let (signing_key, identity_path, peer_id) = persistent_identity(home.path());
-                let options =
+                let mut options =
                     epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
+                let (kernel_wasm, kernel_source) = EXPLICIT_GLIA.select(&mut options);
                 let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
                 let ready_url = format!("http://{admin_addr}/readyz");
                 let ready = wait_for_ready(&client, &ready_url, &mut node).await;
                 assert_eq!(ready["phase"], "ready");
                 let identity = version(&client, admin_addr).await;
-                assert_eq!(identity["kernel_source"], "embedded:main");
+                assert_eq!(identity["kernel_source"], kernel_source);
                 assert_eq!(
                     identity["kernel_cid"],
                     ww::kernel::runtime_cid(&kernel_wasm).to_string()
@@ -2215,7 +2203,8 @@ mod glia_specific {
         let admin_addr = unused_addr().await;
         let http_addr = unused_addr().await;
         let home = tempfile::tempdir().expect("create isolated HOME");
-        let options = NodeOptions::embedded(Some(http_addr));
+        let mut options = NodeOptions::embedded(Some(http_addr));
+        EXPLICIT_GLIA.select(&mut options);
         let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
         wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
         assert_status_cell(&client, http_addr, &ww::kernel::runtime_cid(&status_wasm)).await;
@@ -2235,7 +2224,6 @@ mod glia_specific {
         local
             .run_until(async {
                 let _guard = e2e_lock().await;
-                required_artifact(KERNEL_WASM_PATH);
                 let status_wasm = required_artifact(STATUS_WASM_PATH);
                 let (kubo_addr, client) = require_kubo().await;
                 let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
@@ -2249,8 +2237,9 @@ mod glia_specific {
                 let listen_addr = unused_addr().await;
                 let home = tempfile::tempdir().expect("create isolated init-failure HOME");
                 let (signing_key, identity_path, peer_id) = persistent_identity(home.path());
-                let options =
+                let mut options =
                     epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
+                EXPLICIT_GLIA.select(&mut options);
                 let proxy_listener = TcpListener::bind("127.0.0.1:0")
                     .await
                     .expect("bind replacement-delay Kubo proxy");

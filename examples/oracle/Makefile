@@ -22,11 +22,14 @@ demo: all
 	@echo ""
 	@echo "=== Price Oracle Demo ==="
 	@echo ""
+	@echo "Build the legacy Glia kernel:"
+	@echo "  make kernel-glia"
+	@echo ""
 	@echo "Run the oracle service (terminal 1):"
-	@echo "  cargo run -- run --listen /ip4/127.0.0.1/tcp/2025 --with-http-admin off crates/kernel examples/oracle"
+	@echo "  cargo run -- run --listen /ip4/127.0.0.1/tcp/2025 --with-http-admin off --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia examples/oracle"
 	@echo ""
 	@echo "Run a consumer (terminal 2):"
-	@echo "  WW_CONSUMER=1 cargo run -- run --listen /ip4/127.0.0.1/tcp/2026 --with-http-admin off crates/kernel examples/oracle"
+	@echo "  WW_CONSUMER=1 cargo run -- run --listen /ip4/127.0.0.1/tcp/2026 --with-http-admin off --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia examples/oracle"
 	@echo ""
 
 clean:

@@ -61,10 +61,10 @@ policy-selected session authority.
 
 `ww run` resolves image layers, starts the host services, and loads trusted
 pid0 from `boot/main.wasm`. The host does not interpret the rest of the image
-as application policy. pid0 uses its graft to run Glia init scripts and build
-the authority graph: load bytes, obtain an `Executor`, construct a named grant
-map, spawn a process, and optionally publish the capability the process
-exports.
+as application policy. The default Rust pid0 directly installs the shipped
+`/status` composition. The legacy Glia pid0 remains available through
+`--kernel file:std/kernel-glia/bin/main.wasm`. That implementation runs Glia
+init scripts and builds an authority graph from explicit grants.
 
 The spawn lattice is deliberately small:
 
