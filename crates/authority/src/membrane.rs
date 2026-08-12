@@ -129,6 +129,7 @@ mod tests {
         Epoch {
             seq,
             head: vec![0xAB, 0xCD],
+            root: None,
             provenance: crate::epoch::Provenance::Block(42),
         }
     }

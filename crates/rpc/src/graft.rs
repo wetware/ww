@@ -711,6 +711,7 @@ mod tests {
         Epoch {
             seq,
             head: seq.to_be_bytes().to_vec(),
+            root: None,
             provenance: Provenance::Block(seq),
         }
     }
@@ -782,6 +783,7 @@ mod tests {
         let epoch = Epoch {
             seq: 1,
             head: b"test".to_vec(),
+            root: None,
             provenance: Provenance::Block(100),
         };
         let (tx, rx) = tokio::sync::watch::channel(epoch);
@@ -804,6 +806,7 @@ mod tests {
         let epoch = Epoch {
             seq: 1,
             head: b"pid0".to_vec(),
+            root: None,
             provenance: Provenance::Block(1),
         };
         let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch);
@@ -1165,6 +1168,7 @@ mod tests {
                 let epoch = Epoch {
                     seq: 1,
                     head: b"pid0-session".to_vec(),
+                    root: None,
                     provenance: Provenance::Block(1),
                 };
                 let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch);
@@ -1298,6 +1302,7 @@ mod tests {
                 let epoch = Epoch {
                     seq: 1,
                     head: b"pid0-rpc".to_vec(),
+                    root: None,
                     provenance: Provenance::Block(1),
                 };
                 let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch);
@@ -1647,6 +1652,7 @@ mod tests {
                 tx.send(Epoch {
                     seq: 2,
                     head: b"new".to_vec(),
+                    root: None,
                     provenance: Provenance::Block(101),
                 })
                 .unwrap();

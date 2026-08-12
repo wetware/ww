@@ -55,6 +55,7 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
             let epoch = authority::Epoch {
                 seq: 1,
                 head: vec![],
+                root: None,
                 provenance: authority::Provenance::Block(0),
             };
             let (_epoch_tx, epoch_rx) = watch::channel(epoch);

@@ -345,6 +345,7 @@ mod tests {
                 let (_epoch_tx, epoch_rx) = watch::channel(Epoch {
                     seq: 1,
                     head: vec![1],
+                    root: None,
                     provenance: Provenance::Block(1),
                 });
                 let bootstrap = authority::membrane_client(epoch_rx);

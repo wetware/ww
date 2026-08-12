@@ -262,8 +262,7 @@ enum Commands {
         #[arg(long, default_value = "6")]
         confirmation_depth: u64,
 
-        /// Seconds to drain in-flight operations before advancing the epoch.
-        /// During drain, old capabilities still work but FS already serves new content.
+        /// Deprecated and inert. Epoch authority now changes immediately.
         #[arg(long, default_value = "1")]
         epoch_drain_secs: u64,
 
@@ -1605,7 +1604,10 @@ wasip2::cli::command::export!({iface_name}Guest);
 
         // Reject local configuration before Kubo readiness can intentionally
         // wait forever in production. A bad path must remain actionable.
-        image::validate_mounts_virtual(&mounts)?;
+        if !mounts.is_empty() || stem.is_none() {
+            image::validate_mounts_virtual(&mounts)?;
+        }
+        let user_mounts = mounts.clone();
         let local_roots: Vec<&std::path::Path> = mounts
             .iter()
             .filter(|mount| mount.is_root() && !ww::ipfs::is_ipfs_path(&mount.source))
@@ -1615,6 +1617,13 @@ wasip2::cli::command::export!({iface_name}Guest);
             .context("Failed to scan namespace configs")?;
 
         ww::config::init_tracing_to_stderr(false);
+
+        if epoch_drain_secs != 0 {
+            tracing::warn!(
+                epoch_drain_secs,
+                "--epoch-drain-secs is deprecated and has no effect"
+            );
+        }
 
         let ipfs_client = ipfs::HttpClient::new(ipfs_url);
 
@@ -1632,6 +1641,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         let (epoch_tx, mut epoch_rx) = watch::channel(Epoch {
             seq: 0,
             head: Vec::new(),
+            root: None,
             provenance: Provenance::Block(0),
         });
         let kernel_ready_gate =
@@ -1757,10 +1767,15 @@ wasip2::cli::command::export!({iface_name}Guest);
         // as a base root mount.
         let mut all_mounts: Vec<ww::cell::mount::Mount> = Vec::new();
         let mut mounted_head_seq = 0;
+        let mut initial_head_cid = None;
         let stem_config = if let Some(ref stem_addr) = stem {
             let contract = parse_contract_address(stem_addr)?;
             let head = image::read_contract_head(&rpc_url, &contract).await?;
             let ipfs_path = image::cid_bytes_to_ipfs_path(&head.cid)?;
+            let head_cid = ipfs_path
+                .strip_prefix("/ipfs/")
+                .context("initial head did not convert to an IPFS path")?
+                .to_owned();
 
             tracing::info!(
                 seq = head.seq,
@@ -1768,10 +1783,10 @@ wasip2::cli::command::export!({iface_name}Guest);
                 "Read on-chain HEAD; prepending as base root mount"
             );
 
-            // Pin the initial head.
-            if let Err(error) = boot_ipfs_client.pin_add_once(&ipfs_path).await {
-                tracing::warn!(path = %ipfs_path, "Failed to pin initial head: {error}");
-            }
+            boot_ipfs_client
+                .pin_add_once(&head_cid)
+                .await
+                .context("failed to pin initial authoritative head")?;
 
             all_mounts.push(ww::cell::mount::Mount {
                 source: ipfs_path,
@@ -1780,12 +1795,14 @@ wasip2::cli::command::export!({iface_name}Guest);
 
             let initial_epoch = Epoch {
                 seq: head.seq,
-                head: head.cid,
+                head: head.cid.clone(),
+                root: None,
                 provenance: Provenance::Block(0),
             };
 
             epoch_tx.send_replace(initial_epoch);
             mounted_head_seq = head.seq;
+            initial_head_cid = Some(head_cid);
 
             Some(atom::IndexerConfig {
                 ws_url: ws_url.clone(),
@@ -1829,6 +1846,7 @@ wasip2::cli::command::export!({iface_name}Guest);
 
         // Append user-specified mounts after namespace layers.
         // User mounts are highest priority — they override everything.
+        let user_layer_start = all_mounts.len();
         all_mounts.extend(mounts);
 
         // Resolve mounts into a merged root CID + local overrides. No tempdir
@@ -1842,7 +1860,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             &boot_ipfs_client,
             &mut cancel_rx,
         ));
-        let (root_cid, local_overrides) = tokio::select! {
+        let (root_cid, local_overrides, layer_cids) = tokio::select! {
             result = &mut mount_resolution => result?,
             service_exit = supervisor.next_service_exit() => {
                 let _ = cancel_tx.send(true);
@@ -1852,6 +1870,30 @@ wasip2::cli::command::export!({iface_name}Guest);
                 return Err(service_exit_error(service_exit));
             }
         };
+        for (mount, cid) in user_mounts
+            .iter()
+            .zip(layer_cids.iter().skip(user_layer_start))
+        {
+            if ipfs::is_ipfs_path(&mount.source) {
+                if let Err(error) = boot_ipfs_client.pin_add_once(cid).await {
+                    tracing::warn!(%cid, "Failed to pin user IPFS layer: {error}");
+                }
+            }
+        }
+        let frozen_overlays = if initial_head_cid.is_some() {
+            layer_cids
+                .get(1..)
+                .context("stem root layer is missing from resolved mounts")?
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        if initial_head_cid.is_some() {
+            let mut rooted_epoch = epoch_rx.borrow().clone();
+            rooted_epoch.root = Some(root_cid.clone());
+            epoch_tx.send_replace(rooted_epoch);
+            let _ = epoch_rx.borrow_and_update();
+        }
         let image_path = format!("/ipfs/{}", root_cid);
         tracing::debug!(root = %image_path, "virtual root resolved");
 
@@ -1986,7 +2028,9 @@ wasip2::cli::command::export!({iface_name}Guest);
                     confirmation_depth,
                     ipfs_client: ipfs_client.clone(),
                     cid_tree: Some(cid_tree.clone()),
-                    drain_duration: std::time::Duration::from_secs(epoch_drain_secs),
+                    overlays: frozen_overlays,
+                    initial_head: initial_head_cid.expect("stem configuration has an initial head"),
+                    initial_root: root_cid.clone(),
                 },
             )?;
         }
@@ -2056,12 +2100,28 @@ wasip2::cli::command::export!({iface_name}Guest);
             let (intended_seq, root_path) = if generation == 0 {
                 gen0_identity.clone()
             } else {
-                let epoch = epoch_rx.borrow_and_update().clone();
-                (
-                    epoch.seq,
-                    image::cid_bytes_to_ipfs_path(&epoch.head)
-                        .context("failed to resolve replacement generation root")?,
-                )
+                let epoch = loop {
+                    let epoch = epoch_rx.borrow_and_update().clone();
+                    if epoch.root.is_some() {
+                        break epoch;
+                    }
+                    tokio::select! {
+                        changed = epoch_rx.changed() => {
+                            if changed.is_err() {
+                                tracing::error!("epoch channel closed while preparation was pending");
+                                break 'generations 1;
+                            }
+                        }
+                        service_exit = supervisor.next_service_exit() => {
+                            tracing::error!(error = %service_exit_error(service_exit), "runtime supervision failed");
+                            break 'generations 1;
+                        }
+                    }
+                };
+                let root = epoch
+                    .root
+                    .context("rooted epoch wait returned a pending epoch")?;
+                (epoch.seq, format!("/ipfs/{root}"))
             };
             let loader = ChainLoader::new(vec![
                 Box::new(HostPathLoader),
@@ -3184,11 +3244,13 @@ mod tests {
         let (tx, rx) = watch::channel(Epoch {
             seq: 7,
             head: Vec::new(),
+            root: None,
             provenance: Provenance::Block(1),
         });
         tx.send_replace(Epoch {
             seq: 7,
             head: Vec::new(),
+            root: None,
             provenance: Provenance::Block(2),
         });
         assert!(!epoch_superseded(&rx, 7));
@@ -3196,6 +3258,7 @@ mod tests {
         tx.send_replace(Epoch {
             seq: 8,
             head: Vec::new(),
+            root: None,
             provenance: Provenance::Block(3),
         });
         assert!(epoch_superseded(&rx, 7));

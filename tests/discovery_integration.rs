@@ -45,6 +45,7 @@ async fn spawn_greeter_on_pool(
                 let epoch = authority::Epoch {
                     seq: 1,
                     head: vec![],
+                    root: None,
                     provenance: authority::Provenance::Block(0),
                 };
                 let (_epoch_tx, epoch_rx) = watch::channel(epoch);

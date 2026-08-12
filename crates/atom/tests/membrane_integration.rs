@@ -70,6 +70,7 @@ fn observed_to_epoch(ev: &atom::HeadUpdatedObserved) -> Epoch {
     Epoch {
         seq: ev.seq,
         head: ev.cid.clone(),
+        root: None,
         provenance: authority::Provenance::Block(ev.block_number),
     }
 }
@@ -160,6 +161,7 @@ async fn test_membrane_graft_runtime_against_anvil() {
     let epoch2 = Epoch {
         seq: first_ev.seq + 1,
         head: b"next_head".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(first_ev.block_number + 1),
     };
 
@@ -217,6 +219,7 @@ async fn test_membrane_graft_no_auth() {
     let epoch = Epoch {
         seq: 1,
         head: b"head1".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(100),
     };
 
@@ -250,11 +253,13 @@ async fn test_membrane_stale_epoch_then_recovery_no_chain() {
     let epoch1 = Epoch {
         seq: 1,
         head: b"head1".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(100),
     };
     let epoch2 = Epoch {
         seq: 2,
         head: b"head2".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(101),
     };
 
@@ -316,6 +321,7 @@ async fn test_terminal_wrong_key_rejected() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(100),
     };
 
@@ -346,6 +352,7 @@ async fn test_terminal_missing_signer_rejected() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(100),
     };
 
@@ -377,6 +384,7 @@ async fn test_graft_returns_all_five_capabilities() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(100),
     };
 
@@ -429,6 +437,7 @@ async fn test_terminal_over_stream_pair() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(100),
     };
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -524,6 +533,7 @@ async fn test_terminal_over_stream_wrong_key_rejected() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(100),
     };
     let host_sk = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -609,6 +619,7 @@ async fn test_terminal_malformed_signature_rejected() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(100),
     };
 
@@ -637,6 +648,7 @@ async fn test_terminal_login_fails_after_epoch_advance() {
     let epoch1 = Epoch {
         seq: 1,
         head: b"head1".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(100),
     };
 
@@ -659,6 +671,7 @@ async fn test_terminal_login_fails_after_epoch_advance() {
     tx.send(Epoch {
         seq: 2,
         head: b"head2".to_vec(),
+        root: None,
         provenance: authority::Provenance::Block(101),
     })
     .unwrap();

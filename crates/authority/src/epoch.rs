@@ -24,6 +24,9 @@ pub enum Provenance {
 pub struct Epoch {
     pub seq: u64,
     pub head: Vec<u8>,
+    /// The Host-composed root. `None` means that the epoch is authoritative
+    /// but its replacement generation is not ready to start.
+    pub root: Option<String>,
     pub provenance: Provenance,
 }
 
@@ -60,6 +63,7 @@ mod tests {
         Epoch {
             seq,
             head: head.to_vec(),
+            root: None,
             provenance: Provenance::Block(block),
         }
     }

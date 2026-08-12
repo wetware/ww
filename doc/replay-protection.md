@@ -133,20 +133,14 @@ on-chain state via `eth_call` to `Atom.head()`. This prevents:
 - **Downgrade attacks**: replaying an old organization snapshot fails because
   the on-chain `seq` has advanced past the stale value.
 
-## Graceful epoch shutdown (drain)
+## Epoch authority advance
 
-Epoch transitions support an optional drain duration. When configured:
+The Host broadcasts each finalized epoch before it prepares the filesystem
+root. Existing capabilities then fail with `staleEpoch`. The Host broadcasts
+the same epoch with its effective root only after root preparation succeeds.
 
-1. New CID is pinned and CidTree is swapped (FS serves new content).
-2. **Drain window** begins. In-flight operations on old capabilities continue.
-3. After the drain expires, `epoch_tx.send(new_epoch)` fires.
-4. All old capabilities die with `staleEpoch`.
-
-The drain provides graceful shutdown semantics (SIGTERM before SIGKILL)
-without weakening security: no new capabilities are issued for the old
-epoch during the drain, and the window is bounded and configurable.
-Default: 1 second (`--epoch-drain-secs 1`). Set to 0 for instant
-epoch advance.
+`--epoch-drain-secs` is deprecated and inert. The Host accepts the option for
+CLI compatibility, but the value does not delay the authority broadcast.
 
 ## Summary
 
@@ -156,4 +150,4 @@ epoch advance.
 | Epoch-bound nonce | `nonce \|\| epoch_seq` in login payload | Same-epoch and cross-epoch replay |
 | Epoch guards | `EpochGuard.check()` on every RPC | Stale capability use |
 | On-chain finality | K-deep confirmation + canonical cross-check | Reorg and downgrade attacks |
-| Graceful drain | Configurable delay before epoch broadcast | In-flight operation interruption |
+| Authority-first epoch broadcast | Immediate capability invalidation before Host preparation | Stale-generation authority use |

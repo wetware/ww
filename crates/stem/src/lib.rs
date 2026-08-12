@@ -92,6 +92,7 @@ mod tests {
         let initial = Epoch {
             seq: 0,
             head: vec![],
+            root: None,
             provenance: Provenance::Block(0),
         };
         let (tx, mut rx) = watch::channel(initial);
@@ -101,6 +102,7 @@ mod tests {
             epoch: Epoch {
                 seq: 1,
                 head: b"abc".to_vec(),
+                root: None,
                 provenance: Provenance::Block(42),
             },
         };
@@ -118,6 +120,7 @@ mod tests {
         let initial = Epoch {
             seq: 0,
             head: vec![],
+            root: None,
             provenance: Provenance::Timestamp(0),
         };
         let (tx, mut rx) = watch::channel(initial);
@@ -127,6 +130,7 @@ mod tests {
             epoch: Epoch {
                 seq: 1,
                 head: b"ipns-root".to_vec(),
+                root: None,
                 provenance: Provenance::Timestamp(1712438400),
             },
         };

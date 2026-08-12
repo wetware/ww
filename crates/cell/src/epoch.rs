@@ -1,146 +1,311 @@
-//! Epoch pipeline: source-agnostic pin/swap/broadcast for epoch advances.
+//! Epoch pipeline: authority revocation precedes effective-root preparation.
 //!
-//! The pipeline handles the downstream side of any epoch source:
-//! 1. Pin new CID on IPFS
-//! 2. Pre-warm and swap CidTree root (FS sees new content)
-//! 3. Unpin old CID
-//! 4. Broadcast epoch (capabilities die, guests re-negotiate)
-//!
-//! For the Atom-specific indexer+finalizer pipeline (legacy entry point),
-//! see `run_atom_pipeline` which wraps `AtomSource` from `crates/stem/`.
+//! A finalized epoch first broadcasts `root: None`. That broadcast closes the
+//! previous generation's authority before the Host prepares any filesystem
+//! state. The pipeline then composes the finalized head with the frozen boot
+//! overlays, gates activation on both pins, pre-warms and swaps `CidTree`, and
+//! broadcasts the same epoch with `root: Some(effective_root)`.
 
+use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use authority::Epoch;
+use atom::{AtomIndexer, Finalizer, FinalizerBuilder, IndexerConfig};
+use authority::{Epoch, Provenance};
+use rand::Rng;
 use stem::StemEvent;
-use tokio::sync::watch;
-use tracing::{info, warn};
+use tokio::sync::{broadcast, watch};
+use tracing::{error, info, warn};
 
-use crate::image::cid_bytes_to_ipfs_path;
+use crate::image::{cid_bytes_to_ipfs_path, dag_merge};
 use ipfs;
 
-/// Process a single epoch advance: pin new CID, swap CidTree, unpin old, broadcast.
-///
-/// This is the shared downstream pipeline that all epoch sources feed into.
-/// The ordering follows the two-layer revocation model:
-/// 1. Pin new CID
-/// 2. Pre-warm CidTree directory cache for new root
-/// 3. Swap CidTree root (FS sees new content)
-/// 4. Unpin old CID
-/// 5. Drain — SIGTERM window for in-flight operations
-/// 6. Broadcast epoch — SIGKILL, capabilities die, guests re-negotiate
-///
-/// `drain_duration` controls graceful shutdown: when non-zero, capabilities have
-/// this long to finish in-flight work before the epoch advances and they die.
-/// During the drain window the FS already serves new content (CidTree was swapped),
-/// but capabilities still reference the old epoch.
-pub async fn handle_epoch_advance(
-    event: &StemEvent,
-    epoch_tx: &watch::Sender<Epoch>,
-    ipfs_client: &ipfs::HttpClient,
-    prev_ipfs_path: &mut Option<String>,
-    cid_tree: Option<&Arc<crate::vfs::CidTree>>,
-    drain_duration: Duration,
-) -> Result<()> {
-    let ipfs_path =
-        cid_bytes_to_ipfs_path(&event.cid).context("Failed to convert CID to IPFS path")?;
+const EPOCH_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const EPOCH_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+const EPOCH_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+const EPOCH_RETRY_JITTER_MAX: Duration = Duration::from_millis(500);
 
-    // Extract CID string from /ipfs/<cid>
-    let cid_str = ipfs_path
-        .strip_prefix("/ipfs/")
-        .unwrap_or(&ipfs_path)
-        .to_string();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostFailureClass {
+    Transient,
+    Permanent,
+    Unknown,
+}
 
-    // 1. Pin the new head.
-    if let Err(e) = ipfs_client.pin_add(&ipfs_path).await {
-        warn!(path = %ipfs_path, "Failed to pin new head (continuing): {e}");
+#[derive(Debug)]
+struct EpochOperationTimeout {
+    operation: &'static str,
+    timeout: Duration,
+}
+
+impl std::fmt::Display for EpochOperationTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "epoch operation {} made no progress within {}s",
+            self.operation,
+            self.timeout.as_secs_f64()
+        )
+    }
+}
+
+impl std::error::Error for EpochOperationTimeout {}
+
+#[derive(Debug)]
+struct PermanentHostError(String);
+
+impl std::fmt::Display for PermanentHostError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PermanentHostError {}
+
+fn classify_host_failure(error: &anyhow::Error) -> HostFailureClass {
+    if error.chain().any(|cause| cause.is::<PermanentHostError>()) {
+        HostFailureClass::Permanent
+    } else if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_connect() || error.is_timeout() || error.is_request())
+            || cause
+                .downcast_ref::<ipfs::KuboApiError>()
+                .is_some_and(ipfs::KuboApiError::is_server_error)
+            || cause.is::<EpochOperationTimeout>()
+            || cause.is::<ipfs::KuboOperationTimeout>()
+    }) {
+        HostFailureClass::Transient
     } else {
-        info!(seq = event.seq, path = %ipfs_path, "Pinned new head");
+        HostFailureClass::Unknown
     }
+}
 
-    // 2-3. Pre-warm and swap CidTree root (FS swap happens-before capability death).
-    if let Some(tree) = cid_tree {
-        if let Err(e) = tree.pre_warm(&cid_str).await {
-            warn!(cid = %cid_str, "CidTree pre-warm failed (continuing): {e}");
+fn next_backoff_delay(current_delay: Duration, jitter: Duration) -> (Duration, Duration) {
+    (
+        current_delay + jitter,
+        (current_delay * 2).min(EPOCH_RETRY_MAX_DELAY),
+    )
+}
+
+async fn bounded<T>(operation: &'static str, future: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(EPOCH_OPERATION_TIMEOUT, future)
+        .await
+        .map_err(|_| EpochOperationTimeout {
+            operation,
+            timeout: EPOCH_OPERATION_TIMEOUT,
+        })?
+}
+
+#[derive(Debug, Default)]
+struct PinSlots {
+    head: Option<String>,
+    root: Option<String>,
+}
+
+impl PinSlots {
+    fn new(head: String, root: String) -> Self {
+        Self {
+            head: Some(head),
+            root: Some(root),
         }
-        tree.swap_root(cid_str);
-        info!(seq = event.seq, "CidTree root swapped");
     }
 
-    // 4. Unpin the previous head.
-    if let Some(prev) = prev_ipfs_path.take() {
-        if let Err(e) = ipfs_client.pin_rm(&prev).await {
-            warn!(path = %prev, "Failed to unpin old head (continuing): {e}");
-        } else {
-            info!(path = %prev, "Unpinned old head");
-        }
+    fn is_empty(&self) -> bool {
+        self.head.is_none() && self.root.is_none()
     }
 
-    *prev_ipfs_path = Some(ipfs_path);
-
-    // 5. Drain — give in-flight operations time to finish.
-    if !drain_duration.is_zero() {
-        info!(
-            seq = event.seq,
-            drain_ms = drain_duration.as_millis() as u64,
-            "Draining epoch — capabilities have {}s to finish",
-            drain_duration.as_secs_f32()
-        );
-        tokio::time::sleep(drain_duration).await;
+    fn belongs_to(&self, head: &str) -> bool {
+        self.is_empty() || self.head.as_deref() == Some(head)
     }
 
-    // 6. Broadcast epoch (capabilities die, guests re-negotiate).
-    let new_epoch = Epoch {
-        seq: event.seq,
-        head: event.cid.clone(),
-        provenance: event.provenance.clone(),
+    async fn release(
+        &mut self,
+        ipfs_client: &ipfs::HttpClient,
+        protected: &HashSet<String>,
+        handled: &mut HashSet<String>,
+    ) -> Result<()> {
+        release_pin_slot(&mut self.head, ipfs_client, protected, handled).await?;
+        release_pin_slot(&mut self.root, ipfs_client, protected, handled).await
+    }
+}
+
+async fn release_pin_slot(
+    slot: &mut Option<String>,
+    ipfs_client: &ipfs::HttpClient,
+    protected: &HashSet<String>,
+    handled: &mut HashSet<String>,
+) -> Result<()> {
+    let Some(cid) = slot.as_ref() else {
+        return Ok(());
     };
-
-    info!(
-        seq = new_epoch.seq,
-        ?new_epoch.provenance,
-        "Advancing epoch"
-    );
-
-    epoch_tx.send(new_epoch).ok();
+    if protected.contains(cid) {
+        slot.take();
+        return Ok(());
+    }
+    if !handled.insert(cid.clone()) {
+        slot.take();
+        return Ok(());
+    }
+    bounded("pin removal", ipfs_client.pin_rm(cid)).await?;
+    info!(%cid, "Released epoch pin");
+    slot.take();
     Ok(())
 }
 
-// ── Legacy entry point (Atom-specific) ──────────────────────────────
+async fn release_retained_pins(
+    retained_pins: &mut Vec<PinSlots>,
+    ipfs_client: &ipfs::HttpClient,
+    active_pins: &PinSlots,
+) {
+    let protected: HashSet<String> = active_pins
+        .head
+        .iter()
+        .chain(active_pins.root.iter())
+        .cloned()
+        .collect();
+    let mut handled = HashSet::new();
+    for pins in retained_pins.iter_mut() {
+        if let Err(error) = pins.release(ipfs_client, &protected, &mut handled).await {
+            warn!("Retained epoch pin release deferred: {error:#}");
+        }
+    }
+    retained_pins.retain(|pins| !pins.is_empty());
+}
 
-use atom::{AtomIndexer, FinalizerBuilder, IndexerConfig};
-use authority::Provenance;
+fn bare_head_cid(head: &[u8]) -> Result<String> {
+    let path = cid_bytes_to_ipfs_path(head).map_err(|error| {
+        PermanentHostError(format!(
+            "failed to parse authoritative epoch head: {error:#}"
+        ))
+    })?;
+    path.strip_prefix("/ipfs/")
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            PermanentHostError("CID conversion did not return an IPFS path".to_owned()).into()
+        })
+}
 
-/// Run the Atom-specific epoch pipeline (legacy entry point).
-///
-/// Wraps the old AtomIndexer + Finalizer flow with the shared
-/// `handle_epoch_advance` downstream. Callers should migrate to
-/// `AtomSource::run()` from `crates/stem/` for new code.
-///
-/// `drain_duration` controls graceful shutdown: when non-zero, capabilities have
-/// this long to finish in-flight work before the epoch advances and they die.
+fn broadcast_authority(epoch_tx: &watch::Sender<Epoch>, event: &StemEvent) {
+    epoch_tx.send_replace(Epoch {
+        seq: event.seq,
+        head: event.cid.clone(),
+        root: None,
+        provenance: event.provenance.clone(),
+    });
+}
+
+async fn prepare_effective_root(
+    head: &str,
+    overlays: &[String],
+    ipfs_client: &ipfs::HttpClient,
+    cid_tree: Option<&Arc<crate::vfs::CidTree>>,
+    attempt_pins: &mut PinSlots,
+) -> Result<String> {
+    bounded("head pin", ipfs_client.pin_add(head))
+        .await
+        .context("pinning authoritative epoch head")?;
+    attempt_pins.head = Some(head.to_owned());
+
+    let mut layers = Vec::with_capacity(overlays.len() + 1);
+    layers.push(head.to_owned());
+    layers.extend_from_slice(overlays);
+    let boot_client = ipfs::BootClient::one_attempt(ipfs_client.clone(), EPOCH_OPERATION_TIMEOUT);
+    let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+    let effective = bounded(
+        "effective-root merge",
+        dag_merge(&layers, &boot_client, &mut cancel_rx),
+    )
+    .await
+    .context("composing effective epoch root")?;
+    attempt_pins.root = Some(effective.clone());
+
+    if let Some(tree) = cid_tree {
+        bounded("effective-root prewarm", tree.pre_warm(&effective))
+            .await
+            .context("pre-warming effective epoch root")?;
+        tree.swap_root(effective.clone());
+        info!(root = %effective, "CidTree effective root swapped");
+    }
+    Ok(effective)
+}
+
+async fn next_finalized_batch(
+    events: &mut broadcast::Receiver<atom::HeadUpdatedObserved>,
+    finalizer: &mut Finalizer,
+) -> Option<Vec<StemEvent>> {
+    loop {
+        match events.recv().await {
+            Ok(event) => finalizer.feed(event),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "Epoch pipeline lagged; observed events were dropped"
+                );
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+
+        let tip = match finalizer.current_tip().await {
+            Ok(tip) => tip,
+            Err(error) => {
+                warn!("Failed to fetch chain tip: {error}");
+                continue;
+            }
+        };
+        let finalized = match finalizer.drain_eligible(tip).await {
+            Ok(finalized) => finalized,
+            Err(error) => {
+                warn!("Finalizer drain error: {error}");
+                continue;
+            }
+        };
+        if !finalized.is_empty() {
+            return Some(
+                finalized
+                    .into_iter()
+                    .map(|event| StemEvent {
+                        seq: event.seq,
+                        cid: event.cid,
+                        provenance: Provenance::Block(event.block_number),
+                    })
+                    .collect(),
+            );
+        }
+    }
+}
+
+/// Run the Atom epoch pipeline with one pending authoritative target.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_epoch_pipeline(
     config: IndexerConfig,
     epoch_tx: watch::Sender<Epoch>,
     confirmation_depth: u64,
     ipfs_client: ipfs::HttpClient,
     cid_tree: Option<Arc<crate::vfs::CidTree>>,
-    drain_duration: Duration,
+    overlays: Vec<String>,
+    initial_head: String,
+    initial_root: String,
 ) -> Result<()> {
+    for overlay in &overlays {
+        overlay.parse::<cid::Cid>().map_err(|error| {
+            PermanentHostError(format!("malformed frozen overlay CID {overlay}: {error}"))
+        })?;
+    }
+
     let indexer = Arc::new(AtomIndexer::new(config.clone()));
     let mut events = indexer.subscribe();
-
     let indexer_handle = {
-        let idx = indexer.clone();
+        let indexer = Arc::clone(&indexer);
         tokio::spawn(async move {
-            if let Err(e) = idx.run().await {
-                tracing::error!("Atom indexer exited with error: {e}");
+            if let Err(error) = indexer.run().await {
+                error!("Atom indexer exited with error: {error}");
             }
         })
     };
-
     let mut finalizer = FinalizerBuilder::new()
         .http_url(&config.http_url)
         .contract_address(config.contract_address)
@@ -148,59 +313,130 @@ pub async fn run_epoch_pipeline(
         .build()
         .context("Failed to build finalizer")?;
 
-    let mut prev_ipfs_path: Option<String> = None;
+    let mut pending: Option<(u64, Vec<u8>)> = None;
+    let mut current_delay = EPOCH_RETRY_BASE_DELAY;
+    let mut active_pins = PinSlots::new(initial_head, initial_root);
+    let mut retained_pins = Vec::new();
+    let mut attempt_pins = PinSlots::default();
 
     loop {
-        match events.recv().await {
-            Ok(ev) => {
-                finalizer.feed(ev);
-
-                let tip = match finalizer.current_tip().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("Failed to fetch chain tip: {e}");
-                        continue;
-                    }
-                };
-
-                let finalized = match finalizer.drain_eligible(tip).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        warn!("Finalizer drain error: {e}");
-                        continue;
-                    }
-                };
-
-                for fe in finalized {
-                    let stem_event = StemEvent {
-                        seq: fe.seq,
-                        cid: fe.cid.clone(),
-                        provenance: Provenance::Block(fe.block_number),
-                    };
-                    if let Err(e) = handle_epoch_advance(
-                        &stem_event,
-                        &epoch_tx,
-                        &ipfs_client,
-                        &mut prev_ipfs_path,
-                        cid_tree.as_ref(),
-                        drain_duration,
-                    )
-                    .await
-                    {
-                        warn!(seq = fe.seq, "Failed to handle finalized event: {e}");
-                    }
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                warn!(
-                    skipped = n,
-                    "Epoch pipeline lagged; some events were dropped"
-                );
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+        if pending.is_none() {
+            let Some(batch) = next_finalized_batch(&mut events, &mut finalizer).await else {
                 info!("Indexer channel closed; epoch pipeline shutting down");
                 break;
+            };
+            for event in batch {
+                pending.take();
+                broadcast_authority(&epoch_tx, &event);
+                info!(
+                    seq = event.seq,
+                    "Advancing epoch authority; readiness closed"
+                );
+                pending = Some((event.seq, event.cid));
+                current_delay = EPOCH_RETRY_BASE_DELAY;
             }
+        }
+
+        let (seq, head_bytes) = pending.as_ref().expect("pending target exists");
+        let seq = *seq;
+        let head_bytes = head_bytes.clone();
+        let head = match bare_head_cid(&head_bytes) {
+            Ok(head) => head,
+            Err(error) => {
+                error!(seq, head = %hex::encode(&head_bytes), "Permanent authoritative epoch failure: {error:#}");
+                indexer_handle.abort();
+                return Err(error);
+            }
+        };
+
+        release_retained_pins(&mut retained_pins, &ipfs_client, &active_pins).await;
+
+        if !attempt_pins.belongs_to(&head) {
+            let protected: HashSet<String> = active_pins
+                .head
+                .iter()
+                .chain(active_pins.root.iter())
+                .cloned()
+                .collect();
+            let mut handled = HashSet::new();
+            if let Err(error) = attempt_pins
+                .release(&ipfs_client, &protected, &mut handled)
+                .await
+            {
+                warn!(seq, head = %head, "Superseded epoch pin release will retry: {error:#}");
+            }
+        }
+
+        let attempt = if attempt_pins.belongs_to(&head) {
+            prepare_effective_root(
+                &head,
+                &overlays,
+                &ipfs_client,
+                cid_tree.as_ref(),
+                &mut attempt_pins,
+            )
+            .await
+        } else {
+            Err(anyhow::anyhow!(EpochOperationTimeout {
+                operation: "superseded epoch pin release",
+                timeout: EPOCH_OPERATION_TIMEOUT,
+            }))
+        };
+
+        match attempt {
+            Ok(effective) => {
+                let provenance = epoch_tx.borrow().provenance.clone();
+                epoch_tx.send_replace(Epoch {
+                    seq,
+                    head: head_bytes,
+                    root: Some(effective.clone()),
+                    provenance,
+                });
+                info!(seq, head = %head, root = %effective, "Effective epoch root is ready");
+
+                let new_pins = std::mem::take(&mut attempt_pins);
+                retained_pins.push(std::mem::replace(&mut active_pins, new_pins));
+                release_retained_pins(&mut retained_pins, &ipfs_client, &active_pins).await;
+                pending = None;
+                current_delay = EPOCH_RETRY_BASE_DELAY;
+            }
+            Err(error) => match classify_host_failure(&error) {
+                HostFailureClass::Transient => {
+                    let jitter_millis =
+                        rand::rng().random_range(0..EPOCH_RETRY_JITTER_MAX.as_millis() as u64);
+                    let (sleep_duration, next_delay) =
+                        next_backoff_delay(current_delay, Duration::from_millis(jitter_millis));
+                    current_delay = next_delay;
+                    warn!(
+                        seq,
+                        head = %head,
+                        retry_ms = sleep_duration.as_millis() as u64,
+                        "Transient epoch preparation failure; retry scheduled: {error:#}"
+                    );
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(sleep_duration) => {}
+                        batch = next_finalized_batch(&mut events, &mut finalizer) => {
+                            let Some(batch) = batch else {
+                                continue;
+                            };
+                            for event in batch {
+                                pending.take();
+                                broadcast_authority(&epoch_tx, &event);
+                                info!(seq = event.seq, "Advancing epoch authority; pending preparation superseded");
+                                pending = Some((event.seq, event.cid));
+                                current_delay = EPOCH_RETRY_BASE_DELAY;
+                            }
+                        }
+                    }
+                }
+                HostFailureClass::Permanent | HostFailureClass::Unknown => {
+                    let class = classify_host_failure(&error);
+                    error!(seq, head = %head, ?class, "Epoch preparation failed hard: {error:#}");
+                    indexer_handle.abort();
+                    return Err(error);
+                }
+            },
         }
     }
 
@@ -211,148 +447,172 @@ pub async fn run_epoch_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use authority::Provenance;
     use std::collections::HashMap;
 
-    fn test_stem_event(seq: u64) -> StemEvent {
-        // Build a valid CIDv1 (raw codec, identity multihash) so
-        // cid_bytes_to_ipfs_path succeeds.
-        let mh = cid::multihash::Multihash::<64>::wrap(0x00, b"test").expect("identity mh");
-        let c = cid::Cid::new_v1(0x55, mh);
-        StemEvent {
-            seq,
-            cid: c.to_bytes(),
-            provenance: Provenance::Block(42),
+    #[test]
+    fn backoff_doubles_to_cap_and_resets() {
+        let mut current = EPOCH_RETRY_BASE_DELAY;
+        for attempt in 0..8 {
+            let jitter = Duration::from_millis(499);
+            let (sleep, next) = next_backoff_delay(current, jitter);
+            let expected = (EPOCH_RETRY_BASE_DELAY * 2_u32.pow(attempt)).min(EPOCH_RETRY_MAX_DELAY);
+            assert_eq!(current, expected);
+            assert!(sleep >= expected);
+            assert!(sleep < expected + EPOCH_RETRY_JITTER_MAX);
+            assert!(next >= current);
+            current = next;
         }
+        current = EPOCH_RETRY_BASE_DELAY;
+        assert_eq!(current, EPOCH_RETRY_BASE_DELAY);
     }
 
-    fn event_cid_string(event: &StemEvent) -> String {
-        cid_bytes_to_ipfs_path(&event.cid)
-            .expect("valid event cid")
-            .strip_prefix("/ipfs/")
-            .expect("ipfs path prefix")
-            .to_string()
+    #[test]
+    fn malformed_head_is_permanent_before_network_access() {
+        let error = bare_head_cid(b"not-a-cid").unwrap_err();
+        assert_eq!(classify_host_failure(&error), HostFailureClass::Permanent);
     }
 
-    /// Drain delay defers epoch broadcast by the configured duration.
-    #[tokio::test]
-    async fn drain_delay_defers_epoch_broadcast() {
-        let (epoch_tx, mut epoch_rx) = watch::channel(Epoch {
-            seq: 0,
-            head: vec![],
-            provenance: Provenance::Block(0),
-        });
+    #[test]
+    fn root_only_attempt_remains_superseded_until_release_succeeds() {
+        let pins = PinSlots {
+            head: None,
+            root: Some("old-root".to_owned()),
+        };
 
-        let event = test_stem_event(1);
-        let ipfs_client = ipfs::HttpClient::new("http://127.0.0.1:1".into());
-
-        let drain = Duration::from_millis(200);
-        let start = tokio::time::Instant::now();
-
-        let _ = handle_epoch_advance(&event, &epoch_tx, &ipfs_client, &mut None, None, drain).await;
-
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed >= drain,
-            "epoch broadcast should be deferred by drain duration ({drain:?}), but only {elapsed:?} elapsed"
-        );
-
-        epoch_rx.mark_changed();
-        let epoch = epoch_rx.borrow_and_update().clone();
-        assert_eq!(epoch.seq, 1, "epoch should have advanced to seq=1");
+        assert!(!pins.belongs_to("new-head"));
     }
 
-    /// Zero drain duration broadcasts immediately (no regression).
-    #[tokio::test]
-    async fn zero_drain_broadcasts_immediately() {
-        let (epoch_tx, mut epoch_rx) = watch::channel(Epoch {
-            seq: 0,
-            head: vec![],
-            provenance: Provenance::Block(0),
-        });
-
-        let event = test_stem_event(1);
-        let ipfs_client = ipfs::HttpClient::new("http://127.0.0.1:1".into());
-
-        let start = tokio::time::Instant::now();
-        let _ = handle_epoch_advance(
-            &event,
-            &epoch_tx,
-            &ipfs_client,
-            &mut None,
-            None,
-            Duration::ZERO,
-        )
-        .await;
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "zero drain should broadcast immediately, took {elapsed:?}"
-        );
-
-        epoch_rx.mark_changed();
-        let epoch = epoch_rx.borrow_and_update().clone();
-        assert_eq!(epoch.seq, 1);
-    }
-
-    /// CidTree root swap happens before the epoch broadcast drain completes.
-    #[tokio::test]
-    async fn cid_tree_root_swaps_to_event_cid_before_epoch_broadcast() {
-        let (epoch_tx, epoch_rx) = watch::channel(Epoch {
-            seq: 0,
-            head: vec![],
-            provenance: Provenance::Block(0),
-        });
-
-        let event = test_stem_event(1);
-        let target_cid = event_cid_string(&event);
-        let ipfs_client = ipfs::HttpClient::new("http://127.0.0.1:1".into());
-        let staging_dir = tempfile::tempdir().expect("temp staging dir");
-        let cid_tree = Arc::new(crate::vfs::CidTree::new(
-            "initial-root".to_string(),
-            ipfs_client.clone(),
+    #[test]
+    fn authority_broadcast_precedes_root_swap() {
+        let initial = Epoch {
+            seq: 1,
+            head: Vec::new(),
+            root: Some("old-root".to_owned()),
+            provenance: Provenance::Block(1),
+        };
+        let (epoch_tx, epoch_rx) = watch::channel(initial);
+        let client = ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
+        let staging = tempfile::tempdir().unwrap();
+        let tree = crate::vfs::CidTree::new(
+            "old-root".to_owned(),
+            client,
             HashMap::new(),
-            staging_dir.path().to_path_buf(),
+            staging.path().to_owned(),
+        );
+        let event = StemEvent {
+            seq: 2,
+            cid: vec![1],
+            provenance: Provenance::Block(2),
+        };
+
+        broadcast_authority(&epoch_tx, &event);
+
+        assert_eq!(epoch_rx.borrow().seq, 2);
+        assert_eq!(epoch_rx.borrow().root, None);
+        assert_eq!(tree.root_cid().as_ref(), "old-root");
+    }
+
+    #[tokio::test]
+    async fn four_xx_kubo_error_is_unknown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
+                .await
+                .unwrap();
+        });
+        let client = ipfs::HttpClient::new(format!("http://{address}"));
+        let error = client.pin_add("bafy-invalid").await.unwrap_err();
+        assert_eq!(classify_host_failure(&error), HostFailureClass::Unknown);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn head_pin_failure_gates_root_swap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
+                .await
+                .unwrap();
+        });
+        let client = ipfs::HttpClient::new(format!("http://{address}"));
+        let staging = tempfile::tempdir().unwrap();
+        let tree = Arc::new(crate::vfs::CidTree::new(
+            "old-root".to_owned(),
+            client.clone(),
+            HashMap::new(),
+            staging.path().to_owned(),
         ));
-        let mut prev_ipfs_path = None;
-        let drain = Duration::from_millis(500);
+        let mut pins = PinSlots::default();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            let handle = handle_epoch_advance(
-                &event,
-                &epoch_tx,
-                &ipfs_client,
-                &mut prev_ipfs_path,
-                Some(&cid_tree),
-                drain,
-            );
-            tokio::pin!(handle);
+        let error = prepare_effective_root("new-head", &[], &client, Some(&tree), &mut pins)
+            .await
+            .unwrap_err();
 
-            loop {
-                tokio::select! {
-                    result = &mut handle => {
-                        result.expect("epoch advance succeeds despite unreachable IPFS");
-                        panic!("epoch advance completed before observing CidTree root swap");
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                        if cid_tree.root_cid().as_ref() == &target_cid {
-                            assert_eq!(cid_tree.root_cid().as_ref(), &target_cid);
-                            assert!(
-                                !epoch_rx.has_changed().expect("epoch channel open"),
-                                "epoch broadcast should not happen until after drain"
-                            );
-                            break;
-                        }
-                    }
-                }
-            }
+        assert_eq!(classify_host_failure(&error), HostFailureClass::Unknown);
+        assert_eq!(tree.root_cid().as_ref(), "old-root");
+        assert!(pins.is_empty());
+        server.await.unwrap();
+    }
 
-            handle.await.expect("epoch advance succeeds");
-        })
-        .await
-        .expect("CidTree root should swap promptly");
+    #[tokio::test]
+    async fn failed_pin_release_retains_one_owner_and_guarded_release_skips_active_cid() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        assert_eq!(cid_tree.root_cid().as_ref(), &target_cid);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy")
+                .await
+                .unwrap();
+        });
+        let client = ipfs::HttpClient::new(format!("http://{address}"));
+        let mut retained = vec![
+            PinSlots {
+                head: Some("shared".to_owned()),
+                root: None,
+            },
+            PinSlots {
+                head: Some("shared".to_owned()),
+                root: None,
+            },
+        ];
+        release_retained_pins(&mut retained, &client, &PinSlots::default()).await;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].head.as_deref(), Some("shared"));
+        server.await.unwrap();
+
+        let active = PinSlots {
+            head: Some("shared".to_owned()),
+            root: None,
+        };
+        retained[0]
+            .release(
+                &client,
+                &HashSet::from(["shared".to_owned()]),
+                &mut HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert!(retained[0].is_empty());
+        release_retained_pins(&mut retained, &client, &active).await;
+        assert!(retained.is_empty());
     }
 }

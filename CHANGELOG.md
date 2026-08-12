@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Epoch replacement now uses per-generation effective roots and fail-closed
+  authority ordering.** A finalized Atom head invalidates the old generation
+  before Host filesystem preparation. The Host reapplies frozen boot overlays,
+  gates activation on head and effective-root pins, and starts PID0 only after
+  the rooted epoch broadcast. Positively classified transient Host failures use
+  jittered exponential backoff while readiness remains closed. Permanent and
+  unknown Host failures exit through supervision. PID0 failures retain the L1
+  lifecycle policy and are not classified by the Host. `--epoch-drain-secs` is
+  deprecated and inert.
 - **PID0 lifecycle E2E coverage is a kernel-independent parity harness.**
   `tests/pid0_e2e.rs` now drives one shared behavioral contract — boot/serving
   identity, host-owned replacement with replacement-byte identity via

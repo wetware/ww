@@ -2200,6 +2200,7 @@ mod tests {
                 let epoch = authority::Epoch {
                     seq: 1,
                     head: b"head".to_vec(),
+                    root: None,
                     provenance: authority::Provenance::Block(0),
                 };
                 let (_epoch_tx, epoch_rx) = watch::channel(epoch);

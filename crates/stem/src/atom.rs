@@ -89,6 +89,7 @@ impl StemSource for AtomSource {
                                 let epoch = Epoch {
                                     seq: fe.seq,
                                     head: fe.cid.clone(),
+                                    root: None,
                                     provenance: Provenance::Block(fe.block_number),
                                 };
                                 info!(

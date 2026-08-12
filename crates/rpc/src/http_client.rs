@@ -276,6 +276,7 @@ mod tests {
         let epoch = Epoch {
             seq: 1,
             head: vec![],
+            root: None,
             provenance: Provenance::Block(0),
         };
         let (_tx, rx) = watch::channel(epoch);
@@ -290,6 +291,7 @@ mod tests {
         let epoch = Epoch {
             seq: 2,
             head: vec![],
+            root: None,
             provenance: Provenance::Block(0),
         };
         let (_tx, rx) = watch::channel(epoch);
