@@ -581,6 +581,7 @@ mod tests {
         Epoch {
             seq,
             head: vec![],
+            root: None,
             provenance: Provenance::Block(0),
         }
     }

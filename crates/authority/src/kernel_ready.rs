@@ -96,6 +96,7 @@ mod tests {
         Epoch {
             seq,
             head: Vec::new(),
+            root: None,
             provenance: Provenance::Block(0),
         }
     }

@@ -53,7 +53,7 @@ Layers stack with per-file union; later layers win.
 | `--rpc-url <URL>` | `http://127.0.0.1:8545` | HTTP JSON-RPC for eth_call/eth_getLogs |
 | `--ws-url <URL>` | `ws://127.0.0.1:8545` | WebSocket JSON-RPC for eth_subscribe |
 | `--confirmation-depth <N>` | `6` | Blocks before finalizing HeadUpdated events |
-| `--epoch-drain-secs <N>` | `1` | Seconds to drain in-flight ops before epoch advance |
+| `--epoch-drain-secs <N>` | `1` | Deprecated compatibility option. The value is ignored. Epoch authority advances immediately. |
 
 ### Examples
 

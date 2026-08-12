@@ -44,13 +44,17 @@ references exist where*:
 Trusted pid0 receives the host graft; each ordinary child receives only its
 immutable `InitialAuthorityRecord`, constructed from the parent’s explicit
 grants and delivered through `InitialGrants.get()`. The root Atom binding flows
-through `stem::Atom`. When the Atom value changes, `CidTree::swap_root` first
-switches the host filesystem view. The host then terminates the old PID0 and
-starts a new non-interactive PID0 generation. `WW_ROOT` is fixed when that
-generation starts. The process-local graft and readiness gate use the same
-captured epoch sequence, so a PID0 generation cannot activate with a root from
-one epoch and authority from another epoch. Interactive `ww run` exits on the
-change instead of replacing the interactive process.
+through `stem::Atom`. When the Atom value changes, the host first broadcasts an
+authoritative epoch whose `root` is `None`. That broadcast invalidates the old
+generation's capabilities and causes PID0 teardown before filesystem
+preparation. The host composes the new head with the frozen boot overlays,
+gates activation on the head and effective-root pins, pre-warms and swaps
+`CidTree`, then broadcasts `root: Some(effective)`. The generation loop starts
+PID0 only from the rooted broadcast. `WW_ROOT` is fixed when that generation
+starts. The process-local graft and readiness gate use the same captured epoch
+sequence, so a PID0 generation cannot activate with a root from one epoch and
+authority from another epoch. Interactive `ww run` exits on the authority
+broadcast instead of replacing the interactive process.
 
 The Glia env layer binds capabilities such as `fs`, `routing`, and `host`.
 Omitting a handler restricts access inside that cell. Env bindings and effect
@@ -187,7 +191,8 @@ resolution in this mode.
 3. To gate a remotely published capability, trusted configuration attaches
    an explicit policy and publishes the resulting `Terminal(Session)`
 4. An epoch advance stales host-issued guarded capabilities
-5. pid0 re-grafts, reruns affected init, and explicitly re-delegates fresh
+5. The host prepares and pins the new effective root while readiness is closed
+6. pid0 re-grafts, reruns affected init, and explicitly re-delegates fresh
    references or replaces affected children
 
 ## Revocation

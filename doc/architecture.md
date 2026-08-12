@@ -113,19 +113,34 @@ three-phase handoff remains an upstream limitation.
 
 An **epoch** is the host-issued authority timeslot and PID0 deployment
 generation. One PID0 instance belongs to one generation. An epoch advance
-closes readiness and makes stale host-issued references fail. The host then
-terminates the current PID0 instance. A non-interactive daemon starts a new
-instance after the old instance has completed teardown. An interactive
-`ww run` invocation exits successfully and requires an explicit restart or
-reconnection through `ww shell`.
+first broadcasts the authoritative head with no effective root. This broadcast
+closes readiness, invalidates host-issued references, expires route leases, and
+causes the host to terminate the current PID0 instance. The old generation is
+never restored after this broadcast.
+
+The host then applies the boot filesystem composition to the new head. The
+composition order is the head, frozen namespace layers, then frozen user root
+mounts. Later layers retain precedence. The host pins the head and effective
+root, pre-warms the effective root, swaps `CidTree`, and broadcasts the rooted
+epoch. A non-interactive daemon starts PID0 only from this rooted epoch. An
+interactive `ww run` invocation exits successfully at the authority broadcast.
+
+The Host retries only positively classified transient preparation failures.
+Transport failures, Kubo 5xx responses, unavailable content, and the operation
+timeout use jittered exponential backoff. Readiness stays closed, and the old
+PID0 stays terminated, during every retry. A newer authoritative epoch replaces
+the pending target and resets the backoff. Pre-network input failures and
+unclassified failures stop `EpochService`, which makes the daemon exit nonzero.
+PID0 owns failures from guest composition and service setup. The Host does not
+inspect PID0 errors to decide whether to retry.
 
 The host captures each generation's epoch sequence and filesystem root before
 spawn. PID0's process-local graft uses that captured sequence. The graft fails
 if the live epoch has changed. The private readiness commit also rejects a
 captured sequence that is no longer live. PID0 therefore cannot combine one
 generation's filesystem root with another generation's authority or readiness.
-Rapid advances can briefly activate a coherent intermediate generation, then
-converge to the newest epoch.
+Rapid advances converge to the newest rooted epoch. An epoch superseded during
+Host preparation does not activate.
 
 Route registrations are epoch-scoped and identity-owned. A stale registration
 stops dispatching immediately, and cleanup from an old registration cannot

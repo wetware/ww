@@ -221,6 +221,7 @@ mod tests {
         Epoch {
             seq,
             head: format!("head-{seq}").into_bytes(),
+            root: None,
             provenance: Provenance::Block(seq),
         }
     }

@@ -242,6 +242,7 @@ mod tests {
                 let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(Epoch {
                     seq: 1,
                     head: Vec::new(),
+                    root: None,
                     provenance: Provenance::Block(0),
                 });
                 let registry = new_registry();
@@ -267,6 +268,7 @@ mod tests {
                 epoch_tx.send_replace(Epoch {
                     seq: 2,
                     head: Vec::new(),
+                    root: None,
                     provenance: Provenance::Block(0),
                 });
                 assert_eq!(

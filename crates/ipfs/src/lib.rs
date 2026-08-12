@@ -66,6 +66,14 @@ impl KuboApiError {
                 | reqwest::StatusCode::GATEWAY_TIMEOUT
         )
     }
+
+    /// Whether Kubo returned a server-side HTTP failure.
+    ///
+    /// Epoch preparation uses this typed status predicate. It must not inspect
+    /// Kubo's diagnostic message because that text is not a stable API.
+    pub fn is_server_error(&self) -> bool {
+        self.status.is_server_error()
+    }
 }
 
 impl std::fmt::Display for KuboApiError {
@@ -87,13 +95,16 @@ impl std::error::Error for KuboApiError {}
 /// A boot-operation watchdog elapsed before Kubo made progress.
 #[derive(Debug)]
 pub struct KuboOperationTimeout {
-    operation: &'static str,
+    operation: String,
     timeout: Duration,
 }
 
 impl KuboOperationTimeout {
-    pub fn new(operation: &'static str, timeout: Duration) -> Self {
-        Self { operation, timeout }
+    pub fn new(operation: impl Into<String>, timeout: Duration) -> Self {
+        Self {
+            operation: operation.into(),
+            timeout,
+        }
     }
 }
 
@@ -174,6 +185,7 @@ pub struct BootClient {
     retry_deadline: Option<Duration>,
     operation_timeout: Option<Duration>,
     retry_observer: Option<RetryObserver>,
+    retry_transient: bool,
 }
 
 impl BootClient {
@@ -187,6 +199,19 @@ impl BootClient {
             operation_timeout: (operation_timeout_secs > 0)
                 .then(|| Duration::from_secs(operation_timeout_secs)),
             retry_observer: None,
+            retry_transient: true,
+        }
+    }
+
+    /// Create a bounded client that returns the original typed error after one
+    /// attempt. The epoch pipeline owns retries and classifies that error.
+    pub fn one_attempt(client: HttpClient, operation_timeout: Duration) -> Self {
+        Self {
+            client,
+            retry_deadline: None,
+            operation_timeout: Some(operation_timeout),
+            retry_observer: None,
+            retry_transient: false,
         }
     }
 
@@ -259,14 +284,19 @@ impl BootClient {
             let retry_reason = match attempt_timeout {
                 Some(timeout) => match tokio::time::timeout(timeout, operation()).await {
                     Ok(Ok(value)) => return Ok(value),
+                    Ok(Err(error)) if !self.retry_transient => return Err(error),
                     Ok(Err(error)) if is_retryable_kubo_error(&error) => {
                         format!("transient Kubo failure: {error:#}")
                     }
                     Ok(Err(error)) => return Err(error),
+                    Err(_) if !self.retry_transient => {
+                        return Err(KuboOperationTimeout::new(operation_name, timeout).into())
+                    }
                     Err(_) => format!("made no progress within {}s", timeout.as_secs_f64()),
                 },
                 None => match operation().await {
                     Ok(value) => return Ok(value),
+                    Err(error) if !self.retry_transient => return Err(error),
                     Err(error) if is_retryable_kubo_error(&error) => {
                         format!("transient Kubo failure: {error:#}")
                     }
@@ -311,6 +341,11 @@ impl BootClient {
 
     pub async fn name_resolve(&self, name: &str) -> Result<String> {
         self.retry("IPNS mount resolution", || self.client.name_resolve(name))
+            .await
+    }
+
+    pub async fn resolve(&self, path: &str) -> Result<String> {
+        self.retry("IPFS subpath resolution", || self.client.resolve(path))
             .await
     }
 
@@ -596,6 +631,33 @@ impl HttpClient {
             .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow::anyhow!("name resolve response missing Path field"))
+    }
+
+    /// Resolve an IPFS path, including a subpath, to its canonical CID path.
+    pub async fn resolve(&self, path: &str) -> anyhow::Result<String> {
+        let url = format!("{}/api/v0/resolve?arg={}", self.base_url, path);
+        let response = self
+            .http_client
+            .post(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to resolve IPFS path {path}"))?;
+        if !response.status().is_success() {
+            return Err(KuboApiError::from_response(
+                format!("IPFS resolve (path: {path})"),
+                response,
+            )
+            .await
+            .into());
+        }
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .with_context(|| format!("Failed to parse IPFS resolve response for {path}"))?;
+        body["Path"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("IPFS resolve response missing Path field"))
     }
 
     /// Publish a CID under this node's IPNS key.
@@ -989,7 +1051,11 @@ impl HttpClient {
             .with_context(|| format!("Failed to unpin {cid}"))?;
 
         if !response.status().is_success() {
-            anyhow::bail!("IPFS pin rm failed: {} (cid: {})", response.status(), cid);
+            return Err(
+                KuboApiError::from_response(format!("IPFS pin rm (cid: {cid})"), response)
+                    .await
+                    .into(),
+            );
         }
 
         Ok(())

@@ -623,6 +623,7 @@ mod tests {
         let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(Epoch {
             seq: 1,
             head: Vec::new(),
+            root: None,
             provenance: Provenance::Block(0),
         });
         let kernel_ready_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx));
@@ -673,6 +674,7 @@ mod tests {
         Epoch {
             seq,
             head: Vec::new(),
+            root: None,
             provenance: Provenance::Block(0),
         }
     }

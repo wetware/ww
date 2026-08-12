@@ -150,6 +150,7 @@ impl StemSource for IpnsSource {
                                 let epoch = Epoch {
                                     seq: current_seq,
                                     head: cid_bytes,
+                                    root: None,
                                     provenance: Provenance::Timestamp(now_unix_secs()),
                                 };
 

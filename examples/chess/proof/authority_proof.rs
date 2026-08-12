@@ -940,6 +940,7 @@ fn epoch(seq: u64) -> Epoch {
     Epoch {
         seq,
         head: format!("head-{seq}").into_bytes(),
+        root: None,
         provenance: Provenance::Block(seq),
     }
 }

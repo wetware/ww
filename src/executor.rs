@@ -639,6 +639,7 @@ impl Cell {
         let initial_epoch = self.initial_epoch.clone().unwrap_or(Epoch {
             seq: 0,
             head: vec![],
+            root: None,
             provenance: Provenance::Block(0),
         });
         // Use the externally-provided epoch receiver if available,
