@@ -92,14 +92,6 @@ The cleanest near-term fix is (1). The latency was hidden in production until ma
 **Priority:** P3
 **Depends on:** Hybrid ValMap (done)
 
-## Shell session memory limits / TTL
-**What:** Bound memory growth in long-lived shell cell sessions. Each `def` grows the Glia `Env`, each `load` caches bytes in a `thread_local! HashMap` with no eviction. A long-lived session or malicious client can grow WASM linear memory until the host OOMs.
-**Why:** Each shell session is a separate WASM process, but there's no ceiling on how large that process can grow.
-**Context:** Options: (a) WASM linear memory limit via wasmtime config, (b) session TTL (kill after N minutes), (c) Env size limit in glia, (d) `load` cache eviction. This TODO handles per-session growth. Design doc: `~/.gstack/projects/wetware-ww/lthibault-master-design-20260402-192805.md`.
-**Effort:** S
-**Priority:** P2
-**Depends on:** Shell cell (ww shell)
-
 ## Glia-level finally / resource cleanup via effects
 **What:** `with-resource` or `finally` pattern — cleanup handlers that run on scope exit.
 **Why:** Rust Drop handles Rust-side cleanup, but Glia code can't hook into scope exit.
@@ -256,45 +248,13 @@ usable by trusted FHS configuration or a future Warrant/ICME adapter.
 **Priority:** P2
 **Depends on:** issue #509 design approval, cross-crate capnp migration plan, compatibility decision for schema/type IDs
 
-## MCP resources (Filesystem capability)
-**What:** Expose the merged FHS filesystem as MCP resources via a `Filesystem` capability in the membrane. The MCP cell would serve `resources/list` and `resources/read` requests by delegating to the host-provided Filesystem cap.
-**Why:** Claude Code needs to browse files (init.d scripts, WASM binaries, Glia modules) without writing Glia expressions. MCP resources is the standard mechanism for this.
-**Context:** The MCP cell is a WASM process with zero ambient filesystem access (by design). Workaround: `eval` with `(perform fs :list ...)` and `(perform fs :read ...)`. The clean solution requires a new Filesystem capability interface in the membrane graft, specifically for MCP cells.
-**Effort:** S-M
-**Priority:** P2
-**Depends on:** MCP dynamic tools (done)
-
-## MCP prompts (guided workflows)
-**What:** Pre-built MCP conversation starters for common workflows: `create-cell` (scaffold a new cell project), `deploy-script` (write and deploy a Glia script to ~/.ww), `connect-peer` (guide peer connection setup).
-**Why:** Discoverability for AI agents. Teaches the right workflow patterns. MCP prompts are the standard mechanism for guided interactions.
-**Context:** Tools + eval are sufficient for v1. Prompts become valuable once we see which workflows Claude Code actually uses most. Should be informed by real usage patterns.
-**Effort:** M
-**Priority:** P2
-**Depends on:** MCP dynamic tools (done)
-
-## Eval error improvements + Glia introspection
-**What:** Structured error messages from `eval` (not opaque strings). New Glia forms: `(doc cap)` for capability documentation, `(schema cap)` for schema introspection, enhanced `(help)` with per-cap info.
-**Why:** AI clients need actionable errors to recover from failures. Introspection makes the eval interface self-documenting, reducing the need for hardcoded MCP tool descriptions.
-**Context:** Current eval returns string errors. Structured errors (with error type, capability name, action, and recovery hints) help AI clients decide whether to retry, use a different approach, or escalate. The `(doc)` and `(schema)` forms complement MCP tools by making eval itself discoverable.
-**Effort:** S-M
-**Priority:** P2
-**Depends on:** none
-
-## MCP server over HTTP+SSE (Mode 2)
-**What:** Run the McpAdapter as an HTTP+SSE endpoint on the node, so remote MCP clients can connect without a local `ww mcp` process. Same adapter code, different transport.
-**Why:** Enables web-based MCP clients and remote LLM-to-node connections without requiring the LLM to run on the same machine as the node.
-**Context:** Mode 1 (`ww mcp` over stdio) is the primary interface. Mode 2 reuses the same `ProtocolAdapter` trait with an HTTP+SSE transport instead of stdio. The design doc (`~/.gstack/projects/wetware-ww/lthibault-master-design-20260326-223714.md`) already accounts for this. Not needed for the initial demo since Claude connects to a local host and dials remote nodes via capabilities.
-**Effort:** M
-**Priority:** P3
-**Depends on:** `ww mcp` (Mode 1, stdio transport)
-
 ## `ww perform upgrade` — self-update from GitHub Releases
 **What:** `ww perform upgrade` hits the GitHub Releases API, compares semver against the running binary version, downloads the latest release binary, verifies SHA256 checksum, atomically replaces the binary, clears macOS quarantine, and restarts the daemon.
 **Why:** Cohort testers shouldn't have to manually re-download and replace the binary on every release. Self-update is table stakes for CLI tools.
-**Context:** Deferred from the Phase 1 DX pass (PR for install/uninstall/MCP/CID). Complexity areas: SHA256 verification relies on checksums.txt in the release (no binary signing yet), atomic replacement via rename(2) is safe on Unix but needs macOS quarantine clearing, daemon restart needs to handle in-flight MCP connections gracefully. `reqwest` and `serde_json` are already in Cargo.toml. Consider adding binary signing (Apple notarization, GPG) before enabling auto-update for a broader audience.
+**Context:** Deferred from the Phase 1 DX pass. Complexity areas: SHA256 verification relies on checksums.txt in the release (no binary signing yet), atomic replacement via rename(2) is safe on Unix but needs macOS quarantine clearing, and daemon restart must handle in-flight connections. `reqwest` and `serde_json` are already in Cargo.toml. Consider adding binary signing (Apple notarization, GPG) before enabling auto-update for a broader audience.
 **Effort:** M
 **Priority:** P2
-**Depends on:** DX pass Phase 1 (install/uninstall), GitHub Releases with consistent tag naming
+**Depends on:** DX pass Phase 1, GitHub Releases with consistent tag naming
 
 ## macOS binary notarization
 **What:** Sign and notarize the macOS binary with an Apple Developer certificate so Gatekeeper doesn't block it on download.
@@ -322,8 +282,8 @@ usable by trusted FHS configuration or a future Warrant/ICME adapter.
 
 ## Wire CompilationService through ProcBuilder for shared compile cache
 **What:** `CompilationService` (`src/services.rs:540-610`) is implemented but not integrated. Today, `Component::from_binary` runs inline at `crates/cell/src/proc.rs:651` per-spawn on the executor worker thread; each cell-spawn pays compile cost (modulo the per-RuntimeImpl `executor_cache` at `src/launcher.rs:65`). Wire `CompilationService` in by adding `ProcBuilder::with_component(Component)` and routing `Runtime.load(bytes)` through the compilation channel: submit, await `Arc<Component>`, hand to ProcBuilder. Per-thread RuntimeImpl caches collapse to one shared cache.
-**Why:** Singleton compile cache. Eliminates duplicate compiles when multiple Services (kernel + AdminUdsService, etc.) load the same bytecode. Surfaced during the lthibault/ww-shell-usable design — UDS admin service needs to pre-load shell.wasm at startup; without CompilationService, kernel + UDS each compile their own copy.
-**Context:** TODO is in-place in `services.rs:548-553` ("ProcBuilder needs a `with_component(Component)` method to accept pre-compiled components"). Full plumbing: (a) ProcBuilder API change, (b) RuntimeImpl::load routes through CompilationService channel, (c) channel sender held in shared backing state (alongside network_state etc.). Touches `src/launcher.rs`, `crates/cell/src/proc.rs`, `src/services.rs`. Design context in `~/.gstack/projects/wetware-ww/lthibault-lthibault-ww-shell-usable-design-20260509-152936.md` under "Eng Review Findings" (E2 discussion).
+**Why:** A singleton compilation cache avoids duplicate compilation when multiple services load the same bytecode.
+**Context:** TODO is in-place in `services.rs:548-553` ("ProcBuilder needs a `with_component(Component)` method to accept pre-compiled components"). Full plumbing: (a) ProcBuilder API change, (b) RuntimeImpl::load routes through CompilationService channel, (c) channel sender held in shared backing state (alongside network_state etc.). Touches `src/launcher.rs`, `crates/cell/src/proc.rs`, `src/services.rs`.
 **Effort:** S-M (human) → S (CC)
-**Priority:** P3 (UDS shell ships without it by accepting one extra startup compile)
+**Priority:** P3
 **Depends on:** none

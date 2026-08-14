@@ -11,7 +11,6 @@ Source: https://github.com/wetware/ww
 ```
 ww run .                          # boot node from current dir
 ww run /ipfs/QmHash               # boot from IPFS CID
-ww run . --mcp                    # run as MCP server (stdin/stdout)
 ww run . --listen /ip4/0.0.0.0/tcp/2025  # libp2p swarm listener
 ww run . --http-listen 0.0.0.0:2080   # WAGI HTTP endpoint
 ww run . --http-dial api.example.com # allow outbound HTTP to host
@@ -30,9 +29,8 @@ ww run . --stem 0xAddr --rpc-url http://... --ws-url ws://...
 | `ww run [MOUNT...]` | Boot a node; mounts are `source[:target]` |
 | `ww push [PATH]` | Snapshot FHS tree to IPFS, optionally update on-chain HEAD |
 | `ww keygen` | Generate Ed25519 identity (prints to stdout) |
-| `ww shell` | Glia REPL on the local daemon via UDS (~/.ww/run/<peer-id>.sock) |
 | `ww doctor` | Check dev environment (Rust, wasm target, Kubo) |
-| `ww perform install` | Bootstrap ~/.ww, daemon, MCP wiring |
+| `ww perform install` | Bootstrap ~/.ww and the daemon |
 | `ww perform upgrade` | Self-update binary via IPNS |
 | `ww daemon install` | Register background daemon (launchd/systemd) |
 | `ww ns add NAME --ipns KEY` | Add a namespace (IPFS mount layer) |
@@ -71,12 +69,6 @@ Layers stack with per-file union; later layers win.
 ```
 ww run images/app ~/.ww/identity:/etc/identity ~/data:/var/data
 ```
-
-## AI integration
-
-Wetware is the drivetrain, not the engine. An LLM connects *to*
-a node over MCP and gets a Glia shell. `ww run . --mcp` makes
-the cell an MCP server on stdin/stdout.
 
 ## Standard ports
 

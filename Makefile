@@ -5,7 +5,7 @@
 
 WASM_TARGET := wasm32-wasip2
 
-.PHONY: all host std kernel kernel-glia shell status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
+.PHONY: all host std kernel kernel-glia status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
 .PHONY: publish-std try-publish-std publish test-deps test test-wasm check-glia-effects authority-probe
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
@@ -45,7 +45,7 @@ check-glia-effects:
 
 # --- Std components ----------------------------------------------------------
 
-std: kernel kernel-glia shell status
+std: kernel kernel-glia status
 
 kernel:
 	cargo build -p kernel --target $(WASM_TARGET) --release --manifest-path std/kernel/Cargo.toml
@@ -57,11 +57,6 @@ kernel-glia:
 	cargo build -p kernel-glia --target $(WASM_TARGET) --release --manifest-path std/kernel-glia/Cargo.toml
 	@mkdir -p std/kernel-glia/bin
 	cp std/kernel-glia/target/$(WASM_TARGET)/release/kernel_glia.wasm std/kernel-glia/bin/main.wasm
-
-shell:
-	cargo build -p shell --target $(WASM_TARGET) --release --manifest-path std/shell/Cargo.toml
-	@mkdir -p std/shell/bin
-	cp std/shell/target/$(WASM_TARGET)/release/shell.wasm std/shell/bin/shell.wasm
 
 status:
 	cargo build -p status --target $(WASM_TARGET) --release --manifest-path std/status/Cargo.toml
@@ -123,10 +118,8 @@ publish-std: std
 	$(eval STD_TREE := $(shell mktemp -d))
 	@mkdir -p $(STD_TREE)/lib/ww
 	@mkdir -p $(STD_TREE)/kernel/bin
-	@mkdir -p $(STD_TREE)/shell/bin
 	@cp std/lib/ww/*.glia $(STD_TREE)/lib/ww/
 	@cp std/kernel/bin/main.wasm $(STD_TREE)/kernel/bin/main.wasm
-	@cp std/shell/bin/shell.wasm $(STD_TREE)/shell/bin/shell.wasm
 	@echo "Publishing to IPFS..."
 	@CID=$$(ipfs add --pin=false -r --cid-version=1 -Q $(STD_TREE)) && \
 		echo "$$CID" > target/std-namespace.cid && \
@@ -184,7 +177,7 @@ publish: host
 
 # --- Test WASM components ----------------------------------------------------
 # Scaffolding for WASM component tests. Today this is a no-op because the
-# WASM crates (kernel, shell, status) have no test suite yet. When tests are
+# WASM crates (kernel, kernel-glia, status) have no test suite yet. When tests are
 # added, this target will run them. CI calls this after building WASM.
 #
 # WASM crates can't run cargo test on the host (they depend on wasip2).
@@ -197,7 +190,6 @@ test-wasm: std
 	@echo "Verifying WASM artifacts..."
 	@test -f std/kernel/bin/main.wasm  || { echo "FAIL: kernel WASM missing"; exit 1; }
 	@test -f std/kernel-glia/bin/main.wasm || { echo "FAIL: kernel-glia WASM missing"; exit 1; }
-	@test -f std/shell/bin/shell.wasm  || { echo "FAIL: shell WASM missing"; exit 1; }
 	@test -f std/status/bin/status.wasm || { echo "FAIL: status WASM missing"; exit 1; }
 	@echo "WASM artifacts OK (no test suite yet — see Makefile for guidance)"
 
@@ -212,7 +204,6 @@ clean:
 	cargo clean
 	rm -f std/kernel/bin/main.wasm
 	rm -f std/kernel-glia/bin/main.wasm
-	rm -f std/shell/bin/shell.wasm
 	rm -f std/status/bin/status.wasm
 	$(MAKE) -C examples/chess clean
 	$(MAKE) -C examples/echo clean
@@ -234,7 +225,7 @@ CONTAINER_TAG    ?= wetware:latest
 
 container-build:
 	$(CONTAINER_ENGINE) build \
-		--build-arg GIT_COMMIT=$$(git rev-parse --short HEAD) \
+		--build-arg WW_BUILD_GIT_SHA=$$(git rev-parse HEAD) \
 		-t $(CONTAINER_TAG) .
 
 container-run:

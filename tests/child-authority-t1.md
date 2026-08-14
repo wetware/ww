@@ -43,12 +43,8 @@ Host/pid0 surfaces that retain grafting and must **not** be mechanically
 migrated as ordinary children:
 
 - `std/kernel/src/lib.rs`: `KernelBootstrap` and pid0's initial graft. The
-  corrected Autoplan addendum explicitly keeps this pid0/shell export surface.
-- `src/executor.rs`, `src/cli/main.rs`, and `src/cli/shell.rs`: pid0/daemon and
-  remote shell bootstrap consumers.
-- `std/shell/src/lib.rs` is an ordinary WASM guest and reads explicit
-  `host`/`routing` grants. The CLI-side `src/cli/shell.rs` Terminal/Membrane
-  path remains the trusted remote surface.
+  corrected Autoplan addendum explicitly keeps this pid0 export surface.
+- `src/executor.rs` and `src/cli/main.rs`: pid0 and daemon bootstrap consumers.
 
 Ordinary children receive exactly their requested named grants through
 `InitialAuthorityRecord` and `InitialGrants.get()`; they do not receive a
@@ -95,10 +91,9 @@ Spawner/listener state after T3:
 - `src/dispatcher/mod.rs` is the WAGI dispatcher spawn site and receives the
   bounded executor rather than a universal child graft.
 - Direct zero-cap spawn sites in `tests/discovery_integration.rs`,
-  `tests/stdin_shutdown_integration.rs`, `tests/shell_e2e.rs`,
-  `tests/runtime_spike_test.rs`, and `examples/echo_handler_e2e.rs` do not need
-  node authority for their stated behavior and now exercise explicit zero-grant
-  construction.
+  `tests/stdin_shutdown_integration.rs`, `tests/runtime_spike_test.rs`, and
+  `examples/echo_handler_e2e.rs` do not need node authority for their stated
+  behavior and now exercise explicit zero-grant construction.
 - HTTP and stream listener unit tests assert that repeated children receive the
   same fixed registration template.
 

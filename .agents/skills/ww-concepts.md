@@ -24,7 +24,6 @@ Don't follow a fixed order.  Ask:
 > 3. **Architecture** — the three layers (host, kernel, children)
 > 4. **The Membrane** — how capabilities flow and get attenuated
 > 5. **Effects** — the boundary between local and global
-> 6. **AI integration** — drivetrain, not engine (MCP, Glia, who decides)
 > 7. **Concurrency** — how race conditions disappear (E-ordering)
 > 8. **Epochs** — on-chain coordination and capability lifecycle
 > 9. **Images** — how code is packaged and layered
@@ -216,45 +215,6 @@ pipeline. And every boundary crossing is trivially auditable.
 stack, pid0 can intercept, wrap, attenuate, or deny any effect
 a child performs.  This is how the Membrane composes — it's
 handlers all the way up.
-
-### AI integration
-
-Key files: `src/dispatcher/mod.rs`, `src/cli/main.rs` (MCP flag),
-`doc/designs/economic-agent-platform.md`
-
-**Lead with the confusion this clears up:** "agent" in Wetware
-means *any autonomous process* — an AI, a human at a REPL, a
-cron job, a script.  Wetware doesn't care who's driving.  It
-cares what they're *allowed to do*.
-
-**The inversion:** most AI agent frameworks embed the LLM inside
-the runtime.  Wetware inverts this.  The LLM (Claude, Ollama,
-whatever) connects *to* a Wetware node over MCP and gets a Glia
-shell — a capability-scoped REPL.  Wetware is the drivetrain;
-the LLM is the driver.
-
-Walk through the stack:
-
-1. **Wetware node** runs.  MCP is served by a **Cell** — a WASM
-   process running inside the sandbox, with its own scoped
-   capabilities.  It's not special host code; it's just another
-   Cell that happens to speak MCP over stdio.  *(TODO: this Cell
-   is being built now.)*
-2. **LLM** connects as an MCP client.  It sees Glia as a tool.
-3. **Glia** is the language the LLM speaks — Clojure-inspired,
-   capability-aware, designed for agents to consume.
-4. **Membrane** scopes what the LLM can do.  Different LLMs or
-   users can get different capability sets — because the MCP Cell
-   itself was granted a specific set of capabilities at spawn.
-
-**Why this matters:** the AI never touches raw sockets, never
-reads secrets, never has ambient authority.  It can only
-`perform` effects through capabilities it was granted.  You can
-audit, attenuate, or revoke its access at any time.
-
-If the user asks "where's the Anthropic API call?": it's not
-here.  The LLM calls *in* to Wetware, not the other way around.
-The WASM processes don't know or care that an AI is driving.
 
 ### Concurrency
 

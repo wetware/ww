@@ -5,7 +5,7 @@
 # ── Stage 1: Builder ─────────────────────────────────────────────────
 FROM rust:alpine AS builder
 
-ARG GIT_COMMIT=unknown
+ARG WW_BUILD_GIT_SHA=unknown
 
 RUN apk add --no-cache \
     musl-dev \
@@ -46,7 +46,6 @@ COPY crates/glia/Cargo.toml crates/glia/build.rs crates/glia/
 COPY crates/authority/Cargo.toml crates/authority/build.rs crates/authority/
 COPY crates/membrane/Cargo.toml crates/membrane/build.rs crates/membrane/
 COPY crates/guest/auth/Cargo.toml crates/guest/auth/Cargo.toml
-COPY std/shell/Cargo.toml std/shell/Cargo.toml
 COPY std/system/Cargo.toml std/system/Cargo.toml
 COPY examples/chess/Cargo.toml examples/chess/build.rs examples/chess/
 COPY examples/discovery/Cargo.toml examples/discovery/build.rs examples/discovery/
@@ -61,7 +60,6 @@ RUN mkdir -p src/cli && echo 'fn main() {}' > src/cli/main.rs \
     && mkdir -p crates/authority/src && echo '' > crates/authority/src/lib.rs \
     && mkdir -p crates/membrane/src && echo '' > crates/membrane/src/lib.rs \
     && mkdir -p crates/guest/auth/src && echo '' > crates/guest/auth/src/lib.rs \
-    && mkdir -p std/shell/src && echo 'fn main() {}' > std/shell/src/main.rs \
     && mkdir -p std/system/src && echo '' > std/system/src/lib.rs \
     && mkdir -p examples/chess/src && echo '' > examples/chess/src/lib.rs \
     && mkdir -p examples/discovery/src && echo '' > examples/discovery/src/lib.rs
@@ -75,8 +73,8 @@ RUN cargo build --release --target wasm32-wasip2 || true
 RUN find . -name '*.rs' -path '*/src/*' -delete
 COPY . .
 
-# GIT_COMMIT set after cache-warming so the hash doesn't bust dep cache.
-ENV GIT_COMMIT=${GIT_COMMIT}
+# WW_BUILD_GIT_SHA is set after cache-warming so the hash does not bust the dependency cache.
+ENV WW_BUILD_GIT_SHA=${WW_BUILD_GIT_SHA}
 
 # Build std + echo example (embedded by build.rs), then host binary
 RUN make std echo host
@@ -90,16 +88,8 @@ COPY --from=builder /usr/src/app/target/release/ww /usr/local/bin/ww
 COPY --from=builder /usr/src/app/std/kernel/bin/main.wasm \
      /usr/share/wetware/kernel/bin/main.wasm
 
-# Shell layer (WASM + schema + init.d)
-COPY --from=builder /usr/src/app/std/shell/bin/shell.wasm \
-     /usr/share/wetware/shell/bin/shell.wasm
-COPY --from=builder /usr/src/app/std/shell/bin/shell.capnpc \
-     /usr/share/wetware/shell/bin/shell.capnpc
-COPY --from=builder /usr/src/app/std/shell/etc/init.d/50-shell.glia \
-     /usr/share/wetware/shell/etc/init.d/50-shell.glia
-
 USER 1000:1000
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/ww"]
-CMD ["run", "/usr/share/wetware/kernel", "/usr/share/wetware/shell"]
+CMD ["run", "/usr/share/wetware/kernel"]

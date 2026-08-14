@@ -19,7 +19,7 @@ between the image author and the kernel (pid0).
 - **Default Rust kernel:** directly installs the shipped `/status`
   composition. The Rust kernel does not evaluate `etc/init.d`.
 - **Legacy Glia workflow:** run the node with the explicit Glia kernel, attach
-  with `ww shell`, and load Glia snippets from the example directory.
+  through the image's configured init scripts.
 - **Legacy Glia deployment:** bake service wiring into `etc/init.d/*.glia`
   so the Glia kernel registers services at boot.
 

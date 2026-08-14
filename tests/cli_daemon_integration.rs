@@ -19,43 +19,7 @@ fn stderr_text(output: &Output) -> String {
 }
 
 #[test]
-fn shell_rejects_select_with_explicit_addr() {
-    let home = tempfile::tempdir().expect("temp home");
-    let output = run_ww(
-        home.path(),
-        &[
-            "shell",
-            "/ip4/127.0.0.1/tcp/2025/p2p/12D3KooWJ3qM19qUUj8JdT9kPEg6VZLoes6eexfUYd6Xn7SPrf8n",
-            "--select",
-            "1",
-        ],
-    );
-
-    assert!(!output.status.success(), "unexpected success");
-    let stderr = stderr_text(&output);
-    assert!(stderr.contains("cannot be used with"), "stderr: {stderr}");
-    assert!(stderr.contains("--select"), "stderr: {stderr}");
-}
-
-#[test]
-fn shell_requires_persistent_identity_even_with_select() {
-    let home = tempfile::tempdir().expect("temp home");
-    let output = run_ww(home.path(), &["shell", "--select", "1"]);
-
-    assert!(!output.status.success(), "unexpected success");
-    let stderr = stderr_text(&output);
-    assert!(
-        stderr.contains("requires a persistent identity to authenticate"),
-        "stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("ww keygen > ~/.ww/identity"),
-        "stderr: {stderr}"
-    );
-}
-
-#[test]
-fn daemon_install_writes_service_with_listen_args_and_no_config_glia_dependency() {
+fn daemon_install_writes_service_with_listen_args() {
     if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
         eprintln!("SKIP: daemon service writer only supports macOS/Linux");
         return;
@@ -102,8 +66,4 @@ fn daemon_install_writes_service_with_listen_args_and_no_config_glia_dependency(
         "{service}"
     );
     assert!(service.contains("--identity"), "{service}");
-    assert!(
-        !service.contains("config.glia"),
-        "service should not reference config.glia: {service}"
-    );
 }

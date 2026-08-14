@@ -326,7 +326,6 @@ jobs:
         name: wasm-artifacts
         path: |
           std/kernel/bin/main.wasm
-          std/shell/bin/shell.wasm
           std/status/bin/status.wasm
           examples/*/bin/
         retention-days: 1
@@ -459,23 +458,14 @@ jobs:
         cd deploy-context
         chmod +x ww
 
-        # Two-layer layout matching the production k8s manifest:
-        #   /usr/share/wetware/kernel/  → kernel image (mounted as base)
-        #   /usr/share/wetware/shell/   → shell image (overlaid on kernel)
-        # The daemon mounts both as separate root layers; the shell layer
-        # provides bin/shell.wasm. Shell is a daemon built-in, not an
-        # init.d-registered vat.
+        # Kernel image layout matching the production k8s manifest.
         mkdir -p wetware/kernel/bin wetware/kernel/etc/init.d
-        mkdir -p wetware/shell/bin
 
         # Kernel layer: the pid0 entrypoint and its status route both live
         # at the merged root. The init script registers /status at boot.
         cp wasm/std/kernel/bin/main.wasm wetware/kernel/bin/main.wasm
         cp wasm/std/status/bin/status.wasm wetware/kernel/bin/status.wasm
         cp ../std/status/etc/init.d/05-status.glia wetware/kernel/etc/init.d/
-
-        # Shell layer: WASM.
-        cp wasm/std/shell/bin/shell.wasm    wetware/shell/bin/shell.wasm
 
         cp ../Containerfile.deploy Containerfile
 
@@ -673,7 +663,6 @@ jobs:
         # root, so the kernel is named main.wasm. Other cells keep their
         # canonical names (loaded by name via embedded loader / VFS).
         cp artifacts/wasm-artifacts/std/kernel/bin/main.wasm   "$STAGE/bin/main.wasm"
-        cp artifacts/wasm-artifacts/std/shell/bin/shell.wasm   "$STAGE/bin/shell.wasm"
         cp artifacts/wasm-artifacts/std/status/bin/status.wasm "$STAGE/bin/status.wasm"
 
         # Example WASM cells (flat, for reference / convenience).
@@ -686,8 +675,8 @@ jobs:
 
         # Per-example cell-shaped subtrees: enables `ww run /ipns/<key>/examples/<name>`
         # (or `/ipfs/<cid>/examples/<name>`) to mount the cell as a layer.
-        # Each subtree mirrors the kernel/shell `<name>/{etc/init.d,bin}/`
-        # convention so init.d glia files end up at the merged tree's
+        # Each subtree uses the `<name>/{etc/init.d,bin}/` cell convention,
+        # so init.d glia files end up at the merged tree's
         # /etc/init.d/ where the kernel discovers them
         # (std/kernel/src/lib.rs:1148-1188), and `(perform :load "bin/<name>.wasm")`
         # resolves relative to the merged tree root.
@@ -710,7 +699,6 @@ jobs:
         cp std/lib/ww/*.glia "$STAGE/lib/ww/" 2>/dev/null || true
 
         # Reference init.d scripts
-        cp std/shell/etc/init.d/*.glia "$STAGE/lib/init.d/" 2>/dev/null || true
         for ex_init in examples/*/etc/init.d/*.glia; do
           [ -f "$ex_init" ] && cp "$ex_init" "$STAGE/lib/init.d/"
         done

@@ -45,27 +45,18 @@ ww perform install
 ```
 
 `ww perform install` creates `~/.ww`, generates an identity,
-registers the background daemon, and wires MCP into Claude Code.
-It prints a summary with next steps.
+and registers the background daemon. It prints next steps.
 
 ### If installed
 
 Check if setup is complete: `ww doctor`
 
-Look at the "Install state" section.  If anything is missing
-(identity, daemon, MCP wiring), run `ww perform install` to fix it.
+Look at the "Install state" section. If the identity or daemon is missing,
+run `ww perform install` to fix it.
 
 If everything is OK, hand off to the quickstart.
 
-## Hand off to quickstart
-
-Once installed and configured, hand off to `/ww-mcp-demo`:
-
-> You're all set.  Let's run the quickstart -- takes about 3 minutes.
-> You'll see your AI agent execute verified WASM with provenance
-> tracking.
-
-## After quickstart
+## After setup
 
 Recall what brought them here (from your first question) and route:
 

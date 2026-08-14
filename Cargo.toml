@@ -20,7 +20,6 @@ exclude = [
     "std/caps",          # WASI guest lib — targets wasm32-wasip2, not host
     "std/kernel",        # Default WASI pid0 guest — targets wasm32-wasip2
     "std/kernel-glia",   # Legacy Glia pid0 guest — targets wasm32-wasip2
-    "std/shell",         # WASI guest — targets wasm32-wasip2, not host
     "examples/echo",     # WASI guest — targets wasm32-wasip2, not host
     "examples/counter",  # WASI guest — targets wasm32-wasip2, not host
     "examples/oracle",   # WASI guest — targets wasm32-wasip2, not host
@@ -102,13 +101,11 @@ stem = { path = "crates/stem" }
 cache = { package = "ww-cache", path = "crates/cache" }
 cell = { path = "crates/cell" }
 rpc = { path = "crates/rpc" }
-caps = { path = "std/caps" }
 blake3 = { workspace = true }
 cid = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 axum = "0.8"
-rustyline = "15"
 dirs = { workspace = true }
 indicatif = "0.17"
 

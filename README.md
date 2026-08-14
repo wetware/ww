@@ -34,24 +34,6 @@ The second command hit a WebAssembly cell running inside the daemon. The
 default Rust kernel installs this composition directly. The cell receives only
 the explicit `host` grant, which lets the cell report peer identity and peers.
 
-Here is the capability surface in action, directly in the Wetware shell (Glia):
-- `defcap` defines a capability server in Glia.
-- `attenuate` derives a restricted capability.
-
-```clojure
-;; Define a local capability server with two methods.
-(defcap directory
-  :lookup   (fn [name]
-              (perform routing :find name :count 5))
-  :announce (fn [name]
-              (perform routing :provide name)
-              :ok))
-
-;; Attenuate to a read-only view (lookup only).
-(def directory-ro
-  (attenuate directory [:lookup]))
-```
-
 ## Features
 
 - **Explicit child grants.** Each ordinary cell starts with a typed bundle of capabilities and nothing else. Parent cells choose which capabilities to hand down; method-level restrictions are enforced on the capability reference and on capabilities reached through it.
@@ -59,8 +41,6 @@ Here is the capability surface in action, directly in the Wetware shell (Glia):
 - **Content-addressed code.** Cells are identified by CID. The binary that ran is the binary you pinned; no swap-under-the-rug between generation and execution.
 - **WASM cell scale.** ~10ms spawn, KB-scale binaries, language-agnostic via `wasm32-wasip2`. Per-call sandboxing is only feasible because cells are cheap; microVM cold-start is too slow for that.
 - **P2P capability sharing.** A cell can export a typed capability to a peer over libp2p. Service names locate a stream; they do not authorize its caller. A deployer can publish a `Terminal` that authenticates a login identity and issues only the method authority selected for that identity.
-- **MCP integration.** `ww perform install` wires the node into Claude Code as an MCP server. The same capability surface you can hit with `curl` is reachable from an LLM through the grafted membrane. See [.agents/prompt.md](.agents/prompt.md).
-- **Glia shell.** A Clojure-inspired language where capabilities are first-class values and every side effect (capability calls, exceptions, I/O) is gated by an effect system. The same shell serves humans (REPL) and LLMs (over MCP).
 
 ## Quickstart
 
@@ -84,13 +64,7 @@ Requires a Rust toolchain with the `wasm32-wasip2` target. Optional: [Kubo](http
 
 ```bash
 ww run .                                # boot a node from current dir
-ww shell                                # discover a local node, then open REPL
 ```
-
-`ww shell` uses libp2p transport and Terminal(Membrane) auth. By default it
-discovers local hosts from runtime state and prefers an unambiguous identity match.
-If multiple hosts remain, TTY sessions prompt for selection, and
-non-interactive sessions can pass `--select <index|peer-id>`.
 
 ### Boot a cell
 
@@ -106,14 +80,6 @@ curl http://localhost:2080/oracle
 ```
 
 Read [examples/oracle/README.md](examples/oracle/README.md) for the full walkthrough, including the DHT-based consumer flow.
-
-### Use it from an LLM
-
-```bash
-ww perform install
-```
-
-Wires the node into Claude Code as an MCP server. The LLM gets a Glia shell over the same grafted membrane as the `curl` flow above. See [.agents/prompt.md](.agents/prompt.md).
 
 ## How it works
 
@@ -138,23 +104,6 @@ WASM processes ("cells") run with zero ambient authority. Their stdio is wired t
 | `http` | CGI (WAGI) | Stateless HTTP request adapters |
 | *(absent)* | Host RPC channel | pid0 kernel, full membrane graft |
 
-## The shell
-
-Glia is a Clojure-inspired language where capabilities are first-class values. The design blends three traditions:
-
-- **E-lang**: capabilities as values you can pass, compose, and attenuate
-- **Clojure**: s-expression syntax, immutable data, functional composition
-- **Unix**: processes, PATH lookup, stdin/stdout, init.d scripts
-
-```
-/ > (perform host :id)
-"12D3KooWExample..."
-/ > (perform host :addrs)
-("/ip4/127.0.0.1/tcp/2025" "/ip4/192.168.1.5/tcp/2025")
-```
-
-See [doc/shell.md](doc/shell.md) for the full syntax and capability reference.
-
 ## Standard ports
 
 | Port | Service |
@@ -176,7 +125,6 @@ ww run /ipfs/<CID>                           # run from content-addressed image
 ## Roadmap
 
 - **dosync**: transactional state management for Glia. Atomic multi-field updates over content-addressed stems. "Every agent gets its own Datomic, as a language primitive."
-- **`ww shell` capability discovery**: attach a shell to a running node, enumerate cells, call them via Cap'n Proto from Glia.
 
 ## Learn more
 
@@ -184,7 +132,6 @@ ww run /ipfs/<CID>                           # run from content-addressed image
 - [Architecture](doc/architecture.md): design principles and capability flow
 - [Capabilities](doc/capabilities.md): the capability model and Cap'n Proto schemas
 - [CLI reference](doc/cli.md): full command-line usage
-- [Shell](doc/shell.md): Glia shell syntax and capabilities
 - [Image layout](doc/images.md): FHS convention, mounts, on-chain coordination
 - [Routing](doc/routing.md): Kademlia DHT and peer discovery
 - [Keys & identity](doc/keys.md): Ed25519 identity management

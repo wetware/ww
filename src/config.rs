@@ -29,7 +29,7 @@ fn default_filter(level: &str) -> String {
 /// Initialize tracing using `RUST_LOG`.
 ///
 /// Default log level depends on context:
-/// - TTY (interactive shell): `warn` — keep the Glia REPL clean
+/// - TTY (interactive command): `warn` — keep command output readable
 /// - Non-TTY (daemon/pipe): `info` — standard Rust log behavior
 ///
 /// Applied uniformly across all wetware-internal workspace crates
@@ -38,7 +38,7 @@ fn default_filter(level: &str) -> String {
 /// `RUST_LOG` always takes precedence when set.
 ///
 /// When `stderr` is true, logs are written to stderr instead of stdout.
-/// This is required for MCP mode where stdout carries JSON-RPC.
+/// Callers can use this mode when stdout carries structured output.
 ///
 /// Attempts to initialize a global `tracing_subscriber` (no-op if already set).
 pub fn init_tracing_to_stderr(stderr: bool) {

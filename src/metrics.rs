@@ -23,7 +23,6 @@ pub struct VersionInfo {
     pub git_sha: String,
     pub oci_image_id: Option<String>,
     pub kernel_identity: crate::kernel::KernelIdentityState,
-    pub shell_wasm_blake3: Option<String>,
 }
 
 /// Mutable boot diagnostics shared between the boot path and admin server.
@@ -470,7 +469,6 @@ async fn version_handler(State(state): State<AdminState>) -> impl IntoResponse {
         "kernel_size": kernel_identity.map(|identity| identity.size),
         "kernel_abi": crate::kernel::KERNEL_ABI_VERSION,
         "kernel_abi_fingerprint": crate::kernel::KERNEL_ABI_FINGERPRINT,
-        "shell_wasm_blake3": state.version_info.shell_wasm_blake3,
         "degraded": runtime.degraded || cache.state == WasmtimeCacheState::Fallback,
         "degraded_reasons": runtime.degraded_reasons,
         "wasmtime_cache_state": cache.state.as_str(),
@@ -647,7 +645,6 @@ mod tests {
                 git_sha: "0123456789abcdef".to_string(),
                 oci_image_id: Some("sha256:image".to_string()),
                 kernel_identity,
-                shell_wasm_blake3: Some("shell".to_string()),
             },
             runtime_status: RuntimeStatus::starting(),
             kernel_ready_gate,
@@ -773,7 +770,6 @@ mod tests {
             value["kernel_abi_fingerprint"],
             crate::kernel::KERNEL_ABI_FINGERPRINT
         );
-        assert_eq!(value["shell_wasm_blake3"], "shell");
         assert!(value["wasmtime_cache_hits_total"].is_u64());
         assert!(value["wasmtime_cache_stores_total"].is_u64());
         assert!(value["wasmtime_component_compilations_total"].is_u64());

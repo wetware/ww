@@ -1,10 +1,9 @@
 ---
 name: ww-reference
-description: Capability schemas, CLI flags, shell commands, and API reference
+description: Capability schemas, CLI flags, and API reference
 reads:
   - doc/ai-context.md
   - doc/cli.md
-  - doc/shell.md
   - doc/capabilities.md
   - doc/rpc-transport.md
   - doc/keys.md
@@ -12,7 +11,7 @@ reads:
 ---
 # Browse Reference
 
-Deep-dive into schemas, CLI, and shell commands.
+Deep-dive into schemas, CLI, and APIs.
 
 ## Start with what they need
 
@@ -35,21 +34,20 @@ If they want to browse, show the menu:
 > 4. **Routing / DHT** — provide, findProviders
 >    (`capnp/routing.capnp`, `doc/routing.md`)
 > 5. **CLI** — flags, subcommands, env vars (`doc/cli.md`)
-> 6. **Shell** — Glia REPL syntax, built-ins (`doc/shell.md`)
-> 7. **RPC transport** — duplex streams, scheduling (`doc/rpc-transport.md`)
-> 8. **schema-inject** — post-build cell type injection
+> 6. **RPC transport** — duplex streams, scheduling (`doc/rpc-transport.md`)
+> 7. **schema-inject** — post-build cell type injection
 >    (`crates/schema-id/src/bin/schema-inject.rs`)
-> 9. **Effects** — `perform`, `with-effect-handler`,
+> 8. **Effects** — `perform`, `with-effect-handler`,
 >    `resume` (`crates/glia/src/effect.rs`)
-> 10. **Signing & keys** — Signer interface, key derivation
+> 9. **Signing & keys** — Signer interface, key derivation
 >     (`doc/keys.md`)
-> 11. **Cross-crate schemas** — sharing Cap'n Proto definitions
+> 10. **Cross-crate schemas** — sharing Cap'n Proto definitions
 >     across crates (`doc/capnp-cross-crate.md`)
-> 12. **Guest API** — WASI bindings for guest WASM modules
+> 11. **Guest API** — WASI bindings for guest WASM modules
 >     (`doc/api/wasm-guest.md`)
-> 13. **Guest runtime** — poll loop, effect dispatch, oneshot
+> 12. **Guest runtime** — poll loop, effect dispatch, oneshot
 >     channel, WASI integration (`doc/guest-runtime.md`)
-> 14. **Design docs** — deep dives on effects, macros, HTTP surface,
+> 13. **Design docs** — deep dives on effects, macros, HTTP surface,
 >     economic platform (`doc/designs/`)
 
 ## How to present reference material

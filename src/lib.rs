@@ -27,8 +27,6 @@ pub use ipfs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod launcher;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod local_host;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod metrics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ns;
@@ -61,11 +59,6 @@ pub use authority::system_capnp;
 pub mod greeter_capnp {
     include!(concat!(env!("OUT_DIR"), "/greeter_capnp.rs"));
 }
-#[allow(dead_code)]
-pub mod shell_capnp {
-    include!(concat!(env!("OUT_DIR"), "/shell_capnp.rs"));
-}
-
 // Modules available for both host and guest
 pub mod config;
 pub mod default_kernel;

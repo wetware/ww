@@ -146,25 +146,6 @@ pub(super) async fn doctor() -> Result<()> {
         }
     }
 
-    // Claude Code MCP
-    let claude_check = std::process::Command::new("claude")
-        .args(["mcp", "list"])
-        .output();
-    match claude_check {
-        Ok(out) if out.status.success() => {
-            let list = String::from_utf8_lossy(&out.stdout);
-            if list.contains("wetware") {
-                println!("  Claude Code MCP ............. CONFIGURED");
-            } else {
-                println!("  Claude Code MCP ............. NOT CONFIGURED");
-                println!("    Fix: claude mcp add wetware -- ww shell --mcp");
-            }
-        }
-        _ => {
-            println!("  Claude Code MCP ............. UNKNOWN (claude CLI not found)");
-        }
-    }
-
     // --- Namespace checks ---
     println!();
     println!("Namespaces:");
