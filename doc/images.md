@@ -8,22 +8,27 @@ Each wetware image follows a minimal FHS convention:
     main.wasm          # agent entrypoint (required)
   svc/                 # nested service images (spawned by pid0)
   etc/                 # configuration (consumed by pid0)
-    init.d/            # boot scripts evaluated by the kernel
+    init.d/            # boot scripts evaluated by the legacy Glia kernel
 ```
 
 Only `bin/main.wasm` is required. Everything else is convention
 between the image author and the kernel (pid0).
 
-## Demo vs deployment boot flow
+## Default and legacy Glia boot flow
 
-- **Demo default:** run a node process, attach with `ww shell`, then
-  load explicit Glia snippets (for example `glia/register.glia`,
-  `glia/serve.glia`) from the example directory.
-- **Deployment default:** bake service wiring into `etc/init.d/*.glia`
-  so services auto-register at boot without an interactive shell.
+- **Default Rust kernel:** directly installs the shipped `/status`
+  composition. The Rust kernel does not evaluate `etc/init.d`.
+- **Legacy Glia workflow:** run the node with the explicit Glia kernel, attach
+  with `ww shell`, and load Glia snippets from the example directory.
+- **Legacy Glia deployment:** bake service wiring into `etc/init.d/*.glia`
+  so the Glia kernel registers services at boot.
 
-Use snippets for interactive walkthroughs and reproducible tutorials.
-Use init scripts for packaged images and unattended startup.
+Build and select the legacy kernel explicitly:
+
+```sh
+make kernel-glia
+ww run --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
+```
 
 ## Mount sources
 
@@ -32,7 +37,7 @@ as layers (later mounts override earlier ones):
 
 | Form | Example |
 |------|---------|
-| Local path | `std/kernel` |
+| Local path | `std/kernel-glia` |
 | IPFS path | `/ipfs/QmAbc123...` |
 | Layered | `ww run /ipfs/QmBase my-overlay` |
 
@@ -47,7 +52,7 @@ head is updated:
 1. The off-chain indexer detects the `HeadUpdated` event
 2. Waits for confirmation depth (reorg safety)
 3. Advances the epoch, revoking all agent capabilities
-4. Agents re-graft, receiving capabilities scoped to the new epoch
+4. The host terminates pid0 and starts a replacement for the new epoch
 
 This provides a coordination primitive across trust boundaries:
 multiple independent nodes watching the same contract will

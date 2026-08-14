@@ -37,7 +37,8 @@ cp target/wasm32-wasip2/release/echo.wasm examples/echo/bin/echo.wasm
 Start a host:
 
 ```sh
-ww run --port=2025 std/kernel
+make kernel-glia
+ww run --port=2025 --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
 ```
 
 Leave this process running.

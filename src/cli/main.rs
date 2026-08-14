@@ -1307,7 +1307,7 @@ wasip2::cli::command::export!({iface_name}Guest);
 
         // etc/init.d/<name>.glia — skeleton init script
         let glia = format!(
-            r#"; {name} init.d script — evaluated by the kernel at boot.
+            r#"; {name} init.d script — evaluated by the legacy Glia kernel at boot.
 ;
 ; Starts one cell, obtains its exported capability, and publishes it as
 ; an explicitly ungated vat service under the "{name}" protocol.
@@ -1338,13 +1338,14 @@ wasip2::cli::command::export!({iface_name}Guest);
         println!("  Cargo.toml              — project configuration");
         println!("  build.rs                — schema compilation");
         println!("  src/lib.rs              — guest entry point");
-        println!("  etc/init.d/{name}.glia  — kernel init script");
+        println!("  etc/init.d/{name}.glia  — legacy Glia kernel init script");
         println!();
         println!("\u{2697}\u{fe0f}  Next steps:");
         println!("  1. Edit {name}.capnp with your interface methods");
         println!("  2. Implement the server in src/lib.rs");
         println!("  3. ww build {name}");
-        println!("  4. ww run std/kernel {name}");
+        println!("  4. make kernel-glia");
+        println!("  5. ww run --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia {name}");
         Ok(())
     }
 

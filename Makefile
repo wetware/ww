@@ -5,7 +5,7 @@
 
 WASM_TARGET := wasm32-wasip2
 
-.PHONY: all host std kernel kernel-rust shell status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
+.PHONY: all host std kernel kernel-glia shell status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
 .PHONY: publish-std try-publish-std publish test-deps test test-wasm check-glia-effects authority-probe
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
@@ -45,18 +45,18 @@ check-glia-effects:
 
 # --- Std components ----------------------------------------------------------
 
-std: kernel kernel-rust shell status
+std: kernel kernel-glia shell status
 
 kernel:
 	cargo build -p kernel --target $(WASM_TARGET) --release --manifest-path std/kernel/Cargo.toml
 	@mkdir -p std/kernel/bin
 	cp std/kernel/target/$(WASM_TARGET)/release/kernel.wasm std/kernel/bin/main.wasm
 
-# Transitional, opt-in Rust pid0. The host does not embed or publish it.
-kernel-rust:
-	cargo build -p kernel-rust --target $(WASM_TARGET) --release --manifest-path std/kernel-rust/Cargo.toml
-	@mkdir -p std/kernel-rust/bin
-	cp std/kernel-rust/target/$(WASM_TARGET)/release/kernel_rust.wasm std/kernel-rust/bin/main.wasm
+# Legacy Glia pid0 for explicit rollback and parity validation.
+kernel-glia:
+	cargo build -p kernel-glia --target $(WASM_TARGET) --release --manifest-path std/kernel-glia/Cargo.toml
+	@mkdir -p std/kernel-glia/bin
+	cp std/kernel-glia/target/$(WASM_TARGET)/release/kernel_glia.wasm std/kernel-glia/bin/main.wasm
 
 shell:
 	cargo build -p shell --target $(WASM_TARGET) --release --manifest-path std/shell/Cargo.toml
@@ -196,22 +196,22 @@ publish: host
 test-wasm: std
 	@echo "Verifying WASM artifacts..."
 	@test -f std/kernel/bin/main.wasm  || { echo "FAIL: kernel WASM missing"; exit 1; }
-	@test -f std/kernel-rust/bin/main.wasm || { echo "FAIL: kernel-rust WASM missing"; exit 1; }
+	@test -f std/kernel-glia/bin/main.wasm || { echo "FAIL: kernel-glia WASM missing"; exit 1; }
 	@test -f std/shell/bin/shell.wasm  || { echo "FAIL: shell WASM missing"; exit 1; }
 	@test -f std/status/bin/status.wasm || { echo "FAIL: status WASM missing"; exit 1; }
 	@echo "WASM artifacts OK (no test suite yet — see Makefile for guidance)"
 
 # --- Run ---------------------------------------------------------------------
 
-run-kernel: kernel
-	cargo run -- run std/kernel
+run-kernel: kernel status
+	cargo run -- run std/status
 
 # --- Clean -------------------------------------------------------------------
 
 clean:
 	cargo clean
 	rm -f std/kernel/bin/main.wasm
-	rm -f std/kernel-rust/bin/main.wasm
+	rm -f std/kernel-glia/bin/main.wasm
 	rm -f std/shell/bin/shell.wasm
 	rm -f std/status/bin/status.wasm
 	$(MAKE) -C examples/chess clean

@@ -53,7 +53,7 @@ Cells are WASM binaries whose stdio is wired to a transport.
 ## Architecture (three layers)
 
 - **Host** (`ww` binary): libp2p swarm, loads kernel WASM, serves Membrane.
-- **Kernel** (pid0): calls `membrane.graft()`, receives `List(Export)` of named capabilities. All policy lives here.
+- **Kernel** (pid0): calls `membrane.graft()` and receives named capabilities. The embedded Rust kernel is the default. The legacy Glia kernel requires `--kernel file:std/kernel-glia/bin/main.wasm`.
 - **Children**: spawned by pid0 with attenuated capabilities.
 
 ## Capabilities after graft

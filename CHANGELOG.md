@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **The Rust PID0 is now the default kernel.** The surviving implementation is
+  `std/kernel`, and the legacy Glia implementation is `std/kernel-glia`.
+  Select Glia explicitly with
+  `--kernel file:std/kernel-glia/bin/main.wasm`. The default remains
+  `embedded:main` with no fallback. `/version.kernel_cid` changes because the
+  embedded kernel bytes change.
 - **Epoch replacement now uses per-generation effective roots and fail-closed
   authority ordering.** A finalized Atom head invalidates the old generation
   before Host filesystem preparation. The Host reapplies frozen boot overlays,

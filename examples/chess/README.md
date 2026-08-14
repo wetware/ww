@@ -98,11 +98,13 @@ method-level proof; it does not claim per-argument or per-resource filtering.
 Start two hosts:
 
 ```sh
+make kernel-glia
+
 # Terminal 1
-ww run --port=2025 std/kernel
+ww run --port=2025 --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
 
 # Terminal 2
-ww run --port=2026 std/kernel
+ww run --port=2026 --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
 ```
 
 Leave both processes running.
@@ -143,7 +145,8 @@ The `ww run` command takes one or more **image layers** as positional
 args. Each layer is a directory that gets merged into a single FHS
 root, left to right. The kernel (PID 0) sees this merged root as
 its virtual filesystem. If you run a layered image such as
-`ww run --port=2025 std/kernel examples/chess`, the merged tree looks
+`ww run --port=2025 --kernel file:std/kernel-glia/bin/main.wasm
+std/kernel-glia examples/chess`, the merged tree looks
 like:
 
 ```
@@ -153,7 +156,7 @@ $WW_ROOT/
 ├── glia/
 │   └── register.glia      <- shell-loaded snippet
 ├── boot/
-│   └── main.wasm          <- from std/kernel
+│   └── main.wasm          <- from std/kernel-glia
 └── ...
 ```
 

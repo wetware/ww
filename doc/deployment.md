@@ -95,6 +95,10 @@ The production image contains two core layers:
 comes first; kernel and shell layers follow so application content cannot
 replace pid0 or the image-owned status route.
 
+The default Rust pid0 directly installs the image-owned `/status` composition.
+The staged `05-status.glia` file remains for the explicit legacy Glia rollback
+path and does not change the deployment layout.
+
 ## HTTP request path
 
 ```text
@@ -110,7 +114,7 @@ ww-master :2080 (WAGI adapter)
 longest registered route prefix
   |
   v
-cell registered by etc/init.d/*.glia
+status cell registered by the default Rust pid0
 ```
 
 The public `/status` cell route is an end-to-end serving check. The

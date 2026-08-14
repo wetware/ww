@@ -19,41 +19,44 @@ First, check prerequisites yourself:
 - `rustup target list --installed | grep wasm32-wasip2` — present?
   If missing, run `rustup target add wasm32-wasip2`.
 
-Then run `make` yourself.  Builds host binary, kernel, shell, and
-examples.  First build is slower — tell the user that's normal.
+Then run `make` yourself. It builds the host binary, both kernels, the shell,
+and examples. The first build takes longer.
 
 ## Step 2 of 3: Run (~30 sec)
 
-```
-cargo run -- run std/kernel
+```sh
+cargo run -- run --http-listen 127.0.0.1:2080 std/status
 ```
 
-Boots a libp2p swarm, loads the kernel WASM, drops into the Glia
-shell.
+This command boots a libp2p swarm with the embedded Rust kernel. The kernel
+installs the shipped `/status` composition directly.
 
 ## Step 3 of 3: Try it (~1 min)
 
-```clojure
-(perform host :id)              ;; your peer identity
-(perform host :peers)           ;; connected peers
-(perform host :addrs)           ;; listen addresses — round-trip RPC through the Membrane
-(perform :exit nil)             ;; end the Glia session
+```sh
+curl http://127.0.0.1:2080/status
 ```
 
-⚗️ **That's it.**  You just booted a p2p capability-secured OS:
-host, kernel, Membrane, shell.
+The response reports `status: "ok"` and a non-null `peer_id`.
 
 ## What happened (optional — ask first)
 
 `ww run` did three things:
 
 1. Started a **libp2p swarm** on the configured port
-2. Loaded `std/kernel/bin/main.wasm` — the kernel Cell (pid0)
+2. Loaded embedded `std/kernel/bin/main.wasm` — the Rust kernel Cell (pid0)
 3. Spawned it with a **Membrane** — the capability hub that grants
    Host, Executor, IPFS, Routing, and Identity via Cap'n Proto RPC
 
 The kernel grafted onto the Membrane, received epoch-scoped
-capabilities, and launched the Glia shell.
+capabilities, and installed the `/status` cell with an explicit `host` grant.
+
+The legacy Glia workflow remains available through an explicit kernel source:
+
+```sh
+make kernel-glia
+cargo run -- run --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
+```
 
 ## Next
 

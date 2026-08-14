@@ -283,7 +283,7 @@ User code constructs structured errors via the `ex-info` builtin:
 ## Introspection
 
 Three Glia builtins return data about caps an agent holds. They are
-registered by the kernel after graft (`std/kernel/src/lib.rs`):
+registered by the legacy Glia kernel after graft (`std/kernel-glia/src/lib.rs`):
 
 - `(schema cap)` returns the cap's canonical `Schema.Node` bytes as
   `Val::Bytes`. An MCP agent can parse this to enumerate methods,

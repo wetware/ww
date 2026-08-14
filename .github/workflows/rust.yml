@@ -75,7 +75,7 @@ jobs:
     - name: cargo fmt --all -- --check
       run: |
         cargo fmt --all -- --check
-        cargo fmt --manifest-path std/kernel-rust/Cargo.toml -- --check
+        cargo fmt --manifest-path std/kernel/Cargo.toml -- --check
 
     - name: Check Glia host-effect migration
       run: make check-glia-effects
@@ -119,8 +119,8 @@ jobs:
     - name: Check membrane substrate builds for WASI
       run: cargo check -p wetware-membrane --target wasm32-wasip2
 
-    - name: Clippy kernel-rust WASI component
-      run: cargo clippy --manifest-path std/kernel-rust/Cargo.toml --target wasm32-wasip2 -- -D warnings
+    - name: Clippy kernel WASI component
+      run: cargo clippy --manifest-path std/kernel/Cargo.toml --target wasm32-wasip2 -- -D warnings
 
   solidity:
     name: Solidity (Foundry)
@@ -284,8 +284,8 @@ jobs:
       if: ${{ always() }}
       run: |
         cargo test --manifest-path std/caps/Cargo.toml
+        cargo test --manifest-path std/kernel-glia/Cargo.toml
         cargo test --manifest-path std/kernel/Cargo.toml
-        cargo test --manifest-path std/kernel-rust/Cargo.toml
 
   # === Master-only: fan out after checks pass ===
 

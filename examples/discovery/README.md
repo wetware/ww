@@ -40,14 +40,16 @@ Vat publication uses the service name `greeter`.
 
 ### Step 1: Run the two nodes (daemon terminals)
 
-Start two hosts:
+Build the legacy Glia kernel, then start two hosts:
 
 ```sh
+make kernel-glia
+
 # Terminal A
-ww run --port=2025 std/kernel
+ww run --port=2025 --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
 
 # Terminal B
-ww run --port=2026 std/kernel
+ww run --port=2026 --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
 ```
 
 Leave both processes running.

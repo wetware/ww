@@ -33,8 +33,9 @@ Architecture (three layers):
 - **Host** (`ww` binary): boots a libp2p swarm, loads the kernel
   WASM, serves a Membrane over Cap'n Proto RPC.
 - **Kernel** (pid0): calls `membrane.graft()` to obtain capabilities
-  (Host, Runtime, Routing, Identity, HttpClient).  Interprets the FHS
-  image layout.  All policy lives here.
+  (Host, Runtime, Routing, Identity, HttpClient). The default Rust kernel
+  installs the shipped `/status` composition. The explicit legacy Glia kernel
+  interprets `etc/init.d`. All policy lives in the selected kernel.
 - **Ordinary children**: spawned with an immutable `InitialAuthorityRecord`
   delivered by `InitialGrants`; they do not receive `Membrane.graft()`.
 
@@ -46,8 +47,9 @@ Key abstractions:
   authenticated remote sessions; it is not child bootstrap.
 - **InitialGrants**: the grants-only ordinary-child bootstrap. It returns the
   exact parent-selected record and has no refresh, graft, or lookup API.
-- **Epoch lifecycle**: an advance stales host-issued guarded references. pid0
-  re-grafts and reruns affected init; children cannot refresh themselves.
+- **Epoch lifecycle**: an advance stales host-issued guarded references. The
+  host terminates the old pid0 and starts a replacement for the new generation.
+  Children cannot refresh themselves.
 - **FHS images**: layers are stacked with per-file union.  Later
   layers override earlier ones.
 - **Cap'n Proto RPC**: bidirectional -- both host and guest can serve
@@ -92,7 +94,16 @@ Quick start:
 ```
 rustup target add wasm32-wasip2
 make
-cargo run -- run std/kernel
+cargo run -- run --http-listen 127.0.0.1:2080 std/status
+curl http://127.0.0.1:2080/status
+```
+
+The embedded default is the Rust kernel. Use the legacy Glia kernel only when
+a workflow requires init scripts or the Glia REPL:
+
+```sh
+make kernel-glia
+cargo run -- run --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
 ```
 
 Concurrency model (E-ordering):
