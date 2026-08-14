@@ -523,7 +523,7 @@ impl Libp2pHost {
         beh.kad_lan.get_closest_peers(self.local_peer_id);
         tracing::debug!("Kad self-announcement walks started (WAN + LAN)");
 
-        // Advertise on the LAN DHT so `ww shell` can discover us via Kubo.
+        // Advertise the node's discovery record on the LAN DHT.
         let discovery_key = crate::discovery::discovery_record_key();
         match self
             .swarm
@@ -1750,7 +1750,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Client-mode swarm — minimal libp2p for dialing only (ww shell)
+// Client-mode swarm — minimal libp2p for dialing only
 // ---------------------------------------------------------------------------
 
 /// Minimal network behaviour for client-only operation.
@@ -1764,8 +1764,8 @@ pub struct ClientBehaviour {
     relay_client: libp2p::relay::client::Behaviour,
 }
 
-/// A lightweight libp2p swarm for dialing peers and consuming vat services.
-/// Used by `ww shell` to connect to a running node without booting a full host.
+/// A lightweight libp2p swarm for dialing peers and consuming vat services
+/// without booting a full host.
 pub struct ClientSwarm {
     swarm: libp2p::swarm::Swarm<ClientBehaviour>,
     local_peer_id: PeerId,

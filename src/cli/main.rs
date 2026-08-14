@@ -13,7 +13,6 @@ use libp2p::Multiaddr;
 mod daemon_cmd;
 mod doctor_cmd;
 mod ns_cmd;
-mod shell;
 
 use ww::cell::image;
 use ww::cell::loaders::{ChainLoader, EmbeddedLoader, HostPathLoader, IpfsLoader};
@@ -32,11 +31,6 @@ const KERNEL_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const EMBEDDED_KERNEL: &[u8] = include_bytes!("../../std/kernel/bin/main.wasm");
 #[cfg(not(has_wasm_std_kernel_bin_main_wasm))]
 const EMBEDDED_KERNEL: &[u8] = b"";
-
-#[cfg(has_wasm_std_shell_bin_shell_wasm)]
-const EMBEDDED_SHELL: &[u8] = include_bytes!("../../std/shell/bin/shell.wasm");
-#[cfg(not(has_wasm_std_shell_bin_shell_wasm))]
-const EMBEDDED_SHELL: &[u8] = b"";
 
 #[cfg(has_wasm_examples_echo_bin_echo_wasm)]
 const EMBEDDED_ECHO: &[u8] = include_bytes!("../../examples/echo/bin/echo.wasm");
@@ -57,9 +51,6 @@ fn embedded_loader() -> EmbeddedLoader {
     if !EMBEDDED_KERNEL.is_empty() {
         loader = loader.insert("bin/main.wasm", EMBEDDED_KERNEL);
     }
-    if !EMBEDDED_SHELL.is_empty() {
-        loader = loader.insert("bin/shell.wasm", EMBEDDED_SHELL);
-    }
     if !EMBEDDED_ECHO.is_empty() {
         loader = loader.insert("bin/echo.wasm", EMBEDDED_ECHO);
     }
@@ -74,10 +65,6 @@ fn embedded_loader() -> EmbeddedLoader {
 /// CLI and environment input share one tested disable path.
 fn admin_listen_addr(value: String) -> Option<String> {
     (!value.trim().eq_ignore_ascii_case("off")).then_some(value)
-}
-
-fn embedded_blake3(bytes: &[u8]) -> Option<String> {
-    (!bytes.is_empty()).then(|| blake3::hash(bytes).to_hex().to_string())
 }
 
 fn service_exit_error(exit: Option<ww::services::ServiceExit>) -> anyhow::Error {
@@ -399,27 +386,6 @@ enum Commands {
         private_key: Option<String>,
     },
 
-    /// Connect to a running node and open a Glia REPL.
-    ///
-    /// Example:
-    ///   ww shell
-    ///   ww shell --mcp
-    ///   ww shell --select 2
-    ///   ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...
-    Shell {
-        /// Multiaddr of a remote node.
-        addr: Option<Multiaddr>,
-
-        /// Selection override for host discovery (`index` or `peer-id`).
-        #[arg(long, value_name = "TARGET", conflicts_with = "addr")]
-        select: Option<String>,
-
-        /// Run shell in MCP stdio mode (JSON-RPC on stdin/stdout).
-        /// In this mode the shell never prompts interactively.
-        #[arg(long)]
-        mcp: bool,
-    },
-
     /// Effectful operations that mutate state beyond the current directory.
     Perform {
         #[command(subcommand)]
@@ -489,7 +455,7 @@ enum DaemonAction {
 
 #[derive(Subcommand)]
 enum PerformAction {
-    /// Bootstrap the ~/.ww user layer, daemon, and MCP wiring.
+    /// Bootstrap the ~/.ww user layer and daemon.
     ///
     /// Idempotent: re-running skips completed steps, retries failed ones.
     ///
@@ -497,19 +463,17 @@ enum PerformAction {
     ///   1. Create ~/.ww directory structure
     ///   2. Generate Ed25519 identity at ~/.ww/identity (if missing)
     ///   3. Register background daemon (launchd/systemd)
-    ///   4. Wire MCP into Claude Code (if installed)
-    ///   5. Print summary with next steps
+    ///   4. Print summary with next steps
     Install,
 
-    /// Remove wetware daemon, MCP wiring, and optionally ~/.ww.
+    /// Remove the wetware daemon and optionally ~/.ww.
     ///
     /// Steps:
     ///   1. Stop and remove background daemon
-    ///   2. Remove MCP config from Claude Code
-    ///   3. Optionally remove ~/.ww (prompts for confirmation)
+    ///   2. Optionally remove ~/.ww (prompts for confirmation)
     Uninstall,
 
-    /// Refresh WASM images, daemon, and MCP wiring to match this binary.
+    /// Refresh WASM images and the daemon to match this binary.
     ///
     /// Safe to run repeatedly. Does not touch identity or directory structure.
     ///
@@ -518,7 +482,6 @@ enum PerformAction {
     ///   2. Republish standard library (if images changed and Kubo running)
     ///   3. Regenerate daemon service file
     ///   4. Restart daemon
-    ///   5. Re-wire MCP into Claude Code
     Update,
 
     /// Self-update the ww binary via IPNS.
@@ -526,7 +489,7 @@ enum PerformAction {
     /// Resolves /ipns/releases.wetware.run/Cargo.toml to check for a
     /// newer version, then fetches the platform binary and atomically
     /// replaces the running executable, then runs `update` to refresh
-    /// WASM images, daemon, and MCP wiring.
+    /// WASM images and daemon configuration.
     Upgrade {
         /// IPFS HTTP API endpoint.
         #[arg(long, default_value = "http://localhost:5001", env = "IPFS_API")]
@@ -880,13 +843,6 @@ impl Commands {
                 private_key,
             } => Self::push(path, ipfs_url, stem, rpc_url, private_key).await,
             Commands::Keygen { output } => Self::keygen(output).await,
-            Commands::Shell { addr, select, mcp } => {
-                if mcp {
-                    shell::run_mcp(addr, select).await
-                } else {
-                    shell::run_shell(addr, select).await
-                }
-            }
             Commands::Perform { action } => match action {
                 PerformAction::Install => Self::perform_install().await,
                 PerformAction::Uninstall => Self::perform_uninstall().await,
@@ -1661,7 +1617,6 @@ wasip2::cli::command::export!({iface_name}Guest);
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
             kernel_identity: ww::kernel::KernelIdentityState::pending(&kernel_source),
-            shell_wasm_blake3: embedded_blake3(EMBEDDED_SHELL),
         };
         let kernel_identity = version_info.kernel_identity.clone();
 
@@ -2005,20 +1960,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         tracing::debug!("swarm ready");
         let network_state = swarm_ready.network_state;
         let stream_control = swarm_ready.stream_control;
-        let runtime_hostfile_task = {
-            let network_state = network_state.clone();
-            tokio::spawn(async move {
-                loop {
-                    match ww::local_host::write_from_snapshot(&network_state.snapshot().await) {
-                        Ok(true) => {}
-                        Ok(false) => {}
-                        Err(e) => tracing::debug!("failed to update local host state file: {e}"),
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            })
-        };
-
         // Epoch thread: on-chain watcher (only when --stem is provided).
         if let Some(config) = stem_config {
             supervisor.try_spawn(
@@ -2196,7 +2137,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                             tracing::info!(
                                 event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
                                 generation,
-                                "Interactive PID0 generation was replaced; restart ww run or reconnect with ww shell"
+                                "Interactive PID0 generation was replaced; restart ww run"
                             );
                             break 'generations 0;
                         }
@@ -2246,7 +2187,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                             tracing::info!(
                                 event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
                                 generation,
-                                "Interactive PID0 generation was replaced; restart ww run or reconnect with ww shell"
+                                "Interactive PID0 generation was replaced; restart ww run"
                             );
                             break 'generations 0;
                         }
@@ -2257,7 +2198,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                         tracing::info!(
                             event_code = ww::rpc::graft::KernelEventCode::InteractiveReplaced as u16,
                             generation,
-                            "Interactive PID0 generation was replaced; restart ww run or reconnect with ww shell"
+                            "Interactive PID0 generation was replaced; restart ww run"
                         );
                     }
                     let _ = terminate_tx.send(());
@@ -2291,11 +2232,6 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
         };
         tracing::info!(code = exit_code, "Kernel exited");
-
-        runtime_hostfile_task.abort();
-        if let Err(e) = ww::local_host::remove_state_file() {
-            tracing::debug!("failed to remove local host state file: {e}");
-        }
 
         supervisor.shutdown();
 
@@ -2372,16 +2308,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         Ok(())
     }
 
-    fn claude_cli_available() -> bool {
-        std::process::Command::new("claude")
-            .args(["--version"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-
     fn restart_user_daemon(home: &std::path::Path) -> Option<bool> {
         let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
         let systemd_path = home.join(".config/systemd/user/ww.service");
@@ -2446,7 +2372,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         bail!("unsupported platform; only macOS and Linux are supported")
     }
 
-    /// Refresh WASM images, daemon service file, and MCP wiring
+    /// Refresh WASM images and the daemon service file
     /// to match the current binary. Safe to run repeatedly.
     async fn perform_update() -> Result<()> {
         use indicatif::{ProgressBar, ProgressStyle};
@@ -2481,9 +2407,6 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
         }
 
-        // Shell service registration is intentionally absent while remote
-        // shell transport/auth replacement is in progress.
-
         // ── Status init.d ────────────────────────────────────────────
         let status_init = ww_dir.join("etc/init.d/05-status.glia");
         if !status_init.exists() {
@@ -2504,7 +2427,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         // Other cells keep their canonical names.
         let embedded_cells: &[(&str, &[u8])] = &[
             ("main.wasm", EMBEDDED_KERNEL),
-            ("shell.wasm", EMBEDDED_SHELL),
             ("status.wasm", EMBEDDED_STATUS),
         ];
         let images_ok = embedded_cells.iter().all(|(_, bytes)| !bytes.is_empty());
@@ -2619,7 +2541,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         }
 
         // ── Daemon config + service file (unconditional) ─────────────
-        let ww_bin = std::env::current_exe().context("cannot determine ww binary path")?;
         let identity_path = ww_dir.join("identity");
         // Mount ~/.ww as the single root layer. WASM cells are resolved
         // from the embedded loader or IPNS namespace. Init scripts in
@@ -2649,56 +2570,10 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
         }
 
-        // ── Claude Code MCP ──────────────────────────────────────────
-        let ww_bin_str = ww_bin.display().to_string();
-        if Self::claude_cli_available() {
-            // Try add first. If it fails with "already exists", remove and retry.
-            let output = std::process::Command::new("claude")
-                .args(["mcp", "add", "wetware", "--", &ww_bin_str, "shell", "--mcp"])
-                .output();
-            match output {
-                Ok(o) if o.status.success() => done("Claude Code MCP".into()),
-                Ok(o) => {
-                    let msg = String::from_utf8_lossy(&o.stdout).to_string()
-                        + &String::from_utf8_lossy(&o.stderr);
-                    if msg.contains("already exists") {
-                        // Remove stale entry and re-add with current binary path.
-                        let _ = std::process::Command::new("claude")
-                            .args(["mcp", "remove", "wetware"])
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status();
-                        let retry = std::process::Command::new("claude")
-                            .args(["mcp", "add", "wetware", "--", &ww_bin_str, "shell", "--mcp"])
-                            .output();
-                        match retry {
-                            Ok(r) if r.status.success() => done("Claude Code MCP (updated)".into()),
-                            _ => {
-                                fail("Claude Code MCP".into());
-                                println!(
-                                    "    claude mcp add wetware -- {} shell --mcp",
-                                    ww_bin_str
-                                );
-                            }
-                        }
-                    } else {
-                        fail("Claude Code MCP".into());
-                        println!("    claude mcp add wetware -- {} shell --mcp", ww_bin_str);
-                    }
-                }
-                Err(_) => {
-                    fail("Claude Code MCP".into());
-                    println!("    claude mcp add wetware -- {} shell --mcp", ww_bin_str);
-                }
-            }
-        } else {
-            skip("Claude Code MCP (claude CLI not found)".into());
-        }
-
         Ok(())
     }
 
-    /// Bootstrap the ~/.ww user layer, daemon, and MCP wiring.
+    /// Bootstrap the ~/.ww user layer and daemon.
     ///
     /// If ~/.ww already exists, delegates directly to `perform_update`.
     /// Otherwise performs first-time bootstrap then calls `perform_update`.
@@ -2742,9 +2617,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         done(format!("Binary symlink ({})", symlink_path.display()));
 
         // ── Default init.d ──────────────────────────────────────────
-        // Shell service registration is intentionally absent while remote
-        // shell transport/auth replacement is in progress.
-
         // ── Status init.d ────────────────────────────────────────────
         let status_init = ww_dir.join("etc/init.d/05-status.glia");
         if !status_init.exists() {
@@ -2810,7 +2682,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
         }
 
-        // ── Update: WASM images, stdlib, daemon, MCP ─────────────────
+        // ── Update: WASM images, stdlib, daemon ─────────────────────
         Self::perform_update().await?;
 
         // ── PATH + summary ───────────────────────────────────────────
@@ -2844,7 +2716,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         Ok(())
     }
 
-    /// Remove wetware daemon, MCP wiring, and optionally ~/.ww.
+    /// Remove the wetware daemon and optionally ~/.ww.
     #[allow(clippy::unused_async)]
     async fn perform_uninstall() -> Result<()> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
@@ -2856,34 +2728,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             false => println!("  Daemon ...................... NOT FOUND (already removed)"),
         }
 
-        // Step 2: Remove MCP config from Claude Code.
-        if Self::claude_cli_available() {
-            let output = std::process::Command::new("claude")
-                .args(["mcp", "remove", "wetware"])
-                .output();
-            match output {
-                Ok(o) if o.status.success() => {
-                    println!("  Claude Code MCP ............. REMOVED");
-                }
-                Ok(o) => {
-                    let msg = String::from_utf8_lossy(&o.stdout);
-                    if msg.contains("No MCP server found") || msg.contains("not found") {
-                        println!("  Claude Code MCP ............. OK (not configured)");
-                    } else {
-                        println!("  Claude Code MCP ............. FAILED (remove manually)");
-                        println!("    Run:  claude mcp remove wetware");
-                    }
-                }
-                Err(_) => {
-                    println!("  Claude Code MCP ............. FAILED (remove manually)");
-                    println!("    Run:  claude mcp remove wetware");
-                }
-            }
-        } else {
-            println!("  Claude Code MCP ............. SKIPPED (claude CLI not found)");
-        }
-
-        // Step 3: Optionally remove ~/.ww.
+        // Step 2: Optionally remove ~/.ww.
         let mut ww_dir_removed = false;
         if ww_dir.exists() {
             print!("  Remove ~/.ww? This deletes your identity and all data. [y/N] ");

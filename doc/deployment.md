@@ -79,21 +79,18 @@ runtime.
 
 ## Runtime layers
 
-The production image contains two core layers:
+The production image contains one core layer:
 
 ```text
 /usr/share/wetware/kernel/
   bin/main.wasm
   bin/status.wasm
   etc/init.d/05-status.glia
-
-/usr/share/wetware/shell/
-  bin/shell.wasm
 ```
 
 `ww run` merges root layers left-to-right. Optional IPNS application content
-comes first; kernel and shell layers follow so application content cannot
-replace pid0 or the image-owned status route.
+comes first; the kernel layer follows so application content cannot replace
+pid0 or the image-owned status route.
 
 The default Rust pid0 directly installs the image-owned `/status` composition.
 The staged `05-status.glia` file remains for the explicit legacy Glia rollback

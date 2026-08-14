@@ -1,8 +1,7 @@
 //! Generic request dispatcher for wetware.
 //!
-//! Handles routing external requests (MCP, HTTP) to WASI cell processes.
-//! The dispatcher (HttpServer) is generic over a ProtocolAdapter — adding a
-//! new protocol means implementing one trait.
+//! Handles routing external requests to WASI cell processes.
+//! The dispatcher (`HttpServer`) is generic over a `ProtocolAdapter`.
 //!
 //! Two execution modes:
 //! - **Per-request spawn** (Mode A): each request spawns a fresh WASI process.
@@ -12,7 +11,7 @@
 //!
 //! ```text
 //!  Protocol Client ──transport──► ProtocolAdapter ──► HttpServer ──► Cell process
-//!  (MCP/HTTP)                     (framing)           (dispatch)     (WASI guest)
+//!                                (framing)           (dispatch)     (WASI guest)
 //! ```
 //!
 //! // NOTE: interested in feedback from embedded apps and other
@@ -30,14 +29,11 @@ use async_trait::async_trait;
 // =========================================================================
 
 /// A protocol adapter that handles framing, decoding, and encoding
-/// for a specific wire protocol (MCP JSON-RPC, HTTP, etc.).
+/// for a specific wire protocol.
 ///
 /// The dispatcher (HttpServer) is generic over this trait. Adding a new
 /// protocol = implementing this trait. The dispatcher doesn't change.
 ///
-/// Implementors:
-/// - McpAdapter (Mikel) — newline-delimited JSON-RPC over stdio
-/// - HttpAdapter (Phase 2) — axum/hyper over TCP
 #[async_trait]
 pub trait ProtocolAdapter {
     /// Protocol-specific request type.
@@ -53,9 +49,6 @@ pub trait ProtocolAdapter {
     /// Returns `Ok(None)` on clean EOF (client disconnected).
     /// Returns `Err` on I/O or parse failure.
     ///
-    /// MCP: reads newline-delimited JSON, handles initialize/tools/list directly,
-    /// only returns `Some(req)` for tools/call.
-    /// HTTP: accepts connection, parses HTTP request via hyper.
     async fn next_request(&mut self) -> Result<Option<Self::Request>, Self::Error>;
 
     /// Extract the body bytes to write to the cell process's stdin.

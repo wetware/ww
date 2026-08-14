@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **The Glia shell and MCP product surfaces have been removed.** The `ww shell`
+  command, its `--mcp` mode, shell WASM and schema, MCP registration and doctor
+  checks, and shell-specific documentation are no longer present.
+  `/version.shell_wasm_blake3` has been removed. The daemon no longer writes
+  `~/.ww/run/host.json`. Container builds now pass the source revision through
+  `WW_BUILD_GIT_SHA`. Tag `archive/glia-final` preserves the pre-removal state.
 - **The Rust PID0 is now the default kernel.** The surviving implementation is
   `std/kernel`, and the legacy Glia implementation is `std/kernel-glia`.
   Select Glia explicitly with

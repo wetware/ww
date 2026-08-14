@@ -290,8 +290,6 @@ spin "Fetching standard library..."
 
 STD_OK=true
 fetch_to "bin/main.wasm"     "std/kernel/bin/main.wasm"   || STD_OK=false
-fetch_to "bin/shell.wasm"    "std/shell/bin/shell.wasm"   || STD_OK=false
-fetch_to "bin/shell.capnpc"  "std/shell/bin/shell.capnpc" || STD_OK=false
 fetch_to "bin/status.wasm"   "std/status/bin/status.wasm" || STD_OK=false
 
 # Glia stdlib (enumerate directory, fetch each file)
@@ -308,7 +306,7 @@ else
   warn "You can still use IPFS paths directly: ww run /ipfs/<CID>"
 fi
 
-# --- Full node setup (identity, namespace, daemon, MCP, PATH) ---
+# --- Full node setup (identity, namespace, daemon, PATH) ---
 printf '\n'
 if ! "${WW_HOME}/bin/ww" perform install; then
   warn "Some setup steps failed.  You can retry with:"

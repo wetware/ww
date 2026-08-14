@@ -113,53 +113,6 @@ ww healthcheck --ready --require-cache-enabled
 
 The command prints `ok` and exits zero only when every requested check passes.
 
-## ww shell
-
-Connect to a running daemon and open a Glia REPL.
-
-```
-ww shell [ADDR] [--select <index|peer-id>] [--mcp]
-```
-
-Shell transport/auth is remote, but evaluation is local:
-- Connect over libp2p `/ww/0.1.0`.
-- Authenticate via `Terminal(Membrane)` challenge-response.
-- Graft capabilities from the daemon membrane.
-- Evaluate Glia inside the local `ww shell` process.
-
-- *(no args)* — discover via local host-state (`~/.ww/run/host.json`,
-  or `$WW_HOST_STATE_PATH`). Auto-connect if unambiguous; otherwise prompt
-  for selection in TTY mode.
-- `<multiaddr>` — explicit remote dial.
-- `--select <index|peer-id>` — non-interactive target override when discovery
-  returns multiple hosts.
-- `--mcp` — run shell in MCP stdio mode (JSON-RPC over stdin/stdout).
-
-`ww shell` does not call daemon-side `runtime.load(shell.wasm)`,
-`executor.spawn`, or `process.bootstrap` on connect.
-For `(perform :load path)` and `import`, `/ipfs|/ipns|/ipld` paths route
-through grafted `system.Ipfs` reads; non-IPFS load paths use local process
-filesystem reads. In `--mcp` mode, `:stdout` and `:exit` are unavailable so
-JSON-RPC stdout stays protocol-only.
-
-### Examples
-
-```sh
-ww shell                                    # local host-state discover + connect
-ww shell --select 2                         # choose 2nd discovered host
-ww shell /dnsaddr/master.wetware.run        # explicit dial
-ww shell /ip4/127.0.0.1/tcp/2025/p2p/12D3KooW...
-ww shell garbage                            # clap parse error: invalid multiaddr
-```
-
-### Auth model
-
-Shell uses Terminal(Membrane) challenge-response auth over libp2p.
-The signer key comes from `WW_IDENTITY` or `~/.ww/identity`.
-
-See [shell.md](shell.md) for Glia syntax and the capabilities the
-shell cell exposes.
-
 ## ww push
 
 Snapshot a project's FHS tree and publish to IPFS.
@@ -211,14 +164,13 @@ Effectful operations that mutate state beyond the current directory.
 
 ### ww perform install
 
-Bootstrap `~/.ww`, daemon, and MCP wiring.
+Bootstrap `~/.ww` and the daemon.
 
 Idempotent: re-running skips completed steps, retries failed ones.
 
 1. Creates `~/.ww` directory structure
 2. Generates Ed25519 identity (if missing)
 3. Registers background daemon (launchd/systemd)
-4. Wires MCP into Claude Code (if installed)
 
 ### ww perform upgrade
 
@@ -234,7 +186,7 @@ running executable.
 
 ### ww perform uninstall
 
-Remove daemon, MCP wiring, and optionally `~/.ww`.
+Remove the daemon and optionally `~/.ww`.
 
 ## ww daemon
 
