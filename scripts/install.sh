@@ -272,9 +272,8 @@ mkdir -p "${WW_HOME}/bin"
 mv "${WW_TMPDIR}/ww" "${WW_HOME}/bin/ww"
 chmod +x "${WW_HOME}/bin/ww"
 
-# --- Fetch standard library -------------------------------------------------
-# WASM cells and glia scripts from the release tree, needed to resolve
-# std/ mount paths at runtime (e.g. `ww run std/kernel`).
+# --- Fetch standard components ---------------------------------------------
+# WASM components from the release tree support standard mount paths.
 # IPFS is already verified above — reuse $IPFS_BASE.
 
 fetch_to() {
@@ -286,22 +285,16 @@ fetch_to() {
   fi
 }
 
-spin "Fetching standard library..."
+spin "Fetching standard components..."
 
 STD_OK=true
 fetch_to "bin/main.wasm"     "std/kernel/bin/main.wasm"   || STD_OK=false
 fetch_to "bin/status.wasm"   "std/status/bin/status.wasm" || STD_OK=false
 
-# Glia stdlib (enumerate directory, fetch each file)
-mkdir -p "${WW_HOME}/std/lib/ww"
-for _name in $(ipfs ls "${IPFS_BASE}/lib/ww" 2>/dev/null | awk '{print $NF}'); do
-  fetch_to "lib/ww/${_name}" "std/lib/ww/${_name}" || true
-done
-
 if $STD_OK; then
-  spin_ok "Fetched standard library"
+  spin_ok "Fetched standard components"
 else
-  spin_fail "Some standard library files could not be fetched"
+  spin_fail "Some standard components could not be fetched"
   warn "The binary is installed but std/ mounts may not resolve."
   warn "You can still use IPFS paths directly: ww run /ipfs/<CID>"
 fi
@@ -315,7 +308,7 @@ fi
 
 # --- Wait for the daemon to answer /status ---
 # `ww perform install` registers and starts the daemon (launchd / systemd),
-# but the daemon takes a few seconds to bind, evaluate init.d, and serve
+# but the daemon takes a few seconds to bind and serve
 # the status route. The install script owns this UX because it's the
 # cold-install entry point; `ww perform install` itself can't see the
 # daemon's stdout (launchd / systemd redirect it to ~/.ww/logs/ww.log).

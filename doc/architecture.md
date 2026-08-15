@@ -62,9 +62,7 @@ policy-selected session authority.
 `ww run` resolves image layers, starts the host services, and loads trusted
 pid0 from `boot/main.wasm`. The host does not interpret the rest of the image
 as application policy. The default Rust pid0 directly installs the shipped
-`/status` composition. The legacy Glia pid0 remains available through
-`--kernel file:std/kernel-glia/bin/main.wasm`. That implementation runs Glia
-init scripts and builds an authority graph from explicit grants.
+`/status` composition.
 
 The spawn lattice is deliberately small:
 
@@ -77,15 +75,6 @@ image-bound spawn authority. `Process` is authority over one running child
 (stdio, lifecycle, and optionally its guest export through
 `Process.bootstrap()`). A child receives `Runtime`, an `Executor`, or neither
 only through an explicit grant.
-
-Glia follows the same rule:
-
-- `(cell image)` gives the cell zero application capabilities.
-- `(cell image :grants {"name" cap ...})` gives it exactly that named map.
-- `with` is ordinary lexical composition; it does not grant authority.
-- Lexical capability capture is not a child-authority path. Late delegation
-  uses an explicitly granted conduit and does not change the child's
-  `InitialAuthorityRecord`.
 
 The initial record is closed and idempotent. `InitialGrants` exposes no graft,
 refresh, append, arbitrary-name resolution, policy, or parent-channel API.
@@ -146,7 +135,7 @@ Route registrations are epoch-scoped and identity-owned. A stale registration
 stops dispatching immediately, and cleanup from an old registration cannot
 delete a fresh replacement. Route liveness is not a kernel-readiness signal.
 
-Readiness has one commit event. After init/init.d, trusted PID0 calls the
+Readiness has one commit event. After composition, trusted PID0 calls the
 argument-free private Component Model import
 `wetware:kernel-runtime/readiness@1.0.0` function `kernel-ready`. The host
 derives the generation from the process-local graft, rejects a stale

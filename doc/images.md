@@ -6,29 +6,18 @@ Each wetware image follows a minimal FHS convention:
 <image>/
   bin/
     main.wasm          # agent entrypoint (required)
+    status.wasm        # status component used by the shipped Rust PID0
   svc/                 # nested service images (spawned by pid0)
-  etc/                 # configuration (consumed by pid0)
-    init.d/            # boot scripts evaluated by the legacy Glia kernel
 ```
 
 Only `bin/main.wasm` is required. Everything else is convention
 between the image author and the kernel (pid0).
 
-## Default and legacy Glia boot flow
+## Rust PID0 boot flow
 
-- **Default Rust kernel:** directly installs the shipped `/status`
-  composition. The Rust kernel does not evaluate `etc/init.d`.
-- **Legacy Glia workflow:** run the node with the explicit Glia kernel, attach
-  through the image's configured init scripts.
-- **Legacy Glia deployment:** bake service wiring into `etc/init.d/*.glia`
-  so the Glia kernel registers services at boot.
-
-Build and select the legacy kernel explicitly:
-
-```sh
-make kernel-glia
-ww run --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
-```
+The shipped Rust PID0 reads `bin/status.wasm`, loads the component, registers
+`/status`, grants `host`, and commits kernel readiness. The Rust PID0 does not
+evaluate an init directory.
 
 ## Mount sources
 
@@ -37,7 +26,7 @@ as layers (later mounts override earlier ones):
 
 | Form | Example |
 |------|---------|
-| Local path | `std/kernel-glia` |
+| Local path | `std/status` |
 | IPFS path | `/ipfs/QmAbc123...` |
 | Layered | `ww run /ipfs/QmBase my-overlay` |
 

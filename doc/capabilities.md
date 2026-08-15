@@ -39,7 +39,6 @@ references exist where*:
 | **Initial grants** | Which RPC capability references enter an ordinary child | Edit the spawning `cell :grants` map; respawn |
 | **Terminal authority policy** | Which verified login identity receives which method profile over one application capability | Publish with `host :serve-vat ... :auth policy`; the listener creates one Terminal per stream |
 | **Image root / CAS wiring** | The fixed read-only root and optional known-CID reads | Select the execution context; respawn |
-| **Glia bindings** | Names available while trusted Glia composes an authority graph | Edit init; they do not cross a child boundary by lexical capture |
 
 Trusted pid0 receives the host graft; each ordinary child receives only its
 immutable `InitialAuthorityRecord`, constructed from the parent’s explicit
@@ -55,11 +54,6 @@ starts. The process-local graft and readiness gate use the same captured epoch
 sequence, so a PID0 generation cannot activate with a root from one epoch and
 authority from another epoch. Interactive `ww run` exits on the authority
 broadcast instead of replacing the interactive process.
-
-The Glia env layer binds capabilities such as `fs`, `routing`, and `host`.
-Omitting a handler restricts access inside that cell. Env bindings and effect
-handlers are not load-bearing across a process boundary. See
-[designs/single-authority-capability-model.md](designs/single-authority-capability-model.md).
 
 ## Attenuation: `(attenuate cap [:method ...])`
 
@@ -280,45 +274,6 @@ User code constructs structured errors via the `ex-info` builtin:
 ;; `:glia.error/type` while remaining preserved for back-compat readers.
 ```
 
-## Introspection
-
-Three Glia builtins return data about caps an agent holds. They are
-registered by the legacy Glia kernel after graft (`std/kernel-glia/src/lib.rs`):
-
-- `(schema cap)` returns the cap's canonical `Schema.Node` bytes as
-  `Val::Bytes`. An MCP agent can parse this to enumerate methods,
-  parameter types, and return types without hardcoded knowledge.
-- `(doc cap)` returns a human-readable summary string (cap name,
-  schema CID, one-line description).
-- `(help cap)` returns a multi-line cap reference (name, schema CID,
-  schema byte count, usage hint, pointers to `(schema cap)` /
-  `(doc cap)`).
-
-All three reject non-cap arguments via `:glia.error/type-mismatch` and
-unknown caps via `:glia.error/permission-denied`, propagating typed
-errors end-to-end.
-
-## MCP = Glia eval
-
-The MCP cell exposes `eval` as the universal primitive, plus per-cap
-sugar tools (`host`, `routing`, `runtime`, ...) that translate to
-internal Glia expressions for client convenience. There is no
-`resources/*` or `prompts/*` surface — the attenuation surface should
-be one thing, the Glia env, and adding parallel protocols would mean
-gating each separately.
-
-An AI agent connects, sees the per-cap tools in `tools/list` (each
-backed by accurate descriptions derived from `Schema.Node` bytes),
-calls `eval` with a Glia expression, and gets back either a result or
-a structured error it can route on. Restrict the agent's capabilities
-by editing the env it sees, not by adding ACLs to MCP itself.
-
-MCP mode preserves JSON-RPC stdout: `(perform :stdout value)` and
-`(perform :exit nil)` are rejected with the typed
-`:glia.error/protocol-mode-unavailable` error instead of writing or exiting.
-`(perform :load path)` remains available when the embedding supplies an
-appropriate loader.
-
 ## Cap'n Proto schemas
 
 Schema definitions live in `capnp/`:
@@ -331,7 +286,5 @@ Schema definitions live in `capnp/`:
 - **`routing.capnp`** — Kademlia DHT (provide, findProviders, hash)
 - **`http.capnp`** — HttpClient
 
-Build scripts extract canonical `Schema.Node` bytes for the
-`schema`/`doc`/`help` introspection builtins and schema CIDs. These bytes
-are introspection inputs, not runtime sidecars: exported capabilities cross
-membranes as bare capability references in `Export { name, cap }`.
+Build scripts extract canonical `Schema.Node` bytes and schema CIDs. Exported
+capabilities cross membranes as bare references in `Export { name, cap }`.

@@ -1,6 +1,0 @@
-; Deployment-only hook.
-;
-; Demos are shell-forward by default.
-; Load snippets from examples/discovery/glia/ in ww shell:
-;   (perform :load "glia/register.glia")
-;   (perform :load "glia/serve.glia")

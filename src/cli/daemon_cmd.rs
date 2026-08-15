@@ -65,8 +65,7 @@ pub(super) async fn daemon_install(
         images.iter().map(PathBuf::from).collect()
     };
 
-    // Default WAGI HTTP listener so the install layer's status init.d
-    // (etc/init.d/05-status.glia) responds to curl on first boot.
+    // Default WAGI HTTP listener so Rust PID0 responds to curl on first boot.
     let config = DaemonServiceConfig {
         listen: listen_addrs,
         identity: key_path.clone(),

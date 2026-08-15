@@ -1,4 +1,0 @@
-; Demo snippet: register a substrate-only raw stream echo handler.
-(perform host :listen-stream
-  (cell (perform :load "bin/echo.wasm") :grants {})
-  "echo")

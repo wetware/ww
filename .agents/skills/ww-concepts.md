@@ -148,10 +148,7 @@ Host → Kernel → Children.  The host is deliberately simple (it's
 the sandbox).  The kernel is the policy engine.  Children get only
 what pid0 hands them.
 
-The embedded default is the Rust kernel in `std/kernel`. The legacy Glia
-kernel remains in `std/kernel-glia` and requires an explicit `--kernel file:`
-selection. Both implementations use the same PID0 ABI and host selection
-semantics.
+The Rust kernel in `std/kernel` is the active PID0 implementation.
 
 ### The Membrane
 

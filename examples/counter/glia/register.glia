@@ -1,4 +1,0 @@
-; Demo snippet: register a substrate-only counter HTTP handler.
-(def counter (cell (perform :load "bin/counter.wasm") :grants {}))
-
-(perform host :listen counter "/counter")

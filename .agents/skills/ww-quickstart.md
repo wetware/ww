@@ -51,13 +51,6 @@ The response reports `status: "ok"` and a non-null `peer_id`.
 The kernel grafted onto the Membrane, received epoch-scoped
 capabilities, and installed the `/status` cell with an explicit `host` grant.
 
-The legacy Glia workflow remains available through an explicit kernel source:
-
-```sh
-make kernel-glia
-cargo run -- run --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
-```
-
 ## Next
 
 > Ready to go deeper?  We can explore concepts, study an example,
