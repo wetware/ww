@@ -32,6 +32,7 @@ fn main() {
         })
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=WW_BUILD_GIT_SHA={git_sha}");
+    emit_git_commit(manifest_path);
 
     emit_kernel_abi_fingerprint(manifest_path);
 
@@ -148,6 +149,28 @@ fn main() {
             println!("cargo:warning={msg}");
         }
     }
+}
+
+fn emit_git_commit(manifest_path: &Path) {
+    let commit = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(manifest_path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|| env::var("GIT_COMMIT").unwrap_or_else(|_| "unknown".to_string()));
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(manifest_path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| !output.stdout.is_empty());
+    let suffix = if dirty { "+dirty" } else { "" };
+
+    println!("cargo:rustc-env=GIT_COMMIT={commit}{suffix}");
 }
 
 fn emit_kernel_abi_fingerprint(manifest_path: &Path) {

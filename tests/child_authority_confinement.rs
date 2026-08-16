@@ -1258,19 +1258,6 @@ fn empty_and_duplicate_wire_names_abort_spawn_but_path_like_labels_are_valid() {
 }
 
 #[test]
-fn t1_glia_cell_has_no_implicit_lexical_capability_capture() {
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/glia/src/eval.rs"),
-    )
-    .expect("Glia evaluator source");
-    let captures = source.matches("env.collect_caps()").count();
-    assert_eq!(
-        captures, 0,
-        "Glia cell evaluation still has {captures} implicit lexical-capability capture paths"
-    );
-}
-
-#[test]
 fn ordinary_child_bootstrap_has_no_membrane_graft_compatibility_shape() {
     let source = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/rpc/src/graft.rs"),

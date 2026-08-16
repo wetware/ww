@@ -1,3 +1,0 @@
-;; This trusted compiler service deliberately accepts Runtime authority because
-;; it must select arbitrary submitted WASM images rather than one fixed image.
-(cell compiler-service-image :grants {:runtime runtime})

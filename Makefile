@@ -6,7 +6,7 @@
 WASM_TARGET := wasm32-wasip2
 
 .PHONY: all host std kernel status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
-.PHONY: publish-std try-publish-std publish test-deps test test-wasm check-glia-effects authority-probe
+.PHONY: publish-std try-publish-std publish test-deps test test-wasm authority-probe
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
 
@@ -30,18 +30,6 @@ authority-probe:
 	CARGO_TARGET_DIR=target/authority-probe cargo build --locked \
 		--manifest-path tests/fixtures/authority-probe/Cargo.toml \
 		--target $(WASM_TARGET) --release
-
-# Guard the explicit pre-alpha Glia host-effect syntax. Historical audits and
-# changelog entries intentionally retain old spellings as evidence.
-check-glia-effects:
-	@! rg -n --hidden '\((load|println|exit)([[:space:]]|\))' \
-		--glob '*.glia' --glob '*.md' --glob 'README' \
-		--glob '!.git/**' --glob '!doc/audits/**' --glob '!CHANGELOG.md' --glob '!target/**' \
-		--glob '!std/**/target/**' .
-	@! rg -n --hidden 'eval_path_lookup' \
-		--glob '*.rs' --glob '!.git/**' --glob '!target/**' --glob '!std/**/target/**' .
-	@! rg -n --hidden 'Val::Keyword\(("exit"|\x27exit\x27)' \
-		--glob '!.git/**' --glob '!target/**' --glob '!std/**/target/**' .
 
 # --- Std components ----------------------------------------------------------
 

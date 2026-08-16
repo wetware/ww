@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **The remaining Glia implementation and directly coupled assets have been
+  removed.** This removes `crates/glia`, Glia fixtures and stdlib files, and
+  Glia-only benches and tests. The root build now emits the existing short
+  `GIT_COMMIT` value, including its `+dirty` and fallback behavior.
 - **PID0 no longer exposes the obsolete compatibility membrane.** The bare
   `/ww/0.1.0` compatibility endpoint is removed while `/ww/0.1.0/vat/*` and
   `/ww/0.1.0/stream/*` remain available. The Host↔PID0 ABI advances from v2 to

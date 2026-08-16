@@ -1,2 +1,0 @@
-;; The trusted supervisor may spawn one preselected worker image, not load any image.
-(cell supervisor-image :grants {:executor worker-executor})
