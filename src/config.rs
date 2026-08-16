@@ -15,7 +15,7 @@ Exports:
 /// from these crates emit at their own target (e.g. `rpc::vat_listener`),
 /// not under `ww::*`, so a bare `ww=info` filter would silence them.
 const INTERNAL_CRATES: &[&str] = &[
-    "ww", "atom", "cache", "cell", "glia", "ipfs", "membrane", "rpc", "stem",
+    "ww", "atom", "cache", "cell", "ipfs", "membrane", "rpc", "stem",
 ];
 
 fn default_filter(level: &str) -> String {

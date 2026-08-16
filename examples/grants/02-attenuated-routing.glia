@@ -1,3 +1,0 @@
-;; Local hashing does not need DHT announcements, IPNS, or content mutation.
-(def hash-only-routing (attenuate routing [:hash]))
-(cell hasher-image :grants {:routing hash-only-routing})

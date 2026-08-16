@@ -77,9 +77,6 @@ jobs:
         cargo fmt --all -- --check
         cargo fmt --manifest-path std/kernel/Cargo.toml -- --check
 
-    - name: Check Glia host-effect migration
-      run: make check-glia-effects
-
     - name: Check IPFS release publish scripts
       run: |
         bash tests/test_ipfs_release_publish.sh

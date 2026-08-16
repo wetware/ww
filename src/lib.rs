@@ -6,8 +6,8 @@
 /// Runtime package version embedded at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Git revision embedded by the Glia build, including `+dirty` when applicable.
-pub const GIT_COMMIT: &str = glia::GIT_COMMIT;
+/// Git revision embedded by the root build, including `+dirty` when applicable.
+pub const GIT_COMMIT: &str = env!("GIT_COMMIT");
 
 // Host-only modules (not available for WASM guests)
 #[cfg(not(target_arch = "wasm32"))]
@@ -63,9 +63,6 @@ pub mod greeter_capnp {
 pub mod config;
 pub mod default_kernel;
 pub mod namespace;
-
-// Re-export the Glia language crate
-pub use glia;
 
 // Re-export commonly used types for convenience
 #[cfg(not(target_arch = "wasm32"))]

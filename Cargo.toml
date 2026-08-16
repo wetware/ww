@@ -2,7 +2,6 @@
 members = [
     ".",
     "crates/atom",
-    "crates/glia",
     "crates/cache",
     "crates/cell",
     "crates/ipfs",
@@ -77,7 +76,6 @@ base58 = { workspace = true }
 libc = "0.2.177"
 tempfile = { workspace = true }
 walkdir = "2"
-glia = { path = "crates/glia" }
 auth = { path = "crates/guest/auth" }
 blake3 = { workspace = true }
 
@@ -126,15 +124,7 @@ name = "streams"
 harness = false
 
 [[bench]]
-name = "glia_map"
-harness = false
-
-[[bench]]
 name = "arc_cache"
-harness = false
-
-[[bench]]
-name = "kernel_dispatch"
 harness = false
 
 [build-dependencies]
