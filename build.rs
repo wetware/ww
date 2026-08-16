@@ -6,13 +6,6 @@ use std::process::Command;
 #[path = "std/kernel/abi/kernel_abi_fingerprint.rs"]
 mod kernel_abi_fingerprint;
 
-mod pid0_runtime_abi {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/std/kernel/abi/pid0_export_membrane_cap.rs"
-    ));
-}
-
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
@@ -158,9 +151,8 @@ fn main() {
 }
 
 fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
-    const KERNEL_ABI_VERSION: &str = "2";
+    const KERNEL_ABI_VERSION: &str = "3";
     const KERNEL_RUNTIME_WIT: &str = "std/kernel/wit/kernel.wit";
-    const PID0_EXPORT_MEMBRANE_ABI: &str = "std/kernel/abi/pid0_export_membrane_cap.rs";
     const SCHEMA_ROOTS: &[&str] = &[
         "system.capnp",
         "routing.capnp",
@@ -244,13 +236,9 @@ fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
     let kernel_runtime_wit_path = manifest_path.join(KERNEL_RUNTIME_WIT);
     let kernel_runtime_wit =
         fs::read(&kernel_runtime_wit_path).expect("read private kernel runtime WIT");
-    let pid0_export_membrane_abi_path = manifest_path.join(PID0_EXPORT_MEMBRANE_ABI);
-    let mut material = kernel_abi_fingerprint::private_pid0_abi_material(
-        KERNEL_ABI_VERSION,
-        &kernel_runtime_wit,
-        pid0_runtime_abi::PID0_EXPORT_MEMBRANE_CAP,
-    )
-    .expect("canonicalize private PID0 ABI material");
+    let mut material =
+        kernel_abi_fingerprint::private_pid0_abi_material(KERNEL_ABI_VERSION, &kernel_runtime_wit)
+            .expect("canonicalize private PID0 ABI material");
     for schema in SCHEMA_ROOTS {
         material.push_str(&format!("schema-root={schema}\n"));
     }
@@ -266,10 +254,6 @@ fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
     println!(
         "cargo:rerun-if-changed={}",
         kernel_runtime_wit_path.display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        pid0_export_membrane_abi_path.display()
     );
     for schema in SCHEMA_ROOTS {
         println!(

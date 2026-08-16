@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **PID0 no longer exposes the obsolete compatibility membrane.** The bare
+  `/ww/0.1.0` compatibility endpoint is removed while `/ww/0.1.0/vat/*` and
+  `/ww/0.1.0/stream/*` remain available. The Host↔PID0 ABI advances from v2 to
+  v3 without a v2 compatibility shim.
 - **The legacy Glia PID0 and its direct consumers have been removed.**
   `std/kernel` is the only active kernel. `std/kernel-glia`, `std/caps`, Glia
   init scripts, legacy example flows, and their build and test staging are no

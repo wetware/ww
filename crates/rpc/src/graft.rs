@@ -435,11 +435,7 @@ impl GraftBuilder for HostGraftBuilder {
 // RPC bootstrap constructors
 // ---------------------------------------------------------------------------
 
-/// The Membrane type exported by WASM guests back to the host.
-///
-/// When a guest calls `runtime::serve(my_membrane, ...)`, the host
-/// captures it here. The host can then re-serve it to external peers,
-/// allowing the guest to attenuate or enrich the capability surface it exposes.
+/// A graft-capable Membrane client used by the host and guest RPC constructors.
 pub type GuestMembrane = authority::membrane_capnp::membrane::Client;
 
 /// Host-provided bootstrap received by an ordinary child.
@@ -513,9 +509,6 @@ where
 /// the private key. Auth (if needed) is handled by wrapping in `TerminalServer`
 /// at the transport layer, not here.
 ///
-/// Returns both the RPC system and the guest's exported [`GuestMembrane`], if
-/// the guest called `runtime::serve()`. If the guest called `runtime::run()`
-/// instead, the returned capability is broken and attempts to use it will fail.
 #[must_use = "dropping the scope owner invalidates this pid0 generation's HTTP registrations"]
 pub struct Pid0RegistrationScope {
     _sender: watch::Sender<()>,
@@ -528,22 +521,11 @@ impl Pid0RegistrationScope {
     }
 }
 
-mod pid0_runtime_abi {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../std/kernel/abi/pid0_export_membrane_cap.rs"
-    ));
-}
-
-use pid0_runtime_abi::PID0_EXPORT_MEMBRANE_CAP;
-
 /// Process-local graft wrapper. Only the trusted PID0 bootstrap receives a
-/// client for this server; the separately constructed export membrane never
-/// touches the readiness gate.
+/// client for this server.
 struct Pid0RootGraftBuilder {
     inner: HostGraftBuilder,
     readiness_gate: Arc<authority::KernelReadyGate>,
-    export_membrane: GuestMembrane,
     intended_seq: u64,
 }
 
@@ -571,20 +553,9 @@ impl GraftBuilder for Pid0RootGraftBuilder {
             receiver: guard.receiver.clone(),
         };
         let ambient = self.inner.build_named_capabilities(&intended_guard)?;
-        let export_cap = NamedCapability::new(
-            PID0_EXPORT_MEMBRANE_CAP,
-            self.export_membrane.clone().client,
-        )?;
-        let extras = NamedCapabilities::try_from_iter(
-            self.inner
-                .extras
-                .iter()
-                .cloned()
-                .chain(std::iter::once(export_cap)),
-        )?;
-        let count = export_count(&ambient, &extras)?;
+        let count = export_count(&ambient, &self.inner.extras)?;
         self.readiness_gate.bind_generation(self.intended_seq);
-        encode_graft_capabilities(&ambient, &extras, builder.init_caps(count));
+        encode_graft_capabilities(&ambient, &self.inner.extras, builder.init_caps(count));
         drop(live_epoch);
         Ok(())
     }
@@ -607,13 +578,13 @@ pub fn build_pid0_membrane_rpc<R, W>(
     ipfs_client: ipfs::HttpClient,
     http_dial: Vec<String>,
     intended_seq: u64,
-) -> (RpcSystem<Side>, GuestMembrane, Pid0RegistrationScope)
+) -> (RpcSystem<Side>, Pid0RegistrationScope)
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
     let (registration_scope, registration_scope_rx) = Pid0RegistrationScope::new();
-    let mut export_builder = HostGraftBuilder::new(
+    let mut root_builder = HostGraftBuilder::new(
         network_state,
         swarm_cmd_tx,
         wasm_debug,
@@ -625,24 +596,16 @@ where
     )
     .with_registration_scope(registration_scope_rx);
     if !extras.is_empty() {
-        export_builder = export_builder.with_extras(extras);
+        root_builder = root_builder.with_extras(extras);
     }
     if let Some(registry) = route_registry {
-        export_builder = export_builder.with_route_registry(registry);
+        root_builder = root_builder.with_route_registry(registry);
     }
 
     // PID0 receives a process-local root membrane whose graft binds readiness.
-    // The root graft also provisions a distinct ordinary membrane for the
-    // kernel to publish. Network-facing grafts therefore cannot retarget the
-    // private PID0 readiness gate.
-    let export_membrane: GuestMembrane = capnp_rpc::new_client(MembraneServer::new(
-        epoch_rx.clone(),
-        export_builder.clone(),
-    ));
     let root_builder = Pid0RootGraftBuilder {
-        inner: export_builder,
+        inner: root_builder,
         readiness_gate,
-        export_membrane,
         intended_seq,
     };
     let root_membrane: GuestMembrane =
@@ -654,9 +617,8 @@ where
         Side::Server,
         Default::default(),
     );
-    let mut rpc_system = RpcSystem::new(Box::new(rpc_network), Some(root_membrane.client));
-    let guest_membrane: GuestMembrane = rpc_system.bootstrap(Side::Client);
-    (rpc_system, guest_membrane, registration_scope)
+    let rpc_system = RpcSystem::new(Box::new(rpc_network), Some(root_membrane.client));
+    (rpc_system, registration_scope)
 }
 
 // IPFS content access is tested in fs_intercept::tests and vfs::tests.
@@ -928,66 +890,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn pid0_root_graft_rejects_reserved_membrane_handoff_collision() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
-                let guard = EpochGuard {
-                    issued_seq: 1,
-                    receiver: epoch_rx.clone(),
-                };
-                let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
-                let grafts = Rc::new(Cell::new(0));
-                let export_membrane: GuestMembrane = capnp_rpc::new_client(MembraneServer::new(
-                    epoch_rx,
-                    CountingGraftBuilder { grafts },
-                ));
-                let reserved = NamedCapabilities::try_from_pairs([(
-                    PID0_EXPORT_MEMBRANE_CAP,
-                    export_membrane.clone().client,
-                )])
-                .expect("construct colliding test extra");
-                let (swarm_tx, _swarm_rx) = mpsc::channel(1);
-                let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
-                let inner = HostGraftBuilder::new(
-                    NetworkState::from_peer_id(vec![1, 2, 3]),
-                    swarm_tx,
-                    false,
-                    None,
-                    libp2p_stream::Behaviour::new().new_control(),
-                    Vec::new(),
-                    runtime,
-                    ipfs::HttpClient::new("http://127.0.0.1:1".into()),
-                )
-                .with_extras(reserved);
-                let root = Pid0RootGraftBuilder {
-                    inner,
-                    readiness_gate: readiness_gate.clone(),
-                    export_membrane,
-                    intended_seq: 1,
-                };
-
-                let mut message = capnp::message::Builder::new_default();
-                let mut cap_table = Vec::new();
-                let error = {
-                    let mut results =
-                        message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
-                    results.imbue_mut(&mut cap_table);
-                    root.build(&guard, results)
-                        .expect_err("reserved handoff collision must fail closed")
-                };
-                assert!(error.to_string().contains("duplicate capability name"));
-                assert!(error.to_string().contains(PID0_EXPORT_MEMBRANE_CAP));
-                assert_eq!(
-                    readiness_gate.kernel_ready(),
-                    Err(KernelReadyError::NotBound),
-                    "a failed root graft must not bind readiness"
-                );
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn pid0_root_graft_keeps_readiness_bound_to_the_intended_generation() {
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -997,12 +899,6 @@ mod tests {
                     receiver: epoch_rx.clone(),
                 };
                 let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
-                let export_membrane: GuestMembrane = capnp_rpc::new_client(MembraneServer::new(
-                    epoch_rx,
-                    CountingGraftBuilder {
-                        grafts: Rc::new(Cell::new(0)),
-                    },
-                ));
                 let (swarm_tx, _swarm_rx) = mpsc::channel(1);
                 let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
                 let root = Pid0RootGraftBuilder {
@@ -1017,7 +913,6 @@ mod tests {
                         ipfs::HttpClient::new("http://127.0.0.1:1".into()),
                     ),
                     readiness_gate: readiness_gate.clone(),
-                    export_membrane,
                     intended_seq: 1,
                 };
                 let mut message = capnp::message::Builder::new_default();
@@ -1048,12 +943,6 @@ mod tests {
                     receiver: epoch_rx.clone(),
                 };
                 let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
-                let export_membrane: GuestMembrane = capnp_rpc::new_client(MembraneServer::new(
-                    epoch_rx,
-                    CountingGraftBuilder {
-                        grafts: Rc::new(Cell::new(0)),
-                    },
-                ));
                 let (swarm_tx, _swarm_rx) = mpsc::channel(1);
                 let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
                 let root = Pid0RootGraftBuilder {
@@ -1068,7 +957,6 @@ mod tests {
                         ipfs::HttpClient::new("http://127.0.0.1:1".into()),
                     ),
                     readiness_gate: readiness_gate.clone(),
-                    export_membrane,
                     intended_seq: 1,
                 };
                 let mut message = capnp::message::Builder::new_default();
@@ -1305,7 +1193,7 @@ mod tests {
                     root: None,
                     provenance: Provenance::Block(1),
                 };
-                let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch);
+                let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch);
                 let (swarm_tx, _swarm_rx) = mpsc::channel(1);
                 let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
                 let (host_stream, guest_stream) = io::duplex(16 * 1024);
@@ -1313,7 +1201,7 @@ mod tests {
                 let (guest_reader, guest_writer) = io::split(guest_stream);
                 let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
 
-                let (host_rpc, _guest_export, _registration_scope) = build_pid0_membrane_rpc(
+                let (host_rpc, _registration_scope) = build_pid0_membrane_rpc(
                     host_reader,
                     host_writer,
                     NetworkState::from_peer_id(vec![1, 2, 3]),
@@ -1371,57 +1259,17 @@ mod tests {
                     "authority",
                     "ipfs",
                     "http-client",
-                    PID0_EXPORT_MEMBRANE_CAP,
                 ] {
                     assert!(
                         names.contains(expected),
                         "pid0 RPC bootstrap lost {expected}: {names:?}"
                     );
                 }
-                assert_eq!(names.len(), 8);
+                assert_eq!(names.len(), 7);
                 readiness_gate
                     .kernel_ready()
                     .expect("commit current pid0 generation");
                 assert!(readiness_gate.is_ready());
-
-                let caps = response.get().unwrap().get_caps().unwrap();
-                let export = caps
-                    .iter()
-                    .find(|entry| {
-                        entry.get_name().unwrap().to_str().unwrap() == PID0_EXPORT_MEMBRANE_CAP
-                    })
-                    .expect("process-local graft exports safe membrane");
-                let export_membrane = GuestMembrane {
-                    client: export
-                        .get_cap()
-                        .get_as_capability::<capnp::capability::Client>()
-                        .unwrap(),
-                };
-                epoch_tx.send_replace(test_epoch(2));
-                let export_response = export_membrane
-                    .graft_request()
-                    .send()
-                    .promise
-                    .await
-                    .expect("export-safe E2 graft");
-                let export_names: std::collections::HashSet<_> = export_response
-                    .get()
-                    .unwrap()
-                    .get_caps()
-                    .unwrap()
-                    .iter()
-                    .map(|entry| entry.get_name().unwrap().to_str().unwrap().to_owned())
-                    .collect();
-                assert!(
-                    !export_names.contains(PID0_EXPORT_MEMBRANE_CAP),
-                    "the process-local membrane handoff must not leak into public grafts"
-                );
-                assert_eq!(
-                    readiness_gate.kernel_ready(),
-                    Err(KernelReadyError::StaleGeneration),
-                    "export-safe graft must not rebind PID0 readiness"
-                );
-                assert!(!readiness_gate.is_ready());
             })
             .await;
     }

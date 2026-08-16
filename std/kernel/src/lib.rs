@@ -1,11 +1,10 @@
 //! Rust PID0 for the shipped Wetware production composition.
 //!
-//! One PID0 instance grafts the three capabilities it needs, transparently
-//! republishes the temporary compatibility membrane, installs the existing
-//! status component at `/status`, and commits readiness. The host owns
-//! deployment replacement and PID0 generation lifetime.
+//! One PID0 instance grafts the capabilities it needs, installs the status
+//! component at `/status`, and commits readiness. The host owns deployment
+//! replacement and PID0 generation lifetime.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use system::{get_graft_cap, membrane_capnp};
@@ -38,15 +37,7 @@ mod kernel_runtime {
     });
 }
 
-mod pid0_runtime_abi {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/abi/pid0_export_membrane_cap.rs"
-    ));
-}
-
 use kernel_runtime::wetware::kernel_runtime::readiness::{kernel_ready, ReadyError};
-use pid0_runtime_abi::PID0_EXPORT_MEMBRANE_CAP;
 
 type Membrane = membrane_capnp::membrane::Client;
 
@@ -78,53 +69,6 @@ static LOGGER: StderrLogger = StderrLogger;
 fn init_logging() {
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(log::LevelFilter::Info);
-    }
-}
-
-/// Temporary compatibility relay for the remote Glia shell/MCP capability API.
-///
-/// The Rust kernel does not use this membrane for composition, readiness, child
-/// grants, or lifecycle handling. It republishes the host-provided membrane without
-/// modification because the current host/PID0 bootstrap contract expects a
-/// guest membrane. This relay is expected to disappear with the Glia shell/MCP
-/// and `/ww/0.1.0` remote membrane API.
-struct KernelBootstrap {
-    membrane: Rc<RefCell<Option<Membrane>>>,
-}
-
-#[allow(refining_impl_trait)]
-impl membrane_capnp::membrane::Server for KernelBootstrap {
-    fn graft(
-        self: capnp::capability::Rc<Self>,
-        _params: membrane_capnp::membrane::GraftParams,
-        mut results: membrane_capnp::membrane::GraftResults,
-    ) -> capnp::capability::Promise<(), capnp::Error> {
-        let membrane = match self.membrane.borrow().clone() {
-            Some(membrane) => membrane,
-            None => {
-                return capnp::capability::Promise::err(capnp::Error::failed(
-                    "INIT_MEMBRANE_NOT_READY: kernel bootstrap membrane not ready".into(),
-                ));
-            }
-        };
-
-        capnp::capability::Promise::from_future(async move {
-            let response = membrane.graft_request().send().promise.await?;
-            let source = response.get()?.get_caps()?;
-            let mut destination = results.get().init_caps(source.len());
-            for index in 0..source.len() {
-                let source_entry = source.get(index);
-                let mut destination_entry = destination.reborrow().get(index);
-                destination_entry.set_name(source_entry.get_name()?);
-                destination_entry.init_cap().set_as_capability(
-                    source_entry
-                        .get_cap()
-                        .get_as_capability::<capnp::capability::Client>()?
-                        .hook,
-                );
-            }
-            Ok(())
-        })
     }
 }
 
@@ -177,21 +121,13 @@ async fn install_status_route(
     Ok(())
 }
 
-async fn initialize(
-    membrane: &Membrane,
-    exported_membrane: &Rc<RefCell<Option<Membrane>>>,
-) -> Result<(), capnp::Error> {
+async fn initialize(membrane: &Membrane) -> Result<(), capnp::Error> {
     let graft_response = membrane.graft_request().send().promise.await?;
     let caps = graft_response.get()?.get_caps()?;
 
-    let export_membrane: Membrane = get_graft_cap(&caps, PID0_EXPORT_MEMBRANE_CAP)?;
     let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
     let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
 
-    // The current host/PID0 compatibility contract requires publication before
-    // initialization. The Rust kernel does not use this membrane or treat publication
-    // as a readiness commit.
-    *exported_membrane.borrow_mut() = Some(export_membrane);
     install_status_route(&host, &runtime).await?;
     Ok(())
 }
@@ -207,11 +143,8 @@ fn wait_for_tty_exit() {
     }
 }
 
-async fn run_kernel(
-    membrane: Membrane,
-    exported_membrane: Rc<RefCell<Option<Membrane>>>,
-) -> Result<(), capnp::Error> {
-    initialize(&membrane, &exported_membrane)
+async fn run_kernel(membrane: Membrane) -> Result<(), capnp::Error> {
+    initialize(&membrane)
         .await
         .map_err(|error| capnp::Error::failed(format!("{INITIAL_INIT_FAILED}: {error}")))?;
 
@@ -236,17 +169,12 @@ fn run_impl() -> Result<(), ()> {
     init_logging();
 
     let initialization_failed = Rc::new(Cell::new(false));
-    let exported_membrane = Rc::new(RefCell::new(None));
-    let bootstrap: Membrane = capnp_rpc::new_client(KernelBootstrap {
-        membrane: Rc::clone(&exported_membrane),
-    });
     let callback_failed = Rc::clone(&initialization_failed);
 
-    system::serve(bootstrap.client, move |membrane: Membrane| {
-        let exported_membrane = Rc::clone(&exported_membrane);
+    system::run(move |membrane: Membrane| {
         let callback_failed = Rc::clone(&callback_failed);
         async move {
-            match run_kernel(membrane, exported_membrane).await {
+            match run_kernel(membrane).await {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     callback_failed.set(true);

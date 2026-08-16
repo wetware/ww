@@ -7,7 +7,6 @@ edition = "2021"
 
 [dependencies]
 capnp = "0.25.3"
-capnp-rpc = "0.25.0"
 log = "0.4.29"
 wasip2 = "1.0.2"
 wit-bindgen = "0.41.0"
@@ -20,6 +19,6 @@ crate-type = ["cdylib"]
 capnpc = "0.25.3"
 
 # capnp-rpc 0.25.1 + import-wrapper-reuse fix (wetware/ww#586). Keep the
-# kernel component on the same transport implementation as the host and Glia pid0.
+# kernel component on the same transport implementation as the host.
 [patch.crates-io]
 capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", branch = "ww/import-fix-0.25-consume" }

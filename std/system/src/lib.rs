@@ -632,9 +632,7 @@ pub fn serve_stdio(bootstrap: capnp::capability::Client) {
 /// capability on the RPC connection.  The host can retrieve it via
 /// `rpc_system.bootstrap(Side::Client)`.
 ///
-/// Use this when the guest needs to export a capability back to the host —
-/// for example, a kernel that wraps and attenuates the host's Membrane before
-/// re-exporting it to external peers.
+/// Use this when the guest needs to export a capability back to the host.
 ///
 /// # Example
 ///

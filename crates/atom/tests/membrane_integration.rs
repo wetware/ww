@@ -422,8 +422,7 @@ async fn test_graft_returns_all_five_capabilities() {
         .expect("shutdown RPC");
 }
 
-/// Test Terminal-gated Membrane over a VatNetwork stream pair (simulates the
-/// libp2p `/ww/0.1.0` path from `serve_one_terminal_stream` in executor.rs).
+/// Test Terminal-gated Membrane over a VatNetwork stream pair.
 ///
 /// Server side: bootstrap = Terminal(Membrane).
 /// Client side: bootstrap Terminal → login(signer) → get Membrane → graft → runtime.shutdown.

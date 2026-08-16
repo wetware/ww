@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use libp2p::{Multiaddr, PeerId};
+use libp2p::PeerId;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -31,7 +31,6 @@ use axum::http::{header, Response, StatusCode};
 use axum::Router;
 
 use support::atom::AtomFixture;
-use support::terminal::{expect_stale_or_disconnected, TerminalSession};
 
 const KERNEL_WASM_PATH: &str = "std/kernel/bin/main.wasm";
 const STATUS_WASM_PATH: &str = "std/status/bin/status.wasm";
@@ -750,12 +749,6 @@ fn epoch_node_options(
         ws_url: atom.ws_url.clone(),
     });
     options
-}
-
-fn terminal_address(listen_addr: SocketAddr) -> Multiaddr {
-    format!("/ip4/127.0.0.1/tcp/{}", listen_addr.port())
-        .parse()
-        .expect("parse explicit Terminal multiaddr")
 }
 
 async fn wait_for_log(node: &mut RunningNode, first: &str, second: &str) {
@@ -1549,20 +1542,14 @@ async fn host_transient_epoch_preparation_recovers_without_restoring_old_generat
             let http_addr = unused_addr().await;
             let listen_addr = unused_addr().await;
             let home = tempfile::tempdir().unwrap();
-            let (signing_key, identity_path, peer_id) = persistent_identity(home.path());
+            let (_, identity_path, _) = persistent_identity(home.path());
             let options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
             let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
             let ready_url = format!("http://{admin_addr}/readyz");
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert_status_cell(&client, http_addr, &cid_a).await;
-            let terminal =
-                TerminalSession::connect(peer_id, terminal_address(listen_addr), &signing_key)
-                    .await;
-            let retained_old_host = terminal.graft.host.clone();
-
             atom.set_head(&epoch2.cid).await;
             wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
-            expect_stale_or_disconnected(&retained_old_host).await;
             let deadline = Instant::now() + INVALIDATION_TIMEOUT;
             while attempts.load(Ordering::SeqCst) < 2 {
                 assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node)
