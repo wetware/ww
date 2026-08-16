@@ -1,13 +1,9 @@
 use anyhow::{Context, Result};
 use authority::{Epoch, Provenance};
-use capnp_rpc::rpc_twoparty_capnp::Side;
-use capnp_rpc::twoparty::VatNetwork;
-use capnp_rpc::RpcSystem;
 use ed25519_dalek::SigningKey;
 use futures::FutureExt;
-use libp2p::StreamProtocol;
+#[cfg(test)]
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{stderr, stdout, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
@@ -16,18 +12,8 @@ use tracing::info;
 
 use crate::host::SwarmCommand;
 use crate::services::CompileRequest;
-use crate::{auth_capnp, membrane_capnp};
 use cell::{proc::DataStreamHandles, Loader, ProcBuilder};
-use rpc::graft::GuestMembrane;
 use rpc::NetworkState;
-
-const CAPNP_PROTOCOL: StreamProtocol = StreamProtocol::new("/ww/0.1.0");
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TerminalPreAuthOutcome {
-    Authenticated,
-    ConnectionClosed,
-    LoginTimedOut,
-}
 
 /// Builder for constructing a [`Cell`].
 ///
@@ -258,13 +244,9 @@ impl CellBuilder {
 
     /// Set the Ed25519 signing key for the node identity.
     ///
-    /// When set:
-    /// - Incoming libp2p streams on `/ww/0.1.0` are served behind a
-    ///   `Terminal(Membrane)` auth gate — remote peers must prove identity
-    ///   via challenge-response before receiving capabilities.
-    /// - An [`EpochGuardedIdentity`] hub backed by this key is injected into every
-    ///   `Session` so the kernel can request domain-scoped signers without holding
-    ///   the private key.
+    /// When set, an [`EpochGuardedIdentity`] hub backed by this key is injected
+    /// into every `Session`. The kernel can request domain-scoped signers without
+    /// holding the private key.
     pub fn with_signing_key(mut self, sk: Arc<SigningKey>) -> Self {
         self.signing_key = Some(sk);
         self
@@ -406,33 +388,27 @@ pub enum KernelOutcome {
     Terminated,
 }
 
-/// Result of spawning a cell with RPC: outcome, guest membrane, and optional epoch sender.
+/// Result of spawning a cell with RPC: outcome and optional epoch sender.
 ///
 /// `epoch_tx` is `Some` when the cell created its own epoch channel (no external
 /// receiver was provided). It is `None` when the caller supplied a pre-created
 /// receiver via [`CellBuilder::with_epoch_rx`].
 pub struct SpawnResult {
     pub outcome: KernelOutcome,
-    pub guest_membrane: GuestMembrane,
     pub epoch_tx: Option<watch::Sender<Epoch>>,
 }
 
 impl Cell {
     /// Execute the cell command using wetware streams for RPC transport.
     ///
-    /// Returns a [`SpawnResult`] containing the guest's outcome, its exported
-    /// [`GuestMembrane`], and the epoch sender for advancing epochs.
+    /// Returns a [`SpawnResult`] containing the guest's outcome and the epoch
+    /// sender for advancing epochs.
     pub async fn spawn(self) -> Result<SpawnResult> {
         self.spawn_rpc_inner(None).await
     }
 
-    /// Like [`spawn`], but also accepts incoming libp2p streams on
-    /// `/ww/0.1.0`.
-    ///
-    /// When a signing key is present, streams are served behind a
-    /// `Terminal(Membrane)` auth gate — remote peers must `login(signer)` to
-    /// obtain the kernel's capability surface.  Without a signing key
-    /// (ephemeral node), the raw membrane is served directly.
+    /// Like [`spawn`], but provides libp2p transport to the vat and stream
+    /// capabilities exposed to the cell.
     pub async fn spawn_serving(self, control: libp2p_stream::Control) -> Result<SpawnResult> {
         self.spawn_rpc_inner(Some(control)).await
     }
@@ -622,9 +598,6 @@ impl Cell {
         let network_state = self.network_state.clone();
         let swarm_cmd_tx = self.swarm_cmd_tx.clone();
         let signing_key = self.signing_key.take();
-        // Clone before build_membrane_rpc consumes it — we need it for the
-        // Terminal-gated network accept loop.
-        let terminal_signing_key = signing_key.clone();
         let pre_epoch_rx = self.epoch_rx.take();
         let terminate_rx = self.terminate_rx.take();
         let intended_seq = self.kernel_generation.take();
@@ -679,7 +652,7 @@ impl Cell {
 
         // Clone the stream control for the membrane RPC layer (Server capability).
         // If no stream_control is provided (non-serving mode), create a dummy one.
-        let membrane_stream_control = stream_control.clone().unwrap_or_else(|| {
+        let membrane_stream_control = stream_control.unwrap_or_else(|| {
             // Non-serving mode: Server.serve() will fail at accept() time,
             // which is acceptable — guests that don't have a real swarm
             // shouldn't be registering subprotocol cells.
@@ -698,10 +671,7 @@ impl Cell {
             runtime_pinset_cache,
         );
 
-        // Clone epoch receiver for Terminal auth before it's moved into the RPC system.
-        let terminal_epoch_rx = epoch_rx.clone();
-
-        let (rpc_system, guest_membrane, registration_scope) = rpc::graft::build_pid0_membrane_rpc(
+        let (rpc_system, registration_scope) = rpc::graft::build_pid0_membrane_rpc(
             reader,
             writer,
             network_state,
@@ -720,32 +690,11 @@ impl Cell {
         );
 
         tracing::debug!("Starting streams RPC server for guest");
-        // Spawn RPC system and stream acceptors on the ambient LocalSet.
+        // Spawn the RPC system on the ambient LocalSet.
         // When running inside an ExecutorPool worker, this targets the
         // worker's LocalSet, enabling M:N cooperative scheduling with
         // other cells on the same thread.
         let rpc_task = tokio::task::spawn_local(rpc_system.map(|_| ()));
-
-        let accept_task = if let Some(control) = stream_control {
-            let membrane = guest_membrane.clone();
-            match terminal_signing_key {
-                Some(sk) => Some(tokio::task::spawn_local(accept_terminal_streams(
-                    control,
-                    membrane,
-                    sk,
-                    terminal_epoch_rx,
-                ))),
-                None => {
-                    // No signing key (ephemeral node) — serve raw membrane without
-                    // Terminal auth gate.  Remote peers get full capabilities.
-                    Some(tokio::task::spawn_local(accept_capnp_streams(
-                        control, membrane,
-                    )))
-                }
-            }
-        } else {
-            None
-        };
 
         let outcome = if let Some(mut terminate_rx) = terminate_rx {
             tokio::select! {
@@ -770,17 +719,9 @@ impl Cell {
         drop(registration_scope);
         rpc_task.abort();
         let _ = rpc_task.await;
-        if let Some(task) = accept_task {
-            task.abort();
-            let _ = task.await;
-        }
         tracing::debug!(?outcome, "Guest exited (streams RPC)");
 
-        Ok(SpawnResult {
-            outcome,
-            guest_membrane,
-            epoch_tx,
-        })
+        Ok(SpawnResult { outcome, epoch_tx })
     }
 }
 
@@ -870,163 +811,6 @@ fn prepare_guest_env(
     guest_env
 }
 
-/// Accept incoming libp2p streams for the capnp protocol and serve each with
-/// the guest's exported membrane.  Runs inside the cell's `LocalSet` so that
-/// `spawn_local` is available for per-connection tasks.
-async fn accept_capnp_streams(mut control: libp2p_stream::Control, membrane: GuestMembrane) {
-    let mut incoming = match control.accept(CAPNP_PROTOCOL) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("failed to register capnp stream cell: {}", e);
-            return;
-        }
-    };
-    tracing::info!(protocol = %CAPNP_PROTOCOL, "Accepting capnp streams");
-    let budget = rpc::inbound_connection_budget();
-    use futures::StreamExt;
-    while let Some((peer_id, stream)) = incoming.next().await {
-        let permit = match budget.try_acquire() {
-            Ok(permit) => permit,
-            Err(error) => {
-                tracing::warn!(
-                    %peer_id,
-                    capacity = error.capacity,
-                    active = budget.active(),
-                    "rejecting raw Cap'n Proto connection: connection budget exhausted"
-                );
-                drop(stream);
-                continue;
-            }
-        };
-        let m = membrane.clone();
-        tokio::task::spawn_local(async move {
-            let _permit = permit;
-            serve_one_capnp_stream(stream, m).await;
-        });
-    }
-}
-
-/// Serve a single libp2p stream as a Cap'n Proto RPC connection, bootstrapping
-/// the remote peer with the guest's exported membrane.
-async fn serve_one_capnp_stream(stream: libp2p::Stream, membrane: GuestMembrane) {
-    // Box::pin(stream) → Pin<Box<Stream>>: AsyncRead + AsyncWrite + Unpin,
-    // which allows .split() even though Stream itself is !Unpin.
-    use futures::AsyncReadExt;
-    let (reader, writer) = Box::pin(stream).split();
-    let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
-    let rpc_system = RpcSystem::new(Box::new(network), Some(membrane.client));
-    let _ = rpc_system.await;
-}
-
-/// Accept incoming libp2p streams on `/ww/0.1.0` and serve each behind a
-/// `Terminal(Membrane)` auth gate.  Remote peers must call `login(signer)` with
-/// the host's verifying key to obtain the guest's exported membrane.
-async fn accept_terminal_streams(
-    mut control: libp2p_stream::Control,
-    membrane: GuestMembrane,
-    signing_key: Arc<SigningKey>,
-    epoch_rx: watch::Receiver<Epoch>,
-) {
-    let mut incoming = match control.accept(CAPNP_PROTOCOL) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("failed to register terminal stream cell: {}", e);
-            return;
-        }
-    };
-    let vk = signing_key.verifying_key();
-    tracing::info!(protocol = %CAPNP_PROTOCOL, "Accepting Terminal-gated streams");
-    let budget = rpc::inbound_connection_budget();
-    use futures::StreamExt;
-    while let Some((peer_id, stream)) = incoming.next().await {
-        tracing::debug!(%peer_id, "Terminal stream accepted");
-        let permit = match budget.try_acquire() {
-            Ok(permit) => permit,
-            Err(error) => {
-                tracing::warn!(
-                    %peer_id,
-                    capacity = error.capacity,
-                    active = budget.active(),
-                    "rejecting Terminal connection: connection budget exhausted"
-                );
-                drop(stream);
-                continue;
-            }
-        };
-        let m = membrane.clone();
-        let erx = epoch_rx.clone();
-        tokio::task::spawn_local(async move {
-            let _permit = permit;
-            serve_one_terminal_stream(stream, m, vk, erx).await;
-        });
-    }
-}
-
-/// Serve a single libp2p stream behind a Terminal auth gate.  The remote peer
-/// bootstraps a `Terminal<membrane_capnp::membrane::Owned>` and must
-/// `login(signer)` to receive
-/// the underlying membrane.
-async fn serve_one_terminal_stream(
-    stream: libp2p::Stream,
-    membrane: GuestMembrane,
-    vk: ed25519_dalek::VerifyingKey,
-    epoch_rx: watch::Receiver<Epoch>,
-) {
-    use authority::TerminalServer;
-    use futures::AsyncReadExt;
-
-    let (granted_tx, granted_rx) = tokio::sync::oneshot::channel();
-    let terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
-        vk,
-        membrane,
-        auth::SigningDomain::terminal_membrane(),
-        epoch_rx,
-    )
-    .with_grant_notifier(granted_tx);
-    let terminal_client: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
-        capnp_rpc::new_client(terminal);
-
-    let (reader, writer) = Box::pin(stream).split();
-    let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
-    let rpc_system = RpcSystem::new(Box::new(network), Some(terminal_client.client));
-    tokio::pin!(rpc_system);
-
-    let deadline = tokio::time::sleep(rpc::terminal_login_timeout());
-    match supervise_terminal_login(rpc_system.as_mut(), granted_rx, deadline).await {
-        TerminalPreAuthOutcome::Authenticated => {
-            let _ = rpc_system.await;
-        }
-        TerminalPreAuthOutcome::ConnectionClosed => {}
-        TerminalPreAuthOutcome::LoginTimedOut => {
-            tracing::warn!("closing Terminal connection: login deadline expired");
-        }
-    }
-}
-
-async fn supervise_terminal_login<Rpc, Deadline>(
-    mut rpc_system: Pin<&mut Rpc>,
-    granted_rx: tokio::sync::oneshot::Receiver<()>,
-    deadline: Deadline,
-) -> TerminalPreAuthOutcome
-where
-    Rpc: Future,
-    Deadline: Future<Output = ()>,
-{
-    tokio::pin!(deadline);
-    tokio::select! {
-        biased;
-        _ = &mut deadline => TerminalPreAuthOutcome::LoginTimedOut,
-        result = granted_rx => {
-            if result.is_ok() {
-                TerminalPreAuthOutcome::Authenticated
-            } else {
-                TerminalPreAuthOutcome::ConnectionClosed
-            }
-        }
-        _ = rpc_system.as_mut() => TerminalPreAuthOutcome::ConnectionClosed,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,35 +860,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot be installed for an ordinary cell"));
-    }
-
-    #[tokio::test]
-    async fn terminal_login_supervision_is_deterministic() {
-        let (granted_tx, granted_rx) = tokio::sync::oneshot::channel();
-        let rpc = std::future::pending::<()>();
-        tokio::pin!(rpc);
-        assert_eq!(
-            supervise_terminal_login(rpc.as_mut(), granted_rx, std::future::ready(())).await,
-            TerminalPreAuthOutcome::LoginTimedOut
-        );
-        drop(granted_tx);
-
-        let (granted_tx, granted_rx) = tokio::sync::oneshot::channel();
-        granted_tx.send(()).unwrap();
-        let rpc = std::future::pending::<()>();
-        tokio::pin!(rpc);
-        assert_eq!(
-            supervise_terminal_login(rpc.as_mut(), granted_rx, std::future::pending()).await,
-            TerminalPreAuthOutcome::Authenticated
-        );
-
-        let (_granted_tx, granted_rx) = tokio::sync::oneshot::channel();
-        let rpc = std::future::ready(());
-        tokio::pin!(rpc);
-        assert_eq!(
-            supervise_terminal_login(rpc.as_mut(), granted_rx, std::future::pending()).await,
-            TerminalPreAuthOutcome::ConnectionClosed
-        );
     }
 
     /// T1 (Item 1b cleanup, regression test): `Cell::spawn_with_streams`

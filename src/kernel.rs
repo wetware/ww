@@ -303,6 +303,11 @@ mod tests {
     const TEST_CID: &str = "bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a";
 
     #[test]
+    fn host_pid0_abi_is_v3() {
+        assert_eq!(KERNEL_ABI_VERSION, "3");
+    }
+
+    #[test]
     fn selector_precedence_is_cli_then_env_then_embedded() {
         assert_eq!(
             select_kernel_source(Some("file:/cli.wasm"), Some("file:/env.wasm")).unwrap(),
