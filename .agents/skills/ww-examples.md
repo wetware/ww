@@ -82,8 +82,8 @@ Walk through together:
    `POST /counter` (increments).  405 for everything else.
 2. **The key difference**: this cell has a *type tag*.  Run
    `make -C examples/counter` yourself and show the output.
-   The init.d script registers it with `(perform host :listen executor "/counter" wasm)` —
-   that's what tells the host to route HTTP traffic here.
+   The repository does not currently ship runtime composition for the
+   counter after removal of the legacy Glia PID0.
 3. **FastCGI protocol**: the cell speaks binary FastCGI over stdio.
    The host translates HTTP ↔ FastCGI.  Simpler than parsing HTTP/1.1.
 4. **Per-request spawn**: each request gets a fresh instance.  Counter
@@ -107,7 +107,6 @@ Read files from `examples/chess/`.
 | Overview | `examples/chess/README.md` |
 | Source | `examples/chess/src/lib.rs` |
 | Schema | `examples/chess/chess.capnp` |
-| Init script | `examples/chess/etc/init.d/chess.glia` |
 | Replay design | `examples/chess/doc/replay.md` |
 
 This is the big one.  Walk through in layers — don't dump
@@ -121,8 +120,7 @@ everything at once:
 3. **The code** (~5 min): Walk through `src/lib.rs`.  Focus on: how
    it registers a listener, accepts connections, manages game state.
    Don't read every line — hit the interesting parts.
-4. **The image layout** (~2 min): FHS structure with `bin/` and
-   `etc/init.d/`.  "This is how it'd be deployed."
+4. **The image layout** (~2 min): show the built component under `bin/`.
 
 5. **Local vs. global** (~3 min): This is the payoff.  Walk through
    which operations are local (validating a move, updating the board)

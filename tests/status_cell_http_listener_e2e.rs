@@ -10,9 +10,8 @@
 //!             └─ spawn_and_run calls executor.spawn(env, caps)
 //!                 └─ WAGI cell grafts membrane, returns JSON
 //!
-//! The test additionally seeds a non-empty caps list (kernel emits this
-//! when an init.d author supplies `:grants {:host host}` to `cell`. That fixed
-//! registration-time template is the status cell's only host authority; the
+//! The test additionally seeds the non-empty caps list that Rust PID0 supplies.
+//! That fixed registration-time template is the status cell's only host authority; the
 //! dispatcher path must reproduce it for each child without widening or
 //! corruption. A regression would surface here as `peer_id: null` or a CGI
 //! dispatch failure.

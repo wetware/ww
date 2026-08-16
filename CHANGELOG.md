@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **The legacy Glia PID0 and its direct consumers have been removed.**
+  `std/kernel` is the only active kernel. `std/kernel-glia`, `std/caps`, Glia
+  init scripts, legacy example flows, and their build and test staging are no
+  longer present. Rust PID0 retains the `/status` composition and lifecycle
+  coverage. `crates/glia` remains for the final removal tranche.
 - **The Glia shell and MCP product surfaces have been removed.** The `ww shell`
   command, its `--mcp` mode, shell WASM and schema, MCP registration and doctor
   checks, and shell-specific documentation are no longer present.

@@ -33,16 +33,12 @@ Architecture (three layers):
 - **Host** (`ww` binary): boots a libp2p swarm, loads the kernel
   WASM, serves a Membrane over Cap'n Proto RPC.
 - **Kernel** (pid0): calls `membrane.graft()` to obtain capabilities
-  (Host, Runtime, Routing, Identity, HttpClient). The default Rust kernel
-  installs the shipped `/status` composition. The explicit legacy Glia kernel
-  interprets `etc/init.d`. All policy lives in the selected kernel.
+  (Host, Runtime, Routing, Identity, HttpClient). The Rust kernel installs the
+  shipped `/status` composition.
 - **Ordinary children**: spawned with an immutable `InitialAuthorityRecord`
   delivered by `InitialGrants`; they do not receive `Membrane.graft()`.
 
 Key abstractions:
-- **Cell type system**: Glia spawns cells, obtains exported capabilities,
-  and publishes them with named vat services; HTTP/raw listeners are byte
-  adapters and still spawn handler cells.
 - **Membrane**: graft-capable authority issuance for pid0 and separately for
   authenticated remote sessions; it is not child bootstrap.
 - **InitialGrants**: the grants-only ordinary-child bootstrap. It returns the
@@ -54,20 +50,8 @@ Key abstractions:
   layers override earlier ones.
 - **Cap'n Proto RPC**: bidirectional -- both host and guest can serve
   and consume capabilities.
-- **Glia host effects**: application-visible host interaction begins with
-  `perform`: `(perform :load path)`, `(perform :stdout value)`,
-  `(perform :exit nil)`, or `(perform cap :method ...)`. This is an
-  evaluator-semantic boundary, not an authority grant. The membrane remains
-  the authority boundary; WASI guest access remains governed by sandbox and
-  preopen configuration. In MCP mode `:stdout` and `:exit` fail with a typed
-  protocol-mode-unavailable error so JSON-RPC stdout stays clean.
-
-AI integration -- drivetrain, not engine:
-Wetware doesn't embed an LLM.  The LLM connects *to* a Wetware
-node over MCP and gets a Glia shell.  Wetware is the drivetrain;
-the LLM is the driver.  "Agent" means any autonomous process --
-AI, human, script.  Wetware controls what they're *allowed to do*,
-not what they *are*.
+Wetware does not embed an LLM. "Agent" means any autonomous process: AI,
+human, or script. Wetware controls the authority available to that process.
 
 Capabilities after pid0 grafting (ordinary children receive only explicitly
 granted entries):
@@ -82,11 +66,7 @@ granted entries):
 | StreamListener / StreamDialer | P2P byte streams for raw cells |
 | VatListener / VatClient | Cap'n Proto RPC for capnp cells |
 
-Grant authoring:
-
-- `(cell image)` means zero application capabilities. Write
-  `(cell image :grants {:name possessed-cap})` for exact delegation.
-- Prefer an image-bound Executor over Runtime, scoped Signer over Identity,
+Grant authoring must prefer an image-bound Executor over Runtime, scoped Signer over Identity,
   attenuated methods over broad Host/Routing, and a capability protocol over
   bearer tokens in args/env.
 
@@ -96,14 +76,6 @@ rustup target add wasm32-wasip2
 make
 cargo run -- run --http-listen 127.0.0.1:2080 std/status
 curl http://127.0.0.1:2080/status
-```
-
-The embedded default is the Rust kernel. Use the legacy Glia kernel only when
-a workflow requires init scripts or the Glia REPL:
-
-```sh
-make kernel-glia
-cargo run -- run --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia
 ```
 
 Concurrency model (E-ordering):

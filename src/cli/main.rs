@@ -990,7 +990,6 @@ impl Commands {
 
         // Create directory structure
         std::fs::create_dir_all(target_dir.join("src"))?;
-        std::fs::create_dir_all(target_dir.join("etc/init.d"))?;
 
         // foo.capnp — skeleton interface
         let iface_name = to_pascal_case(&name);
@@ -1261,47 +1260,16 @@ wasip2::cli::command::export!({iface_name}Guest);
         );
         std::fs::write(target_dir.join("src/lib.rs"), lib_rs)?;
 
-        // etc/init.d/<name>.glia — skeleton init script
-        let glia = format!(
-            r#"; {name} init.d script — evaluated by the legacy Glia kernel at boot.
-;
-; Starts one cell, obtains its exported capability, and publishes it as
-; an explicitly ungated vat service under the "{name}" protocol.
-; Replace serve-raw-vat with serve-vat plus a deployer auth policy before
-; exposing authority that requires recipient authentication.
-;
-; To run the service from the shell:
-;   (def service-executor (perform runtime :load (perform :load "bin/{name}.wasm")))
-;   (def service-process
-;     (perform service-executor :spawn
-;       :args ["serve"]
-;       :caps {{"host" host}}))
-;   (perform service-process :wait)
-
-(def {snake_name}-wasm (perform :load "bin/{name}.wasm"))
-(def {snake_name}-executor (perform runtime :load {snake_name}-wasm))
-(def {snake_name}-process (perform {snake_name}-executor :spawn :caps {{}}))
-(def {snake_name}-cap (perform {snake_name}-process :bootstrap))
-
-(perform host :serve-raw-vat {snake_name}-cap "{name}")
-"#,
-            snake_name = name.replace('-', "_"),
-        );
-        std::fs::write(target_dir.join(format!("etc/init.d/{name}.glia")), glia)?;
-
         println!("Initialized cell project: {name}/");
         println!("  {name}.capnp            — capability interface (edit this)");
         println!("  Cargo.toml              — project configuration");
         println!("  build.rs                — schema compilation");
         println!("  src/lib.rs              — guest entry point");
-        println!("  etc/init.d/{name}.glia  — legacy Glia kernel init script");
         println!();
         println!("\u{2697}\u{fe0f}  Next steps:");
         println!("  1. Edit {name}.capnp with your interface methods");
         println!("  2. Implement the server in src/lib.rs");
         println!("  3. ww build {name}");
-        println!("  4. make kernel-glia");
-        println!("  5. ww run --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia {name}");
         Ok(())
     }
 
@@ -2400,22 +2368,11 @@ wasip2::cli::command::export!({iface_name}Guest);
         }
 
         // Ensure subdirectories exist (may be missing if created by older version).
-        for sub in &["bin", "etc/init.d", "etc/ns", "logs"] {
+        for sub in &["bin", "etc/ns", "logs"] {
             let dir = ww_dir.join(sub);
             if !dir.exists() {
                 std::fs::create_dir_all(&dir)?;
             }
-        }
-
-        // ── Status init.d ────────────────────────────────────────────
-        let status_init = ww_dir.join("etc/init.d/05-status.glia");
-        if !status_init.exists() {
-            std::fs::write(
-                &status_init,
-                include_str!("../../std/status/etc/init.d/05-status.glia"),
-            )
-            .context("Failed to write default status init script")?;
-            done("Default init.d (05-status.glia)".into());
         }
 
         // ── WASM images (embedded check) ─────────────────────────────
@@ -2456,7 +2413,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             skip("WASM images (unchanged)".into());
         }
 
-        // ── Stdlib republish (if images changed + Kubo running) ──────
+        // ── Standard namespace republish (if images changed + Kubo running) ──
         let ipfs_client = ipfs::HttpClient::new("http://localhost:5001".into());
         let kubo_ok = ipfs_client.kubo_info().await.is_ok();
 
@@ -2477,28 +2434,12 @@ wasip2::cli::command::export!({iface_name}Guest);
 
             if kubo_ok && images_ok && any_images_changed {
                 let sp = spin();
-                sp.set_message("Indexing standard library...");
+                sp.set_message("Indexing standard namespace...");
 
                 let tmp = tempfile::TempDir::new()?;
                 let tree = tmp.path();
                 let bin_dir = tree.join("bin");
-                let lib_dir = tree.join("lib/ww");
                 std::fs::create_dir_all(&bin_dir)?;
-                std::fs::create_dir_all(&lib_dir)?;
-
-                // Copy Glia stdlib if present on disk.
-                let glia_src = std::path::Path::new("std/lib/ww");
-                if glia_src.is_dir() {
-                    for entry in std::fs::read_dir(glia_src)? {
-                        let entry = entry?;
-                        let path = entry.path();
-                        if path.extension().and_then(|e| e.to_str()) == Some("glia") {
-                            if let Some(name) = path.file_name() {
-                                std::fs::copy(&path, lib_dir.join(name))?;
-                            }
-                        }
-                    }
-                }
 
                 // Write WASM cells to bin/ (flat layout).
                 for (wasm_name, bytes) in embedded_cells {
@@ -2516,17 +2457,17 @@ wasip2::cli::command::export!({iface_name}Guest);
                             let _ = ipfs_client.name_publish(&ipfs_path, "ww").await;
                         }
                         sp.finish_and_clear();
-                        done(format!("Standard library ({ipfs_path})"));
+                        done(format!("Standard namespace ({ipfs_path})"));
                     }
                     Err(e) => {
                         sp.finish_and_clear();
-                        fail(format!("Standard library ({e})"));
+                        fail(format!("Standard namespace ({e})"));
                     }
                 }
             } else if !kubo_ok {
-                skip("Standard library (Kubo not running)".into());
+                skip("Standard namespace (Kubo not running)".into());
             } else if !any_images_changed {
-                skip("Standard library (images unchanged)".into());
+                skip("Standard namespace (images unchanged)".into());
             }
 
             config.write_to(&ns_path)?;
@@ -2543,8 +2484,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         // ── Daemon config + service file (unconditional) ─────────────
         let identity_path = ww_dir.join("identity");
         // Mount ~/.ww as the single root layer. WASM cells are resolved
-        // from the embedded loader or IPNS namespace. Init scripts in
-        // etc/init.d/ control which cells are activated at boot.
+        // from the embedded loader or IPNS namespace.
         let image_layers: Vec<String> = vec![ww_dir.display().to_string()];
         Self::daemon_install(Some(identity_path), Vec::new(), image_layers, true).await?;
         done("Background daemon".into());
@@ -2590,7 +2530,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         let done = |msg: String| println!("  \u{2713} {msg}");
 
         // ── Directories ──────────────────────────────────────────────
-        let subdirs = ["bin", "etc/init.d", "etc/ns", "logs"];
+        let subdirs = ["bin", "etc/ns", "logs"];
         for sub in &subdirs {
             let dir = ww_dir.join(sub);
             std::fs::create_dir_all(&dir)
@@ -2615,18 +2555,6 @@ wasip2::cli::command::export!({iface_name}Guest);
             )
         })?;
         done(format!("Binary symlink ({})", symlink_path.display()));
-
-        // ── Default init.d ──────────────────────────────────────────
-        // ── Status init.d ────────────────────────────────────────────
-        let status_init = ww_dir.join("etc/init.d/05-status.glia");
-        if !status_init.exists() {
-            std::fs::write(
-                &status_init,
-                include_str!("../../std/status/etc/init.d/05-status.glia"),
-            )
-            .context("Failed to write default status init script")?;
-            done("Default init.d (05-status.glia)".into());
-        }
 
         // ── Identity ─────────────────────────────────────────────────
         let identity_path = ww_dir.join("identity");

@@ -66,20 +66,16 @@ Requires a Rust toolchain with the `wasm32-wasip2` target. Optional: [Kubo](http
 ww run .                                # boot a node from current dir
 ```
 
-### Boot a cell
-
-`examples/oracle/` is a working cell with both native vat RPC and an
-HTTP/WAGI adapter. The vat path is the stateful service surface; HTTP/WAGI
-is a stateless request adapter for curl/browser infrastructure:
+### Build the example cells
 
 ```bash
-make kernel-glia
-ww run --http-listen 127.0.0.1:2080 --port=2025 \
-  --kernel file:std/kernel-glia/bin/main.wasm std/kernel-glia examples/oracle
-curl http://localhost:2080/oracle
+make examples
 ```
 
-Read [examples/oracle/README.md](examples/oracle/README.md) for the full walkthrough, including the DHT-based consumer flow.
+The repository keeps the Rust example crates as buildable guest-component
+references. The Rust PID0 installs only the default `/status` composition, so
+the repository does not currently ship a generic runtime composition for these
+examples.
 
 ## How it works
 
@@ -117,10 +113,11 @@ WASM processes ("cells") run with zero ambient authority. Their stdio is wired t
 ```sh
 ww init myapp                                # scaffold a new cell project
 cd myapp && ww build                         # compile to WASM
-ww run .                                     # test locally
 ww push . --ipfs-url http://localhost:5001   # publish to IPFS
-ww run /ipfs/<CID>                           # run from content-addressed image
 ```
+
+The Rust PID0 does not automatically compose arbitrary guest components from
+an image. A published guest requires an application-specific composition path.
 
 ## Roadmap
 

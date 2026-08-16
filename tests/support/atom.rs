@@ -16,9 +16,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct TransactionReceipt {
-    pub hash: String,
     pub block_number: u64,
-    pub transaction_index: u64,
 }
 
 pub struct AtomFixture {
@@ -171,16 +169,10 @@ impl AtomFixture {
             if !receipt.is_null() {
                 assert_receipt_success(&receipt, &format!("Atom transaction {hash}"));
                 return TransactionReceipt {
-                    hash,
                     block_number: parse_hex_u64(
                         receipt["blockNumber"]
                             .as_str()
                             .expect("receipt blockNumber"),
-                    ),
-                    transaction_index: parse_hex_u64(
-                        receipt["transactionIndex"]
-                            .as_str()
-                            .expect("receipt transactionIndex"),
                     ),
                 };
             }

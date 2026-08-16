@@ -283,8 +283,6 @@ jobs:
     - name: Run standalone standard-library tests
       if: ${{ always() }}
       run: |
-        cargo test --manifest-path std/caps/Cargo.toml
-        cargo test --manifest-path std/kernel-glia/Cargo.toml
         cargo test --manifest-path std/kernel/Cargo.toml
 
   # === Master-only: fan out after checks pass ===
@@ -459,13 +457,12 @@ jobs:
         chmod +x ww
 
         # Kernel image layout matching the production k8s manifest.
-        mkdir -p wetware/kernel/bin wetware/kernel/etc/init.d
+        mkdir -p wetware/kernel/bin
 
-        # Kernel layer: the pid0 entrypoint and its status route both live
-        # at the merged root. The init script registers /status at boot.
+        # Kernel layer: the pid0 entrypoint and status component both live
+        # at the merged root. The Rust kernel registers /status at boot.
         cp wasm/std/kernel/bin/main.wasm wetware/kernel/bin/main.wasm
         cp wasm/std/status/bin/status.wasm wetware/kernel/bin/status.wasm
-        cp ../std/status/etc/init.d/05-status.glia wetware/kernel/etc/init.d/
 
         cp ../Containerfile.deploy Containerfile
 
@@ -649,7 +646,6 @@ jobs:
         STAGE=/tmp/release-tree
         mkdir -p "$STAGE/bin/ww/linux/x86_64" "$STAGE/bin/ww/linux/aarch64"
         mkdir -p "$STAGE/bin/ww/macos/aarch64" "$STAGE/bin/ww/macos/x86_64"
-        mkdir -p "$STAGE/lib/ww" "$STAGE/lib/init.d"
 
         # VERSION
         grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/' > "$STAGE/VERSION"
@@ -673,13 +669,8 @@ jobs:
           fi
         done
 
-        # Per-example cell-shaped subtrees: enables `ww run /ipns/<key>/examples/<name>`
-        # (or `/ipfs/<cid>/examples/<name>`) to mount the cell as a layer.
-        # Each subtree uses the `<name>/{etc/init.d,bin}/` cell convention,
-        # so init.d glia files end up at the merged tree's
-        # /etc/init.d/ where the kernel discovers them
-        # (std/kernel/src/lib.rs:1148-1188), and `(perform :load "bin/<name>.wasm")`
-        # resolves relative to the merged tree root.
+        # Per-example binary subtrees keep each reference WASM component
+        # available under `/examples/<name>/bin/`.
         for example_dir in artifacts/wasm-artifacts/examples/*/bin; do
           if [ -d "$example_dir" ]; then
             name=$(basename "$(dirname "$example_dir")")
@@ -687,22 +678,6 @@ jobs:
             cp "$example_dir"/*.wasm "$STAGE/examples/$name/bin/" 2>/dev/null || true
           fi
         done
-        for ex_etc in examples/*/etc; do
-          if [ -d "$ex_etc/init.d" ]; then
-            name=$(basename "$(dirname "$ex_etc")")
-            mkdir -p "$STAGE/examples/$name/etc/init.d"
-            cp "$ex_etc/init.d"/*.glia "$STAGE/examples/$name/etc/init.d/" 2>/dev/null || true
-          fi
-        done
-
-        # Glia stdlib
-        cp std/lib/ww/*.glia "$STAGE/lib/ww/" 2>/dev/null || true
-
-        # Reference init.d scripts
-        for ex_init in examples/*/etc/init.d/*.glia; do
-          [ -f "$ex_init" ] && cp "$ex_init" "$STAGE/lib/init.d/"
-        done
-
         # Host binaries: from CI artifacts if host lane ran, else from previous IPNS
         if [ "$HOST_CHANGED" = "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
           echo "Using fresh binaries from build matrix"

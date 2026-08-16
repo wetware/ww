@@ -11,7 +11,7 @@ ww master commit
        |
        +--> host build matrix ----------> downloadable host binaries
        |
-       +--> WASM build -----------------> kernel/shell/status artifacts
+       +--> WASM build -----------------> kernel/status artifacts
        |                                      |
        +--> deploy image assembly <------------+
        |        |
@@ -85,16 +85,13 @@ The production image contains one core layer:
 /usr/share/wetware/kernel/
   bin/main.wasm
   bin/status.wasm
-  etc/init.d/05-status.glia
 ```
 
 `ww run` merges root layers left-to-right. Optional IPNS application content
 comes first; the kernel layer follows so application content cannot replace
 pid0 or the image-owned status route.
 
-The default Rust pid0 directly installs the image-owned `/status` composition.
-The staged `05-status.glia` file remains for the explicit legacy Glia rollback
-path and does not change the deployment layout.
+The Rust pid0 directly installs the image-owned `/status` composition.
 
 ## HTTP request path
 
@@ -138,7 +135,7 @@ invocation fails clearly when Kubo is absent. A production deployment that
 must survive a sustained Kubo outage must set `WW_KUBO_WAIT_MAX_SECS=0`; the
 reviewed `ww-master` manifest does so. This keeps `/healthz` available while
 `/readyz` remains closed until trusted PID0 commits the current generation
-after init/init.d. The commit uses a private Wasm host import installed only
+after composition. The commit uses a private Wasm host import installed only
 for PID0; it is not a Cap'n Proto capability and cannot be delegated over the
 network. HTTP route liveness is checked by dispatch and the public `/status`
 endpoint, not folded into kernel readiness. Readiness is not a continuous Kubo

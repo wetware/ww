@@ -1,13 +1,8 @@
 //! Kernel-independent PID0 lifecycle coverage.
 //!
-//! `shared_parity` launches the real `ww` binary and asserts the behavioral
-//! contract that must hold for every PID0 implementation: boot/serving
-//! identity, host-owned generation replacement with replacement-byte identity,
-//! initialization failure, and TTY process lifetime. Each driver runs against
-//! the embedded Rust PID0 and against the explicit `file:` Glia PID0
-//! (`std/kernel-glia`). Glia-only observables live in `glia_specific`; tests
-//! that ride the temporary `/ww/0.1.0` guest-membrane surface live in
-//! `ww_protocol_compat`.
+//! These tests launch the real `ww` binary and assert the Rust PID0 behavioral
+//! contract: boot/serving identity, host-owned generation replacement with
+//! replacement-byte identity, initialization failure, and TTY process lifetime.
 //!
 //! CI must run `make std` before compiling this test. Missing artifacts are a
 //! hard failure: silently skipping would recreate the false-green gap this
@@ -39,7 +34,6 @@ use support::atom::AtomFixture;
 use support::terminal::{expect_stale_or_disconnected, TerminalSession};
 
 const KERNEL_WASM_PATH: &str = "std/kernel/bin/main.wasm";
-const KERNEL_GLIA_WASM_PATH: &str = "std/kernel-glia/bin/main.wasm";
 const STATUS_WASM_PATH: &str = "std/status/bin/status.wasm";
 const STATUS_LAYER: &str = "std/status";
 const DEFAULT_KUBO_ADDR: &str = "127.0.0.1:5001";
@@ -101,46 +95,6 @@ fn status_variant(base: &[u8], tag: &[u8]) -> (Vec<u8>, cid::Cid) {
     append_custom_section(&mut bytes, b"ww.test.epoch", tag);
     let cid = ww::kernel::runtime_cid(&bytes);
     (bytes, cid)
-}
-
-/// A PID0 implementation selected through the host's existing kernel-source
-/// machinery. The shared drivers assert host-observable behavior only;
-/// kernel-specific observables live in `glia_specific` and
-/// `ww_protocol_compat`.
-#[derive(Clone, Copy)]
-struct KernelUnderTest {
-    explicit_path: Option<&'static str>,
-}
-
-const EMBEDDED_RUST: KernelUnderTest = KernelUnderTest {
-    explicit_path: None,
-};
-const EXPLICIT_GLIA: KernelUnderTest = KernelUnderTest {
-    explicit_path: Some(KERNEL_GLIA_WASM_PATH),
-};
-
-impl KernelUnderTest {
-    fn artifact_path(self) -> &'static str {
-        self.explicit_path.unwrap_or(KERNEL_WASM_PATH)
-    }
-
-    /// Apply the selection to `options`; return the kernel bytes and the
-    /// exact `kernel_source` string `/version` must report.
-    fn select(self, options: &mut NodeOptions) -> (Vec<u8>, String) {
-        let bytes = required_artifact(self.artifact_path());
-        let source = match self.explicit_path {
-            Some(path) => {
-                let path = Path::new(path)
-                    .canonicalize()
-                    .unwrap_or_else(|error| panic!("canonicalize {path}: {error}"));
-                let source = format!("file:{}", path.display());
-                options.kernel_cli = Some(source.clone());
-                source
-            }
-            None => "embedded:main".to_string(),
-        };
-        (bytes, source)
-    }
 }
 
 async fn unused_addr() -> SocketAddr {
@@ -348,7 +302,7 @@ async fn assert_status_route(client: &reqwest::Client, http_addr: SocketAddr) {
         .timeout(Duration::from_secs(20))
         .send()
         .await
-        .expect("query real Glia-registered /status route")
+        .expect("query Rust PID0 /status route")
         .error_for_status()
         .expect("/status should return HTTP 200")
         .json()
@@ -373,7 +327,7 @@ async fn assert_status_cell(
         .timeout(Duration::from_secs(20))
         .send()
         .await
-        .expect("query real Glia-registered /status route")
+        .expect("query Rust PID0 /status route")
         .error_for_status()
         .expect("/status should return HTTP 200");
     let observed_cell_cid = response
@@ -696,74 +650,20 @@ fn start_failing_merge_kubo_proxy(
 struct EpochRoot {
     _directory: tempfile::TempDir,
     cid: cid::Cid,
-    delay_cid: String,
-    marker: Vec<u8>,
-    route: String,
 }
 
 impl EpochRoot {
     async fn valid(ipfs: &ww::ipfs::HttpClient, status_wasm: &[u8], generation: u64) -> Self {
-        let route = format!("/epoch-{generation}");
         let marker = format!("epoch-{generation}\n").into_bytes();
-        let script = format!(
-            r#"(perform :load "architecture.md")
-
-(perform host :listen
-  (cell (perform :load "bin/status.wasm")
-    :grants {{:host host}})
-  "/status")
-
-(perform host :listen
-  (cell (perform :load "bin/status.wasm")
-    :grants {{:host host}})
-  "{route}")
-"#
-        );
-        Self::build(ipfs, status_wasm, route, marker, script).await
-    }
-
-    async fn failing(ipfs: &ww::ipfs::HttpClient, status_wasm: &[u8]) -> Self {
-        let route = "/epoch-invalid".to_string();
-        let marker = b"epoch-invalid\n".to_vec();
-        let script = format!(
-            r#"; The replacement is syntactically valid, but status points at a
-; missing component. SysV best-effort continues to the route below; the
-; replacement-generation policy must then fail and tear that route down.
-(perform :load "architecture.md")
-
-(perform host :listen
-  (cell (perform :load "bin/missing-status.wasm")
-    :grants {{:host host}})
-  "/status")
-
-(perform host :listen
-  (cell (perform :load "bin/status.wasm")
-    :grants {{:host host}})
-  "{route}")
-
-; The failed-replacement test delays only this Kubo load. While it is pending,
-; the real route task can finish executor.cid preflight, but readiness must
-; remain closed until the generation commit that this init will never reach.
-(perform :load "delay.txt")
-"#
-        );
-        Self::build(ipfs, status_wasm, route, marker, script).await
+        Self::build(ipfs, status_wasm, marker).await
     }
 
     /// A deployment root whose production status policy requires
     /// `bin/status.wasm` while the tree does not contain it. Every PID0
     /// implementation must fail composition against this root.
     async fn missing_status(ipfs: &ww::ipfs::HttpClient, generation: u64) -> Self {
-        let route = format!("/epoch-{generation}");
         let marker = format!("epoch-{generation}-missing-status\n").into_bytes();
         let directory = tempfile::tempdir().expect("create missing-status root");
-        let init = directory.path().join("etc/init.d");
-        std::fs::create_dir_all(&init).expect("create missing-status init.d");
-        std::fs::copy(
-            "std/status/etc/init.d/05-status.glia",
-            init.join("05-status.glia"),
-        )
-        .expect("copy production status policy");
         std::fs::write(directory.path().join("delay.txt"), &marker)
             .expect("write missing-status delay marker");
         std::fs::write(directory.path().join("generation.txt"), &marker)
@@ -774,38 +674,17 @@ impl EpochRoot {
             .expect("add missing-status root to Kubo")
             .parse()
             .expect("Kubo returned a valid missing-status root CID");
-        let delay_cid = ipfs
-            .ls(&format!("/ipfs/{cid}"))
-            .await
-            .expect("list missing-status root in Kubo")
-            .into_iter()
-            .find(|entry| entry.name == "delay.txt")
-            .expect("missing-status root omitted delay.txt")
-            .hash;
         Self {
             _directory: directory,
             cid,
-            delay_cid,
-            marker,
-            route,
         }
     }
 
-    async fn build(
-        ipfs: &ww::ipfs::HttpClient,
-        status_wasm: &[u8],
-        route: String,
-        marker: Vec<u8>,
-        script: String,
-    ) -> Self {
+    async fn build(ipfs: &ww::ipfs::HttpClient, status_wasm: &[u8], marker: Vec<u8>) -> Self {
         let directory = tempfile::tempdir().expect("create epoch content root");
         let bin = directory.path().join("bin");
-        let init = directory.path().join("etc/init.d");
         std::fs::create_dir_all(&bin).expect("create epoch bin directory");
-        std::fs::create_dir_all(&init).expect("create epoch init.d directory");
         std::fs::write(bin.join("status.wasm"), status_wasm).expect("write epoch status component");
-        std::fs::write(init.join("05-status.glia"), script.as_bytes())
-            .expect("write epoch init script");
         std::fs::write(directory.path().join("delay.txt"), &marker)
             .expect("write replacement delay marker");
         std::fs::write(directory.path().join("generation.txt"), &marker)
@@ -818,27 +697,12 @@ impl EpochRoot {
             .parse()
             .expect("Kubo returned a valid epoch root CID");
         let root = format!("/ipfs/{cid}");
-        let delay_cid = ipfs
-            .ls(&root)
-            .await
-            .expect("list epoch root in Kubo")
-            .into_iter()
-            .find(|entry| entry.name == "delay.txt")
-            .expect("epoch root omitted delay.txt")
-            .hash;
         assert_eq!(
             ipfs.cat(&format!("{root}/bin/status.wasm"))
                 .await
                 .expect("verify /bin/status.wasm in Kubo"),
             status_wasm,
             "Kubo epoch root changed status.wasm"
-        );
-        assert_eq!(
-            ipfs.cat(&format!("{root}/etc/init.d/05-status.glia"))
-                .await
-                .expect("verify init script in Kubo"),
-            script.as_bytes(),
-            "Kubo epoch root changed init script"
         );
         assert_eq!(
             ipfs.cat(&format!("{root}/generation.txt"))
@@ -851,18 +715,7 @@ impl EpochRoot {
         Self {
             _directory: directory,
             cid,
-            delay_cid,
-            marker,
-            route,
         }
-    }
-
-    fn mount(&self) -> String {
-        format!("/ipfs/{}", self.cid)
-    }
-
-    fn marker_path(&self) -> String {
-        format!("{}/generation.txt", self.mount())
     }
 }
 
@@ -954,19 +807,6 @@ async fn wait_for_not_ready(
     }
 }
 
-async fn assert_route_available(client: &reqwest::Client, http_addr: SocketAddr, path: &str) {
-    let response = client
-        .get(format!("http://{http_addr}{path}"))
-        .send()
-        .await
-        .unwrap_or_else(|error| panic!("query {path}: {error}"));
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::OK,
-        "expected {path} to be live"
-    );
-}
-
 async fn assert_route_unavailable(client: &reqwest::Client, http_addr: SocketAddr, path: &str) {
     if let Ok(response) = client.get(format!("http://{http_addr}{path}")).send().await {
         assert_ne!(
@@ -974,88 +814,6 @@ async fn assert_route_unavailable(client: &reqwest::Client, http_addr: SocketAdd
             reqwest::StatusCode::OK,
             "stale or partial route {path} remained live"
         );
-    }
-}
-
-struct FailedReplacementObservation {
-    exit: ExitStatus,
-    readiness_samples: usize,
-    saw_partial_route_live: bool,
-    saw_kernel_not_ready_with_live_route: bool,
-    saw_partial_route_removed: bool,
-}
-
-async fn wait_for_exit_while_unready(
-    client: &reqwest::Client,
-    admin_addr: SocketAddr,
-    http_addr: SocketAddr,
-    stale_route: &str,
-    partial_route: &str,
-    node: &mut RunningNode,
-) -> FailedReplacementObservation {
-    let deadline = Instant::now() + EXIT_TIMEOUT;
-    let ready_url = format!("http://{admin_addr}/readyz");
-    let partial_url = format!("http://{http_addr}{partial_route}");
-    let mut readiness_samples = 0;
-    let mut saw_partial_route_live = false;
-    let mut saw_kernel_not_ready_with_live_route = false;
-    let mut saw_partial_route_removed = false;
-    loop {
-        if let Some(status) = node.try_wait() {
-            assert_route_unavailable(client, http_addr, stale_route).await;
-            assert_route_unavailable(client, http_addr, partial_route).await;
-            if saw_partial_route_live {
-                saw_partial_route_removed = true;
-            }
-            return FailedReplacementObservation {
-                exit: status,
-                readiness_samples,
-                saw_partial_route_live,
-                saw_kernel_not_ready_with_live_route,
-                saw_partial_route_removed,
-            };
-        }
-        let partial_is_live = client
-            .get(&partial_url)
-            .send()
-            .await
-            .is_ok_and(|response| response.status() == reqwest::StatusCode::OK);
-        if partial_is_live {
-            saw_partial_route_live = true;
-        } else if saw_partial_route_live {
-            saw_partial_route_removed = true;
-        }
-
-        if let Ok(response) = client.get(&ready_url).send().await {
-            readiness_samples += 1;
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .expect("read failed-replacement /readyz");
-            assert_eq!(
-                status,
-                reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                "readiness recovered during failed replacement: {body}"
-            );
-            let readiness: Value = serde_json::from_str(&body).unwrap_or_else(|error| {
-                panic!("invalid failed-replacement /readyz: {error}; {body}")
-            });
-            if partial_is_live {
-                assert_eq!(
-                    readiness["phase"], "kernel-not-ready",
-                    "a live partial route must not override the kernel gate: {readiness}"
-                );
-                saw_kernel_not_ready_with_live_route = true;
-            }
-        }
-        assert_route_unavailable(client, http_addr, stale_route).await;
-        assert!(
-            Instant::now() < deadline,
-            "ww did not exit after failed replacement\n{}",
-            node.logs()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -1097,17 +855,14 @@ fn unregistered_route_positions(logs: &str, route: &str) -> Vec<usize> {
         .collect()
 }
 
-/// An image carrying the production status policy with a missing or corrupt
-/// `bin/status.wasm`. Every PID0 implementation must fail initialization.
+/// An image with a missing or corrupt `bin/status.wasm`.
 fn invalid_status_image(status_bytes: Option<&[u8]>) -> tempfile::TempDir {
     let image = tempfile::tempdir().expect("create invalid status image");
-    let init = image.path().join("etc/init.d");
-    std::fs::create_dir_all(&init).expect("create status policy directory");
-    std::fs::copy(
-        "std/status/etc/init.d/05-status.glia",
-        init.join("05-status.glia"),
+    std::fs::write(
+        image.path().join("invalid-status.txt"),
+        b"invalid status fixture\n",
     )
-    .expect("copy status boot policy");
+    .expect("write invalid status fixture marker");
     if let Some(status_bytes) = status_bytes {
         let bin = image.path().join("bin");
         std::fs::create_dir_all(&bin).expect("create status component directory");
@@ -1191,17 +946,13 @@ async fn wait_for_pin_release(client: &reqwest::Client, kubo_addr: SocketAddr, c
     }
 }
 
-/// The kernel-independent behavioral contract. Every driver runs against the
-/// embedded Rust PID0 and the explicit `file:` Glia PID0 through named
-/// wrappers. Drivers assert host-observable behavior (admin plane, data
-/// plane, host lifecycle events, exit codes) plus the shared
-/// `INITIAL_INIT_FAILED` failure token. They must not assert same-instance
-/// re-graft behavior, guest generation counters, per-kernel log wording, or
-/// anything reachable only through the temporary `/ww/0.1.0` surface.
-mod shared_parity {
+/// The Rust PID0 lifecycle contract. Drivers assert host-observable behavior:
+/// admin and data planes, host lifecycle events, exit codes, and the
+/// `INITIAL_INIT_FAILED` failure token.
+mod rust_lifecycle {
     use super::*;
 
-    async fn boot_and_tty_driver(kernel: KernelUnderTest) {
+    async fn boot_and_tty_driver() {
         let _guard = e2e_lock().await;
         let status_wasm = required_artifact(STATUS_WASM_PATH);
         assert!(
@@ -1216,8 +967,9 @@ mod shared_parity {
             .expect("bind delayed Kubo proxy");
         let proxy_addr = proxy_listener.local_addr().expect("read proxy address");
         let home = tempfile::tempdir().expect("create isolated HOME");
-        let mut options = NodeOptions::embedded(Some(http_addr));
-        let (kernel_wasm, kernel_source) = kernel.select(&mut options);
+        let options = NodeOptions::embedded(Some(http_addr));
+        let kernel_wasm = required_artifact(KERNEL_WASM_PATH);
+        let kernel_source = "embedded:main";
         let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
 
         let health_url = format!("http://{admin_addr}/healthz");
@@ -1268,7 +1020,7 @@ mod shared_parity {
         );
     }
 
-    async fn initial_failure_driver(kernel: KernelUnderTest) {
+    async fn initial_failure_driver() {
         let _guard = e2e_lock().await;
         let (kubo_addr, client) = require_kubo().await;
         for status_bytes in [None, Some(b"corrupt status component".as_slice())] {
@@ -1278,7 +1030,6 @@ mod shared_parity {
             let home = tempfile::tempdir().expect("create isolated HOME");
             let mut options = NodeOptions::embedded(Some(http_addr));
             options.mounts = vec![image.path().display().to_string()];
-            kernel.select(&mut options);
             let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
             let (exit, _samples) =
                 wait_for_exit_without_readiness(&client, admin_addr, &mut node).await;
@@ -1300,7 +1051,7 @@ mod shared_parity {
         }
     }
 
-    async fn epoch_replacement_driver(kernel: KernelUnderTest) {
+    async fn epoch_replacement_driver() {
         let _guard = e2e_lock().await;
         let status_wasm = required_artifact(STATUS_WASM_PATH);
         let (variant_a, cid_a) = status_variant(&status_wasm, b"variant-a");
@@ -1318,8 +1069,7 @@ mod shared_parity {
         let listen_addr = unused_addr().await;
         let home = tempfile::tempdir().expect("create isolated epoch HOME");
         let (_signing_key, identity_path, _peer_id) = persistent_identity(home.path());
-        let mut options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
-        kernel.select(&mut options);
+        let options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
         let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
         let ready_url = format!("http://{admin_addr}/readyz");
 
@@ -1394,7 +1144,7 @@ mod shared_parity {
         );
     }
 
-    async fn epoch_burst_driver(kernel: KernelUnderTest) {
+    async fn epoch_burst_driver() {
         let _guard = e2e_lock().await;
         let status_wasm = required_artifact(STATUS_WASM_PATH);
         let (variant_a, cid_a) = status_variant(&status_wasm, b"variant-a");
@@ -1413,8 +1163,7 @@ mod shared_parity {
         let listen_addr = unused_addr().await;
         let home = tempfile::tempdir().expect("create isolated burst HOME");
         let (_signing_key, identity_path, _peer_id) = persistent_identity(home.path());
-        let mut options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
-        kernel.select(&mut options);
+        let options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
         let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
         let ready_url = format!("http://{admin_addr}/readyz");
         wait_for_ready(&client, &ready_url, &mut node).await;
@@ -1471,7 +1220,7 @@ mod shared_parity {
         );
     }
 
-    async fn replacement_failure_driver(kernel: KernelUnderTest) {
+    async fn replacement_failure_driver() {
         let _guard = e2e_lock().await;
         let status_wasm = required_artifact(STATUS_WASM_PATH);
         let (variant_a, cid_a) = status_variant(&status_wasm, b"variant-a");
@@ -1487,8 +1236,7 @@ mod shared_parity {
         let listen_addr = unused_addr().await;
         let home = tempfile::tempdir().expect("create isolated failure HOME");
         let (_signing_key, identity_path, _peer_id) = persistent_identity(home.path());
-        let mut options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
-        kernel.select(&mut options);
+        let options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
         // Delay host fetches of the invalid root so the closed-readiness
         // window between the epoch advance and the authoritative failure is
         // reliably observable.
@@ -1536,7 +1284,7 @@ mod shared_parity {
         );
     }
 
-    async fn interactive_replacement_driver(kernel: KernelUnderTest) {
+    async fn interactive_replacement_driver() {
         let _guard = e2e_lock().await;
         let status_wasm = required_artifact(STATUS_WASM_PATH);
         let (kubo_addr, client) = require_kubo().await;
@@ -1553,7 +1301,6 @@ mod shared_parity {
         let (_signing_key, identity_path, _peer_id) = persistent_identity(home.path());
         let mut options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
         options.tty = true;
-        kernel.select(&mut options);
         let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
         wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
 
@@ -1571,78 +1318,40 @@ mod shared_parity {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn glia_pid0_boot_and_tty_parity() {
-        boot_and_tty_driver(EXPLICIT_GLIA).await;
+    async fn rust_pid0_boot_and_tty() {
+        boot_and_tty_driver().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rust_pid0_boot_and_tty_parity() {
-        boot_and_tty_driver(EMBEDDED_RUST).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn glia_pid0_initial_failure_parity() {
-        initial_failure_driver(EXPLICIT_GLIA).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rust_pid0_initial_failure_parity() {
-        initial_failure_driver(EMBEDDED_RUST).await;
+    async fn rust_pid0_initial_failure() {
+        initial_failure_driver().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn glia_pid0_replacement_parity() {
+    async fn rust_pid0_replacement() {
         tokio::task::LocalSet::new()
-            .run_until(epoch_replacement_driver(EXPLICIT_GLIA))
+            .run_until(epoch_replacement_driver())
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rust_pid0_replacement_parity() {
+    async fn rust_pid0_rapid_replacement() {
         tokio::task::LocalSet::new()
-            .run_until(epoch_replacement_driver(EMBEDDED_RUST))
+            .run_until(epoch_burst_driver())
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn glia_pid0_rapid_replacement_parity() {
+    async fn rust_pid0_replacement_failure() {
         tokio::task::LocalSet::new()
-            .run_until(epoch_burst_driver(EXPLICIT_GLIA))
+            .run_until(replacement_failure_driver())
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rust_pid0_rapid_replacement_parity() {
+    async fn rust_pid0_interactive_replacement() {
         tokio::task::LocalSet::new()
-            .run_until(epoch_burst_driver(EMBEDDED_RUST))
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn glia_pid0_replacement_failure_parity() {
-        tokio::task::LocalSet::new()
-            .run_until(replacement_failure_driver(EXPLICIT_GLIA))
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn rust_pid0_replacement_failure_parity() {
-        tokio::task::LocalSet::new()
-            .run_until(replacement_failure_driver(EMBEDDED_RUST))
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn glia_pid0_interactive_replacement_parity() {
-        tokio::task::LocalSet::new()
-            .run_until(interactive_replacement_driver(EXPLICIT_GLIA))
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn rust_pid0_interactive_replacement_parity() {
-        tokio::task::LocalSet::new()
-            .run_until(interactive_replacement_driver(EMBEDDED_RUST))
+            .run_until(interactive_replacement_driver())
             .await;
     }
 }
@@ -2055,270 +1764,4 @@ async fn superseded_pending_generation_converges_to_the_newer_epoch() {
             proxy_task.abort();
         })
         .await;
-}
-
-/// Coverage that rides the temporary `/ww/0.1.0` guest-membrane surface:
-/// Terminal grafting, semantic probes, and stale-capability delivery to a
-/// remote holder. This module shrinks or disappears when that surface is
-/// retired with the Glia shell/MCP; deleting it must not weaken
-/// `shared_parity`, which never touches `/ww/0.1.0`.
-mod ww_protocol_compat {
-    use super::*;
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn real_atom_epoch_transition_replaces_explicit_glia_pid0() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let _guard = e2e_lock().await;
-                let status_wasm = required_artifact(STATUS_WASM_PATH);
-                let (kubo_addr, client) = require_kubo().await;
-                let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
-                let epoch1 = EpochRoot::valid(&ipfs, &status_wasm, 1).await;
-                let epoch2 = EpochRoot::valid(&ipfs, &status_wasm, 2).await;
-                let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
-                let initial_receipt = atom.set_head(&epoch1.cid).await;
-                assert!(!initial_receipt.hash.is_empty());
-                assert_eq!(initial_receipt.transaction_index, 0);
-
-                let admin_addr = unused_addr().await;
-                let http_addr = unused_addr().await;
-                let listen_addr = unused_addr().await;
-                let home = tempfile::tempdir().expect("create isolated epoch HOME");
-                let (signing_key, identity_path, peer_id) = persistent_identity(home.path());
-                let mut options =
-                    epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
-                let (kernel_wasm, kernel_source) = EXPLICIT_GLIA.select(&mut options);
-                let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
-                let ready_url = format!("http://{admin_addr}/readyz");
-                let ready = wait_for_ready(&client, &ready_url, &mut node).await;
-                assert_eq!(ready["phase"], "ready");
-                let identity = version(&client, admin_addr).await;
-                assert_eq!(identity["kernel_source"], kernel_source);
-                assert_eq!(
-                    identity["kernel_cid"],
-                    ww::kernel::runtime_cid(&kernel_wasm).to_string()
-                );
-                assert_status_route(&client, http_addr).await;
-                assert_route_available(&client, http_addr, &epoch1.route).await;
-                assert_route_unavailable(&client, http_addr, &epoch2.route).await;
-
-                let terminal =
-                    TerminalSession::connect(peer_id, terminal_address(listen_addr), &signing_key)
-                        .await;
-                terminal
-                    .graft
-                    .semantic_probes(
-                        &signing_key,
-                        &status_wasm,
-                        &epoch1.marker_path(),
-                        &epoch1.marker,
-                    )
-                    .await;
-                let retained_old_host = terminal.graft.host.clone();
-
-                let replacement_receipt = atom.set_head(&epoch2.cid).await;
-                assert!(
-                    replacement_receipt.block_number > initial_receipt.block_number,
-                    "Atom head updates must be mined in order"
-                );
-                wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
-                let replacing = wait_for_not_ready(&client, admin_addr, &mut node).await;
-                assert_eq!(replacing["ready"], false);
-                assert_eq!(
-                    replacing["phase"], "kernel-not-ready",
-                    "epoch advance must close readiness before replacement commit: {replacing}"
-                );
-                assert_route_unavailable(&client, http_addr, &epoch1.route).await;
-                assert_route_unavailable(&client, http_addr, &epoch2.route).await;
-                expect_stale_or_disconnected(&retained_old_host).await;
-
-                let recovered = wait_for_ready(&client, &ready_url, &mut node).await;
-                assert_eq!(recovered["phase"], "ready");
-                assert_status_route(&client, http_addr).await;
-                assert_route_unavailable(&client, http_addr, &epoch1.route).await;
-                assert_route_available(&client, http_addr, &epoch2.route).await;
-
-                let fresh_terminal =
-                    TerminalSession::connect(peer_id, terminal_address(listen_addr), &signing_key)
-                        .await;
-                fresh_terminal
-                    .graft
-                    .semantic_probes(
-                        &signing_key,
-                        &status_wasm,
-                        &epoch2.marker_path(),
-                        &epoch2.marker,
-                    )
-                    .await;
-
-                let logs = node.logs();
-                assert_eq!(
-                    count_log_lines(&logs, "event_code=3"),
-                    1,
-                    "one Atom epoch transition must replace one PID0 generation\n{logs}"
-                );
-                let old_unregistered =
-                    log_position(&logs, "unregistered HTTP route", &epoch1.route);
-                let replacement_registered =
-                    log_position(&logs, "registered HTTP route", &epoch2.route);
-                assert!(
-                    old_unregistered < replacement_registered,
-                    "old-generation teardown must precede replacement activation\n{logs}"
-                );
-                assert_eq!(
-                    count_log_lines_with(&logs, "registered HTTP route", &epoch2.route),
-                    1,
-                    "exactly one replacement generation route must register\n{logs}"
-                );
-                assert_eq!(
-                    count_log_lines_with(&logs, "unregistered HTTP route", &epoch2.route),
-                    0,
-                    "the committed replacement route must remain live\n{logs}"
-                );
-            })
-            .await;
-    }
-}
-
-/// Glia-implementation-specific behavior retained during coexistence: the
-/// interactive REPL and SysV best-effort init.d choreography (including
-/// partial-route teardown during a failed replacement, which requires a
-/// multi-form init script only the Glia kernel can execute). This module is
-/// deleted with the Glia kernel.
-mod glia_specific {
-    use super::*;
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tty_enters_repl_before_eof() {
-        let _guard = e2e_lock().await;
-        let status_wasm = required_artifact(STATUS_WASM_PATH);
-        let (kubo_addr, client) = require_kubo().await;
-        let admin_addr = unused_addr().await;
-        let http_addr = unused_addr().await;
-        let home = tempfile::tempdir().expect("create isolated HOME");
-        let mut options = NodeOptions::embedded(Some(http_addr));
-        EXPLICIT_GLIA.select(&mut options);
-        let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
-        wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
-        assert_status_cell(&client, http_addr, &ww::kernel::runtime_cid(&status_wasm)).await;
-        node.close_stdin();
-        let exit = node.wait(EXIT_TIMEOUT).await;
-        let logs = node.logs();
-        assert_eq!(exit.code(), Some(0), "unexpected host exit\n{logs}");
-        assert!(
-            logs.contains("\u{276f}"),
-            "Glia pid0 never entered its TTY REPL\n{logs}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn replacement_init_failure_exits_nonzero_without_stale_or_partial_routes() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let _guard = e2e_lock().await;
-                let status_wasm = required_artifact(STATUS_WASM_PATH);
-                let (kubo_addr, client) = require_kubo().await;
-                let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
-                let epoch1 = EpochRoot::valid(&ipfs, &status_wasm, 1).await;
-                let invalid = EpochRoot::failing(&ipfs, &status_wasm).await;
-                let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
-                atom.set_head(&epoch1.cid).await;
-
-                let admin_addr = unused_addr().await;
-                let http_addr = unused_addr().await;
-                let listen_addr = unused_addr().await;
-                let home = tempfile::tempdir().expect("create isolated init-failure HOME");
-                let (signing_key, identity_path, peer_id) = persistent_identity(home.path());
-                let mut options =
-                    epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
-                EXPLICIT_GLIA.select(&mut options);
-                let proxy_listener = TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .expect("bind replacement-delay Kubo proxy");
-                let proxy_addr = proxy_listener.local_addr().expect("read proxy address");
-                let proxy_task =
-                    start_delayed_kubo_proxy(proxy_listener, kubo_addr, invalid.delay_cid.clone());
-                let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
-                wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
-                assert_status_route(&client, http_addr).await;
-                assert_route_available(&client, http_addr, &epoch1.route).await;
-                let terminal =
-                    TerminalSession::connect(peer_id, terminal_address(listen_addr), &signing_key)
-                        .await;
-                let retained_old_host = terminal.graft.host.clone();
-
-                atom.set_head(&invalid.cid).await;
-                wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
-                let initial_unready = wait_for_not_ready(&client, admin_addr, &mut node).await;
-                assert_eq!(initial_unready["ready"], false);
-                let (observation, ()) = tokio::join!(
-                    wait_for_exit_while_unready(
-                        &client,
-                        admin_addr,
-                        http_addr,
-                        &epoch1.route,
-                        &invalid.route,
-                        &mut node,
-                    ),
-                    expect_stale_or_disconnected(&retained_old_host),
-                );
-                let logs = node.logs();
-                assert_eq!(
-                    observation.exit.code(),
-                    Some(1),
-                    "replacement init failure must propagate nonzero\n{logs}"
-                );
-                assert!(
-                    observation.readiness_samples > 0,
-                    "failed replacement exited without any readiness observations\n{logs}"
-                );
-                assert!(
-                    observation.saw_partial_route_live,
-                    "failure fixture registered but never preflighted a live partial route\n{logs}"
-                );
-                assert!(
-                    observation.saw_kernel_not_ready_with_live_route,
-                    "a live partial route overrode authoritative kernel readiness\n{logs}"
-                );
-                assert!(
-                    observation.saw_partial_route_removed,
-                    "partial replacement route was not removed after failure\n{logs}"
-                );
-                assert!(
-                    logs.contains("event_code=2"),
-                    "replacement failure omitted the host lifecycle event\n{logs}"
-                );
-                assert!(
-                    logs.lines().any(|line| {
-                        line.contains("registered HTTP route") && line.contains(&invalid.route)
-                    }),
-                    "failure fixture never exercised partial replacement registration\n{logs}"
-                );
-                let old_unregistered =
-                    log_position(&logs, "unregistered HTTP route", &epoch1.route);
-                let partial_registered =
-                    log_position(&logs, "registered HTTP route", &invalid.route);
-                let partial_unregistered =
-                    log_position(&logs, "unregistered HTTP route", &invalid.route);
-                assert!(
-                    old_unregistered < partial_registered
-                        && partial_registered < partial_unregistered,
-                    "old and partial registration teardown ordering changed\n{logs}"
-                );
-                assert!(
-                    !logs
-                        .lines()
-                        .any(|line| line.contains("Kernel exited") && line.contains("code=0")),
-                    "failed replacement followed the accidental success path\n{logs}"
-                );
-                assert!(
-                    !logs.contains("Transient epoch preparation failure"),
-                    "Host classified a PID0-owned failure for retry\n{logs}"
-                );
-                proxy_task.abort();
-            })
-            .await;
-    }
 }

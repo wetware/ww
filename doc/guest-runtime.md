@@ -16,7 +16,7 @@ PID0 additionally imports the versioned private
 `wetware:kernel-runtime/readiness@1.0.0` interface. The native runtime installs
 this interface only on the trusted PID0 linker; ordinary cell linkers omit it.
 Its argument-free `kernel-ready` function (`kernel_ready()` in generated Rust)
-commits the generation recorded by PID0's process-local graft after init/init.d
+commits the generation recorded by PID0's process-local graft after composition
 completes. Because a WIT host function is not a Cap'n Proto capability value,
 it cannot appear in a graft, be delegated to a child, or cross a network
 connection.

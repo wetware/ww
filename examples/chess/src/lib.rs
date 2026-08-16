@@ -2,9 +2,6 @@
 
 //! Chess guest: cross-node play via RPC capability cells.
 //!
-//! This binary serves two roles, selected by env vars set in the
-//! init.d script (`etc/init.d/chess.glia`):
-//!
 //! Two modes, selected by subcommand:
 //!
 //! **Cell mode** (no args, default): creates a ChessEngine and exports it via
