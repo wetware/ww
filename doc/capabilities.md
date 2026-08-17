@@ -85,7 +85,9 @@ Trusted pid0 receives the host capabilities below. An ordinary child receives
 only the named references its parent supplied in the `Executor.spawn` caps
 list or a listener's registration-time grant template. Each `Export` entry
 carries an inert name and a capability reference. The reference carries
-authority; the name does not resolve authority.
+authority; the name does not resolve authority. `identity` requires a
+configured signing key. `http-client` requires a non-empty `--http-dial`
+allowlist.
 
 | Capability | What it does |
 |------------|--------------|
@@ -94,6 +96,7 @@ authority; the name does not resolve authority.
 | **host** | Peer identity, listen addresses, connected peers, network access |
 | **runtime** | Load WASM binaries and obtain scoped Executors (with compilation caching) |
 | **routing** | Kademlia DHT: provide and find content/services |
+| **ipfs** | Read `/ipfs`, `/ipns`, or `/ipld` content through a `ByteStream` |
 | **http-client** | Outbound HTTP requests, gated by `--http-dial` allowlist |
 Application-specific entries use their parent-chosen grant-map keys.
 
@@ -107,7 +110,7 @@ re-graft. The Host terminates the old PID0 and starts a fresh PID0 for the new
 generation. Epoch guards do not revoke arbitrary capability
 references that were not issued by the host.
 
-### Content access (WASI path I/O only)
+### Filesystem content access
 
 Cells do not receive an explicit filesystem capability over the membrane.
 Filesystem substrate is fixed by the trusted execution context:
@@ -126,9 +129,10 @@ explicit `/ipfs/<cid>/...` paths. The WASI virtual filesystem and its reachable
 CID tree govern guest path I/O. The membrane governs RPC capability authority.
 
 Known-CID cache wiring is execution-context state, not a child-visible control
-capability. A child cannot replace or widen it, and it provides no
-CID enumeration, mutation, pin management, publishing, routing, arbitrary
-dialing, ambient network API, or `ipfs` RPC capability.
+capability. A child cannot replace or widen it. The separate `ipfs` graft
+export can be delegated explicitly and provides `Ipfs.read()` through a
+`ByteStream`; it does not expose cache controls, mutation, pin management,
+publishing, routing, or arbitrary dialing.
 
 This does not mean a CAS read has no node effect. A read can fetch over the
 node's network, pin and materialize blocks on disk, occupy cache budget, affect

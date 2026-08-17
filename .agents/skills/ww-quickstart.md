@@ -45,8 +45,9 @@ The response reports `status: "ok"` and a non-null `peer_id`.
 
 1. Started a **libp2p swarm** on the configured port
 2. Loaded embedded `std/kernel/bin/main.wasm` — the Rust kernel Cell (pid0)
-3. Spawned it with a **Membrane** — the capability hub that grants
-   Host, Executor, IPFS, Routing, and Identity via Cap'n Proto RPC
+3. Spawned it with a **Membrane** whose `graft()` returns a `List(Export)`.
+   Canonical exports are `identity`, `host`, `runtime`, `routing`,
+   `authority`, and `ipfs`; `http-client` appears when configured.
 
 The kernel grafted onto the Membrane, received epoch-scoped
 capabilities, and installed the `/status` cell with an explicit `host` grant.

@@ -29,13 +29,14 @@ Work through these questions *conversationally* — don't present
 them as a checklist.  Weave them into the discussion as they
 become relevant.  One at a time.
 
-- **What cell type fits?**  This is the first architectural decision.
+- **What service transport fits?**  This is the first network decision.
   Explain the options briefly and help them choose:
-  - `raw` — custom binary protocols, file transfer, tunneling
-  - `http` — REST APIs, web services, familiar tooling
-  - `capnp` — typed capabilities, schema-addressed discovery,
-    bidirectional RPC
-  - pid0 — the agent IS the kernel (rare, advanced)
+  - byte stream — custom binary protocols through `StreamListener.listen()`
+  - HTTP/WAGI — HTTP routes through `HttpListener.listen()`
+  - Cap'n Proto vat — typed capabilities published through
+    `VatListener.serveAuthenticated()` or the explicit raw escape hatch
+  - no network publication — an ordinary child used only through delegated
+    capabilities
 
   If they're unsure: "What does your app's network interface look
   like?  HTTP endpoints?  Binary streams?  Typed RPC?"
@@ -62,14 +63,13 @@ When you have enough to sketch an architecture, say so:
 
 Based on discovery, produce a concrete design.  Cover:
 
-- **Cell type and protocol**: confirm the type.  For `capnp`
-  cells, sketch the `.capnp` interface.  For `http`, define
-  endpoints.  For `raw`, define the wire format.
+- **Service transport and protocol**: confirm the registration or publication
+  API. For Cap'n Proto vats, sketch the `.capnp` interface. For HTTP, define
+  endpoints. For byte streams, define the wire format.
 - **Image layout**: what goes in `bin/`, `svc/`, `etc/`.
   Reference `doc/images.md`.
-- **Build pipeline**: source → WASM component → `schema-inject`
-  (if non-pid0).  Reference `examples/counter/Makefile` as
-  template.
+- **Build pipeline**: source → WASI P2 component. Reference
+  `examples/counter/Makefile` as a Rust template.
 - **Capability map**: which capabilities each agent needs.  Flag
   anything that could be attenuated.  Reference `doc/capabilities.md`.
 - **Membrane design**: what pid0 exports, what children receive.
@@ -78,8 +78,8 @@ Based on discovery, produce a concrete design.  Cover:
 
 Present the architecture as a structured outline or diagram.
 
-⚗️ Milestone: "Design phase done — we've mapped out agents, cell
-types, capabilities, and coordination."  Then ask:
+⚗️ Milestone: "Design phase done — we've mapped out agents, transports,
+capabilities, and coordination."  Then ask:
 
 > Does this match what you had in mind?  Anything to change before
 > we write it up?
@@ -91,10 +91,10 @@ Get sign-off before moving to the handoff.
 Produce a design document another human (or AI) can execute from:
 
 - System diagram showing agents, capabilities, and data flow
-- Cell type for each agent
+- Service transport and registration API for each agent
 - Capability map: per-agent capabilities and attenuations
 - Image layout: directory tree
-- Build pipeline: compile + inject steps
+- Build pipeline: component compilation steps
 - Protocol specs: interface sketches, endpoints, or wire format
 - Open questions and risks
 

@@ -34,7 +34,8 @@ Architecture (three layers):
   `CidTree` root, and owns PID0 replacement across epochs.
 - **Kernel** (`std/kernel`): calls `membrane.graft()` once, loads
   `$WW_ROOT/bin/status.wasm`, grants `host`, installs `/status`, calls
-  `kernel_ready()`, and remains alive until Host termination.
+  `kernel_ready()`, and normally remains alive until Host termination.
+  Interactive `WW_TTY` execution can also end on stdin EOF.
 - **Ordinary children**: spawned with an immutable `InitialAuthorityRecord`
   delivered by `InitialGrants`; they do not receive `Membrane.graft()`.
 

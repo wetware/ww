@@ -62,7 +62,8 @@ The Rust PID0 follows one straight-line sequence for each generation:
 2. Read `$WW_ROOT/bin/status.wasm`.
 3. Load the status component, grant `host`, and register `/status`.
 4. Call the private `kernel_ready()` import.
-5. Remain alive until the Host terminates the generation.
+5. Normally remain alive until the Host terminates the generation. With
+   `WW_TTY`, stdin EOF also ends PID0.
 
 PID0 does not poll for stale epochs and does not re-graft. The Host owns epoch
 awareness, PID0 termination, and PID0 replacement.
@@ -136,13 +137,18 @@ Host preparation does not activate.
 
 Route registrations are epoch-scoped and identity-owned. A stale registration
 stops dispatching immediately, and cleanup from an old registration cannot
-delete a fresh replacement. Route liveness is not a kernel-readiness signal.
+delete a fresh replacement. Route liveness does not change
+`KernelReadyGate`.
 
 Readiness has one commit event. After composition, trusted PID0 calls the
 argument-free private Component Model import
 `wetware:kernel-runtime/readiness@1.0.0` function `kernel-ready`. The host
 derives the generation from the process-local graft, rejects a stale
-generation, and commits `KernelReadyGate`; `/readyz` reads that gate directly.
+generation, and commits `KernelReadyGate`. Kernel readiness is this gate alone.
+Externally observed `/readyz` requires both kernel readiness and, when the HTTP
+route registry is configured, at least one live route. Without a route
+registry, the route condition is satisfied.
+
 The import is installed only on PID0's linker, is not a Cap'n Proto capability
 value, and therefore cannot be delegated to children or transferred over the
 network.

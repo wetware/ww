@@ -26,7 +26,8 @@ If they want to browse, show the menu:
 
 > Pick a topic, or tell me what you're trying to do:
 >
-> 1. **Cell types** — raw, http, capnp, pid0 (`capnp/cell.capnp`)
+> 1. **Guest and service transports** — host bootstrap, byte streams, HTTP,
+>    and Cap'n Proto vats (`doc/api/wasm-guest.md`, `capnp/system.capnp`)
 > 2. **System capabilities** — Host, Executor, Process, streams
 >    (`capnp/system.capnp`)
 > 3. **Membrane & auth** — Terminal, Membrane, Epoch, Identity
@@ -35,17 +36,15 @@ If they want to browse, show the menu:
 >    (`capnp/routing.capnp`, `doc/routing.md`)
 > 5. **CLI** — flags, subcommands, env vars (`doc/cli.md`)
 > 6. **RPC transport** — duplex streams, scheduling (`doc/rpc-transport.md`)
-> 7. **schema-inject** — post-build cell type injection
->    (`crates/schema-id/src/bin/schema-inject.rs`)
-> 8. **Signing & keys** — Signer interface, key derivation
+> 7. **Signing & keys** — Signer interface, key derivation
 >     (`doc/keys.md`)
-> 9. **Cross-crate schemas** — sharing Cap'n Proto definitions
+> 8. **Cross-crate schemas** — sharing Cap'n Proto definitions
 >     across crates (`doc/capnp-cross-crate.md`)
-> 10. **Guest API** — WASI bindings for guest WASM modules
+> 9. **Guest API** — WASI bindings for guest WASM modules
 >     (`doc/api/wasm-guest.md`)
-> 11. **Guest runtime** — poll loop, Cap'n Proto RPC, and WASI
+> 10. **Guest runtime** — poll loop, Cap'n Proto RPC, and WASI
 >     integration (`doc/guest-runtime.md`)
-> 12. **Design docs** — historical and current design records
+> 11. **Design docs** — historical and current design records
 >     (`doc/designs/`; check each document's status header)
 
 ## How to present reference material
@@ -55,17 +54,10 @@ When walking through a `.capnp` file:
 - Then show the schema definition
 - One interface at a time — don't dump the whole file
 
-For `schema-inject`, run `cargo run -p schema-id --bin schema-inject -- --help`
-yourself and show the user the actual CLI output.  Then walk through
-the three modes with examples:
-- `--raw bitswap` — raw libp2p streams
-- `--http /api/v1` — HTTP/FastCGI routing
-- `--capnp schema.bytes [--no-ipfs]` — typed Cap'n Proto RPC
-
-Note: `--no-ipfs` (capnp only) skips pushing canonical schema bytes
-to IPFS via Kubo.  Useful offline or when Kubo isn't running.
-Protocol IDs for raw cells must not contain `/` (host prefixes
-`/ww/0.1.0/stream/` automatically).
+For service transports, show the relevant `capnp/system.capnp` method. Explain
+that the registration or publication call selects the transport. The host does
+not read a custom section to select one. Protocol names must not contain `/`;
+the host adds `/ww/0.1.0/stream/` or `/ww/0.1.0/vat/`.
 
 ## After each topic
 
