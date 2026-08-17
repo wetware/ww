@@ -1,5 +1,18 @@
 # TODOs
 
+## Custom domain for the architecture map
+**What:** Serve the GitHub Pages architecture map at `map.wetware.run`.
+**Why:** The default project URL, `https://wetware.github.io/ww/`, is suitable for
+the initial deployment. A `wetware.run` subdomain provides a first-party address
+without replacing the existing VPS landing page at `wetware.run`.
+**Context:** Complete only after the Pages artifact deployment works. Configure the
+custom domain in GitHub Pages first, then add `map.wetware.run` as a CNAME for
+`wetware.github.io`, complete GitHub domain verification, and enable HTTPS. Do not
+change the apex `wetware.run` DNS record or add a VPS reverse proxy for this work.
+**Effort:** XS-S
+**Priority:** P3
+**Depends on:** Interactive architecture-map Pages deployment
+
 ## Recursive attenuation for named vat services — SHIPPED 2026-07
 **What:** Done via the single-authority capability model (eng review
 2026-07-17; PRs #563–#568 plus the attenuation reification PR).

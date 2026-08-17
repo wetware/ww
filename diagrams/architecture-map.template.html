@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wetware Architecture Map</title>
+  <style>
+    :root { --paper:#d4cc98; --paper-dark:#beb67f; --ink:#141712; --muted:#686854; --line:#2a2d20; --panel:rgba(214,207,157,.94); }
+    * { box-sizing:border-box; }
+    body { margin:0; overflow:hidden; background:var(--paper); color:var(--ink); font-family:"SFMono-Regular",Menlo,Monaco,Consolas,monospace; letter-spacing:.02em; }
+    button { font:inherit; color:inherit; background:transparent; border:1px solid var(--ink); cursor:pointer; }
+    button:hover, button:focus-visible { background:var(--ink); color:var(--paper); outline:none; }
+    .topbar { position:fixed; inset:0 0 auto; z-index:5; height:52px; display:grid; grid-template-columns:2.2fr repeat(4,1fr) auto; border-bottom:2px solid var(--ink); background:var(--paper-dark); }
+    .metric { padding:6px 12px; border-right:1px solid rgba(20,23,18,.35); }
+    .metric b { display:block; font-size:11px; letter-spacing:.15em; color:var(--muted); }
+    .metric span { display:block; margin-top:3px; font-size:14px; white-space:nowrap; }
+    .controls { align-self:center; display:flex; gap:7px; padding:0 12px; }
+    .controls button { padding:6px 9px; font-size:11px; letter-spacing:.1em; }
+    .sidebar, .detail { position:fixed; top:52px; bottom:0; z-index:4; background:var(--panel); }
+    .sidebar { left:0; width:207px; border-right:2px solid var(--ink); overflow:auto; }
+    .detail { right:0; width:360px; border-left:2px solid var(--ink); overflow:auto; }
+    .side-title { margin:0; padding:18px 12px 8px; font-size:11px; letter-spacing:.16em; color:var(--muted); }
+    .nav-button { width:100%; min-height:44px; padding:7px 12px; border:0; border-top:1px solid var(--line); text-align:left; }
+    .nav-button:last-child { border-bottom:1px solid var(--line); }
+    .nav-button span { display:block; font-size:10px; color:var(--muted); }
+    .nav-button strong { display:block; margin-top:3px; font-size:12px; font-weight:600; letter-spacing:.08em; }
+    .nav-button.is-active { background:var(--ink); color:var(--paper); }
+    .nav-button.is-active span { color:var(--paper-dark); }
+    main { position:fixed; inset:52px 360px 0 207px; overflow:hidden; }
+    .canvas-label { position:absolute; top:18px; left:24px; z-index:2; font-size:11px; color:var(--muted); letter-spacing:.14em; }
+    .legend { position:absolute; z-index:2; left:24px; bottom:16px; font-size:10px; color:var(--muted); letter-spacing:.09em; }
+    #map { width:100%; height:100%; display:block; cursor:grab; }
+    #map.is-panning { cursor:grabbing; }
+    .node { cursor:pointer; }
+    .node:focus { outline:none; }
+    .node .top { fill:#d8d09e; stroke:var(--ink); stroke-width:1.4; }
+    .node .front { fill:url(#hatch); stroke:var(--ink); stroke-width:1.4; }
+    .node .side { fill:#c1b97f; stroke:var(--ink); stroke-width:1.4; }
+    .node .label { font-size:13px; font-weight:700; text-anchor:middle; fill:var(--ink); }
+    .node .id { font-size:9px; text-anchor:middle; fill:var(--muted); }
+    .node.is-active .top, .node:hover .top, .node.is-active .front, .node:hover .front, .node.is-active .side, .node:hover .side { fill:var(--ink); }
+    .node.is-active .label, .node:hover .label { fill:var(--paper); }
+    .node.is-active .id, .node:hover .id { fill:var(--paper-dark); }
+    .route { fill:none; stroke:var(--ink); stroke-width:1.6; opacity:.78; }
+    .route.secondary { stroke-dasharray:6 5; opacity:.44; }
+    .signal { fill:var(--ink); }
+    .grid { stroke:#817c5f; opacity:.22; stroke-width:1; }
+    .canvas-controls { position:absolute; z-index:3; right:18px; top:16px; display:grid; gap:6px; }
+    .canvas-controls button { width:30px; height:30px; font-size:16px; line-height:1; }
+    .tabs { display:flex; border-bottom:2px solid var(--ink); }
+    .tab { flex:1; border:0; border-right:1px solid var(--ink); padding:10px 4px; font-size:10px; letter-spacing:.12em; }
+    .tab:last-child { border-right:0; }
+    .tab.is-active { background:var(--ink); color:var(--paper); }
+    .detail-body { padding:20px 18px 36px; }
+    .eyebrow { margin:0 0 8px; color:var(--muted); font-size:11px; letter-spacing:.15em; }
+    h1 { margin:0 0 5px; font-size:23px; letter-spacing:.03em; }
+    .subtitle { margin:0 0 22px; font-size:12px; color:var(--muted); }
+    .rule { border:0; border-top:2px solid var(--ink); margin:20px 0 13px; }
+    h2 { margin:0 0 10px; font-size:11px; letter-spacing:.15em; color:var(--muted); }
+    p, li { font-size:12px; line-height:1.56; }
+    p { margin:0 0 14px; }
+    ul { margin:0; padding-left:19px; }
+    .path { display:block; margin-top:8px; padding:9px; border:1px solid var(--line); font-size:11px; line-height:1.45; overflow-wrap:anywhere; }
+    .build-only { position:fixed; left:0; bottom:0; width:1px; height:1px; overflow:hidden; font-size:1px; color:transparent; }
+    @media (max-width:1100px) { .detail { width:300px; } main { right:300px; } .topbar { grid-template-columns:2fr repeat(2,1fr) auto; } .topbar .metric:nth-of-type(4), .topbar .metric:nth-of-type(5) { display:none; } }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="metric"><b>REPOSITORY</b><span>wetware / ww · Rust</span></div>
+    <div class="metric"><b>MAP NODES</b><span id="node-count"></span></div>
+    <div class="metric"><b>MAP ROUTES</b><span id="route-count"></span></div>
+    <div class="metric"><b>DEFAULT KERNEL</b><span>Rust pid0 · /status</span></div>
+    <div class="metric"><b>AUTHORITY MODEL</b><span>explicit grants</span></div>
+    <div class="controls"><button id="focus-flow">▶ TRACE BOOT</button><button id="reset">RESET MAP</button></div>
+  </header>
+  <nav class="sidebar" id="component-list" aria-label="Architecture components"></nav>
+  <main>
+    <div class="canvas-label">WETWARE / ARCHITECTURE MAP / MASTER @ __ARCHITECTURE_MAP_REVISION__ / CLICK A STRUCTURE TO INSPECT</div>
+    <div class="canvas-controls" aria-label="Map controls"><button id="zoom-in" aria-label="Zoom in">+</button><button id="zoom-out" aria-label="Zoom out">−</button><button id="view-reset" aria-label="Reset pan and zoom">⌂</button></div>
+    <svg id="map" role="img" aria-label="Interactive Wetware architecture map" viewBox="0 0 1420 870" preserveAspectRatio="xMidYMid meet"></svg>
+    <div class="legend">← DRAG TO PAN · SCROLL TO ZOOM · CLICK TO SELECT · TAB TO MOVE · ENTER TO INSPECT →</div>
+  </main>
+  <aside class="detail">
+    <div class="tabs"><button class="tab is-active" data-tab="what">WHAT IT DOES</button><button class="tab" data-tab="built">HOW IT'S BUILT</button></div>
+    <section class="detail-body" id="detail-body"></section>
+  </aside>
+  <script>
+    const architectureMap = __ARCHITECTURE_MAP_DATA__;
+    const nodes = Object.fromEntries(architectureMap.nodes.map(node => [node.key, node]));
+    const svg = document.querySelector('#map');
+    const ns = 'http://www.w3.org/2000/svg';
+    const make = (tag, attrs = {}) => { const element = document.createElementNS(ns, tag); Object.entries(attrs).forEach(([key, value]) => element.setAttribute(key, value)); return element; };
+    const html = (tag, className, value) => { const element = document.createElement(tag); if (className) element.className = className; if (value !== undefined) element.textContent = value; return element; };
+    const addText = (parent, value, x, y, className) => { const element = make('text', { x, y, class: className }); element.textContent = value; parent.appendChild(element); };
+    document.querySelector('#node-count').textContent = String(architectureMap.nodes.length);
+    document.querySelector('#route-count').textContent = String(architectureMap.routes.length);
+
+    const sidebar = document.querySelector('#component-list');
+    let currentGroup = '';
+    for (const node of architectureMap.nodes) {
+      if (node.group !== currentGroup) { currentGroup = node.group; sidebar.appendChild(html('p', 'side-title', currentGroup)); }
+      const button = html('button', 'nav-button');
+      button.type = 'button'; button.dataset.node = node.key;
+      button.append(html('span', '', `${node.id} · ${node.group}`), html('strong', '', node.label));
+      button.addEventListener('click', () => selectNode(node.key));
+      sidebar.appendChild(button);
+    }
+
+    const viewport = make('g', { id: 'viewport' });
+    const connector = route => {
+      const from = nodes[route.from]; const to = nodes[route.to];
+      const start = [from.x + from.w / 2, from.y + from.h / 2 + from.z / 3];
+      const end = [to.x + to.w / 2, to.y + to.h / 2 + to.z / 3];
+      const middle = Math.round((start[0] + end[0]) / 2);
+      viewport.appendChild(make('path', { d: `M ${start[0]} ${start[1]} L ${middle} ${start[1]} L ${middle} ${end[1]} L ${end[0]} ${end[1]}`, class: `route ${route.style === 'secondary' ? 'secondary' : ''}` }));
+      [start, end].forEach(([x, y]) => viewport.appendChild(make('circle', { cx: x, cy: y, r: 3, class: 'signal' })));
+    };
+    const drawNode = node => {
+      const group = make('g', { class: 'node', tabindex: '0', role: 'button', 'aria-label': `Inspect ${node.title}`, 'data-key': node.key });
+      const { x, y, w, h, z } = node; const dx = Math.round(z * .58);
+      group.append(make('polygon', { points: `${x},${y + h / 2} ${x + dx},${y} ${x + w + dx},${y} ${x + w},${y + h / 2}`, class: 'top' }), make('polygon', { points: `${x},${y + h / 2} ${x + w},${y + h / 2} ${x + w},${y + h / 2 + z} ${x},${y + h / 2 + z}`, class: 'front' }), make('polygon', { points: `${x + w},${y + h / 2} ${x + w + dx},${y} ${x + w + dx},${y + z} ${x + w},${y + h / 2 + z}`, class: 'side' }));
+      addText(group, node.id, x + w / 2, y + h / 2 - 4, 'id'); addText(group, node.label, x + w / 2, y + h / 2 + 13, 'label');
+      group.addEventListener('click', () => selectNode(node.key));
+      group.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectNode(node.key); } });
+      viewport.appendChild(group);
+    };
+    const defs = make('defs'); const pattern = make('pattern', { id: 'hatch', width: '5', height: '5', patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' });
+    pattern.appendChild(make('line', { x1: '0', y1: '0', x2: '0', y2: '5', stroke: '#3e402e', 'stroke-width': '1' })); defs.appendChild(pattern); svg.append(defs, viewport);
+    for (let x = -150; x < 1600; x += 75) viewport.appendChild(make('line', { x1: x, y1: 120, x2: x + 640, y2: 870, class: 'grid' }));
+    for (let x = 40; x < 1650; x += 75) viewport.appendChild(make('line', { x1: x, y1: 870, x2: x - 640, y2: 120, class: 'grid' }));
+    architectureMap.routes.forEach(connector); architectureMap.nodes.forEach(drawNode);
+
+    let selected = 'kernel'; let tab = 'what'; const detail = document.querySelector('#detail-body');
+    function selectNode(key) { selected = key; document.querySelectorAll('.node').forEach(node => node.classList.toggle('is-active', node.dataset.key === key)); document.querySelectorAll('.nav-button').forEach(button => button.classList.toggle('is-active', button.dataset.node === key)); renderDetail(); }
+    function renderDetail() {
+      const node = nodes[selected]; const content = tab === 'what' ? node.what : node.built;
+      const files = html('ul'); node.files.forEach(file => files.appendChild(html('li', 'path', file)));
+      detail.replaceChildren(html('p', 'eyebrow', node.group), html('h1', '', node.title), html('p', 'subtitle', node.subtitle), html('hr', 'rule'), html('h2', '', tab === 'what' ? 'WHAT THIS STRUCTURE DOES' : 'IMPLEMENTATION'), html('p', '', content), html('h2', '', 'SOURCE FILES'), files, html('hr', 'rule'), html('h2', '', 'HOW TO READ THE MAP'), html('p', '', 'Solid paths show boot, spawn, or request flow. Dashed paths show host-managed service paths. The shaded front face marks a capability boundary or a long-running service.'));
+    }
+    document.querySelectorAll('.tab').forEach(button => button.addEventListener('click', () => { tab = button.dataset.tab; document.querySelectorAll('.tab').forEach(item => item.classList.toggle('is-active', item === button)); renderDetail(); }));
+    document.querySelector('#reset').addEventListener('click', () => { resetView(); selectNode('kernel'); });
+    document.querySelector('#focus-flow').addEventListener('click', () => { const sequence = ['cli', 'loader', 'host', 'epoch', 'kernel', 'runtime', 'executor', 'cell']; let index = 0; selectNode(sequence[index]); const timer = setInterval(() => { index += 1; if (index === sequence.length) { clearInterval(timer); return; } selectNode(sequence[index]); }, 460); });
+    const pan = { x: 0, y: 0, scale: 1 }; let drag = null;
+    function applyTransform() { viewport.setAttribute('transform', `translate(${pan.x} ${pan.y}) scale(${pan.scale})`); }
+    function pointFromEvent(event) { const rect = svg.getBoundingClientRect(); const viewBox = svg.viewBox.baseVal; return { x: (event.clientX - rect.left) * viewBox.width / rect.width, y: (event.clientY - rect.top) * viewBox.height / rect.height }; }
+    function setZoom(nextScale, origin) { const clamped = Math.max(.65, Math.min(2.5, nextScale)); const anchor = origin || { x: 710, y: 435 }; const ratio = clamped / pan.scale; pan.x = anchor.x - (anchor.x - pan.x) * ratio; pan.y = anchor.y - (anchor.y - pan.y) * ratio; pan.scale = clamped; applyTransform(); }
+    function resetView() { pan.x = 0; pan.y = 0; pan.scale = 1; applyTransform(); }
+    svg.addEventListener('wheel', event => { event.preventDefault(); setZoom(pan.scale * Math.exp(-event.deltaY * .0012), pointFromEvent(event)); }, { passive: false });
+    svg.addEventListener('pointerdown', event => { if (event.button !== 0 || event.target.closest('.node')) return; const point = pointFromEvent(event); drag = { pointerId: event.pointerId, x: point.x, y: point.y, panX: pan.x, panY: pan.y }; svg.setPointerCapture(event.pointerId); svg.classList.add('is-panning'); });
+    svg.addEventListener('pointermove', event => { if (!drag || event.pointerId !== drag.pointerId) return; const point = pointFromEvent(event); pan.x = drag.panX + point.x - drag.x; pan.y = drag.panY + point.y - drag.y; applyTransform(); });
+    svg.addEventListener('pointerup', event => { if (!drag || event.pointerId !== drag.pointerId) return; svg.releasePointerCapture(event.pointerId); drag = null; svg.classList.remove('is-panning'); });
+    svg.addEventListener('dblclick', resetView); document.querySelector('#zoom-in').addEventListener('click', () => setZoom(pan.scale * 1.2)); document.querySelector('#zoom-out').addEventListener('click', () => setZoom(pan.scale / 1.2)); document.querySelector('#view-reset').addEventListener('click', resetView);
+    selectNode(selected); document.body.dataset.ready = 'true'; const ready = html('span', 'build-only', '.'); ready.id = 'diagram-ready'; document.body.appendChild(ready);
+  </script>
+</body>
+</html>
