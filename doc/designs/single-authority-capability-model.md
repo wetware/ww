@@ -1,5 +1,9 @@
 # Single-Authority Capability Model
 
+> **Historical design record.** The hook-level membrane remains active. Glia
+> and the Glia-specific integration described below were later removed from
+> active mainline. See `archive/glia-final` for the final legacy implementation.
+
 Status: ADOPTED (2026-07). Implemented across #563 (isolate removal),
 #564 (`wetware-membrane` crate), #566 (`Export { name, cap }` ABI cutover),
 #568 (production membrane recursion), and the `(attenuate ...)`

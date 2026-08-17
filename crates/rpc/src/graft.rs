@@ -264,8 +264,7 @@ pub struct HostGraftBuilder {
     route_registry: Option<crate::dispatch::RouteRegistry>,
     /// Pre-created Runtime client (singleton — same backend for every graft).
     runtime_client: system_capnp::runtime::Client,
-    /// Named capabilities from init.d `with` blocks, forwarded to the child
-    /// cell's graft response as `Export { name, cap }` entries.
+    /// Additional named capabilities configured for the graft response.
     extras: NamedCapabilities,
     /// IPFS HTTP client for Kubo API calls (e.g. IPNS resolution).
     ipfs_client: ipfs::HttpClient,
@@ -308,7 +307,7 @@ impl HostGraftBuilder {
         self
     }
 
-    /// Set named capabilities from init.d `with` block to inject into graft.
+    /// Set additional named capabilities to inject into the graft.
     ///
     pub fn with_extras(mut self, extras: NamedCapabilities) -> Self {
         self.extras = extras;
@@ -385,7 +384,7 @@ impl HostGraftBuilder {
             entries.push(NamedCapability::new("http-client", http_client.client)?);
         }
 
-        // Append init.d-scoped extras.
+        // Additional entries are encoded separately by the graft builder.
         // Keep ambient graft entries and parent extras as independently
         // validated sets. Collision policy between those sets remains a graft
         // concern until the T3 bootstrap cutover.

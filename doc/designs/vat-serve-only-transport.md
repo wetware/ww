@@ -53,10 +53,6 @@ The serve-only model intentionally does not include:
 - `VatConnection` metadata envelopes
 - executor provenance checks
 - per-connection vat cell spawning
-- recursive attenuation
-
-Recursive attenuation is still a required future feature, but it should be
-designed after this transport simplification lands.
 
 ## Related Adapters
 
@@ -71,13 +67,13 @@ Wetware-native stateful services belong on vat RPC.
 
 ## Naming Guidance
 
-Use `host :serve-vat` language as "publish an authenticated capability
-service" rather than "listen with a vat cell" or "register a vat handler."
+Use `VatListener.serveAuthenticated` to publish an authenticated capability
+service.
 The caller supplies the application capability, service name, and auth policy;
 VatListener creates one single-use Terminal per inbound stream. The service
 name is only a routing key, and the libp2p peer ID is not the authenticated
 principal.
 
-Use `host :serve-raw-vat` only when unauthenticated publication is intentional.
-Its name is deliberately conspicuous because it exposes the supplied
-capability directly to every peer that negotiates the protocol.
+Use `VatListener.serveRaw` only when unauthenticated publication is
+intentional. It exposes the supplied capability directly to every peer that
+negotiates the protocol.

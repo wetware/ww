@@ -201,7 +201,8 @@ What we have today:
 - Async Terminal policy that maps a verified login key to a fresh session,
   with global epoch expiry and targeted recipient revocation.
 - Content-addressed code via IPFS (CIDs flow through the runtime).
-- MCP/Glia bridge with membrane-grafted agent execution.
+- Authenticated vat transport that creates a fresh `Terminal` for each inbound
+  stream and applies the configured authority policy after login.
 - Optional P2P transport with named Cap'n Proto services; service names
   locate capabilities and do not authorize recipients.
 - A Rust Chess proof over direct-dial libp2p showing unknown denial,
@@ -224,9 +225,9 @@ What we don't have today, and won't pretend to:
 - **Peer-ID authorization.** A node is a multi-tenant transport/runtime host,
   not a principal. Terminal authenticates the per-login credential; policy
   resolves the logical account or tenant.
-- **Arbitrary dynamic-schema attenuation in Glia.** Trusted Rust can use typed
-  generated method selectors. Glia refuses attenuation when it cannot
-  associate a compiled schema with the capability.
+- **Arbitrary schema-less attenuation.** Rust integrations can use typed
+  generated method selectors. A capability without associated schema metadata
+  cannot be attenuated through the current allowlist resolver.
 - **Deploy-everywhere routing.** The DHT finds providers globally
   but doesn't sort by network proximity. CF's Anycast advantage
   is real and we don't claim it.

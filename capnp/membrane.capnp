@@ -33,6 +33,6 @@ interface Membrane @0xdb52c25106bc2c5e {
   #
   # Listener/Dialer accessed via host.network().
   # WASI guests resolve content via the virtual filesystem (CidTree).
-  # Non-WASI clients (for example process-local `ww shell`) may also receive
-  # the `ipfs` cap and call `system.Ipfs.read` for `/ipfs`/`/ipns`/`/ipld`.
+  # Non-WASI clients may also receive the `ipfs` cap and call
+  # `system.Ipfs.read` for `/ipfs`/`/ipns`/`/ipld`.
 }

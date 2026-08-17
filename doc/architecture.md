@@ -12,35 +12,28 @@ explicit delegation of a Cap'n Proto capability reference. A grant name is a
 parent-chosen local label; it is neither an authorization key nor a service
 lookup mechanism.
 
-The important distinction is between the trusted root, the membrane it may
-publish, and ordinary children:
+The important distinction is between trusted PID0 and ordinary children:
 
 - **pid0** is trusted by construction. It alone receives the process-local
   root `Membrane` and calls `Membrane.graft()`. That graft records the current
-  generation in trusted host state and includes a distinct ordinary
-  `Membrane` that pid0 may publish.
-- A **network client** may receive the published `Membrane`. Its grafts
-  provision ordinary epoch-guarded capabilities but cannot bind or commit
-  PID0 readiness.
+  generation in trusted host state.
 - An **ordinary child** receives `InitialGrants`, a host-provided,
   grants-only bootstrap. `InitialGrants.get()` returns exactly the immutable
   `InitialAuthorityRecord` selected by its parent.
 
-`Membrane` is therefore an authority-issuance interface for trusted pid0 (and
-for the separate, authenticated remote `Terminal(Membrane)` path). It is not
-the ordinary-child bootstrap. `Process.bootstrap()` is also distinct: it is
-the parent-held capability exported by a guest that uses `system::serve()`.
+The PID0 `Membrane` is process-local. PID0 does not publish a base compatibility
+payload on bare `/ww/0.1.0`. Authenticated vat services and byte streams remain
+available under `/ww/0.1.0/vat/*` and `/ww/0.1.0/stream/*` respectively.
+`Process.bootstrap()` is distinct: it is the parent-held capability exported
+by a guest that uses `system::serve()`.
 
 ```
 HOST PROCESS
 │
 ├─ pid0 boot
 │  process-local root Membrane → trusted pid0
-│       ├─ Membrane.graft() → host grants + publishable Membrane
+│       ├─ Membrane.graft() → epoch-scoped host grants
 │       └─ private WIT kernel-ready() → commit bound generation
-│
-├─ network export
-│  publishable Membrane → ordinary epoch-guarded grafts
 │
 └─ ordinary child spawn
    Executor.spawn(explicit named grants)
@@ -49,20 +42,30 @@ HOST PROCESS
        → (only if granted) Executor → grandchild with another exact grant set
 ```
 
-The host graft contains the host-provided capabilities appropriate for the
+The PID0 graft contains the host-provided capabilities appropriate for the
 node configuration, including identity, host, runtime, routing, authority,
-IPFS, and optional HTTP client. PID0's process-local graft also contains the
-ordinary membrane handoff, whose internal name is part of the private PID0 ABI.
-Local pid0 grafting has no `AuthPolicy`. Remote authenticated issuance remains
-separate: a `Terminal` verifies a login identity and returns the
-policy-selected session authority.
+IPFS, and optional HTTP client. Local PID0 grafting has no `AuthPolicy`.
+Authenticated vat publication remains separate: each inbound stream receives
+a fresh `Terminal` that verifies login before returning policy-selected service
+authority.
 
 ## Boot and child creation
 
-`ww run` resolves image layers, starts the host services, and loads trusted
-pid0 from `boot/main.wasm`. The host does not interpret the rest of the image
-as application policy. The default Rust pid0 directly installs the shipped
-`/status` composition.
+`ww run` resolves image layers and starts the host services. The Host selects
+trusted PID0 through `KernelSource`: `--kernel` takes precedence over
+`WW_KERNEL`, and the default is the embedded `std/kernel` `main` component.
+The Host↔PID0 ABI is version 3; no ABI-v2 compatibility shim exists.
+
+The Rust PID0 follows one straight-line sequence for each generation:
+
+1. Call `Membrane.graft()` once.
+2. Read `$WW_ROOT/bin/status.wasm`.
+3. Load the status component, grant `host`, and register `/status`.
+4. Call the private `kernel_ready()` import.
+5. Remain alive until the Host terminates the generation.
+
+PID0 does not poll for stale epochs and does not re-graft. The Host owns epoch
+awareness, PID0 termination, and PID0 replacement.
 
 The spawn lattice is deliberately small:
 
@@ -123,7 +126,7 @@ unclassified failures stop `EpochService`, which makes the daemon exit nonzero.
 PID0 owns failures from guest composition and service setup. The Host does not
 inspect PID0 errors to decide whether to retry.
 
-The host captures each generation's epoch sequence and filesystem root before
+The Host captures each generation's epoch sequence and filesystem root before
 spawn. PID0's process-local graft uses that captured sequence. The graft fails
 if the live epoch has changed. The private readiness commit also rejects a
 captured sequence that is no longer live. PID0 therefore cannot combine one
@@ -182,12 +185,12 @@ The image root visible to pid0 follows the FHS convention:
 
 ```
 <image>/
-  boot/main.wasm    # trusted pid0 entrypoint, consumed by the host
-  bin/              # executables selected by pid0
-  svc/<name>/       # service images selected by pid0
-  etc/              # init and configuration selected by pid0
+  boot/main.wasm    # conventional application entrypoint produced by ww build
+  bin/status.wasm   # status component loaded by the shipped Rust PID0
 ```
 
+The shipped PID0 reads only `bin/status.wasm` from the effective root. It does
+not evaluate an init directory or compose arbitrary application components.
 Image layers may be merged per file. Their composition and Stem integration
 are described in [images.md](images.md); neither changes the ordinary-child
 grant rule described above.

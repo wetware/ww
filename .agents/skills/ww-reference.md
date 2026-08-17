@@ -37,18 +37,16 @@ If they want to browse, show the menu:
 > 6. **RPC transport** — duplex streams, scheduling (`doc/rpc-transport.md`)
 > 7. **schema-inject** — post-build cell type injection
 >    (`crates/schema-id/src/bin/schema-inject.rs`)
-> 8. **Effects** — `perform`, `with-effect-handler`,
->    `resume` (`crates/glia/src/effect.rs`)
-> 9. **Signing & keys** — Signer interface, key derivation
+> 8. **Signing & keys** — Signer interface, key derivation
 >     (`doc/keys.md`)
-> 10. **Cross-crate schemas** — sharing Cap'n Proto definitions
+> 9. **Cross-crate schemas** — sharing Cap'n Proto definitions
 >     across crates (`doc/capnp-cross-crate.md`)
-> 11. **Guest API** — WASI bindings for guest WASM modules
+> 10. **Guest API** — WASI bindings for guest WASM modules
 >     (`doc/api/wasm-guest.md`)
-> 12. **Guest runtime** — poll loop, effect dispatch, oneshot
->     channel, WASI integration (`doc/guest-runtime.md`)
-> 13. **Design docs** — deep dives on effects, macros, HTTP surface,
->     economic platform (`doc/designs/`)
+> 11. **Guest runtime** — poll loop, Cap'n Proto RPC, and WASI
+>     integration (`doc/guest-runtime.md`)
+> 12. **Design docs** — historical and current design records
+>     (`doc/designs/`; check each document's status header)
 
 ## How to present reference material
 
@@ -68,18 +66,6 @@ Note: `--no-ipfs` (capnp only) skips pushing canonical schema bytes
 to IPFS via Kubo.  Useful offline or when Kubo isn't running.
 Protocol IDs for raw cells must not contain `/` (host prefixes
 `/ww/0.1.0/stream/` automatically).
-
-For effects, walk through the three forms:
-- `(perform :keyword data)` — raise a keyword effect
-- `(perform cap :method args...)` — raise a cap-scoped effect
-- `(with-effect-handler target handler body)` — install a handler
-  (keyword or cap target; use inline kwargs for multiple keyword
-  handlers: `(with-effect-handler :k1 fn1 :k2 fn2 body...)`)
-
-Explain the handler stack (dynamic scope, newest-first matching)
-and one-shot `resume`.  Read `crates/glia/src/effect.rs` for the
-implementation.  Emphasize: effects are the *only* way to cross
-the process boundary — anything not wrapped in an effect is local.
 
 ## After each topic
 

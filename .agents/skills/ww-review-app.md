@@ -27,8 +27,8 @@ rest.
 If they want a full sweep, tell them what to expect:
 
 > I'll check seven things: cell type correctness, least authority,
-> trust boundaries, image layout, protocol correctness, effect
-> hygiene, and epoch safety.  I'll flag anything I find as
+> trust boundaries, image layout, protocol correctness, boundary
+> I/O, and epoch safety.  I'll flag anything I find as
 > critical / warning / suggestion.  Should take a few minutes.
 
 ## What to check
@@ -61,8 +61,8 @@ pattern section).
 
 - Does pid0 give children more authority than needed?
 - Could a compromised child escalate?
-- Are network-exported Membranes restricted?
-- Terminal authentication used where needed?
+- Does each published vat service use `Terminal` authentication where needed?
+- Does any raw vat publication expose more authority than intended?
 
 ### 4. Image layout
 
@@ -77,31 +77,24 @@ pattern section).
 - RPC bidirectionality used appropriately?
 - WAGI cells handle all expected methods?  Error codes correct?
 
-### 6. Effect hygiene
+### 6. Boundary I/O
 
 Read the app's source and trace every operation that reaches
 beyond the process.  Do this yourself — don't ask the user.
 
-- **Trace boundary crossings**: grep for `perform`, handler
-  installations, and any direct I/O.  Every network/swarm
-  interaction MUST go through an effect.  If something crosses
-  the boundary without `perform`, flag it as critical.
-- **Prefer `->` threading for effectful pipelines**: pure steps
-  are bare names, `perform` steps are boundary crossings.  This
-  makes audit trivial — scan the pipeline for `perform` and you
-  see every boundary crossing at a glance.
-- **Check handler scope**: are handlers installed too high
-  (over-privileged) or too low (effects propagate unhandled)?
-- **Blast radius**: could any handler be narrowed?  A handler
-  that handles more effect types than needed is a risk.
-- **Unhandled effects**: trace which effects propagate to the
-  top without being caught.  Flag any that should be handled.
+- Trace Cap'n Proto calls, WASI I/O, and stdin/stdout protocol handling.
+- Confirm that each network operation uses an explicitly granted capability or
+  the cell's declared transport.
+- Confirm that capability references passed to children or peers have the
+  smallest required method surface.
+- Check timeouts, response bounds, and error handling at remote boundaries.
 
 ### 7. Epoch safety
 
-- Agents handle re-grafting correctly?
-- Stale capabilities caught and retried?
-- State that doesn't survive epoch transitions?
+- Does the application treat `staleEpoch` as terminal for the old authority?
+- Do callers stop using a capability after `staleEpoch`?
+- Does the Host replace PID0 rather than relying on guest re-grafting?
+- Which application state does not survive epoch transitions?
 
 ## Output
 

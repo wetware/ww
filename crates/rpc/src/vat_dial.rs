@@ -77,8 +77,8 @@
 //!   the caller sees their `connect` return immediately, then their first
 //!   call wait for compile.
 //! - **Remote up but not speaking Cap'n Proto on the negotiated
-//!   subprotocol.** Surfaces as a first-method-call timeout (e.g.
-//!   `eval timeout (30s)` in `ww shell`) rather than a precise
+//!   subprotocol.** Surfaces through the caller's first-method timeout rather
+//!   than a precise
 //!   `RPC handshake timeout` at connect.  Time-to-failure is unchanged
 //!   (~30s either way); **diagnostic precision is slightly reduced**.
 //! - **Connection drops mid-session.** No change vs. the prior code:

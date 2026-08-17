@@ -55,11 +55,8 @@ Walk through together:
 ⚗️ **Name the win**: "That's a complete cell.  Everything else is
 just fancier plumbing on top of this pattern."
 
-5. **The effects angle**: point out that echo's stdin/stdout I/O
-   is the simplest possible effect boundary — data comes in from
-   the network (effect), gets processed locally (pure), goes back
-   out (effect).  The cell itself has no way to reach the network
-   except through this boundary.
+5. **The authority boundary**: echo receives the connected byte stream through
+   stdin/stdout. The cell receives no ambient network API.
 
 Check in: "Make sense?  Want to see it run, or move on to something
 with more moving parts?"
@@ -82,8 +79,8 @@ Walk through together:
    `POST /counter` (increments).  405 for everything else.
 2. **The key difference**: this cell has a *type tag*.  Run
    `make -C examples/counter` yourself and show the output.
-   The repository does not currently ship runtime composition for the
-   counter after removal of the legacy Glia PID0.
+   The repository does not currently ship a runtime composition for the
+   counter.
 3. **FastCGI protocol**: the cell speaks binary FastCGI over stdio.
    The host translates HTTP ↔ FastCGI.  Simpler than parsing HTTP/1.1.
 4. **Per-request spawn**: each request gets a fresh instance.  Counter
@@ -122,12 +119,9 @@ everything at once:
    Don't read every line — hit the interesting parts.
 4. **The image layout** (~2 min): show the built component under `bin/`.
 
-5. **Local vs. global** (~3 min): This is the payoff.  Walk through
-   which operations are local (validating a move, updating the board)
-   vs. which cross the process boundary as effects (sending a move
-   to the opponent, publishing replay to IPFS, discovering peers via
-   DHT).  "Anything that can't affect the swarm isn't an effect.
-   Anything that can, must be."
+5. **Local computation vs. granted authority** (~3 min): Walk through
+   which operations are local, such as validating a move, and which require
+   an explicit capability, such as routing or peer communication.
 
 ⚗️ **Name the win**: "That's a full peer-to-peer application: typed
 RPC, DHT discovery, IPFS publishing, image packaging."

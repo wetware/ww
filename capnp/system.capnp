@@ -54,8 +54,8 @@ interface Ipfs {
   read @0 (path :Text) -> (stream :ByteStream);
   # Read bytes from an IPFS-family path as a stream via the daemon backend.
   # Accepts `/ipfs/<cid>`, `/ipns/...`, `/ipld/...`.
-  # Used by non-WASI clients (e.g. process-local `ww shell` eval) to
-  # preserve content-path semantics without direct shell→Kubo coupling.
+  # Used by non-WASI clients to preserve content-path semantics without
+  # direct client-to-Kubo coupling.
 }
 
 struct FuelPolicy {

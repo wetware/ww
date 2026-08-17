@@ -124,12 +124,12 @@ kernel. It is deliberately absent from ordinary-cell linkers.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `kernel-ready` (`kernel_ready()` in generated Rust) | `() -> result<_, stale-generation>` | Commit the generation bound by PID0's most recent process-local graft. The guest supplies no generation or token. |
+| `kernel-ready` (`kernel_ready()` in generated Rust) | `() -> result<_, stale-generation>` | Commit the generation bound by PID0's process-local graft. The guest supplies no generation or token. |
 
 This host function is not a Cap'n Proto capability. It cannot appear in a
 `Membrane` graft or `InitialGrants`, be delegated to a child, or cross a
-network connection. A stale-generation result tells PID0 to discard the
-initialized environment and re-graft.
+network connection. A stale-generation result makes the PID0 initialization
+fail. The Host owns termination and replacement.
 
 ## Cap'n Proto RPC (over wetware:streams)
 
@@ -244,7 +244,8 @@ Full interface reference for the capabilities available to guests.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `serve` | `(cap: Capability, protocol: Text) -> ()` | Accept connections on `/ww/0.1.0/vat/{protocol}` and bootstrap each connection with the provided capability. The protocol is a locator only. |
+| `serveRaw` | `(cap: Capability, protocol: Text) -> ()` | Accept unauthenticated connections on `/ww/0.1.0/vat/{protocol}` and bootstrap each connection with the provided capability. |
+| `serveAuthenticated` | `(cap: Capability, protocol: Text, policy: AuthorityPolicy) -> ()` | Create a fresh `Terminal` for each connection and expose the capability only after login satisfies `policy`. |
 
 ### VatClient (capability mode)
 
@@ -258,7 +259,7 @@ The host does not inspect WASM custom sections to decide whether a binary is a
 raw, HTTP, or vat service cell. Byte adapters receive their routing inputs
 explicitly at registration time. Vat publication serves an already-existing
 capability; spawn, bootstrap, wrapping, and attenuation happen before
-`VatListener.serve()`.
+`VatListener.serveRaw()` or `VatListener.serveAuthenticated()`.
 
 ## Implementation Constraints
 
@@ -292,7 +293,8 @@ revisit when wasmtime stabilizes resource cleanup ordering.
 Host capabilities grafted by pid0 are wrapped in epoch guards. When the host
 advances its epoch (e.g., on-chain state change), delegated copies also become
 invalid and calls return `staleEpoch` errors. Ordinary children cannot
-re-graft; pid0 must explicitly re-delegate fresh authority or respawn them.
+re-graft. The Host terminates the old PID0 and starts a fresh PID0 for the new
+generation.
 
 ### Pipe buffer sizes
 

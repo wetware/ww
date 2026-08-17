@@ -1,5 +1,8 @@
 # Glia Macro System Design
 
+> **Historical design document.** Glia was removed from active mainline. The
+> final legacy implementation is preserved by `archive/glia-final`.
+
 ## Status: Phase 1 (defmacro + gensym) — shipping with #166
 
 ## Overview
