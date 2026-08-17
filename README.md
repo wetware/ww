@@ -79,7 +79,11 @@ examples.
 
 ## How it works
 
-`ww run` starts a libp2p node on port 2025, merges any [image layers](doc/images.md) into a virtual FHS filesystem, and spawns trusted `boot/main.wasm` (pid0) with the full graft-capable Membrane.
+`ww run` starts a libp2p node on port 2025 and merges any [image layers](doc/images.md)
+into a virtual FHS filesystem. The Host selects trusted PID0 independently
+through `KernelSource`: `--kernel` takes precedence over `WW_KERNEL`, and the
+default is embedded `std/kernel`. `ww build` produces `boot/main.wasm` as the
+conventional application artifact; the Host does not use it as PID0 input.
 
 Pid0 calls `membrane.graft()` to obtain host capabilities. Ordinary children
 instead call `initial_grants.get()` and receive exactly the immutable
