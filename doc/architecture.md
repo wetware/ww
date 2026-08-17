@@ -51,8 +51,9 @@ authority.
 
 ## Boot and child creation
 
-`ww run` resolves image layers, starts the host services, and loads trusted
-PID0 from `boot/main.wasm`. `std/kernel` is the only active PID0 implementation.
+`ww run` resolves image layers and starts the host services. The Host selects
+trusted PID0 through `KernelSource`: `--kernel` takes precedence over
+`WW_KERNEL`, and the default is the embedded `std/kernel` `main` component.
 The Host↔PID0 ABI is version 3; no ABI-v2 compatibility shim exists.
 
 The Rust PID0 follows one straight-line sequence for each generation:
@@ -184,7 +185,7 @@ The image root visible to pid0 follows the FHS convention:
 
 ```
 <image>/
-  boot/main.wasm    # trusted pid0 entrypoint, consumed by the host
+  boot/main.wasm    # conventional application entrypoint produced by ww build
   bin/status.wasm   # status component loaded by the shipped Rust PID0
 ```
 

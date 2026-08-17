@@ -25,9 +25,9 @@ envvar tells the guest what plumbing it's running under:
 | `http` | CGI env vars + stdin/stdout | WAGI (CGI for WASM) |
 | absent | Cap'n Proto RPC (host channel) | pid0 -- full Membrane graft |
 
-The kernel (`boot/main.wasm`) is trusted PID0. Its stdio is the Host's Cap'n
-Proto RPC channel, not a libp2p stream. It alone receives the process-local,
-graft-capable `Membrane`.
+The trusted PID0 implementation is `std/kernel`, which is embedded in `ww` by
+default. Its stdio is the Host's Cap'n Proto RPC channel, not a libp2p stream.
+It alone receives the process-local, graft-capable `Membrane`.
 
 Architecture (three layers):
 - **Host** (`ww` binary): boots a libp2p swarm, prepares each effective
