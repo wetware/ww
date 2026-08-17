@@ -23,10 +23,9 @@ Don't follow a fixed order.  Ask:
 > 2. **Capabilities** — why no ambient authority, and what replaces it
 > 3. **Architecture** — the three layers (host, kernel, children)
 > 4. **The Membrane** — how capabilities flow and get attenuated
-> 5. **Effects** — the boundary between local and global
-> 7. **Concurrency** — how race conditions disappear (E-ordering)
-> 8. **Epochs** — on-chain coordination and capability lifecycle
-> 9. **Images** — how code is packaged and layered
+> 5. **Concurrency** — how race conditions disappear (E-ordering)
+> 6. **Epochs** — on-chain coordination and capability lifecycle
+> 7. **Images** — how code is packaged and layered
 >
 > Or just ask a question and I'll find the right thread.
 
@@ -90,7 +89,7 @@ Present one row at a time, explain each, check in.
 | `ioctl(fd, ...)` | method call on cap | Both operate on a handle.  But capnp calls are typed, async, and pipelined — not a bag-of-bytes command code.  `runtime.load(...).executor()` resolves in one round-trip via pipelining. |
 | filesystem | WASI VFS over IPFS + `$WW_ROOT` | No writable local fs in the sandbox.  Content is read through the WASI virtual filesystem — `open("$WW_ROOT/bin/foo.wasm")` transparently resolves `/ipfs/<cid>/...` paths.  Content-addressed, not capability-gated. |
 | `open()` returns fd | `graft()` returns Session | `open()` grants access to anything the path resolves to.  `graft()` returns a Session with specific named capabilities: Host, Executor, Routing, Identity — each of which can be null (withheld). |
-| signals | epoch lifecycle | Unix signals are fire-and-forget.  Epoch advances revoke *all* capabilities and force re-graft — the Cell picks up new state automatically.  It's like SIGHUP but for security policy. |
+| signals | epoch lifecycle | Unix signals are fire-and-forget. An epoch advance makes host-issued capabilities stale. The Host terminates the old PID0 and starts a fresh PID0 for the new generation. |
 | pipe | `ByteStream` (`capnp/system.capnp`) | Both connect two processes via read/write.  But ByteStream is a capability — it can be passed to third parties, attenuated, or revoked. |
 | `bind()`/`listen()` | `StreamListener.listen()` / `VatListener.listen()` | Unix: any process can bind any port.  Wetware: listening requires the StreamListener or VatListener capability, scoped to a specific protocol.  No ambient network access. |
 | semaphore / mutex | E-ordering (capnp objects) | No explicit locks.  Each capnp object serializes its own method calls — the object IS the lock.  Cross-object calls are concurrent; use pipelining to express ordering. |
@@ -154,64 +153,8 @@ The Rust kernel in `std/kernel` is the active PID0 implementation.
 
 Key files: `doc/architecture.md` (section "The Membrane pattern")
 
-How pid0 receives capabilities, wraps/attenuates them, and exports
-them.  This is the key mechanism for security composition.
-
-### Effects
-
-Key files: `crates/glia/src/effect.rs`, `crates/glia/src/eval.rs`
-
-**Lead with the why:** anything that isn't wrapped in an effect is
-process-local.  It can't reach the network, can't mutate shared
-state, can't affect anything "out there" in the swarm.  Effects
-are the boundary between local computation and global action.
-
-This is the flip side of "no ambient authority."  In a normal OS,
-any code can call any syscall.  In Wetware, the only way to cross
-the process boundary is to `perform` an effect — and an effect
-only does something if a handler is installed for it.  No handler,
-no action.
-
-Walk through the two flavors:
-
-1. **Keyword effects** — environmental, matched by name.
-   `(perform :log "msg")`.  Think: "I want something from the
-   environment."  The handler decides what `:log` means.
-2. **Capability effects** — object-scoped, matched by schema CID
-   (same interface type).
-   `(perform my-cap :method arg)`.  Think: "I want any capability
-   of this type to do something."  Any handler installed for a cap
-   with the same schema CID responds.
-
-Then show the handler side — one unified form:
-
-- `(with-effect-handler :keyword handler-fn body...)` — keyword handler.
-- `(with-effect-handler my-cap handler-fn body...)` — cap handler.
-- Multiple keyword handlers via inline kwargs (Clojure-style):
-  `(with-effect-handler :log log-fn :fail fail-fn body...)`
-- Handlers receive `(data, resume)`.  `resume` is a one-shot
-  continuation — call it to send a value back to the performer.
-
-Show the **threaded effects pattern** — `->` makes boundary
-crossings visually scannable:
-
-```clojure
-(with-effect-handler :store db-handler :emit bus-handler
-  (-> input
-      validate          ;; pure
-      (perform :store)  ;; effect — crosses boundary
-      transform         ;; pure
-      (perform :emit))) ;; effect — crosses boundary
-```
-
-The pipeline says *what* happens. The handler says *how*. You can
-swap handlers (test doubles, attenuated caps) without touching the
-pipeline. And every boundary crossing is trivially auditable.
-
-**The key insight:** because effects propagate up the handler
-stack, pid0 can intercept, wrap, attenuate, or deny any effect
-a child performs.  This is how the Membrane composes — it's
-handlers all the way up.
+How PID0 receives host capabilities and how hook-level policies attenuate
+references passed across process or vat boundaries.
 
 ### Concurrency
 
@@ -251,8 +194,10 @@ ordering."
 Key files: `doc/capabilities.md`, `doc/architecture.md`
 (section "Epoch lifecycle")
 
-On-chain coordination: when the epoch advances, all capabilities
-are revoked.  Agents re-graft and pick up new state automatically.
+On-chain coordination: when the epoch advances, host-issued capabilities
+become stale. The Host terminates the old PID0, prepares the effective root,
+and starts one new PID0 for the accepted generation. Ordinary children cannot
+re-graft.
 
 ### Images
 

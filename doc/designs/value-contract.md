@@ -2,7 +2,7 @@
 
 Status: PARTIALLY SHIPPED / REMAINDER REJECTED — PR-0 shipped as #632. PR-1
 through PR-4 did not ship and were superseded by the August 2026 decision to
-archive the Glia language work on `archive/glia-2026-08`. This document is
+archive the Glia language work on `archive/glia-final`. This document is
 retained as design history, not an active roadmap.
 Scope: the invariants shared by all Glia runtime values, and the staged plan
 that makes them true. Individual collection designs (vector, seq API,

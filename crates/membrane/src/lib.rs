@@ -64,11 +64,11 @@ mod integration_tests;
 // Denial errors
 // ---------------------------------------------------------------------------
 
-/// Stable prefix marking an error as a membrane policy denial. Glia maps such
-/// errors to `:glia.error/permission-denied` (roadmap D9); the marker plus the
-/// `(interface_id, ordinal)` it carries let the mapping route without parsing
-/// human-readable prose. The legacy namespace is a compatibility identifier,
-/// not the Rust crate name.
+/// Stable prefix marking an error as a membrane policy denial.
+///
+/// The marker and its `(interface_id, ordinal)` identify the denied method
+/// without requiring callers to parse the diagnostic text. The namespace is a
+/// compatibility identifier, not the Rust crate name.
 pub const DENIED_MARKER: &str = "ww-membrane/permission-denied";
 /// Stable marker for a capability revoked without advancing the global epoch.
 pub const REVOKED_MARKER: &str = "wetware/call-guard/target-revoked";

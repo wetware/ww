@@ -5,13 +5,15 @@ Each wetware image follows a minimal FHS convention:
 ```
 <image>/
   bin/
-    main.wasm          # agent entrypoint (required)
+    main.wasm          # conventional application entrypoint
     status.wasm        # status component used by the shipped Rust PID0
-  svc/                 # nested service images (spawned by pid0)
+  svc/                 # optional application content; not composed automatically
 ```
 
-Only `bin/main.wasm` is required. Everything else is convention
-between the image author and the kernel (pid0).
+The Host selects PID0 independently from the effective application root. The
+shipped Rust PID0 consumes only `bin/status.wasm` from that root. An
+application-specific composition can select `bin/main.wasm`; the shipped Rust
+PID0 does not select it automatically.
 
 ## Rust PID0 boot flow
 

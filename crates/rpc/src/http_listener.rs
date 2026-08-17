@@ -209,9 +209,9 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
         let registry = self.registry.clone();
         let registration_scope = self.registration_scope.clone();
         Promise::from_future(async move {
-            // `init.d` must not proceed to `kernel_ready()` until the target
-            // component is valid. A failed preflight is an initialization
-            // failure, not a transient unavailable route.
+            // PID0 must not call `kernel_ready()` until the target component is
+            // valid. A failed preflight is an initialization failure, not a
+            // transient unavailable route.
             let cid_response = executor.cid_request().send().promise.await?;
             let cell_cid = read_preflight_cid(&cid_response).map_err(capnp::Error::failed)?;
             guard.check()?;
@@ -415,9 +415,9 @@ impl From<capnp::Error> for WagiRequestError {
 ///
 /// Per-request CGI env vars (REQUEST_METHOD, PATH_INFO, etc.) are passed via
 /// `executor.spawn(args, env, caps, ...)` — this is the late-binding pattern that the
-/// Runtime+Executor API was designed for. `caps` carries explicit init.d grants
-/// (name + capnp client + canonical Schema.Node bytes) into the spawned cell's
-/// membrane graft, so a WAGI cell only sees what the init.d author handed it.
+/// Runtime+Executor API was designed for. `caps` carries explicit registration
+/// grants into the spawned cell's `InitialGrants` bootstrap, so a WAGI cell
+/// receives only the registration-time grant template.
 async fn spawn_and_run(
     executor: &system_capnp::executor::Client,
     caps: &NamedCapabilities,

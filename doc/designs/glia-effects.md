@@ -1,5 +1,8 @@
 # Glia Effect System
 
+> **Historical design document.** Glia was removed from active mainline. The
+> final legacy implementation is preserved by `archive/glia-final`.
+
 ## Overview
 
 Glia's error handling and effect system, implemented in two phases:

@@ -119,10 +119,6 @@ ww push . --ipfs-url http://localhost:5001   # publish to IPFS
 The Rust PID0 does not automatically compose arbitrary guest components from
 an image. A published guest requires an application-specific composition path.
 
-## Roadmap
-
-- **dosync**: transactional state management for Glia. Atomic multi-field updates over content-addressed stems. "Every agent gets its own Datomic, as a language primitive."
-
 ## Learn more
 
 - [Positioning](doc/positioning.md): the JTBD-anchored category claim and audience

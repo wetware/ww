@@ -291,8 +291,8 @@ to move data.
 
 6) **Client-side dial: awaiting a derived promise before spawning the
    RpcSystem.** This is a client-side analog of cause (1), specific to
-   code that *dials* a remote vat (e.g., `ww shell` against a daemon,
-   or `VatClient::dial()` for outgoing guest dials). The buggy shape:
+   code that *dials* a remote vat, including `VatClient::dial()` for outgoing
+   guest dials. The buggy shape:
 
    ```rust
    // BUG: when_resolved() / .send().promise / etc. registers a waker
@@ -313,8 +313,8 @@ to move data.
    straight to method calls — the response promise IS the handshake
    observable.
 
-   Surfaced as #450, which manifested as a 30s `ww shell` "RPC handshake
-   timeout" on every connect.
+   The removed `ww shell` path originally surfaced this defect as #450, with a
+   30-second handshake timeout on every connection.
 
    [capnproto-rust hello-world client]: https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/client.rs
 
@@ -364,8 +364,8 @@ to move data.
    responded to Bootstrap before returning the cap.  In the rare case
    that the peer accepts the libp2p subprotocol stream but doesn't
    actually speak Cap'n Proto, the failure surfaces on the caller's
-   first method call via that call's own timeout (e.g. `eval timeout
-   (30s)` in `ww shell`) rather than as a distinct "handshake timeout"
+   first method call via that call's own timeout rather than as a distinct
+   "handshake timeout"
    at connect.  Time-to-failure is unchanged (~30s either way);
    diagnostic precision is slightly reduced.  Acceptable because libp2p
    subprotocol negotiation already established the peer claims to speak

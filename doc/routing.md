@@ -11,45 +11,42 @@ service providers on the peer-to-peer network. The DHT is untrusted discovery
 The `Routing` capability (explicitly delegated to an ordinary child and read
 via `initial_grants.get()`) provides:
 
-| Method | Shell syntax | Description |
-|--------|-------------|-------------|
-| `provide` | `(perform routing :provide "name")` | Hash name to CID, announce this node as a provider |
-| `find` | `(perform routing :find "name" [:count N])` | Discover providers for a name (default 20) |
-| `hash` | `(perform routing :hash "data")` | Compute CID from data (advanced — `provide` hashes internally) |
-| `resolve` | `(perform routing :resolve "k51...")` | Resolve an IPNS name to `/ipfs/<cid>` |
-| `mkdir` | `(perform routing :mkdir "<base-cid>" "path" true)` | Create directory in a derived UnixFS root; returns new root CID |
-| `write-file` | `(perform routing :write-file "<base-cid>" "path" "data" true)` | Write file content in a derived UnixFS root; returns new root CID |
-| `remove` | `(perform routing :remove "<base-cid>" "path" true)` | Remove path from a derived UnixFS root; returns new root CID |
-| `publish` | `(perform routing :publish "ww" "<cid>" "/ipfs/<expected>")` | Publish CID to IPNS with optional CAS guard |
+| Method | Parameters | Description |
+|--------|------------|-------------|
+| `provide` | `key` | Announce this node as a provider for a CID key |
+| `findProviders` | `key`, `count`, `sink` | Stream provider records to `ProviderSink` |
+| `hash` | `data` | Compute a CIDv1 raw SHA-256 key from bytes |
+| `resolve` | `name` | Resolve an IPNS name to `/ipfs/<cid>` |
+| `mkdir` | `baseCid`, `path`, `parents` | Create a directory in a derived UnixFS root |
+| `writeFile` | `baseCid`, `path`, `data`, `createParents` | Write a file in a derived UnixFS root |
+| `remove` | `baseCid`, `path`, `recursive` | Remove a path from a derived UnixFS root |
+| `publish` | `name`, `cid`, `expectedCurrent` | Publish a CID to IPNS with an optional compare-and-set guard |
 
-All methods are epoch-guarded: they fail with `staleEpoch` when the on-chain
-head advances. Pid0 must explicitly re-delegate fresh routing authority or
-respawn the child.
+All methods are epoch-guarded. They fail with `staleEpoch` when the on-chain
+head advances. The Host terminates the old PID0 and starts a fresh PID0 for the
+new generation. Ordinary children cannot refresh their grants.
 
 ## Service discovery pattern
 
-```clojure
-;; Node A: announce as a price oracle
-(perform routing :provide "price-oracle")
+```text
+key = Routing.hash("price-oracle")
 
-;; Node B: discover price oracles
-(perform routing :find "price-oracle")
-;; → [{:peer-id "12D3KooW..." :addrs ["/ip4/1.2.3.4/tcp/2025" ...]} ...]
+Node A: Routing.provide(key)
+Node B: Routing.findProviders(key, count, providerSink)
 ```
 
-Names are plain strings — no namespace convention required. Internally, the name
-is hashed to a CIDv1 (SHA-256, raw codec) which becomes the DHT key.
+Application service names are plain strings. Call `Routing.hash` to derive the
+CID key used by `provide` and `findProviders`.
 
 ## Trust model
 
 ```
-DHT discovery (untrusted)          Terminal auth (trusted)
+DHT discovery (untrusted)          Vat transport and Terminal auth
 ─────────────────────────          ──────────────────────
-(perform routing :find "oracle")  →  (perform host :connect addr)
-  returns peer addresses            establish RPC connection
+Routing.findProviders(key, ...)  →  VatClient.dial(peer, protocol)
+  returns peer addresses            receive a fresh Terminal
                                     Terminal.login(signer)
-                                    verify identity
-                                    receive Membrane
+                                    receive policy-selected service cap
 ```
 
 The DHT is a **public bulletin board** — any node can announce as a provider for
@@ -58,10 +55,9 @@ challenge-response tells you *whether you trust them*.
 
 ## Key format
 
-Provider keys are CIDv1 hashes (SHA-256, raw codec) of the service name string.
-The shell's `(perform routing :provide "name")` and `(perform routing :find "name")` handle hashing
-internally. The raw `(perform routing :hash "data")` method is exposed for advanced use
-cases (e.g. content-addressed lookups).
+Provider keys are CIDv1 hashes. `Routing.hash` computes a raw-codec SHA-256 CID
+from application bytes. `provide` and `findProviders` accept the resulting key;
+they do not hash service names implicitly.
 
 ## Mutation semantics
 

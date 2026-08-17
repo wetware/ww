@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Active documentation now reflects the Rust PID0 architecture after Glia
+  removal.** Current references describe ABI v3, direct `/status` composition,
+  Host-owned epoch replacement, and the surviving vat and stream transports.
 - **The remaining Glia implementation and directly coupled assets have been
   removed.** This removes `crates/glia`, Glia fixtures and stdlib files, and
   Glia-only benches and tests. The root build now emits the existing short

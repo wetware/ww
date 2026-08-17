@@ -1,7 +1,6 @@
 # std
 
-`std/` contains the Rust PID0, standard guest components, the guest SDK, and
-Glia module fixtures still consumed by `crates/glia` tests.
+`std/` contains the Rust PID0, standard guest components, and the guest SDK.
 
 ## Layout
 
@@ -10,7 +9,6 @@ Glia module fixtures still consumed by `crates/glia` tests.
 | `system/` | Guest SDK (rlib) -- connects a WASM agent to the host over WASI streams and drives Cap'n Proto RPC. All guests link against this. |
 | `kernel/` | Rust kernel (pid0) -- directly installs the shipped `/status` composition. The host embeds and publishes this component. |
 | `status/` | Standard `/status` guest component loaded by Rust PID0 with an explicit `host` grant. |
-| `lib/ww/` | Glia module fixtures consumed directly by surviving `crates/glia` tests. These files are not staged into the runtime namespace. |
 
 ## Convention
 
@@ -25,5 +23,5 @@ make std          # builds kernel + status
 
 ## vs crates/
 
-`std/` = standard guest components and their retained source fixtures.
+`std/` = the Rust PID0, standard guest components, and the guest SDK.
 `crates/` = Rust libraries consumed by the host binary or shared between host and guests.
