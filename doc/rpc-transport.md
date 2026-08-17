@@ -1,388 +1,223 @@
-# RPC Transport: Async Bidirectional Cap'n Proto over WASI Streams
+# RPC Transport: Host Channels and Network Services
 
-This document explains how the host and WASM agents communicate over
-Cap'n Proto RPC, with a focus on the transport plumbing, scheduling
-model, and deadlock analysis.
+Wetware uses Cap'n Proto RPC in two distinct places:
 
-Primary code references:
-- `src/rpc/mod.rs`
-- `src/cell/proc.rs`
-- `std/system/src/lib.rs`
+- Each WASM process has an in-memory host channel for its bootstrap and
+  delegated capabilities.
+- Published vat services run Cap'n Proto RPC over named libp2p streams.
 
-## High-level layout
+Raw byte-stream services also use named libp2p streams, but they do not add a
+Cap'n Proto vat unless the application implements one over stdin/stdout.
 
-At runtime there are two RPC links:
-- Host <-> pid0 (kernel agent)
-- Host <-> child (agent spawned by pid0 via `runtime.load()` + `executor.spawn()`)
+Primary implementation references:
 
-Both links use the same transport mechanism: Cap'n Proto RPC over a
-bidirectional in-memory duplex stream exposed to agents as WASI
-io/streams resources.
+- `crates/cell/src/proc.rs` — in-memory host/guest stream creation
+- `src/executor.rs` — trusted PID0 startup and host-side RPC driver
+- `src/launcher.rs` — ordinary-child startup and host-side RPC driver
+- `crates/rpc/src/graft.rs` — PID0 and ordinary-child bootstraps
+- `std/system/src/lib.rs` — guest-side RPC session and poll loop
+- `crates/rpc/src/vat_listener.rs` and `crates/rpc/src/vat_client.rs` — network vats
+- `crates/rpc/src/stream_listener.rs` and `crates/rpc/src/stream_dialer.rs` — byte streams
+- `capnp/membrane.capnp` and `capnp/system.capnp` — public capability interfaces
 
-```
-          (Cap'n Proto RPC over WASI io/streams)
-┌───────────────────────────┐           ┌───────────────────────────┐
-│        Host (ww)          │           │        pid0 (kernel)      │
-│  - serves Membrane        │<=========>│  - grafts, obtains Session │
-│  - VatNetwork + RpcSystem │           │  - poll_loop event loop    │
-└───────────────────────────┘           └───────────────────────────┘
-           ^                                            |
-           | runtime.load + spawn (child)               | Cap'n Proto RPC
-           |                                            v
-┌───────────────────────────┐           ┌───────────────────────────┐
-│        Host (ww)          │           │        child agent         │
-│  - serves Session         │<=========>│  - poll_loop event loop    │
-│  - VatNetwork + RpcSystem │           │                            │
-└───────────────────────────┘           └───────────────────────────┘
-```
+## Process-local host channel
 
-## Design rationale
+Every PID0 or ordinary-child process starts with a bidirectional in-memory
+stream created by `cell::proc::Builder::with_data_streams()`. The host retains
+one end. The guest receives the other end through
+`wetware:streams/streams@0.1.0`.
 
-The transport was migrated from a custom `wetware:streams` interface
-with stub pollables and a busy-spin loop to standard WASI `io/streams`
-+ `io/poll`. This eliminates CPU busy-spins in idle agents and aligns
-with the WASI component model.
-
-The transport uses **in-memory pipes** (`tokio::io::duplex`) with
-Wasmtime's `AsyncReadStream` / `AsyncWriteStream` adapters. No OS
-socket I/O is involved — all RPC messages traverse memory-only duplex
-streams.
-
-## Transport plumbing: host side
-
-### 1) Creating the transport channel
-
-`ProcBuilder::with_data_streams()` allocates an in-memory duplex stream:
-
-- `tokio::io::duplex(PIPE_BUFFER_SIZE)` yields `(host_stream, guest_stream)`.
-- `host_stream` stays on the host; `guest_stream` is injected into the
-  guest runtime state (`ComponentRunStates.data_stream`).
-
-Reference: `src/cell/proc.rs`
-
-```
-tokio::io::duplex()  ->  host_stream  <----->  guest_stream
+```text
+Host                                      WASM guest
+----                                      ----------
+tokio::io::DuplexStream                   wetware:streams connection
+        |                                 WASI input/output streams
+        v                                         |
+VatNetwork + RpcSystem <--- Cap'n Proto RPC ----> VatNetwork + RpcSystem
 ```
 
-### 2) Exposing to the agent as WASI io/streams
+The stream has no libp2p or OS-socket hop. `crates/cell/src/proc.rs` exposes
+the guest end as WASI stream resources and returns the host end through
+`DataStreamHandles`.
 
-When the agent calls `wetware:streams/streams#create-connection`, the host
-replaces the `guest_stream` with WASI stream resources:
+### PID0 bootstrap
 
-- Split guest stream into read/write halves.
-- Wrap them as `AsyncReadStream` and `AsyncWriteStream`.
-- Store them in a `ConnectionState` resource.
+`src/executor.rs` passes the host stream halves to
+`build_pid0_membrane_rpc()`. The host serves a process-local `Membrane` as the
+bootstrap capability.
 
-Reference: `src/cell/proc.rs`
+PID0 calls `Membrane.graft()`, which returns `List(Export)`. The canonical
+exports are:
 
-```
-guest_stream
-  -> split (guest_read, guest_write)
-  -> DynInputStream (AsyncReadStream)
-  -> DynOutputStream (AsyncWriteStream)
-```
+- `identity`, when a signing key is configured;
+- `host`;
+- `runtime`;
+- `routing`;
+- `authority`;
+- `ipfs`;
+- `http-client`, when an outbound HTTP allowlist is configured.
 
-### 3) Wiring Cap'n Proto RPC over the host side
+The host can also append explicitly configured extra exports. Graft-issued
+host capabilities use the PID0 generation's epoch guard.
 
-`ExecutorImpl::spawn()` in the host sets up the child process and builds a Cap'n Proto
-`VatNetwork` over the host's stream halves:
+### Ordinary-child bootstrap
 
-- `handles.take_host_split()` yields `(reader, writer)`.
-- `build_peer_rpc(reader, writer, wasm_debug)` wraps them in a `VatNetwork`.
-- A `RpcSystem` is spawned in a local task set alongside the guest process.
+`src/launcher.rs` passes the host stream halves and the child's
+`InitialAuthorityRecord` to `build_initial_authority_rpc()`. The host serves
+`InitialGrants`, whose `get()` method returns exactly the immutable
+parent-selected `List(Export)`.
 
-Reference: `src/rpc/mod.rs`
+An ordinary child does not receive `Membrane.graft()`. The host does not add
+PID0 exports to the child's record.
 
-```
-host_stream -> split -> (AsyncRead, AsyncWrite) -> VatNetwork -> RpcSystem
-```
+### Guest setup
 
-## Transport plumbing: guest side
+`RpcSession::connect()` in `std/system/src/lib.rs` performs the guest setup:
 
-### 1) Guest stream connection
+1. Call `create_connection()` once.
+2. Take the connection's input and output streams once.
+3. Wrap the streams in `StreamReader` and `StreamWriter`.
+4. Construct the guest `VatNetwork` and `RpcSystem`.
+5. Bootstrap the host-provided `Membrane` or `InitialGrants` capability.
 
-`RpcSession::connect()` in the guest SDK calls the WIT binding
-`create_connection()` and obtains a WASI input and output stream:
+`system::run()` drives the RPC system with an async guest closure.
+`system::run_with()` also includes caller-provided `PollSet` entries.
+`system::serve()` additionally exports one guest bootstrap capability.
+The parent can retrieve that guest export through `Process.bootstrap()`.
 
-- `create_connection()` -> `connection.get_input_stream()` and
-  `connection.get_output_stream()`.
-- These are wrapped as `StreamReader` and `StreamWriter`.
+`system::serve_stdio()` is separate. It serves a guest capability over WASI
+stdin/stdout and does not connect to the process-local host bootstrap.
 
-Reference: `std/system/src/lib.rs`
+## Network protocol boundary
 
-```
-create_connection()
-  -> WASI InputStream  -> StreamReader (AsyncRead)
-  -> WASI OutputStream -> StreamWriter (AsyncWrite)
-```
+Wetware publishes network services only below these protocol prefixes:
 
-### 2) Cap'n Proto RPC over WASI streams
+| Prefix | Payload | Host capabilities |
+|--------|---------|-------------------|
+| `/ww/0.1.0/vat/{protocol}` | Cap'n Proto RPC | `VatListener`, `VatClient` |
+| `/ww/0.1.0/stream/{protocol}` | Application-defined bytes | `StreamListener`, `StreamDialer` |
 
-The guest constructs a Cap'n Proto `VatNetwork` over those stream adapters
-and bootstraps a client:
+The bare `/ww/0.1.0` compatibility publication no longer exists. The
+process-local PID0 `Membrane` is not a network bootstrap.
 
-Reference: `std/system/src/lib.rs`
+Protocol names are locators. They do not carry authority or schema identity.
+The protocol constructors reject empty names and names that contain `/`.
 
-```
-StreamReader/StreamWriter -> VatNetwork -> RpcSystem -> client
-```
+### Vat services
 
-## Scheduling model and CPU behavior
+`VatListener` publishes an existing capability. It does not load or spawn a
+WASM process.
 
-Agents are not busy-spinning when idle. They run a cooperative event
-loop in `poll_loop`:
+- `serveRaw(cap, protocol)` accepts a vat stream and exposes `cap` directly.
+  This method is the explicit unauthenticated escape hatch.
+- `serveAuthenticated(cap, protocol, policy)` creates a fresh, single-use
+  `Terminal` for each inbound stream. The `Terminal` releases policy-selected
+  authority only after login succeeds within the configured deadline.
 
-1) Poll the RPC system and any application futures/promises.
-2) If no progress is made, block in `wasi_poll::poll` on stream readiness
-   (pollable handles from the WASI streams).
+Both methods stop their accept loops when their epoch guard becomes stale.
+Connection budgets limit concurrent inbound streams.
 
-Reference: `std/system/src/lib.rs`
+`VatClient.dial(peer, protocol)` opens the named vat stream and returns the
+remote bootstrap capability. `connect()` in `crates/rpc/src/vat_dial.rs`
+starts the client-side `RpcSystem` driver before returning the capability. The
+caller's first typed method response reports bootstrap or transport failure.
 
-Key points:
-- **No constant CPU polling**: when nothing makes progress, the agent
-  blocks on `wasi_poll::poll`, yielding to the host runtime.
-- **Asynchronous on the host**: the host side uses Tokio async I/O and a
-  spawned `RpcSystem` to process messages without blocking the host thread.
-- **Double-poll pattern**: `poll_loop` calls `rpc_system.poll`
-  twice per iteration — once before and once after `poll_work` — to flush
-  RPC writes the user future queued before blocking in `wasi_poll`. Missing
-  the second poll causes deadlock: calls queued during `poll_work` are never
-  sent, and the host never responds.
-
-```
-loop:
-  poll_rpc        -- deliver inbound messages
-  poll_future     -- run application logic (may queue outbound RPC)
-  poll_rpc        -- flush outbound messages
-  if done -> exit
-  if no progress -> wasi_poll::poll([reader, writer])
-```
-
-## End-to-end flows
-
-### Flow A: pid0 spawns a child agent
-
-```
-pid0 (kernel)               host                        child agent
-─────────────              ──────                      ─────────────
-Membrane.graft() -> host grants
-load+spawn(explicit grants) ─> spawn child Proc + InitialGrants RpcSystem
-                           return Process cap
-wait RPC     <──────────── ProcessImpl::wait
+```text
+publisher                                         remote peer
+---------                                         -----------
+existing capability
+        |
+VatListener.serveAuthenticated()
+        |
+fresh Terminal <--- /ww/0.1.0/vat/{protocol} ---> VatClient.dial()
 ```
 
-### Flow B: child loads + spawns a grandchild
+### Byte-stream services
 
-```
-child agent (with Runtime grant)    host
-───────────────────────────────     ──────
-runtime.load(wasm) ───────────────> RuntimeImpl::load (cache lookup or compile)
-  -> Executor client <──── return pipelined Executor
-executor.spawn()   ──────> ExecutorImpl::spawn
-  -> Process client <───── return Process cap
-```
+`StreamListener.listen(executor, protocol, caps)` registers a named byte-stream
+handler. For each inbound `/ww/0.1.0/stream/{protocol}` connection, the
+listener:
 
-## Transport diagram (host/guest boundary)
+1. spawns one process through the supplied `Executor`;
+2. copies the registration-time `List(Export)` into the child's initial grants;
+3. pumps the network stream to the child's stdin;
+4. pumps the child's stdout to the network stream.
 
-```
-Guest code (WASM)                           Host (Tokio + Wasmtime)
-─────────────────                          ────────────────────────
-RpcSession::connect()                      ProcBuilder::with_data_streams()
-  create_connection()  <WIT>              create duplex (host/guest)
-  get_input_stream()   <WIT>              map to AsyncReadStream
-  get_output_stream()  <WIT>              map to AsyncWriteStream
-  StreamReader/Writer                      host_stream split
-        |                                        |
-        v                                        v
-  VatNetwork + RpcSystem                VatNetwork + RpcSystem
-        |                                        |
-        +------------- Cap'n Proto RPC ----------+
-```
+`StreamDialer.dial(peer, protocol)` opens the named stream and returns a
+bidirectional `ByteStream` capability. The bytes have application-defined
+semantics.
 
-## Cell I/O semantics
+This raw stream path differs from vat publication. `StreamListener` spawns a
+process and wires bytes. `VatListener` serves an existing capability through a
+Cap'n Proto `RpcSystem`.
 
-All cell types get `with_data_streams()` + membrane RPC. The WIT membrane
-channel is universal. What differs is the stdin/stdout semantics:
+### HTTP registration
 
-| Cell type | stdin carries | stdout carries |
-|-----------|--------------|----------------|
-| **Raw** (`Cell::raw`) | Wire protocol bytes (libp2p stream) | Wire protocol bytes |
-| **HTTP/WAGI** (`Cell::http`) | CGI request body (RFC 3875) | CGI response |
-| **Cap'n Proto** (`Cell::capnp`) | Shutdown signal only (close = graceful exit) | Unused |
-| **pid0** (no cell section) | Host terminal / daemon stdin | Host terminal |
+`HttpListener.listen(executor, prefix, caps)` is another explicit registration
+path. It creates an HTTP route, spawns one process per request, supplies CGI
+environment variables and request bytes, and reads the CGI response from
+stdout. The host does not select HTTP, byte-stream, or vat behavior from a
+WASM custom section.
 
-For Cap'n Proto (RPC) cells, stdin is a shutdown signal channel, not a data
-transport. The host never writes bytes. All RPC I/O goes through the WIT
-data_streams side-channel.
+## Guest scheduling
 
-Vat publication is publisher-owned: the publisher spawns a cell, imports its
-guest-exported capability with `Process.bootstrap()`, and passes that capability plus
-an explicit auth policy to `VatListener.serveAuthenticated`. The listener owns
-one Terminal and login deadline per stream, but it does not own or spawn the
-publishing cell. `handle_vat_connection_serve` is retained for the explicit
-raw-serving path.
+WASM guests use the cooperative `poll_loop` in `std/system/src/lib.rs`. Each
+cycle performs these actions:
 
-`Process.bootstrap()` is parent-held guest-exported authority, not the
-host-provided `InitialGrants` that bootstraps an ordinary child.
+1. Poll the guest `RpcSystem` for inbound work.
+2. Poll the application future.
+3. If the cycle wrote RPC bytes, poll the `RpcSystem` again to flush them.
+4. Block in `wasi:io/poll` on the RPC reader, optional writer, additional
+   `PollSet` entries, or the idle timeout.
 
-## Executor pool and M:N scheduling
+The second RPC poll is required after application work queues an outbound
+call. Without that poll, the guest can block before it sends the request.
 
-Cell processes run on an `ExecutorPool` of N worker threads (one per CPU core
-by default, configurable via `--executor-threads`). Each worker is an OS thread
-with a `current_thread` tokio runtime and a `LocalSet`, because `wasmtime::Store`
-is `!Send`.
+The writer participates in the poll set only after a write attempt. Otherwise,
+the loop includes a 100 ms monotonic-clock pollable as protection against a
+missed host-stream wakeup.
 
-Cells are assigned to the least-loaded worker at spawn time (with round-robin
-fallback for ties). Multiple cells on the same worker cooperatively share the
-thread via the EWMA fuel scheduler: cells yield every ~10K instructions at
-wasmtime host call boundaries, giving sibling cells a chance to run.
-See [fuel-scheduling.md](designs/fuel-scheduling.md) for the full design.
+Host-side `RpcSystem` instances run as local Tokio tasks. PID0 starts its driver
+in `src/executor.rs`. Ordinary children start their drivers in
+`src/launcher.rs`.
 
-Reference: `src/runtime.rs`
+## Executor scheduling
 
-## Notes and implications
+`ExecutorPool` in `src/services.rs` runs worker OS threads. Each worker has a
+current-thread Tokio runtime and a `LocalSet` because WASM stores and Cap'n
+Proto clients are local tasks. The pool assigns new cells to the least-loaded
+worker and uses round-robin assignment for equal loads.
 
-- The transport is **async** on the host and **poll-driven** on the guest
-  with explicit blocking on WASI pollables.
-- RPC messages traverse memory-only duplex streams; there is no OS socket I/O.
-- Backpressure is mediated by the WASI output stream budget (`check_write`)
-  and the duplex buffer size (`PIPE_BUFFER_SIZE`, currently 64 KiB).
-- `blocking_read()` inside a `system::run` closure is safe: wasmtime's async
-  machinery suspends the entire `call_async` future while waiting, yielding
-  the tokio thread. The poll loop resumes exactly where it left off.
+Scheduled cells use Wasmtime fuel for cooperative yielding. See
+[fuel-scheduling.md](designs/fuel-scheduling.md) for the scheduling policy.
 
-## Deadlock analysis and mitigations
+## Backpressure and lifetime
 
-The guest can deadlock if it blocks without a peer making progress, or if
-both ends wait for each other without driving their RPC systems. The
-transport itself is cooperative: it requires one side to be actively polled
-to move data.
+The process-local duplex stream uses `PIPE_BUFFER_SIZE` from
+`crates/cell/src/proc.rs`. Guest writes obey the WASI output stream's
+`check_write()` budget. Network byte-stream pumps use bounded chunks and wait
+for their readers and writers.
 
-### Deadlock causes
+The host keeps each process-local `RpcSystem` driver alive with the process.
+Dropping the driver closes the RPC path. Guest code must keep `system::run()`,
+`system::run_with()`, or `system::serve()` active while it awaits RPC promises.
 
-1) **Host stops driving the child RPC system.**
-   In `ExecutorImpl::spawn()`, the host spawns a local task to run the child's `RpcSystem`.
-   If that task is never scheduled (or exits early), the guest will block in
-   `wasi_poll::poll` waiting for read/write readiness that never comes.
+`Process.bootstrap()` is parent-held authority exported by a guest through
+`system::serve()`. It is distinct from the host-provided `InitialGrants`
+bootstrap that the ordinary child receives.
 
-2) **Guest waits on RPC promises without driving the poll loop.**
-   Cap'n Proto RPC futures only make progress when `rpc_system.poll`
-   is driven. If user code blocks or returns without continuing the
-   `poll_loop`, responses will never be delivered.
+## Deadlock constraints
 
-3) **Missing flush poll (the double-poll requirement).**
-   If the poll loop only calls `poll_rpc` once (before `poll_future`), RPC
-   calls queued during `future.poll` are never flushed to the wire before
-   `wasi_poll` blocks. The host never sees the request, the guest never
-   gets a response.
+The following constraints keep RPC progress possible:
 
-4) **Backpressure deadlock: both sides waiting on writable/readable state.**
-   If the guest's writer is not ready and the host's reader isn't draining
-   (or vice versa), both sides can become stuck waiting for readiness.
-   The guest-side `StreamWriter` reports readiness via `check_write`; if
-   it repeatedly returns 0, the driver waits for readiness with
-   `wasi_poll::poll`.
+- The host must poll the process's `RpcSystem` while the process is active.
+- The guest must poll its `RpcSystem` while it awaits derived promises.
+- The guest poll loop must flush calls queued by the application future before
+  it blocks on WASI pollables.
+- A vat dialer must start its `RpcSystem` before awaiting a derived promise.
+- Application protocols must avoid call cycles in which both peers wait for
+  callbacks that neither peer can poll.
 
-5) **Application-level wait cycles.**
-   A guest can block awaiting a host response that itself depends on a
-   guest callback or further guest progress (capability-based cycles).
-   This shows up when the guest stops polling while the host expects a
-   follow-up message from the same guest.
-
-6) **Client-side dial: awaiting a derived promise before spawning the
-   RpcSystem.** This is a client-side analog of cause (1), specific to
-   code that *dials* a remote vat, including `VatClient::dial()` for outgoing
-   guest dials. The buggy shape:
-
-   ```rust
-   // BUG: when_resolved() / .send().promise / etc. registers a waker
-   //      on RpcSystem-internal state that never advances because no
-   //      one is polling the system. Deadlock until the timeout fires.
-   let mut rpc_system = RpcSystem::new(network, None);
-   let client = rpc_system.bootstrap(Side::Server);
-   client.when_resolved().await?;                  // <-- hangs forever
-   tokio::task::spawn_local(rpc_system);           // never reached
-   ```
-
-   A second, capnp-rpc-rust-internal quirk compounds the first:
-   `when_resolved()` on a fresh `PromiseClient` does not reliably
-   fire even with correct ordering in capnp-rpc-rust 0.25
-   (`when_more_resolved` keeps appending waiters to an already-drained
-   queue after `PromiseClient::resolve`). The canonical
-   [capnproto-rust hello-world client] sidesteps this entirely by going
-   straight to method calls — the response promise IS the handshake
-   observable.
-
-   The removed `ww shell` path originally surfaced this defect as #450, with a
-   30-second handshake timeout on every connection.
-
-   [capnproto-rust hello-world client]: https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/client.rs
-
-### Mitigations
-
-1) **Ensure both RPC systems are continuously driven.**
-   Host: keep the child's `RpcSystem` alive for the lifetime of the guest
-   process. Guest: keep the poll loop running whenever promises are
-   outstanding.
-
-2) **Use the double-poll pattern.**
-   Always call `poll_rpc` both before and after `poll_work` in the
-   poll loop. This is the single most common deadlock fix.
-
-3) **Use timeouts on long-lived RPC calls.**
-   On the guest, wrap poll-driven workflows with timeouts and error
-   if no progress is made for a window. On the host,
-   bound guest process execution (`tokio::time::timeout`).
-
-4) **Add explicit yield points in agents.**
-   If an agent performs long CPU work, ensure it periodically drives the
-   RPC system and yields to pollables. Without this, inbound RPC traffic
-   will stall.
-
-5) **Tune buffer size.**
-   Increase `PIPE_BUFFER_SIZE` or chunk writes to reduce long stalls when
-   one side is briefly slow to drain.
-
-6) **Observability.**
-   Keep trace logging enabled during development to detect stalled states
-   and verify that the RPC system is being polled.
-
-7) **Use the `vat_dial` paved-path helper for client-side dials.**
-   For any code that dials a remote vat (host-side CLI, the
-   `VatClient::dial()` capability impl, future internal callers), use
-   [`crates/rpc/src/vat_dial.rs::connect`] instead of building the
-   `RpcSystem` + `VatNetwork` + `bootstrap()` chain by hand.  The helper
-   spawns the driver *before* returning the typed bootstrap client, so
-   callers structurally cannot reproduce cause (6).  Returns
-   `VatDial<C>` carrying the typed cap plus a `JoinHandle` for the
-   detached driver; the driver flushes the Bootstrap message and
-   receives the remote Return on its own, with no handshake-check
-   `await` needed.  Regression tests live alongside the helper.
-
-   **Trade-off** (accepted, documented in the helper's module docs):
-   `vat_dial::connect` does not synchronously verify the remote
-   responded to Bootstrap before returning the cap.  In the rare case
-   that the peer accepts the libp2p subprotocol stream but doesn't
-   actually speak Cap'n Proto, the failure surfaces on the caller's
-   first method call via that call's own timeout rather than as a distinct
-   "handshake timeout"
-   at connect.  Time-to-failure is unchanged (~30s either way);
-   diagnostic precision is slightly reduced.  Acceptable because libp2p
-   subprotocol negotiation already established the peer claims to speak
-   our exact capnp interface, the canonical capnproto-rust pattern
-   operates the same way, and the alternative (`when_resolved` await)
-   was empirically broken in capnp-rpc-rust 0.25.  In every other
-   scenario the new behaviour is a strict improvement: no 30s connect
-   penalty for dials that never make a method call, no synchronous wait
-   for cold-cache WASM compile on the other side, etc.
-
-   [`crates/rpc/src/vat_dial.rs::connect`]: ../crates/rpc/src/vat_dial.rs
-
-## Open questions
-
-- **Duplex buffer size.** The current `PIPE_BUFFER_SIZE` (64 KiB) was
-  chosen pragmatically. Profiling under realistic RPC payloads may suggest
-  a different value.
-- **WASI io/streams linkage.** The stream setup currently lives in `Proc`.
-  It may be worth lifting to a shared helper if additional agent types
-  (e.g. `crates/proc/` stream handlers) need the same plumbing.
+Host-side vat clients use `connect()` in `crates/rpc/src/vat_dial.rs` for the
+required driver-before-await ordering. Guest code uses the `system` crate
+entry points instead of constructing an undriven `RpcSystem`.

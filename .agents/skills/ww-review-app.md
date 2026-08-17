@@ -26,7 +26,7 @@ rest.
 
 If they want a full sweep, tell them what to expect:
 
-> I'll check seven things: cell type correctness, least authority,
+> I'll check seven things: transport registration, least authority,
 > trust boundaries, image layout, protocol correctness, boundary
 > I/O, and epoch safety.  I'll flag anything I find as
 > critical / warning / suggestion.  Should take a few minutes.
@@ -37,15 +37,15 @@ Work through these in order of impact.  **Report findings as you
 go** — don't save everything for the end.  Each finding is a small
 deliverable that keeps the review feeling productive.
 
-### 1. Cell type correctness
+### 1. Transport registration
 
-- Right custom section for the use case?
-- Cell type appropriate? (`raw` for streams, `http` for REST,
-  `capnp` for typed RPC, absent for pid0)
-- For `capnp`: embedded schema matches actual interface?
-- For `http`: path prefix matches host routing?
-- For `raw`: protocol ID valid (non-empty, no `/`)?
-- `schema-inject` idempotent in build pipeline?
+- Does the application use `StreamListener.listen()`, `HttpListener.listen()`,
+  `VatListener.serveRaw()`, or `VatListener.serveAuthenticated()` for the
+  intended service?
+- For a vat, does the published capability match the schema?
+- For HTTP, does the path prefix match host routing?
+- For stream or vat protocols, is the name non-empty and free of `/`?
+- Does the application keep service publication separate from process spawn?
 
 ### 2. Principle of least authority
 
@@ -103,8 +103,8 @@ After each area, share what you found.  Then compile a summary:
 1. **Summary** — overall assessment (1-2 sentences)
 2. **Findings** — numbered, each with severity
    (critical / warning / suggestion) and a concrete fix
-3. **Cell type audit** — confirm type is appropriate and correctly
-   injected
+3. **Transport audit** — confirm the registration or publication API matches
+   the intended protocol
 4. **Capability map** — table: current capabilities vs. recommended
    minimum
 

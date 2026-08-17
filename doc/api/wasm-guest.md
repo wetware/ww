@@ -124,7 +124,7 @@ kernel. It is deliberately absent from ordinary-cell linkers.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `kernel-ready` (`kernel_ready()` in generated Rust) | `() -> result<_, stale-generation>` | Commit the generation bound by PID0's process-local graft. The guest supplies no generation or token. |
+| `kernel-ready` (`kernel_ready()` in generated Rust) | `() -> result<_, ready-error>` | Commit the generation bound by PID0's process-local graft. `ready-error` currently contains `stale-generation`. The guest supplies no generation or token. |
 
 This host function is not a Cap'n Proto capability. It cannot appear in a
 `Membrane` graft or `InitialGrants`, be delegated to a child, or cross a
@@ -151,33 +151,43 @@ it bootstraps a Cap'n Proto RPC session over them. The host serves the full
 
 ### Guest Entry Points
 
-The `system` crate (`std/system`) provides two entry points that handle
-all connection setup automatically:
+The `system` crate (`std/system`) provides these entry points, which handle
+connection setup automatically:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `system::run` | `(f: FnOnce(C) -> Future) -> ()` | Bootstrap host cap, run closure, drive RPC. |
+| `system::run_with` | `(poll_set: PollSet, f: FnOnce(C) -> Future) -> ()` | Run as `system::run` does, with additional guest pollables serviced alongside RPC. |
 | `system::serve` | `(bootstrap: Client, f: FnOnce(C) -> Future) -> ()` | Same as `run`, but also exports `bootstrap` to host. |
 | `system::serve_stdio` | `(bootstrap: Client) -> ()` | Export cap over stdin/stdout (no host bootstrap). For byte-stream handlers. |
 
-### Child Initial Grants
+### Graft Exports and Child Initial Grants
 
-An ordinary child calls `initial_grants.get()` to obtain exactly the immutable
-named capabilities delegated at spawn:
+`Membrane.graft()` returns a `List(Export)`. The current host graft uses the
+following canonical names. `identity` requires a configured signing key, and
+`http-client` appears only when the operator configures an `--http-dial`
+allowlist. Trusted PID0 can delegate any selected references to an ordinary
+child through `Executor.spawn` or a listener's registration-time grant list.
 
-| Capability | Interface | Description |
-|------------|-----------|-------------|
-| Host | `system_capnp::host` | Node identity, network interfaces. |
-| Runtime | `system_capnp::runtime` | Load WASM binaries and obtain Executors. |
-| Routing | `routing_capnp::routing` | DHT operations (provide/find_providers). |
-| Identity | `auth_capnp::identity` | Host-side signing, only when explicitly delegated. |
+| Export name | Interface | Description |
+|-------------|-----------|-------------|
+| `identity` | `auth_capnp::identity` | Host-side signing. |
+| `host` | `system_capnp::host` | Node identity and network interfaces. |
+| `runtime` | `system_capnp::runtime` | Load WASM binaries and obtain Executors. |
+| `routing` | `routing_capnp::routing` | DHT operations such as providing and finding providers. |
+| `authority` | `auth_capnp::authority` | Construct a policy-bound `Terminal` over an explicit capability. |
+| `ipfs` | `system_capnp::ipfs` | Read `/ipfs`, `/ipns`, or `/ipld` content through a `ByteStream`. |
+| `http-client` | `http_capnp::http_client` | Make outbound HTTP requests to the configured host allowlist. |
 
-IPFS content is not an RPC capability. If the host explicitly installs the
-known-CID cache substrate, guests may read `/ipfs/<cid>/...` for CIDs they
-already know. Without that execution-context wiring the path does not
-materialize. The substrate provides no enumeration, mutation, pin management,
-publishing, routing, dialing, or ambient network API, though reads can consume
-node network, disk, cache, and eviction resources.
+An ordinary child calls `InitialGrants.get()` to obtain exactly the immutable
+named references selected by its parent. `InitialGrants` does not add the
+canonical graft exports automatically.
+
+WASI filesystem access and the `ipfs` RPC capability are separate surfaces.
+When the host installs the content substrate, WASI guests can read IPFS-family
+paths through the virtual filesystem. The `ipfs` export provides
+`Ipfs.read(path)` for non-WASI clients and for explicit delegation. Neither
+surface provides enumeration, mutation, pin management, or publishing.
 
 Host-derived grants retain their **epoch guards** and become invalid when the
 host advances its epoch. Repeated `InitialGrants.get()` calls return the same
@@ -209,6 +219,7 @@ Full interface reference for the capabilities available to guests.
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `spawn` | `(args: List(Text), env: List(Text), caps: List(Export), fuelPolicy: FuelPolicy) -> (process: Process)` | Spawn a new instance of the bound WASM binary with args, env, explicit initial grants, and fuel policy. |
+| `cid` | `() -> (cid: Text)` | Return the CID of the WASM binary bound to this Executor. |
 
 ### Process
 
@@ -219,6 +230,7 @@ Full interface reference for the capabilities available to guests.
 | `stderr` | `() -> (stream: ByteStream)` | Readable stream from guest's stderr. |
 | `wait` | `() -> (exitCode: Int32)` | Block until process exits. |
 | `bootstrap` | `() -> (cap: Capability)` | Get the capability exported by the guest via `system::serve()`. |
+| `kill` | `() -> ()` | Terminate the process by revoking its fuel. |
 
 ### ByteStream
 

@@ -17,14 +17,14 @@ practice.
 
 Don't just present a list — ask what they're after:
 
-> We have three examples that show different cell types.  What
+> We have three examples that show different guest transports. What
 > sounds most useful to you?
 >
-> 1. **Echo** — simplest possible cell.  Good if you want to see
+> 1. **Echo** — simplest possible guest. Good if you want to see
 >    the bare minimum.  *(~5 min walkthrough)*
-> 2. **Counter** — WAGI cell with FastCGI.  Good if you're building
+> 2. **Counter** — WAGI guest with FastCGI. Good if you're building
 >    a web service.  *(~10 min walkthrough)*
-> 3. **Chess** — full Cap'n Proto vat cell over libp2p.  Good if you want
+> 3. **Chess** — Cap'n Proto vat guest over libp2p. Good if you want
 >    to see a real multi-node app.  *(~15 min walkthrough)*
 >
 > Or tell me what you're trying to build and I'll pick the most
@@ -32,7 +32,7 @@ Don't just present a list — ask what they're after:
 
 ---
 
-## 1. Echo (raw cell) — ~5 min
+## 1. Echo (stdin/stdout guest) — ~5 min
 
 Read files from `examples/echo/`.
 
@@ -45,10 +45,10 @@ Read files from `examples/echo/`.
 Walk through together:
 
 1. **What it does**: reads stdin, writes it back to stdout.  That's it.
-2. **Why it matters**: this is the stdin/stdout convention that *all*
-   cell types share.  Everything else builds on this.
+2. **Why it matters**: `StreamListener.listen()` wires each connection to a
+   guest through stdin/stdout.
 3. **Build it**: run `make -C examples/echo` yourself and show the
-   output.  No schema needed (raw cell, no typed RPC).
+   output. No schema is needed for this byte protocol.
 4. **See it tested**: `examples/echo_handler_e2e.rs` shows how the
    host spawns and exercises it.
 
@@ -63,7 +63,7 @@ with more moving parts?"
 
 ---
 
-## 2. Counter (HTTP/FastCGI cell) — ~10 min
+## 2. Counter (HTTP/FastCGI guest) — ~10 min
 
 Read files from `examples/counter/`.
 
@@ -77,25 +77,25 @@ Walk through together:
 
 1. **What it does**: serves `GET /counter` (returns count) and
    `POST /counter` (increments).  405 for everything else.
-2. **The key difference**: this cell has a *type tag*.  Run
-   `make -C examples/counter` yourself and show the output.
-   The repository does not currently ship a runtime composition for the
+2. **The key difference**: this guest speaks FastCGI over stdin/stdout. Run
+   `make -C examples/counter` yourself and show the output. The repository
+   does not currently ship an `HttpListener.listen()` composition for the
    counter.
 3. **FastCGI protocol**: the cell speaks binary FastCGI over stdio.
    The host translates HTTP ↔ FastCGI.  Simpler than parsing HTTP/1.1.
 4. **Per-request spawn**: each request gets a fresh instance.  Counter
    resets — that's expected for the demo.
 
-⚗️ **Name the win**: "You've seen the full build pipeline: compile
-WASM, inject cell type, host routes traffic.  That's how WAGI cells
-work."
+⚗️ **Name the win**: "You've seen the guest side of WAGI: compile a WASI P2
+component that speaks FastCGI. An `HttpListener.listen()` registration supplies
+the route and per-request process plumbing."
 
 Check in: "Ready for the big one (Chess), or want to dig into
 something here first?"
 
 ---
 
-## 3. Chess (Cap'n Proto vat cell) — ~15 min
+## 3. Chess (Cap'n Proto vat guest) — ~15 min
 
 Read files from `examples/chess/`.
 
@@ -114,9 +114,9 @@ everything at once:
    "This shows what a real multi-node Wetware app looks like."
 2. **The schema** (~3 min): Read `chess.capnp`.  Show the interface.
    "This is the contract between the two nodes."
-3. **The code** (~5 min): Walk through `src/lib.rs`.  Focus on: how
-   it registers a listener, accepts connections, manages game state.
-   Don't read every line — hit the interesting parts.
+3. **The code** (~5 min): Walk through `src/lib.rs`. Focus on how the guest
+   exports its service capability with `system::serve()` and manages game
+   state. Use the authority proof to show separate authenticated publication.
 4. **The image layout** (~2 min): show the built component under `bin/`.
 
 5. **Local computation vs. granted authority** (~3 min): Walk through
