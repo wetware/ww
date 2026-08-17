@@ -125,6 +125,7 @@ an image. A published guest requires an application-specific composition path.
 
 ## Learn more
 
+- [Architecture map](https://wetware.github.io/ww/): interactive map of the current host, authority, cell, and network paths; see the [maintenance guide](diagrams/README.md) for updates
 - [Positioning](doc/positioning.md): the JTBD-anchored category claim and audience
 - [Architecture](doc/architecture.md): design principles and capability flow
 - [Capabilities](doc/capabilities.md): the capability model and Cap'n Proto schemas

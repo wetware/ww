@@ -35,6 +35,7 @@ jobs:
     outputs:
       std: ${{ steps.filter.outputs.std }}
       host: ${{ steps.filter.outputs.host }}
+      architecture_map: ${{ steps.filter.outputs.architecture_map }}
     steps:
     - uses: actions/checkout@v5
     - uses: dorny/paths-filter@v4
@@ -56,8 +57,37 @@ jobs:
             - 'Makefile'
             - '.github/workflows/**'
             - '.github/actions/**'
+          architecture_map:
+            - 'diagrams/architecture-map.json'
+            - 'diagrams/architecture-map.template.html'
+            - 'scripts/generate-architecture-map.mjs'
+            - 'scripts/generate-architecture-map.test.mjs'
+            - 'src/**'
+            - 'crates/**'
+            - 'std/**'
+            - 'Cargo.toml'
+            - 'Cargo.lock'
+            - 'README.md'
+            - 'doc/architecture.md'
+            - 'doc/capabilities.md'
+            - '.github/workflows/rust.yml'
 
   # === Always-run checks (PRs and pushes) ===
+
+  test-architecture-map:
+    name: Test architecture map
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: 24
+        package-manager-cache: false
+
+    - name: Test map generator
+      run: node --test scripts/generate-architecture-map.test.mjs
 
   fmt:
     name: Check formatting
@@ -281,6 +311,62 @@ jobs:
       if: ${{ always() }}
       run: |
         cargo test --manifest-path std/kernel/Cargo.toml
+
+  build-architecture-map:
+    name: Build architecture map
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/master'
+          && needs.changes.outputs.architecture_map == 'true')
+    needs: [changes, fmt, clippy, solidity, build, test, test-architecture-map]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: 24
+        package-manager-cache: false
+
+    - name: Test map generator
+      run: node --test scripts/generate-architecture-map.test.mjs
+
+    - name: Generate Pages artifact
+      run: |
+        mkdir site
+        node scripts/generate-architecture-map.mjs \
+          --output site \
+          --revision "${{ github.sha }}"
+        test "$(find site -maxdepth 1 -type f | wc -l | tr -d ' ')" = 1
+        test -f site/index.html
+
+    - name: Configure GitHub Pages
+      uses: actions/configure-pages@v5
+
+    - name: Upload Pages artifact
+      uses: actions/upload-pages-artifact@v4
+      with:
+        path: site
+
+  deploy-architecture-map:
+    name: Deploy architecture map
+    if: ${{ needs.build-architecture-map.result == 'success' }}
+    needs: build-architecture-map
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+    - name: Deploy GitHub Pages artifact
+      id: deployment
+      uses: actions/deploy-pages@v4
 
   # === Master-only: fan out after checks pass ===
 

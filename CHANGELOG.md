@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **The repository now publishes an interactive architecture map through GitHub
+  Pages.** Reviewed map metadata generates one standalone HTML artifact after
+  the existing CI checks pass. The README links to the map and its maintenance
+  contract documents how contributors update it.
 - **Active documentation now reflects the Rust PID0 architecture after Glia
   removal.** Current references describe ABI v3, direct `/status` composition,
   Host-owned epoch replacement, and the surviving vat and stream transports.
