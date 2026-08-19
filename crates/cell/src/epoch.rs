@@ -538,7 +538,6 @@ pub async fn run_epoch_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn observed_event(seq: u64, cid: &[u8]) -> atom::HeadUpdatedObserved {
         atom::HeadUpdatedObserved {
@@ -617,12 +616,8 @@ mod tests {
         let (epoch_tx, epoch_rx) = watch::channel(initial);
         let client = ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
         let staging = tempfile::tempdir().unwrap();
-        let tree = crate::vfs::CidTree::new(
-            "old-root".to_owned(),
-            client,
-            HashMap::new(),
-            staging.path().to_owned(),
-        );
+        let tree =
+            crate::vfs::CidTree::new("old-root".to_owned(), client, staging.path().to_owned());
         let event = StemEvent {
             seq: 2,
             cid: vec![1],
@@ -766,7 +761,6 @@ mod tests {
         let tree = Arc::new(crate::vfs::CidTree::new(
             "old-root".to_owned(),
             client.clone(),
-            HashMap::new(),
             staging.path().to_owned(),
         ));
         let mut pins = PinSlots::default();

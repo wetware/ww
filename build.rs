@@ -3,9 +3,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[path = "std/kernel/abi/kernel_abi_fingerprint.rs"]
-mod kernel_abi_fingerprint;
-
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
@@ -33,8 +30,6 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=WW_BUILD_GIT_SHA={git_sha}");
     emit_git_commit(manifest_path);
-
-    emit_kernel_abi_fingerprint(manifest_path);
 
     // Compile example schemas so integration tests get typed access.
     let greeter_schema = manifest_path.join("examples/discovery/greeter.capnp");
@@ -102,11 +97,7 @@ fn main() {
     // Check for WASM files that will be embedded via include_bytes!() in release builds.
     // In debug mode, emit a warning but don't fail (allows iterating on non-WASM code).
     // In release mode, fail with a clear error message.
-    let embedded_wasm = [
-        "std/kernel/bin/main.wasm",
-        "std/status/bin/status.wasm",
-        "examples/echo/bin/echo.wasm",
-    ];
+    let embedded_wasm = ["std/kernel/bin/main.wasm", "std/status/bin/status.wasm"];
     let mut missing = Vec::new();
     for wasm_path in &embedded_wasm {
         let full = manifest_path.join(wasm_path);
@@ -171,119 +162,6 @@ fn emit_git_commit(manifest_path: &Path) {
     let suffix = if dirty { "+dirty" } else { "" };
 
     println!("cargo:rustc-env=GIT_COMMIT={commit}{suffix}");
-}
-
-fn emit_kernel_abi_fingerprint(manifest_path: &Path) {
-    const KERNEL_ABI_VERSION: &str = "3";
-    const KERNEL_RUNTIME_WIT: &str = "std/kernel/wit/kernel.wit";
-    const SCHEMA_ROOTS: &[&str] = &[
-        "system.capnp",
-        "routing.capnp",
-        "auth.capnp",
-        "membrane.capnp",
-        "stem.capnp",
-        "http.capnp",
-    ];
-    let capnp_dir = manifest_path.join("capnp");
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let raw_request = out_dir.join("kernel_abi_schema_request.bin");
-    let mut compiler = capnpc::CompilerCommand::new();
-    compiler
-        .src_prefix(&capnp_dir)
-        .crate_provides("capnp", [0xa93fc509624c72d9]);
-    for schema in SCHEMA_ROOTS {
-        compiler.file(capnp_dir.join(schema));
-    }
-    compiler
-        .raw_code_generator_request_path(&raw_request)
-        .run()
-        .expect("failed to compile schemas for kernel ABI fingerprint");
-
-    // Fingerprint every generated schema node, not a hand-maintained subset.
-    // This covers interface method ordinals plus referenced structs/enums such
-    // as membrane exports, process handles, and HTTP request data.
-    let request_data = fs::read(&raw_request).expect("read kernel ABI schema request");
-    let message = capnp::serialize::read_message(
-        &mut request_data.as_slice(),
-        capnp::message::ReaderOptions::new(),
-    )
-    .expect("decode kernel ABI schema request");
-    let request: capnp::schema_capnp::code_generator_request::Reader = message
-        .get_root()
-        .expect("read kernel ABI code generator request");
-    let mut schema_ids: Vec<u64> = request
-        .get_nodes()
-        .expect("read kernel ABI schema nodes")
-        .iter()
-        .map(|node| node.get_id())
-        .collect();
-    schema_ids.sort_unstable();
-    schema_ids.dedup();
-    let schema_names: Vec<String> = schema_ids
-        .iter()
-        .map(|type_id| format!("NODE_{type_id:016X}"))
-        .collect();
-    let requested_schemas: Vec<(&str, u64)> = schema_names
-        .iter()
-        .zip(schema_ids.iter().copied())
-        .map(|(name, type_id)| (name.as_str(), type_id))
-        .collect();
-    let mut schemas = schema_id::extract_schemas(&raw_request, &requested_schemas)
-        .expect("extract schemas for kernel ABI fingerprint");
-    schemas.sort_by_key(|schema| schema.type_id);
-
-    let lock_path = manifest_path.join("Cargo.lock");
-    let lock = fs::read_to_string(&lock_path).expect("read Cargo.lock for kernel ABI fingerprint");
-    let capnp_rpc_source = lock
-        .split("[[package]]")
-        .find(|package| {
-            package
-                .lines()
-                .any(|line| line.trim() == "name = \"capnp-rpc\"")
-        })
-        .and_then(|package| {
-            package.lines().find_map(|line| {
-                line.trim()
-                    .strip_prefix("source = \"")
-                    .and_then(|value| value.strip_suffix('"'))
-            })
-        })
-        .filter(|source| {
-            source.starts_with("git+https://github.com/wetware/capnproto-rust?")
-                && source.rsplit_once('#').is_some_and(|(_, revision)| {
-                    revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-        })
-        .expect("patched capnp-rpc source missing from Cargo.lock");
-
-    let kernel_runtime_wit_path = manifest_path.join(KERNEL_RUNTIME_WIT);
-    let kernel_runtime_wit =
-        fs::read(&kernel_runtime_wit_path).expect("read private kernel runtime WIT");
-    let mut material =
-        kernel_abi_fingerprint::private_pid0_abi_material(KERNEL_ABI_VERSION, &kernel_runtime_wit)
-            .expect("canonicalize private PID0 ABI material");
-    for schema in SCHEMA_ROOTS {
-        material.push_str(&format!("schema-root={schema}\n"));
-    }
-    for schema in schemas {
-        material.push_str(&format!("schema-{:016x}={}\n", schema.type_id, schema.cid));
-    }
-    material.push_str(&format!("capnp-rpc={capnp_rpc_source}\n"));
-    let fingerprint = blake3::hash(material.as_bytes()).to_hex();
-
-    println!("cargo:rustc-env=WW_KERNEL_ABI={KERNEL_ABI_VERSION}");
-    println!("cargo:rustc-env=WW_KERNEL_ABI_FPR={fingerprint}");
-    println!("cargo:rerun-if-changed={}", lock_path.display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        kernel_runtime_wit_path.display()
-    );
-    for schema in SCHEMA_ROOTS {
-        println!(
-            "cargo:rerun-if-changed={}",
-            capnp_dir.join(schema).display()
-        );
-    }
 }
 
 fn emit_git_rerun_paths(manifest_path: &Path) {

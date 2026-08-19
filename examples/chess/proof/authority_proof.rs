@@ -840,9 +840,10 @@ fn start_libp2p_host(
     let listen_addr = "/ip4/127.0.0.1/tcp/0"
         .parse()
         .map_err(|error| ProofFailure::new(ProofStage::Setup, format!("{error}")))?;
-    let host = ww::host::Libp2pHost::new(vec![listen_addr], keypair, None, Vec::new()).map_err(
-        |error| ProofFailure::new(ProofStage::Setup, format!("host setup failed: {error}")),
-    )?;
+    let host =
+        ww::host::Net::new(vec![listen_addr], keypair, None, Vec::new()).map_err(|error| {
+            ProofFailure::new(ProofStage::Setup, format!("host setup failed: {error}"))
+        })?;
     let peer_id = host.local_peer_id();
     let stream_control = host.stream_control();
     let network_state = ww::rpc::NetworkState::from_peer_id(peer_id.to_bytes());

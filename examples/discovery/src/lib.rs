@@ -64,10 +64,6 @@ mod greeter_capnp {
     include!(concat!(env!("OUT_DIR"), "/greeter_capnp.rs"));
 }
 
-// Build-time schema constants: GREETER_SCHEMA (&[u8]) and GREETER_CID (&str).
-// Vat publication uses the service name below; the schema CID is metadata.
-include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
-
 const GREETER_SERVICE: &str = "greeter";
 
 /// Host-provided closed delivery of this child's immutable initial grants.

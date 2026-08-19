@@ -11,16 +11,6 @@ use cid::Cid;
 use crate::cell::loaders::{HostPathLoader, IpfsLoader};
 use crate::cell::Loader;
 
-#[cfg(test)]
-#[path = "../std/kernel/abi/kernel_abi_fingerprint.rs"]
-mod kernel_abi_fingerprint;
-
-/// Version of the native host ↔ pid0 component contract.
-pub const KERNEL_ABI_VERSION: &str = env!("WW_KERNEL_ABI");
-
-/// Build-locked fingerprint of the native/PID0 WIT and Cap'n Proto ABI inputs.
-pub const KERNEL_ABI_FINGERPRINT: &str = env!("WW_KERNEL_ABI_FPR");
-
 /// Source selected for the pid0 component.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelSource {
@@ -95,8 +85,6 @@ impl ResolvedKernel {
             wasm_blake3: blake3::hash(&self.bytes).to_hex().to_string(),
             source_cid: self.metadata.source_cid.as_ref().map(ToString::to_string),
             size: self.metadata.size,
-            abi: KERNEL_ABI_VERSION.to_string(),
-            abi_fingerprint: KERNEL_ABI_FINGERPRINT.to_string(),
         }
     }
 }
@@ -109,8 +97,6 @@ pub struct KernelIdentity {
     pub wasm_blake3: String,
     pub source_cid: Option<String>,
     pub size: usize,
-    pub abi: String,
-    pub abi_fingerprint: String,
 }
 
 /// Shared identity state keeps `/version` available before Kubo and pid0.
@@ -301,11 +287,6 @@ mod tests {
     use super::*;
 
     const TEST_CID: &str = "bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a";
-
-    #[test]
-    fn host_pid0_abi_is_v3() {
-        assert_eq!(KERNEL_ABI_VERSION, "3");
-    }
 
     #[test]
     fn selector_precedence_is_cli_then_env_then_embedded() {

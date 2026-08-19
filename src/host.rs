@@ -4,7 +4,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::num::{NonZeroU8, NonZeroUsize};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -15,7 +14,6 @@ use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
 use tokio::sync::{mpsc, oneshot};
-use wasmtime::Engine;
 
 use rpc::{NatReachability, NetworkState, PeerInfo};
 
@@ -258,8 +256,8 @@ fn is_relay_capable(protocols: &[libp2p::StreamProtocol]) -> bool {
 /// Bootstrap info for the in-process Kad client.
 ///
 /// Obtained by calling [`crate::ipfs::HttpClient::kubo_info`] and parsing the
-/// returned peer ID + swarm address.  Passed to [`WetwareHost::new`] so the
-/// Kad client can bootstrap against the local Kubo node.
+/// returned peer ID + swarm address. Passed to [`Net::new`] so the Kad client
+/// can bootstrap against the local Kubo node.
 pub struct KuboBootstrapInfo {
     pub peer_id: PeerId,
     pub addr: Multiaddr,
@@ -269,7 +267,7 @@ pub use rpc::SwarmCommand;
 
 /// Network behavior for Wetware hosts.
 #[derive(libp2p::swarm::NetworkBehaviour)]
-pub struct WetwareBehaviour {
+pub struct Behaviour {
     pub identify: libp2p::identify::Behaviour,
     pub stream: libp2p_stream::Behaviour,
     /// WAN Kademlia DHT client (Amino protocol `/ipfs/kad/1.0.0`).
@@ -290,14 +288,14 @@ pub struct WetwareBehaviour {
     pub connection_limits: libp2p::connection_limits::Behaviour,
 }
 
-/// Libp2p host wrapper for Wetware.
-pub struct Libp2pHost {
-    swarm: libp2p::swarm::Swarm<WetwareBehaviour>,
+/// Host-side P2P networking subsystem.
+pub struct Net {
+    swarm: libp2p::swarm::Swarm<Behaviour>,
     local_peer_id: PeerId,
     stream_control: libp2p_stream::Control,
 }
 
-impl Libp2pHost {
+impl Net {
     /// Create a new libp2p host and start listening on the given multiaddrs.
     ///
     /// `listen` is the set of multiaddrs to bind. Every entry must succeed —
@@ -430,7 +428,7 @@ impl Libp2pHost {
                     .with_max_pending_outgoing(Some(16))
                     .with_max_established_incoming(Some(64))
                     .with_max_established_outgoing(Some(64));
-                Ok(WetwareBehaviour {
+                Ok(Behaviour {
                     identify: libp2p::identify::Behaviour::new(identify_config),
                     stream: stream_behaviour,
                     kad: kad_wan,
@@ -649,7 +647,7 @@ impl Libp2pHost {
                             }
                         }
                         // WAN Kad events
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::Kad(
+                        SwarmEvent::Behaviour(BehaviourEvent::Kad(
                             kad::Event::OutboundQueryProgressed { id, result, step, .. },
                         )) => {
                             handle_kad_event(
@@ -669,11 +667,11 @@ impl Libp2pHost {
                                 );
                             }
                         }
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::Kad(ref ev)) => {
+                        SwarmEvent::Behaviour(BehaviourEvent::Kad(ref ev)) => {
                             tracing::debug!("WAN Kad event: {ev:?}");
                         }
                         // LAN Kad events
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::KadLan(
+                        SwarmEvent::Behaviour(BehaviourEvent::KadLan(
                             kad::Event::OutboundQueryProgressed { id, result, step, .. },
                         )) => {
                             handle_kad_event(
@@ -693,11 +691,11 @@ impl Libp2pHost {
                                 );
                             }
                         }
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::KadLan(ref ev)) => {
+                        SwarmEvent::Behaviour(BehaviourEvent::KadLan(ref ev)) => {
                             tracing::debug!("LAN Kad event: {ev:?}");
                         }
                         // --- Identify: relay discovery ---
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::Identify(
+                        SwarmEvent::Behaviour(BehaviourEvent::Identify(
                             libp2p::identify::Event::Received { peer_id, info, .. },
                         )) => {
                             handle_identify_received(
@@ -711,9 +709,9 @@ impl Libp2pHost {
                                 &mut self.swarm,
                             );
                         }
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::Identify(_)) => {}
+                        SwarmEvent::Behaviour(BehaviourEvent::Identify(_)) => {}
                         // --- AutoNAT v2: supplementary probes ---
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::AutonatV2(ev)) => {
+                        SwarmEvent::Behaviour(BehaviourEvent::AutonatV2(ev)) => {
                             let success = ev.result.is_ok();
                             tracing::debug!(
                                 addr = %ev.tested_addr,
@@ -753,7 +751,7 @@ impl Libp2pHost {
                             }
                         }
                         // --- Relay client ---
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::RelayClient(
+                        SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
                             libp2p::relay::client::Event::ReservationReqAccepted {
                                 relay_peer_id,
                                 renewal,
@@ -776,11 +774,11 @@ impl Libp2pHost {
                                 "Relay reservation accepted"
                             );
                         }
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::RelayClient(ev)) => {
+                        SwarmEvent::Behaviour(BehaviourEvent::RelayClient(ev)) => {
                             tracing::debug!("Relay client event: {ev:?}");
                         }
                         // --- DCUtR: hole-punch results ---
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::Dcutr(ev)) => {
+                        SwarmEvent::Behaviour(BehaviourEvent::Dcutr(ev)) => {
                             match &ev.result {
                                 Ok(conn_id) => {
                                     tracing::info!(
@@ -799,7 +797,7 @@ impl Libp2pHost {
                             }
                         }
                         // --- Stream behaviour has no events ---
-                        SwarmEvent::Behaviour(WetwareBehaviourEvent::Stream(_)) => {}
+                        SwarmEvent::Behaviour(BehaviourEvent::Stream(_)) => {}
                         _ => {}
                     }
                 }
@@ -916,7 +914,7 @@ fn handle_kad_event(
     id: kad::QueryId,
     result: kad::QueryResult,
     step: &kad::ProgressStep,
-    swarm: &mut libp2p::swarm::Swarm<WetwareBehaviour>,
+    swarm: &mut libp2p::swarm::Swarm<Behaviour>,
     pending_provides: &mut HashMap<u64, ProvideRequest>,
     provide_query_to_req: &mut HashMap<DhtQueryKey, u64>,
     pending_finds: &mut HashMap<u64, FindRequest>,
@@ -1164,7 +1162,7 @@ fn handle_identify_received(
     pending_relay_attempts: &mut HashMap<PeerId, usize>,
     relay_candidates: &mut Vec<(PeerId, Multiaddr)>,
     seen_relay_peers: &mut HashSet<PeerId>,
-    swarm: &mut libp2p::swarm::Swarm<WetwareBehaviour>,
+    swarm: &mut libp2p::swarm::Swarm<Behaviour>,
 ) {
     // Check if this peer can serve as a relay.
     if !is_relay_capable(&info.protocols) {
@@ -1224,7 +1222,7 @@ fn try_reserve_relay(
     active_relay_reservations: &mut usize,
     inflight_relay_requests: &mut usize,
     pending_relay_attempts: &mut HashMap<PeerId, usize>,
-    swarm: &mut libp2p::swarm::Swarm<WetwareBehaviour>,
+    swarm: &mut libp2p::swarm::Swarm<Behaviour>,
 ) {
     while *active_relay_reservations + *inflight_relay_requests < MAX_RELAY_RESERVATIONS {
         let Some((peer_id, circuit_addr)) = relay_candidates.pop() else {
@@ -1245,7 +1243,7 @@ fn request_relay_reservation(
     circuit_addr: Multiaddr,
     inflight_relay_requests: &mut usize,
     pending_relay_attempts: &mut HashMap<PeerId, usize>,
-    swarm: &mut libp2p::swarm::Swarm<WetwareBehaviour>,
+    swarm: &mut libp2p::swarm::Swarm<Behaviour>,
 ) {
     tracing::info!(
         relay = %peer_id,
@@ -1277,81 +1275,6 @@ fn clear_pending_relay_attempts(
             inflight = *inflight_relay_requests,
             "Cleared pending relay attempts"
         );
-    }
-}
-
-/// Shared Wasmtime runtime state for Wetware hosts.
-pub struct WasmtimeHost {
-    engine: Arc<Engine>,
-}
-
-impl WasmtimeHost {
-    pub fn new() -> Result<Self> {
-        // Uses the canonical engine factory. WasmtimeHost serves integration
-        // tests, not the ExecutorPool; with no tick task epoch interruption is
-        // inert here, but cache policy remains identical to runtime engines.
-        let engine = cell::engine::wasm_engine()?;
-        Ok(Self {
-            engine: Arc::new(engine),
-        })
-    }
-
-    pub fn engine(&self) -> Arc<Engine> {
-        Arc::clone(&self.engine)
-    }
-}
-
-/// Wetware host combines libp2p and Wasmtime runtimes.
-pub struct WetwareHost {
-    libp2p: Libp2pHost,
-    wasmtime: WasmtimeHost,
-    network_state: NetworkState,
-    swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
-    swarm_cmd_rx: Option<mpsc::Receiver<SwarmCommand>>,
-}
-
-impl WetwareHost {
-    pub fn new(
-        listen: Vec<Multiaddr>,
-        keypair: libp2p::identity::Keypair,
-        kubo_bootstrap: Option<KuboBootstrapInfo>,
-        kubo_peers: Vec<(PeerId, Multiaddr)>,
-    ) -> Result<Self> {
-        let libp2p = Libp2pHost::new(listen, keypair, kubo_bootstrap, kubo_peers)?;
-        let wasmtime = WasmtimeHost::new()?;
-        let network_state = NetworkState::from_peer_id(libp2p.local_peer_id().to_bytes());
-        let (swarm_cmd_tx, swarm_cmd_rx) = mpsc::channel(64);
-        Ok(Self {
-            libp2p,
-            wasmtime,
-            network_state,
-            swarm_cmd_tx,
-            swarm_cmd_rx: Some(swarm_cmd_rx),
-        })
-    }
-
-    pub fn network_state(&self) -> NetworkState {
-        self.network_state.clone()
-    }
-
-    pub fn swarm_cmd_tx(&self) -> mpsc::Sender<SwarmCommand> {
-        self.swarm_cmd_tx.clone()
-    }
-
-    pub fn wasmtime_engine(&self) -> Arc<Engine> {
-        self.wasmtime.engine()
-    }
-
-    pub fn stream_control(&self) -> libp2p_stream::Control {
-        self.libp2p.stream_control()
-    }
-
-    pub async fn run(mut self) -> Result<()> {
-        let cmd_rx = self
-            .swarm_cmd_rx
-            .take()
-            .expect("run() called more than once");
-        self.libp2p.run(self.network_state, cmd_rx).await
     }
 }
 
@@ -1746,134 +1669,5 @@ mod tests {
         clear_pending_relay_attempts(peer, &mut inflight, &mut pending);
         assert_eq!(inflight, 1);
         assert!(!pending.contains_key(&peer));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Client-mode swarm — minimal libp2p for dialing only
-// ---------------------------------------------------------------------------
-
-/// Minimal network behaviour for client-only operation.
-/// Identify for peer info exchange + libp2p_stream for VatClient dialing.
-/// Relay client for connecting to NATted nodes via relayed addresses.
-/// No Kademlia and no listeners.
-#[derive(libp2p::swarm::NetworkBehaviour)]
-pub struct ClientBehaviour {
-    identify: libp2p::identify::Behaviour,
-    stream: libp2p_stream::Behaviour,
-    relay_client: libp2p::relay::client::Behaviour,
-}
-
-/// A lightweight libp2p swarm for dialing peers and consuming vat services
-/// without booting a full host.
-pub struct ClientSwarm {
-    swarm: libp2p::swarm::Swarm<ClientBehaviour>,
-    local_peer_id: PeerId,
-    stream_control: libp2p_stream::Control,
-}
-
-impl ClientSwarm {
-    /// Build a client-mode swarm with TCP + QUIC + Relay (same stack as host).
-    /// No listeners are registered — this swarm only dials outgoing connections.
-    /// Relay transport enables dialing NATted nodes via their relayed addresses.
-    pub fn new(keypair: libp2p::identity::Keypair) -> Result<Self> {
-        let peer_id = keypair.public().to_peer_id();
-
-        let stream_behaviour = libp2p_stream::Behaviour::new();
-        let stream_control = stream_behaviour.new_control();
-
-        let identify_config =
-            libp2p::identify::Config::new("wetware-shell/0.1.0".to_string(), keypair.public());
-
-        let swarm = SwarmBuilder::with_existing_identity(keypair)
-            .with_tokio()
-            .with_tcp(
-                Default::default(),
-                libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
-            )?
-            .with_quic()
-            .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
-            .with_behaviour(|_keypair, relay_client| {
-                Ok(ClientBehaviour {
-                    identify: libp2p::identify::Behaviour::new(identify_config),
-                    stream: stream_behaviour,
-                    relay_client,
-                })
-            })?
-            .with_swarm_config(|c: libp2p::swarm::Config| {
-                c.with_idle_connection_timeout(Duration::from_secs(60))
-            })
-            .build();
-
-        Ok(Self {
-            swarm,
-            local_peer_id: peer_id,
-            stream_control,
-        })
-    }
-
-    pub fn local_peer_id(&self) -> PeerId {
-        self.local_peer_id
-    }
-
-    pub fn stream_control(&self) -> libp2p_stream::Control {
-        self.stream_control.clone()
-    }
-
-    /// Add a known address for a peer and initiate dialing.
-    pub fn add_peer_addr(&mut self, peer_id: PeerId, addr: Multiaddr) {
-        self.swarm.add_peer_address(peer_id, addr.clone());
-        // Proactively dial so the connection is established before open_stream.
-        if let Err(e) = self
-            .swarm
-            .dial(addr.with(libp2p::multiaddr::Protocol::P2p(peer_id)))
-        {
-            tracing::warn!(peer = %peer_id, "Failed to initiate dial: {e}");
-        }
-    }
-
-    /// Dial a multiaddr directly.
-    ///
-    /// Use this when the peer ID is not yet known.
-    pub fn dial(&mut self, addr: Multiaddr) -> Result<(), libp2p::swarm::DialError> {
-        self.swarm.dial(addr)
-    }
-
-    /// Drive the swarm event loop. Spawn this as a background task.
-    ///
-    /// If `connected_tx` is provided, the peer ID of the first established
-    /// connection is sent through it (useful when the
-    /// peer ID is not known upfront).
-    pub async fn run(
-        mut self,
-        connected_tx: Option<tokio::sync::oneshot::Sender<Result<PeerId, String>>>,
-    ) {
-        use libp2p::swarm::SwarmEvent;
-        let mut connected_tx = connected_tx;
-        loop {
-            match self.swarm.next().await {
-                Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {
-                    tracing::debug!(peer = %peer_id, "Client connection established");
-                    if let Some(tx) = connected_tx.take() {
-                        let _ = tx.send(Ok(peer_id));
-                    }
-                }
-                Some(SwarmEvent::ConnectionClosed { peer_id, .. }) => {
-                    tracing::debug!(peer = %peer_id, "Client connection closed");
-                }
-                Some(SwarmEvent::OutgoingConnectionError { peer_id, error, .. }) => {
-                    tracing::warn!(
-                        peer = ?peer_id,
-                        "Client outgoing connection error: {error}"
-                    );
-                    if let Some(tx) = connected_tx.take() {
-                        let _ = tx.send(Err(format!("{error}")));
-                    }
-                }
-                Some(_) => {} // Ignore other events
-                None => break,
-            }
-        }
     }
 }

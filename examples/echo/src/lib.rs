@@ -1,8 +1,7 @@
 //! Minimal WASI echo cell for integration testing.
 //!
 //! Reads all of stdin, writes it to stdout unchanged, then exits.
-//! Used by HttpServer integration tests to validate the full
-//! spawn → pipe → collect pipeline.
+//! Used by executor integration tests to validate the spawn and stdio path.
 
 use wasip2::cli::stdin::get_stdin;
 use wasip2::cli::stdout::get_stdout;

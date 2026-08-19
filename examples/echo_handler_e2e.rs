@@ -1,4 +1,4 @@
-//! End-to-end integration test: HttpServer + Runtime/Executor + echo cell.
+//! End-to-end integration test: Runtime/Executor + echo cell.
 //!
 //! Validates the full pipeline:
 //!   1. Load echo WASM binary
@@ -9,15 +9,11 @@
 //!   6. Write to Process.stdin, read from Process.stdout
 //!   7. Verify echo round-trip
 //!
-//! Also validates HttpServer::handle() (Mode A: per-request spawn).
-//!
 //! Run: cargo run --example echo_handler_e2e
 
 use ww::launcher::create_runtime_client;
 use ww::rpc::CachePolicy;
 use ww::system_capnp;
-
-const ECHO_WASM: &[u8] = include_bytes!("echo/bin/echo.wasm");
 
 /// Create a Runtime client for testing (no network, no epoch guard).
 fn setup_runtime() -> system_capnp::runtime::Client {
@@ -35,6 +31,8 @@ async fn main() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
+            let echo_wasm = std::fs::read("examples/echo/bin/echo.wasm")
+                .expect("build the echo example with `make -C examples/echo`");
             println!("Echo Cell E2E Test");
             println!("=====================\n");
 
@@ -42,7 +40,7 @@ async fn main() {
 
             // Load echo WASM via runtime.load() → Executor
             let mut load_req = runtime.load_request();
-            load_req.get().set_wasm(ECHO_WASM);
+            load_req.get().set_wasm(&echo_wasm);
             let load_resp = load_req.send().promise.await.unwrap();
             let executor = load_resp.get().unwrap().get_executor().unwrap();
 
@@ -130,29 +128,6 @@ async fn main() {
                 let wait_resp2 = process2.wait_request().send().promise.await.unwrap();
                 assert_eq!(wait_resp2.get().unwrap().get_exit_code(), 0);
                 println!("  [OK] Second spawn exit code: 0");
-            }
-
-            // ─── Test 3: HttpServer.handle() (Mode A) ───
-            println!("\n--- Test 3: HttpServer.handle() (per-request spawn) ---");
-            {
-                let server = ww::dispatcher::HttpServer::new(executor.clone());
-
-                let (response, exit_code) = server
-                    .handle(b"hello via HttpServer".to_vec())
-                    .await
-                    .unwrap();
-
-                assert_eq!(response, b"hello via HttpServer");
-                assert_eq!(exit_code, 0);
-                println!("  [OK] HttpServer echo: 'hello via HttpServer'");
-                println!("  [OK] Exit code: {exit_code}");
-
-                // Second request (new spawn)
-                let (response2, exit_code2) =
-                    server.handle(b"second request".to_vec()).await.unwrap();
-                assert_eq!(response2, b"second request");
-                assert_eq!(exit_code2, 0);
-                println!("  [OK] Second request echo: 'second request'");
             }
 
             println!("\n=====================");

@@ -102,23 +102,6 @@ pub fn stream_protocol(protocol: &str) -> Result<StreamProtocol, capnp::Error> {
         .map_err(|e| capnp::Error::failed(format!("invalid stream protocol: {e}")))
 }
 
-/// Re-canonicalize a `Schema.Node` reader into raw single-segment bytes.
-///
-/// Mirrors `crates/schema-id::canonicalize_node` and the build-time
-/// emission path so the bytes match what `crates/authority`'s
-/// `schema_registry` exposes for core caps. Returns `None` if the message
-/// produces an unexpected (non-single) segment count, which would indicate
-/// a malformed input.
-pub fn canonicalize_schema_node(node: capnp::schema_capnp::node::Reader<'_>) -> Option<Vec<u8>> {
-    let mut msg = capnp::message::Builder::new_default();
-    msg.set_root_canonical(node).ok()?;
-    let segments = msg.get_segments_for_output();
-    if segments.len() != 1 {
-        return None;
-    }
-    Some(segments[0].to_vec())
-}
-
 /// Maximum bytes a single ByteStream read may allocate.
 ///
 /// Guards against OOM from callers requesting u32::MAX bytes.

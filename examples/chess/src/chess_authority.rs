@@ -393,7 +393,7 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[seed; 32]);
         let keypair = ww::keys::to_libp2p(&signing_key).expect("convert host key");
         let listen_addr = "/ip4/127.0.0.1/tcp/0".parse().expect("listen address");
-        let host = ww::host::Libp2pHost::new(vec![listen_addr], keypair, None, Vec::new())
+        let host = ww::host::Net::new(vec![listen_addr], keypair, None, Vec::new())
             .expect("start libp2p host");
         let peer_id = host.local_peer_id();
         let stream_control = host.stream_control();

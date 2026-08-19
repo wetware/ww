@@ -51,7 +51,7 @@ fn fresh_kad() -> (libp2p::PeerId, kad::Behaviour<kad::store::MemoryStore>) {
 // ---------------------------------------------------------------------------
 
 /// Verify that `kubo_info()` returns a parseable peer ID and at least one
-/// swarm address.  This is the very first call `Libp2pHost::new` makes.
+/// swarm address. This is the first call `Net::new` makes.
 #[tokio::test]
 async fn test_kubo_info_valid_identity() {
     if !ipfs_available().await {
@@ -86,7 +86,7 @@ async fn test_kubo_info_valid_identity() {
 
 /// Verify that swarm_peers() returns parseable peers and that they can be
 /// added to a Kad routing table.  This is the plumbing that
-/// `Libp2pHost::new` relies on to populate the routing table from Kubo's
+/// `Net::new` relies on to populate the routing table from Kubo's
 /// connected peers.
 #[tokio::test]
 async fn test_swarm_peers_populate_routing_table() {
@@ -124,7 +124,7 @@ async fn test_swarm_peers_populate_routing_table() {
 
 /// Verify that the Kubo node itself can be added as a Kad bootstrap peer.
 ///
-/// `Libp2pHost::new` adds Kubo as a bootstrap entry alongside random swarm
+/// `Net::new` adds Kubo as a bootstrap entry alongside random swarm
 /// peers.  This test validates that the `KuboInfo` peer ID + address can
 /// populate the routing table the same way.
 #[tokio::test]

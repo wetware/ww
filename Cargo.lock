@@ -1457,7 +1457,6 @@ dependencies = [
  "libp2p-stream",
  "log",
  "rand 0.9.4",
- "schema-id",
  "serde_json",
  "shakmaty",
  "system",
@@ -2227,7 +2226,6 @@ dependencies = [
  "hex",
  "log",
  "rand 0.9.4",
- "schema-id",
  "system",
  "tokio",
  "tokio-util",
@@ -5268,7 +5266,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "atom",
  "auth",
  "base58",
  "blake3",
@@ -5287,12 +5284,10 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "stem",
  "tokio",
  "tokio-util",
  "tracing",
  "wetware-authority",
- "ww-cache",
 ]
 
 [[package]]
@@ -5501,16 +5496,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "schema-id"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "capnp",
- "capnpc",
- "cid",
 ]
 
 [[package]]
@@ -7273,7 +7258,6 @@ dependencies = [
  "libp2p-core",
  "libp2p-identity",
  "rand 0.8.6",
- "schema-id",
  "tokio",
  "tracing",
  "wetware-membrane",
@@ -8039,7 +8023,6 @@ dependencies = [
  "rand 0.9.4",
  "reqwest",
  "rpc",
- "schema-id",
  "serde",
  "serde_json",
  "stem",

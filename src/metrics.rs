@@ -467,8 +467,6 @@ async fn version_handler(State(state): State<AdminState>) -> impl IntoResponse {
         "kernel_source_cid": kernel_identity.and_then(|identity| identity.source_cid.as_deref()),
         "kernel_wasm_blake3": kernel_identity.map(|identity| identity.wasm_blake3.as_str()),
         "kernel_size": kernel_identity.map(|identity| identity.size),
-        "kernel_abi": crate::kernel::KERNEL_ABI_VERSION,
-        "kernel_abi_fingerprint": crate::kernel::KERNEL_ABI_FINGERPRINT,
         "degraded": runtime.degraded || cache.state == WasmtimeCacheState::Fallback,
         "degraded_reasons": runtime.degraded_reasons,
         "wasmtime_cache_state": cache.state.as_str(),
@@ -634,8 +632,6 @@ mod tests {
                 wasm_blake3: "kernel".to_string(),
                 source_cid: None,
                 size: 42,
-                abi: crate::kernel::KERNEL_ABI_VERSION.to_string(),
-                abi_fingerprint: crate::kernel::KERNEL_ABI_FINGERPRINT.to_string(),
             })
             .unwrap();
         AdminState {
@@ -765,11 +761,6 @@ mod tests {
         assert_eq!(value["kernel_source"], "embedded:main");
         assert_eq!(value["kernel_wasm_blake3"], "kernel");
         assert_eq!(value["kernel_size"], 42);
-        assert_eq!(value["kernel_abi"], crate::kernel::KERNEL_ABI_VERSION);
-        assert_eq!(
-            value["kernel_abi_fingerprint"],
-            crate::kernel::KERNEL_ABI_FINGERPRINT
-        );
         assert!(value["wasmtime_cache_hits_total"].is_u64());
         assert!(value["wasmtime_cache_stores_total"].is_u64());
         assert!(value["wasmtime_component_compilations_total"].is_u64());

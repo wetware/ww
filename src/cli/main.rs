@@ -32,11 +32,6 @@ const EMBEDDED_KERNEL: &[u8] = include_bytes!("../../std/kernel/bin/main.wasm");
 #[cfg(not(has_wasm_std_kernel_bin_main_wasm))]
 const EMBEDDED_KERNEL: &[u8] = b"";
 
-#[cfg(has_wasm_examples_echo_bin_echo_wasm)]
-const EMBEDDED_ECHO: &[u8] = include_bytes!("../../examples/echo/bin/echo.wasm");
-#[cfg(not(has_wasm_examples_echo_bin_echo_wasm))]
-const EMBEDDED_ECHO: &[u8] = b"";
-
 #[cfg(has_wasm_std_status_bin_status_wasm)]
 const EMBEDDED_STATUS: &[u8] = include_bytes!("../../std/status/bin/status.wasm");
 #[cfg(not(has_wasm_std_status_bin_status_wasm))]
@@ -50,9 +45,6 @@ fn embedded_loader() -> EmbeddedLoader {
     // loaders (HostPath/IPFS), causing zero-byte WASM loads.
     if !EMBEDDED_KERNEL.is_empty() {
         loader = loader.insert("bin/main.wasm", EMBEDDED_KERNEL);
-    }
-    if !EMBEDDED_ECHO.is_empty() {
-        loader = loader.insert("bin/echo.wasm", EMBEDDED_ECHO);
     }
     if !EMBEDDED_STATUS.is_empty() {
         loader = loader.insert("bin/status.wasm", EMBEDDED_STATUS);
@@ -1034,22 +1026,18 @@ crate-type = ["cdylib"]
 
 [build-dependencies]
 capnpc    = "0.23.3"
-capnp     = "0.23.2"
-schema-id = {{ path = "../../crates/schema-id" }}
 "#
         );
         std::fs::write(target_dir.join("Cargo.toml"), cargo_toml)?;
 
-        // build.rs — compiles schema, extracts CID
+        // build.rs — compiles schemas
         let build_rs = format!(
             r#"use std::env;
-use std::path::{{Path, PathBuf}};
+use std::path::Path;
 
 fn main() {{
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-
     let capnp_dir = manifest_path
         .join("../..")
         .join("capnp")
@@ -1073,26 +1061,12 @@ fn main() {{
         .run()
         .expect("failed to compile shared capnp schemas");
 
-    // Pass 2: local schema + schema CID
-    let raw_request = out_dir.join("{name}_request.bin");
+    // Pass 2: local schema
     capnpc::CompilerCommand::new()
         .src_prefix(manifest_path)
         .file(&local_schema)
-        .raw_code_generator_request_path(&raw_request)
         .run()
         .expect("failed to compile {name}.capnp");
-
-    let iface_id = find_interface_id(&raw_request, "{iface_name}")
-        .expect("{iface_name} interface not found in CodeGeneratorRequest");
-
-    let schemas = schema_id::extract_schemas(
-        &raw_request,
-        &[("{const_name}", iface_id)],
-    )
-    .expect("extract schema");
-
-    schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
-        .expect("emit schema consts");
 
     for schema in &["system", "routing", "auth", "membrane", "stem", "http"] {{
         println!(
@@ -1102,29 +1076,7 @@ fn main() {{
     }}
     println!("cargo:rerun-if-changed={{}}", local_schema.display());
 }}
-
-fn find_interface_id(raw_request_path: &Path, name: &str) -> Option<u64> {{
-    let data = std::fs::read(raw_request_path).ok()?;
-    let reader =
-        capnp::serialize::read_message(&mut data.as_slice(), capnp::message::ReaderOptions::new())
-            .ok()?;
-    let request: capnp::schema_capnp::code_generator_request::Reader = reader.get_root().ok()?;
-    for node in request.get_nodes().ok()?.iter() {{
-        if let Ok(n) = node.get_display_name() {{
-            if n.to_str().ok()?.ends_with(&format!(":{{}}", name)) || n.to_str().ok()? == name {{
-                if matches!(
-                    node.which(),
-                    Ok(capnp::schema_capnp::node::Which::Interface(_))
-                ) {{
-                    return Some(node.get_id());
-                }}
-            }}
-        }}
-    }}
-    None
-}}
 "#,
-            const_name = name.to_uppercase().replace('-', "_"),
         );
         std::fs::write(target_dir.join("build.rs"), build_rs)?;
 
@@ -1169,8 +1121,6 @@ mod http_capnp {{
 mod {name}_capnp {{
     include!(concat!(env!("OUT_DIR"), "/{name}_capnp.rs"));
 }}
-
-include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
 
 type InitialGrants = membrane_capnp::initial_grants::Client;
 
@@ -1427,9 +1377,8 @@ wasip2::cli::command::export!({iface_name}Guest);
 
     /// Backend policy: only root mounts are allowed.
     ///
-    /// Targeted mounts (`source:/guest/path`) previously fed `LocalOverride`.
-    /// Backend virtual mode removes that path to enforce a single data-plane:
-    /// publish to IPFS/IPNS and mount as root layers.
+    /// Backend virtual mode uses one data plane. Publish content to IPFS/IPNS
+    /// and mount it as a root layer.
     fn validate_backend_mount_policy(mounts: &[ww::cell::mount::Mount]) -> Result<()> {
         let targeted: Vec<&ww::cell::mount::Mount> =
             mounts.iter().filter(|m| !m.is_root()).collect();
@@ -1670,8 +1619,6 @@ wasip2::cli::command::export!({iface_name}Guest);
             kernel_cid = %resolved_identity.cid,
             source_cid = ?resolved_identity.source_cid,
             bytes = resolved_identity.size,
-            abi = %resolved_identity.abi,
-            abi_fingerprint = %resolved_identity.abi_fingerprint,
             "Kernel source resolved"
         );
         kernel_identity.publish(resolved_identity)?;
@@ -1773,9 +1720,8 @@ wasip2::cli::command::export!({iface_name}Guest);
         let user_layer_start = all_mounts.len();
         all_mounts.extend(mounts);
 
-        // Resolve mounts into a merged root CID + local overrides. No tempdir
-        // materialization — guest filesystem reads are lazy via CidTree,
-        // backed by the IPFS DAG.
+        // Resolve mounts into a merged root CID. Guest filesystem reads are
+        // lazy via CidTree and backed by the IPFS DAG.
         runtime_status.set_phase("resolving-mounts");
         tracing::debug!("resolving mounts (virtual)...");
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
@@ -1784,7 +1730,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             &boot_ipfs_client,
             &mut cancel_rx,
         ));
-        let (root_cid, local_overrides, layer_cids) = tokio::select! {
+        let (root_cid, layer_cids) = tokio::select! {
             result = &mut mount_resolution => result?,
             service_exit = supervisor.next_service_exit() => {
                 let _ = cancel_tx.send(true);
@@ -1830,7 +1776,6 @@ wasip2::cli::command::export!({iface_name}Guest);
         let cid_tree = std::sync::Arc::new(ww::cell::vfs::CidTree::new(
             root_cid.clone(),
             ipfs_client.clone(),
-            local_overrides,
             staging_dir,
         ));
 
@@ -1894,7 +1839,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         let (swarm_ready_tx, swarm_ready_rx) = tokio::sync::oneshot::channel();
 
         // Swarm thread: libp2p event loop.
-        // The Libp2pHost is constructed inside the swarm thread so that
+        // The libp2p Host is constructed inside the swarm thread so that
         // TCP listeners register with the correct tokio reactor.
         supervisor.try_spawn(
             "swarm",

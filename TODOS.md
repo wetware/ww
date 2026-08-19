@@ -142,7 +142,7 @@ usable by trusted FHS configuration or a future Warrant/ICME adapter.
 **RESOLVED:** `handle_vat_connection()` now wraps `bootstrap_request()` in a 10s `tokio::time::timeout`. Produces a clear error referencing `system::serve()`.
 
 ## ~~Dual DHT — LAN + WAN content routing~~ ✅
-**RESOLVED:** `kad_lan` field added to `WetwareBehaviour` running `/ipfs/lan/kad/1.0.0` in server mode. Dual-dispatch provide/findProviders with cross-DHT PeerId dedup via `FindRequest`. Kubo peers classified by `is_lan_addr()` into WAN/LAN routing tables. 10 unit tests for extracted helpers. Design doc at `~/.gstack/projects/wetware-ww/lthibault-feat-local-routing-design-20260329-131709.md`.
+**RESOLVED:** `kad_lan` field added to `host::Behaviour` running `/ipfs/lan/kad/1.0.0` in server mode. Dual-dispatch provide/findProviders with cross-DHT PeerId dedup via `FindRequest`. Kubo peers classified by `is_lan_addr()` into WAN/LAN routing tables. 10 unit tests for extracted helpers. Design doc at `~/.gstack/projects/wetware-ww/lthibault-feat-local-routing-design-20260329-131709.md`.
 
 ## ~~Thread-per-subsystem runtime (Pingora-inspired) (#302)~~ ✅
 **RESOLVED:** Service trait + Host supervisor + ExecutorPool (M:N cell scheduling). SwarmService, EpochService, WagiService, MetricsService each on dedicated OS threads. EWMA fuel scheduler for cooperative yielding. Design doc: `doc/designs/fuel-scheduling.md`.
@@ -178,7 +178,7 @@ usable by trusted FHS configuration or a future Warrant/ICME adapter.
 **Depends on:** WAGI host implementation (done), VatClient guest-side
 
 ## mDNS for Kubo-less LAN peer discovery
-**What:** Add `libp2p::mdns::tokio::Behaviour` to `WetwareBehaviour` to discover LAN peers without Kubo. mDNS is a **peer discovery source** that feeds the LAN DHT routing table — not a routing primitive. It does not touch Cap'n Proto or the guest API.
+**What:** Add `libp2p::mdns::tokio::Behaviour` to `host::Behaviour` to discover LAN peers without Kubo. mDNS is a **peer discovery source** that feeds the LAN DHT routing table — not a routing primitive. It does not touch Cap'n Proto or the guest API.
 **Why:** The dual DHT bootstraps the LAN routing table from Kubo's swarm peers. Without Kubo (or in environments where Kubo has no private-address peers), the LAN DHT starts empty. mDNS enables zero-config LAN discovery. Note: mDNS does NOT work in cloud/container environments (no multicast). Kubo bootstrap is the fallback/primary for those environments. Dual DHT and mDNS are orthogonal — can be built and merged independently.
 **Context:** mDNS adds ~25-40 lines (config, event handling, address reconciliation). CI consideration: GitHub Actions runners may not support mDNS multicast, so mDNS-dependent tests should be `#[ignore]` or gated behind an env check. All critical logic remains testable via `LocalRouting` and mock swarm channels.
 **Effort:** S (CC: ~30 min)

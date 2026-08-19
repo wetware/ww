@@ -4,11 +4,9 @@
 //! variables (RFC 3875), pipes the request body to stdin, reads a
 //! CGI-formatted response from stdout. Fresh cell per request. Stateless.
 //!
-//! This module provides standalone functions for CGI env construction and
-//! response parsing. WagiAdapter does NOT implement ProtocolAdapter because
-//! ProtocolAdapter's request_body() returns only Vec<u8> and WAGI needs
-//! env vars too. Phase 2 will either extend the trait or bypass the generic
-//! dispatcher.
+//! This module provides standalone functions for CGI environment construction
+//! and response parsing. The HTTP listener connects these functions directly
+//! to the concrete WAGI routing path.
 
 use std::collections::HashMap;
 

@@ -10,7 +10,6 @@
 //! epoch updates. Open file descriptors are unaffected because they hold
 //! real staging-dir FDs. New opens after a swap see the new tree.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -49,18 +48,6 @@ pub struct DirEntry {
     pub size: u64,
 }
 
-// ── Local override types ──────────────────────────────────────────
-
-/// A host-local override for a targeted mount (e.g. identity file).
-///
-/// These are checked before CID resolution so that private files
-/// never enter IPFS.
-#[derive(Debug, Clone)]
-pub enum LocalOverride {
-    File(PathBuf),
-    Dir(PathBuf),
-}
-
 // ── Resolved node ─────────────────────────────────────────────────
 
 /// The result of resolving a guest path through the CID tree.
@@ -70,10 +57,6 @@ pub enum ResolvedNode {
     CidFile { cid: String, size: u64 },
     /// Directory backed by a CID. Listing via `ls_dir()`.
     CidDir { cid: String },
-    /// Host-local file (targeted mount override).
-    LocalFile(PathBuf),
-    /// Host-local directory (targeted mount override).
-    LocalDir(PathBuf),
 }
 
 // ── CidTree ───────────────────────────────────────────────────────
@@ -90,27 +73,19 @@ pub struct CidTree {
     ipfs: ipfs::HttpClient,
     /// In-memory LRU cache for directory listings, keyed by CID string.
     dir_cache: Mutex<LruCache<String, Vec<DirEntry>>>,
-    /// Host-local overrides from targeted mounts.
-    overrides: HashMap<PathBuf, LocalOverride>,
     /// Staging directory for persisted directory listings.
     staging_dir: PathBuf,
 }
 
 impl CidTree {
-    /// Create a new CidTree with the given root CID and targeted mount overrides.
-    pub fn new(
-        root_cid: String,
-        ipfs: ipfs::HttpClient,
-        overrides: HashMap<PathBuf, LocalOverride>,
-        staging_dir: PathBuf,
-    ) -> Self {
+    /// Create a new CidTree with the given root CID.
+    pub fn new(root_cid: String, ipfs: ipfs::HttpClient, staging_dir: PathBuf) -> Self {
         Self {
             root: ArcSwap::from_pointee(root_cid),
             ipfs,
             dir_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DIR_CACHE_CAPACITY).unwrap(),
             )),
-            overrides,
             staging_dir,
         }
     }
@@ -225,8 +200,8 @@ impl CidTree {
 
     /// Resolve a guest path to a `ResolvedNode`.
     ///
-    /// Checks local overrides first, then walks the CID tree from the
-    /// current root. Symlinks are followed up to `MAX_SYMLINK_DEPTH`.
+    /// Walks the CID tree from the current root. Symlinks are followed up to
+    /// `MAX_SYMLINK_DEPTH`.
     pub async fn resolve_path(&self, path: &str) -> Result<ResolvedNode> {
         self.resolve_path_inner(path, 0).await
     }
@@ -261,36 +236,6 @@ impl CidTree {
         // Reject path traversal
         if path.split('/').any(|seg| seg == "..") {
             bail!("path traversal (..) not allowed: {path}");
-        }
-
-        // Check local overrides: exact match
-        let path_buf = PathBuf::from(path);
-        if let Some(ovr) = self.overrides.get(&path_buf) {
-            return match ovr {
-                LocalOverride::File(p) => Ok(ResolvedNode::LocalFile(p.clone())),
-                LocalOverride::Dir(p) => Ok(ResolvedNode::LocalDir(p.clone())),
-            };
-        }
-
-        // Check local overrides: prefix match (directory mount covering subtree)
-        for (mount_path, ovr) in &self.overrides {
-            if let Ok(rest) = path_buf.strip_prefix(mount_path) {
-                match ovr {
-                    LocalOverride::Dir(host_dir) => {
-                        let full = host_dir.join(rest);
-                        if full.is_dir() {
-                            return Ok(ResolvedNode::LocalDir(full));
-                        } else if full.exists() {
-                            return Ok(ResolvedNode::LocalFile(full));
-                        }
-                        // Fall through to CID resolution if not found in override dir
-                    }
-                    LocalOverride::File(_) => {
-                        // Exact-match file override already checked above;
-                        // can't navigate into a file.
-                    }
-                }
-            }
         }
 
         // Walk the CID tree from root
@@ -408,7 +353,6 @@ impl std::fmt::Debug for CidTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CidTree")
             .field("root", &*self.root.load())
-            .field("overrides", &self.overrides.len())
             .finish()
     }
 }
@@ -425,34 +369,6 @@ mod tests {
         // but we can verify the traversal check logic inline.
         let path = "etc/../../shadow";
         assert!(path.split('/').any(|seg| seg == ".."));
-    }
-
-    #[test]
-    fn test_local_override_exact_match() {
-        let mut overrides = HashMap::new();
-        overrides.insert(
-            PathBuf::from("etc/identity"),
-            LocalOverride::File(PathBuf::from("/host/my-key")),
-        );
-
-        // Exact match should find it
-        let path_buf = PathBuf::from("etc/identity");
-        assert!(overrides.contains_key(&path_buf));
-    }
-
-    #[test]
-    fn test_local_override_prefix_match() {
-        let mut overrides = HashMap::new();
-        overrides.insert(
-            PathBuf::from("var/data"),
-            LocalOverride::Dir(PathBuf::from("/host/data")),
-        );
-
-        // Prefix match: var/data/file.txt should strip prefix
-        let path_buf = PathBuf::from("var/data/file.txt");
-        let mount_path = PathBuf::from("var/data");
-        let rest = path_buf.strip_prefix(&mount_path).unwrap();
-        assert_eq!(rest, Path::new("file.txt"));
     }
 
     #[test]

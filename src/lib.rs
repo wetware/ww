@@ -50,7 +50,6 @@ pub use authority::routing_capnp;
 #[cfg(not(target_arch = "wasm32"))]
 pub use authority::stem_capnp;
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 pub use authority::system_capnp;
 
 // Example schemas compiled by build.rs for integration tests.

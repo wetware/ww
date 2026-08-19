@@ -8,7 +8,6 @@ members = [
     "crates/authority",
     "crates/membrane",
     "crates/rpc",
-    "crates/schema-id",
     "crates/stem",
     "crates/guest/auth",
     "std/system",
@@ -61,7 +60,6 @@ edition = "2021"
 # Dependencies needed for both host and guest
 multiaddr = "0.18.2"
 anyhow = { workspace = true }
-async-trait = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 base64 = "0.22.1"
 serde_json = { workspace = true }
@@ -110,8 +108,8 @@ name = "ww"
 path = "src/cli/main.rs"
 
 [dev-dependencies]
-schema-id = { path = "crates/schema-id" }
 membrane = { package = "wetware-membrane", path = "crates/membrane" }
+async-trait = { workspace = true }
 wasm-encoder = "0.243"
 wit-component = "0.244"
 wit-parser = "0.244"
@@ -120,20 +118,11 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 reqwest = { workspace = true, features = ["rustls-tls", "json", "stream", "multipart"] }
 
 [[bench]]
-name = "streams"
-harness = false
-
-[[bench]]
 name = "arc_cache"
 harness = false
 
 [build-dependencies]
-blake3 = { workspace = true }
 capnpc = { workspace = true }
-capnp = { workspace = true }
-schema-id = { path = "crates/schema-id" }
-wit-component = "0.244"
-wit-parser = "0.244"
 
 # Optimise WASM guests for size; host binary overridden below.
 [profile.release]

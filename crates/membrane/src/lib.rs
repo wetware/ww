@@ -33,7 +33,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::{Rc, Weak};
-use std::time::{Duration, Instant};
 
 use capnp::any_pointer;
 use capnp::capability::{Promise, RemotePromise, Request, Response};
@@ -44,8 +43,6 @@ use capnp::private::capability::{
 use capnp::traits::{Imbue, ImbueMut};
 use capnp::{Error, MessageSize};
 use futures::channel::oneshot;
-
-pub mod schema;
 
 type CapTable = Vec<Option<Box<dyn ClientHook>>>;
 
@@ -459,96 +456,6 @@ impl CallGuard for RevocationGuard {
         } else {
             Ok(())
         }
-    }
-}
-
-/// Compatibility policy that applies a [`RevocationGuard`] before another policy.
-///
-/// Dropping a granted capability's authority without killing the holder is the
-/// classic membrane use; call [`RevocablePolicy::revoke`] and every subsequent
-/// call fails closed.
-///
-/// Hold the `Rc<RevocablePolicy>` on the granter side and hand a
-/// `Rc<dyn Policy>` clone to [`membrane`]; both point at the same revoke flag.
-pub struct RevocablePolicy {
-    inner: Box<dyn Policy>,
-    guard: Rc<RevocationGuard>,
-}
-
-impl RevocablePolicy {
-    pub fn new(inner: Box<dyn Policy>) -> Rc<Self> {
-        Rc::new(Self {
-            inner,
-            guard: RevocationGuard::new(),
-        })
-    }
-
-    pub fn revoke(&self) {
-        self.guard.revoke();
-    }
-
-    pub fn is_revoked(&self) -> bool {
-        self.guard.is_revoked()
-    }
-
-    pub fn guard(&self) -> Rc<RevocationGuard> {
-        Rc::clone(&self.guard)
-    }
-}
-
-impl Policy for RevocablePolicy {
-    fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error> {
-        self.guard.check()?;
-        self.inner.check(interface_id, method_id)
-    }
-}
-
-/// Wraps another policy with a fixed-window rate limit. Rate-limit-as-
-/// capability: the limit is intrinsic to the reference and travels with it
-/// across boundaries, rather than being an endpoint policy check (roadmap
-/// D29). Stateful — it counts calls, so it never collapses with another
-/// membrane (roadmap D18); it stacks.
-pub struct RateLimit {
-    inner: Box<dyn Policy>,
-    max_per_window: u32,
-    window: Duration,
-    state: RefCell<RateWindow>,
-}
-
-struct RateWindow {
-    count: u32,
-    started: Instant,
-}
-
-impl RateLimit {
-    pub fn new(inner: Box<dyn Policy>, max_per_window: u32, window: Duration) -> Self {
-        Self {
-            inner,
-            max_per_window,
-            window,
-            state: RefCell::new(RateWindow {
-                count: 0,
-                started: Instant::now(),
-            }),
-        }
-    }
-}
-
-impl Policy for RateLimit {
-    fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error> {
-        // Composition: the call must also satisfy the wrapped policy.
-        self.inner.check(interface_id, method_id)?;
-
-        let mut w = self.state.borrow_mut();
-        if w.started.elapsed() >= self.window {
-            w.count = 0;
-            w.started = Instant::now();
-        }
-        if w.count >= self.max_per_window {
-            return Err(denied_error(interface_id, method_id, "rate limit exceeded"));
-        }
-        w.count += 1;
-        Ok(())
     }
 }
 
@@ -1358,20 +1265,6 @@ mod tests {
     }
 
     #[test]
-    fn revocable_denies_after_revoke() {
-        let base = Box::new(Allowlist::new().allow(IFACE, 0));
-        let rev = RevocablePolicy::new(base);
-        assert!(rev.check(IFACE, 0).is_ok());
-        rev.revoke();
-        let denied = rev.check(IFACE, 0).unwrap_err();
-        assert_eq!(
-            call_failure_code(&denied),
-            Some(CallFailureCode::TargetRevoked)
-        );
-        assert!(rev.is_revoked());
-    }
-
-    #[test]
     fn guarded_policy_composes_revocation_and_method_authority() {
         let revocation = RevocationGuard::new();
         let policy = GuardedPolicy::new(Box::new(Allowlist::new().allow(IFACE, 0)))
@@ -1408,37 +1301,6 @@ mod tests {
             call_failure_code(&Error::failed("staleEpoch prose only".into())),
             None
         );
-    }
-
-    #[test]
-    fn rate_limit_denies_after_n_calls() {
-        // Flagship "rate-limit-as-capability" demo, at the policy layer (D29).
-        // A generous window so timing never flakes the count assertion.
-        let base = Box::new(Allowlist::new().allow(IFACE, 0));
-        let rl = RateLimit::new(base, 3, Duration::from_secs(3600));
-        assert!(rl.check(IFACE, 0).is_ok()); // 1
-        assert!(rl.check(IFACE, 0).is_ok()); // 2
-        assert!(rl.check(IFACE, 0).is_ok()); // 3
-        let denied = rl.check(IFACE, 0).unwrap_err(); // 4 -> denied
-        assert!(denied.to_string().contains(DENIED_MARKER));
-    }
-
-    #[test]
-    fn rate_limit_still_enforces_inner_policy() {
-        let base = Box::new(Allowlist::new().allow(IFACE, 0));
-        let rl = RateLimit::new(base, 100, Duration::from_secs(3600));
-        // Method 1 is not on the inner allowlist -> denied regardless of rate.
-        assert!(rl.check(IFACE, 1).is_err());
-    }
-
-    #[test]
-    fn rate_limit_window_resets() {
-        let base = Box::new(Allowlist::new().allow(IFACE, 0));
-        let rl = RateLimit::new(base, 1, Duration::from_millis(20));
-        assert!(rl.check(IFACE, 0).is_ok());
-        assert!(rl.check(IFACE, 0).is_err());
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(rl.check(IFACE, 0).is_ok(), "window should have reset");
     }
 
     // -----------------------------------------------------------------------

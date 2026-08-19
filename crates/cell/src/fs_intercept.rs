@@ -116,42 +116,6 @@ impl IpfsFilesystemView<'_> {
         })?;
 
         match resolved {
-            ResolvedNode::LocalFile(host_path) => {
-                let file = cap_std::fs::Dir::open_ambient_dir(
-                    host_path.parent().unwrap_or(&host_path),
-                    cap_std::ambient_authority(),
-                )
-                .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?
-                .open(host_path.file_name().unwrap_or_default())
-                .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-
-                let wasi_file = wasmtime_wasi::filesystem::File::new(
-                    file,
-                    FilePerms::READ,
-                    OpenMode::READ,
-                    false,
-                );
-                let descriptor = wasmtime_wasi::filesystem::Descriptor::File(wasi_file);
-                self.table
-                    .push(descriptor)
-                    .map_err(|_| -> FsError { types::ErrorCode::Io.into() })
-            }
-            ResolvedNode::LocalDir(host_path) => {
-                let dir =
-                    cap_std::fs::Dir::open_ambient_dir(&host_path, cap_std::ambient_authority())
-                        .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-                let wasi_dir = wasmtime_wasi::filesystem::Dir::new(
-                    dir,
-                    DirPerms::READ,
-                    FilePerms::READ,
-                    OpenMode::READ,
-                    false,
-                );
-                let descriptor = wasmtime_wasi::filesystem::Descriptor::Dir(wasi_dir);
-                self.table
-                    .push(descriptor)
-                    .map_err(|_| -> FsError { types::ErrorCode::Io.into() })
-            }
             ResolvedNode::CidFile { cid, .. } => {
                 // Materialize file content to staging via PinsetCache, then open real FD.
                 let cache = self

@@ -160,8 +160,10 @@ Backend virtual mode rejects targeted mounts, so host-local overrides are
 currently not part of the backend runtime surface. Publish content to IPFS/IPNS
 and mount it as a root layer instead.
 
-`LocalOverride` types remain as internal implementation scaffolding, but `ww
-run` backend mount resolution does not use them in this mode.
+A future host-mount facility must require explicit host authorization and must
+expose files and directories read-only. It must not grant ambient host-filesystem
+authority. The design must define overlay precedence and reject `/ipfs` and all
+of its descendants as mount targets. No such facility exists now.
 
 ## Capability lifecycle
 
@@ -211,5 +213,5 @@ Schema definitions live in `capnp/`:
 - **`routing.capnp`** — Kademlia DHT (provide, findProviders, hash)
 - **`http.capnp`** — HttpClient
 
-Build scripts extract canonical `Schema.Node` bytes and schema CIDs. Exported
-capabilities cross membranes as bare references in `Export { name, cap }`.
+Build scripts generate typed Rust bindings. Exported capabilities cross
+membranes as bare references in `Export { name, cap }`.

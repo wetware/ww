@@ -60,10 +60,6 @@ mod oracle_capnp {
     include!(concat!(env!("OUT_DIR"), "/oracle_capnp.rs"));
 }
 
-// Build-time schema constants: PRICE_ORACLE_SCHEMA (&[u8]) and PRICE_ORACLE_CID (&str).
-// Vat publication uses the service name below; the schema CID is metadata.
-include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
-
 const ORACLE_SERVICE: &str = "oracle";
 
 type InitialGrants = membrane_capnp::initial_grants::Client;
