@@ -43,7 +43,7 @@ impl std::error::Error for WagiError {}
 /// Construct RFC 3875 CGI environment variables from an HTTP request.
 ///
 /// Returns a `Vec<String>` of `KEY=VALUE` pairs suitable for passing to
-/// `ProcBuilder::with_env()` or `Executor.bind()`.
+/// `cell::Builder::with_env()` or `Executor.bind()`.
 ///
 /// Header values are converted with `to_string_lossy()` to handle non-UTF8.
 pub fn build_cgi_env(

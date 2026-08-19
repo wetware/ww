@@ -20,7 +20,8 @@ use ::authority::EpochGuard;
 
 use crate::services::CompileRequest;
 use crate::system_capnp;
-use cell::proc::{Builder as ProcBuilder, FuelEstimator, Proc};
+use cell::proc::FuelEstimator;
+use cell::{Builder, Proc, Program};
 use rpc::{
     graft, ByteStreamImpl, CachePolicy, InitialAuthorityRecord, ProcessBootstrapControl,
     ProcessImpl, StreamMode,
@@ -45,7 +46,7 @@ const MAX_WASM_BYTES: usize = 8 * 1024 * 1024;
 /// behind Runtime; Executors carry no Runtime or ambient host authority.
 pub struct RuntimeImpl {
     wasm_debug: bool,
-    guard: Option<EpochGuard>,
+    guard: EpochGuard,
     /// Runtime-wide cache policy (from `WW_RUNTIME_CACHE_POLICY` env var).
     cache_policy: CachePolicy,
     /// BLAKE3(wasm bytes) → cached Executor client (used when policy = Shared).
@@ -68,10 +69,7 @@ pub struct RuntimeImpl {
 
 impl RuntimeImpl {
     fn check_epoch(&self) -> Result<(), capnp::Error> {
-        match self.guard {
-            Some(ref g) => g.check(),
-            None => Ok(()),
-        }
+        self.guard.check()
     }
 
     /// Create a new ExecutorImpl bound to the given bytecode and wrap it as a client.
@@ -128,7 +126,7 @@ async fn compile_with_service(
 /// services used by pid0's graft are passed separately at the pid0 call site.
 pub fn create_runtime_client(
     wasm_debug: bool,
-    guard: Option<EpochGuard>,
+    guard: EpochGuard,
     engine: Option<Arc<wasmtime::Engine>>,
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
@@ -143,7 +141,7 @@ pub fn create_runtime_client(
 /// [`create_runtime_client`] for a cache-free substrate.
 pub fn create_runtime_client_with_pinset(
     wasm_debug: bool,
-    guard: Option<EpochGuard>,
+    guard: EpochGuard,
     engine: Option<Arc<wasmtime::Engine>>,
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
@@ -252,6 +250,7 @@ impl system_capnp::runtime::Server for RuntimeImpl {
         _params: system_capnp::runtime::ShutdownParams,
         _results: system_capnp::runtime::ShutdownResults,
     ) -> Promise<(), capnp::Error> {
+        pry!(self.check_epoch());
         tracing::info!("runtime.shutdown: stub (tokio-runtime-per-Runtime is a future PR)");
         Promise::ok(())
     }
@@ -273,7 +272,7 @@ pub struct ExecutorImpl {
     component: Option<Arc<wasmtime::component::Component>>,
     engine: Arc<wasmtime::Engine>,
     wasm_debug: bool,
-    guard: Option<EpochGuard>,
+    guard: EpochGuard,
     pinset_cache: Option<Arc<cache::PinsetCache>>,
 }
 
@@ -424,9 +423,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
         params: system_capnp::executor::SpawnParams,
         mut results: system_capnp::executor::SpawnResults,
     ) -> Promise<(), capnp::Error> {
-        if let Some(ref guard) = self.guard {
-            pry!(guard.check());
-        }
+        pry!(self.guard.check());
 
         let params = pry!(params.get());
         let args = read_text_list_result(params.get_args());
@@ -478,23 +475,23 @@ impl system_capnp::executor::Server for ExecutorImpl {
             // All cells get data_streams + membrane RPC.
             // stdin/stdout semantics vary by cell type (wire protocol, CGI,
             // or shutdown signal), but the WIT membrane channel is universal.
-            let mut proc_builder = ProcBuilder::new()
+            let program = match component {
+                Some(component) => Program::Precompiled(component),
+                None => Program::Bytes((*bytecode).clone()),
+            };
+            let (mut builder, mut handles) =
+                Builder::ordinary(program, guest_stdin, guest_stdout, guest_stderr);
+            builder = builder
                 .with_engine(engine)
                 .with_env(env)
                 .with_args(args)
-                .with_wasm_debug(wasm_debug)
-                .with_bytecode((*bytecode).clone())
-                .with_stdio(guest_stdin, guest_stdout, guest_stderr);
-            if let Some(component) = component {
-                proc_builder = proc_builder.with_component(component);
-            }
+                .with_wasm_debug(wasm_debug);
             if let Some(est) = fuel_estimator {
-                proc_builder = proc_builder.with_fuel_estimator(est);
+                builder = builder.with_fuel_estimator(est);
             }
             if let Some(pinset_cache) = pinset_cache {
-                proc_builder = proc_builder.with_cache(cache::CacheMode::Shared(pinset_cache));
+                builder = builder.with_cache(cache::CacheMode::Shared(pinset_cache));
             }
-            let (builder, mut handles) = proc_builder.with_data_streams();
 
             let proc = builder
                 .build()
@@ -575,6 +572,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
         _params: system_capnp::executor::CidParams,
         mut results: system_capnp::executor::CidResults,
     ) -> Promise<(), capnp::Error> {
+        pry!(self.guard.check());
         const RAW_CODEC: u64 = 0x55;
         const BLAKE3_MULTIHASH_CODE: u64 = 0x1e;
 
@@ -592,6 +590,27 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    fn live_guard(
+        seq: u64,
+    ) -> (
+        tokio::sync::watch::Sender<authority::Epoch>,
+        authority::EpochGuard,
+    ) {
+        let (sender, receiver) = tokio::sync::watch::channel(authority::Epoch {
+            seq,
+            head: Vec::new(),
+            root: None,
+            provenance: authority::Provenance::Block(seq),
+        });
+        (
+            sender,
+            authority::EpochGuard {
+                issued_seq: seq,
+                receiver,
+            },
+        )
+    }
 
     struct DropFlag {
         dropped: Rc<Cell<u32>>,
@@ -637,6 +656,76 @@ mod tests {
                     4,
                     "process, RPC task, streams, and record must all be released"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_and_executor_become_stale_after_epoch_advance() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (epoch_tx, guard) = live_guard(1);
+                let runtime =
+                    create_runtime_client(false, guard, None, None, CachePolicy::Isolated);
+
+                let mut load = runtime.load_request();
+                load.get().set_wasm(b"executor identity bytes");
+                let executor = load
+                    .send()
+                    .promise
+                    .await
+                    .expect("fresh Runtime must load")
+                    .get()
+                    .expect("load results")
+                    .get_executor()
+                    .expect("Executor result");
+                executor
+                    .cid_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("fresh Executor must answer");
+
+                epoch_tx.send_replace(authority::Epoch {
+                    seq: 2,
+                    head: Vec::new(),
+                    root: None,
+                    provenance: authority::Provenance::Block(2),
+                });
+
+                let mut stale_load = runtime.load_request();
+                stale_load.get().set_wasm(b"new bytes");
+                assert!(
+                    stale_load.send().promise.await.is_err(),
+                    "Runtime must reject calls after its epoch advances"
+                );
+                assert!(
+                    executor.cid_request().send().promise.await.is_err(),
+                    "Executor must reject calls after its epoch advances"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_epoch_zero_runtime_remains_valid() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let runtime = create_runtime_client(
+                    false,
+                    authority::EpochGuard::fixed(authority::Epoch::zero()),
+                    None,
+                    None,
+                    CachePolicy::Isolated,
+                );
+                for bytes in [b"first".as_slice(), b"second".as_slice()] {
+                    let mut load = runtime.load_request();
+                    load.get().set_wasm(bytes);
+                    load.send()
+                        .promise
+                        .await
+                        .expect("fixed epoch-zero Runtime must remain valid");
+                }
             })
             .await;
     }

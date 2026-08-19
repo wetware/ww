@@ -15,8 +15,6 @@ use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_io::streams::{DynInputStream, DynOutputStream};
 
-use crate::Loader;
-
 // Generate bindings from WIT file
 // Resources are defined within the interface
 bindgen!({
@@ -191,7 +189,6 @@ pub struct ComponentRunStates {
     pub image_root: Option<tempfile::TempDir>,
     /// Process-private writable scratch preopened at `/tmp`.
     pub scratch: tempfile::TempDir,
-    pub loader: Option<Box<dyn Loader>>,
     // Guest-side bidirectional stream used to build WASI io/streams resources.
     pub data_stream: Option<tokio::io::DuplexStream>,
     /// Cache mode for this process. `None` means no cache (default).
@@ -260,18 +257,23 @@ struct ConnectionState {
 struct ProcInit {
     env: Vec<String>,
     args: Vec<String>,
-    bytecode: Vec<u8>,
-    component: Option<Arc<Component>>,
-    loader: Option<Box<dyn Loader>>,
+    program: Program,
     engine: Option<Arc<Engine>>,
     stdin: BoxAsyncRead,
     stdout: BoxAsyncWrite,
     stderr: BoxAsyncWrite,
-    data_streams: Option<tokio::io::DuplexStream>,
+    data_stream: tokio::io::DuplexStream,
     cache_mode: Option<cache::CacheMode>,
-    cid_tree: Option<std::sync::Arc<crate::vfs::CidTree>>,
+    mode: ConstructionMode,
     fuel_estimator: Option<FuelEstimator>,
-    kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
+}
+
+enum ConstructionMode {
+    Ordinary,
+    Kernel {
+        root: Arc<crate::vfs::CidTree>,
+        readiness_gate: Arc<authority::KernelReadyGate>,
+    },
 }
 
 struct ProcessFilesystem {
@@ -313,23 +315,32 @@ fn configure_process_filesystem(
     })
 }
 
-/// Builder for constructing a Proc configuration
+/// A WASIP2 program supplied as bytes or as a component compiled for the
+/// builder's engine.
+pub enum Program {
+    Bytes(Vec<u8>),
+    Precompiled(Arc<Component>),
+}
+
+/// Builder for constructing one Cell's host-side process representation.
+///
+/// Use [`Builder::ordinary`] for an ordinary child with a private root. Use
+/// [`Builder::kernel`] for a kernel Cell with an authoritative `CidTree` root
+/// and the private readiness import. Both modes always install live duplex
+/// `wetware:streams` transport.
 pub struct Builder {
     env: Vec<String>,
     args: Vec<String>,
     wasm_debug: bool,
-    bytecode: Option<Vec<u8>>,
-    component: Option<Arc<Component>>,
-    loader: Option<Box<dyn Loader>>,
+    program: Program,
     engine: Option<Arc<Engine>>,
-    stdin: Option<BoxAsyncRead>,
-    stdout: Option<BoxAsyncWrite>,
-    stderr: Option<BoxAsyncWrite>,
-    data_streams: Option<tokio::io::DuplexStream>,
+    stdin: BoxAsyncRead,
+    stdout: BoxAsyncWrite,
+    stderr: BoxAsyncWrite,
+    data_stream: tokio::io::DuplexStream,
     cache_mode: Option<cache::CacheMode>,
-    cid_tree: Option<std::sync::Arc<crate::vfs::CidTree>>,
+    mode: ConstructionMode,
     fuel_estimator: Option<FuelEstimator>,
-    kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
 }
 
 /// Handles for accessing the host-side of data streams.
@@ -357,25 +368,78 @@ impl DataStreamHandles {
 }
 
 impl Builder {
-    /// Create a new Proc builder
-    pub fn new() -> Self {
-        Self {
+    /// Construct an ordinary Cell with a private empty root.
+    pub fn ordinary<R, W1, W2>(
+        program: Program,
+        stdin: R,
+        stdout: W1,
+        stderr: W2,
+    ) -> (Self, DataStreamHandles)
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+        W1: AsyncWrite + Send + Sync + Unpin + 'static,
+        W2: AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        Self::new(program, stdin, stdout, stderr, ConstructionMode::Ordinary)
+    }
+
+    /// Construct a kernel Cell with an authoritative root and readiness import.
+    pub fn kernel<R, W1, W2>(
+        program: Program,
+        stdin: R,
+        stdout: W1,
+        stderr: W2,
+        root: Arc<crate::vfs::CidTree>,
+        readiness_gate: Arc<authority::KernelReadyGate>,
+    ) -> (Self, DataStreamHandles)
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+        W1: AsyncWrite + Send + Sync + Unpin + 'static,
+        W2: AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        Self::new(
+            program,
+            stdin,
+            stdout,
+            stderr,
+            ConstructionMode::Kernel {
+                root,
+                readiness_gate,
+            },
+        )
+    }
+
+    fn new<R, W1, W2>(
+        program: Program,
+        stdin: R,
+        stdout: W1,
+        stderr: W2,
+        mode: ConstructionMode,
+    ) -> (Self, DataStreamHandles)
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+        W1: AsyncWrite + Send + Sync + Unpin + 'static,
+        W2: AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        let (host_stream, guest_stream) = tokio::io::duplex(PIPE_BUFFER_SIZE);
+        let handles = DataStreamHandles {
+            host_stream: Some(host_stream),
+        };
+        let builder = Self {
             env: Vec::new(),
             args: Vec::new(),
             wasm_debug: false,
-            bytecode: None,
-            component: None,
-            loader: None,
+            program,
             engine: None,
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            data_streams: None,
+            stdin: Box::new(stdin),
+            stdout: Box::new(stdout),
+            stderr: Box::new(stderr),
+            data_stream: guest_stream,
             cache_mode: None,
-            cid_tree: None,
+            mode,
             fuel_estimator: None,
-            kernel_ready_gate: None,
-        }
+        };
+        (builder, handles)
     }
 
     /// Set WASM debug mode
@@ -396,86 +460,10 @@ impl Builder {
         self
     }
 
-    /// Provide the component bytecode
-    pub fn with_bytecode(mut self, bytecode: Vec<u8>) -> Self {
-        self.bytecode = Some(bytecode);
-        self
-    }
-
-    /// Provide a pre-compiled component for this process.
-    ///
-    /// When set, `Proc::new` skips `Component::from_binary` and directly
-    /// instantiates this component on the provided engine.
-    pub fn with_component(mut self, component: Arc<Component>) -> Self {
-        self.component = Some(component);
-        self
-    }
-
-    /// Provide the optional loader used for host callbacks
-    pub fn with_loader(mut self, loader: Option<Box<dyn Loader>>) -> Self {
-        self.loader = loader;
-        self
-    }
-
     /// Provide a shared Wasmtime engine to reuse across processes.
     pub fn with_engine(mut self, engine: Arc<Engine>) -> Self {
         self.engine = Some(engine);
         self
-    }
-
-    /// Provide the stdin handle
-    pub fn with_stdin<R>(mut self, stdin: R) -> Self
-    where
-        R: AsyncRead + Send + Sync + Unpin + 'static,
-    {
-        self.stdin = Some(Box::new(stdin));
-        self
-    }
-
-    /// Provide the stdout handle
-    pub fn with_stdout<W>(mut self, stdout: W) -> Self
-    where
-        W: AsyncWrite + Send + Sync + Unpin + 'static,
-    {
-        self.stdout = Some(Box::new(stdout));
-        self
-    }
-
-    /// Provide the stderr handle
-    pub fn with_stderr<W>(mut self, stderr: W) -> Self
-    where
-        W: AsyncWrite + Send + Sync + Unpin + 'static,
-    {
-        self.stderr = Some(Box::new(stderr));
-        self
-    }
-
-    /// Convenience helper to set all stdio handles at once.
-    pub fn with_stdio<R, W1, W2>(self, stdin: R, stdout: W1, stderr: W2) -> Self
-    where
-        R: AsyncRead + Send + Sync + Unpin + 'static,
-        W1: AsyncWrite + Send + Sync + Unpin + 'static,
-        W2: AsyncWrite + Send + Sync + Unpin + 'static,
-    {
-        self.with_stdin(stdin)
-            .with_stdout(stdout)
-            .with_stderr(stderr)
-    }
-
-    /// Enable bidirectional data streams for host-guest communication.
-    ///
-    /// This creates in-memory pipes that are exposed to the guest via
-    /// a custom connection resource. Returns handles that the host can use
-    /// to communicate with the guest.
-    pub fn with_data_streams(mut self) -> (Self, DataStreamHandles) {
-        let (host_stream, guest_stream) = tokio::io::duplex(PIPE_BUFFER_SIZE);
-        let handles = DataStreamHandles {
-            host_stream: Some(host_stream),
-        };
-
-        self.data_streams = Some(guest_stream);
-
-        (self, handles)
     }
 
     /// Set the cache mode for this process.
@@ -484,12 +472,6 @@ impl Builder {
     /// - `CacheMode::Isolated`: private pinset, no shared state (for untrusted guests)
     pub fn with_cache(mut self, mode: cache::CacheMode) -> Self {
         self.cache_mode = Some(mode);
-        self
-    }
-
-    /// Set the CidTree for virtual filesystem resolution.
-    pub fn with_cid_tree(mut self, tree: std::sync::Arc<crate::vfs::CidTree>) -> Self {
-        self.cid_tree = Some(tree);
         self
     }
 
@@ -503,54 +485,22 @@ impl Builder {
         self
     }
 
-    /// Install the private PID0 readiness import for this process.
-    ///
-    /// Callers must use this only for the trusted kernel selected by the native
-    /// bootstrap boundary. The default linker used by ordinary cells omits the
-    /// interface, so components cannot acquire or delegate it.
-    pub fn with_kernel_ready_gate(mut self, gate: Arc<authority::KernelReadyGate>) -> Self {
-        self.kernel_ready_gate = Some(gate);
-        self
-    }
-
-    /// Build a Proc instance. All required parameters must be supplied first.
+    /// Build the host-side process representation.
     pub async fn build(self) -> Result<Proc> {
-        let bytecode = self
-            .bytecode
-            .ok_or_else(|| anyhow!("bytecode must be provided to Proc::Builder"))?;
-        let stdin = self
-            .stdin
-            .ok_or_else(|| anyhow!("stdin handle must be provided to Proc::Builder"))?;
-        let stdout = self
-            .stdout
-            .ok_or_else(|| anyhow!("stdout handle must be provided to Proc::Builder"))?;
-        let stderr = self
-            .stderr
-            .ok_or_else(|| anyhow!("stderr handle must be provided to Proc::Builder"))?;
-
         Proc::new(ProcInit {
             env: self.env,
             args: self.args,
-            bytecode,
-            component: self.component,
-            loader: self.loader,
+            program: self.program,
             engine: self.engine,
-            stdin,
-            stdout,
-            stderr,
-            data_streams: self.data_streams,
+            stdin: self.stdin,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            data_stream: self.data_stream,
             cache_mode: self.cache_mode,
-            cid_tree: self.cid_tree,
+            mode: self.mode,
             fuel_estimator: self.fuel_estimator,
-            kernel_ready_gate: self.kernel_ready_gate,
         })
         .await
-    }
-}
-
-impl Default for Builder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -571,19 +521,23 @@ impl Proc {
         let ProcInit {
             env,
             args,
-            bytecode,
-            component,
-            loader,
+            program,
             engine,
             stdin,
             stdout,
             stderr,
-            data_streams,
+            data_stream,
             cache_mode,
-            cid_tree,
+            mode,
             fuel_estimator,
-            kernel_ready_gate,
         } = init;
+        let (cid_tree, kernel_ready_gate) = match mode {
+            ConstructionMode::Ordinary => (None, None),
+            ConstructionMode::Kernel {
+                root,
+                readiness_gate,
+            } => (Some(root), Some(readiness_gate)),
+        };
 
         let stdin_stream = AsyncStdinStream::new(stdin);
         let stdout_stream = AsyncStdoutStream::new(BUFFER_SIZE, stdout);
@@ -618,11 +572,6 @@ impl Proc {
             crate::fs_intercept::override_filesystem_linker(&mut linker)?;
         }
 
-        // Add loader host function if loader is provided
-        if loader.is_some() {
-            add_loader_to_linker(&mut linker)?;
-        }
-
         // Prepare environment variables as key-value pairs
         let envs: Vec<(&str, &str)> = env.iter().filter_map(|var| var.split_once('=')).collect();
 
@@ -647,21 +596,14 @@ impl Proc {
 
         let wasi = wasi_builder.build();
 
-        // Set up data streams if enabled
-        let data_stream = if let Some(stream) = data_streams {
-            add_streams_to_linker(&mut linker)?;
-            Some(stream)
-        } else {
-            None
-        };
+        add_streams_to_linker(&mut linker)?;
 
         let state = ComponentRunStates {
             wasi_ctx: wasi,
             resource_table: ResourceTable::new(),
             image_root: filesystem.image_root,
             scratch: filesystem.scratch,
-            loader,
-            data_stream,
+            data_stream: Some(data_stream),
             cache_mode,
             cid_tree,
             writable_fs_descriptors: std::collections::HashSet::new(),
@@ -756,17 +698,20 @@ impl Proc {
         // Instantiate it as a normal component. The canonical engine has
         // Wasmtime's optional persistent cache configured, so this path stays
         // portable while reusing host-local compiled code when available.
-        let component = if let Some(component) = component {
-            tracing::debug!("Using precompiled guest component");
-            component
-        } else {
-            let start = std::time::Instant::now();
-            let compiled = crate::engine::compile_component(&engine, &bytecode)?;
-            tracing::debug!(
-                elapsed_ms = start.elapsed().as_millis(),
-                "Guest component ready"
-            );
-            Arc::new(compiled)
+        let component = match program {
+            Program::Precompiled(component) => {
+                tracing::debug!("Using precompiled guest component");
+                component
+            }
+            Program::Bytes(bytecode) => {
+                let start = std::time::Instant::now();
+                let compiled = crate::engine::compile_component(&engine, &bytecode)?;
+                tracing::debug!(
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Guest component ready"
+                );
+                Arc::new(compiled)
+            }
         };
         let component_type = component.component_type();
         tracing::trace!(
@@ -922,48 +867,42 @@ fn add_streams_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> 
     Ok(())
 }
 
-/// Add the loader host function to the Wasmtime linker
-///
-/// This exports a host function that allows WASM guests to call back into
-/// the host to load bytecode from various sources (IPFS, filesystem, etc.).
-///
-/// Note: This requires a WIT interface definition. For now, this is a
-/// placeholder that can be implemented once the WIT interface is defined.
-fn add_loader_to_linker<T>(_linker: &mut Linker<T>) -> Result<()> {
-    // TODO: Implement using WIT interface
-    // The WIT interface would look something like:
-    //
-    // package wetware:loader;
-    //
-    // interface loader {
-    //   load: func(path: string) -> result<list<u8>, string>;
-    // }
-    //
-    // world wetware {
-    //   import loader: self.loader;
-    // }
-    //
-    // Then we'd use wit-bindgen to generate bindings and implement:
-    // linker.root().func_wrap_async("wetware:loader/loader", "load", |mut store, (path,): (String,)| async move {
-    //     let state = store.data_mut();
-    //     if let Some(ref loader) = state.loader {
-    //         match loader.load(&path).await {
-    //             Ok(data) => Ok((data,)),
-    //             Err(e) => Err(e.to_string()),
-    //         }
-    //     } else {
-    //         Err("Loader not available".to_string())
-    //     }
-    // })?;
-
-    // For now, this is a no-op placeholder
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct EpochTicker {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl EpochTicker {
+        fn start(engine: Arc<Engine>) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = stop.clone();
+            let thread = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    engine.increment_epoch();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            Self {
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for EpochTicker {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("epoch ticker thread");
+            }
+        }
+    }
 
     fn private_kernel_import_component() -> Vec<u8> {
         use wit_component::{ComponentEncoder, StringEncoding};
@@ -1051,16 +990,28 @@ mod tests {
     }
 
     #[test]
-    fn test_proc_builder_creation() {
-        let builder = Builder::new();
+    fn ordinary_builder_has_explicit_required_mechanisms() {
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(vec![0]),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
         assert!(!builder.wasm_debug);
         assert!(builder.env.is_empty());
         assert!(builder.args.is_empty());
+        assert!(matches!(builder.mode, ConstructionMode::Ordinary));
     }
 
     #[test]
-    fn test_proc_builder() {
-        let builder = Builder::new()
+    fn builder_sets_optional_execution_configuration() {
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(vec![0]),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let builder = builder
             .with_wasm_debug(true)
             .with_env(vec!["TEST=1".to_string()])
             .with_args(vec!["arg1".to_string()]);
@@ -1123,13 +1074,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_data_stream_handles_full_duplex() {
-        // Enable data streams and capture the returned handles
-        let (mut builder, mut handles) = Builder::new().with_data_streams();
+        let (builder, mut handles) = Builder::ordinary(
+            Program::Bytes(vec![0]),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
 
-        let guest_stream = builder
-            .data_streams
-            .take()
-            .expect("data streams should be configured");
+        let guest_stream = builder.data_stream;
         let host_stream = handles
             .take_host_stream()
             .expect("host stream should be configured");
@@ -1149,58 +1101,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_fails_without_bytecode() {
-        let err = Builder::new()
-            .with_stdio(tokio::io::empty(), tokio::io::sink(), tokio::io::sink())
-            .build()
-            .await
-            .err()
-            .expect("should fail");
-        assert!(err.to_string().contains("bytecode"));
-    }
-
-    #[tokio::test]
-    async fn test_builder_fails_without_stdin() {
-        let err = Builder::new()
-            .with_bytecode(vec![0])
-            .with_stdout(tokio::io::sink())
-            .with_stderr(tokio::io::sink())
-            .build()
-            .await
-            .err()
-            .expect("should fail");
-        assert!(err.to_string().contains("stdin"));
-    }
-
-    #[tokio::test]
-    async fn test_builder_fails_without_stdout() {
-        let err = Builder::new()
-            .with_bytecode(vec![0])
-            .with_stdin(tokio::io::empty())
-            .with_stderr(tokio::io::sink())
-            .build()
-            .await
-            .err()
-            .expect("should fail");
-        assert!(err.to_string().contains("stdout"));
-    }
-
-    #[tokio::test]
-    async fn test_builder_fails_without_stderr() {
-        let err = Builder::new()
-            .with_bytecode(vec![0])
-            .with_stdin(tokio::io::empty())
-            .with_stdout(tokio::io::sink())
-            .build()
-            .await
-            .err()
-            .expect("should fail");
-        assert!(err.to_string().contains("stderr"));
-    }
-
-    #[tokio::test]
     async fn test_data_stream_handles_take_host_split() {
-        let (_builder, mut handles) = Builder::new().with_data_streams();
+        let (_builder, mut handles) = Builder::ordinary(
+            Program::Bytes(vec![0]),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
 
         let split = handles.take_host_split();
         assert!(split.is_some());
@@ -1210,13 +1117,66 @@ mod tests {
         assert!(split2.is_none());
     }
 
-    #[test]
-    fn test_builder_default() {
-        let builder = Builder::default();
-        assert!(!builder.wasm_debug);
-        assert!(builder.bytecode.is_none());
-        assert!(builder.engine.is_none());
-        assert!(builder.loader.is_none());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_looping_component_can_be_aborted_within_a_bound() {
+        let bytecode = wat::parse_str(include_str!(
+            "../../../tests/fixtures/spinning-component.wat"
+        ))
+        .expect("parse spinning component fixture");
+        let engine = Arc::new(crate::engine::wasm_engine().expect("component engine"));
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytecode),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let mut proc = builder
+            .with_engine(engine.clone())
+            .build()
+            .await
+            .expect("build spinning component");
+
+        // Remove fuel-based cooperative yields so task cancellation can only
+        // become observable after Wasmtime handles an engine epoch deadline.
+        proc.store
+            .fuel_async_yield_interval(None)
+            .expect("disable fuel-based yields");
+        proc.store
+            .set_fuel(u64::MAX)
+            .expect("set non-exhausting test fuel");
+        let epoch_observed = Arc::new(AtomicBool::new(false));
+        let callback_observed = epoch_observed.clone();
+        proc.store.epoch_deadline_callback(move |_context| {
+            callback_observed.store(true, Ordering::Release);
+            Ok(wasmtime::UpdateDeadline::Yield(1))
+        });
+        proc.store.set_epoch_deadline(1);
+
+        let mut proc_task = tokio::spawn(async move { proc.run().await });
+        let _ticker = EpochTicker::start(engine);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !epoch_observed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("spinning guest did not reach an epoch interruption");
+        assert!(
+            !proc_task.is_finished(),
+            "spinning guest exited before cancellation"
+        );
+
+        let started = std::time::Instant::now();
+        proc_task.abort();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), &mut proc_task)
+            .await
+            .expect("busy-loop cancellation exceeded timeout")
+            .expect_err("aborted busy-loop task must return JoinError");
+        assert!(error.is_cancelled());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "busy-loop cancellation exceeded bound"
+        );
     }
 
     // =========================================================================

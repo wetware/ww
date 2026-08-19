@@ -12,7 +12,7 @@ Cap'n Proto vat unless the application implements one over stdin/stdout.
 Primary implementation references:
 
 - `crates/cell/src/proc.rs` — in-memory host/guest stream creation
-- `src/executor.rs` — trusted PID0 startup and host-side RPC driver
+- `src/kernel.rs` — trusted kernel startup and host-side RPC driver
 - `src/launcher.rs` — ordinary-child startup and host-side RPC driver
 - `crates/rpc/src/graft.rs` — PID0 and ordinary-child bootstraps
 - `std/system/src/lib.rs` — guest-side RPC session and poll loop
@@ -42,9 +42,9 @@ the guest end as WASI stream resources and returns the host end through
 
 ### PID0 bootstrap
 
-`src/executor.rs` passes the host stream halves to
-`build_pid0_membrane_rpc()`. The host serves a process-local `Membrane` as the
-bootstrap capability.
+`kernel::Generation` passes the host stream halves to
+`build_kernel_membrane_rpc()`. The host serves a process-local `Membrane` as
+the bootstrap capability.
 
 PID0 calls `Membrane.graft()`, which returns `List(Export)`. The canonical
 exports are:
@@ -177,8 +177,8 @@ The writer participates in the poll set only after a write attempt. Otherwise,
 the loop includes a 100 ms monotonic-clock pollable as protection against a
 missed host-stream wakeup.
 
-Host-side `RpcSystem` instances run as local Tokio tasks. PID0 starts its driver
-in `src/executor.rs`. Ordinary children start their drivers in
+Host-side `RpcSystem` instances run as local Tokio tasks. `kernel::Generation`
+starts the kernel driver. `ExecutorImpl` starts ordinary-child drivers in
 `src/launcher.rs`.
 
 ## Executor scheduling

@@ -67,12 +67,12 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
 
             let (swarm_tx, _swarm_rx) = mpsc::channel(16);
             let runtime =
-                create_runtime_client(false, Some(guard.clone()), None, None, CachePolicy::Shared);
+                create_runtime_client(false, guard.clone(), None, None, CachePolicy::Shared);
             let host: system_capnp::host::Client = capnp_rpc::new_client(ww::rpc::HostImpl::new(
                 network_state,
                 swarm_tx,
                 false,
-                Some(guard),
+                guard,
                 Some(stream_control),
             ));
 

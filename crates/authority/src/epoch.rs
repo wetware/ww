@@ -30,6 +30,18 @@ pub struct Epoch {
     pub provenance: Provenance,
 }
 
+impl Epoch {
+    /// Construct the epoch-zero value used before a host adopts Stem state.
+    pub fn zero() -> Self {
+        Self {
+            seq: 0,
+            head: Vec::new(),
+            root: None,
+            provenance: Provenance::Block(0),
+        }
+    }
+}
+
 /// Guard that checks whether the epoch under which a capability was issued is
 /// still current. Shared by all session-scoped capability servers so that
 /// every RPC hard-fails once the epoch advances.
@@ -40,6 +52,20 @@ pub struct EpochGuard {
 }
 
 impl EpochGuard {
+    /// Construct a guard whose epoch cannot advance.
+    ///
+    /// Embedders and tests can use this guard when no live epoch sender exists.
+    /// Production `ww` hosts always use the ordinary watch channel seeded at
+    /// epoch zero; without Stem, that channel does not advance.
+    pub fn fixed(epoch: Epoch) -> Self {
+        let issued_seq = epoch.seq;
+        let (_sender, receiver) = watch::channel(epoch);
+        Self {
+            issued_seq,
+            receiver,
+        }
+    }
+
     pub fn check(&self) -> Result<(), Error> {
         CallGuard::check(self)
     }
@@ -93,5 +119,13 @@ mod tests {
             call_guard::call_failure_code(&res.unwrap_err()),
             Some(call_guard::CallFailureCode::StaleEpoch)
         );
+    }
+
+    #[test]
+    fn fixed_epoch_zero_guard_remains_valid() {
+        let guard = EpochGuard::fixed(Epoch::zero());
+        assert_eq!(guard.issued_seq, 0);
+        assert!(guard.check().is_ok());
+        assert!(guard.check().is_ok());
     }
 }

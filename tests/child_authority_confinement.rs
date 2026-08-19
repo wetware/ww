@@ -34,6 +34,10 @@ const SENSITIVE_CAPS: &[&str] = &[
 ];
 const KNOWN_CID: &str = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
 
+fn fixed_epoch_zero_guard() -> authority::EpochGuard {
+    authority::EpochGuard::fixed(authority::Epoch::zero())
+}
+
 fn assert_capnp_rpc_revision(lock: &str, label: &str) {
     let stanza = lock
         .split("[[package]]")
@@ -163,7 +167,7 @@ async fn harness(wasm: &[u8]) -> Harness {
         issued_seq: 1,
         receiver: epoch_rx.clone(),
     };
-    let runtime = create_runtime_client(false, Some(guard), None, None, CachePolicy::Shared);
+    let runtime = create_runtime_client(false, guard, None, None, CachePolicy::Shared);
     let executor = load_executor(&runtime, wasm).await;
     Harness {
         executor,
@@ -174,8 +178,14 @@ async fn harness(wasm: &[u8]) -> Harness {
     }
 }
 
-async fn raw_fallback_executor(wasm: &[u8]) -> system_capnp::executor::Client {
-    let runtime = create_runtime_client(false, None, None, None, CachePolicy::Isolated);
+async fn fixed_epoch_zero_executor(wasm: &[u8]) -> system_capnp::executor::Client {
+    let runtime = create_runtime_client(
+        false,
+        fixed_epoch_zero_guard(),
+        None,
+        None,
+        CachePolicy::Isolated,
+    );
     load_executor(&runtime, wasm).await
 }
 
@@ -659,7 +669,13 @@ fn multi_grant_trusted_constructor_lattice_is_concrete_and_exact() {
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
         let harness = harness(&wasm).await;
-        let runtime = create_runtime_client(false, None, None, None, CachePolicy::Isolated);
+        let runtime = create_runtime_client(
+            false,
+            fixed_epoch_zero_guard(),
+            None,
+            None,
+            CachePolicy::Isolated,
+        );
         let report = probe_report(
             &harness.executor,
             "trusted-lattice",
@@ -768,7 +784,14 @@ fn runtime_is_available_only_when_explicitly_granted() {
             &[("WW_PROBE_CAP", "runtime")],
             &[Grant {
                 name: "runtime".into(),
-                cap: create_runtime_client(false, None, None, None, CachePolicy::Isolated).client,
+                cap: create_runtime_client(
+                    false,
+                    fixed_epoch_zero_guard(),
+                    None,
+                    None,
+                    CachePolicy::Isolated,
+                )
+                .client,
             }],
         )
         .await;
@@ -894,9 +917,15 @@ fn invalid_grants_are_rejected_before_process_build() {
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
         // Runtime.load intentionally defers component compilation when no
-        // compile service is configured. If spawn reached ProcBuilder::build,
+        // compile service is configured. If spawn reached `cell::Builder::build`,
         // these bytes would fail as invalid WASM.
-        let runtime = create_runtime_client(false, None, None, None, CachePolicy::Isolated);
+        let runtime = create_runtime_client(
+            false,
+            fixed_epoch_zero_guard(),
+            None,
+            None,
+            CachePolicy::Isolated,
+        );
         let executor = load_executor(&runtime, b"not a WebAssembly component").await;
         let (grant, _calls) = counting_host(b"never-started");
         let error = spawn_probe(
@@ -985,7 +1014,7 @@ fn explicitly_wired_known_cid_read_has_path_only_authority_and_node_effects() {
         let cache = Arc::new(cache::PinsetCache::new(pinner.clone(), 1024).unwrap());
         let runtime = create_runtime_client_with_pinset(
             false,
-            None,
+            fixed_epoch_zero_guard(),
             None,
             None,
             CachePolicy::Isolated,
@@ -1335,11 +1364,11 @@ fn restricted_executor_cannot_amplify_descendant() {
 }
 
 #[test]
-fn no_epoch_no_stream_has_no_raw_host_fallback() {
+fn fixed_epoch_zero_runtime_has_no_raw_host_fallback() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
-        let executor = raw_fallback_executor(&wasm).await;
+        let executor = fixed_epoch_zero_executor(&wasm).await;
         let report = probe_report(&executor, "raw-host", &[], &[]).await;
         assert_ne!(
             report["ok"], true,

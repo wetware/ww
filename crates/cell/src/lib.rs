@@ -16,7 +16,7 @@ pub mod proc;
 pub mod sched;
 pub mod vfs;
 
-pub use proc::{Builder as ProcBuilder, Proc};
+pub use proc::{Builder, Proc, Program};
 
 /// Trait for loading bytecode from various sources (IPFS, filesystem, etc.)
 ///

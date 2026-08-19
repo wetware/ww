@@ -1,7 +1,7 @@
 //! Cap'n Proto RPC for host-provided capabilities.
 //!
 //! The Host capability is served to each WASM guest over in-memory duplex
-//! streams (no TCP listener). See [`build_peer_rpc`] for the entry point.
+//! streams (no TCP listener).
 #![cfg(not(target_arch = "wasm32"))]
 
 pub mod connection_budget;
@@ -35,11 +35,17 @@ use std::sync::Arc;
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
+#[cfg(test)]
 use capnp_rpc::rpc_twoparty_capnp::Side;
+#[cfg(test)]
 use capnp_rpc::twoparty::VatNetwork;
+#[cfg(test)]
 use capnp_rpc::RpcSystem;
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+#[cfg(test)]
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use authority::EpochGuard;
@@ -499,7 +505,7 @@ pub struct HostImpl {
     network_state: NetworkState,
     swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
     wasm_debug: bool,
-    guard: Option<EpochGuard>,
+    guard: EpochGuard,
     stream_control: Option<libp2p_stream::Control>,
     route_registry: Option<crate::dispatch::RouteRegistry>,
     /// Host-internal view of the trusted pid0 execution-generation lifetime.
@@ -513,7 +519,7 @@ impl HostImpl {
         network_state: NetworkState,
         swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
         wasm_debug: bool,
-        guard: Option<EpochGuard>,
+        guard: EpochGuard,
         stream_control: Option<libp2p_stream::Control>,
     ) -> Self {
         Self {
@@ -544,10 +550,7 @@ impl HostImpl {
     }
 
     fn check_epoch(&self) -> Result<(), capnp::Error> {
-        match self.guard {
-            Some(ref g) => g.check(),
-            None => Ok(()),
-        }
+        self.guard.check()
     }
 }
 
@@ -612,14 +615,7 @@ impl system_capnp::host::Server for HostImpl {
         mut results: system_capnp::host::NetworkResults,
     ) -> Promise<(), capnp::Error> {
         pry!(self.check_epoch());
-        let guard = match &self.guard {
-            Some(g) => g.clone(),
-            None => {
-                return Promise::err(capnp::Error::failed(
-                    "network() requires an epoch-scoped Host".into(),
-                ))
-            }
-        };
+        let guard = self.guard.clone();
         let stream_control = match &self.stream_control {
             Some(c) => c.clone(),
             None => {
@@ -678,7 +674,8 @@ pub enum CachePolicy {
     Isolated,
 }
 
-pub fn build_peer_rpc<R, W>(
+#[cfg(test)]
+pub(crate) fn build_test_peer_rpc<R, W>(
     reader: R,
     writer: W,
     network_state: NetworkState,
@@ -693,7 +690,7 @@ where
         network_state,
         swarm_cmd_tx,
         wasm_debug,
-        None,
+        EpochGuard::fixed(authority::Epoch::zero()),
         None,
     ));
 
@@ -734,7 +731,8 @@ mod tests {
         let network_state = NetworkState::from_peer_id(peer_id);
         let (swarm_tx, swarm_rx) = mpsc::channel(16);
 
-        let server_rpc = build_peer_rpc(server_read, server_write, network_state, swarm_tx, false);
+        let server_rpc =
+            build_test_peer_rpc(server_read, server_write, network_state, swarm_tx, false);
 
         let server_handle = tokio::task::spawn_local(async move {
             let _ = server_rpc.await;
@@ -765,6 +763,39 @@ mod tests {
                 let resp = host.id_request().send().promise.await.unwrap();
                 let peer_id = resp.get().unwrap().get_peer_id().unwrap();
                 assert_eq!(peer_id, &[1, 2, 3, 4]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn host_becomes_stale_after_epoch_advance() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (epoch_tx, guard) = test_epoch_guard(1);
+                let (swarm_tx, _swarm_rx) = mpsc::channel(1);
+                let host: system_capnp::host::Client = capnp_rpc::new_client(HostImpl::new(
+                    NetworkState::from_peer_id(vec![1, 2, 3, 4]),
+                    swarm_tx,
+                    false,
+                    guard,
+                    None,
+                ));
+
+                host.id_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("fresh Host must answer");
+                epoch_tx.send_replace(authority::Epoch {
+                    seq: 2,
+                    head: Vec::new(),
+                    root: None,
+                    provenance: authority::Provenance::Block(2),
+                });
+                assert!(
+                    host.id_request().send().promise.await.is_err(),
+                    "Host must reject calls after its epoch advances"
+                );
             })
             .await;
     }
@@ -1189,17 +1220,17 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_host_network_errors_without_epoch() {
+    async fn test_host_network_errors_without_stream_control() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                // setup_rpc() creates a non-epoch-scoped Host (no guard, no stream_control).
+                // setup_rpc() creates a fixed epoch-zero Host without stream control.
                 let (host, _server, _rx) = setup_rpc();
 
                 let result = host.network_request().send().promise.await;
                 assert!(
                     result.is_err(),
-                    "network() should fail on non-epoch-scoped Host"
+                    "network() should fail without stream control"
                 );
             })
             .await;

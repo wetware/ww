@@ -22,7 +22,7 @@ use crate::cell::engine::{WasmtimeCacheMetrics, WasmtimeCacheSnapshot, WasmtimeC
 pub struct VersionInfo {
     pub git_sha: String,
     pub oci_image_id: Option<String>,
-    pub kernel_identity: crate::kernel::KernelIdentityState,
+    pub kernel_identity: crate::kernel::IdentityState,
 }
 
 /// Mutable boot diagnostics shared between the boot path and admin server.
@@ -623,10 +623,10 @@ mod tests {
             provenance: Provenance::Block(0),
         });
         let kernel_ready_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx));
-        let source = crate::kernel::KernelSource::Embedded("main");
-        let kernel_identity = crate::kernel::KernelIdentityState::pending(&source);
+        let source = crate::kernel::Source::Embedded("main");
+        let kernel_identity = crate::kernel::IdentityState::pending(&source);
         kernel_identity
-            .publish(crate::kernel::KernelIdentity {
+            .publish(crate::kernel::Identity {
                 cid: "kernel-cid".to_string(),
                 source: "embedded:main".to_string(),
                 wasm_blake3: "kernel".to_string(),
@@ -769,8 +769,8 @@ mod tests {
     #[tokio::test]
     async fn version_remains_available_while_kernel_identity_is_pending() {
         let mut state = test_state();
-        state.version_info.kernel_identity = crate::kernel::KernelIdentityState::pending(
-            &crate::kernel::KernelSource::Path("/tmp/pid0.wasm".into()),
+        state.version_info.kernel_identity = crate::kernel::IdentityState::pending(
+            &crate::kernel::Source::Path("/tmp/pid0.wasm".into()),
         );
         let response = version_handler(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);

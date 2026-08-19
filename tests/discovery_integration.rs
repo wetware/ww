@@ -55,7 +55,7 @@ async fn spawn_greeter_on_pool(
                 };
                 let runtime = ww::launcher::create_runtime_client(
                     false,
-                    Some(guard),
+                    guard,
                     None,
                     None,
                     CachePolicy::Shared,

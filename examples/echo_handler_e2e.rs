@@ -15,9 +15,15 @@ use ww::launcher::create_runtime_client;
 use ww::rpc::CachePolicy;
 use ww::system_capnp;
 
-/// Create a Runtime client for testing (no network, no epoch guard).
+/// Create a Runtime client for testing with a fixed epoch-zero guard.
 fn setup_runtime() -> system_capnp::runtime::Client {
-    create_runtime_client(false, None, None, None, CachePolicy::Shared)
+    create_runtime_client(
+        false,
+        authority::EpochGuard::fixed(authority::Epoch::zero()),
+        None,
+        None,
+        CachePolicy::Shared,
+    )
 }
 
 #[tokio::main(flavor = "current_thread")]
