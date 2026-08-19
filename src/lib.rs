@@ -17,8 +17,6 @@ pub mod discovery;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dispatcher;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod executor;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod host;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod kernel;
@@ -62,9 +60,3 @@ pub mod greeter_capnp {
 pub mod config;
 pub mod default_kernel;
 pub mod namespace;
-
-// Re-export commonly used types for convenience
-#[cfg(not(target_arch = "wasm32"))]
-pub use cell::{Loader, Proc, ProcBuilder};
-#[cfg(not(target_arch = "wasm32"))]
-pub use executor::{Cell, CellBuilder, KernelOutcome, SpawnResult};

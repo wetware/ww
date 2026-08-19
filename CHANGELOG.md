@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Cell construction and kernel launch now use separate policy layers.**
+  `cell::Builder` replaces `ProcBuilder` as the canonical construction
+  mechanism and exposes explicit ordinary and kernel modes. `kernel::Generation`
+  now owns privileged kernel lifecycle policy. The historical root `Cell`,
+  `CellBuilder`, `SpawnResult`, and `KernelOutcome` Rust APIs are removed.
+  Embedders must use `cell::Builder` for low-level construction or
+  `kernel::Generation` for a privileged kernel Cell. `HostImpl`, `RuntimeImpl`,
+  and `ExecutorImpl` now require `EpochGuard`. Production hosts always use the
+  ordinary epoch watch channel seeded at epoch zero; without Stem, the channel
+  does not advance. `EpochGuard::fixed()` supports embedders and tests without
+  a live sender. Cap'n Proto and WIT interfaces are unchanged.
 - **The repository now publishes an interactive architecture map through GitHub
   Pages.** Reviewed map metadata generates one standalone HTML artifact after
   the existing CI checks pass. The README links to the map and its maintenance

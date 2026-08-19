@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use std::io::Write as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use authority::{Epoch, Provenance};
+use authority::{Epoch, EpochGuard, Provenance};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::VerifyingKey;
 use std::path::{Path, PathBuf};
@@ -15,8 +15,8 @@ mod doctor_cmd;
 mod ns_cmd;
 
 use ww::cell::image;
-use ww::cell::loaders::{ChainLoader, EmbeddedLoader, HostPathLoader, IpfsLoader};
-use ww::executor::CellBuilder;
+#[cfg(test)]
+use ww::cell::loaders::EmbeddedLoader;
 use ww::host;
 use ww::ipfs;
 
@@ -38,6 +38,7 @@ const EMBEDDED_STATUS: &[u8] = include_bytes!("../../std/status/bin/status.wasm"
 const EMBEDDED_STATUS: &[u8] = b"";
 
 /// Build the standard embedded loader with all bundled WASM images.
+#[cfg(test)]
 fn embedded_loader() -> EmbeddedLoader {
     let mut loader = EmbeddedLoader::new();
     // Important: do NOT register empty placeholders. If an empty blob is
@@ -1447,7 +1448,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         insecure_ephemeral: bool,
         listen: Vec<Multiaddr>,
         wasm_debug: bool,
-        kernel_source: ww::kernel::KernelSource,
+        kernel_source: ww::kernel::Source,
         stem: Option<String>,
         rpc_url: String,
         ws_url: String,
@@ -1533,7 +1534,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             oci_image_id: std::env::var("WW_OCI_IMAGE_ID")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            kernel_identity: ww::kernel::KernelIdentityState::pending(&kernel_source),
+            kernel_identity: ww::kernel::IdentityState::pending(&kernel_source),
         };
         let kernel_identity = version_info.kernel_identity.clone();
 
@@ -1978,36 +1979,37 @@ wasip2::cli::command::export!({iface_name}Guest);
                     .context("rooted epoch wait returned a pending epoch")?;
                 (epoch.seq, format!("/ipfs/{root}"))
             };
-            let loader = ChainLoader::new(vec![
-                Box::new(HostPathLoader),
-                Box::new(embedded_loader()),
-                Box::new(IpfsLoader::new(ipfs_client.clone())),
-            ]);
             let (terminate_tx, terminate_rx) = watch::channel(());
-            let mut builder = CellBuilder::new(root_path)
-                .with_loader(Box::new(loader))
-                .with_resolved_kernel(resolved_kernel.clone())
-                .with_kernel_generation(intended_seq)
-                .with_terminate(terminate_rx)
-                .with_network_state(network_state.clone())
-                .with_swarm_cmd_tx(swarm_cmd_tx.clone())
-                .with_wasm_debug(wasm_debug)
-                .with_cid_tree(cid_tree.clone())
-                .with_pinset_cache(pinset_cache.clone())
-                .with_signing_key(signing_key.clone())
-                .with_cache_policy(cache_policy)
-                .with_compile_tx(compile_tx.clone())
-                .with_wasmtime_engine(executor_pool.engine())
-                .with_suppress_stdin(false)
-                .with_ipfs_client(ipfs_client.clone())
-                .with_http_dial(http_dial.clone())
-                .with_epoch_rx(epoch_rx.clone())
-                .with_kernel_ready_gate(kernel_ready_gate.clone());
+            let mut bootstrap = ww::kernel::Bootstrap::new(
+                network_state.clone(),
+                swarm_cmd_tx.clone(),
+                signing_key.clone(),
+                stream_control.clone(),
+                ipfs_client.clone(),
+                http_dial.clone(),
+            );
             if let Some(ref registry) = route_registry {
-                builder = builder.with_route_registry(registry.clone());
+                bootstrap = bootstrap.with_route_registry(registry.clone());
             }
-            let cell = builder.build();
-            let generation_stream_control = stream_control.clone();
+            let kernel_generation = ww::kernel::Generation::new(
+                resolved_kernel.clone(),
+                ww::kernel::Root::new(root_path, cid_tree.clone()),
+                EpochGuard {
+                    issued_seq: intended_seq,
+                    receiver: epoch_rx.clone(),
+                },
+                kernel_ready_gate.clone(),
+                bootstrap,
+                ww::kernel::RuntimeInputs::new(
+                    wasm_debug,
+                    executor_pool.engine(),
+                    compile_tx.clone(),
+                    cache_policy,
+                    pinset_cache.clone(),
+                ),
+                ww::kernel::Stdio::Host,
+                terminate_rx,
+            );
             let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
             runtime_status.set_phase("starting-kernel");
             executor_pool
@@ -2015,9 +2017,9 @@ wasip2::cli::command::export!({iface_name}Guest);
                     name: "kernel".into(),
                     factory: Box::new(move |_shutdown| {
                         Box::pin(async move {
-                            match cell.spawn_serving(generation_stream_control).await {
-                                Ok(result) => {
-                                    if result_tx.send(Ok(result.outcome)).is_ok() {
+                            match kernel_generation.run().await {
+                                Ok(outcome) => {
+                                    if result_tx.send(Ok(outcome)).is_ok() {
                                         notify_pid0_result_ready(intended_seq).await;
                                     }
                                 }
@@ -2058,11 +2060,11 @@ wasip2::cli::command::export!({iface_name}Guest);
                         continue 'generations;
                     }
                     match result {
-                        Ok(Ok(ww::executor::KernelOutcome::Exited(0))) => break 'generations 0,
-                        Ok(Ok(ww::executor::KernelOutcome::Exited(code))) => {
+                        Ok(Ok(ww::kernel::Outcome::Exited(0))) => break 'generations 0,
+                        Ok(Ok(ww::kernel::Outcome::Exited(code))) => {
                             tracing::error!(code, generation, "Kernel generation exited with failure");
                         }
-                        Ok(Ok(ww::executor::KernelOutcome::Terminated)) => {
+                        Ok(Ok(ww::kernel::Outcome::Terminated)) => {
                             tracing::error!(generation, "Kernel terminated without a host replacement signal");
                         }
                         Ok(Err(error)) => {

@@ -20,7 +20,13 @@ fn load_echo_wasm() -> Option<Vec<u8>> {
 }
 
 fn setup_runtime() -> system_capnp::runtime::Client {
-    create_runtime_client(false, None, None, None, CachePolicy::Shared)
+    create_runtime_client(
+        false,
+        authority::EpochGuard::fixed(authority::Epoch::zero()),
+        None,
+        None,
+        CachePolicy::Shared,
+    )
 }
 
 /// Load echo WASM via runtime.load() and spawn a cell, returning its Process capability.

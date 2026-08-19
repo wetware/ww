@@ -330,7 +330,7 @@ impl HostGraftBuilder {
             self.network_state.clone(),
             self.swarm_cmd_tx.clone(),
             self.wasm_debug,
-            Some(guard.clone()),
+            guard.clone(),
             Some(self.stream_control.clone()),
         );
         if let Some(scope) = self.registration_scope.clone() {
@@ -508,27 +508,15 @@ where
 /// the private key. Auth (if needed) is handled by wrapping in `TerminalServer`
 /// at the transport layer, not here.
 ///
-#[must_use = "dropping the scope owner invalidates this pid0 generation's HTTP registrations"]
-pub struct Pid0RegistrationScope {
-    _sender: watch::Sender<()>,
-}
-
-impl Pid0RegistrationScope {
-    fn new() -> (Self, watch::Receiver<()>) {
-        let (sender, receiver) = watch::channel(());
-        (Self { _sender: sender }, receiver)
-    }
-}
-
 /// Process-local graft wrapper. Only the trusted PID0 bootstrap receives a
 /// client for this server.
-struct Pid0RootGraftBuilder {
+struct KernelRootGraftBuilder {
     inner: HostGraftBuilder,
     readiness_gate: Arc<authority::KernelReadyGate>,
     intended_seq: u64,
 }
 
-impl GraftBuilder for Pid0RootGraftBuilder {
+impl GraftBuilder for KernelRootGraftBuilder {
     fn build(
         &self,
         guard: &EpochGuard,
@@ -561,7 +549,7 @@ impl GraftBuilder for Pid0RootGraftBuilder {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn build_pid0_membrane_rpc<R, W>(
+pub fn build_kernel_membrane_rpc<R, W>(
     reader: R,
     writer: W,
     network_state: NetworkState,
@@ -577,12 +565,12 @@ pub fn build_pid0_membrane_rpc<R, W>(
     ipfs_client: ipfs::HttpClient,
     http_dial: Vec<String>,
     intended_seq: u64,
-) -> (RpcSystem<Side>, Pid0RegistrationScope)
+    registration_scope: watch::Receiver<()>,
+) -> RpcSystem<Side>
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
-    let (registration_scope, registration_scope_rx) = Pid0RegistrationScope::new();
     let mut root_builder = HostGraftBuilder::new(
         network_state,
         swarm_cmd_tx,
@@ -593,7 +581,7 @@ where
         runtime_client,
         ipfs_client,
     )
-    .with_registration_scope(registration_scope_rx);
+    .with_registration_scope(registration_scope);
     if !extras.is_empty() {
         root_builder = root_builder.with_extras(extras);
     }
@@ -602,7 +590,7 @@ where
     }
 
     // PID0 receives a process-local root membrane whose graft binds readiness.
-    let root_builder = Pid0RootGraftBuilder {
+    let root_builder = KernelRootGraftBuilder {
         inner: root_builder,
         readiness_gate,
         intended_seq,
@@ -616,8 +604,7 @@ where
         Side::Server,
         Default::default(),
     );
-    let rpc_system = RpcSystem::new(Box::new(rpc_network), Some(root_membrane.client));
-    (rpc_system, registration_scope)
+    RpcSystem::new(Box::new(rpc_network), Some(root_membrane.client))
 }
 
 // IPFS content access is tested in fs_intercept::tests and vfs::tests.
@@ -900,7 +887,7 @@ mod tests {
                 let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
                 let (swarm_tx, _swarm_rx) = mpsc::channel(1);
                 let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
-                let root = Pid0RootGraftBuilder {
+                let root = KernelRootGraftBuilder {
                     inner: HostGraftBuilder::new(
                         NetworkState::from_peer_id(vec![1, 2, 3]),
                         swarm_tx,
@@ -944,7 +931,7 @@ mod tests {
                 let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
                 let (swarm_tx, _swarm_rx) = mpsc::channel(1);
                 let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
-                let root = Pid0RootGraftBuilder {
+                let root = KernelRootGraftBuilder {
                     inner: HostGraftBuilder::new(
                         NetworkState::from_peer_id(vec![1, 2, 3]),
                         swarm_tx,
@@ -1065,7 +1052,7 @@ mod tests {
                 };
                 let (swarm_tx, _swarm_rx) = mpsc::channel(1);
                 let registry = crate::dispatch::new_registry();
-                let (registration_scope, registration_scope_rx) = Pid0RegistrationScope::new();
+                let (registration_scope, registration_scope_rx) = watch::channel(());
                 let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
                 let builder = HostGraftBuilder::new(
                     NetworkState::from_peer_id(vec![1, 2, 3]),
@@ -1200,7 +1187,8 @@ mod tests {
                 let (guest_reader, guest_writer) = io::split(guest_stream);
                 let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
 
-                let (host_rpc, _registration_scope) = build_pid0_membrane_rpc(
+                let (_registration_scope, registration_scope_rx) = watch::channel(());
+                let host_rpc = build_kernel_membrane_rpc(
                     host_reader,
                     host_writer,
                     NetworkState::from_peer_id(vec![1, 2, 3]),
@@ -1216,6 +1204,7 @@ mod tests {
                     ipfs::HttpClient::new("http://127.0.0.1:1".into()),
                     vec!["example.com".into()],
                     1,
+                    registration_scope_rx,
                 );
                 tokio::task::spawn_local(host_rpc.map(|_| ()));
 

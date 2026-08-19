@@ -66,12 +66,12 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
 
             let (swarm_tx, _swarm_rx) = mpsc::channel(16);
             let runtime =
-                create_runtime_client(false, Some(guard.clone()), None, None, CachePolicy::Shared);
+                create_runtime_client(false, guard.clone(), None, None, CachePolicy::Shared);
             let host: system_capnp::host::Client = capnp_rpc::new_client(ww::rpc::HostImpl::new(
                 network_state,
                 swarm_tx,
                 false,
-                Some(guard.clone()),
+                guard.clone(),
                 Some(stream_control),
             ));
 

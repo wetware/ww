@@ -209,9 +209,8 @@ pub struct ExecutorPool {
     threads: Vec<Option<JoinHandle<Result<()>>>>,
     cell_counts: Arc<Vec<AtomicUsize>>,
     next: AtomicUsize,
-    /// Shared engine for all cells. Callers should pass this to CellBuilder
-    /// via `with_wasmtime_engine()` so all cells on a worker share the same
-    /// Engine and respond to `increment_epoch()`.
+    /// Shared engine for all cells. Callers pass this to `cell::Builder` so
+    /// all cells on a worker respond to `increment_epoch()` on the same engine.
     engine: Arc<Engine>,
 }
 
@@ -318,8 +317,8 @@ impl ExecutorPool {
 
     /// Shared Wasmtime engine for all cells in this pool.
     ///
-    /// Pass this to `CellBuilder::with_wasmtime_engine()` so all cells share
-    /// the same Engine and respond to `Engine::increment_epoch()`.
+    /// Pass this to `cell::Builder::with_engine()` so all cells share the same
+    /// Engine and respond to `Engine::increment_epoch()`.
     pub fn engine(&self) -> Arc<Engine> {
         Arc::clone(&self.engine)
     }

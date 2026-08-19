@@ -183,7 +183,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use crate::{build_peer_rpc, NetworkState, SwarmCommand};
+    use crate::{build_test_peer_rpc, NetworkState, SwarmCommand};
     use authority::system_capnp;
     use tokio::io;
     use tokio::sync::mpsc;
@@ -200,7 +200,8 @@ mod tests {
         let network_state = NetworkState::from_peer_id(local_peer_id);
         let (swarm_tx, swarm_rx) = mpsc::channel(16);
 
-        let server_rpc = build_peer_rpc(server_read, server_write, network_state, swarm_tx, false);
+        let server_rpc =
+            build_test_peer_rpc(server_read, server_write, network_state, swarm_tx, false);
         tokio::task::spawn_local(async move {
             let _ = server_rpc.await;
         });
