@@ -14,12 +14,7 @@ pub mod loaders;
 pub mod mount;
 pub mod proc;
 pub mod sched;
-pub mod streams;
-pub mod swappable;
 pub mod vfs;
-
-#[cfg(test)]
-mod streams_test;
 
 pub use proc::{Builder as ProcBuilder, Proc};
 

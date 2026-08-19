@@ -9,7 +9,6 @@ name = "authority"
 
 [build-dependencies]
 capnpc = { workspace = true }
-schema-id = { path = "../schema-id" }
 
 [dependencies]
 capnp = { workspace = true }

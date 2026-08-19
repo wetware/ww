@@ -555,7 +555,7 @@ impl Cell {
             ProcBuilder::new()
         };
 
-        let guest_env = prepare_guest_env(env, interactive, &path, &wasm_cid, is_kernel);
+        let guest_env = prepare_guest_env(env, interactive, &path, &wasm_cid);
 
         let mut builder = builder
             .with_wasm_debug(wasm_debug)
@@ -775,7 +775,6 @@ fn prepare_guest_env(
     interactive: bool,
     path: &str,
     wasm_cid: &cid::Cid,
-    is_kernel: bool,
 ) -> Vec<String> {
     let mut guest_env = env.unwrap_or_default();
     if interactive {
@@ -793,61 +792,12 @@ fn prepare_guest_env(
     {
         guest_env.push(format!("WW_CELL_CID={wasm_cid}"));
     }
-    if is_kernel {
-        // The host owns this contract. Caller-provided values must not spoof
-        // the build-locked compatibility boundary seen by pid0.
-        guest_env.retain(|value| {
-            !value.starts_with("WW_KERNEL_ABI=") && !value.starts_with("WW_KERNEL_ABI_FPR=")
-        });
-        guest_env.push(format!(
-            "WW_KERNEL_ABI={}",
-            crate::kernel::KERNEL_ABI_VERSION
-        ));
-        guest_env.push(format!(
-            "WW_KERNEL_ABI_FPR={}",
-            crate::kernel::KERNEL_ABI_FINGERPRINT
-        ));
-    }
     guest_env
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn kernel_abi_environment_is_host_owned_and_injected() {
-        let cid = crate::kernel::runtime_cid(b"pid0");
-        let env = prepare_guest_env(
-            Some(vec![
-                "WW_KERNEL_ABI=spoofed".to_string(),
-                "WW_KERNEL_ABI_FPR=spoofed".to_string(),
-            ]),
-            false,
-            "/image",
-            &cid,
-            true,
-        );
-        assert!(env.contains(&format!(
-            "WW_KERNEL_ABI={}",
-            crate::kernel::KERNEL_ABI_VERSION
-        )));
-        assert!(env.contains(&format!(
-            "WW_KERNEL_ABI_FPR={}",
-            crate::kernel::KERNEL_ABI_FINGERPRINT
-        )));
-        assert!(!env.iter().any(|value| value.ends_with("=spoofed")));
-    }
-
-    #[test]
-    fn ordinary_cells_do_not_receive_kernel_abi_environment() {
-        let cid = crate::kernel::runtime_cid(b"cell");
-        let env = prepare_guest_env(None, false, "/image", &cid, false);
-        assert!(!env.iter().any(|value| value.starts_with("WW_KERNEL_ABI=")));
-        assert!(!env
-            .iter()
-            .any(|value| value.starts_with("WW_KERNEL_ABI_FPR=")));
-    }
 
     #[test]
     fn ordinary_cells_reject_private_kernel_readiness_installation() {
@@ -907,7 +857,6 @@ mod tests {
         let cid_tree = Arc::new(cell::vfs::CidTree::new(
             crate::kernel::runtime_cid(b"spinning-root").to_string(),
             crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
-            Default::default(),
             image.path().to_path_buf(),
         ));
         let component = image.path().join("bin/main.wasm");

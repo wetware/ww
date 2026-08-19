@@ -486,7 +486,7 @@ pub use crate::dispatcher::server::WagiService;
 // Re-export AdminService so cli/main.rs can use `ww::services::AdminService`.
 pub use crate::metrics::AdminService;
 
-/// Parameters for constructing a [`Libp2pHost`] inside the swarm thread.
+/// Parameters for constructing a libp2p [`crate::host::Net`] inside the swarm thread.
 ///
 /// The host must be constructed on the same tokio runtime that will poll it,
 /// because `with_tokio()` registers TCP listeners with the current reactor.
@@ -537,18 +537,14 @@ impl Service for SwarmService {
             // error to the main thread so the user sees the real cause
             // (e.g. bind failure) instead of a "channel closed" symptom.
             let p = self.params;
-            let host = match crate::host::Libp2pHost::new(
-                p.listen,
-                p.keypair,
-                p.kubo_bootstrap,
-                p.kubo_peers,
-            ) {
-                Ok(h) => h,
-                Err(e) => {
-                    let _ = self.ready_tx.send(Err(e));
-                    return Ok(());
-                }
-            };
+            let host =
+                match crate::host::Net::new(p.listen, p.keypair, p.kubo_bootstrap, p.kubo_peers) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = self.ready_tx.send(Err(e));
+                        return Ok(());
+                    }
+                };
             let network_state = self.network_state;
             let stream_control = host.stream_control();
 

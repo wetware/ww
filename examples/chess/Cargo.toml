@@ -36,4 +36,3 @@ ww         = { path = "../.." }
 
 [build-dependencies]
 capnpc = { workspace = true }
-schema-id = { path = "../../crates/schema-id" }

@@ -72,10 +72,6 @@ pub mod chess_authority;
 #[cfg(not(target_arch = "wasm32"))]
 authority::impl_terminal_session_pipeline!(chess_capnp::chess_engine::Client);
 
-// Build-time schema constants: CHESS_ENGINE_SCHEMA (&[u8]) and CHESS_ENGINE_CID (&str).
-// Vat publication uses the service name below; the schema CID is metadata.
-include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
-
 const CHESS_SERVICE: &str = "chess";
 
 /// Host-provided closed delivery of this child's immutable initial grants.

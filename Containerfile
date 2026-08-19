@@ -38,7 +38,6 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY capnp/ capnp/
 
 # Workspace member manifests + build scripts
-COPY crates/schema-id/Cargo.toml crates/schema-id/Cargo.toml
 COPY crates/atom/Cargo.toml crates/atom/Cargo.toml
 COPY crates/cache/Cargo.toml crates/cache/Cargo.toml
 COPY crates/stem/Cargo.toml crates/stem/Cargo.toml
@@ -51,7 +50,6 @@ COPY examples/discovery/Cargo.toml examples/discovery/build.rs examples/discover
 
 # Dummy source files so cargo can resolve the workspace
 RUN mkdir -p src/cli && echo 'fn main() {}' > src/cli/main.rs \
-    && mkdir -p crates/schema-id/src && echo '' > crates/schema-id/src/lib.rs \
     && mkdir -p crates/atom/src && echo '' > crates/atom/src/lib.rs \
     && mkdir -p crates/cache/src && echo '' > crates/cache/src/lib.rs \
     && mkdir -p crates/stem/src && echo '' > crates/stem/src/lib.rs \

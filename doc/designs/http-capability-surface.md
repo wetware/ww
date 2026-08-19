@@ -89,10 +89,9 @@ env vars and print to stdout.
 
 ## Architecture
 
-### Host-side: WagiAdapter (`src/dispatcher/wagi.rs`)
+### Host-side: WAGI functions (`crates/rpc/src/wagi.rs`)
 
-Standalone functions, NOT a ProtocolAdapter impl (ProtocolAdapter's
-`request_body()` returns only `Vec<u8>` and WAGI needs env vars too).
+The HTTP listener calls standalone CGI environment and response functions.
 
 - `build_cgi_env(method, path, query, headers, server_name, server_port)`
   constructs RFC 3875 env vars
@@ -189,7 +188,7 @@ WASI Guest --Cap'n Proto RPC--> EpochGuardedHttpClient (reqwest) --> Internet
 
 ### Membrane Integration (Phase 2)
 
-HttpClientBuilder added to graft() return. HttpServer null without
+HttpClientBuilder added to graft() return. HttpListener withheld without
 `--with-http`.
 
 ## Implementation Status

@@ -27,8 +27,6 @@ tokio-util = { version = "0.7", features = ["compat"] }
 
 [build-dependencies]
 capnpc = "0.25.3"
-capnp = "0.25.3"
-schema-id = { path = "../../crates/schema-id" }
 
 # capnp-rpc 0.25.1 + import-wrapper-reuse fix (wetware/ww#586): re-importing an
 # already-held capability created a duplicate wrapper Client whose later drop

@@ -1106,7 +1106,6 @@ mod tests {
         let tree = Arc::new(crate::vfs::CidTree::new(
             root_cid.to_string(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
-            std::collections::HashMap::new(),
             staging.path().to_path_buf(),
         ));
         let mut wasi = WasiCtxBuilder::new();

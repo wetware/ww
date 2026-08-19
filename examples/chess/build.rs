@@ -1,25 +1,13 @@
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Build script for the chess example crate.
 ///
-/// This does two things:
-///
-/// 1. Compile Cap'n Proto schemas into Rust types so the chess WASM
-///    guest can speak typed RPC with the host.
-///
-/// 2. Derive a content-addressed **schema CID** from the ChessEngine
-///    interface definition. This is schema metadata; vat publication
-///    uses a normal service name such as "chess".
-///
-/// The schema CID pipeline:
-///   chess.capnp  →  capnpc (CodeGeneratorRequest)
-///                →  schema_id::extract_schemas (canonical bytes + BLAKE3)
-///                →  `CHESS_ENGINE_SCHEMA_CID` const in generated Rust
+/// Compiles Cap'n Proto schemas into Rust types so the chess WASM guest can
+/// speak typed RPC with the host.
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let manifest_path = Path::new(&manifest_dir);
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // Locate the shared schema directory at the repo root. Every crate
     // that speaks Cap'n Proto RPC compiles these same definitions so
@@ -55,33 +43,12 @@ fn main() {
         .run()
         .expect("failed to compile shared capnp schemas");
 
-    // ── Pass 2: chess-specific schema + schema CID ──────────────────
-    // We need two outputs from chess.capnp:
-    //   a) Rust types (ChessEngine client/server traits)
-    //   b) The raw CodeGeneratorRequest binary, which contains the
-    //      canonical encoding of every schema node. We feed this into
-    //      schema_id to derive the content-addressed CID.
-    let raw_request = out_dir.join("chess_request.bin");
+    // ── Pass 2: chess-specific schema ───────────────────────────────
     capnpc::CompilerCommand::new()
         .src_prefix(manifest_path)
         .file(&local_schema)
-        .raw_code_generator_request_path(&raw_request)
         .run()
         .expect("failed to compile chess.capnp");
-
-    // Extract the canonical bytes for the ChessEngine interface node
-    // (type ID 0xd0ac8299df079c61) and compute its CID:
-    //   CIDv1(raw, BLAKE3(canonical(schema.Node)))
-    //
-    // This produces a (name, cid, bytes) tuple. The `name` is "CHESS_ENGINE",
-    // used to emit a Rust const: `pub const CHESS_ENGINE_SCHEMA_CID: &str = "bafy..."`.
-    let schemas = schema_id::extract_schemas(&raw_request, &[("CHESS_ENGINE", 0xd0ac8299df079c61)])
-        .expect("extract ChessEngine schema");
-
-    // Emit `CHESS_ENGINE_SCHEMA_CID` and `CHESS_ENGINE_SCHEMA_BYTES`
-    // constants. The guest includes these via `include!(concat!(env!("OUT_DIR"), ...))`.
-    schema_id::emit_schema_consts(&out_dir.join("schema_ids.rs"), &schemas)
-        .expect("emit schema consts");
 
     // ── Cargo rebuild triggers ──────────────────────────────────────
     // Re-run this build script whenever any schema file changes.

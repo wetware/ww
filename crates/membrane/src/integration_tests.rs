@@ -5,7 +5,7 @@
 //! spike; adapted to the `Policy` trait API. The real-cap end-to-end path is
 //! additionally covered by the M1a spike in `crates/rpc`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::rc::Rc;
 
@@ -435,22 +435,39 @@ async fn independent_boundary_does_not_collapse_foreign_lineage() {
 /// per-call counter survives. The inner allowlist still filters underneath.
 #[tokio::test]
 async fn stateful_policy_stacks_not_collapses() {
-    use crate::RateLimit;
-    use std::time::Duration;
+    struct DenyAfterFirst {
+        inner: Allowlist,
+        calls: Cell<u32>,
+    }
+
+    impl Policy for DenyAfterFirst {
+        fn check(&self, interface_id: u64, method_id: u16) -> Result<(), Error> {
+            self.inner.check(interface_id, method_id)?;
+            let calls = self.calls.get();
+            if calls > 0 {
+                return Err(crate::denied_error(
+                    interface_id,
+                    method_id,
+                    "test call limit exceeded",
+                ));
+            }
+            self.calls.set(calls + 1);
+            Ok(())
+        }
+    }
 
     let raw: thing::Client = capnp_rpc::new_client(ThingImpl { depth: 0 });
     let inner = membrane(
         raw,
         Rc::new(Allowlist::new().allow(thing_id(), PING)) as Rc<dyn Policy>,
     );
-    // Rate-limit the already-membraned cap: 1 call per long window.
+    // Apply a stateful policy to the already-membraned capability.
     let outer = attenuate(
         inner,
-        Rc::new(RateLimit::new(
-            Box::new(Allowlist::new().allow(thing_id(), PING)),
-            1,
-            Duration::from_secs(3600),
-        )) as Rc<dyn Policy>,
+        Rc::new(DenyAfterFirst {
+            inner: Allowlist::new().allow(thing_id(), PING),
+            calls: Cell::new(0),
+        }) as Rc<dyn Policy>,
     );
 
     // Stacked, not collapsed: outer wraps a membrane, not the bare cap.
@@ -461,11 +478,11 @@ async fn stateful_policy_stacks_not_collapses() {
         "stateful policy must stack: inner should still be a membrane",
     );
 
-    // First ping passes the rate limit; second is denied by the counter.
-    expect_ping(&outer, "pong-0", "rate-limit first call").await;
+    // The first call passes. The second call observes the retained state.
+    expect_ping(&outer, "pong-0", "stateful policy first call").await;
     assert_denied(
         outer.ping_request().send().promise.await,
-        "rate-limit second call denied",
+        "stateful policy second call denied",
     );
 }
 

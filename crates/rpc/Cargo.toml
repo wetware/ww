@@ -27,9 +27,6 @@ tokio-util = { workspace = true, features = ["codec", "compat"] }
 tracing = { workspace = true }
 
 # Workspace crates
-atom = { path = "../atom" }
 auth = { path = "../guest/auth" }
-cache = { package = "ww-cache", path = "../cache" }
 ipfs = { path = "../ipfs" }
 authority = { package = "wetware-authority", path = "../authority" }
-stem = { path = "../stem" }

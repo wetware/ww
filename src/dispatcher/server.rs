@@ -3,7 +3,7 @@
 //! Implements the `Service` trait from `runtime.rs`. Accepts route
 //! registrations from `HttpListenerImpl` via a shared registry, then
 //! dispatches incoming HTTP requests to WASM cells using the CGI adapter
-//! (`dispatcher::wagi`).
+//! (`rpc::wagi`).
 //!
 //! Architecture: Cap'n Proto clients are `!Send`, so the axum handler
 //! can't hold a `Executor` directly. Instead, each route registers

@@ -80,161 +80,40 @@ mod test_session_capnp {
 #[cfg(test)]
 impl_terminal_session_pipeline!(test_session_capnp::structured_session::Client);
 
-/// Canonical Schema.Node bytes for each grafted capability interface.
-/// These back the `schema`/`doc`/`help` introspection builtins, not authority.
-pub mod schema_registry {
-    include!(concat!(env!("OUT_DIR"), "/schema_ids.rs"));
+#[cfg(test)]
+mod wire_type_id_tests {
+    use capnp::traits::HasTypeId;
 
-    /// Resolve canonical Schema.Node bytes by the canonical cap name used
-    /// in the membrane graft loop (e.g. "host", "runtime", "routing",
-    /// "identity", "http-client").
-    pub fn schema_by_name(name: &str) -> Option<&'static [u8]> {
-        match name {
-            "host" => Some(HOST_SCHEMA),
-            "runtime" => Some(RUNTIME_SCHEMA),
-            "routing" => Some(ROUTING_SCHEMA),
-            "identity" => Some(IDENTITY_SCHEMA),
-            "authority" => Some(AUTHORITY_SCHEMA),
-            "http-client" => Some(HTTP_CLIENT_SCHEMA),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use capnp::traits::HasTypeId;
-
-        #[test]
-        fn each_core_cap_has_non_empty_bytes() {
-            for name in [
-                "host",
-                "runtime",
-                "routing",
-                "identity",
-                "authority",
-                "http-client",
-            ] {
-                let bytes = schema_by_name(name)
-                    .unwrap_or_else(|| panic!("missing schema for cap '{name}'"));
-                assert!(!bytes.is_empty(), "schema for '{name}' is empty");
-            }
-        }
-
-        #[test]
-        fn unknown_cap_returns_none() {
-            assert!(schema_by_name("nonexistent").is_none());
-            assert!(schema_by_name("").is_none());
-        }
-
-        #[test]
-        fn bytes_are_word_aligned() {
-            for name in [
-                "host",
-                "runtime",
-                "routing",
-                "identity",
-                "authority",
-                "http-client",
-            ] {
-                let bytes = schema_by_name(name).expect("schema present");
-                assert_eq!(
-                    bytes.len() % 8,
-                    0,
-                    "canonical schema for '{name}' must be word-aligned (got {} bytes)",
-                    bytes.len()
-                );
-            }
-        }
-
-        #[test]
-        fn bytes_parse_as_schema_node() {
-            for name in ["host", "runtime", "routing", "identity", "http-client"] {
-                let bytes = schema_by_name(name).expect("schema present");
-                // Capnp segments require 8-byte alignment; the static byte
-                // slice is only byte-aligned, so copy into a Word buffer.
-                let word_count = bytes.len().div_ceil(8);
-                let mut words: Vec<capnp::Word> =
-                    vec![capnp::word(0, 0, 0, 0, 0, 0, 0, 0); word_count];
-                capnp::Word::words_to_bytes_mut(&mut words)[..bytes.len()].copy_from_slice(bytes);
-                let aligned = capnp::Word::words_to_bytes(&words);
-                let segments: &[&[u8]] = &[aligned];
-                let segment_array = capnp::message::SegmentArray::new(segments);
-                let reader = capnp::message::Reader::new(
-                    segment_array,
-                    capnp::message::ReaderOptions::new(),
-                );
-                let node: capnp::schema_capnp::node::Reader =
-                    reader.get_root().expect("root is a node");
-                let which = node.which().expect("node has Which");
-                assert!(
-                    matches!(which, capnp::schema_capnp::node::Which::Interface(_)),
-                    "schema for '{name}' is not an interface node"
-                );
-            }
-        }
-
-        #[test]
-        fn split_schema_type_ids_are_pinned_for_wire_compat() {
-            // These IDs were historically defined in stem.capnp and are now
-            // split across auth.capnp and membrane.capnp. Keep them pinned.
-            assert_eq!(
-                <crate::auth_capnp::signer::Client as HasTypeId>::TYPE_ID,
-                0xafaf_af94_68b6_a274
-            );
-            assert_eq!(
-                <crate::auth_capnp::identity::Client as HasTypeId>::TYPE_ID,
-                0xa7c2_00e5_b472_6d89
-            );
-            assert_eq!(
-                <crate::auth_capnp::terminal::Client<capnp::any_pointer::Owned> as HasTypeId>::TYPE_ID,
-                0xeae8_840b_2a89_8ba9
-            );
-            assert_eq!(
-                <crate::auth_capnp::opaque_session::Client as HasTypeId>::TYPE_ID,
-                0xc11f_8355_d7fc_e6bb
-            );
-            assert_eq!(
-                <crate::auth_capnp::authority::Client as HasTypeId>::TYPE_ID,
-                0xd119_09df_3e52_3d41
-            );
-            assert_eq!(
-                <crate::membrane_capnp::export::Reader<'static> as HasTypeId>::TYPE_ID,
-                0xbb8d_5590_cb2f_3d2e
-            );
-            assert_eq!(
-                <crate::membrane_capnp::membrane::Client as HasTypeId>::TYPE_ID,
-                0xdb52_c251_06bc_2c5e
-            );
-        }
-
-        #[test]
-        fn core_cap_schema_cids_are_stable() {
-            // CID snapshots guard against accidental protocol drift.
-            // Host and Runtime reach Executor.spawn's Export type, so adding
-            // the sibling InitialGrants interface to membrane.capnp changes
-            // their canonical dependency graph. Interface IDs remain pinned.
-            assert_eq!(
-                HOST_CID,
-                "bafkr4icm7fhyzerlzv477jxvwkohhkyig6p3pzfc2twhcbowiqz6iugl7m"
-            );
-            assert_eq!(
-                RUNTIME_CID,
-                "bafkr4ics33cfatdvjuso5btlgkzdcvlrsoufo3fb6d6w5hthgfq35yt6oa"
-            );
-            assert_eq!(
-                ROUTING_CID,
-                "bafkr4ids5ycfp6wd4ta5nf6e7deg625pyiur6ee53u63t47dsfoiwv5zsy"
-            );
-            assert_eq!(
-                IDENTITY_CID,
-                "bafkr4iakqlclxvdrgqk63shamitujssfmdnkzroyr5fw7wxjwcyhrqtpjy"
-            );
-            assert_eq!(
-                HTTP_CLIENT_CID,
-                "bafkr4ibch3gln5hzay6uivfxkwb5gsqphlkxn75rh3gb6fj2viznd33ari"
-            );
-        }
+    #[test]
+    fn split_schema_type_ids_are_pinned_for_wire_compat() {
+        assert_eq!(
+            <crate::auth_capnp::signer::Client as HasTypeId>::TYPE_ID,
+            0xafaf_af94_68b6_a274
+        );
+        assert_eq!(
+            <crate::auth_capnp::identity::Client as HasTypeId>::TYPE_ID,
+            0xa7c2_00e5_b472_6d89
+        );
+        assert_eq!(
+            <crate::auth_capnp::terminal::Client<capnp::any_pointer::Owned> as HasTypeId>::TYPE_ID,
+            0xeae8_840b_2a89_8ba9
+        );
+        assert_eq!(
+            <crate::auth_capnp::opaque_session::Client as HasTypeId>::TYPE_ID,
+            0xc11f_8355_d7fc_e6bb
+        );
+        assert_eq!(
+            <crate::auth_capnp::authority::Client as HasTypeId>::TYPE_ID,
+            0xd119_09df_3e52_3d41
+        );
+        assert_eq!(
+            <crate::membrane_capnp::export::Reader<'static> as HasTypeId>::TYPE_ID,
+            0xbb8d_5590_cb2f_3d2e
+        );
+        assert_eq!(
+            <crate::membrane_capnp::membrane::Client as HasTypeId>::TYPE_ID,
+            0xdb52_c251_06bc_2c5e
+        );
     }
 }
 

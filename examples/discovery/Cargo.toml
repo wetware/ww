@@ -22,5 +22,3 @@ tokio-util = { workspace = true, features = ["compat"] }
 
 [build-dependencies]
 capnpc = { workspace = true }
-capnp = { workspace = true }
-schema-id = { path = "../../crates/schema-id" }

@@ -434,27 +434,22 @@ async fn merge_overlay_recursive_inner(
 
 // ── Virtual mount resolution (lazy CidTree path) ─────────────────
 
-/// Resolve mounts into a root CID and local overrides for the virtual filesystem.
+/// Resolve mounts into a root CID for the virtual filesystem.
 ///
 /// Performs the DAG merge to produce a merged root CID.
 /// Targeted mounts are rejected in backend mode to avoid a second,
 /// host-local filesystem path.
 ///
-/// Returns `(root_cid, local_overrides)` suitable for constructing a `CidTree`.
 pub async fn resolve_mounts_virtual(
     mounts: &[Mount],
     ipfs_client: &ipfs::BootClient,
-) -> Result<(
-    String,
-    std::collections::HashMap<std::path::PathBuf, crate::vfs::LocalOverride>,
-    Vec<String>,
-)> {
+) -> Result<(String, Vec<String>)> {
     let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
     resolve_mounts_virtual_with_cancel(mounts, ipfs_client, &mut cancel).await
 }
 
 /// Validate local mount configuration before waiting for Kubo.
-pub fn validate_mounts_virtual(mounts: &[Mount]) -> Result<(Vec<&Mount>, Vec<&Mount>)> {
+pub fn validate_mounts_virtual(mounts: &[Mount]) -> Result<Vec<&Mount>> {
     if mounts.is_empty() {
         bail!("No mounts provided");
     }
@@ -483,7 +478,7 @@ pub fn validate_mounts_virtual(mounts: &[Mount]) -> Result<(Vec<&Mount>, Vec<&Mo
         }
     }
 
-    Ok((root_mounts, targeted_mounts))
+    Ok(root_mounts)
 }
 
 /// Cancellable variant used during host boot so service failure waits for MFS
@@ -492,12 +487,8 @@ pub async fn resolve_mounts_virtual_with_cancel(
     mounts: &[Mount],
     ipfs_client: &ipfs::BootClient,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
-) -> Result<(
-    String,
-    std::collections::HashMap<std::path::PathBuf, crate::vfs::LocalOverride>,
-    Vec<String>,
-)> {
-    let (root_mounts, _) = validate_mounts_virtual(mounts)?;
+) -> Result<(String, Vec<String>)> {
+    let root_mounts = validate_mounts_virtual(mounts)?;
 
     // Resolve all root mounts to CIDs.
     let mut cids = Vec::with_capacity(root_mounts.len());
@@ -520,7 +511,7 @@ pub async fn resolve_mounts_virtual_with_cancel(
     let root_cid = dag_merge(&cids, ipfs_client, cancel).await?;
     tracing::info!(cid = %root_cid, layers = cids.len(), "Virtual DAG merge complete");
 
-    Ok((root_cid, std::collections::HashMap::new(), cids))
+    Ok((root_cid, cids))
 }
 
 async fn resolve_bare_cid(
@@ -984,9 +975,9 @@ mod tests {
     #[test]
     fn split_ipns_path_nested_subpath_preserved() {
         // A deeper subpath: every '/' after the hash is part of the subpath.
-        let (hash, sub) = split_ipns_path("/ipns/k51abc/a/b/c/d.glia").unwrap();
+        let (hash, sub) = split_ipns_path("/ipns/k51abc/a/b/c/main.wasm").unwrap();
         assert_eq!(hash, "k51abc");
-        assert_eq!(sub, "a/b/c/d.glia");
+        assert_eq!(sub, "a/b/c/main.wasm");
     }
 
     #[test]

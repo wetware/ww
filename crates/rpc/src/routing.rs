@@ -682,8 +682,8 @@ mod tests {
 
     #[test]
     fn test_normalize_rel_path_accepts_clean_relative_path() {
-        let p = normalize_rel_path("apps/demo/main.glia").unwrap();
-        assert_eq!(p, "apps/demo/main.glia");
+        let p = normalize_rel_path("apps/demo/main.wasm").unwrap();
+        assert_eq!(p, "apps/demo/main.wasm");
     }
 
     #[test]
