@@ -125,9 +125,9 @@
       "group": "THE AUTHORITY PATH",
       "title": "Image-bound executor",
       "subtitle": "Spawns a cell with explicit grants.",
-      "files": ["src/executor.rs", "src/launcher.rs"],
+      "files": ["src/launcher.rs"],
       "what": "`Executor.spawn(args, env, grants)` creates a process for one pinned binary. A child receives the exact parent-selected named grants and fixed computation substrate.",
-      "built": "`src/executor.rs` and `src/launcher.rs` bridge Cap’n Proto RPC requests to `cell::ProcBuilder`. Executors do not contain a `Runtime` or ambient host authority."
+      "built": "`src/launcher.rs` bridges Cap’n Proto RPC requests to `cell::Builder`. Executors do not contain a `Runtime` or ambient host authority."
     },
     {
       "key": "membrane",
