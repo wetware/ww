@@ -2,7 +2,7 @@ use std::fmt;
 use std::time::Duration;
 
 use auth::SigningDomain;
-use authority::{auth_capnp, system_capnp, Epoch, EpochGuard, Provenance};
+use authority::{auth_capnp, system_capnp, Epoch, EpochGuard};
 use capnp::capability::{FromClientHook, Promise};
 use chess::chess_authority::{chess_method_profile, ChessProfile};
 use chess::{chess_capnp, ChessEngineImpl};
@@ -942,7 +942,6 @@ fn epoch(seq: u64) -> Epoch {
         seq,
         head: format!("head-{seq}").into_bytes(),
         root: None,
-        provenance: Provenance::Block(seq),
     }
 }
 

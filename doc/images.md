@@ -40,10 +40,16 @@ The `--stem` flag connects to an Atom contract on an EVM chain.
 The contract holds a monotonic head pointer (an IPFS CID). When the
 head is updated:
 
-1. The off-chain indexer detects the `HeadUpdated` event
-2. Waits for confirmation depth (reorg safety)
-3. Advances the epoch, revoking all agent capabilities
-4. The host terminates pid0 and starts a replacement for the new epoch
+1. The Atom Source reads the chain tip.
+2. It reads `Atom.head()` at `tip - confirmation_depth`.
+3. Deployment advances its host-local epoch and publishes `root: None`.
+4. Deployment terminates PID0 while it prepares the head plus frozen layers.
+5. Deployment waits for teardown, swaps `CidTree`, publishes the rooted epoch,
+   and starts the replacement.
+
+Contract events are not required for correctness. The boot head and later
+updates use the same finalized-depth rule. Atom's contract sequence remains
+private to the Source and does not become `Epoch.seq`.
 
 This provides a coordination primitive across trust boundaries:
 multiple independent nodes watching the same contract will

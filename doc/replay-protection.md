@@ -108,9 +108,9 @@ pub fn check(&self) -> Result<(), Error> {
 }
 ```
 
-When the epoch advances (an on-chain `HeadUpdated` event, finalized by the
-confirmation-depth strategy), host-issued capabilities guarded by that epoch
-fail simultaneously. This does not revoke arbitrary non-host capabilities.
+When deployment accepts an authoritative Stem update, host-issued capabilities
+guarded by the old local epoch fail simultaneously. This does not revoke
+arbitrary non-host capabilities.
 Trusted pid0 may call `Membrane.graft()` again. Ordinary children have no graft
 surface: they receive fresh references only through explicit ancestor
 re-delegation or respawn.
@@ -120,24 +120,31 @@ a capability issued under epoch N cannot be used during epoch N+1.
 
 Targeted `RevocationGuard`s can also invalidate one recipient or policy
 decision inside an epoch. They compose with `EpochGuard`; they do not replace
-Atom as the global epoch source.
+the configured Stem as the deployment source.
 
 ## Layer 4: On-chain finality (Stem contract)
 
-The epoch sequence is anchored to the Stem contract's `HeadUpdated` event.
-The `Finalizer` requires K-deep confirmation (default: 6 blocks) before
-accepting an event, and cross-checks every event against the canonical
-on-chain state via `eth_call` to `Atom.head()`. This prevents:
+The Atom Source polls the canonical chain tip and reads `Atom.head()` at
+`tip - confirmation_depth`. The default confirmation depth is six blocks.
+Bootstrap and follow mode apply this same rule. `HeadUpdated` delivery is not
+required for correctness. This mechanism provides:
 
-- **Reorg attacks**: events on reorged forks are silently discarded.
-- **Downgrade attacks**: replaying an old organization snapshot fails because
-  the on-chain `seq` has advanced past the stale value.
+- **Depth-bounded reorg handling**: only state at the configured chain depth
+  becomes authoritative.
+- **Canonical reconciliation**: polling observes the current canonical state
+  after transport failures or missed events.
+- **Contract progression**: each non-duplicate `setHead` call increments Atom's
+  contract-local sequence, and polling reads the selected state directly.
+
+The contract revision remains private to the Atom Source. `Epoch.seq` is a
+host-local counter that starts at zero on each process start.
 
 ## Epoch authority advance
 
-The Host broadcasts each finalized epoch before it prepares the filesystem
-root. Existing capabilities then fail with `staleEpoch`. The Host broadcasts
-the same epoch with its effective root only after root preparation succeeds.
+Deployment publishes each accepted local epoch before it prepares the
+filesystem root. Existing capabilities then fail with `staleEpoch`.
+Deployment publishes the same epoch with its effective root only after
+preparation succeeds and old PID0 terminates.
 
 `--epoch-drain-secs` is deprecated and inert. The Host accepts the option for
 CLI compatibility, but the value does not delay the authority broadcast.

@@ -264,7 +264,7 @@ impl http_capnp::http_client::Server for EpochGuardedHttpProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use authority::epoch::{Epoch, Provenance};
+    use authority::epoch::Epoch;
     use std::error::Error;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -277,7 +277,6 @@ mod tests {
             seq: 1,
             head: vec![],
             root: None,
-            provenance: Provenance::Block(0),
         };
         let (_tx, rx) = watch::channel(epoch);
         let guard = EpochGuard {
@@ -292,7 +291,6 @@ mod tests {
             seq: 2,
             head: vec![],
             root: None,
-            provenance: Provenance::Block(0),
         };
         let (_tx, rx) = watch::channel(epoch);
         let guard = EpochGuard {

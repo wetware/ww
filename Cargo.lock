@@ -942,7 +942,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3",
- "thiserror 1.0.69",
  "tokio",
  "tokio-test",
  "tokio-tungstenite",
@@ -1367,19 +1366,15 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
- "atom",
  "cap-std",
  "cid",
  "dirs",
  "futures",
- "hex",
  "ipfs",
  "lru",
  "rand 0.9.4",
- "reqwest",
  "serde",
  "serde_json",
- "stem",
  "tempfile",
  "tokio",
  "tracing",
@@ -5824,21 +5819,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
-name = "stem"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "atom",
- "reqwest",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "wetware-authority",
-]
-
-[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8025,7 +8005,6 @@ dependencies = [
  "rpc",
  "serde",
  "serde_json",
- "stem",
  "tempfile",
  "tokio",
  "tokio-util",

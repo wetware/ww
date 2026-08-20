@@ -536,7 +536,6 @@ mod tests {
             seq: 1,
             head: vec![],
             root: None,
-            provenance: authority::Provenance::Block(0),
         };
         let (tx, rx) = tokio::sync::watch::channel(epoch);
         let guard = authority::EpochGuard {
@@ -561,7 +560,6 @@ mod tests {
             seq,
             head: vec![],
             root: None,
-            provenance: authority::Provenance::Block(0),
         });
     }
 
@@ -1253,7 +1251,6 @@ mod tests {
                     seq: 2,
                     head: vec![],
                     root: None,
-                    provenance: authority::Provenance::Block(0),
                 })
                 .expect("epoch broadcast");
 

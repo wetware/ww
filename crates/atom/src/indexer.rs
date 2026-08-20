@@ -2,8 +2,8 @@
 //!
 //! Subscribes via WebSocket, backfills via HTTP on startup/reconnect, maintains
 //! in-memory cursor and current HEAD. No reorg safety or confirmations in the indexer
-//! itself; use the [crate::Finalizer] with a [crate::Strategy] (e.g. [crate::ConfirmationDepth])
-//! for reorg-safe, confirmation-based output.
+//! itself. The host's Atom Stem adapter derives authoritative state by polling
+//! `Atom.head()` at finalized chain depth.
 
 use crate::abi::{decode_log_to_observed, CurrentHead, HeadUpdatedObserved, HEAD_UPDATED_TOPIC0};
 use crate::config::IndexerConfig;

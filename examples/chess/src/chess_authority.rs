@@ -161,7 +161,7 @@ mod tests {
     use std::time::Duration;
 
     use auth::SigningDomain;
-    use authority::{auth_capnp, EpochGuard, Provenance, TerminalServer};
+    use authority::{auth_capnp, EpochGuard, TerminalServer};
     use capnp::capability::{FromClientHook, Promise};
     use capnp_rpc::rpc_twoparty_capnp::Side;
     use capnp_rpc::twoparty::VatNetwork;
@@ -222,7 +222,6 @@ mod tests {
             seq,
             head: format!("head-{seq}").into_bytes(),
             root: None,
-            provenance: Provenance::Block(seq),
         }
     }
 

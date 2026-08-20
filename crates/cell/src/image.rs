@@ -291,7 +291,7 @@ impl Drop for MfsNamespaceGuard {
 ///
 /// Layers are applied left-to-right. Later layers win on file conflicts.
 /// Directories are merged recursively. Returns the root CID of the merged tree.
-pub(crate) async fn dag_merge(
+pub async fn dag_merge(
     cids: &[String],
     client: &ipfs::BootClient,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
@@ -488,11 +488,32 @@ pub async fn resolve_mounts_virtual_with_cancel(
     ipfs_client: &ipfs::BootClient,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(String, Vec<String>)> {
-    let root_mounts = validate_mounts_virtual(mounts)?;
+    if mounts.is_empty() {
+        bail!("No mounts provided");
+    }
+    let cids = resolve_mount_layers_virtual_with_cancel(mounts, ipfs_client, cancel).await?;
+    let root_cid = dag_merge(&cids, ipfs_client, cancel).await?;
+    tracing::info!(cid = %root_cid, layers = cids.len(), "Virtual DAG merge complete");
 
-    // Resolve all root mounts to CIDs.
+    Ok((root_cid, cids))
+}
+
+/// Resolve configured root layers to immutable CIDs without composing them.
+///
+/// Deployment owns composition because a Stem head, when configured, is the
+/// first layer and can change after boot. An empty layer list is valid only for
+/// callers that supply a Stem head separately.
+pub async fn resolve_mount_layers_virtual_with_cancel(
+    mounts: &[Mount],
+    ipfs_client: &ipfs::BootClient,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<Vec<String>> {
+    if mounts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root_mounts = validate_mounts_virtual(mounts)?;
     let mut cids = Vec::with_capacity(root_mounts.len());
-    for mount in &root_mounts {
+    for mount in root_mounts {
         if ipfs::is_ipfs_path(&mount.source) {
             let ipfs_path = if mount.source.starts_with("/ipns/") {
                 await_or_cancel(cancel, resolve_ipns_to_ipfs(&mount.source, ipfs_client)).await?
@@ -507,11 +528,7 @@ pub async fn resolve_mounts_virtual_with_cancel(
             cids.push(cid);
         }
     }
-
-    let root_cid = dag_merge(&cids, ipfs_client, cancel).await?;
-    tracing::info!(cid = %root_cid, layers = cids.len(), "Virtual DAG merge complete");
-
-    Ok((root_cid, cids))
+    Ok(cids)
 }
 
 async fn resolve_bare_cid(
@@ -569,52 +586,6 @@ async fn resolve_ipns_to_ipfs(ipns_path: &str, ipfs_client: &ipfs::BootClient) -
     } else {
         format!("{}/{}", resolved.trim_end_matches('/'), subpath)
     })
-}
-
-/// Read the current head from an Atom contract via one-shot `eth_call`.
-///
-/// Returns `CurrentHead { seq, cid }` where `cid` is raw binary bytes
-/// from the contract's `head()` view function.
-pub async fn read_contract_head(rpc_url: &str, contract: &[u8; 20]) -> Result<atom::CurrentHead> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .context("Failed to build HTTP client")?;
-
-    let params = serde_json::json!([{
-        "to": format!("0x{}", hex::encode(contract)),
-        "data": format!("0x{}", hex::encode(atom::abi::HEAD_SELECTOR)),
-    }, "latest"]);
-
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_call",
-        "params": params,
-    });
-
-    let resp = client
-        .post(rpc_url)
-        .json(&body)
-        .send()
-        .await
-        .context("eth_call request failed")?;
-
-    let json: serde_json::Value = resp.json().await.context("Failed to parse RPC response")?;
-
-    if let Some(err) = json.get("error") {
-        bail!("RPC error: {err}");
-    }
-
-    let result_str = json
-        .get("result")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing result in RPC response"))?;
-
-    let bytes = hex::decode(result_str.strip_prefix("0x").unwrap_or(result_str))
-        .context("Failed to decode hex from eth_call result")?;
-
-    atom::abi::decode_head_return(&bytes).context("Failed to decode head() return data")
 }
 
 /// Convert raw binary CID bytes to an IPFS path string.

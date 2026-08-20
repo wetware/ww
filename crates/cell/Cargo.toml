@@ -11,10 +11,8 @@ tracing = { workspace = true }
 arc-swap = "1"
 lru = "0.12"
 cid = { workspace = true }
-hex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls", "json"] }
 futures = { workspace = true }
 rand = { workspace = true }
 dirs = { workspace = true }
@@ -25,8 +23,6 @@ wasmtime-wasi-io = "45.0.0"
 tempfile = { workspace = true }
 
 # Workspace crates
-atom = { path = "../atom" }
-stem = { path = "../stem" }
 authority = { package = "wetware-authority", path = "../authority" }
 cache = { package = "ww-cache", path = "../cache" }
 ipfs = { path = "../ipfs" }

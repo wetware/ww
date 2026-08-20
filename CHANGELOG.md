@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Deployment lifecycle now has one host-side owner.** New `ww::stem` and
+  `ww::deployment` modules replace `crates/stem`, `cell::epoch`, and
+  `EpochService`. The Atom Source reads `Atom.head()` at finalized chain depth
+  during both bootstrap and follow mode; `HeadUpdated` events no longer drive
+  correctness. Deployment epochs now start at local epoch zero on every host
+  process and increment independently of Atom's contract sequence.
+  `authority::Epoch` no longer contains backend provenance. Deployment
+  publishes `root: None` before preparation, overlaps root preparation with
+  old-kernel teardown, drains superseding updates, waits for old PID0 to stop,
+  then swaps `CidTree` and publishes the rooted epoch without an intervening
+  await. Static startup uses this same path without a fake Source. Root
+  preparation now produces an owned `PreparedRoot`; deployment owns active,
+  attempt, frozen, and retained pins. The obsolete Atom `Finalizer` is removed,
+  while the observed-event `AtomIndexer` remains available for separate
+  consumers. `capnp/stem.capnp` is unchanged.
 - **Cell construction and kernel launch now use separate policy layers.**
   `cell::Builder` replaces `ProcBuilder` as the canonical construction
   mechanism and exposes explicit ordinary and kernel modes. `kernel::Generation`

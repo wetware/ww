@@ -8,7 +8,6 @@ members = [
     "crates/authority",
     "crates/membrane",
     "crates/rpc",
-    "crates/stem",
     "crates/guest/auth",
     "std/system",
     "examples/chess",
@@ -91,7 +90,8 @@ capnp-rpc = { workspace = true }
 libp2p-stream = { workspace = true }
 authority = { package = "wetware-authority", path = "crates/authority" }
 atom = { path = "crates/atom" }
-stem = { path = "crates/stem" }
+async-trait = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "json"] }
 cache = { package = "ww-cache", path = "crates/cache" }
 cell = { path = "crates/cell" }
 rpc = { path = "crates/rpc" }
@@ -109,13 +109,12 @@ path = "src/cli/main.rs"
 
 [dev-dependencies]
 membrane = { package = "wetware-membrane", path = "crates/membrane" }
-async-trait = { workspace = true }
 wasm-encoder = "0.243"
 wit-component = "0.244"
 wit-parser = "0.244"
 wat = "1"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
-reqwest = { workspace = true, features = ["rustls-tls", "json", "stream", "multipart"] }
+reqwest = { workspace = true, features = ["stream", "multipart"] }
 
 [[bench]]
 name = "arc_cache"

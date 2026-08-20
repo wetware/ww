@@ -569,7 +569,7 @@ mod tests {
     use super::*;
     use crate::PeerInfo;
     use crate::SwarmCommand;
-    use authority::{Epoch, Provenance};
+    use authority::Epoch;
     use capnp_rpc::rpc_twoparty_capnp::Side;
     use capnp_rpc::twoparty::VatNetwork;
     use capnp_rpc::RpcSystem;
@@ -582,7 +582,6 @@ mod tests {
             seq,
             head: vec![],
             root: None,
-            provenance: Provenance::Block(0),
         }
     }
 

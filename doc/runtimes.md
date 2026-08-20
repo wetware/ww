@@ -16,8 +16,8 @@ shared runtimes.
 
 | Subsystem | Thread name | Runtime | Why |
 |---|---|---|---|
+| Deployment coordinator and Stem follower | main `ww` runtime workers | `multi_thread` | Root preparation, source polling, and kernel teardown overlap without a separate service thread |
 | Libp2p swarm | `swarm` (+ `ww-swarm-worker-*`) | `multi_thread` | TLS handshake parallelism — see below |
-| Epoch pipeline | `epoch` | `current_thread` | Single linear consumer of L1 events |
 | Executor pool worker (×N) | `executor-N` | `current_thread` + `LocalSet` | `wasmtime::Store` is `!Send` |
 
 The default is `current_thread`. We pick it because:
@@ -110,11 +110,11 @@ total thread budget is:
 
 - 1 `swarm` OS thread (the supervisor's child)
 - N `ww-swarm-worker-*` workers (tokio default)
-- 1 `epoch`
 - M `executor-*` (also `available_parallelism()`)
 
-On an 8-core Mac this lands around 18 threads under load, which is
-fine — most of them sit parked. If a future profile shows worker
+The main `ww` runtime also uses Tokio's default worker count. Most runtime
+workers remain parked outside concurrent lifecycle or network work. If a
+future profile shows worker
 contention with the executor pool, we tune `with_quic_config` or set
 an explicit `worker_threads(2)` on the swarm runtime.
 

@@ -204,7 +204,7 @@ impl BootClient {
     }
 
     /// Create a bounded client that returns the original typed error after one
-    /// attempt. The epoch pipeline owns retries and classifies that error.
+    /// attempt. Deployment owns retries and classifies that error.
     pub fn one_attempt(client: HttpClient, operation_timeout: Duration) -> Self {
         Self {
             client,
@@ -328,8 +328,8 @@ impl BootClient {
         }
     }
 
-    /// One bounded best-effort operation. Pins are an optimization: callers
-    /// log and continue rather than holding serving readiness behind retries.
+    /// Run one bounded pin attempt and return its typed failure to the caller.
+    /// The caller decides whether the pin gates readiness or is best-effort.
     pub async fn pin_add_once(&self, cid: &str) -> Result<()> {
         match self.bounded_timeout() {
             Some(timeout) => tokio::time::timeout(timeout, self.client.pin_add(cid))

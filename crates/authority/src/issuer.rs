@@ -298,14 +298,13 @@ mod tests {
     use libp2p_core::SignedEnvelope;
 
     use super::*;
-    use crate::{membrane_capnp, membrane_client, Provenance};
+    use crate::{membrane_capnp, membrane_client};
 
     fn epoch(seq: u64) -> Epoch {
         Epoch {
             seq,
             head: format!("head-{seq}").into_bytes(),
             root: None,
-            provenance: Provenance::Block(seq),
         }
     }
 

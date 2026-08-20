@@ -1074,7 +1074,7 @@ mod rust_lifecycle {
             second.block_number > first.block_number,
             "Atom head updates must be mined in order"
         );
-        wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
+        wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
         let replacing = wait_for_not_ready(&client, admin_addr, &mut node).await;
         assert_eq!(replacing["ready"], false);
         assert_eq!(
@@ -1162,12 +1162,13 @@ mod rust_lifecycle {
         wait_for_ready(&client, &ready_url, &mut node).await;
         assert_status_cell(&client, http_addr, &cid_a).await;
 
-        // Finalizer canonicality: update 2 must be observed before update 3 is
-        // mined, or the contract's head would correctly supersede update 2.
+        // Each mined head is polled from finalized-depth chain state. Mine the
+        // intermediate update before the final update to exercise both local
+        // transitions.
         let second = atom.set_head(&epoch2.cid).await;
-        wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
+        wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
         let third = atom.set_head(&epoch3.cid).await;
-        wait_for_log(&mut node, "Advancing epoch", "seq=3").await;
+        wait_for_log(&mut node, "Advancing deployment epoch", "seq=2").await;
         assert!(first.block_number < second.block_number);
         assert!(second.block_number < third.block_number);
 
@@ -1181,9 +1182,9 @@ mod rust_lifecycle {
         );
 
         let logs = node.logs();
-        let seq2 = log_position(&logs, "Advancing epoch", "seq=2");
-        let seq3 = log_position(&logs, "Advancing epoch", "seq=3");
-        assert!(seq2 < seq3, "host advances must be ordered\n{logs}");
+        let seq1 = log_position(&logs, "Advancing deployment epoch", "seq=1");
+        let seq2 = log_position(&logs, "Advancing deployment epoch", "seq=2");
+        assert!(seq1 < seq2, "host advances must be ordered\n{logs}");
         // Convergence contract: the final generation serves. A coherent
         // superseded intermediate generation may transiently activate, so one
         // or two replacements are legitimate outcomes.
@@ -1245,7 +1246,7 @@ mod rust_lifecycle {
         assert_status_cell(&client, http_addr, &cid_a).await;
 
         atom.set_head(&invalid.cid).await;
-        wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
+        wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
         let unready = wait_for_not_ready(&client, admin_addr, &mut node).await;
         assert_eq!(unready["ready"], false);
         let (exit, samples) = wait_for_exit_without_readiness(&client, admin_addr, &mut node).await;
@@ -1549,7 +1550,7 @@ async fn host_transient_epoch_preparation_recovers_without_restoring_old_generat
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert_status_cell(&client, http_addr, &cid_a).await;
             atom.set_head(&epoch2.cid).await;
-            wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
+            wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
             let deadline = Instant::now() + INVALIDATION_TIMEOUT;
             while attempts.load(Ordering::SeqCst) < 2 {
                 assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node)
@@ -1568,7 +1569,7 @@ async fn host_transient_epoch_preparation_recovers_without_restoring_old_generat
             assert_status_cell(&client, http_addr, &cid_b).await;
             let logs = node.logs();
             assert!(
-                count_log_lines(&logs, "Transient epoch preparation failure") >= 2,
+                count_log_lines(&logs, "Transient deployment preparation failure") >= 2,
                 "retry logs missing\n{logs}"
             );
             assert!(
@@ -1613,7 +1614,7 @@ async fn host_epoch_preparation_supersession_activates_only_latest_target() {
             assert_status_cell(&client, http_addr, &cid_a).await;
 
             atom.set_head(&epoch2.cid).await;
-            wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
+            wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
             let retry_deadline = Instant::now() + INVALIDATION_TIMEOUT;
             while attempts.load(Ordering::SeqCst) < 2 {
                 assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node)
@@ -1623,13 +1624,13 @@ async fn host_epoch_preparation_supersession_activates_only_latest_target() {
             }
 
             atom.set_head(&epoch3.cid).await;
-            wait_for_log(&mut node, "Advancing epoch", "seq=3").await;
+            wait_for_log(&mut node, "Advancing deployment epoch", "seq=2").await;
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert_status_cell(&client, http_addr, &cid_c).await;
             wait_for_pin_release(&client, kubo_addr, &epoch2.cid).await;
             let logs = node.logs();
             assert_eq!(
-                count_log_lines_with(&logs, "Effective epoch root is ready", "seq=2"),
+                count_log_lines_with(&logs, "Deployment root activated", "seq=1"),
                 0,
                 "superseded epoch activated\n{logs}"
             );
@@ -1689,7 +1690,7 @@ async fn superseded_pending_generation_converges_to_the_newer_epoch() {
             wait_for_ready(&client, &ready_url, &mut node).await;
 
             atom.set_head(&pending.cid).await;
-            wait_for_log(&mut node, "Advancing epoch", "seq=2").await;
+            wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
             tokio::time::timeout(INVALIDATION_TIMEOUT, reached_rx.recv())
                 .await
                 .expect("pending generation did not reach its sentinel")
@@ -1708,7 +1709,7 @@ async fn superseded_pending_generation_converges_to_the_newer_epoch() {
                 .await
                 .expect("read host epoch marker");
             assert_eq!(marker, *b"E");
-            wait_for_log(&mut node, "Advancing epoch", "seq=3").await;
+            wait_for_log(&mut node, "Advancing deployment epoch", "seq=2").await;
             release_tx
                 .send(true)
                 .expect("release pending generation sentinel");

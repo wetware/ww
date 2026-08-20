@@ -14,8 +14,8 @@
       "title": "The `ww` command",
       "subtitle": "Starts and controls a Wetware node.",
       "files": ["src/cli/main.rs"],
-      "what": "The CLI parses `ww run`, `ww shell`, `ww perform`, namespace, and daemon commands. `ww run` selects image sources, starts the host services, and starts trusted pid0 from `boot/main.wasm`.",
-      "built": "The binary lives at `src/cli/main.rs`. It combines `clap` command parsing with image loaders and the host runtime. The CLI keeps terminal behavior separate from non-interactive daemon behavior."
+      "what": "The CLI parses `ww run`, `ww shell`, `ww perform`, namespace, and daemon commands. `ww run` selects configured root layers, starts host services, and applies process and operator policy to deployment outcomes.",
+      "built": "The binary lives at `src/cli/main.rs`. It combines `clap` command parsing with image loaders and the host runtime. Deployment owns generation transitions; the CLI retains terminal behavior and process exit policy."
     },
     {
       "key": "loader",
@@ -46,24 +46,24 @@
       "title": "Host supervisor",
       "subtitle": "Owns the node service threads.",
       "files": ["src/services.rs", "src/host.rs"],
-      "what": "The `Host` supervisor starts and stops the swarm, epoch pipeline, WAGI service, and executor pool. Each subsystem owns a Tokio runtime on a dedicated OS thread.",
+      "what": "The `Host` supervisor starts and stops the swarm, WAGI service, compiler, admin service, and executor pool. Long-running services own dedicated threads; deployment coordination runs in the main host runtime.",
       "built": "`src/services.rs` defines `Service` and `Host`. `src/host.rs` owns libp2p behavior and swarm events. The executor pool uses local runtimes because Wasmtime stores are not `Send`."
     },
     {
       "key": "epoch",
-      "id": "E",
-      "label": "EPOCH",
+      "id": "D",
+      "label": "DEPLOY",
       "x": 730,
       "y": 238,
       "w": 122,
       "h": 62,
       "z": 40,
       "group": "THE HOST",
-      "title": "Epoch lifecycle",
-      "subtitle": "Binds authority to one deployment generation.",
-      "files": ["crates/authority/src/epoch.rs"],
-      "what": "An epoch advances when the authority head changes. The host stops the old pid0, prepares a rooted image, then starts the next pid0 only for the current epoch.",
-      "built": "`crates/authority` provides `Epoch`, `EpochGuard`, and the readiness gate. Stale host-issued references fail after an epoch change. The host only retries classified transient preparation failures."
+      "title": "Deployment lifecycle",
+      "subtitle": "Turns optional Stem state into one rooted kernel generation.",
+      "files": ["src/stem/mod.rs", "src/stem/atom.rs", "src/deployment/mod.rs", "crates/authority/src/epoch.rs"],
+      "what": "Deployment allocates host-local epochs, revokes old authority, prepares and pins an effective root, waits for old pid0 teardown, activates `CidTree`, and launches one new kernel generation.",
+      "built": "`src/stem` defines the backend-neutral Source contract and Atom finalized-depth adapter. `src/deployment` owns retry, supersession, pin ownership, activation, and generation coordination. `crates/authority` enforces the resulting local epoch."
     },
     {
       "key": "kernel",

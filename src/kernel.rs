@@ -290,6 +290,7 @@ pub fn runtime_cid(bytes: &[u8]) -> Cid {
 }
 
 /// Prepared filesystem root for one kernel generation.
+#[derive(Clone)]
 pub struct Root {
     path: String,
     tree: Arc<cell::vfs::CidTree>,
@@ -311,6 +312,7 @@ pub enum Stdio {
 }
 
 /// Privileged Membrane bootstrap dependencies for one kernel generation.
+#[derive(Clone)]
 pub struct Bootstrap {
     network_state: rpc::NetworkState,
     swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
@@ -351,6 +353,7 @@ impl Bootstrap {
 }
 
 /// Runtime construction inputs shared by the kernel and its child Executors.
+#[derive(Clone)]
 pub struct RuntimeInputs {
     wasm_debug: bool,
     engine: Arc<wasmtime::Engine>,

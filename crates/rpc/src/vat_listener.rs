@@ -333,7 +333,7 @@ pub async fn handle_vat_connection_serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use authority::{Epoch, Provenance};
+    use authority::Epoch;
     use tokio::sync::{oneshot, watch};
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
@@ -346,7 +346,6 @@ mod tests {
                     seq: 1,
                     head: vec![1],
                     root: None,
-                    provenance: Provenance::Block(1),
                 });
                 let bootstrap = authority::membrane_client(epoch_rx);
                 let (server_stream, peer_stream) = tokio::io::duplex(64);

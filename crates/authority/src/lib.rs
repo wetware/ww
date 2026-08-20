@@ -124,7 +124,7 @@ pub mod membrane;
 pub mod terminal;
 
 pub use call_guard::{call_failure_code, stale_epoch_error, CallFailureCode};
-pub use epoch::{Epoch, EpochGuard, Provenance};
+pub use epoch::{Epoch, EpochGuard};
 pub use issuer::{AuthorityServer, KeyMethodAuthorization, PolicyCompileError};
 pub use kernel_ready::{KernelReadyError, KernelReadyGate};
 pub use membrane::{get_graft_cap, membrane_client, GraftBuilder, MembraneServer, NoExtension};

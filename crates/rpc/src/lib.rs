@@ -790,7 +790,6 @@ mod tests {
                     seq: 2,
                     head: Vec::new(),
                     root: None,
-                    provenance: authority::Provenance::Block(2),
                 });
                 assert!(
                     host.id_request().send().promise.await.is_err(),
@@ -1452,7 +1451,6 @@ mod tests {
             seq,
             head: vec![],
             root: None,
-            provenance: authority::Provenance::Block(0),
         };
         let (tx, rx) = tokio::sync::watch::channel(epoch);
         let guard = EpochGuard {
@@ -1550,7 +1548,6 @@ mod tests {
                     seq: 2,
                     head: vec![],
                     root: None,
-                    provenance: authority::Provenance::Block(0),
                 })
                 .unwrap();
 
@@ -1580,7 +1577,6 @@ mod tests {
                     seq: 2,
                     head: vec![],
                     root: None,
-                    provenance: authority::Provenance::Block(0),
                 })
                 .unwrap();
 
