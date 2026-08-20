@@ -29,6 +29,7 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 const RETRY_JITTER_MAX: Duration = Duration::from_millis(500);
 const SOURCE_QUEUE_CAPACITY: usize = 16;
 const KERNEL_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const SPECULATIVE_RETENTION: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureClass {
@@ -126,10 +127,9 @@ impl PinSet {
     }
 }
 
-/// A fully prepared but not necessarily active deployment root.
+/// Immutable deployment content with pin ownership but no authority or epoch binding.
 #[derive(Debug)]
 pub struct PreparedRoot {
-    epoch: u64,
     head: Option<Head>,
     effective: String,
     pins: PinSet,
@@ -146,23 +146,29 @@ impl PreparedRoot {
 }
 
 async fn prepare_root(
-    epoch: u64,
     head: Option<Head>,
     frozen_layers: &[String],
     ipfs_client: &crate::ipfs::HttpClient,
     cid_tree: Option<&Arc<CidTree>>,
     pins: &mut PinSet,
+    cancel: &mut watch::Receiver<bool>,
 ) -> Result<PreparedRoot> {
+    if *cancel.borrow() {
+        anyhow::bail!("deployment preparation cancelled");
+    }
     let mut layers = Vec::with_capacity(frozen_layers.len() + usize::from(head.is_some()));
     if let Some(head) = &head {
         let cid = head.cid.to_string();
         if !pins.contains(&cid) {
             bounded("head pin", ipfs_client.pin_add(&cid))
                 .await
-                .context("pinning authoritative deployment head")?;
+                .context("pinning deployment head")?;
             pins.insert(cid.clone());
         }
         layers.push(cid);
+    }
+    if *cancel.borrow() {
+        anyhow::bail!("deployment preparation cancelled");
     }
     layers.extend_from_slice(frozen_layers);
     if layers.is_empty() {
@@ -173,14 +179,17 @@ async fn prepare_root(
     }
 
     let boot_client = crate::ipfs::BootClient::one_attempt(ipfs_client.clone(), OPERATION_TIMEOUT);
-    let (_cancel_tx, mut cancel_rx) = watch::channel(false);
     let effective = bounded(
         "effective-root merge",
-        dag_merge(&layers, &boot_client, &mut cancel_rx),
+        dag_merge(&layers, &boot_client, cancel),
     )
     .await
     .context("composing effective deployment root")?;
     pins.insert(effective.clone());
+
+    if *cancel.borrow() {
+        anyhow::bail!("deployment preparation cancelled");
+    }
 
     if let Some(tree) = cid_tree {
         bounded("effective-root prewarm", tree.pre_warm(&effective))
@@ -188,11 +197,63 @@ async fn prepare_root(
             .context("pre-warming effective deployment root")?;
     }
     Ok(PreparedRoot {
-        epoch,
         head,
         effective,
         pins: std::mem::take(pins),
     })
+}
+
+struct PreparationOutput {
+    result: Result<PreparedRoot>,
+    pins: PinSet,
+}
+
+async fn prepare_root_owned(
+    head: Head,
+    frozen_layers: Vec<String>,
+    ipfs_client: crate::ipfs::HttpClient,
+    cid_tree: Arc<CidTree>,
+    mut pins: PinSet,
+    mut cancel: watch::Receiver<bool>,
+) -> PreparationOutput {
+    let result = prepare_root(
+        Some(head),
+        &frozen_layers,
+        &ipfs_client,
+        Some(&cid_tree),
+        &mut pins,
+        &mut cancel,
+    )
+    .await;
+    PreparationOutput { result, pins }
+}
+
+#[derive(Clone)]
+struct Candidate {
+    head: Head,
+    expires_at: tokio::time::Instant,
+}
+
+struct SpeculativeTask {
+    candidate: Candidate,
+    cancel: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<PreparationOutput>,
+}
+
+enum Speculation {
+    InFlight(SpeculativeTask),
+    Ready {
+        prepared: PreparedRoot,
+        expires_at: tokio::time::Instant,
+    },
+    Stopping {
+        task: SpeculativeTask,
+        next: Option<Candidate>,
+    },
+    Releasing {
+        task: tokio::task::JoinHandle<PinSet>,
+        next: Option<Candidate>,
+    },
 }
 
 enum SourceMessage {
@@ -243,9 +304,26 @@ async fn current_with_retry(source: &mut dyn Source) -> Update {
     }
 }
 
+async fn next_source_update(source_rx: &mut mpsc::Receiver<SourceMessage>) -> Result<Update> {
+    loop {
+        match source_rx
+            .recv()
+            .await
+            .context("Stem source follower stopped")?
+        {
+            SourceMessage::Update(update) => return Ok(update),
+            SourceMessage::Error(error) => {
+                warn!("Stem source unavailable; deployment authority unchanged: {error:#}");
+            }
+        }
+    }
+}
+
 /// Inputs used to establish deployment epoch zero.
 pub struct Config {
     pub source: Option<Box<dyn Source>>,
+    /// Latest observed Atom `HeadUpdated` CID bytes. These values are advisory only.
+    pub candidates: Option<watch::Receiver<Option<Vec<u8>>>>,
     pub frozen_layers: Vec<String>,
     pub ipfs_client: crate::ipfs::HttpClient,
     pub staging_dir: PathBuf,
@@ -398,6 +476,9 @@ pub struct Deployment {
     cid_tree: Arc<CidTree>,
     source_rx: Option<mpsc::Receiver<SourceMessage>>,
     source_task: Option<tokio::task::JoinHandle<()>>,
+    candidate_rx: Option<watch::Receiver<Option<Vec<u8>>>>,
+    candidate_initialized: bool,
+    speculation: Option<Speculation>,
 }
 
 impl Deployment {
@@ -461,6 +542,7 @@ impl Deployment {
             staging_dir: config.staging_dir,
             source_rx,
             source_task,
+            candidate_rx: config.candidates,
         };
         state.prepare().await
     }
@@ -473,51 +555,356 @@ impl Deployment {
         self.epoch_rx.borrow().clone()
     }
 
+    fn candidate_is_active(&self, candidate: &Candidate) -> bool {
+        let epoch = self.epoch_rx.borrow();
+        epoch.root.is_some() && epoch.head == candidate.head.bytes()
+    }
+
+    fn start_speculation(&mut self, candidate: Candidate) {
+        if candidate.expires_at <= tokio::time::Instant::now()
+            || self.candidate_is_active(&candidate)
+        {
+            return;
+        }
+        let (cancel, cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(prepare_root_owned(
+            candidate.head.clone(),
+            self.frozen_layers.clone(),
+            self.ipfs_client.clone(),
+            self.cid_tree.clone(),
+            PinSet::default(),
+            cancel_rx,
+        ));
+        self.speculation = Some(Speculation::InFlight(SpeculativeTask {
+            candidate,
+            cancel,
+            task,
+        }));
+    }
+
+    fn start_speculative_release(&mut self, pins: PinSet, next: Option<Candidate>) {
+        if pins.is_empty() {
+            self.speculation = None;
+            if let Some(next) = next {
+                self.start_speculation(next);
+            }
+            return;
+        }
+        let mut protected = self.protected_cids(None);
+        protected.extend(
+            self.retained_pins
+                .iter()
+                .flat_map(|pins| pins.cids.iter().cloned()),
+        );
+        let ipfs_client = self.ipfs_client.clone();
+        let task = tokio::spawn(async move {
+            let mut pins = pins;
+            release_pin_set(&mut pins, &ipfs_client, &protected, &mut HashSet::new()).await;
+            pins
+        });
+        self.speculation = Some(Speculation::Releasing { task, next });
+    }
+
+    fn set_speculative_candidate(&mut self, candidate: Option<Candidate>) {
+        let state = self.speculation.take();
+        self.speculation = match state {
+            None => {
+                if let Some(candidate) = candidate {
+                    self.start_speculation(candidate);
+                }
+                return;
+            }
+            Some(Speculation::InFlight(mut task)) => {
+                if candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.head == task.candidate.head)
+                {
+                    task.candidate.expires_at = candidate.expect("candidate is present").expires_at;
+                    Some(Speculation::InFlight(task))
+                } else {
+                    let _ = task.cancel.send(true);
+                    Some(Speculation::Stopping {
+                        task,
+                        next: candidate,
+                    })
+                }
+            }
+            Some(Speculation::Ready {
+                prepared,
+                expires_at: _,
+            }) => {
+                if candidate
+                    .as_ref()
+                    .is_some_and(|candidate| prepared.head.as_ref() == Some(&candidate.head))
+                {
+                    Some(Speculation::Ready {
+                        prepared,
+                        expires_at: candidate.expect("candidate is present").expires_at,
+                    })
+                } else {
+                    let pins = prepared.pins;
+                    self.start_speculative_release(pins, candidate);
+                    return;
+                }
+            }
+            Some(Speculation::Stopping { task, next: _ }) => Some(Speculation::Stopping {
+                task,
+                next: candidate,
+            }),
+            Some(Speculation::Releasing { task, next: _ }) => Some(Speculation::Releasing {
+                task,
+                next: candidate,
+            }),
+        };
+    }
+
+    fn observe_candidate(&mut self, bytes: Option<Vec<u8>>) {
+        let candidate = bytes.and_then(|bytes| match cid::Cid::read_bytes(bytes.as_slice()) {
+            Ok(cid) => Some(Candidate {
+                head: Head { cid },
+                expires_at: tokio::time::Instant::now() + SPECULATIVE_RETENTION,
+            }),
+            Err(error) => {
+                tracing::debug!(%error, "Ignoring malformed advisory Atom head");
+                None
+            }
+        });
+        let candidate = candidate.filter(|candidate| !self.candidate_is_active(candidate));
+        self.set_speculative_candidate(candidate);
+    }
+
+    fn finish_speculative_preparation(
+        &mut self,
+        candidate: Candidate,
+        output: PreparationOutput,
+        keep: bool,
+        next: Option<Candidate>,
+    ) {
+        if !keep {
+            let pins = match output.result {
+                Ok(prepared) => prepared.pins,
+                Err(error) => {
+                    tracing::debug!(%error, "Discarded obsolete speculative preparation");
+                    output.pins
+                }
+            };
+            self.start_speculative_release(pins, next);
+            return;
+        }
+
+        match output.result {
+            Ok(prepared) if candidate.expires_at > tokio::time::Instant::now() => {
+                self.speculation = Some(Speculation::Ready {
+                    prepared,
+                    expires_at: candidate.expires_at,
+                });
+            }
+            Ok(prepared) => self.start_speculative_release(prepared.pins, None),
+            Err(error) => {
+                if classify_failure(&error) == FailureClass::Transient {
+                    warn!(%error, "Transient deployment preparation failure during speculation; candidate abandoned");
+                } else {
+                    tracing::debug!(%error, "Speculative deployment preparation failed");
+                }
+                self.start_speculative_release(output.pins, None);
+            }
+        }
+    }
+
+    fn finish_speculative_release(&mut self, pins: PinSet, next: Option<Candidate>) {
+        if !pins.is_empty() {
+            self.retained_pins.push(pins);
+        }
+        self.speculation = None;
+        if let Some(next) = next {
+            self.start_speculation(next);
+        }
+    }
+
     /// Launch and supervise the current rooted deployment generation.
     pub async fn run_generation(&mut self, launcher: &KernelLauncher<'_>) -> Result<Outcome> {
         let epoch = self.current_epoch();
-        let running = launcher.launch(epoch, self.epoch_rx.clone(), self.cid_tree.clone())?;
-        self.await_generation(running).await
+        let running = match launcher.launch(epoch, self.epoch_rx.clone(), self.cid_tree.clone()) {
+            Ok(running) => running,
+            Err(error) => {
+                self.shutdown_speculation().await;
+                return Err(error);
+            }
+        };
+        let outcome = self.await_generation(running).await;
+        if outcome.is_err() {
+            self.shutdown_speculation().await;
+        }
+        outcome
+    }
+
+    /// Stop advisory work and release every speculative pin before host shutdown.
+    pub async fn shutdown(&mut self) {
+        self.candidate_rx = None;
+        self.shutdown_speculation().await;
+        self.release_retained().await;
+        if let Some(task) = self.source_task.take() {
+            task.abort();
+        }
+    }
+
+    async fn shutdown_speculation(&mut self) {
+        let Some(state) = self.speculation.take() else {
+            return;
+        };
+        match state {
+            Speculation::InFlight(task) | Speculation::Stopping { task, .. } => {
+                let _ = task.cancel.send(true);
+                match task.task.await {
+                    Ok(output) => {
+                        let mut pins = match output.result {
+                            Ok(prepared) => prepared.pins,
+                            Err(error) => {
+                                tracing::debug!(%error, "Speculative preparation stopped during shutdown");
+                                output.pins
+                            }
+                        };
+                        self.release_attempt(&mut pins).await;
+                    }
+                    Err(error) => {
+                        warn!(%error, "Speculative preparation task failed during shutdown")
+                    }
+                }
+            }
+            Speculation::Ready { prepared, .. } => {
+                self.release_attempt(&mut { prepared.pins }).await;
+            }
+            Speculation::Releasing { task, .. } => match task.await {
+                Ok(pins) if !pins.is_empty() => self.retained_pins.push(pins),
+                Ok(_) => {}
+                Err(error) => warn!(%error, "Speculative pin release task failed during shutdown"),
+            },
+        }
     }
 
     async fn await_generation(&mut self, mut running: RunningGeneration) -> Result<Outcome> {
         loop {
-            let message = match self.source_rx.as_mut() {
-                Some(source_rx) => {
-                    tokio::select! {
-                        biased;
-                        message = source_rx.recv() => Some(message.context("Stem source follower stopped")?),
-                        result = &mut running.result_rx => {
-                            let updates = self.drain_source_updates()?;
-                            if !updates.is_empty() {
-                                return self.replace(running, updates, Some(result)).await;
+            if !self.candidate_initialized {
+                let candidate = self
+                    .candidate_rx
+                    .as_mut()
+                    .map(|receiver| receiver.borrow_and_update().clone());
+                if let Some(candidate) = candidate {
+                    self.observe_candidate(candidate);
+                }
+                self.candidate_initialized = true;
+            }
+
+            enum LiveEvent {
+                Source(Option<SourceMessage>),
+                Kernel(Result<Result<kernel::Outcome>, oneshot::error::RecvError>),
+                Candidate(Result<(), watch::error::RecvError>),
+                Prepared(Result<PreparationOutput, tokio::task::JoinError>),
+                Released(Result<PinSet, tokio::task::JoinError>),
+                Expired,
+            }
+
+            let source_rx = self.source_rx.as_mut();
+            let candidate_rx = self.candidate_rx.as_mut();
+            let (preparation_task, release_task, expires_at) = match self.speculation.as_mut() {
+                Some(Speculation::InFlight(task)) => {
+                    (Some(&mut task.task), None, Some(task.candidate.expires_at))
+                }
+                Some(Speculation::Stopping { task, .. }) => (Some(&mut task.task), None, None),
+                Some(Speculation::Ready { expires_at, .. }) => (None, None, Some(*expires_at)),
+                Some(Speculation::Releasing { task, .. }) => (None, Some(task), None),
+                None => (None, None, None),
+            };
+            let event = tokio::select! {
+                biased;
+                message = async { source_rx.expect("source receiver is present").recv().await }, if source_rx.is_some() => LiveEvent::Source(message),
+                result = &mut running.result_rx => LiveEvent::Kernel(result),
+                result = async { preparation_task.expect("preparation task is present").await }, if preparation_task.is_some() => LiveEvent::Prepared(result),
+                result = async { release_task.expect("release task is present").await }, if release_task.is_some() => LiveEvent::Released(result),
+                changed = async { candidate_rx.expect("candidate receiver is present").changed().await }, if candidate_rx.is_some() => LiveEvent::Candidate(changed),
+                _ = async { tokio::time::sleep_until(expires_at.expect("expiry is present")).await }, if expires_at.is_some() => LiveEvent::Expired,
+            };
+
+            match event {
+                LiveEvent::Source(Some(SourceMessage::Update(update))) => {
+                    return self.replace(running, vec![update], None).await;
+                }
+                LiveEvent::Source(Some(SourceMessage::Error(error))) => {
+                    warn!("Stem source unavailable; current deployment remains authoritative: {error:#}");
+                }
+                LiveEvent::Source(None) => anyhow::bail!("Stem source follower stopped"),
+                LiveEvent::Kernel(result) => {
+                    let updates = self.drain_source_updates()?;
+                    if !updates.is_empty() {
+                        return self.replace(running, updates, Some(result)).await;
+                    }
+                    self.shutdown_speculation().await;
+                    return Ok(Outcome::Authoritative {
+                        epoch: running.intended_seq,
+                        result: result.context("kernel result channel dropped")?,
+                    });
+                }
+                LiveEvent::Candidate(Ok(())) => {
+                    let candidate = self
+                        .candidate_rx
+                        .as_mut()
+                        .expect("candidate receiver is present")
+                        .borrow_and_update()
+                        .clone();
+                    self.observe_candidate(candidate);
+                }
+                LiveEvent::Candidate(Err(_)) => {
+                    tracing::debug!("Atom advisory candidate feed stopped; disabling speculation");
+                    self.candidate_rx = None;
+                    self.set_speculative_candidate(None);
+                }
+                LiveEvent::Prepared(result) => {
+                    let state = self
+                        .speculation
+                        .take()
+                        .expect("preparation state is present");
+                    let (candidate, keep, next) = match state {
+                        Speculation::InFlight(task) => (task.candidate, true, None),
+                        Speculation::Stopping { task, next } => (task.candidate, false, next),
+                        Speculation::Ready { .. } | Speculation::Releasing { .. } => {
+                            unreachable!("preparation event without a preparation task")
+                        }
+                    };
+                    match result {
+                        Ok(output) => {
+                            self.finish_speculative_preparation(candidate, output, keep, next)
+                        }
+                        Err(error) => {
+                            warn!(%error, "Speculative preparation task failed");
+                            self.speculation = None;
+                            if let Some(next) = next {
+                                self.start_speculation(next);
                             }
-                            return Ok(Outcome::Authoritative {
-                                epoch: running.intended_seq,
-                                result: result.context("kernel result channel dropped")?,
-                            });
                         }
                     }
                 }
-                None => {
-                    let result = running
-                        .result_rx
-                        .await
-                        .context("kernel result channel dropped")?;
-                    return Ok(Outcome::Authoritative {
-                        epoch: running.intended_seq,
-                        result,
-                    });
+                LiveEvent::Released(result) => {
+                    let state = self.speculation.take().expect("release state is present");
+                    let next = match state {
+                        Speculation::Releasing { next, .. } => next,
+                        Speculation::InFlight(_)
+                        | Speculation::Ready { .. }
+                        | Speculation::Stopping { .. } => {
+                            unreachable!("release event without a release task")
+                        }
+                    };
+                    match result {
+                        Ok(pins) => self.finish_speculative_release(pins, next),
+                        Err(error) => {
+                            warn!(%error, "Speculative pin release task failed");
+                            self.speculation = None;
+                            if let Some(next) = next {
+                                self.start_speculation(next);
+                            }
+                        }
+                    }
                 }
-            };
-            match message {
-                Some(SourceMessage::Update(update)) => {
-                    return self.replace(running, vec![update], None).await;
-                }
-                Some(SourceMessage::Error(error)) => {
-                    warn!("Stem source unavailable; current deployment remains authoritative: {error:#}");
-                }
-                None => unreachable!(),
+                LiveEvent::Expired => self.set_speculative_candidate(None),
             }
         }
     }
@@ -564,18 +951,7 @@ impl Deployment {
             .source_rx
             .as_mut()
             .context("dynamic deployment lost its Stem source")?;
-        loop {
-            match source_rx
-                .recv()
-                .await
-                .context("Stem source follower stopped")?
-            {
-                SourceMessage::Update(update) => return Ok(update),
-                SourceMessage::Error(error) => {
-                    warn!("Stem source unavailable; deployment authority unchanged: {error:#}");
-                }
-            }
-        }
+        next_source_update(source_rx).await
     }
 
     async fn replace(
@@ -603,8 +979,160 @@ impl Deployment {
         let mut attempt = PinSet::default();
         let mut attempt_head: Option<cid::Cid> = None;
         let mut retry = RETRY_BASE_DELAY;
+        match self.speculation.as_mut() {
+            Some(Speculation::Stopping { task, next }) => {
+                let _ = task.cancel.send(true);
+                *next = None;
+            }
+            Some(Speculation::Releasing { next, .. }) => *next = None,
+            Some(Speculation::InFlight(_) | Speculation::Ready { .. }) | None => {}
+        }
 
         'target: loop {
+            while matches!(self.speculation, Some(Speculation::Releasing { .. })) {
+                enum ReleaseEvent {
+                    Stopped,
+                    TimedOut,
+                    Update(Result<Update>),
+                    Released(Result<PinSet, tokio::task::JoinError>),
+                }
+                let source_rx = self
+                    .source_rx
+                    .as_mut()
+                    .context("dynamic deployment lost its Stem source")?;
+                let release = match self.speculation.as_mut() {
+                    Some(Speculation::Releasing { task, .. }) => task,
+                    _ => unreachable!("release event without a release task"),
+                };
+                let event = tokio::select! {
+                    biased;
+                    result = &mut running.result_rx, if stopped.is_none() => {
+                        let _ = result;
+                        ReleaseEvent::Stopped
+                    }
+                    _ = &mut teardown_timer, if stopped.is_none() => ReleaseEvent::TimedOut,
+                    update = next_source_update(source_rx) => ReleaseEvent::Update(update),
+                    result = release => ReleaseEvent::Released(result),
+                };
+                match event {
+                    ReleaseEvent::Stopped => stopped = Some(GenerationStopped(())),
+                    ReleaseEvent::Update(update) => target = self.accept_update(update?)?,
+                    ReleaseEvent::Released(result) => {
+                        let state = self.speculation.take();
+                        debug_assert!(matches!(state, Some(Speculation::Releasing { .. })));
+                        match result {
+                            Ok(pins) if !pins.is_empty() => self.retained_pins.push(pins),
+                            Ok(_) => {}
+                            Err(error) => {
+                                warn!(%error, "Speculative pin release task failed during authoritative transition")
+                            }
+                        }
+                    }
+                    ReleaseEvent::TimedOut => {
+                        self.shutdown_speculation().await;
+                        return Ok(Outcome::TeardownTimedOut {
+                            epoch: old_epoch,
+                            timeout: KERNEL_TEARDOWN_TIMEOUT,
+                        });
+                    }
+                }
+            }
+
+            let target_matches_speculative_task =
+                self.speculation
+                    .as_ref()
+                    .is_some_and(|speculation| match speculation {
+                        Speculation::InFlight(task) => target
+                            .head()
+                            .is_some_and(|head| head == &task.candidate.head),
+                        Speculation::Ready { .. }
+                        | Speculation::Stopping { .. }
+                        | Speculation::Releasing { .. } => false,
+                    });
+            if matches!(self.speculation, Some(Speculation::InFlight(_)))
+                && !target_matches_speculative_task
+            {
+                let state = self.speculation.take();
+                let Some(Speculation::InFlight(task)) = state else {
+                    unreachable!("in-flight speculation state changed synchronously")
+                };
+                let _ = task.cancel.send(true);
+                self.speculation = Some(Speculation::Stopping { task, next: None });
+            }
+            if matches!(self.speculation, Some(Speculation::Stopping { .. })) {
+                enum StopEvent {
+                    Stopped,
+                    TimedOut,
+                    Update(Result<Update>),
+                    Prepared(Result<PreparationOutput, tokio::task::JoinError>),
+                }
+                let source_rx = self
+                    .source_rx
+                    .as_mut()
+                    .context("dynamic deployment lost its Stem source")?;
+                let preparation = match self.speculation.as_mut() {
+                    Some(Speculation::Stopping { task, .. }) => &mut task.task,
+                    _ => unreachable!("preparation event without a stopping task"),
+                };
+                let event = tokio::select! {
+                    biased;
+                    result = &mut running.result_rx, if stopped.is_none() => {
+                        let _ = result;
+                        StopEvent::Stopped
+                    }
+                    _ = &mut teardown_timer, if stopped.is_none() => StopEvent::TimedOut,
+                    update = next_source_update(source_rx) => StopEvent::Update(update),
+                    result = preparation => StopEvent::Prepared(result),
+                };
+                match event {
+                    StopEvent::Stopped => stopped = Some(GenerationStopped(())),
+                    StopEvent::Update(update) => {
+                        target = self.accept_update(update?)?;
+                    }
+                    StopEvent::Prepared(result) => {
+                        let state = self.speculation.take();
+                        debug_assert!(matches!(state, Some(Speculation::Stopping { .. })));
+                        match result {
+                            Ok(output) => {
+                                let mut pins = match output.result {
+                                    Ok(prepared) => prepared.pins,
+                                    Err(error) => {
+                                        tracing::debug!(%error, "Discarded mismatched speculative preparation");
+                                        output.pins
+                                    }
+                                };
+                                self.release_attempt(&mut pins).await;
+                            }
+                            Err(error) => {
+                                warn!(%error, "Speculative preparation task failed during authoritative transition")
+                            }
+                        }
+                    }
+                    StopEvent::TimedOut => {
+                        self.shutdown_speculation().await;
+                        return Ok(Outcome::TeardownTimedOut {
+                            epoch: old_epoch,
+                            timeout: KERNEL_TEARDOWN_TIMEOUT,
+                        });
+                    }
+                }
+                continue 'target;
+            }
+
+            if let Some(Speculation::Ready { prepared, .. }) = self.speculation.as_ref() {
+                if prepared.head.as_ref() != target.head() {
+                    let state = self.speculation.take();
+                    let Some(Speculation::Ready { prepared, .. }) = state else {
+                        unreachable!("ready speculation state changed synchronously")
+                    };
+                    let mut pins = prepared.pins;
+                    self.release_attempt(&mut pins).await;
+                }
+            }
+
+            // `frozen_layers` never changes after bootstrap, so the head CID is
+            // the only variable preparation input within one `Deployment`.
+
             if let Target::Invalid(invalid) = &target {
                 warn!(
                     seq = self.epoch_seq,
@@ -636,6 +1164,7 @@ impl Deployment {
             }
 
             let head = target.head().cloned();
+            let accepted_epoch = self.epoch_seq;
             if attempt_head.as_ref() != head.as_ref().map(|head| &head.cid) {
                 self.release_attempt(&mut attempt).await;
                 attempt_head = head.as_ref().map(|head| head.cid);
@@ -643,20 +1172,83 @@ impl Deployment {
 
             enum PreparationStep {
                 Prepared(Result<PreparedRoot>),
+                SpeculativeFailed { error: anyhow::Error, pins: PinSet },
                 Update(Update),
                 TimedOut,
             }
             let frozen_layers = self.frozen_layers.clone();
             let ipfs_client = self.ipfs_client.clone();
             let cid_tree = self.cid_tree.clone();
-            let step = {
+            let step = if matches!(
+                self.speculation.as_ref(),
+                Some(Speculation::Ready { prepared, .. })
+                    if prepared.head.as_ref() == target.head()
+            ) {
+                let state = self.speculation.take();
+                let Some(Speculation::Ready { prepared, .. }) = state else {
+                    unreachable!("ready speculation state changed synchronously")
+                };
+                PreparationStep::Prepared(Ok(prepared))
+            } else if target_matches_speculative_task {
+                let result = loop {
+                    let source_rx = self
+                        .source_rx
+                        .as_mut()
+                        .context("dynamic deployment lost its Stem source")?;
+                    let preparation = match self.speculation.as_mut() {
+                        Some(Speculation::InFlight(task)) => &mut task.task,
+                        _ => unreachable!("promotion event without an in-flight task"),
+                    };
+                    tokio::select! {
+                        biased;
+                        result = &mut running.result_rx, if stopped.is_none() => {
+                            let _ = result;
+                            stopped = Some(GenerationStopped(()));
+                        }
+                        _ = &mut teardown_timer, if stopped.is_none() => {
+                            break None;
+                        }
+                        message = next_source_update(source_rx) => {
+                            target = self.accept_update(message?)?;
+                            continue 'target;
+                        }
+                        result = preparation => break Some(result),
+                    }
+                };
+                match result {
+                    None => {
+                        self.shutdown_speculation().await;
+                        return Ok(Outcome::TeardownTimedOut {
+                            epoch: old_epoch,
+                            timeout: KERNEL_TEARDOWN_TIMEOUT,
+                        });
+                    }
+                    Some(Ok(output)) => {
+                        let state = self.speculation.take();
+                        debug_assert!(matches!(state, Some(Speculation::InFlight(_))));
+                        match output.result {
+                            Ok(prepared) => PreparationStep::Prepared(Ok(prepared)),
+                            Err(error) => PreparationStep::SpeculativeFailed {
+                                error,
+                                pins: output.pins,
+                            },
+                        }
+                    }
+                    Some(Err(error)) => {
+                        self.speculation = None;
+                        warn!(%error, "Speculative preparation task failed during promotion");
+                        continue 'target;
+                    }
+                }
+            } else {
+                let (_cancel, mut cancel_rx) = watch::channel(false);
                 let preparation = prepare_root(
-                    self.epoch_seq,
                     head,
                     &frozen_layers,
                     &ipfs_client,
                     Some(&cid_tree),
                     &mut attempt,
+                    &mut cancel_rx,
                 );
                 tokio::pin!(preparation);
                 loop {
@@ -689,6 +1281,11 @@ impl Deployment {
                 PreparationStep::Update(update) => {
                     target = self.accept_update(update)?;
                     retry = RETRY_BASE_DELAY;
+                    continue 'target;
+                }
+                PreparationStep::SpeculativeFailed { error, mut pins } => {
+                    tracing::debug!(%error, "Promoted speculative preparation failed; starting authoritative preparation");
+                    self.release_attempt(&mut pins).await;
                     continue 'target;
                 }
                 PreparationStep::Prepared(Err(error)) => match classify_failure(&error) {
@@ -771,7 +1368,12 @@ impl Deployment {
                     }
 
                     let prepared = self
-                        .activate(prepared, stopped.take().expect("generation stopped"))
+                        .activate(
+                            accepted_epoch,
+                            target.head(),
+                            prepared,
+                            stopped.take().expect("generation stopped"),
+                        )
                         .err();
                     if let Some(prepared) = prepared {
                         let mut prepared = *prepared;
@@ -805,14 +1407,15 @@ impl Deployment {
 
     fn activate(
         &mut self,
+        accepted_epoch: u64,
+        accepted_head: Option<&Head>,
         prepared: PreparedRoot,
         _stopped: GenerationStopped,
     ) -> std::result::Result<(), Box<PreparedRoot>> {
-        if prepared.epoch != self.epoch_seq {
+        if accepted_epoch != self.epoch_seq || prepared.head.as_ref() != accepted_head {
             return Err(Box::new(prepared));
         }
         let PreparedRoot {
-            epoch: _,
             head,
             effective,
             pins,
@@ -833,23 +1436,8 @@ impl Deployment {
         if attempt.is_empty() {
             return;
         }
-        let mut owned = std::mem::take(attempt);
-        let mut protected = self.protected_cids(None);
-        protected.extend(
-            self.retained_pins
-                .iter()
-                .flat_map(|pins| pins.cids.iter().cloned()),
-        );
-        release_pin_set(
-            &mut owned,
-            &self.ipfs_client,
-            &protected,
-            &mut HashSet::new(),
-        )
-        .await;
-        if !owned.is_empty() {
-            self.retained_pins.push(owned);
-        }
+        self.retained_pins.push(std::mem::take(attempt));
+        self.release_retained().await;
     }
 
     fn protected_cids(&self, extra: Option<&PinSet>) -> HashSet<String> {
@@ -877,6 +1465,18 @@ impl Drop for Deployment {
         if let Some(task) = self.source_task.take() {
             task.abort();
         }
+        if let Some(speculation) = self.speculation.take() {
+            match speculation {
+                Speculation::InFlight(task) | Speculation::Stopping { task, .. } => {
+                    let _ = task.cancel.send(true);
+                    task.task.abort();
+                }
+                Speculation::Releasing { task, .. } => task.abort(),
+                Speculation::Ready { .. } => {
+                    warn!("Deployment dropped before speculative pins were released")
+                }
+            }
+        }
     }
 }
 
@@ -892,6 +1492,7 @@ struct BootstrapState {
     staging_dir: PathBuf,
     source_rx: Option<mpsc::Receiver<SourceMessage>>,
     source_task: Option<tokio::task::JoinHandle<()>>,
+    candidate_rx: Option<watch::Receiver<Option<Vec<u8>>>>,
 }
 
 impl BootstrapState {
@@ -922,13 +1523,14 @@ impl BootstrapState {
             }
             let head = self.target.head().cloned();
             let step = {
+                let (_cancel, mut cancel_rx) = watch::channel(false);
                 let preparation = prepare_root(
-                    self.epoch_seq,
                     head,
                     &self.frozen_layers,
                     &self.ipfs_client,
                     Some(&tree),
                     &mut attempt,
+                    &mut cancel_rx,
                 );
                 tokio::pin!(preparation);
                 match self.source_rx.as_mut() {
@@ -1004,6 +1606,9 @@ impl BootstrapState {
                         cid_tree: tree,
                         source_rx: self.source_rx,
                         source_task: self.source_task,
+                        candidate_rx: self.candidate_rx,
+                        candidate_initialized: false,
+                        speculation: None,
                     });
                 }
             }
@@ -1153,6 +1758,7 @@ async fn notify_pid0_result_ready(_epoch: u64) {}
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const ROOT: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
@@ -1195,6 +1801,112 @@ mod tests {
             crate::ipfs::HttpClient::new(format!("http://{address}")),
             server,
         )
+    }
+
+    async fn recording_kubo() -> (
+        crate::ipfs::HttpClient,
+        Arc<AtomicUsize>,
+        mpsc::UnboundedReceiver<String>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    _ = &mut shutdown_rx => return,
+                };
+                let (mut stream, _) = accepted.unwrap();
+                let request = read_request(&mut stream).await;
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap()
+                    .to_owned();
+                server_calls.fetch_add(1, Ordering::SeqCst);
+                request_tx.send(path.clone()).unwrap();
+                let body = if path.starts_with("/api/v0/ls") {
+                    serde_json::json!({"Objects": [{"Links": []}]})
+                } else {
+                    serde_json::json!({})
+                };
+                respond(&mut stream, body).await;
+            }
+        });
+        (
+            crate::ipfs::HttpClient::new(format!("http://{address}")),
+            calls,
+            request_rx,
+            shutdown_tx,
+            server,
+        )
+    }
+
+    fn test_deployment(
+        client: crate::ipfs::HttpClient,
+        staging_dir: PathBuf,
+        source_rx: mpsc::Receiver<SourceMessage>,
+        candidate_rx: watch::Receiver<Option<Vec<u8>>>,
+    ) -> (Deployment, Arc<CidTree>, watch::Receiver<Epoch>) {
+        let tree = Arc::new(CidTree::new(
+            "old-root".to_owned(),
+            client.clone(),
+            staging_dir,
+        ));
+        let (epoch_tx, epoch_rx) = watch::channel(Epoch {
+            seq: 0,
+            head: Vec::new(),
+            root: Some("old-root".to_owned()),
+        });
+        let deployment = Deployment {
+            epoch_tx,
+            epoch_rx: epoch_rx.clone(),
+            epoch_seq: 0,
+            frozen_layers: Vec::new(),
+            frozen_pins: PinSet::default(),
+            active_pins: PinSet::default(),
+            retained_pins: Vec::new(),
+            ipfs_client: client,
+            cid_tree: tree.clone(),
+            source_rx: Some(source_rx),
+            source_task: None,
+            candidate_rx: Some(candidate_rx),
+            candidate_initialized: false,
+            speculation: None,
+        };
+        (deployment, tree, epoch_rx)
+    }
+
+    fn test_running_generation() -> (
+        RunningGeneration,
+        oneshot::Sender<Result<kernel::Outcome>>,
+        watch::Receiver<()>,
+    ) {
+        let (terminate_tx, terminate_rx) = watch::channel(());
+        let (result_tx, result_rx) = oneshot::channel();
+        (
+            RunningGeneration {
+                intended_seq: 0,
+                terminate_tx,
+                result_rx,
+            },
+            result_tx,
+            terminate_rx,
+        )
+    }
+
+    async fn next_request(requests: &mut mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .expect("Kubo request timed out")
+            .expect("Kubo request server stopped")
     }
 
     struct ScriptedSource {
@@ -1243,6 +1955,7 @@ mod tests {
         let deployment = Deployment::bootstrap(
             Config {
                 source: None,
+                candidates: None,
                 frozen_layers: vec![ROOT.to_owned()],
                 ipfs_client: crate::ipfs::HttpClient::new(format!("http://{address}")),
                 staging_dir: staging.path().to_owned(),
@@ -1278,6 +1991,7 @@ mod tests {
         let deployment = Deployment::bootstrap(
             Config {
                 source: Some(Box::new(source)),
+                candidates: None,
                 frozen_layers: Vec::new(),
                 ipfs_client,
                 staging_dir: staging.path().to_owned(),
@@ -1314,6 +2028,7 @@ mod tests {
         let deployment = Deployment::bootstrap(
             Config {
                 source: Some(Box::new(source)),
+                candidates: None,
                 frozen_layers: Vec::new(),
                 ipfs_client,
                 staging_dir: staging.path().to_owned(),
@@ -1358,6 +2073,9 @@ mod tests {
             cid_tree: tree,
             source_rx: None,
             source_task: None,
+            candidate_rx: None,
+            candidate_initialized: false,
+            speculation: None,
         };
 
         let result = deployment.accept_update(Update::InvalidHead(InvalidHead {
@@ -1400,15 +2118,17 @@ mod tests {
             cid_tree: tree.clone(),
             source_rx: None,
             source_task: None,
+            candidate_rx: None,
+            candidate_initialized: false,
+            speculation: None,
         };
         let prepared = PreparedRoot {
-            epoch: 2,
             head: None,
             effective: "superseded-root".to_owned(),
             pins: PinSet::default(),
         };
 
-        let result = deployment.activate(prepared, GenerationStopped(()));
+        let result = deployment.activate(2, None, prepared, GenerationStopped(()));
 
         assert!(result.is_err());
         assert_eq!(tree.root_cid().as_ref(), "old-root");
@@ -1425,9 +2145,9 @@ mod tests {
             staging.path().to_owned(),
         ));
         let mut pins = PinSet::default();
+        let (_cancel, mut cancel_rx) = watch::channel(false);
 
         let prepared = prepare_root(
-            1,
             Some(Head {
                 cid: ROOT.parse().unwrap(),
             }),
@@ -1435,12 +2155,547 @@ mod tests {
             &client,
             Some(&tree),
             &mut pins,
+            &mut cancel_rx,
         )
         .await
         .unwrap();
 
         assert_eq!(prepared.effective(), ROOT);
         assert_eq!(tree.root_cid().as_ref(), "old-root");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_speculation_is_authority_neutral_and_reused_after_revocation() {
+        let (client, calls, mut requests, shutdown_tx, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let (_source_tx, source_rx) = mpsc::channel(2);
+        let (_candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, tree, mut epoch_observer) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        let (running, result_tx, terminate_rx) = test_running_generation();
+        let head = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+
+        deployment.observe_candidate(Some(head.bytes()));
+        let task = match deployment.speculation.take().unwrap() {
+            Speculation::InFlight(task) => task,
+            _ => panic!("candidate did not start speculative preparation"),
+        };
+        let candidate = task.candidate.clone();
+        let output = task.task.await.unwrap();
+        deployment.finish_speculative_preparation(candidate, output, true, None);
+        assert!(matches!(
+            deployment.speculation.as_ref(),
+            Some(Speculation::Ready { .. })
+        ));
+        for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+            let request = next_request(&mut requests).await;
+            assert!(request.starts_with(expected), "{request}");
+        }
+        assert_eq!(epoch_observer.borrow().seq, 0);
+        assert_eq!(epoch_observer.borrow().root.as_deref(), Some("old-root"));
+        assert_eq!(tree.root_cid().as_ref(), "old-root");
+        assert!(!terminate_rx.has_changed().unwrap());
+
+        let outcome = {
+            let transition = deployment.replace(running, vec![Update::Head(head.clone())], None);
+            tokio::pin!(transition);
+            tokio::select! {
+                _ = &mut transition => panic!("replacement activated before teardown"),
+                changed = epoch_observer.changed() => changed.unwrap(),
+            }
+            assert_eq!(epoch_observer.borrow().seq, 1);
+            assert_eq!(epoch_observer.borrow().root, None);
+            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert!(terminate_rx.has_changed().unwrap());
+
+            result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
+            transition.await.unwrap()
+        };
+
+        assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
+        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        assert_eq!(deployment.current_epoch().root.as_deref(), Some(ROOT));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_speculation_expires_and_releases_pins_without_changing_authority() {
+        let (client, calls, mut requests, shutdown_tx, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let (_source_tx, source_rx) = mpsc::channel(2);
+        let (candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, tree, epoch_observer) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        let ready_gate = authority::KernelReadyGate::new(epoch_observer.clone());
+        ready_gate.bind_generation(0);
+        ready_gate.kernel_ready().unwrap();
+        let (running, result_tx, terminate_rx) = test_running_generation();
+        let head = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+
+        candidate_tx.send_replace(Some(head.bytes()));
+        deployment.observe_candidate(Some(head.bytes()));
+        let task = match deployment.speculation.take().unwrap() {
+            Speculation::InFlight(task) => task,
+            _ => panic!("candidate did not start speculative preparation"),
+        };
+        let candidate = task.candidate.clone();
+        let output = task.task.await.unwrap();
+        deployment.finish_speculative_preparation(candidate, output, true, None);
+        assert!(matches!(
+            deployment.speculation.as_ref(),
+            Some(Speculation::Ready { .. })
+        ));
+        for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+            let request = next_request(&mut requests).await;
+            assert!(request.starts_with(expected), "{request}");
+        }
+
+        tokio::time::pause();
+        let outcome = {
+            let transition = deployment.await_generation(running);
+            tokio::pin!(transition);
+            tokio::select! {
+                biased;
+                _ = &mut transition => panic!("candidate expiry changed kernel outcome"),
+                _ = tokio::task::yield_now() => {}
+            }
+            tokio::time::advance(SPECULATIVE_RETENTION).await;
+            tokio::time::resume();
+            let unpin = tokio::select! {
+                _ = &mut transition => panic!("candidate expiry changed kernel outcome"),
+                request = tokio::time::timeout(Duration::from_secs(2), requests.recv()) => {
+                    request
+                        .expect("timed out waiting for speculative pin release")
+                        .expect("Kubo request server stopped")
+                },
+            };
+            assert!(unpin.starts_with("/api/v0/pin/rm"), "{unpin}");
+            assert!(unpin.contains(ROOT), "{unpin}");
+            assert_eq!(epoch_observer.borrow().seq, 0);
+            assert_eq!(epoch_observer.borrow().root.as_deref(), Some("old-root"));
+            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert!(!terminate_rx.has_changed().unwrap());
+            assert!(ready_gate.is_ready());
+
+            result_tx.send(Ok(kernel::Outcome::Exited(0))).unwrap();
+            transition.await.unwrap()
+        };
+
+        assert!(matches!(outcome, Outcome::Authoritative { epoch: 0, .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        let (running, _result_tx, _terminate_rx) = test_running_generation();
+        {
+            let transition = deployment.await_generation(running);
+            tokio::pin!(transition);
+            tokio::select! {
+                biased;
+                _ = &mut transition => panic!("unchanged advisory changed kernel outcome"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        assert!(deployment.speculation.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn matching_in_flight_speculation_continues_during_teardown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let (request_tx, mut requests) = mpsc::unbounded_channel();
+        let (release_first_tx, release_first_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut release_first_rx = Some(release_first_rx);
+            for index in 1..=3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap()
+                    .to_owned();
+                server_calls.fetch_add(1, Ordering::SeqCst);
+                request_tx.send(path.clone()).unwrap();
+                if index == 1 {
+                    release_first_rx.take().unwrap().await.unwrap();
+                }
+                let body = if path.starts_with("/api/v0/ls") {
+                    serde_json::json!({"Objects": [{"Links": []}]})
+                } else {
+                    serde_json::json!({})
+                };
+                respond(&mut stream, body).await;
+            }
+        });
+        let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
+        let staging = tempfile::tempdir().unwrap();
+        let (source_tx, source_rx) = mpsc::channel(2);
+        let (candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, tree, mut epoch_observer) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        let (running, result_tx, terminate_rx) = test_running_generation();
+        let head = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+
+        let outcome = {
+            let transition = deployment.await_generation(running);
+            tokio::pin!(transition);
+            candidate_tx.send_replace(Some(head.bytes()));
+            let first_pin = tokio::select! {
+                _ = &mut transition => panic!("candidate changed kernel outcome"),
+                request = next_request(&mut requests) => request,
+            };
+            assert!(first_pin.starts_with("/api/v0/pin/add"), "{first_pin}");
+
+            source_tx
+                .send(SourceMessage::Update(Update::Head(head)))
+                .await
+                .unwrap();
+            tokio::select! {
+                _ = &mut transition => panic!("replacement activated before preparation and teardown"),
+                changed = epoch_observer.changed() => changed.unwrap(),
+            }
+            assert_eq!(epoch_observer.borrow().root, None);
+            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert!(terminate_rx.has_changed().unwrap());
+
+            release_first_tx.send(()).unwrap();
+            for expected in ["/api/v0/pin/add", "/api/v0/ls"] {
+                let request = tokio::select! {
+                    _ = &mut transition => panic!("replacement activated before teardown"),
+                    request = next_request(&mut requests) => request,
+                };
+                assert!(request.starts_with(expected), "{request}");
+            }
+            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
+            transition.await.unwrap()
+        };
+
+        assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
+        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_and_closed_advisory_feed_do_not_affect_authoritative_following() {
+        let (client, calls, mut requests, shutdown_tx, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let (source_tx, source_rx) = mpsc::channel(2);
+        let (candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, tree, epoch_observer) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        let (running, result_tx, terminate_rx) = test_running_generation();
+        let head = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+
+        let outcome = {
+            let transition = deployment.await_generation(running);
+            tokio::pin!(transition);
+            candidate_tx.send_replace(Some(b"not-a-cid".to_vec()));
+            tokio::select! {
+                _ = &mut transition => panic!("malformed candidate changed kernel outcome"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            drop(candidate_tx);
+            tokio::select! {
+                _ = &mut transition => panic!("closed advisory feed changed kernel outcome"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            assert_eq!(epoch_observer.borrow().seq, 0);
+            assert_eq!(epoch_observer.borrow().root.as_deref(), Some("old-root"));
+            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert!(!terminate_rx.has_changed().unwrap());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            source_tx
+                .send(SourceMessage::Update(Update::Head(head)))
+                .await
+                .unwrap();
+            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+                let request = tokio::select! {
+                    _ = &mut transition => panic!("replacement activated before teardown"),
+                    request = next_request(&mut requests) => request,
+                };
+                assert!(request.starts_with(expected), "{request}");
+            }
+            result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
+            transition.await.unwrap()
+        };
+
+        assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
+        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authoritative_mismatch_releases_speculation_and_prepares_the_selected_head() {
+        let (client, calls, mut requests, shutdown_tx, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let (source_tx, source_rx) = mpsc::channel(2);
+        let (candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, tree, mut epoch_observer) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        let (running, result_tx, terminate_rx) = test_running_generation();
+        let speculative = Head {
+            cid: "bafkreibm6jg3ux5qugqkmfqt5uj5rxszb4sa4e3u7jj4c5ukv5s4xvcc7a"
+                .parse()
+                .unwrap(),
+        };
+        let authoritative = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+
+        let outcome = {
+            let transition = deployment.await_generation(running);
+            tokio::pin!(transition);
+            candidate_tx.send_replace(Some(speculative.bytes()));
+            for _ in 0..3 {
+                tokio::select! {
+                    _ = &mut transition => panic!("speculation changed kernel outcome"),
+                    _ = next_request(&mut requests) => {}
+                }
+            }
+            tokio::select! {
+                _ = &mut transition => panic!("speculation changed kernel outcome"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+
+            source_tx
+                .send(SourceMessage::Update(Update::Head(authoritative)))
+                .await
+                .unwrap();
+            tokio::select! {
+                _ = &mut transition => panic!("replacement activated before teardown"),
+                changed = epoch_observer.changed() => changed.unwrap(),
+            }
+            assert_eq!(epoch_observer.borrow().root, None);
+            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert!(terminate_rx.has_changed().unwrap());
+
+            let unpin = tokio::select! {
+                _ = &mut transition => panic!("replacement activated before teardown"),
+                request = next_request(&mut requests) => request,
+            };
+            assert!(unpin.starts_with("/api/v0/pin/rm"), "{unpin}");
+            assert!(unpin.contains(&speculative.cid.to_string()), "{unpin}");
+            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+                let request = tokio::select! {
+                    _ = &mut transition => panic!("replacement activated before teardown"),
+                    request = next_request(&mut requests) => request,
+                };
+                assert!(request.starts_with(expected), "{request}");
+                assert!(request.contains(ROOT), "{request}");
+            }
+            result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
+            transition.await.unwrap()
+        };
+
+        assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
+        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn speculative_failure_releases_pins_and_authority_retries_from_scratch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let (request_tx, mut requests) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for index in 1..=6 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap()
+                    .to_owned();
+                server_calls.fetch_add(1, Ordering::SeqCst);
+                request_tx.send(path.clone()).unwrap();
+                if index == 2 {
+                    stream
+                        .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy")
+                        .await
+                        .unwrap();
+                } else {
+                    let body = if path.starts_with("/api/v0/ls") {
+                        serde_json::json!({"Objects": [{"Links": []}]})
+                    } else {
+                        serde_json::json!({})
+                    };
+                    respond(&mut stream, body).await;
+                }
+            }
+        });
+        let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
+        let staging = tempfile::tempdir().unwrap();
+        let (source_tx, source_rx) = mpsc::channel(2);
+        let (candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, tree, epoch_observer) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        let (running, result_tx, terminate_rx) = test_running_generation();
+        let head = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+
+        let outcome = {
+            let transition = deployment.await_generation(running);
+            tokio::pin!(transition);
+            candidate_tx.send_replace(Some(head.bytes()));
+            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/pin/rm"] {
+                let request = tokio::select! {
+                    _ = &mut transition => panic!("speculative failure changed kernel outcome"),
+                    request = next_request(&mut requests) => request,
+                };
+                assert!(request.starts_with(expected), "{request}");
+            }
+            assert_eq!(epoch_observer.borrow().seq, 0);
+            assert_eq!(epoch_observer.borrow().root.as_deref(), Some("old-root"));
+            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert!(!terminate_rx.has_changed().unwrap());
+
+            source_tx
+                .send(SourceMessage::Update(Update::Head(head)))
+                .await
+                .unwrap();
+            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+                let request = tokio::select! {
+                    _ = &mut transition => panic!("replacement activated before teardown"),
+                    request = next_request(&mut requests) => request,
+                };
+                assert!(request.starts_with(expected), "{request}");
+            }
+            result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
+            transition.await.unwrap()
+        };
+
+        assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
+        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn newest_candidate_cancels_and_cleans_old_work_before_starting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let (request_tx, mut requests) = mpsc::unbounded_channel();
+        let (release_first_tx, release_first_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut release_first_rx = Some(release_first_rx);
+            for index in 1..=6 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap()
+                    .to_owned();
+                server_calls.fetch_add(1, Ordering::SeqCst);
+                request_tx.send(path.clone()).unwrap();
+                if index == 1 {
+                    release_first_rx.take().unwrap().await.unwrap();
+                }
+                let body = if path.starts_with("/api/v0/ls") {
+                    serde_json::json!({"Objects": [{"Links": []}]})
+                } else {
+                    serde_json::json!({})
+                };
+                respond(&mut stream, body).await;
+            }
+        });
+        let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
+        let staging = tempfile::tempdir().unwrap();
+        let (_source_tx, source_rx) = mpsc::channel(2);
+        let (candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, tree, epoch_observer) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        let (running, result_tx, terminate_rx) = test_running_generation();
+        let first = Head {
+            cid: "bafkreibm6jg3ux5qugqkmfqt5uj5rxszb4sa4e3u7jj4c5ukv5s4xvcc7a"
+                .parse()
+                .unwrap(),
+        };
+        let intermediate = Head {
+            cid: "bafkreif2pall7dybz7vecqka3zo24nq2j4tztjwc5c3f4vmrf6sz4d3asa"
+                .parse()
+                .unwrap(),
+        };
+        let newest = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+
+        let outcome = {
+            let transition = deployment.await_generation(running);
+            tokio::pin!(transition);
+            candidate_tx.send_replace(Some(first.bytes()));
+            let first_pin = tokio::select! {
+                _ = &mut transition => panic!("candidate changed kernel outcome"),
+                request = next_request(&mut requests) => request,
+            };
+            assert!(first_pin.starts_with("/api/v0/pin/add"), "{first_pin}");
+            assert!(first_pin.contains(&first.cid.to_string()), "{first_pin}");
+
+            candidate_tx.send_replace(Some(intermediate.bytes()));
+            candidate_tx.send_replace(Some(newest.bytes()));
+            release_first_tx.send(()).unwrap();
+            let old_unpin = tokio::select! {
+                _ = &mut transition => panic!("candidate changed kernel outcome"),
+                request = next_request(&mut requests) => request,
+            };
+            assert!(old_unpin.starts_with("/api/v0/pin/rm"), "{old_unpin}");
+            assert!(old_unpin.contains(&first.cid.to_string()), "{old_unpin}");
+            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+                let request = tokio::select! {
+                    _ = &mut transition => panic!("candidate changed kernel outcome"),
+                    request = next_request(&mut requests) => request,
+                };
+                assert!(request.starts_with(expected), "{request}");
+                assert!(request.contains(ROOT), "{request}");
+            }
+            tokio::select! {
+                _ = &mut transition => panic!("candidate changed kernel outcome"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            assert_eq!(epoch_observer.borrow().seq, 0);
+            assert_eq!(epoch_observer.borrow().root.as_deref(), Some("old-root"));
+            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert!(!terminate_rx.has_changed().unwrap());
+
+            result_tx.send(Ok(kernel::Outcome::Exited(0))).unwrap();
+            transition.await.unwrap()
+        };
+
+        assert!(matches!(outcome, Outcome::Authoritative { epoch: 0, .. }));
+        let newest_unpin = next_request(&mut requests).await;
+        assert!(newest_unpin.starts_with("/api/v0/pin/rm"), "{newest_unpin}");
+        assert!(newest_unpin.contains(ROOT), "{newest_unpin}");
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
         server.await.unwrap();
     }
 
@@ -1491,6 +2746,9 @@ mod tests {
             cid_tree: tree.clone(),
             source_rx: Some(source_rx),
             source_task: None,
+            candidate_rx: None,
+            candidate_initialized: false,
+            speculation: None,
         };
         let (terminate_tx, terminate_rx) = watch::channel(());
         let (result_tx, result_rx) = oneshot::channel();
@@ -1557,6 +2815,9 @@ mod tests {
             cid_tree: tree.clone(),
             source_rx: Some(source_rx),
             source_task: None,
+            candidate_rx: None,
+            candidate_initialized: false,
+            speculation: None,
         };
         let (terminate_tx, terminate_rx) = watch::channel(());
         let (result_tx, result_rx) = oneshot::channel();
@@ -1636,6 +2897,9 @@ mod tests {
             cid_tree: tree,
             source_rx: Some(source_rx),
             source_task: None,
+            candidate_rx: None,
+            candidate_initialized: false,
+            speculation: None,
         };
         let (terminate_tx, _terminate_rx) = watch::channel(());
         let (result_tx, result_rx) = oneshot::channel();
@@ -1704,6 +2968,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_speculative_unpin_is_retained_for_later_cleanup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert!(request.contains("/api/v0/pin/rm"), "{request}");
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy")
+                .await
+                .unwrap();
+        });
+        let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
+        let staging = tempfile::tempdir().unwrap();
+        let tree = Arc::new(CidTree::new(
+            "old-root".to_owned(),
+            client.clone(),
+            staging.path().to_owned(),
+        ));
+        let (epoch_tx, epoch_rx) = watch::channel(Epoch {
+            seq: 0,
+            head: Vec::new(),
+            root: Some("old-root".to_owned()),
+        });
+        let mut deployment = Deployment {
+            epoch_tx,
+            epoch_rx,
+            epoch_seq: 0,
+            frozen_layers: Vec::new(),
+            frozen_pins: PinSet::default(),
+            active_pins: PinSet::default(),
+            retained_pins: Vec::new(),
+            ipfs_client: client,
+            cid_tree: tree,
+            source_rx: None,
+            source_task: None,
+            candidate_rx: None,
+            candidate_initialized: false,
+            speculation: Some(Speculation::Ready {
+                prepared: PreparedRoot {
+                    head: Some(Head {
+                        cid: ROOT.parse().unwrap(),
+                    }),
+                    effective: ROOT.to_owned(),
+                    pins: PinSet {
+                        cids: vec![ROOT.to_owned()],
+                    },
+                },
+                expires_at: tokio::time::Instant::now() + SPECULATIVE_RETENTION,
+            }),
+        };
+
+        deployment.shutdown_speculation().await;
+
+        assert!(deployment.speculation.is_none());
+        assert_eq!(deployment.retained_pins.len(), 1);
+        assert_eq!(deployment.retained_pins[0].cids, [ROOT]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn superseded_attempt_does_not_unpin_a_retained_cid() {
         let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
         let staging = tempfile::tempdir().unwrap();
@@ -1727,6 +3052,9 @@ mod tests {
             cid_tree: tree,
             source_rx: None,
             source_task: None,
+            candidate_rx: None,
+            candidate_initialized: false,
+            speculation: None,
         };
         let mut attempt = PinSet {
             cids: vec!["shared".to_owned()],

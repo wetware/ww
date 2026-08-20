@@ -109,6 +109,7 @@ path = "src/cli/main.rs"
 
 [dev-dependencies]
 membrane = { package = "wetware-membrane", path = "crates/membrane" }
+tokio = { workspace = true, features = ["test-util"] }
 wasm-encoder = "0.243"
 wit-component = "0.244"
 wit-parser = "0.244"

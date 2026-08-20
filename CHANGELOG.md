@@ -22,6 +22,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   attempt, frozen, and retained pins. The obsolete Atom `Finalizer` is removed,
   while the observed-event `AtomIndexer` remains available for separate
   consumers. `capnp/stem.capnp` is unchanged.
+- **Atom deployments now prepare advisory heads before finality.** `HeadUpdated`
+  events fill one newest-wins speculative slot without changing authority;
+  finalized-depth HTTP polling remains authoritative. Matching ready or
+  in-flight work is reused after finalized acceptance, while mismatches and
+  failures use ordinary preparation. Existing deployment pin ownership releases
+  unused speculative pins after the unchanged five-minute retention window.
+  WebSocket and speculative failures affect preparation latency only.
 - **Cell construction and kernel launch now use separate policy layers.**
   `cell::Builder` replaces `ProcBuilder` as the canonical construction
   mechanism and exposes explicit ordinary and kernel modes. `kernel::Generation`

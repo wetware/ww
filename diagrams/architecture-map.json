@@ -61,9 +61,9 @@
       "group": "THE HOST",
       "title": "Deployment lifecycle",
       "subtitle": "Turns optional Stem state into one rooted kernel generation.",
-      "files": ["src/stem/mod.rs", "src/stem/atom.rs", "src/deployment/mod.rs", "crates/authority/src/epoch.rs"],
-      "what": "Deployment allocates host-local epochs, revokes old authority, prepares and pins an effective root, waits for old pid0 teardown, activates `CidTree`, and launches one new kernel generation.",
-      "built": "`src/stem` defines the backend-neutral Source contract and Atom finalized-depth adapter. `src/deployment` owns retry, supersession, pin ownership, activation, and generation coordination. `crates/authority` enforces the resulting local epoch."
+      "files": ["src/stem/mod.rs", "src/stem/atom.rs", "src/deployment/mod.rs", "crates/atom/src/indexer.rs", "crates/authority/src/epoch.rs"],
+      "what": "Deployment may prepare one advisory Atom event candidate without changing authority. Finalized Source updates allocate epochs, revoke old authority, activate `CidTree`, and replace pid0.",
+      "built": "`src/stem` defines the backend-neutral Source contract and Atom finalized-depth adapter. The Atom indexer supplies lossy advisory candidates. `src/deployment` owns preparation, retry, supersession, pin ownership, activation, and generation coordination. `crates/authority` enforces the resulting local epoch."
     },
     {
       "key": "kernel",
