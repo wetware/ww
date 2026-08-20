@@ -159,7 +159,7 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8545")]
         rpc_url: String,
 
-        /// Deprecated compatibility option. Atom following uses HTTP polling.
+        /// WebSocket JSON-RPC URL for advisory pre-finality Atom events.
         #[arg(long, default_value = "ws://127.0.0.1:8545")]
         ws_url: String,
 
@@ -657,6 +657,62 @@ fn parse_contract_address(s: &str) -> Result<[u8; 20]> {
     let mut addr = [0u8; 20];
     addr.copy_from_slice(&bytes);
     Ok(addr)
+}
+
+struct AdvisoryTask(tokio::task::JoinHandle<()>);
+
+impl Drop for AdvisoryTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn atom_advisory_candidates(
+    http_url: String,
+    ws_url: String,
+    contract_address: [u8; 20],
+) -> (watch::Receiver<Option<Vec<u8>>>, AdvisoryTask) {
+    let (candidate_tx, candidate_rx) = watch::channel(None);
+    let task = tokio::spawn(async move {
+        let start_block = match atom::current_block_number(&http_url).await {
+            Ok(block) => block,
+            Err(error) => {
+                tracing::debug!(%error, "Atom advisory setup failed; speculation disabled");
+                return;
+            }
+        };
+        let indexer = std::sync::Arc::new(atom::AtomIndexer::new(atom::IndexerConfig {
+            ws_url,
+            http_url,
+            contract_address,
+            start_block,
+            getlogs_max_range: 2_000,
+            reconnection: atom::ReconnectionConfig::default(),
+        }));
+        let mut events = indexer.subscribe();
+        let relay = async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        candidate_tx.send_replace(Some(event.cid));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!(skipped, "Atom advisory events lagged; using latest event");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        };
+        tokio::select! {
+            result = std::sync::Arc::clone(&indexer).run() => {
+                if let Err(error) = result {
+                    tracing::debug!(%error, "Atom advisory indexer stopped; speculation disabled");
+                }
+            }
+            _ = relay => {}
+        }
+    });
+    (candidate_rx, AdvisoryTask(task))
 }
 
 impl Commands {
@@ -1376,7 +1432,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         kernel_source: ww::kernel::Source,
         stem: Option<String>,
         rpc_url: String,
-        _ws_url: String,
+        ws_url: String,
         confirmation_depth: u64,
         epoch_drain_secs: u64,
         executor_threads: usize,
@@ -1751,6 +1807,13 @@ wasip2::cli::command::export!({iface_name}Guest);
         }
 
         runtime_status.set_phase("preparing-deployment");
+        let (candidate_rx, _advisory_task) = match stem_contract {
+            Some(contract) => {
+                let (receiver, task) = atom_advisory_candidates(rpc_url.clone(), ws_url, contract);
+                (Some(receiver), Some(task))
+            }
+            None => (None, None),
+        };
         let stem_source: Option<Box<dyn ww::stem::Source>> = stem_contract
             .map(|contract| {
                 ww::stem::atom::Source::new(ww::stem::atom::Config::new(
@@ -1763,6 +1826,7 @@ wasip2::cli::command::export!({iface_name}Guest);
             .transpose()?;
         let deployment_config = ww::deployment::Config {
             source: stem_source,
+            candidates: candidate_rx,
             frozen_layers,
             ipfs_client: ipfs_client.clone(),
             staging_dir,
@@ -1914,6 +1978,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         };
         tracing::info!(code = exit_code, "Kernel exited");
 
+        deployment.shutdown().await;
         supervisor.shutdown();
 
         // Hold the CidTree alive until after guest exits (its staging dir
