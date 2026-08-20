@@ -959,13 +959,12 @@ mod tests {
 
     #[test]
     fn private_kernel_import_maps_gate_results_fail_closed() {
-        use authority::{Epoch, Provenance};
+        use authority::Epoch;
         fn epoch(seq: u64) -> Epoch {
             Epoch {
                 seq,
                 head: Vec::new(),
                 root: None,
-                provenance: Provenance::Block(0),
             }
         }
 

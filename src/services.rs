@@ -1,8 +1,9 @@
 //! Thread-per-subsystem runtime inspired by Cloudflare Pingora.
 //!
-//! Each subsystem (libp2p swarm, epoch pipeline, WASM executor) runs on its
-//! own OS thread with its own tokio runtime.  The [`Host`] supervisor owns
-//! all threads and coordinates shutdown.
+//! Long-running services such as the libp2p swarm and WASM executors run on
+//! dedicated OS threads with their own tokio runtimes. The [`Host`] supervisor
+//! owns those threads and coordinates shutdown. Deployment lifecycle runs on
+//! the main host runtime rather than as a `Service` thread.
 //!
 //! Executor threads use `current_thread` + `LocalSet` because `wasmtime::Store`
 //! is `!Send`.  M:N cell scheduling comes from the EWMA fuel estimator
@@ -50,8 +51,7 @@ pub trait Service: Send + 'static {
 /// ```text
 /// Host (Rust-side supervisor)
 ///  ├── Thread 1: SwarmService    — libp2p event loop
-///  ├── Thread 2: EpochService    — on-chain watcher
-///  └── Thread 3..N: ExecutorPool — cells via fuel scheduling
+///  └── Thread 2..N: ExecutorPool — cells via fuel scheduling
 /// ```
 pub struct Host {
     threads: Vec<(String, JoinHandle<Result<()>>)>,
@@ -557,51 +557,6 @@ impl Service for SwarmService {
                 result = host.run(network_state, self.cmd_rx) => result,
                 _ = shutdown.changed() => {
                     tracing::info!("swarm shutting down");
-                    Ok(())
-                }
-            }
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// EpochService
-// ---------------------------------------------------------------------------
-
-use authority::Epoch;
-
-/// The on-chain epoch watcher running on its own thread.
-pub struct EpochService {
-    pub config: atom::IndexerConfig,
-    pub epoch_tx: watch::Sender<Epoch>,
-    pub confirmation_depth: u64,
-    pub ipfs_client: crate::ipfs::HttpClient,
-    pub cid_tree: Option<std::sync::Arc<cell::vfs::CidTree>>,
-    pub overlays: Vec<String>,
-    pub initial_head: String,
-    pub initial_root: String,
-}
-
-impl Service for EpochService {
-    fn run(self, mut shutdown: watch::Receiver<()>) -> Result<()> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let _span = tracing::info_span!("epoch").entered();
-        rt.block_on(async move {
-            tokio::select! {
-                result = cell::epoch::run_epoch_pipeline(
-                    self.config,
-                    self.epoch_tx,
-                    self.confirmation_depth,
-                    self.ipfs_client,
-                    self.cid_tree,
-                    self.overlays,
-                    self.initial_head,
-                    self.initial_root,
-                ) => result,
-                _ = shutdown.changed() => {
-                    tracing::info!("epoch shutting down");
                     Ok(())
                 }
             }

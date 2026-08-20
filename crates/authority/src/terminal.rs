@@ -551,7 +551,6 @@ mod tests {
             seq,
             head: vec![0xAB],
             root: None,
-            provenance: crate::epoch::Provenance::Block(100),
         }
     }
 

@@ -4,22 +4,10 @@ use call_guard::{stale_epoch_error, CallGuard};
 use capnp::Error;
 use tokio::sync::watch;
 
-/// Backend-specific metadata about how an epoch was adopted.
-///
-/// - `Block` — stem::atomic (on-chain via Atom contract): the Ethereum block
-///   number at which the HeadUpdated event was finalized.
-/// - `Timestamp` — stem::eventual (off-chain via IPNS): the wall-clock Unix
-///   timestamp from the IPNS record validity field.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Provenance {
-    Block(u64),
-    Timestamp(u64),
-}
-
 /// Epoch value used by the membrane (matches capnp struct Epoch).
 ///
 /// An epoch anchors a point-in-time snapshot of a namespace's content root.
-/// The `seq` field is monotonically increasing regardless of the source backend.
+/// The host allocates `seq` locally. Every process starts at epoch zero.
 #[derive(Clone, Debug)]
 pub struct Epoch {
     pub seq: u64,
@@ -27,7 +15,6 @@ pub struct Epoch {
     /// The Host-composed root. `None` means that the epoch is authoritative
     /// but its replacement generation is not ready to start.
     pub root: Option<String>,
-    pub provenance: Provenance,
 }
 
 impl Epoch {
@@ -37,7 +24,6 @@ impl Epoch {
             seq: 0,
             head: Vec::new(),
             root: None,
-            provenance: Provenance::Block(0),
         }
     }
 }
@@ -85,18 +71,17 @@ impl CallGuard for EpochGuard {
 mod tests {
     use super::*;
 
-    fn epoch(seq: u64, head: &[u8], block: u64) -> Epoch {
+    fn epoch(seq: u64, head: &[u8]) -> Epoch {
         Epoch {
             seq,
             head: head.to_vec(),
             root: None,
-            provenance: Provenance::Block(block),
         }
     }
 
     #[test]
     fn epoch_guard_ok_when_seq_matches() {
-        let (_tx, rx) = watch::channel(epoch(1, b"head1", 100));
+        let (_tx, rx) = watch::channel(epoch(1, b"head1"));
         let guard = EpochGuard {
             issued_seq: 1,
             receiver: rx,
@@ -106,13 +91,13 @@ mod tests {
 
     #[test]
     fn epoch_guard_fails_when_seq_differs() {
-        let (tx, rx) = watch::channel(epoch(1, b"head1", 100));
+        let (tx, rx) = watch::channel(epoch(1, b"head1"));
         let guard = EpochGuard {
             issued_seq: 1,
             receiver: rx,
         };
         assert!(guard.check().is_ok());
-        tx.send(epoch(2, b"head2", 101)).unwrap();
+        tx.send(epoch(2, b"head2")).unwrap();
         let res = guard.check();
         assert!(res.is_err());
         assert_eq!(

@@ -97,20 +97,21 @@ impl CidTree {
 
     /// Atomically swap the root CID for epoch updates.
     ///
-    /// Clears the in-memory directory listing cache (staging-disk listings
-    /// are CID-keyed and thus immutable, so they persist across swaps).
+    /// Clears the in-memory directory listing cache. This activation operation
+    /// does not perform staging-directory cleanup.
     pub fn swap_root(&self, new_cid: String) {
         self.root.store(Arc::new(new_cid));
 
-        // Clear in-memory dir listing cache.
         if let Ok(mut cache) = self.dir_cache.lock() {
             cache.clear();
         }
+    }
 
-        // Clean up stub directories from the old root. Stub dirs are named
-        // `dir-{cid}` and only relevant while that CID is the active root.
-        // Content-addressed file staging (bare CID files) is managed by
-        // PinsetCache and left alone.
+    /// Remove readdir stubs after a completed generation transition.
+    ///
+    /// Stub directories are root-relative and must not survive a root change.
+    /// Content-addressed staged files remain under `PinsetCache` ownership.
+    pub fn cleanup_stubs(&self) {
         if let Ok(entries) = std::fs::read_dir(&self.staging_dir) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {

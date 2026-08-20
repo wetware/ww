@@ -160,7 +160,6 @@ async fn harness(wasm: &[u8]) -> Harness {
         seq: 1,
         head: b"t1".to_vec(),
         root: None,
-        provenance: authority::Provenance::Block(1),
     };
     let (epoch_tx, epoch_rx) = watch::channel(epoch);
     let guard = authority::EpochGuard {

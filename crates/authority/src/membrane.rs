@@ -130,7 +130,6 @@ mod tests {
             seq,
             head: vec![0xAB, 0xCD],
             root: None,
-            provenance: crate::epoch::Provenance::Block(42),
         }
     }
 
@@ -141,7 +140,6 @@ mod tests {
         let epoch = server.get_current_epoch();
         assert_eq!(epoch.seq, 1);
         assert_eq!(epoch.head, vec![0xAB, 0xCD]);
-        assert_eq!(epoch.provenance, crate::epoch::Provenance::Block(42));
     }
 
     #[test]

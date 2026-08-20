@@ -10,7 +10,6 @@ Nothing in `crates/` ships in the namespace directly.
 | `ipfs/` | Kubo and IPFS integration. |
 | `membrane/` | Hook-level capability policy and recursive wrapping. |
 | `rpc/` | Cap'n Proto and libp2p transport implementations. |
-| `stem/` | Epoch sources -- StemSource trait for atomic (on-chain) and eventual (IPNS) backends. |
 | `atom/` | On-chain Atom -- linearizable register backed by a smart contract. |
 | `cache/` | CID cache -- content-addressed storage layer. |
 | `guest/auth/` | Shared auth types -- common authentication structures. |

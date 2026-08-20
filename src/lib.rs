@@ -13,6 +13,8 @@ pub const GIT_COMMIT: &str = env!("GIT_COMMIT");
 #[cfg(not(target_arch = "wasm32"))]
 pub use cell;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod deployment;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod discovery;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dispatcher;
@@ -34,6 +36,8 @@ pub use rpc;
 pub use rpc::keys;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod services;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stem;
 
 // Re-export capnp schema modules from the authority crate so host code can
 // use `crate::system_capnp`, `crate::routing_capnp`, `crate::auth_capnp`, etc.

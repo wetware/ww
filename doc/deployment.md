@@ -4,6 +4,35 @@
 repository decides which image digest runs in the cluster. A merge to `ww`
 master is therefore a release build, not a production deployment.
 
+## Runtime deployment lifecycle
+
+The host-side `deployment` module owns runtime deployment transitions. A
+deployment combines an optional authoritative Stem head with configured frozen
+root layers. Later layers override earlier layers during DAG composition.
+
+The boot deployment always uses local epoch `0`. An Atom contract revision is
+diagnostic Source state; it never becomes `Epoch.seq`. A host restart allocates
+epoch `0` again. Static startup prepares the frozen layers through the same
+path, publishes a rooted epoch `0`, and starts no Source task.
+
+For a replacement, deployment publishes the new local epoch with `root: None`
+before root preparation. This publication revokes old authority. Deployment
+then prepares a `PreparedRoot` while the old `kernel::Generation` terminates.
+Preparation pins the head, merges the head with frozen layers, pins the
+effective root, and pre-warms the root without changing `CidTree`.
+
+Deployment drains queued Source updates after preparation and teardown. A
+newer update supersedes the prepared root. If the prepared root remains current,
+deployment waits for old PID0 to stop, calls `CidTree::swap_root`, and publishes
+`root: Some(...)` without an intervening await. The CLI then requests the next
+ordinary generation through deployment. The CLI retains interactive behavior,
+exit codes, signals, and teardown-timeout process policy.
+
+Deployment tracks frozen, active, preparation-attempt, and failed-unpin pin
+ownership. It does not unpin a CID that another live category references.
+`CidTree::swap_root` only changes the root and clears its in-memory directory
+cache. Deployment removes stale readdir stubs after rooted publication.
+
 ## Artifact publication
 
 ```text
@@ -156,9 +185,9 @@ calls, not an entire image merge, so a slow valid multi-layer merge can make
 progress. `/healthz` remains available and `/readyz` remains closed while a
 mandatory mount call retries. Namespace fallback to its bootstrap CID marks
 the runtime degraded. This is not a global HTTP timeout: content reads and
-DHT activity after startup remain unbounded by it. Initial-head and namespace
-pins are best-effort, so a failed or stalled pin is logged and does not delay
-serving.
+DHT activity after startup remain unbounded by it. Configured-layer,
+Stem-head, and effective-root pins gate deployment activation. A transient pin
+failure keeps readiness closed and enters the deployment retry policy.
 
 Related references: [architecture](architecture.md),
 [capability model](capabilities.md), and [CLI](cli.md).

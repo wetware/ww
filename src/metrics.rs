@@ -613,14 +613,13 @@ impl crate::services::Service for AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use authority::{Epoch, Provenance};
+    use authority::Epoch;
 
     fn test_state() -> AdminState {
         let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(Epoch {
             seq: 1,
             head: Vec::new(),
             root: None,
-            provenance: Provenance::Block(0),
         });
         let kernel_ready_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx));
         let source = crate::kernel::Source::Embedded("main");
@@ -668,7 +667,6 @@ mod tests {
             seq,
             head: Vec::new(),
             root: None,
-            provenance: Provenance::Block(0),
         }
     }
 

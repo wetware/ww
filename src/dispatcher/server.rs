@@ -30,7 +30,6 @@ pub use rpc::dispatch::{
 /// ```text
 /// Host supervisor
 ///  ├── Thread: SwarmService
-///  ├── Thread: EpochService
 ///  ├── Thread: WagiService  ← this
 ///  └── Threads: ExecutorPool
 /// ```
@@ -170,7 +169,7 @@ pub use rpc::dispatch::extract_server_info;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use authority::{system_capnp, Epoch, EpochGuard, Provenance};
+    use authority::{system_capnp, Epoch, EpochGuard};
     use capnp::capability::Promise;
 
     struct DispatchTestExecutor;
@@ -243,7 +242,6 @@ mod tests {
                     seq: 1,
                     head: Vec::new(),
                     root: None,
-                    provenance: Provenance::Block(0),
                 });
                 let registry = new_registry();
                 let listener: system_capnp::http_listener::Client =
@@ -269,7 +267,6 @@ mod tests {
                     seq: 2,
                     head: Vec::new(),
                     root: None,
-                    provenance: Provenance::Block(0),
                 });
                 assert_eq!(
                     registry.read().expect("registry lock").len(),

@@ -55,7 +55,6 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
                 seq: 1,
                 head: vec![],
                 root: None,
-                provenance: authority::Provenance::Block(0),
             };
             let (_epoch_tx, epoch_rx) = watch::channel(epoch);
             let guard = authority::EpochGuard {

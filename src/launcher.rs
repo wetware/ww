@@ -601,7 +601,6 @@ mod tests {
             seq,
             head: Vec::new(),
             root: None,
-            provenance: authority::Provenance::Block(seq),
         });
         (
             sender,
@@ -690,7 +689,6 @@ mod tests {
                     seq: 2,
                     head: Vec::new(),
                     root: None,
-                    provenance: authority::Provenance::Block(2),
                 });
 
                 let mut stale_load = runtime.load_request();

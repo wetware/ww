@@ -17,7 +17,6 @@ reqwest = { workspace = true, features = ["rustls-tls", "json"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha3 = "0.10"
-thiserror = "1"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
 tokio-tungstenite = "0.24"
 tracing = { workspace = true }
@@ -38,7 +37,3 @@ futures = { workspace = true }
 [[example]]
 name = "atom_indexer"
 path = "examples/atom_indexer.rs"
-
-[[example]]
-name = "finalizer"
-path = "examples/finalizer.rs"

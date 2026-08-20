@@ -612,7 +612,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use authority::{Epoch, KernelReadyError, Provenance};
+    use authority::{Epoch, KernelReadyError};
     use capnp::traits::{Imbue, ImbueMut};
     use ed25519_dalek::Signer;
     use futures::FutureExt;
@@ -660,7 +660,6 @@ mod tests {
             seq,
             head: seq.to_be_bytes().to_vec(),
             root: None,
-            provenance: Provenance::Block(seq),
         }
     }
 
@@ -732,7 +731,6 @@ mod tests {
             seq: 1,
             head: b"test".to_vec(),
             root: None,
-            provenance: Provenance::Block(100),
         };
         let (tx, rx) = tokio::sync::watch::channel(epoch);
         let guard = EpochGuard {
@@ -755,7 +753,6 @@ mod tests {
             seq: 1,
             head: b"pid0".to_vec(),
             root: None,
-            provenance: Provenance::Block(1),
         };
         let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch);
         let guard = EpochGuard {
@@ -1043,7 +1040,6 @@ mod tests {
                     seq: 1,
                     head: b"pid0-session".to_vec(),
                     root: None,
-                    provenance: Provenance::Block(1),
                 };
                 let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch);
                 let guard = EpochGuard {
@@ -1177,7 +1173,6 @@ mod tests {
                     seq: 1,
                     head: b"pid0-rpc".to_vec(),
                     root: None,
-                    provenance: Provenance::Block(1),
                 };
                 let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(epoch);
                 let (swarm_tx, _swarm_rx) = mpsc::channel(1);
@@ -1489,7 +1484,6 @@ mod tests {
                     seq: 2,
                     head: b"new".to_vec(),
                     root: None,
-                    provenance: Provenance::Block(101),
                 })
                 .unwrap();
 

@@ -5,7 +5,7 @@ model an agent receives at birth,
 the membrane mechanism that enforces attenuation, and the three
 configuration surfaces that determine what the agent can do.
 
-For the host-side architecture (cell layout, epoch pipeline, layer
+For the host-side architecture (cell layout, deployment lifecycle, layer
 resolution), see [architecture.md](architecture.md).
 
 ## Content as capability
@@ -43,10 +43,10 @@ references exist where*:
 Trusted pid0 receives the host graft; each ordinary child receives only its
 immutable `InitialAuthorityRecord`, constructed from the parent's explicit
 grants and delivered through `InitialGrants.get()`. The root Atom binding flows
-through `stem::Atom`. When the Atom value changes, the host first broadcasts an
-authoritative epoch whose `root` is `None`. That broadcast invalidates the old
-generation's capabilities and causes PID0 teardown before filesystem
-preparation. The host composes the new head with the frozen boot overlays,
+through `ww::stem::atom::Source`. When the Atom value changes, the host first
+broadcasts an authoritative epoch whose `root` is `None`. That broadcast
+invalidates the old generation's capabilities and causes PID0 teardown before
+filesystem preparation. The host composes the new head with the frozen boot overlays,
 gates activation on the head and effective-root pins, pre-warms and swaps
 `CidTree`, then broadcasts `root: Some(effective)`. The generation loop starts
 PID0 only from the rooted broadcast. `WW_ROOT` identifies the guest-visible

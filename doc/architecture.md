@@ -104,36 +104,50 @@ three-phase handoff remains an upstream limitation.
 
 ## Epoch and PID0 lifecycle
 
-An **epoch** is the host-issued authority timeslot and PID0 deployment
-generation. One PID0 instance belongs to one generation. An epoch advance
-first broadcasts the authoritative head with no effective root. This broadcast
-closes readiness, invalidates host-issued references, expires route leases, and
-causes the host to terminate the current PID0 instance. The old generation is
-never restored after this broadcast.
+An **epoch** is a host-local authority generation. Every host process assigns
+epoch `0` to its boot deployment. Each accepted authoritative transition uses
+checked local increment. Backend revisions, Atom blocks, timestamps, and
+provenance do not become `Epoch.seq` and do not survive a process restart.
 
-The host then applies the boot filesystem composition to the new head. The
-composition order is the head, frozen namespace layers, then frozen user root
-mounts. Later layers retain precedence. The host pins the head and effective
-root, pre-warms the effective root, swaps `CidTree`, and broadcasts the rooted
-epoch. A non-interactive daemon starts PID0 only from this rooted epoch. An
-interactive `ww run` invocation exits successfully at the authority broadcast.
+An optional `stem::Source` establishes the authoritative mutable base head.
+The backend adapter applies its consistency rule before returning an update.
+The Atom adapter polls `Atom.head()` at `tip - confirmation_depth`; contract
+events are not part of its correctness path. Without a Stem, deployment
+composes the configured frozen layers at epoch `0` and starts no source task.
 
-The Host retries only positively classified transient preparation failures.
-Transport failures, Kubo 5xx responses, unavailable content, and the operation
-timeout use jittered exponential backoff. Readiness stays closed, and the old
-PID0 stays terminated, during every retry. A newer authoritative epoch replaces
-the pending target and resets the backoff. Pre-network input failures and
-unclassified failures stop `EpochService`, which makes the daemon exit nonzero.
-PID0 owns failures from guest composition and service setup. The Host does not
-inspect PID0 errors to decide whether to retry.
+`deployment` owns every transition. After it accepts a Source update, it first
+publishes the incremented epoch with `root: None`. That publication closes
+readiness, invalidates host-issued references, and expires route leases.
+Deployment then terminates the current PID0 while it pins, merges, and pre-warms
+the candidate root. The physical `CidTree` root remains unchanged during this
+work.
+
+After preparation and old-generation teardown both complete, deployment drains
+queued Source updates. A newer update discards the prepared candidate and
+starts preparation for the newer local epoch. Otherwise deployment swaps
+`CidTree` and synchronously publishes the same epoch with `root: Some(...)`.
+No await occurs between those operations. Deployment starts the next
+`kernel::Generation` only after rooted publication, so two kernel generations
+cannot be live at the same time.
+
+An `InvalidHead` is an authoritative transition. Deployment publishes
+`root: None`, terminates old PID0, remains alive without a replacement, and
+waits for a later valid update. A Source error does not advance the epoch and
+does not revoke the current deployment.
+
+Deployment retries classified transient preparation failures with jittered
+exponential backoff. Readiness stays closed and the old PID0 stays terminated
+during retry. A newer authoritative update supersedes in-progress preparation
+or retry. PID0 owns guest composition and service-setup failures; deployment
+does not reinterpret a kernel result as a preparation failure.
 
 The Host captures each generation's epoch sequence and filesystem root before
 spawn. PID0's process-local graft uses that captured sequence. The graft fails
 if the live epoch has changed. The private readiness commit also rejects a
 captured sequence that is no longer live. PID0 therefore cannot combine one
 generation's filesystem root with another generation's authority or readiness.
-Rapid advances converge to the newest rooted epoch. An epoch superseded during
-Host preparation does not activate.
+Rapid advances converge to the newest rooted epoch. A superseded
+`PreparedRoot` does not activate.
 
 Route registrations are epoch-scoped and identity-owned. A stale registration
 stops dispatching immediately, and cleanup from an old registration cannot

@@ -49,10 +49,10 @@ Layers stack with per-file union; later layers win.
 | `--executor-threads <N>` | `0` | Executor worker threads (0 = auto-detect, one per CPU core) |
 | `--runtime-cache-policy` | `shared` | `shared`: same WASM bytes share Executor. `isolated`: always fresh. |
 | `--ipfs-url <URL>` | `http://localhost:5001` | IPFS HTTP API endpoint. Also reads `IPFS_API` env. |
-| `--stem <ADDR>` | none | Atom contract address (hex, 0x-prefixed). Enables epoch pipeline. |
-| `--rpc-url <URL>` | `http://127.0.0.1:8545` | HTTP JSON-RPC for eth_call/eth_getLogs |
-| `--ws-url <URL>` | `ws://127.0.0.1:8545` | WebSocket JSON-RPC for eth_subscribe |
-| `--confirmation-depth <N>` | `6` | Blocks before finalizing HeadUpdated events |
+| `--stem <ADDR>` | none | Atom contract address (hex, 0x-prefixed). Enables authoritative deployment following. |
+| `--rpc-url <URL>` | `http://127.0.0.1:8545` | HTTP JSON-RPC for finalized-depth `eth_blockNumber` and `eth_call` polling. |
+| `--ws-url <URL>` | `ws://127.0.0.1:8545` | Deprecated compatibility option. Atom following does not require event subscriptions. |
+| `--confirmation-depth <N>` | `6` | Chain depth used when reading authoritative `Atom.head()` state. |
 | `--epoch-drain-secs <N>` | `1` | Deprecated compatibility option. The value is ignored. Epoch authority advances immediately. |
 
 ### Examples
@@ -73,7 +73,7 @@ ww run --identity ~/.ww/identity images/app /ipfs/QmDataLayer
 # Run from IPFS
 ww run /ipfs/QmHash...
 
-# On-chain epoch lifecycle
+# Atom-backed deployment lifecycle
 ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 ```
 

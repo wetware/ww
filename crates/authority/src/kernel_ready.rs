@@ -90,14 +90,12 @@ impl KernelReadyGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Provenance;
 
     fn epoch(seq: u64) -> Epoch {
         Epoch {
             seq,
             head: Vec::new(),
             root: None,
-            provenance: Provenance::Block(0),
         }
     }
 
