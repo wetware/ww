@@ -34,6 +34,29 @@ as layers (later mounts override earlier ones):
 
 Targeted mounts (`source:/guest/path`) are not accepted by backend virtual mode.
 
+## Installed host layout
+
+`ww perform install` and `ww perform update` separate private host state from
+the local image root:
+
+```
+~/.ww/
+  identity              # private node identity
+  etc/ns/               # host-only namespace configuration
+  logs/                  # host logs
+  run/                   # host runtime state
+  fhs/                   # publishable local image root
+    bin/status.wasm      # status component used by the shipped Rust PID0
+```
+
+The generated service recursively imports only `~/.ww/fhs` and explicit image
+arguments. The service reads `~/.ww/etc/ns` through a separate host-only
+configuration argument. The service does not mount `~/.ww` as an image.
+
+Put intentional local image content under `~/.ww/fhs`, or pass an explicit
+image path to `ww daemon install`. Do not put private host state in an image
+root because Kubo can store, pin, and provide every imported file.
+
 ## On-chain coordination
 
 The `--stem` flag connects to an Atom contract on an EVM chain.

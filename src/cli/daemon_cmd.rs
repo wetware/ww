@@ -17,6 +17,8 @@ pub(super) fn default_listen() -> Vec<String> {
 pub(super) struct DaemonServiceConfig {
     pub listen: Vec<String>,
     pub identity: PathBuf,
+    /// Host-only roots whose `etc/ns` directories configure namespace layers.
+    pub namespace_roots: Vec<PathBuf>,
     pub images: Vec<PathBuf>,
     /// Address (`host:port`) for the WAGI HTTP server. `None` disables WAGI.
     pub http_listen: Option<String>,
@@ -25,13 +27,14 @@ pub(super) struct DaemonServiceConfig {
 /// Register wetware as a user-level background service.
 ///
 /// When `quiet` is true, suppresses status output (used by `perform install`
-/// which prints its own summary).
+/// which prints its own summary). Returns whether the rendered service
+/// definition differs from the definition that was on disk.
 pub(super) async fn daemon_install(
     identity: Option<PathBuf>,
     listen: Vec<Multiaddr>,
     images: Vec<String>,
     quiet: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
     let ww_dir = home.join(".ww");
 
@@ -59,25 +62,67 @@ pub(super) async fn daemon_install(
         listen.iter().map(|a| a.to_string()).collect()
     };
 
-    let image_layers = if images.is_empty() {
-        vec![ww_dir]
+    let (namespace_roots, image_layers) = if images.is_empty() {
+        let (fhs_dir, _) = refresh_default_fhs(&ww_dir)?;
+        (vec![ww_dir.clone()], vec![fhs_dir])
     } else {
-        images.iter().map(PathBuf::from).collect()
+        (Vec::new(), images.iter().map(PathBuf::from).collect())
     };
 
     // Default WAGI HTTP listener so Rust PID0 responds to curl on first boot.
     let config = DaemonServiceConfig {
         listen: listen_addrs,
         identity: key_path.clone(),
+        namespace_roots,
         images: image_layers,
         http_listen: Some("127.0.0.1:2080".to_string()),
     };
 
     // 3. Write platform service file.
     let ww_bin = std::env::current_exe().context("cannot determine ww binary path")?;
-    write_service_file(&ww_bin, &config, &home, quiet)?;
+    write_service_file(&ww_bin, &config, &home, quiet)
+}
 
-    Ok(())
+/// Materialize the install-owned FHS layer outside the private host-state tree.
+///
+/// Release binaries carry the status component. Install-script layouts from
+/// older versions provide the same bytes under `~/.ww/std/status`.
+pub(super) fn refresh_default_fhs(ww_dir: &Path) -> Result<(PathBuf, bool)> {
+    let fhs_dir = ww_dir.join("fhs");
+    let bin_dir = fhs_dir.join("bin");
+    let mut changed = !bin_dir.exists();
+    std::fs::create_dir_all(&bin_dir).context("create ~/.ww/fhs/bin")?;
+
+    let status_path = bin_dir.join("status.wasm");
+    let legacy_status_path = ww_dir.join("std/status/bin/status.wasm");
+    let status_bytes = if !super::EMBEDDED_STATUS.is_empty() {
+        Some(super::EMBEDDED_STATUS.to_vec())
+    } else {
+        match std::fs::read(&legacy_status_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read {}", legacy_status_path.display()));
+            }
+        }
+    };
+    if let Some(status_bytes) = status_bytes {
+        let current = match std::fs::read(&status_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", status_path.display()));
+            }
+        };
+        if current.as_deref() != Some(status_bytes.as_slice()) {
+            std::fs::write(&status_path, status_bytes)
+                .context("write ~/.ww/fhs/bin/status.wasm")?;
+            changed = true;
+        }
+    }
+
+    Ok((fhs_dir, changed))
 }
 
 /// Remove the platform service file.
@@ -116,12 +161,13 @@ pub(super) async fn daemon_uninstall() -> Result<()> {
 }
 
 /// Write a platform-specific service file and print the activation command.
+/// Returns whether the rendered definition differs from the prior file bytes.
 pub(super) fn write_service_file(
     ww_bin: &Path,
     config: &DaemonServiceConfig,
     home: &Path,
     quiet: bool,
-) -> Result<()> {
+) -> Result<bool> {
     // Identity as a --identity CLI flag (NOT a :/etc/identity mount).
     // The host reads it to create the signing key; it never enters
     // the merged FHS tree visible to guests.
@@ -136,6 +182,14 @@ pub(super) fn write_service_file(
     }
 }
 
+fn service_definition_differs(path: &Path, definition: &[u8]) -> Result<bool> {
+    match std::fs::read(path) {
+        Ok(existing) => Ok(existing != definition),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
 /// Write a macOS launchd plist.
 pub(super) fn write_launchd_plist(
     ww_bin: &Path,
@@ -143,7 +197,7 @@ pub(super) fn write_launchd_plist(
     home: &Path,
     identity_path: &str,
     quiet: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let plist_dir = home.join("Library/LaunchAgents");
     std::fs::create_dir_all(&plist_dir).context("create ~/Library/LaunchAgents")?;
 
@@ -169,6 +223,11 @@ pub(super) fn write_launchd_plist(
     if let Some(ref addr) = config.http_listen {
         args.push("        <string>--http-listen</string>".to_string());
         args.push(format!("        <string>{addr}</string>"));
+    }
+    // Namespace configuration is host state, not an image mount.
+    for root in &config.namespace_roots {
+        args.push("        <string>--namespace-root</string>".to_string());
+        args.push(format!("        <string>{}</string>", root.display()));
     }
     // Image layers (root mounts).
     for img in &config.images {
@@ -207,6 +266,7 @@ pub(super) fn write_launchd_plist(
         log = log_path.display(),
     );
 
+    let changed = service_definition_differs(&plist_path, plist.as_bytes())?;
     std::fs::write(&plist_path, plist)
         .with_context(|| format!("write plist: {}", plist_path.display()))?;
     if !quiet {
@@ -216,7 +276,7 @@ pub(super) fn write_launchd_plist(
         eprintln!("  launchctl load {}", plist_path.display());
     }
 
-    Ok(())
+    Ok(changed)
 }
 
 /// Write a Linux systemd user unit.
@@ -226,7 +286,7 @@ pub(super) fn write_systemd_unit(
     home: &Path,
     identity_path: &str,
     quiet: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let unit_dir = home.join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir).context("create ~/.config/systemd/user")?;
 
@@ -248,12 +308,19 @@ pub(super) fn write_systemd_unit(
         Some(addr) => format!(" --http-listen {addr}"),
         None => String::new(),
     };
+    let namespace_args = config
+        .namespace_roots
+        .iter()
+        .map(|root| format!("--namespace-root {}", root.display()))
+        .collect::<Vec<_>>()
+        .join(" ");
     let exec_start = format!(
-        "{} run {} --identity {}{} {}",
+        "{} run {} --identity {}{} {} {}",
         ww_bin.display(),
         listen_args,
         identity_path,
         http_listen_arg,
+        namespace_args,
         positional.join(" "),
     );
 
@@ -273,6 +340,7 @@ pub(super) fn write_systemd_unit(
          WantedBy=default.target\n"
     );
 
+    let changed = service_definition_differs(&unit_path, unit.as_bytes())?;
     std::fs::write(&unit_path, unit)
         .with_context(|| format!("write unit: {}", unit_path.display()))?;
     if !quiet {
@@ -282,5 +350,5 @@ pub(super) fn write_systemd_unit(
         eprintln!("  systemctl --user enable --now ww");
     }
 
-    Ok(())
+    Ok(changed)
 }
