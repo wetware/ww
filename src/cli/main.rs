@@ -81,6 +81,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Initialize a new typed cell guest project.
     ///
@@ -117,6 +118,10 @@ enum Commands {
         /// Mount source(s) at `/` (image layers).
         #[arg(default_value = ".", value_name = "MOUNT")]
         mounts: Vec<String>,
+
+        /// Host-only roots whose `etc/ns` directories configure namespace layers.
+        #[arg(long, value_name = "PATH", hide = true)]
+        namespace_root: Vec<PathBuf>,
 
         /// libp2p listen multiaddr. Repeatable; comma-separated via WW_LISTEN.
         /// Defaults to TCP and QUIC on both IPv4 and IPv6 at port 2025.
@@ -722,6 +727,7 @@ impl Commands {
             Commands::Build { path } => Self::build(path).await,
             Commands::Run {
                 mounts: mount_args,
+                namespace_root,
                 listen,
                 wasm_debug,
                 kernel,
@@ -764,6 +770,7 @@ impl Commands {
                 };
                 Self::run_with_mounts(
                     mounts,
+                    namespace_root,
                     identity_path,
                     insecure_ephemeral,
                     listen,
@@ -806,7 +813,9 @@ impl Commands {
                     identity,
                     listen,
                     images,
-                } => Self::daemon_install(identity, listen, images, false).await,
+                } => Self::daemon_install(identity, listen, images, false)
+                    .await
+                    .map(|_| ()),
                 DaemonAction::Uninstall => Self::daemon_uninstall().await,
             },
             Commands::Push {
@@ -1412,7 +1421,7 @@ wasip2::cli::command::export!({iface_name}Guest);
         listen: Vec<Multiaddr>,
         images: Vec<String>,
         quiet: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         daemon_cmd::daemon_install(identity, listen, images, quiet).await
     }
 
@@ -1425,6 +1434,7 @@ wasip2::cli::command::export!({iface_name}Guest);
     #[allow(clippy::too_many_arguments)]
     async fn run_with_mounts(
         mounts: Vec<ww::cell::mount::Mount>,
+        namespace_roots: Vec<PathBuf>,
         identity: Option<PathBuf>,
         insecure_ephemeral: bool,
         listen: Vec<Multiaddr>,
@@ -1469,7 +1479,12 @@ wasip2::cli::command::export!({iface_name}Guest);
             .filter(|mount| mount.is_root() && !ww::ipfs::is_ipfs_path(&mount.source))
             .map(|mount| std::path::Path::new(&mount.source))
             .collect();
-        let ns_configs = ww::ns::scan_namespace_configs(&local_roots)
+        let namespace_scan_roots: Vec<&std::path::Path> = namespace_roots
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(local_roots.iter().copied())
+            .collect();
+        let ns_configs = ww::ns::scan_namespace_configs(&namespace_scan_roots)
             .context("Failed to scan namespace configs")?;
 
         ww::config::init_tracing_to_stderr(false);
@@ -2259,16 +2274,17 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
         }
 
-        // ── Daemon config + service file (unconditional) ─────────────
+        // ── Install-owned FHS + daemon service file (unconditional) ──
         let identity_path = ww_dir.join("identity");
-        // Mount ~/.ww as the single root layer. WASM cells are resolved
-        // from the embedded loader or IPNS namespace.
-        let image_layers: Vec<String> = vec![ww_dir.display().to_string()];
-        Self::daemon_install(Some(identity_path), Vec::new(), image_layers, true).await?;
+        let (_, install_layer_changed) = daemon_cmd::refresh_default_fhs(&ww_dir)?;
+        // Empty images select ~/.ww/fhs and read ~/.ww/etc/ns through the
+        // separate host-only namespace root.
+        let service_definition_changed =
+            Self::daemon_install(Some(identity_path), Vec::new(), Vec::new(), true).await?;
         done("Background daemon".into());
 
-        // ── Restart daemon (only if images changed) ─────────────────
-        if !any_images_changed {
+        // ── Restart daemon when deployed content or its boundary changed ─
+        if !any_images_changed && !install_layer_changed && !service_definition_changed {
             skip("Daemon restart (nothing changed)".into());
         } else {
             match Self::restart_user_daemon(&home) {
@@ -2903,6 +2919,7 @@ mod tests {
     fn test_run_command_rejects_targeted_mounts_preflight() {
         let cmd = Commands::Run {
             mounts: vec![".".to_string(), "~/.ww/identity:/etc/identity".to_string()],
+            namespace_root: Vec::new(),
             listen: Vec::new(),
             wasm_debug: false,
             kernel: None,
@@ -3144,6 +3161,7 @@ mod tests {
         daemon_cmd::DaemonServiceConfig {
             listen: vec!["/ip4/0.0.0.0/tcp/2025".to_string()],
             identity: PathBuf::from("/tmp/identity"),
+            namespace_roots: vec![PathBuf::from("/tmp/host-state")],
             images: Vec::new(),
             http_listen: Some(addr.to_string()),
         }
@@ -3153,6 +3171,7 @@ mod tests {
         daemon_cmd::DaemonServiceConfig {
             listen: vec!["/ip4/0.0.0.0/tcp/2025".to_string()],
             identity: PathBuf::from("/tmp/identity"),
+            namespace_roots: Vec::new(),
             images: Vec::new(),
             http_listen: None,
         }
@@ -3164,8 +3183,15 @@ mod tests {
         let config = config_with_http_listen("127.0.0.1:2080");
         let ww_bin = std::path::Path::new("/usr/local/bin/ww");
 
-        daemon_cmd::write_launchd_plist(ww_bin, &config, home.path(), "/tmp/identity", true)
-            .expect("write plist should succeed");
+        let changed =
+            daemon_cmd::write_launchd_plist(ww_bin, &config, home.path(), "/tmp/identity", true)
+                .expect("write plist should succeed");
+        assert!(changed, "a missing plist should count as changed");
+
+        let changed =
+            daemon_cmd::write_launchd_plist(ww_bin, &config, home.path(), "/tmp/identity", true)
+                .expect("rewrite identical plist should succeed");
+        assert!(!changed, "an identical plist should not count as changed");
 
         let plist =
             std::fs::read_to_string(home.path().join("Library/LaunchAgents/io.wetware.ww.plist"))
@@ -3178,6 +3204,11 @@ mod tests {
         assert!(
             plist.contains("<string>127.0.0.1:2080</string>"),
             "plist should emit the configured listen address, got:\n{plist}"
+        );
+        assert!(
+            plist.contains("<string>--namespace-root</string>")
+                && plist.contains("<string>/tmp/host-state</string>"),
+            "plist should read namespace configuration through a host-only root, got:\n{plist}"
         );
     }
 
@@ -3206,8 +3237,15 @@ mod tests {
         let config = config_with_http_listen("127.0.0.1:2080");
         let ww_bin = std::path::Path::new("/usr/local/bin/ww");
 
-        daemon_cmd::write_systemd_unit(ww_bin, &config, home.path(), "/tmp/identity", true)
-            .expect("write unit should succeed");
+        let changed =
+            daemon_cmd::write_systemd_unit(ww_bin, &config, home.path(), "/tmp/identity", true)
+                .expect("write unit should succeed");
+        assert!(changed, "a missing unit should count as changed");
+
+        let changed =
+            daemon_cmd::write_systemd_unit(ww_bin, &config, home.path(), "/tmp/identity", true)
+                .expect("rewrite identical unit should succeed");
+        assert!(!changed, "an identical unit should not count as changed");
 
         let unit = std::fs::read_to_string(home.path().join(".config/systemd/user/ww.service"))
             .expect("unit should exist");
@@ -3215,6 +3253,10 @@ mod tests {
         assert!(
             unit.contains("--http-listen 127.0.0.1:2080"),
             "systemd unit should emit --http-listen flag with addr, got:\n{unit}"
+        );
+        assert!(
+            unit.contains("--namespace-root /tmp/host-state"),
+            "systemd unit should read namespace configuration through a host-only root, got:\n{unit}"
         );
     }
 
@@ -3234,5 +3276,33 @@ mod tests {
             !unit.contains("--http-listen"),
             "systemd unit should NOT emit --http-listen when config.http_listen is None, got:\n{unit}"
         );
+    }
+
+    #[test]
+    fn default_fhs_materializes_status_once() {
+        let home = tempfile::tempdir().expect("temp home");
+        let ww_dir = home.path().join(".ww");
+        let legacy_status = b"legacy status component";
+        let legacy_path = ww_dir.join("std/status/bin/status.wasm");
+        std::fs::create_dir_all(legacy_path.parent().expect("legacy status parent"))
+            .expect("create legacy status parent");
+        std::fs::write(&legacy_path, legacy_status).expect("write legacy status");
+
+        let (fhs_dir, changed) =
+            daemon_cmd::refresh_default_fhs(&ww_dir).expect("materialize default FHS");
+        assert!(changed);
+        let expected = if EMBEDDED_STATUS.is_empty() {
+            legacy_status.as_slice()
+        } else {
+            EMBEDDED_STATUS
+        };
+        assert_eq!(
+            std::fs::read(fhs_dir.join("bin/status.wasm")).expect("read installed status"),
+            expected
+        );
+
+        let (_, changed) =
+            daemon_cmd::refresh_default_fhs(&ww_dir).expect("refresh unchanged default FHS");
+        assert!(!changed);
     }
 }

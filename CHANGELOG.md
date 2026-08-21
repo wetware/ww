@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Default daemon images no longer publish private host state.** Installed
+  daemons import only `~/.ww/fhs` as their default deployment image. Identity
+  and namespace configuration remain host-side. Updates rewrite vulnerable
+  service definitions and restart the daemon when image content, default FHS
+  content, or the rendered service definition changes. Explicit images and
+  direct `ww run` behavior remain unchanged.
 - **Deployment lifecycle now has one host-side owner.** New `ww::stem` and
   `ww::deployment` modules replace `crates/stem`, `cell::epoch`, and
   `EpochService`. The Atom Source reads `Atom.head()` at finalized chain depth

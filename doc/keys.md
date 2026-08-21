@@ -35,7 +35,7 @@ challenge-response auth uses `try_into_ed25519()`. Guest auth
 
 Keys are stored as **base58btc** (Bitcoin alphabet, ~44 characters for 32 bytes)
 in a plain text file. Hex-encoded keys are also accepted on load for backward
-compatibility. The default location is `~/.ww/key`.
+compatibility. The default location is `~/.ww/identity`.
 
 Rationale:
 - Denser than hex (44 vs 64 chars), no ambiguous characters (no 0/O/I/l).
@@ -43,8 +43,9 @@ Rationale:
 - Key files belong on encrypted volumes or in a secrets manager at the
   infrastructure level, not wrapped in application-level encryption that just
   moves the password storage problem.
-- Private key material **never touches IPFS** or any other content-addressed
-  store. Even if the node CID is public, the key file stays local.
+- The installed daemon reads `~/.ww/identity` through `--identity`. Its default
+  image root is `~/.ww/fhs`, so the identity file does not enter the imported
+  image DAG. An explicit image path can still expose any key inside that path.
 
 ### Identity resolution
 
@@ -72,17 +73,17 @@ For daemon/service mode, pass identity through the same host flags/env:
 ww keygen
 
 # Save to a file
-ww keygen --output ~/.ww/key
-ww keygen > ~/.ww/key          # equivalent
+ww keygen --output ~/.ww/identity
+ww keygen > ~/.ww/identity          # equivalent
 
 # Run with a persistent identity
-ww run --identity ~/.ww/key images/my-app
+ww run --identity ~/.ww/identity images/my-app
 ```
 
 ## File format
 
 ```
-# ~/.ww/key — base58btc, ~44 chars (hex also accepted on load)
+# ~/.ww/identity — base58btc, ~44 chars (hex also accepted on load)
 6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5
 ```
 
@@ -92,7 +93,7 @@ ww run --identity ~/.ww/key images/my-app
 $ ww keygen 2>/dev/null
 6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5
 
-$ ww keygen --output ~/.ww/key
-Secret written to: /home/user/.ww/key
+$ ww keygen --output ~/.ww/identity
+Secret written to: /home/user/.ww/identity
 Peer ID:        12D3KooWAbcDef...
 ```
