@@ -30,3 +30,6 @@ tracing = { workspace = true }
 auth = { path = "../guest/auth" }
 ipfs = { path = "../ipfs" }
 authority = { package = "wetware-authority", path = "../authority" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -50,6 +50,8 @@ Layers stack with per-file union; later layers win.
 | `--runtime-cache-policy` | `shared` | `shared`: same WASM bytes share Executor. `isolated`: always fresh. |
 | `--ipfs-url <URL>` | `http://localhost:5001` | IPFS HTTP API endpoint. Also reads `IPFS_API` env. |
 | `--stem <ADDR>` | none | Atom contract address (hex, 0x-prefixed). Enables authoritative deployment following. |
+| `--ipns-stem <IPNS_NAME>` | none | Follow an IPNS name as the authoritative deployment Stem. Conflicts with `--stem`. |
+| `--ipns-routing-url <URL>` | `http://localhost:8080` | Kubo Gateway listener for raw HTTP Routing V1 records. Also reads `IPFS_ROUTING_API`. |
 | `--rpc-url <URL>` | `http://127.0.0.1:8545` | HTTP JSON-RPC for finalized-depth `eth_blockNumber` and `eth_call` polling. |
 | `--ws-url <URL>` | `ws://127.0.0.1:8545` | Deprecated compatibility option. Atom following does not require event subscriptions. |
 | `--confirmation-depth <N>` | `6` | Chain depth used when reading authoritative `Atom.head()` state. |
@@ -75,7 +77,26 @@ ww run /ipfs/QmHash...
 
 # Atom-backed deployment lifecycle
 ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
+
+# IPNS-backed deployment lifecycle
+ww run --ipns-stem k51qzi5uqu5... --ipns-routing-url http://localhost:8080
 ```
+
+The IPNS Stem accepts canonical Base36 names, legacy base58 Peer IDs, and
+`/ipns/`-prefixed forms. It is not an `/ipns/...` image mount. The Stem follows
+signed record changes and revokes the deployment at signed EOL when no valid
+replacement exists.
+
+Kubo 0.33 does not expose Routing V1 on the Gateway by default. Configure and
+restart Kubo before using an IPNS Stem or the installed default publisher:
+
+```sh
+ipfs config --json Gateway.ExposeRoutingAPI true
+```
+
+Use the Gateway listener, normally port 8080. Port 5001 is the administrative
+RPC listener and does not serve this path. Wetware does not fall back to Kubo's
+`name/resolve` or `name/publish` APIs for host-owned IPNS records.
 
 ### Environment variables
 
@@ -85,6 +106,7 @@ ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 | `WW_TTY` | host | Set to `1` when stdin is a terminal (triggers interactive shell mode) |
 | `WW_CELL_MODE` | host | Cell transport mode: `vat`, `raw`, `http`, or absent (kernel) |
 | `IPFS_API` | user | Default IPFS HTTP API endpoint |
+| `IPFS_ROUTING_API` | user | Kubo Gateway listener for HTTP Routing V1. Default: `http://localhost:8080`. |
 | `WW_HTTP_ADMIN` | user | Admin listener address, or `off` to disable it |
 | `WW_CWASM_DIR` | operator | Optional directory for Wasmtime's native compilation cache. Wasmtime owns artifact compatibility; an unavailable directory falls back to uncached compilation. |
 | `WW_CWASM_CACHE_MAX_BYTES` | operator | Wasmtime cache cleanup threshold in bytes (default: `335544320`). This is a soft limit, so leave filesystem headroom. |
@@ -169,8 +191,27 @@ Bootstrap `~/.ww` and the daemon.
 Idempotent: re-running skips completed steps, retries failed ones.
 
 1. Creates `~/.ww` directory structure
-2. Generates Ed25519 identity (if missing)
-3. Registers background daemon (launchd/systemd)
+2. Generates `~/.ww/identity` if missing
+3. Derives the host Peer ID and default Base36 IPNS name from that identity
+4. Writes the default namespace bootstrap and derived IPNS name
+5. Registers the background daemon (launchd/systemd)
+
+The command does not create a Kubo `"ww"` signing key. Kubo never receives the
+Wetware identity.
+
+### ww perform update
+
+Refresh embedded images, the default namespace, and the daemon definition.
+
+```sh
+ww perform update
+```
+
+The command keeps `~/.ww/identity`, rewrites the default namespace with the
+IPNS name derived from that identity, and passes the Routing V1 URL to the
+daemon. If Kubo is running without Routing V1, the command returns an error
+that includes the required Kubo configuration. The daemon signs and publishes
+the namespace record when it starts.
 
 ### ww perform upgrade
 
@@ -198,8 +239,12 @@ Register wetware as a user-level background service (launchd on
 macOS, systemd on Linux).
 
 ```
-ww daemon install [--identity PATH] [--listen MULTIADDR ...] [--images PATH...]
+ww daemon install [--identity PATH] [--listen MULTIADDR ...] [--images PATH...] [--ipns-routing-url URL]
 ```
+
+`--ipns-routing-url` defaults to `http://localhost:8080` and reads
+`IPFS_ROUTING_API`. Generated launchd and systemd definitions preserve the
+selected value.
 
 ### ww daemon uninstall
 

@@ -73,6 +73,30 @@ For IPNS updates, `publish` supports compare-and-set semantics:
 if `expected-current` is provided and does not match the currently
 resolved head, the call fails instead of silently overwriting.
 
+## Host IPNS records and guest `Routing.publish`
+
+The default host publisher and an IPNS Stem do not use the guest `Routing`
+capability. They use `src/ipns.rs` to sign or validate raw records locally and
+use Kubo only for HTTP Routing V1 transport:
+
+```text
+GET /routing/v1/ipns/{canonical-base36-name}
+Accept: application/vnd.ipfs.ipns-record
+
+PUT /routing/v1/ipns/{canonical-base36-name}
+Content-Type: application/vnd.ipfs.ipns-record
+```
+
+The default signer is `~/.ww/identity`. Kubo does not receive that private key.
+Follower and publisher records remain private under `~/.ww/ipns/` and outside
+the guest image root.
+
+Guest-visible `Routing.publish` is unchanged in this phase. It still calls
+Kubo `name/resolve` for its optional compare-and-set check and Kubo
+`name/publish` with the supplied key name. It does not use the host-owned
+publisher state or grant access to `~/.ww/identity`. Redesign of that capability
+remains deferred to ARCH-13.
+
 ## Limitations
 
 - **Content routing only.** No key-value store (`putValue`/`getValue`) — deferred.

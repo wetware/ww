@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use cid::Cid;
 
 pub mod atom;
+pub mod ipns;
 
 /// One deployable authoritative Stem head.
 #[derive(Clone, Debug, Eq, PartialEq)]

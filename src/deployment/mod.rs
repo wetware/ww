@@ -2871,6 +2871,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipns_eol_revokes_generation_and_real_source_recovers_host() {
+        use chrono::Utc;
+        use libp2p::identity::Keypair;
+        use rust_ipns::Record;
+
+        let state = tempfile::tempdir().unwrap();
+        let keypair = Keypair::generate_ed25519();
+        let name = keypair.public().to_peer_id();
+        let root: cid::Cid = ROOT.parse().unwrap();
+        let current = Record::new(
+            &keypair,
+            format!("/ipfs/{root}"),
+            Utc::now() + chrono::Duration::seconds(1),
+            1,
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        crate::ipns::RecordStore::follower(state.path(), name)
+            .persist(&current)
+            .unwrap();
+        let recovery = Record::new(
+            &keypair,
+            format!("/ipfs/{root}"),
+            Utc::now() + chrono::Duration::hours(1),
+            2,
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        let routing_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let routing_address = routing_listener.local_addr().unwrap();
+        let routing_server = tokio::spawn(async move {
+            for (status, body) in [
+                ("400 Bad Request", Vec::new()),
+                ("503 Service Unavailable", Vec::new()),
+                ("200 OK", recovery),
+            ] {
+                let (mut stream, _) = routing_listener.accept().await.unwrap();
+                let _request = read_request(&mut stream).await;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    crate::ipns::IPNS_RECORD_MEDIA_TYPE,
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        });
+        let source = crate::stem::ipns::Source::new(crate::stem::ipns::Config::new(
+            name,
+            format!("http://{routing_address}"),
+            state.path().to_path_buf(),
+        ))
+        .unwrap();
+        let (ipfs_client, _calls, _requests, shutdown_tx, ipfs_server) = recording_kubo().await;
+        let (epoch_tx, epoch_rx) = watch::channel(Epoch::zero());
+        let staging = tempfile::tempdir().unwrap();
+        let mut deployment = Deployment::bootstrap(
+            Config {
+                source: Some(Box::new(source)),
+                candidates: None,
+                frozen_layers: Vec::new(),
+                ipfs_client,
+                staging_dir: staging.path().to_path_buf(),
+            },
+            epoch_tx,
+            epoch_rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(deployment.current_epoch().root.as_deref(), Some(ROOT));
+        let mut epoch_observer = deployment.epoch_rx.clone();
+        epoch_observer.borrow_and_update();
+
+        let (running, result_tx, mut terminate_rx) = test_running_generation();
+        let outcome = {
+            let transition = deployment.await_generation(running);
+            tokio::pin!(transition);
+            tokio::select! {
+                _ = &mut transition => panic!("IPNS transition completed before revocation"),
+                changed = epoch_observer.changed() => changed.unwrap(),
+                _ = tokio::time::sleep(Duration::from_secs(3)) => {
+                    panic!("IPNS EOL did not revoke deployment")
+                }
+            }
+            assert_eq!(epoch_observer.borrow().seq, 1);
+            assert_eq!(epoch_observer.borrow().root, None);
+            terminate_rx.changed().await.unwrap();
+            result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), transition)
+                .await
+                .expect("IPNS recovery did not reactivate deployment")
+                .unwrap()
+        };
+
+        assert!(matches!(
+            outcome,
+            Outcome::Replaced {
+                old_epoch: 0,
+                new_epoch: 2,
+                ..
+            }
+        ));
+        assert_eq!(deployment.current_epoch().root.as_deref(), Some(ROOT));
+        assert!(
+            deployment.source_task.is_some(),
+            "host follower must remain alive"
+        );
+        routing_server.await.unwrap();
+        shutdown_tx.send(()).unwrap();
+        ipfs_server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn source_error_does_not_advance_the_epoch() {
         let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
         let staging = tempfile::tempdir().unwrap();

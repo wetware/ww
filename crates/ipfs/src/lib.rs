@@ -692,59 +692,6 @@ impl HttpClient {
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow::anyhow!("name publish response missing Name field"))
     }
-
-    /// List IPNS key names on the local Kubo node.
-    pub async fn key_list(&self) -> anyhow::Result<Vec<String>> {
-        let url = format!("{}/api/v0/key/list", self.base_url);
-        let response = self
-            .http_client
-            .post(&url)
-            .send()
-            .await
-            .context("IPFS key list request failed")?;
-        let status = response.status();
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .context("Failed to parse key list response")?;
-        if !status.is_success() {
-            let msg = body["Message"].as_str().unwrap_or("unknown error");
-            anyhow::bail!("IPFS key list failed ({}): {}", status, msg);
-        }
-        let keys = body["Keys"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|k| k["Name"].as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(keys)
-    }
-
-    /// Generate a new Ed25519 IPNS key. Returns the key's peer ID.
-    pub async fn key_gen(&self, name: &str) -> anyhow::Result<String> {
-        let url = format!("{}/api/v0/key/gen?arg={}&type=ed25519", self.base_url, name);
-        let response = self
-            .http_client
-            .post(&url)
-            .send()
-            .await
-            .context("IPFS key gen request failed")?;
-        let status = response.status();
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .context("Failed to parse key gen response")?;
-        if !status.is_success() {
-            let msg = body["Message"].as_str().unwrap_or("unknown error");
-            anyhow::bail!("IPFS key gen failed ({}): {}", status, msg);
-        }
-        body["Id"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("key gen response missing Id field"))
-    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,8 @@ use anyhow::{bail, Context, Result};
 use base58::{FromBase58, ToBase58};
 use ed25519_dalek::SigningKey;
 use libp2p::identity::Keypair;
+use std::io::Write;
+use std::path::Path;
 
 /// Generate a new random Ed25519 signing key using the OS CSPRNG.
 pub fn generate() -> Result<SigningKey> {
@@ -64,13 +66,97 @@ pub fn load(path: &str) -> Result<SigningKey> {
 
 /// Write a base58btc-encoded Ed25519 private key to disk.
 ///
-/// Parent directories are created as needed.
-pub fn save(sk: &SigningKey, path: &std::path::Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create key directory: {}", parent.display()))?;
+/// The replacement is written with mode 0600, synced, renamed atomically, and
+/// followed by a parent-directory sync. Parent directories created by this
+/// function use mode 0700 on Unix.
+pub fn save(sk: &SigningKey, path: &Path) -> Result<()> {
+    atomic_write_private(path, encode(sk).as_bytes())
+        .with_context(|| format!("write key: {}", path.display()))
+}
+
+/// Atomically replace one trusted private-state file.
+///
+/// Wetware supports one running process per private state directory. This
+/// helper provides crash durability, not multiprocess coordination or
+/// protection against malicious filesystem rollback.
+pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_private_with(path, |file| file.write_all(bytes))
+}
+
+fn atomic_write_private_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    use std::fs::OpenOptions;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_existed = parent.exists();
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create private-state directory: {}", parent.display()))?;
+    #[cfg(unix)]
+    if !parent_existed {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restrict private-state directory: {}", parent.display()))?;
     }
-    std::fs::write(path, encode(sk)).with_context(|| format!("write key: {}", path.display()))
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("private-state path has no UTF-8 file name")?;
+    let mut temporary = None;
+    for _ in 0..128 {
+        let candidate = parent.join(format!(
+            ".{name}.ww-tmp-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create temporary private-state file for {}", path.display())
+                });
+            }
+        }
+    }
+    let (temporary_path, mut file) =
+        temporary.context("could not allocate private-state temp file")?;
+
+    let result = (|| -> Result<()> {
+        write(&mut file).with_context(|| format!("write {}", temporary_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", temporary_path.display()))?;
+        drop(file);
+        std::fs::rename(&temporary_path, path).with_context(|| {
+            format!(
+                "replace private-state file {} with {}",
+                path.display(),
+                temporary_path.display()
+            )
+        })?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("sync private-state directory: {}", parent.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -115,5 +201,50 @@ mod tests {
     fn wrong_length_rejected() {
         let short = [1u8; 16].to_base58();
         assert!(decode(&short).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_is_restrictive_and_load_compatible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private/identity");
+        let key = generate().unwrap();
+        save(&key, &path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            load(path.to_str().unwrap()).unwrap().to_bytes(),
+            key.to_bytes()
+        );
+    }
+
+    #[test]
+    fn interrupted_write_preserves_canonical_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity");
+        std::fs::write(&path, b"canonical").unwrap();
+
+        let error = atomic_write_private_with(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("interrupted"))
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("interrupted"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"canonical");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

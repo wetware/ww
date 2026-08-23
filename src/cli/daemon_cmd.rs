@@ -22,6 +22,8 @@ pub(super) struct DaemonServiceConfig {
     pub images: Vec<PathBuf>,
     /// Address (`host:port`) for the WAGI HTTP server. `None` disables WAGI.
     pub http_listen: Option<String>,
+    /// Kubo Gateway listener that exposes HTTP Routing V1.
+    pub ipns_routing_url: String,
 }
 
 /// Register wetware as a user-level background service.
@@ -33,6 +35,7 @@ pub(super) async fn daemon_install(
     identity: Option<PathBuf>,
     listen: Vec<Multiaddr>,
     images: Vec<String>,
+    ipns_routing_url: String,
     quiet: bool,
 ) -> Result<bool> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
@@ -76,6 +79,7 @@ pub(super) async fn daemon_install(
         namespace_roots,
         images: image_layers,
         http_listen: Some("127.0.0.1:2080".to_string()),
+        ipns_routing_url,
     };
 
     // 3. Write platform service file.
@@ -219,6 +223,11 @@ pub(super) fn write_launchd_plist(
     // Identity as a --identity flag (host-side only, not a guest mount).
     args.push("        <string>--identity</string>".to_string());
     args.push(format!("        <string>{identity_path}</string>"));
+    args.push("        <string>--ipns-routing-url</string>".to_string());
+    args.push(format!(
+        "        <string>{}</string>",
+        config.ipns_routing_url
+    ));
     // WAGI HTTP listen addr (engagement starter kit: status endpoint on :2080).
     if let Some(ref addr) = config.http_listen {
         args.push("        <string>--http-listen</string>".to_string());
@@ -315,10 +324,11 @@ pub(super) fn write_systemd_unit(
         .collect::<Vec<_>>()
         .join(" ");
     let exec_start = format!(
-        "{} run {} --identity {}{} {} {}",
+        "{} run {} --identity {} --ipns-routing-url {}{} {} {}",
         ww_bin.display(),
         listen_args,
         identity_path,
+        config.ipns_routing_url,
         http_listen_arg,
         namespace_args,
         positional.join(" "),

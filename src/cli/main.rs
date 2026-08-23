@@ -157,8 +157,21 @@ enum Commands {
 
         /// Atom contract address (hex, 0x-prefixed). Enables authoritative
         /// deployment following and authority revocation on head changes.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "ipns_stem")]
         stem: Option<String>,
+
+        /// IPNS name to follow as the authoritative deployment Stem.
+        #[arg(long, value_name = "IPNS_NAME", conflicts_with = "stem")]
+        ipns_stem: Option<String>,
+
+        /// HTTP Routing V1 Gateway listener used for raw IPNS records.
+        /// Kubo 0.33 requires Gateway.ExposeRoutingAPI=true.
+        #[arg(
+            long,
+            default_value = "http://localhost:8080",
+            env = "IPFS_ROUTING_API"
+        )]
+        ipns_routing_url: String,
 
         /// HTTP JSON-RPC URL for finalized-depth Atom polling.
         #[arg(long, default_value = "http://127.0.0.1:8545")]
@@ -367,6 +380,14 @@ enum DaemonAction {
         /// Image layers to run (local paths or IPFS CIDs).
         #[arg(long, value_name = "PATH")]
         images: Vec<String>,
+
+        /// HTTP Routing V1 Gateway listener for host-owned IPNS publication.
+        #[arg(
+            long,
+            default_value = "http://localhost:8080",
+            env = "IPFS_ROUTING_API"
+        )]
+        ipns_routing_url: String,
     },
 
     /// Remove the platform service file.
@@ -734,6 +755,8 @@ impl Commands {
                 identity,
                 insecure_ephemeral,
                 stem,
+                ipns_stem,
+                ipns_routing_url,
                 rpc_url,
                 ws_url,
                 confirmation_depth,
@@ -777,6 +800,8 @@ impl Commands {
                     wasm_debug,
                     kernel_source,
                     stem,
+                    ipns_stem,
+                    ipns_routing_url,
                     rpc_url,
                     ws_url,
                     confirmation_depth,
@@ -813,7 +838,8 @@ impl Commands {
                     identity,
                     listen,
                     images,
-                } => Self::daemon_install(identity, listen, images, false)
+                    ipns_routing_url,
+                } => Self::daemon_install(identity, listen, images, ipns_routing_url, false)
                     .await
                     .map(|_| ()),
                 DaemonAction::Uninstall => Self::daemon_uninstall().await,
@@ -1420,9 +1446,10 @@ wasip2::cli::command::export!({iface_name}Guest);
         identity: Option<PathBuf>,
         listen: Vec<Multiaddr>,
         images: Vec<String>,
+        ipns_routing_url: String,
         quiet: bool,
     ) -> Result<bool> {
-        daemon_cmd::daemon_install(identity, listen, images, quiet).await
+        daemon_cmd::daemon_install(identity, listen, images, ipns_routing_url, quiet).await
     }
 
     /// Remove the platform service file.
@@ -1441,6 +1468,8 @@ wasip2::cli::command::export!({iface_name}Guest);
         wasm_debug: bool,
         kernel_source: ww::kernel::Source,
         stem: Option<String>,
+        ipns_stem: Option<String>,
+        ipns_routing_url: String,
         rpc_url: String,
         ws_url: String,
         confirmation_depth: u64,
@@ -1470,7 +1499,7 @@ wasip2::cli::command::export!({iface_name}Guest);
 
         // Reject local configuration before Kubo readiness can intentionally
         // wait forever in production. A bad path must remain actionable.
-        if !mounts.is_empty() || stem.is_none() {
+        if !mounts.is_empty() || (stem.is_none() && ipns_stem.is_none()) {
             image::validate_mounts_virtual(&mounts)?;
         }
         let user_mounts = mounts.clone();
@@ -1628,12 +1657,96 @@ wasip2::cli::command::export!({iface_name}Guest);
 
         let mut all_mounts: Vec<ww::cell::mount::Mount> = Vec::new();
         let stem_contract = stem.as_deref().map(parse_contract_address).transpose()?;
+        let ipns_stem_name = ipns_stem
+            .as_deref()
+            .map(ww::ipns::parse_name)
+            .transpose()
+            .context("parse --ipns-stem")?;
+
+        // The installed `ww` namespace uses the host identity as its default
+        // IPNS signer. Publish before namespace resolution so a newly migrated
+        // name exists before Kubo resolves it. The republisher then becomes
+        // the only writer for this state directory in the running process.
+        let mut runtime_ns_configs = ns_configs.clone();
+        if let Some(config) = ns_configs.iter().find(|config| config.name == "ww") {
+            let configured_name = if config.ipns.is_empty() {
+                None
+            } else {
+                // Namespace IPNS values may also be DNSLink names. Only a
+                // PeerID-form value can identify the host-owned publisher.
+                ww::ipns::parse_name(&config.ipns).ok()
+            };
+            if configured_name == Some(peer_id) {
+                if let Some(path) = config.bootstrap_ipfs_path()? {
+                    let desired: cid::Cid = path
+                        .strip_prefix("/ipfs/")
+                        .expect("validated bootstrap path has /ipfs prefix")
+                        .parse()
+                        .context("parse default ww namespace bootstrap CID")?;
+                    let state_dir = dirs::home_dir()
+                        .context("default IPNS publication requires a HOME directory")?
+                        .join(".ww");
+                    let routing = ww::ipns::RoutingClient::new(ipns_routing_url.clone())?;
+                    let routing_ready = match routing.probe().await {
+                        Ok(()) => true,
+                        Err(error) if error.kind() == ww::ipns::RoutingErrorKind::Unsupported => {
+                            return Err(anyhow::Error::new(error).context(
+                                "default IPNS publication requires Kubo HTTP Routing V1",
+                            ));
+                        }
+                        Err(error) if error.kind() == ww::ipns::RoutingErrorKind::Temporary => {
+                            tracing::warn!(
+                                "Initial Routing V1 probe failed; default IPNS publication will retry: {error}"
+                            );
+                            false
+                        }
+                        Err(error) => {
+                            return Err(anyhow::Error::new(error)
+                                .context("default IPNS Routing V1 probe failed"));
+                        }
+                    };
+                    let mut publisher =
+                        ww::ipns::Publisher::open(keypair.clone(), routing, &state_dir)?;
+                    let initial_publish_succeeded = if routing_ready {
+                        match publisher.publish(desired).await {
+                            Ok(()) => true,
+                            Err(error) if ww::ipns::is_temporary_routing_failure(&error) => {
+                                tracing::warn!(
+                                    "Initial host IPNS publication failed; republisher will retry: {error:#}"
+                                );
+                                false
+                            }
+                            Err(error) => {
+                                return Err(error).context("initial host IPNS publication failed");
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if !initial_publish_succeeded {
+                        if let Some(runtime_config) = runtime_ns_configs
+                            .iter_mut()
+                            .find(|runtime_config| runtime_config.name == config.name)
+                        {
+                            // Until the signed record is visible, select the
+                            // immutable bootstrap instead of treating a 404 as
+                            // a terminal namespace-resolution error.
+                            runtime_config.ipns.clear();
+                        }
+                    }
+                    supervisor.try_spawn(
+                        "ipns-republisher",
+                        ww::ipns::Republisher::new(publisher, desired, initial_publish_succeeded),
+                    )?;
+                }
+            }
+        }
 
         // Namespace layers sit between stem (on-chain base) and user mounts.
-        if !ns_configs.is_empty() {
+        if !runtime_ns_configs.is_empty() {
             let resolved = tokio::select! {
                 resolved = ww::ns::resolve_namespaces(
-                    &ns_configs,
+                    &runtime_ns_configs,
                     &boot_ipfs_client,
                     &runtime_status,
                 ) => resolved.context("Failed to resolve namespace configs")?,
@@ -1829,16 +1942,35 @@ wasip2::cli::command::export!({iface_name}Guest);
             }
             None => (None, None),
         };
-        let stem_source: Option<Box<dyn ww::stem::Source>> = stem_contract
-            .map(|contract| {
-                ww::stem::atom::Source::new(ww::stem::atom::Config::new(
-                    rpc_url.clone(),
-                    contract,
-                    confirmation_depth,
-                ))
-                .map(|source| Box::new(source) as Box<dyn ww::stem::Source>)
-            })
-            .transpose()?;
+        let stem_source: Option<Box<dyn ww::stem::Source>> = if let Some(contract) = stem_contract {
+            Some(Box::new(ww::stem::atom::Source::new(
+                ww::stem::atom::Config::new(rpc_url.clone(), contract, confirmation_depth),
+            )?))
+        } else if let Some(name) = ipns_stem_name {
+            let routing = ww::ipns::RoutingClient::new(ipns_routing_url.clone())?;
+            match routing.probe().await {
+                Ok(()) => {}
+                Err(error) if error.kind() == ww::ipns::RoutingErrorKind::Unsupported => {
+                    return Err(anyhow::Error::new(error)
+                        .context("--ipns-stem requires Kubo HTTP Routing V1"));
+                }
+                Err(error) if error.kind() == ww::ipns::RoutingErrorKind::Temporary => tracing::warn!(
+                    "Initial IPNS Stem Routing V1 probe failed; Source.current() will retry: {error}"
+                ),
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)
+                        .context("--ipns-stem Routing V1 probe failed"));
+                }
+            }
+            let state_dir = dirs::home_dir()
+                .context("--ipns-stem requires a HOME directory for durable watermark state")?
+                .join(".ww");
+            Some(Box::new(ww::stem::ipns::Source::new(
+                ww::stem::ipns::Config::new(name, ipns_routing_url.clone(), state_dir),
+            )?))
+        } else {
+            None
+        };
         let deployment_config = ww::deployment::Config {
             source: stem_source,
             candidates: candidate_rx,
@@ -2159,6 +2291,13 @@ wasip2::cli::command::export!({iface_name}Guest);
         if !ww_dir.exists() {
             bail!("~/.ww does not exist. Run `ww perform install` first.");
         }
+        let identity_path = ww_dir.join("identity");
+        let identity_path_string = identity_path
+            .to_str()
+            .context("~/.ww/identity path is non-UTF-8")?;
+        let host_key = ww::keys::load(identity_path_string)?;
+        let host_peer_id = ww::keys::to_libp2p(&host_key)?.public().to_peer_id();
+        let default_ipns_name = ww::ipns::canonical_name(host_peer_id);
 
         // Ensure subdirectories exist (may be missing if created by older version).
         for sub in &["bin", "etc/ns", "logs"] {
@@ -2206,9 +2345,20 @@ wasip2::cli::command::export!({iface_name}Guest);
             skip("WASM images (unchanged)".into());
         }
 
-        // ── Standard namespace republish (if images changed + Kubo running) ──
+        // ── Standard namespace indexing (if images changed + Kubo running) ──
         let ipfs_client = ipfs::HttpClient::new("http://localhost:5001".into());
         let kubo_ok = ipfs_client.kubo_info().await.is_ok();
+        if kubo_ok {
+            let routing_url = std::env::var("IPFS_ROUTING_API")
+                .unwrap_or_else(|_| "http://localhost:8080".to_string());
+            ww::ipns::RoutingClient::new(routing_url)?
+                .probe()
+                .await
+                .context(
+                    "Kubo HTTP Routing V1 is required for default IPNS publication; run `ipfs config --json Gateway.ExposeRoutingAPI true`, restart Kubo, and set IPFS_ROUTING_API when the Gateway is not http://localhost:8080",
+                )?;
+        }
+        let namespace_identity_changed;
 
         {
             let ns_path = ww_dir.join("etc/ns/ww");
@@ -2224,6 +2374,8 @@ wasip2::cli::command::export!({iface_name}Guest);
                     bootstrap: std_cid.to_string(),
                 }
             };
+            namespace_identity_changed = config.ipns != default_ipns_name;
+            config.ipns.clone_from(&default_ipns_name);
 
             if kubo_ok && images_ok && any_images_changed {
                 let sp = spin();
@@ -2246,9 +2398,6 @@ wasip2::cli::command::export!({iface_name}Guest);
                         let ipfs_path = format!("/ipfs/{cid}");
                         config.bootstrap = ipfs_path.clone();
                         let _ = ipfs_client.pin_add(&ipfs_path).await;
-                        if !config.ipns.is_empty() {
-                            let _ = ipfs_client.name_publish(&ipfs_path, "ww").await;
-                        }
                         sp.finish_and_clear();
                         done(format!("Standard namespace ({ipfs_path})"));
                     }
@@ -2275,16 +2424,27 @@ wasip2::cli::command::export!({iface_name}Guest);
         }
 
         // ── Install-owned FHS + daemon service file (unconditional) ──
-        let identity_path = ww_dir.join("identity");
         let (_, install_layer_changed) = daemon_cmd::refresh_default_fhs(&ww_dir)?;
         // Empty images select ~/.ww/fhs and read ~/.ww/etc/ns through the
         // separate host-only namespace root.
-        let service_definition_changed =
-            Self::daemon_install(Some(identity_path), Vec::new(), Vec::new(), true).await?;
+        let ipns_routing_url = std::env::var("IPFS_ROUTING_API")
+            .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        let service_definition_changed = Self::daemon_install(
+            Some(identity_path),
+            Vec::new(),
+            Vec::new(),
+            ipns_routing_url,
+            true,
+        )
+        .await?;
         done("Background daemon".into());
 
         // ── Restart daemon when deployed content or its boundary changed ─
-        if !any_images_changed && !install_layer_changed && !service_definition_changed {
+        if !any_images_changed
+            && !install_layer_changed
+            && !service_definition_changed
+            && !namespace_identity_changed
+        {
             skip("Daemon restart (nothing changed)".into());
         } else {
             match Self::restart_user_daemon(&home) {
@@ -2292,15 +2452,19 @@ wasip2::cli::command::export!({iface_name}Guest);
                 Some(false) => {
                     if cfg!(target_os = "macos") {
                         let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
-                        fail(format!(
-                            "Daemon start (try: launchctl load {})",
+                        bail!(
+                            "updated namespace was not published because the daemon could not restart; try: launchctl load {}",
                             plist_path.display()
-                        ));
+                        );
                     } else {
-                        fail("Daemon restart (try: systemctl --user restart ww)".into());
+                        bail!(
+                            "updated namespace was not published because the daemon could not restart; try: systemctl --user restart ww"
+                        );
                     }
                 }
-                None => skip("Daemon start (no service file)".into()),
+                None => bail!(
+                    "updated namespace was not published because no daemon service file was available"
+                ),
             }
         }
 
@@ -2357,52 +2521,10 @@ wasip2::cli::command::export!({iface_name}Guest);
         let kp = ww::keys::to_libp2p(&sk)?;
         let peer_id = kp.public().to_peer_id();
         done(format!("Identity ({peer_id})"));
-
-        // ── IPNS key (first-time only, before update so publish works) ─
-        let ipfs_client = ipfs::HttpClient::new("http://localhost:5001".into());
-        let kubo_ok = ipfs_client.kubo_info().await.is_ok();
-
-        if kubo_ok {
-            use indicatif::{ProgressBar, ProgressStyle};
-            use std::time::Duration;
-
-            let spin = || {
-                let pb = ProgressBar::new_spinner();
-                pb.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("  \u{2699} {msg}")
-                        .expect("valid template"),
-                );
-                pb.enable_steady_tick(Duration::from_millis(80));
-                pb
-            };
-            let fail = |msg: String| println!("  \u{2717} {msg}");
-
-            let keys = ipfs_client.key_list().await.unwrap_or_default();
-            if !keys.iter().any(|k| k == "ww") {
-                let sp = spin();
-                sp.set_message("Generating IPNS key...");
-                match ipfs_client.key_gen("ww").await {
-                    Ok(id) => {
-                        // Write the key into namespace config so perform_update
-                        // can publish to IPNS on the first install.
-                        let ns_path = ww_dir.join("etc/ns/ww");
-                        let config = ww::ns::NamespaceConfig {
-                            name: "ww".to_string(),
-                            ipns: id.clone(),
-                            bootstrap: ww::namespace::WW_STD_CID.to_string(),
-                        };
-                        let _ = config.write_to(&ns_path);
-                        sp.finish_and_clear();
-                        done(format!("IPNS key ({id})"));
-                    }
-                    Err(e) => {
-                        sp.finish_and_clear();
-                        fail(format!("IPNS key ({e})"));
-                    }
-                }
-            }
-        }
+        done(format!(
+            "Default IPNS name ({})",
+            ww::ipns::canonical_name(peer_id)
+        ));
 
         // ── Update: WASM images, stdlib, daemon ─────────────────────
         Self::perform_update().await?;
@@ -2926,6 +3048,8 @@ mod tests {
             identity: None,
             insecure_ephemeral: false,
             stem: None,
+            ipns_stem: None,
+            ipns_routing_url: "http://localhost:8080".to_string(),
             rpc_url: "http://127.0.0.1:8545".to_string(),
             ws_url: "ws://127.0.0.1:8545".to_string(),
             confirmation_depth: 6,
@@ -2969,6 +3093,21 @@ mod tests {
     #[test]
     fn run_admin_defaults_to_localhost() {
         assert_eq!(parse_run_admin_addr(&["ww", "run"]), "127.0.0.1:2026");
+    }
+
+    #[test]
+    fn atom_and_ipns_stems_are_mutually_exclusive() {
+        let error = Cli::try_parse_from([
+            "ww",
+            "run",
+            "--stem",
+            "0x0000000000000000000000000000000000000000",
+            "--ipns-stem",
+            "12D3KooWGuR5BdSqp23UeoeesuwYwW3ebQ9rZ8aVwfWEDU8kvCYJ",
+        ])
+        .err()
+        .expect("Atom and IPNS Stem options must conflict");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
@@ -3164,6 +3303,7 @@ mod tests {
             namespace_roots: vec![PathBuf::from("/tmp/host-state")],
             images: Vec::new(),
             http_listen: Some(addr.to_string()),
+            ipns_routing_url: "http://localhost:8080".to_string(),
         }
     }
 
@@ -3174,6 +3314,7 @@ mod tests {
             namespace_roots: Vec::new(),
             images: Vec::new(),
             http_listen: None,
+            ipns_routing_url: "http://localhost:8080".to_string(),
         }
     }
 
@@ -3209,6 +3350,11 @@ mod tests {
             plist.contains("<string>--namespace-root</string>")
                 && plist.contains("<string>/tmp/host-state</string>"),
             "plist should read namespace configuration through a host-only root, got:\n{plist}"
+        );
+        assert!(
+            plist.contains("<string>--ipns-routing-url</string>")
+                && plist.contains("<string>http://localhost:8080</string>"),
+            "plist should preserve the Routing V1 listener, got:\n{plist}"
         );
     }
 
@@ -3257,6 +3403,10 @@ mod tests {
         assert!(
             unit.contains("--namespace-root /tmp/host-state"),
             "systemd unit should read namespace configuration through a host-only root, got:\n{unit}"
+        );
+        assert!(
+            unit.contains("--ipns-routing-url http://localhost:8080"),
+            "systemd unit should preserve the Routing V1 listener, got:\n{unit}"
         );
     }
 

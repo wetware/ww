@@ -21,6 +21,8 @@ pub mod dispatcher;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod host;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod ipns;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod kernel;
 #[cfg(not(target_arch = "wasm32"))]
 pub use ipfs;

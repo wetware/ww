@@ -10,10 +10,11 @@ The host-side `deployment` module owns runtime deployment transitions. A
 deployment combines an optional authoritative Stem head with configured frozen
 root layers. Later layers override earlier layers during DAG composition.
 
-The boot deployment always uses local epoch `0`. An Atom contract revision is
-diagnostic Source state; it never becomes `Epoch.seq`. A host restart allocates
-epoch `0` again. Static startup prepares the frozen layers through the same
-path, publishes a rooted epoch `0`, and starts no Source task.
+The boot deployment always uses local epoch `0`. Atom contract revisions and
+IPNS record sequences are Source state; neither value becomes `Epoch.seq`. A
+host restart allocates epoch `0` again. Static startup prepares the frozen
+layers through the same path, publishes a rooted epoch `0`, and starts no
+Source task.
 
 For a replacement, deployment publishes the new local epoch with `root: None`
 before root preparation. This publication revokes old authority. Deployment
@@ -32,6 +33,62 @@ Deployment tracks frozen, active, preparation-attempt, and failed-unpin pin
 ownership. It does not unpin a CID that another live category references.
 `CidTree::swap_root` only changes the root and clears its in-memory directory
 cache. Deployment removes stale readdir stubs after rooted publication.
+
+## IPNS Stem
+
+`ww run --ipns-stem <name>` selects an IPNS name as the authoritative mutable
+base. `--ipns-stem` and the Atom `--stem` option are mutually exclusive. The
+name can be a canonical Base36 CIDv1 IPNS name, a legacy base58 Peer ID, or the
+same name prefixed with `/ipns/`.
+
+The IPNS Source uses Kubo's Gateway listener for raw HTTP Routing V1 records:
+
+```text
+GET /routing/v1/ipns/{canonical-base36-name}
+Accept: application/vnd.ipfs.ipns-record
+```
+
+Wetware limits records to 10,240 bytes. `rust-ipns` decodes the protobuf,
+verifies the signature and signer, and reads authenticated value, sequence,
+EOL, and TTL semantics. The value must be exactly one `/ipfs/<cid>` binding.
+Kubo supplies transport and routing only.
+
+The Source stores the accepted raw record at
+`~/.ww/ipns/follow/<canonical-base36-name>.record`. Persistence completes
+before the Source returns an update. On Unix, directories use mode `0700` and
+record files use mode `0600`. The write path syncs a temporary file, renames
+it, and syncs the parent directory.
+
+The persisted record is both the restart watermark and the ordering floor. A
+valid unexpired record seeds boot. An expired record retains its ordering floor
+but does not seed a deployment. Lower-order and exact-duplicate observations
+are ignored. A higher-order record with the same value advances the watermark
+without advancing the deployment epoch. A valid same-value refresh also
+updates the stored record and EOL without a deployment transition. A
+higher-order record with a different deployment CID emits `Head` after
+persistence. A same-sequence record with a different value is publisher
+equivocation; Wetware retains the accepted binding while valid.
+
+A validly signed higher-order record whose value is not exactly one
+`/ipfs/<cid>` binding is also persisted before it emits `InvalidHead`. This is
+an authoritative publisher selection, not network garbage.
+
+Malformed protobufs, invalid signatures, wrong signers, expired network
+records, and transport failures do not revoke authority. Once an accepted
+record reaches its signed EOL, the Source emits one `InvalidHead` even when
+retrieval is retrying. Deployment advances its local epoch, publishes
+`root: None`, and terminates the old PID0. The host remains alive. A later
+valid record can recover through the ordinary deployment path.
+
+A Routing V1 `404` means that no record exists. Unsupported routes fail with
+the Gateway configuration guidance above. Transport and server failures retry.
+Unexpected media types, oversized bodies, cryptographic failures, and rejected
+`PUT` responses remain distinct errors. Wetware does not select them as
+authority.
+
+Wetware assumes one running process per `~/.ww` state directory. The local
+state is trusted against rollback. The implementation does not provide
+multiprocess coordination or secure monotonic storage.
 
 ## Artifact publication
 
@@ -63,6 +120,48 @@ The release name is
 IPFS remains a required publication path while `scripts/install.sh` installs
 from IPNS. It must not be made non-blocking until a GitHub Release has been
 published and the installer has migrated to that distribution path.
+
+## Default host IPNS publication
+
+`ww perform install` creates `~/.ww/identity`. `ww perform update` derives the
+default IPNS name from that key, writes the name and immutable bootstrap CID to
+`~/.ww/etc/ns/ww`, and renders the daemon with `--ipns-routing-url`. The
+running daemon signs the configured bootstrap CID before namespace resolution.
+If initial publication has a temporary failure, the daemon uses the immutable
+bootstrap for that boot and retries publication in the background.
+
+The publisher stores its canonical raw record at
+`~/.ww/ipns/publish/<canonical-base36-name>.record`. It reconciles valid newer
+network state before creating a changed binding. It persists locally before
+Routing V1 `PUT`, so a failed `PUT` can retry the same signed bytes. A changed
+CID increments sequence. A same-CID refresh preserves sequence and extends
+the signed EOL. If a newer network record selects a different value, Wetware
+adopts its ordering floor but does not publish over it. Publication stops with
+a single-writer conflict diagnostic for operator review.
+
+The republisher waits one minute after an initial success, then refreshes every
+four hours. Failed publication retries after five minutes. Records use a
+48-hour lifetime and five-minute TTL. Only the default name derived from the
+host identity receives this lifecycle. Following a third-party IPNS Stem does
+not publish that name.
+
+The default publisher no longer creates or uses Kubo's `"ww"` signing key.
+An old `"ww"` key can remain in the Kubo keystore, but Wetware ignores it.
+Kubo never needs `~/.ww/identity`. Guest `Routing.publish` remains a separate
+Kubo-key-backed capability and is unchanged.
+
+Kubo 0.33 requires this one-time operator configuration:
+
+```sh
+ipfs config --json Gateway.ExposeRoutingAPI true
+# Restart Kubo after changing its configuration.
+```
+
+Wetware uses `http://localhost:8080` by default. Set `IPFS_ROUTING_API` or
+`--ipns-routing-url` when the Gateway listener uses another address. Do not
+point this option at the administrative RPC listener on port 5001. Wetware
+fails with an actionable error when the listener does not expose Routing V1;
+it does not fall back to Kubo `name/resolve`, `name/publish`, or key management.
 
 ## Manual image promotion
 
