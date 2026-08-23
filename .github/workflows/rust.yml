@@ -270,6 +270,8 @@ jobs:
 
     - name: Run host workspace tests (hot cache from build job)
       run: cargo test --workspace
+      env:
+        WW_TEST_REQUIRE_KUBO: "1"
 
     - name: Smoke-test Chess authority proof command
       run: |

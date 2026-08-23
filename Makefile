@@ -82,18 +82,12 @@ IPNS_KEY ?=
 
 # Best-effort publish: runs as part of `make all`. If Kubo isn't running,
 # the build continues without a CID (HostPathLoader fallback).
-# Reads IPNS key from ~/.ww/etc/ns/ww if available (provisioned by `ww perform install`).
+# Default IPNS publication is host-owned and runs through `ww perform update`
+# plus the daemon republisher. This build target only imports the tree.
 try-publish-std: std
-	@KEY=$$(grep '^ipns=' ~/.ww/etc/ns/ww 2>/dev/null | cut -d= -f2 | tr -d ' '); \
-	if [ -n "$$KEY" ]; then \
-		$(MAKE) publish-std IPNS_KEY=ww 2>/dev/null \
-			&& echo "  std namespace published to IPFS" \
-			|| echo "  std namespace publish skipped (Kubo not running)"; \
-	else \
-		$(MAKE) publish-std 2>/dev/null \
-			&& echo "  std namespace published to IPFS (no IPNS key)" \
-			|| echo "  std namespace publish skipped (Kubo not running)"; \
-	fi
+	@$(MAKE) publish-std 2>/dev/null \
+		&& echo "  std namespace published to IPFS (host IPNS publish is daemon-owned)" \
+		|| echo "  std namespace publish skipped (Kubo not running)"
 
 publish-std: std
 	@echo "Assembling std namespace tree..."

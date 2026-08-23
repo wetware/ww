@@ -92,6 +92,9 @@ authority = { package = "wetware-authority", path = "crates/authority" }
 atom = { path = "crates/atom" }
 async-trait = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+# Temporary exact pin for V2-only record verification. Remove after
+# https://github.com/dariusc93/rust-ipfs/pull/503 ships in a rust-ipns release.
+rust-ipns = { git = "https://github.com/wetware/rust-ipfs", rev = "02c5ae7bf3f9568c7dbbb1308ae9299cfc7ba2d9", default-features = false, features = ["ed25519", "rsa"] }
 cache = { package = "ww-cache", path = "crates/cache" }
 cell = { path = "crates/cell" }
 rpc = { path = "crates/rpc" }

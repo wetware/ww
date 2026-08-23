@@ -67,7 +67,8 @@ fn image_arguments(arguments: &[String]) -> Vec<&str> {
 
     while index < arguments.len() {
         match arguments[index].as_str() {
-            "--listen" | "--identity" | "--http-listen" | "--namespace-root" => {
+            "--listen" | "--identity" | "--http-listen" | "--namespace-root"
+            | "--ipns-routing-url" => {
                 index += 2;
             }
             argument if argument.starts_with('-') => index += 1,
@@ -300,11 +301,18 @@ async fn default_daemon_import_excludes_private_host_state() {
     std::fs::create_dir_all(fhs_dir.join("svc")).expect("publishable FHS tree");
     std::fs::write(ww_dir.join("identity"), b"PRIVATE_HOST_IDENTITY_SENTINEL")
         .expect("identity fixture");
+    std::fs::create_dir_all(ww_dir.join("ipns/follow")).expect("follower state directory");
+    std::fs::create_dir_all(ww_dir.join("ipns/publish")).expect("publisher state directory");
     std::fs::write(
-        ww_dir.join("durable.ipns-record"),
-        b"PRIVATE_MUTABLE_STATE_SENTINEL",
+        ww_dir.join("ipns/follow/name.record"),
+        b"PRIVATE_FOLLOWER_WATERMARK_SENTINEL",
     )
-    .expect("private state fixture");
+    .expect("follower watermark fixture");
+    std::fs::write(
+        ww_dir.join("ipns/publish/name.record"),
+        b"PRIVATE_PUBLISHER_RECORD_SENTINEL",
+    )
+    .expect("publisher record fixture");
     std::fs::write(
         fhs_dir.join("svc/deployable.txt"),
         b"INTENDED_DEPLOYABLE_CONTENT",
@@ -374,11 +382,19 @@ async fn default_daemon_import_excludes_private_host_state() {
         "{request}"
     );
     assert!(
-        !request.contains("filename=\"durable.ipns-record\""),
+        !request.contains("filename=\"ipns/follow/name.record\""),
         "{request}"
     );
     assert!(
-        !request.contains("PRIVATE_MUTABLE_STATE_SENTINEL"),
+        !request.contains("PRIVATE_FOLLOWER_WATERMARK_SENTINEL"),
+        "{request}"
+    );
+    assert!(
+        !request.contains("filename=\"ipns/publish/name.record\""),
+        "{request}"
+    );
+    assert!(
+        !request.contains("PRIVATE_PUBLISHER_RECORD_SENTINEL"),
         "{request}"
     );
 }

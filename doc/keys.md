@@ -9,9 +9,8 @@ concerns that were previously conflated:
 
 1. **Node identity (Ed25519)** — the `PeerId` derived from the Ed25519 public
    key identifies the node on the p2p network and is used for Terminal
-   challenge-response signing. Ed25519 is libp2p's default and best-supported
-   key type: simpler (32-byte seed, 32-byte pubkey, no compressed/uncompressed
-   distinction), and the ecosystem default.
+   challenge-response and default IPNS publication. The canonical default IPNS
+   name is the Base36 CIDv1 form of the same `PeerId`.
 
 2. **Operator identity (secp256k1)** — the Stem contract owner key. This is
    the one key that calls `setHead()` to advance the on-chain epoch. It is
@@ -34,8 +33,8 @@ challenge-response auth uses `try_into_ed25519()`. Guest auth
 ### Key storage
 
 Keys are stored as **base58btc** (Bitcoin alphabet, ~44 characters for 32 bytes)
-in a plain text file. Hex-encoded keys are also accepted on load for backward
-compatibility. The default location is `~/.ww/identity`.
+in a plain text file. Hex-encoded keys are not accepted. The default location
+is `~/.ww/identity`.
 
 Rationale:
 - Denser than hex (44 vs 64 chars), no ambiguous characters (no 0/O/I/l).
@@ -46,6 +45,34 @@ Rationale:
 - The installed daemon reads `~/.ww/identity` through `--identity`. Its default
   image root is `~/.ww/fhs`, so the identity file does not enter the imported
   image DAG. An explicit image path can still expose any key inside that path.
+
+The save path creates new private directories with mode `0700` on Unix. It
+writes a mode-`0600` temporary file, syncs the file, renames it atomically, and
+syncs the parent directory. The same helper stores durable raw IPNS records.
+An interrupted write therefore does not truncate the canonical identity file.
+
+### Default IPNS identity
+
+`~/.ww/identity` intentionally serves two host-owned roles:
+
+```text
+Ed25519 private key
+  ├─ libp2p host Peer ID
+  └─ default IPNS signer and name
+```
+
+Identity rotation changes both the Peer ID and the default IPNS name.
+`ww perform update` rewrites `~/.ww/etc/ns/ww` with the derived canonical name.
+The running daemon signs records locally and sends only raw signed records to
+Kubo HTTP Routing V1. Wetware no longer creates or uses a Kubo `"ww"` signing
+key for default publication.
+
+Signed publisher state lives at
+`~/.ww/ipns/publish/<canonical-base36-name>.record`. Signed follower watermarks
+live under `~/.ww/ipns/follow/`. Both directories remain outside
+`~/.ww/fhs/`. Wetware assumes one running process per `~/.ww` state directory.
+The local state is trusted against rollback; malicious filesystem rollback and
+multiprocess coordination are out of scope.
 
 ### Identity resolution
 
@@ -59,9 +86,9 @@ Rationale:
 Each time the host resolves the identity it logs the source at `INFO` level
 so the active source is always visible in the log output.
 
-The ephemeral fallback is fine for local development and testing but means
-the node's Peer ID and EVM address change on every restart. Use a persistent
-key for any deployment that other nodes need to remember across restarts.
+The ephemeral fallback is for local development and testing. It changes the
+node Peer ID and derived IPNS name on every restart. Use a persistent key for
+any deployment that other nodes need to remember across restarts.
 
 For daemon/service mode, pass identity through the same host flags/env:
 `--identity PATH` or `WW_IDENTITY=PATH`.
@@ -83,7 +110,7 @@ ww run --identity ~/.ww/identity images/my-app
 ## File format
 
 ```
-# ~/.ww/identity — base58btc, ~44 chars (hex also accepted on load)
+# ~/.ww/identity — base58btc, ~44 chars
 6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5
 ```
 

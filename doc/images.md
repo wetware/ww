@@ -30,9 +30,13 @@ as layers (later mounts override earlier ones):
 |------|---------|
 | Local path | `std/status` |
 | IPFS path | `/ipfs/QmAbc123...` |
+| IPNS path | `/ipns/k51qzi5uqu5...` |
 | Layered | `ww run /ipfs/QmBase my-overlay` |
 
 Targeted mounts (`source:/guest/path`) are not accepted by backend virtual mode.
+An `/ipns/...` mount is an image layer that Kubo resolves during composition.
+It is distinct from `--ipns-stem`, which follows signed changes and replaces
+the active deployment generation.
 
 ## Installed host layout
 
@@ -45,6 +49,9 @@ the local image root:
   etc/ns/               # host-only namespace configuration
   logs/                  # host logs
   run/                   # host runtime state
+  ipns/
+    follow/*.record      # durable signed follower ordering floors
+    publish/*.record     # durable signed records for the default publisher
   fhs/                   # publishable local image root
     bin/status.wasm      # status component used by the shipped Rust PID0
 ```
@@ -57,7 +64,7 @@ Put intentional local image content under `~/.ww/fhs`, or pass an explicit
 image path to `ww daemon install`. Do not put private host state in an image
 root because Kubo can store, pin, and provide every imported file.
 
-## On-chain coordination
+## Stem coordination
 
 The `--stem` flag connects to an Atom contract on an EVM chain.
 The contract holds a monotonic head pointer (an IPFS CID). When the
@@ -77,3 +84,15 @@ private to the Source and does not become `Epoch.seq`.
 This provides a coordination primitive across trust boundaries:
 multiple independent nodes watching the same contract will
 synchronize their agent lifecycle to the same on-chain state.
+
+`--ipns-stem <name>` selects an IPNS record instead of an Atom contract. The
+two flags are mutually exclusive. Wetware fetches the raw signed record through
+Kubo HTTP Routing V1 and validates it locally. A valid new `/ipfs/<cid>` value
+uses the same revoke, prepare, swap, and replacement path described above.
+
+The signed record's EOL is authoritative. Transport failures before EOL keep
+the current image active. EOL without a valid replacement emits
+`InvalidHead`, removes the rooted epoch, and terminates PID0. An expired
+persisted value does not seed boot, although its signed ordering floor remains
+durable. See [deployment.md](deployment.md#ipns-stem) for ordering and recovery
+semantics.

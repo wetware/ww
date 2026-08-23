@@ -112,8 +112,13 @@ provenance do not become `Epoch.seq` and do not survive a process restart.
 An optional `stem::Source` establishes the authoritative mutable base head.
 The backend adapter applies its consistency rule before returning an update.
 The Atom adapter polls `Atom.head()` at `tip - confirmation_depth`; contract
-events are not part of its correctness path. Without a Stem, deployment
-composes the configured frozen layers at epoch `0` and starts no source task.
+events are not part of its correctness path. The IPNS adapter fetches raw
+signed records through Kubo HTTP Routing V1, validates them locally, and
+maps an exact `/ipfs/<cid>` binding with no subpath to `Head`. Another validly
+signed value maps to `InvalidHead`. Atom revision and IPNS sequence remain
+private Source state. Neither value becomes `Epoch.seq`.
+Without a Stem, deployment composes the configured frozen layers at epoch `0`
+and starts no source task.
 
 `deployment` owns every transition. After it accepts a Source update, it first
 publishes the incremented epoch with `root: None`. That publication closes
@@ -134,6 +139,21 @@ An `InvalidHead` is an authoritative transition. Deployment publishes
 `root: None`, terminates old PID0, remains alive without a replacement, and
 waits for a later valid update. A Source error does not advance the epoch and
 does not revoke the current deployment.
+
+The IPNS Source treats transport failure and signed expiry differently. A
+fetch failure preserves current authority before the accepted record's EOL.
+`Source::next()` races retrieval and retry against that EOL. If no valid
+replacement arrives first, the Source emits one `InvalidHead`. Deployment then
+applies the same revoke-first transition used for every authoritative invalid
+head. A later valid record can establish a new rooted generation.
+
+The Source persists each accepted raw signed record before it returns an
+update. The persisted record is an ordering floor across restarts. An expired
+persisted record still rejects older records, but its value does not seed the
+boot deployment. Exact duplicates, higher-order records with the same value,
+and valid same-value EOL refreshes do not advance the deployment epoch.
+Same-sequence records with different values are treated as publisher
+equivocation and do not replace the accepted binding.
 
 Deployment retries classified transient preparation failures with jittered
 exponential backoff. Readiness stays closed and the old PID0 stays terminated
@@ -166,6 +186,35 @@ registry, the route condition is satisfied.
 The import is installed only on PID0's linker, is not a Cap'n Proto capability
 value, and therefore cannot be delegated to children or transferred over the
 network.
+
+## Host-owned IPNS publication
+
+The default `ww` namespace uses `~/.ww/identity` as both the host identity and
+the IPNS signing identity. The host Peer ID and canonical Base36 IPNS name
+derive from the same public key. Rotating the identity changes both names.
+
+Wetware signs and verifies IPNS records through the pinned `rust-ipns`
+implementation. Kubo transports the raw protobuf through
+`GET` and `PUT /routing/v1/ipns/{name}`. Kubo does not receive the private key
+and is not the cryptographic authority. The temporary `rust-ipns` git pin is
+commit `02c5ae7bf3f9568c7dbbb1308ae9299cfc7ba2d9`, pending upstream PR #503 or a
+release that contains the reviewed V2-only validation fix.
+
+Publisher and follower state lives below private `~/.ww/ipns/`, outside the
+publishable `~/.ww/fhs/` tree. The canonical state object is the raw signed
+record. Wetware assumes one running process per private state directory and
+trusts local state against rollback. The storage layer does not coordinate
+multiple writers or defend against malicious filesystem rollback.
+
+The host publisher reconciles its persisted record with valid network state,
+persists a new signed record before `PUT`, and retries failed publication with
+the same bytes. Changed values increment sequence. Same-value refresh keeps
+sequence and extends EOL. A newer network record with a different value
+advances the durable floor but stops publication with a single-writer conflict;
+Wetware does not overwrite that record automatically. The host republisher uses
+a 48-hour lifetime, five-minute TTL, four-hour refresh interval, one-minute
+initial delay, and five-minute retry delay. A followed third-party IPNS Stem
+never creates a publisher.
 
 ## Fixed execution substrate
 

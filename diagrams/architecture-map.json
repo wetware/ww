@@ -13,9 +13,9 @@
       "group": "THE HOST",
       "title": "The `ww` command",
       "subtitle": "Starts and controls a Wetware node.",
-      "files": ["src/cli/main.rs"],
-      "what": "The CLI parses `ww run`, `ww shell`, `ww perform`, namespace, and daemon commands. `ww run` selects configured root layers, starts host services, and applies process and operator policy to deployment outcomes.",
-      "built": "The binary lives at `src/cli/main.rs`. It combines `clap` command parsing with image loaders and the host runtime. Deployment owns generation transitions; the CLI retains terminal behavior and process exit policy."
+      "files": ["src/cli/main.rs", "src/cli/daemon_cmd.rs"],
+      "what": "The CLI parses `ww run`, `ww shell`, `ww perform`, namespace, and daemon commands. `ww run` selects configured root layers or one authoritative Atom/IPNS Stem, starts host services, and applies process and operator policy to deployment outcomes.",
+      "built": "The binary lives at `src/cli/main.rs`. It combines `clap` command parsing with image loaders and the host runtime. `src/cli/daemon_cmd.rs` preserves host-only identity, namespace, and Routing V1 configuration in generated services. Deployment owns generation transitions; the CLI retains terminal behavior and process exit policy."
     },
     {
       "key": "loader",
@@ -45,9 +45,9 @@
       "group": "THE HOST",
       "title": "Host supervisor",
       "subtitle": "Owns the node service threads.",
-      "files": ["src/services.rs", "src/host.rs"],
-      "what": "The `Host` supervisor starts and stops the swarm, WAGI service, compiler, admin service, and executor pool. Long-running services own dedicated threads; deployment coordination runs in the main host runtime.",
-      "built": "`src/services.rs` defines `Service` and `Host`. `src/host.rs` owns libp2p behavior and swarm events. The executor pool uses local runtimes because Wasmtime stores are not `Send`."
+      "files": ["src/services.rs", "src/host.rs", "src/ipns.rs"],
+      "what": "The `Host` supervisor starts and stops the swarm, WAGI service, compiler, admin service, executor pool, and host-owned IPNS republisher. Long-running services own dedicated threads; deployment coordination runs in the main host runtime.",
+      "built": "`src/services.rs` defines `Service` and `Host`. `src/host.rs` owns libp2p behavior and swarm events. `src/ipns.rs` validates, persists, signs, transports, and republishes raw IPNS records. The executor pool uses local runtimes because Wasmtime stores are not `Send`."
     },
     {
       "key": "epoch",
@@ -61,9 +61,9 @@
       "group": "THE HOST",
       "title": "Deployment lifecycle",
       "subtitle": "Turns optional Stem state into one rooted kernel generation.",
-      "files": ["src/stem/mod.rs", "src/stem/atom.rs", "src/deployment/mod.rs", "crates/atom/src/indexer.rs", "crates/authority/src/epoch.rs"],
-      "what": "Deployment may prepare one advisory Atom event candidate without changing authority. Finalized Source updates allocate epochs, revoke old authority, activate `CidTree`, and replace pid0.",
-      "built": "`src/stem` defines the backend-neutral Source contract and Atom finalized-depth adapter. The Atom indexer supplies lossy advisory candidates. `src/deployment` owns preparation, retry, supersession, pin ownership, activation, and generation coordination. `crates/authority` enforces the resulting local epoch."
+      "files": ["src/stem/mod.rs", "src/stem/atom.rs", "src/stem/ipns.rs", "src/deployment/mod.rs", "crates/atom/src/indexer.rs", "crates/authority/src/epoch.rs"],
+      "what": "Deployment may prepare one advisory Atom event candidate without changing authority. Finalized Atom or locally verified IPNS Source updates allocate epochs, revoke old authority, activate `CidTree`, and replace pid0. Signed IPNS expiry produces the same authoritative invalid-head transition.",
+      "built": "`src/stem` defines the backend-neutral Source contract, the Atom finalized-depth adapter, and the IPNS signed-record adapter with a durable ordering floor and EOL deadline. The Atom indexer supplies lossy advisory candidates. `src/deployment` owns preparation, retry, supersession, pin ownership, activation, and generation coordination. `crates/authority` enforces the resulting local epoch."
     },
     {
       "key": "kernel",

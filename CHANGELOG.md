@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Wetware now owns default IPNS signing and can follow an IPNS deployment
+  Stem.** `ww run --ipns-stem <name>` uses locally verified raw records as the
+  authoritative deployment source. Signed EOL revokes the current generation
+  even during a routing outage, while durable raw-record watermarks reject
+  rollback across restarts. The installed daemon derives its default IPNS name
+  from `~/.ww/identity`, signs locally, persists before publication, and
+  republishes through Kubo HTTP Routing V1. Kubo 0.33 operators must enable
+  `Gateway.ExposeRoutingAPI` and use the Gateway listener, which defaults to
+  `http://localhost:8080` and can be set with `IPFS_ROUTING_API` or
+  `--ipns-routing-url`. Wetware no longer creates or requires Kubo's `"ww"`
+  signing key. Guest `Routing.publish` is unchanged. `rust-ipns` is temporarily
+  pinned to reviewed commit `02c5ae7bf3f9568c7dbbb1308ae9299cfc7ba2d9`
+  pending upstream PR #503 or a release that contains its V2-only validation
+  fix.
 - **Default daemon images no longer publish private host state.** Installed
   daemons import only `~/.ww/fhs` as their default deployment image. Identity
   and namespace configuration remain host-side. Updates rewrite vulnerable
