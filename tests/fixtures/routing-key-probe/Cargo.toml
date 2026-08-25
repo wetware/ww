@@ -1,0 +1,14 @@
+[package]
+name = "routing-key-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+routing-key = { path = "../../../crates/guest/routing-key" }
+wit-bindgen = "0.41.0"
+
+[lib]
+crate-type = ["cdylib"]

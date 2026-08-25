@@ -7,7 +7,7 @@ use crate::named_capability::{decode_exports, encode_exports, NamedCapabilities}
 /// The complete parent-delegated authority assigned to a child at birth.
 ///
 /// The record contains only validated named capability references. It has no
-/// mutation API and no ambient host, runtime, routing, identity, storage, HTTP,
+/// mutation API and no ambient host, runtime, provider routing, identity, storage, HTTP,
 /// policy, provenance, supervision, or observability state.
 ///
 /// ```compile_fail

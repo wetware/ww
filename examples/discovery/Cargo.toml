@@ -11,6 +11,7 @@ log       = { workspace = true }
 wasip2    = { workspace = true }
 hex       = { workspace = true }
 rand      = { workspace = true }
+routing-key = { workspace = true }
 system    = { path = "../../std/system" }
 
 [lib]

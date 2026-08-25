@@ -1375,6 +1375,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "blake3",
  "cap-std",
  "cid",
  "dirs",
@@ -1461,6 +1462,7 @@ dependencies = [
  "libp2p-stream",
  "log",
  "rand 0.9.4",
+ "routing-key",
  "serde_json",
  "shakmaty",
  "system",
@@ -2232,6 +2234,7 @@ dependencies = [
  "hex",
  "log",
  "rand 0.9.4",
+ "routing-key",
  "system",
  "tokio",
  "tokio-util",
@@ -5304,6 +5307,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "routing-key"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.41.0",
+]
+
+[[package]]
 name = "rpc"
 version = "0.1.0"
 dependencies = [
@@ -5311,7 +5321,6 @@ dependencies = [
  "async-trait",
  "auth",
  "base58",
- "blake3",
  "bytes",
  "capnp",
  "capnp-rpc",

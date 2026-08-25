@@ -44,7 +44,7 @@ use capnp_rpc::RpcSystem;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 #[cfg(test)]
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock};
 #[cfg(test)]
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -65,18 +65,39 @@ pub enum SwarmCommand {
     /// Announce this Wetware node as a provider for the given DHT key
     /// (multihash bytes of a CID) on the Amino Kademlia DHT.
     KadProvide {
+        owner: ProviderOwnerId,
         key: Vec<u8>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Release every provider registration owned by one Announcer lease.
+    ///
+    /// The swarm stops local WAN and LAN provision only when the released
+    /// owner was the final owner for a key.
+    KadReleaseProviderOwner { owner: ProviderOwnerId },
     /// Find providers for the given DHT key (multihash bytes of a CID).
     ///
-    /// Providers are sent over the unbounded channel as they are discovered.
-    /// The channel is closed when the query completes.
+    /// Providers cross a single-slot channel. The swarm applies its small
+    /// Kademlia-related result cap and retains only selected results until the
+    /// channel accepts them. A per-request token cancels host work without
+    /// consuming capacity in this shared command channel. The result channel
+    /// closes when the query completes, reaches its effective limit, or is
+    /// canceled.
     KadFindProviders {
+        request: ProviderQueryId,
         key: Vec<u8>,
-        reply: mpsc::UnboundedSender<PeerInfo>,
+        count: u32,
+        reply: mpsc::Sender<PeerInfo>,
+        cancel: watch::Receiver<bool>,
     },
 }
+
+/// Host-process identifier for one epoch-owned Announcer lease.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProviderOwnerId(pub u64);
+
+/// Host-process identifier for one logical Finder query.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProviderQueryId(pub u64);
 
 fn validate_service_protocol_name(protocol: &str) -> Result<(), capnp::Error> {
     if protocol.is_empty() {

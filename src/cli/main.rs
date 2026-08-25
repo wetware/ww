@@ -1032,8 +1032,8 @@ edition = "2021"
 [workspace]  # standalone — not part of the host workspace
 
 [dependencies]
-capnp     = "0.23.2"
-capnp-rpc = "0.23.0"
+capnp     = "0.25.3"
+capnp-rpc = "0.25.0"
 log       = "0.4"
 wasip2    = "1.0.2"
 system    = {{ path = "../../std/system" }}
@@ -1042,7 +1042,10 @@ system    = {{ path = "../../std/system" }}
 crate-type = ["cdylib"]
 
 [build-dependencies]
-capnpc    = "0.23.3"
+capnpc    = "0.25.3"
+
+[patch.crates-io]
+capnp-rpc = {{ git = "https://github.com/wetware/capnproto-rust", branch = "ww/import-fix-0.25-consume" }}
 "#
         );
         std::fs::write(target_dir.join("Cargo.toml"), cargo_toml)?;

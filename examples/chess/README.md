@@ -7,7 +7,8 @@ Two-node chess over libp2p RPC capabilities.
 - Cap'n Proto vat RPC with `WW_CELL_MODE=vat`
 - authenticated `VatListener` publication
 - typed `VatClient` calls
-- service-name DHT discovery
+- pure service-name routing-key derivation
+- independent DHT Announcer and Finder grants
 - distinct Reader and Player method authority over one game
 
 ## Build

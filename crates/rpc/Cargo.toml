@@ -7,7 +7,6 @@ edition = "2021"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 base58 = { workspace = true }
-blake3 = { workspace = true }
 bytes = { workspace = true }
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }

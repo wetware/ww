@@ -52,7 +52,8 @@ exports are:
 - `identity`, when a signing key is configured;
 - `host`;
 - `runtime`;
-- `routing`;
+- `routing-finder`;
+- `routing-announcer`;
 - `authority`;
 - `ipfs`;
 - `http-client`, when an outbound HTTP allowlist is configured.

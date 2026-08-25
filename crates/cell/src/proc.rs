@@ -33,6 +33,13 @@ mod pid0_runtime {
     });
 }
 
+mod routing_key_runtime {
+    wasmtime::component::bindgen!({
+        world: "key-client",
+        path: "../guest/routing-key/wit",
+    });
+}
+
 // Import generated types - Connection is a Resource type alias
 use exports::wetware::streams::streams::Connection;
 
@@ -224,6 +231,12 @@ impl pid0_runtime::wetware::kernel_runtime::readiness::Host for ComponentRunStat
     }
 }
 
+impl routing_key_runtime::wetware::routing::key::Host for ComponentRunStates {
+    fn derive(&mut self, data: Vec<u8>) -> String {
+        crate::routing_key::derive(&data).to_string()
+    }
+}
+
 fn commit_kernel_ready(
     gate: &authority::KernelReadyGate,
 ) -> Result<(), pid0_runtime::wetware::kernel_runtime::readiness::ReadyError> {
@@ -236,6 +249,14 @@ fn commit_kernel_ready(
             Err(ReadyError::StaleGeneration)
         }
     }
+}
+
+fn add_routing_key_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> {
+    routing_key_runtime::KeyClient::add_to_linker::<ComponentRunStates, HasSelf<ComponentRunStates>>(
+        linker,
+        |state| state,
+    )?;
+    Ok(())
 }
 
 // Required for WASI IO to work.
@@ -558,6 +579,7 @@ impl Proc {
         };
         let mut linker = Linker::new(&engine);
         add_to_linker_async(&mut linker)?;
+        add_routing_key_to_linker(&mut linker)?;
         if kernel_ready_gate.is_some() {
             pid0_runtime::Pid0::add_to_linker::<ComponentRunStates, HasSelf<ComponentRunStates>>(
                 &mut linker,
@@ -870,8 +892,78 @@ fn add_streams_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const ROUTING_KEY_PROBE_COMPONENT: &str = r#"
+        (component
+          (type $key-type
+            (instance
+              (type $derive-type
+                (func (param "data" (list u8)) (result string)))
+              (export "derive" (func (type $derive-type)))))
+          (import "wetware:routing/key@0.1.0"
+            (instance $key (type $key-type)))
+          (alias export $key "derive" (func $derive))
+
+          (core module $libc
+            (memory (export "memory") 1)
+            (global $last (mut i32) (i32.const 4096))
+            (func $realloc (export "realloc")
+              (param $old-ptr i32)
+              (param $old-size i32)
+              (param $align i32)
+              (param $new-size i32)
+              (result i32)
+              (local $ret i32)
+
+              local.get $old-ptr
+              if unreachable end
+
+              (global.set $last
+                (i32.and
+                  (i32.add
+                    (global.get $last)
+                    (i32.add (local.get $align) (i32.const -1)))
+                  (i32.xor
+                    (i32.add (local.get $align) (i32.const -1))
+                    (i32.const -1))))
+              global.get $last
+              local.set $ret
+              (global.set $last
+                (i32.add (global.get $last) (local.get $new-size)))
+              local.get $ret))
+          (core instance $libc (instantiate $libc))
+
+          (core func $derive-lowered
+            (canon lower (func $derive)
+              (memory $libc "memory")
+              (realloc (func $libc "realloc"))))
+
+          (core module $probe
+            (import "libc" "memory" (memory 1))
+            (import "" "derive" (func $derive (param i32 i32 i32)))
+            (data (i32.const 0) "ww.chess.v1")
+            (func (export "probe") (result i32)
+              i32.const 0
+              i32.const 11
+              i32.const 96
+              call $derive
+              i32.const 96))
+          (core instance $probe
+            (instantiate $probe
+              (with "libc" (instance $libc))
+              (with "" (instance
+                (export "derive" (func $derive-lowered))))))
+
+          (func (export "probe") (result string)
+            (canon lift (core func $probe "probe")
+              (memory $libc "memory")
+              (realloc (func $libc "realloc")))))
+    "#;
 
     struct EpochTicker {
         stop: Arc<AtomicBool>,
@@ -902,6 +994,151 @@ mod tests {
                 thread.join().expect("epoch ticker thread");
             }
         }
+    }
+
+    fn component_test_state() -> ComponentRunStates {
+        ComponentRunStates {
+            wasi_ctx: WasiCtxBuilder::new().build(),
+            resource_table: ResourceTable::new(),
+            image_root: None,
+            scratch: tempfile::TempDir::new().expect("component test scratch"),
+            data_stream: None,
+            cache_mode: None,
+            cid_tree: None,
+            writable_fs_descriptors: std::collections::HashSet::new(),
+            fuel_estimator: FuelEstimator::new(INITIAL_FUEL),
+            kernel_ready_gate: None,
+        }
+    }
+
+    fn routing_key_probe_wasm() -> &'static PathBuf {
+        static PROBE: OnceLock<PathBuf> = OnceLock::new();
+        PROBE.get_or_init(|| {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let target = root.join("target/routing-key-probe");
+            let status = Command::new(env!("CARGO"))
+                .current_dir(&root)
+                .env("CARGO_TARGET_DIR", &target)
+                .args([
+                    "build",
+                    "--locked",
+                    "--manifest-path",
+                    "tests/fixtures/routing-key-probe/Cargo.toml",
+                    "--target",
+                    "wasm32-wasip2",
+                    "--release",
+                ])
+                .status()
+                .expect("launch cargo to build routing-key wrapper probe");
+            assert!(status.success(), "routing-key wrapper probe build failed");
+            let wasm = target.join("wasm32-wasip2/release/routing_key_probe.wasm");
+            assert!(
+                wasm.is_file(),
+                "routing-key probe missing: {}",
+                wasm.display()
+            );
+            wasm
+        })
+    }
+
+    #[tokio::test]
+    async fn routing_key_guest_wrapper_matches_golden_vector() {
+        let engine = crate::engine::wasm_engine().expect("component engine");
+        let component = Component::from_file(&engine, routing_key_probe_wasm())
+            .expect("routing-key wrapper probe component");
+        let mut linker = Linker::new(&engine);
+        add_to_linker_async(&mut linker).expect("install WASI imports");
+        add_routing_key_to_linker(&mut linker).expect("install routing-key import");
+        let mut store = Store::new(&engine, component_test_state());
+        store.set_fuel(INITIAL_FUEL).expect("routing-key test fuel");
+        store.set_epoch_deadline(1);
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .expect("instantiate routing-key wrapper probe");
+        let probe = instance
+            .get_typed_func::<(), (String,)>(&mut store, "probe")
+            .expect("typed routing-key wrapper probe export");
+
+        for _ in 0..2 {
+            let (key,) = probe
+                .call_async(&mut store, ())
+                .await
+                .expect("call routing-key wrapper probe");
+            assert_eq!(
+                key,
+                "bafkr4ifcoue3f52zpzpz2xei7dqhs3gajm326llyljbwisxkwea7hbowyy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_key_wit_call_matches_golden_vector_and_is_deterministic() {
+        let engine = crate::engine::wasm_engine().expect("component engine");
+        let component = Component::new(&engine, ROUTING_KEY_PROBE_COMPONENT)
+            .expect("routing-key probe component");
+        let mut linker = Linker::new(&engine);
+        add_routing_key_to_linker(&mut linker).expect("install routing-key import");
+        let mut store = Store::new(&engine, component_test_state());
+        store.set_fuel(INITIAL_FUEL).expect("routing-key test fuel");
+        store.set_epoch_deadline(1);
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .expect("instantiate routing-key probe");
+        let probe = instance
+            .get_typed_func::<(), (String,)>(&mut store, "probe")
+            .expect("typed routing-key probe export");
+
+        for _ in 0..2 {
+            let (key,) = probe
+                .call_async(&mut store, ())
+                .await
+                .expect("call routing-key probe");
+            assert_eq!(
+                key,
+                "bafkr4ifcoue3f52zpzpz2xei7dqhs3gajm326llyljbwisxkwea7hbowyy"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_key_registration_does_not_require_a_guest_import() {
+        let engine = crate::engine::wasm_engine().expect("component engine");
+        let component = Component::new(&engine, "(component)").expect("empty component");
+        assert!(component
+            .component_type()
+            .imports(&engine)
+            .all(|(name, _)| name != "wetware:routing/key@0.1.0"));
+
+        let mut linker = Linker::new(&engine);
+        add_routing_key_to_linker(&mut linker).expect("install routing-key import");
+        linker
+            .instantiate_pre(&component)
+            .expect("extra routing-key host support must not affect a non-importing component");
+    }
+
+    #[test]
+    fn routing_key_import_is_registered_for_ordinary_and_pid0_linkers() {
+        let engine = crate::engine::wasm_engine().expect("component engine");
+        let component = Component::new(&engine, ROUTING_KEY_PROBE_COMPONENT)
+            .expect("routing-key probe component");
+
+        let mut ordinary = Linker::new(&engine);
+        add_routing_key_to_linker(&mut ordinary).expect("ordinary routing-key import");
+        ordinary
+            .instantiate_pre(&component)
+            .expect("ordinary linker satisfies routing-key import");
+
+        let mut pid0 = Linker::new(&engine);
+        add_routing_key_to_linker(&mut pid0).expect("PID0 routing-key import");
+        pid0_runtime::Pid0::add_to_linker::<ComponentRunStates, HasSelf<ComponentRunStates>>(
+            &mut pid0,
+            |state| state,
+        )
+        .expect("install private PID0 import");
+        pid0.instantiate_pre(&component)
+            .expect("PID0 linker satisfies routing-key import");
     }
 
     fn private_kernel_import_component() -> Vec<u8> {

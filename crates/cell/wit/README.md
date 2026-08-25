@@ -27,6 +27,27 @@ Defines a bidirectional data stream interface for host-guest communication, sepa
 - Guests can use these handles with standard WASI stream APIs (`wasi:io/streams`)
 - Streams are backed by in-memory tokio channels on the host side
 
+### `routing-key/wit/key.wit`
+
+The canonical routing-key WIT source lives in the publishable
+`crates/guest/routing-key` package. `crates/cell/src/proc.rs` reads the same
+file for its host binding.
+
+**Package:** `wetware:routing@0.1.0`
+
+**Interface:** `key`
+
+**Function:** `derive: func(data: list<u8>) -> string`
+
+**World:** `key-client`, which imports `key`
+
+The host registers `key-client` in the common linker path for ordinary and
+PID0 components. The import remains optional. A component that does not select
+`key-client` has no routing-key binding or component metadata.
+
+`routing_key_runtime` generates the host `Host` trait. `ComponentRunStates`
+implements the trait, and `KeyClient::add_to_linker` registers the import.
+
 ## How bindgen! Works
 
 ### Configuration
@@ -50,9 +71,12 @@ bindgen!({
 - `Connection`: A resource type alias (`ResourceAny`) representing the `connection` resource
 - Helper methods: `Connection::try_from_resource()` for converting `Resource<T>` to `Connection`
 
-### Important Limitation
+### Important Limitation for `streams-world`
 
-**`bindgen!` generates guest-side bindings only.** For exported interfaces (host-implemented), you must manually implement host functions using `linker.root().func_wrap_async()`. There is no generated trait to implement.
+The `streams-world` binding does not generate a host trait for its exported
+interface. Register those functions with `linker.root().func_wrap_async()`.
+An import world such as `key-client` generates a `Host` trait and an
+`add_to_linker` helper.
 
 ## Host Function Implementation
 
@@ -136,9 +160,9 @@ Ok((connection,))
 
 ## Key Implementation Details
 
-### Async Function Wrapping
+### `streams-world` Async Function Wrapping
 
-All host functions use `func_wrap_async`:
+The manually registered `streams-world` host functions use `func_wrap_async`:
 
 - Closure must return `Box<dyn Future<Output = Result<T>> + Send>`
 - Use `Box::new(async move { ... })` for async closures
@@ -169,19 +193,17 @@ All host functions use `func_wrap_async`:
 
 **Solution:** Use `Connection::try_from_resource(resource, &mut store)?` provided by bindgen.
 
-### Issue: bindgen! generates guest bindings, not host traits
-
-**Solution:** Implement host functions manually using `linker.root().func_wrap_async()`. There is no trait to implement.
-
 ## Adding New Interfaces
 
 To add a new WIT interface:
 
-1. **Create the WIT file** in this directory (e.g., `loader.wit`)
+1. **Choose one canonical WIT location.** Put a published guest binding's WIT
+   inside that package. Otherwise, create the WIT file in this directory.
 2. **Define the interface** with package, interface, and world
-3. **Add `bindgen!` macro** in the host code (e.g., `src/cell/proc.rs`)
-4. **Implement host functions** using `linker.root().func_wrap_async()`
-5. **Add to linker** before component instantiation
+3. **Add `bindgen!` macro** in the host code (`crates/cell/src/proc.rs`)
+4. **Implement the generated `Host` trait** for an import world, or register
+   exported-world functions with `linker.root().func_wrap_async()`
+5. **Add the interface to each applicable linker** before instantiation
 
 Example WIT structure:
 
@@ -227,7 +249,7 @@ linker.root().func_wrap_async(
 
 - **WIT defines the interface contract** between host and guest
 - **`bindgen!` generates guest-side types** and resource conversion helpers
-- **Host functions are implemented manually** using `linker.root().func_wrap_async()`
+- **Import worlds generate host traits**; exported `streams-world` functions use manual linker registration
 - **Resources are managed via two tables**: component table for host resources, WASI table for WASI streams
 - **Function names must be fully qualified**: `{package}/{interface}#{name}`
 - **Resource parameters must be wrapped in tuples** to satisfy trait bounds

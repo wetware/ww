@@ -26,7 +26,8 @@ const CAPNP_FORK_REVISION: &str = "c6eecf42da63296e5bf628251935cf5af09d80be";
 const SENSITIVE_CAPS: &[&str] = &[
     "host",
     "runtime",
-    "routing",
+    "routing-finder",
+    "routing-announcer",
     "authority",
     "identity",
     "ipfs",
@@ -84,12 +85,6 @@ fn probe_bytes() -> Vec<u8> {
 }
 
 #[derive(Default)]
-struct SwarmCounts {
-    provide: Cell<u32>,
-    find: Cell<u32>,
-}
-
-#[derive(Default)]
 struct BackendCounts {
     http: Cell<u32>,
     ipfs: Cell<u32>,
@@ -97,7 +92,6 @@ struct BackendCounts {
 
 struct Harness {
     executor: system_capnp::executor::Client,
-    counts: Rc<SwarmCounts>,
     backend_counts: Rc<BackendCounts>,
     backend_url: String,
     _epoch_tx: watch::Sender<authority::Epoch>,
@@ -154,7 +148,6 @@ async fn probe_backend() -> (String, Rc<BackendCounts>) {
 
 async fn harness(wasm: &[u8]) -> Harness {
     let (backend_url, backend_counts) = probe_backend().await;
-    let counts = Rc::new(SwarmCounts::default());
 
     let epoch = authority::Epoch {
         seq: 1,
@@ -170,7 +163,6 @@ async fn harness(wasm: &[u8]) -> Harness {
     let executor = load_executor(&runtime, wasm).await;
     Harness {
         executor,
-        counts,
         backend_counts,
         backend_url,
         _epoch_tx: epoch_tx,
@@ -1192,43 +1184,124 @@ fn empty_grant_child_cannot_invoke_node_authority() {
 }
 
 #[test]
-fn empty_grant_child_cannot_route_discover_or_publish() {
+fn empty_grant_child_cannot_discover_or_announce_providers() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
         let harness = harness(&wasm).await;
-        let report = probe_report(&harness.executor, "routing", &[], &[]).await;
-        assert_ne!(
-            report["ok"], true,
-            "empty-grant child used routing authority: {report}"
-        );
-        assert_eq!(harness.counts.provide.get(), 0);
-        assert_eq!(harness.counts.find.get(), 0);
+        for mode in ["routing-finder", "routing-announcer"] {
+            let report = probe_report(&harness.executor, mode, &[], &[]).await;
+            assert_ne!(
+                report["ok"], true,
+                "empty-grant child used {mode} authority: {report}"
+            );
+        }
     });
 }
 
 #[test]
-fn explicitly_granted_routing_remains_concretely_callable() {
+fn finder_only_can_discover_but_cannot_use_announcer() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
         let harness = harness(&wasm).await;
-        let routing: ww::routing_capnp::routing::Client =
-            capnp_rpc::new_client(ww::rpc::routing::LocalRouting::new());
+        let routing = ww::rpc::routing::LocalProviderRouting::new();
+        routing.provide_as(
+            KNOWN_CID,
+            ww::rpc::PeerInfo {
+                peer_id: vec![1, 2, 3],
+                addrs: vec![vec![4, 5, 6]],
+            },
+        );
+        let finder: ww::routing_capnp::finder::Client = capnp_rpc::new_client(routing.finder());
         let report = probe_report(
             &harness.executor,
-            "routing",
+            "routing-finder",
             &[],
             &[Grant {
-                name: "routing".into(),
-                cap: routing.client,
+                name: "routing-finder".into(),
+                cap: finder.client,
             }],
         )
         .await;
-        assert_eq!(report["ok"], true, "routing probe failed: {report}");
+        assert_eq!(report["ok"], true, "Finder probe failed: {report}");
+        assert_eq!(report["detail"]["find_providers"], true);
+        assert_eq!(report["detail"]["providers"], 1);
+        assert_eq!(report["detail"]["done"], true);
+        assert_eq!(report["detail"]["announcer_cast_rejected"], true);
+    });
+}
+
+#[test]
+fn announcer_only_can_announce_but_cannot_use_finder() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let routing = ww::rpc::routing::LocalProviderRouting::new();
+        let announcer: ww::routing_capnp::announcer::Client =
+            capnp_rpc::new_client(routing.announcer());
+        let report = probe_report(
+            &harness.executor,
+            "routing-announcer",
+            &[],
+            &[Grant {
+                name: "routing-announcer".into(),
+                cap: announcer.client,
+            }],
+        )
+        .await;
+        assert_eq!(report["ok"], true, "Announcer probe failed: {report}");
+        assert_eq!(report["detail"]["provide"], true);
+        assert_eq!(report["detail"]["finder_cast_rejected"], true);
+    });
+}
+
+#[test]
+fn finder_and_announcer_are_available_only_when_both_are_explicitly_granted() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let routing = ww::rpc::routing::LocalProviderRouting::new();
+        routing.provide_as(
+            KNOWN_CID,
+            ww::rpc::PeerInfo {
+                peer_id: vec![1, 2, 3],
+                addrs: vec![vec![4, 5, 6]],
+            },
+        );
+        let finder: ww::routing_capnp::finder::Client = capnp_rpc::new_client(routing.finder());
+        let announcer: ww::routing_capnp::announcer::Client =
+            capnp_rpc::new_client(routing.announcer());
+        let report = probe_report(
+            &harness.executor,
+            "routing-both",
+            &[],
+            &[
+                Grant {
+                    name: "routing-finder".into(),
+                    cap: finder.client,
+                },
+                Grant {
+                    name: "routing-announcer".into(),
+                    cap: announcer.client,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(
+            report["ok"], true,
+            "combined routing probe failed: {report}"
+        );
         assert_eq!(report["detail"]["provide"], true);
         assert_eq!(report["detail"]["find_providers"], true);
+        assert_eq!(report["detail"]["providers"], 1);
         assert_eq!(report["detail"]["done"], true);
+        assert_eq!(
+            report["detail"]["explicit_refs"],
+            serde_json::json!(["routing-finder", "routing-announcer"])
+        );
     });
 }
 

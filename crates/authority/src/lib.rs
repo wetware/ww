@@ -114,6 +114,22 @@ mod wire_type_id_tests {
             <crate::membrane_capnp::membrane::Client as HasTypeId>::TYPE_ID,
             0xdb52_c251_06bc_2c5e
         );
+        assert_eq!(
+            <crate::routing_capnp::finder::Client as HasTypeId>::TYPE_ID,
+            0xebb8_ace9_d47a_e6a8
+        );
+        assert_eq!(
+            <crate::routing_capnp::announcer::Client as HasTypeId>::TYPE_ID,
+            0xf526_74c7_8f63_1b2f
+        );
+        assert_ne!(
+            <crate::routing_capnp::finder::Client as HasTypeId>::TYPE_ID,
+            0xa7c3_e8f1_d4b2_9065
+        );
+        assert_ne!(
+            <crate::routing_capnp::announcer::Client as HasTypeId>::TYPE_ID,
+            0xa7c3_e8f1_d4b2_9065
+        );
     }
 }
 

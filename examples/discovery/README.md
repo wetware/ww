@@ -7,7 +7,8 @@ A Greeter guest for named vat RPC and service-name DHT discovery.
 - Cap'n Proto vat RPC with `WW_CELL_MODE=vat`
 - explicit ungated `VatListener.serveRaw` publication for this fixture
 - typed `VatClient` dialing
-- `routing.provide()` and `findProviders()`
+- pure service-name routing-key derivation
+- independent `routing-announcer` and `routing-finder` grants
 - service and consumer execution modes
 
 ## Build

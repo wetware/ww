@@ -1,0 +1,12 @@
+package wetware:routing@0.1.0;
+
+/// Pure canonical routing-key derivation.
+interface key {
+    /// Return CIDv1/raw/BLAKE3-256 text for the supplied bytes.
+    derive: func(data: list<u8>) -> string;
+}
+
+/// Optional guest world for components that derive routing keys.
+world key-client {
+    import key;
+}

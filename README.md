@@ -131,7 +131,7 @@ an image. A published guest requires an application-specific composition path.
 - [Capabilities](doc/capabilities.md): the capability model and Cap'n Proto schemas
 - [CLI reference](doc/cli.md): full command-line usage
 - [Image layout](doc/images.md): FHS convention, mounts, on-chain coordination
-- [Routing](doc/routing.md): Kademlia DHT and peer discovery
+- [Provider routing](doc/routing.md): independent discovery and host-PeerID announcement capabilities
 - [Keys & identity](doc/keys.md): Ed25519 identity management
 - [RPC transport](doc/rpc-transport.md): transport plumbing and scheduling model
 - [Guest runtime](doc/guest-runtime.md): async runtime for WASM guests

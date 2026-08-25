@@ -1,0 +1,5 @@
+package wetware:routing-key-probe@0.1.0;
+
+world probe {
+    export probe: func() -> string;
+}

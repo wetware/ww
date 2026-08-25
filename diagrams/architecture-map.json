@@ -47,7 +47,7 @@
       "subtitle": "Owns the node service threads.",
       "files": ["src/services.rs", "src/host.rs", "src/ipns.rs"],
       "what": "The `Host` supervisor starts and stops the swarm, WAGI service, compiler, admin service, executor pool, and host-owned IPNS republisher. Long-running services own dedicated threads; deployment coordination runs in the main host runtime.",
-      "built": "`src/services.rs` defines `Service` and `Host`. `src/host.rs` owns libp2p behavior and swarm events. `src/ipns.rs` validates, persists, signs, transports, and republishes raw IPNS records. The executor pool uses local runtimes because Wasmtime stores are not `Send`."
+      "built": "`src/services.rs` defines `Service` and `Host`. `src/host.rs` owns libp2p behavior, swarm events, bounded provider queries, and epoch-owned provider registrations. `src/ipns.rs` validates, persists, signs, transports, and republishes raw IPNS records. The executor pool uses local runtimes because Wasmtime stores are not `Send`."
     },
     {
       "key": "epoch",
@@ -141,9 +141,9 @@
       "group": "THE AUTHORITY PATH",
       "title": "Capability membrane",
       "subtitle": "Attenuates a reference and preserves the restriction.",
-      "files": ["crates/membrane/src/lib.rs"],
+      "files": ["crates/membrane/src/lib.rs", "crates/rpc/src/routing.rs", "capnp/routing.capnp"],
       "what": "The membrane enforces an allowlist at the Cap’n Proto hook level. It also re-wraps returned, pipelined, and resolved capabilities so an allowed call cannot escape the policy.",
-      "built": "`Policy` checks every call through the wrapped `ClientHook`. `crates/rpc` provides the host capability servers, initial grants, routing, streams, and HTTP listeners."
+      "built": "`Policy` checks every call through the wrapped `ClientHook`. `crates/rpc` provides independent provider `Finder` and `Announcer` servers, initial grants, streams, and HTTP listeners. Finder and Announcer remain separately graftable and delegable."
     },
     {
       "key": "cell",
@@ -157,9 +157,9 @@
       "group": "THE CELL AND NETWORK",
       "title": "Isolated WASM cell",
       "subtitle": "A process with no ambient node authority.",
-      "files": ["crates/cell/src/lib.rs"],
+      "files": ["crates/cell/src/lib.rs", "crates/cell/src/routing_key.rs", "crates/guest/routing-key/wit/key.wit"],
       "what": "A cell has local computation, spawn-selected arguments and environment, stdio, clocks, randomness, and a private writable `/tmp`. Application authority arrives only through explicit grants.",
-      "built": "`crates/cell` contains Wasmtime process execution, image mounting, stream plumbing, filesystem interception, fuel scheduling, and virtual filesystems. `WW_CELL_MODE` selects vat, raw, HTTP, or pid0 stdio behavior."
+      "built": "`crates/cell` contains Wasmtime process execution, image mounting, stream plumbing, filesystem interception, fuel scheduling, and virtual filesystems. Components can optionally import pure CIDv1/raw/BLAKE3 routing-key derivation. `WW_CELL_MODE` selects vat, raw, HTTP, or pid0 stdio behavior."
     },
     {
       "key": "rpc",
@@ -173,9 +173,9 @@
       "group": "THE CELL AND NETWORK",
       "title": "Cap’n Proto RPC",
       "subtitle": "Carries typed capability calls.",
-      "files": ["crates/rpc/src/lib.rs"],
+      "files": ["crates/rpc/src/lib.rs", "crates/rpc/src/routing.rs"],
       "what": "RPC connects cells to host-provided capabilities through in-memory duplex streams. It also carries vat service calls over libp2p streams between peers.",
-      "built": "`crates/rpc` implements grafts, initial authority records, named capabilities, stream dialing and listening, routing, WAGI, and connection budgets."
+      "built": "`crates/rpc` implements grafts, initial authority records, named capabilities, independent provider discovery and announcement, stream dialing and listening, WAGI, and connection budgets."
     },
     {
       "key": "swarm",
@@ -188,10 +188,10 @@
       "z": 36,
       "group": "THE CELL AND NETWORK",
       "title": "libp2p swarm",
-      "subtitle": "Provides peer identity, routing, and streams.",
+      "subtitle": "Provides peer identity, provider routing, and streams.",
       "files": ["src/host.rs"],
-      "what": "The swarm runs Wetware’s peer-to-peer network. It manages Kademlia routing, identity, streams, relays, reachability, peer discovery, and service transports.",
-      "built": "`src/host.rs` builds the libp2p behavior. The runtime distinguishes WAN and LAN DHT requests and routes commands between capability implementations and the swarm loop."
+      "what": "The swarm runs Wetware’s peer-to-peer network. It manages Kademlia provider routing, identity, streams, relays, reachability, peer discovery, and service transports.",
+      "built": "`src/host.rs` builds separate WAN and LAN Kademlia behaviors. Finder calls deduplicate and bound dual-DHT results. Announcer owner leases retain local provision until final-owner cleanup stops republication."
     },
     {
       "key": "wagi",

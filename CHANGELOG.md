@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Breaking: provider routing now uses independent object capabilities.** The
+  legacy broad `Routing` interface and `routing` graft are replaced by
+  provider discovery through `routing::Finder` (`routing-finder`) and host
+  PeerID announcement through `routing::Announcer` (`routing-announcer`).
+  Finder queries enforce the requested unique-provider count, deduplicate WAN
+  and LAN results, retain at most `min(count, 16)` selected results behind a
+  single-slot handoff, and use a per-request token to cancel after sink
+  callback failure, epoch expiry, or a 30-second deadline that includes
+  swarm-command admission. Announcer
+  registrations and republication now end with their final owning authority
+  epoch. Guest IPNS resolution/publication and persistent UnixFS mutation are
+  removed. Canonical CIDv1/raw/BLAKE3 routing-key derivation is now the
+  optional pure `wetware:routing/key@0.1.0` WIT import.
 - **Wetware now owns default IPNS signing and can follow an IPNS deployment
   Stem.** `ww run --ipns-stem <name>` uses locally verified raw records as the
   authoritative deployment source. Signed EOL revokes the current generation
@@ -17,7 +30,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Gateway.ExposeRoutingAPI` and use the Gateway listener, which defaults to
   `http://localhost:8080` and can be set with `IPFS_ROUTING_API` or
   `--ipns-routing-url`. Wetware no longer creates or requires Kubo's `"ww"`
-  signing key. Guest `Routing.publish` is unchanged. `rust-ipns` is temporarily
+  signing key. The host publisher remains separate from guest provider routing.
+  `rust-ipns` is temporarily
   pinned to reviewed commit `02c5ae7bf3f9568c7dbbb1308ae9299cfc7ba2d9`
   pending upstream PR #503 or a release that contains its V2-only validation
   fix.

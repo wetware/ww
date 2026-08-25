@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+blake3 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 arc-swap = "1"

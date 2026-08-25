@@ -283,10 +283,7 @@ pub fn select_kernel_source(cli: Option<&str>, env: Option<&str>) -> Result<Sour
 }
 
 pub fn runtime_cid(bytes: &[u8]) -> Cid {
-    let digest = blake3::hash(bytes);
-    let mh = cid::multihash::Multihash::<64>::wrap(0x1e, digest.as_bytes())
-        .expect("blake3 digest always fits in 64-byte multihash");
-    Cid::new_v1(0x55, mh)
+    cell::routing_key::derive(bytes)
 }
 
 /// Prepared filesystem root for one kernel generation.

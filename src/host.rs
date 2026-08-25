@@ -1,19 +1,21 @@
 //! Wetware host runtime: libp2p host + Wasmtime host.
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::num::{NonZeroU8, NonZeroUsize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use libp2p::core::connection::ConnectedPoint;
 use libp2p::kad;
+use libp2p::kad::store::RecordStore;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use rpc::{NatReachability, NetworkState, PeerInfo};
 
@@ -23,6 +25,16 @@ use rpc::{NatReachability, NetworkState, PeerInfo};
 
 /// Maximum number of concurrent relay reservations to maintain.
 const MAX_RELAY_RESERVATIONS: usize = 2;
+
+/// Each DHT query contacts this many peers. The same bound caps selected
+/// provider results so an untrusted `count` cannot scale host memory or
+/// address-resolution fan-out without limit.
+const KAD_REPLICATION_FACTOR: usize = 16;
+const MAX_FIND_PROVIDER_RESULTS: u32 = KAD_REPLICATION_FACTOR as u32;
+
+fn find_provider_limit(requested: u32) -> u32 {
+    requested.min(MAX_FIND_PROVIDER_RESULTS)
+}
 
 /// The relay v2 hop protocol advertised by peers that can serve as relays.
 const RELAY_HOP_PROTOCOL: &str = "/libp2p/circuit/relay/0.2.0/hop";
@@ -138,34 +150,171 @@ fn actions_for_nat_transition(transition: NatTransition) -> NatTransitionActions
 
 /// Shared state for a logical `find_providers` request dispatched to both DHTs.
 ///
-/// Both WAN and LAN queries feed providers into the same `sender`.  The `seen`
-/// set deduplicates across DHTs.  `remaining` tracks how many DHT queries are
-/// still active; the channel closes when it reaches 0.
+/// Both WAN and LAN queries feed providers into the same `sender`. `seen`
+/// deduplicates discovery results. `queued_peers` also deduplicates the two
+/// address-resolution queries for an addressless provider. `pending` retains
+/// selected results until the single-slot sender accepts them. Its length plus
+/// `delivered` cannot exceed the caller's `limit`. `remaining` tracks how many
+/// provider queries are still active.
 struct FindRequest {
-    sender: mpsc::UnboundedSender<PeerInfo>,
+    sender: mpsc::Sender<PeerInfo>,
+    cancellation: watch::Receiver<bool>,
     seen: HashSet<PeerId>,
+    queued_peers: HashSet<PeerId>,
+    pending: VecDeque<PendingProvider>,
     remaining: u8,
+    limit: u32,
+    delivered: u32,
+}
+
+#[derive(Clone)]
+struct PendingProvider {
+    peer_id: PeerId,
+    info: PeerInfo,
+}
+
+type PendingFindDelivery = (u64, mpsc::Sender<PeerInfo>, PendingProvider);
+type PendingFindCancellation = (u64, watch::Receiver<bool>);
+
+fn pending_find_deliveries(requests: &HashMap<u64, FindRequest>) -> Vec<PendingFindDelivery> {
+    requests
+        .iter()
+        .filter_map(|(&request_id, request)| {
+            request
+                .pending
+                .front()
+                .cloned()
+                .map(|provider| (request_id, request.sender.clone(), provider))
+        })
+        .collect()
+}
+
+async fn send_next_find_provider(
+    candidates: Vec<PendingFindDelivery>,
+) -> Option<(u64, PeerId, bool)> {
+    if candidates.is_empty() {
+        return std::future::pending().await;
+    }
+
+    let mut deliveries = FuturesUnordered::new();
+    for (request_id, sender, provider) in candidates {
+        deliveries.push(async move {
+            let peer_id = provider.peer_id;
+            let sent = sender.send(provider.info).await.is_ok();
+            (request_id, peer_id, sent)
+        });
+    }
+    deliveries.next().await
+}
+
+fn pending_find_cancellations(
+    requests: &HashMap<u64, FindRequest>,
+) -> Vec<PendingFindCancellation> {
+    requests
+        .iter()
+        .map(|(&request_id, request)| (request_id, request.cancellation.clone()))
+        .collect()
+}
+
+async fn wait_for_next_find_cancellation(candidates: Vec<PendingFindCancellation>) -> Option<u64> {
+    if candidates.is_empty() {
+        return std::future::pending().await;
+    }
+
+    let mut cancellations = FuturesUnordered::new();
+    for (request_id, mut cancellation) in candidates {
+        cancellations.push(async move {
+            let already_canceled = *cancellation.borrow();
+            if !already_canceled {
+                let _ = cancellation.changed().await;
+            }
+            request_id
+        });
+    }
+    cancellations.next().await
+}
+
+impl FindRequest {
+    fn can_select_provider(&self) -> bool {
+        self.seen.len() < usize::try_from(self.limit).unwrap_or(usize::MAX)
+    }
+
+    fn select_provider(&mut self, peer_id: PeerId) -> bool {
+        self.can_select_provider() && self.seen.insert(peer_id)
+    }
+
+    fn selection_complete(&self) -> bool {
+        !self.can_select_provider()
+    }
+
+    fn queue_resolved_provider(&mut self, peer_id: PeerId, addrs: &[Multiaddr]) {
+        if self.queued_peers.insert(peer_id) {
+            self.pending.push_back(PendingProvider {
+                peer_id,
+                info: PeerInfo {
+                    peer_id: peer_id.to_bytes(),
+                    addrs: addrs.iter().map(|addr| addr.to_vec()).collect(),
+                },
+            });
+        }
+    }
 }
 
 /// Shared state for a logical `provide` request dispatched to both DHTs.
 ///
-/// WAN is the source of truth.  We reply on first success.  If both fail,
-/// reply with the WAN error.
+/// The first WAN or LAN success activates the registration and replies to all
+/// owners. If both DHTs fail, the request reports the WAN error when available.
 struct ProvideRequest {
-    reply: Option<oneshot::Sender<Result<(), String>>>,
+    key: Vec<u8>,
+    owners: HashSet<rpc::ProviderOwnerId>,
+    replies: Vec<(rpc::ProviderOwnerId, oneshot::Sender<Result<(), String>>)>,
     wan_done: bool,
     lan_done: bool,
     wan_err: Option<String>,
+    succeeded: bool,
 }
 
 impl ProvideRequest {
-    fn new(reply: oneshot::Sender<Result<(), String>>) -> Self {
+    fn new(
+        owner: rpc::ProviderOwnerId,
+        key: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    ) -> Self {
         Self {
-            reply: Some(reply),
+            key,
+            owners: HashSet::from([owner]),
+            replies: vec![(owner, reply)],
             wan_done: false,
             lan_done: false,
             wan_err: None,
+            succeeded: false,
         }
+    }
+
+    fn add_owner(
+        &mut self,
+        owner: rpc::ProviderOwnerId,
+        reply: oneshot::Sender<Result<(), String>>,
+    ) {
+        self.owners.insert(owner);
+        if self.succeeded {
+            let _ = reply.send(Ok(()));
+        } else {
+            self.replies.push((owner, reply));
+        }
+    }
+
+    fn release_owner(&mut self, owner: rpc::ProviderOwnerId, reason: &str) {
+        self.owners.remove(&owner);
+        let mut retained = Vec::with_capacity(self.replies.len());
+        for (reply_owner, reply) in self.replies.drain(..) {
+            if reply_owner == owner {
+                let _ = reply.send(Err(reason.to_string()));
+            } else {
+                retained.push((reply_owner, reply));
+            }
+        }
+        self.replies = retained;
     }
 
     /// Record a DHT result.  Returns true if the request is fully resolved.
@@ -176,8 +325,10 @@ impl ProvideRequest {
         }
         match result {
             Ok(()) => {
-                // First success wins — reply immediately.
-                if let Some(reply) = self.reply.take() {
+                self.succeeded = true;
+                // First success wins. All duplicate callers observe the same
+                // registration result.
+                for (_, reply) in self.replies.drain(..) {
                     let _ = reply.send(Ok(()));
                 }
             }
@@ -191,13 +342,89 @@ impl ProvideRequest {
     }
 
     /// Finalize: if nobody got a success, send the WAN error.
-    fn finalize(mut self) {
-        if let Some(reply) = self.reply.take() {
+    fn finalize(mut self) -> ProvideOutcome {
+        if !self.succeeded {
             let err = self
                 .wan_err
                 .unwrap_or_else(|| "both DHTs failed".to_string());
-            let _ = reply.send(Err(err));
+            for (_, reply) in self.replies.drain(..) {
+                let _ = reply.send(Err(err.clone()));
+            }
+            ProvideOutcome::Failed {
+                owners: self.owners.into_iter().collect(),
+                key: self.key,
+            }
+        } else {
+            ProvideOutcome::Active
         }
+    }
+}
+
+enum ProvideOutcome {
+    Active,
+    Failed {
+        owners: Vec<rpc::ProviderOwnerId>,
+        key: Vec<u8>,
+    },
+}
+
+/// Reference ownership for local provider registration and republication.
+#[derive(Default)]
+struct ProviderOwnership {
+    by_key: HashMap<Vec<u8>, HashSet<rpc::ProviderOwnerId>>,
+    by_owner: HashMap<rpc::ProviderOwnerId, HashSet<Vec<u8>>>,
+}
+
+impl ProviderOwnership {
+    /// Claim one key. Returns true only for the first local owner.
+    fn claim(&mut self, owner: rpc::ProviderOwnerId, key: Vec<u8>) -> bool {
+        let owners = self.by_key.entry(key.clone()).or_default();
+        if !owners.insert(owner) {
+            return false;
+        }
+        self.by_owner.entry(owner).or_default().insert(key);
+        owners.len() == 1
+    }
+
+    fn contains(&self, owner: rpc::ProviderOwnerId, key: &[u8]) -> bool {
+        self.by_key
+            .get(key)
+            .is_some_and(|owners| owners.contains(&owner))
+    }
+
+    /// Release one claim. Returns true when the key lost its final owner.
+    fn release_key(&mut self, owner: rpc::ProviderOwnerId, key: &[u8]) -> bool {
+        let mut final_owner = false;
+        if let Some(owners) = self.by_key.get_mut(key) {
+            owners.remove(&owner);
+            final_owner = owners.is_empty();
+        }
+        if final_owner {
+            self.by_key.remove(key);
+        }
+        if let Some(keys) = self.by_owner.get_mut(&owner) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.by_owner.remove(&owner);
+            }
+        }
+        final_owner
+    }
+
+    /// Release all claims for an owner and return keys that lost their final owner.
+    fn release_owner(&mut self, owner: rpc::ProviderOwnerId) -> Vec<Vec<u8>> {
+        let keys = self.by_owner.remove(&owner).unwrap_or_default();
+        let mut final_keys = Vec::new();
+        for key in keys {
+            if let Some(owners) = self.by_key.get_mut(&key) {
+                owners.remove(&owner);
+                if owners.is_empty() {
+                    self.by_key.remove(&key);
+                    final_keys.push(key);
+                }
+            }
+        }
+        final_keys
     }
 }
 
@@ -350,7 +577,7 @@ impl Net {
         let kad_store = kad::store::MemoryStore::new(peer_id);
         let mut kad_config = kad::Config::new(kad::PROTOCOL_NAME);
         kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(bootstrap_secs)));
-        kad_config.set_replication_factor(NonZeroUsize::new(16).unwrap());
+        kad_config.set_replication_factor(NonZeroUsize::new(KAD_REPLICATION_FACTOR).unwrap());
         // NOTE: we'd like to call `kad_config.set_automatic_bootstrap_throttle`
         // here to rate-limit identify-triggered bootstrap fan-out (kad
         // auto-bootstraps whenever a new peer is inserted into the routing
@@ -368,7 +595,7 @@ impl Net {
         let lan_proto = libp2p::StreamProtocol::new("/ipfs/lan/kad/1.0.0");
         let mut kad_lan_config = kad::Config::new(lan_proto);
         kad_lan_config.set_periodic_bootstrap_interval(None);
-        kad_lan_config.set_replication_factor(NonZeroUsize::new(16).unwrap());
+        kad_lan_config.set_replication_factor(NonZeroUsize::new(KAD_REPLICATION_FACTOR).unwrap());
         // Same throttle limitation applies here — see WAN comment above.
         let mut kad_lan = kad::Behaviour::with_config(peer_id, kad_lan_store, kad_lan_config);
         kad_lan.set_mode(Some(kad::Mode::Server));
@@ -486,6 +713,10 @@ impl Net {
         let mut pending_provides: HashMap<u64, ProvideRequest> = HashMap::new();
         // Compound (source, query_id) → logical request_id for provide.
         let mut provide_query_to_req: HashMap<DhtQueryKey, u64> = HashMap::new();
+        // One in-flight provide per owner/key pair. Duplicate calls join it.
+        let mut pending_provider_claims: HashMap<(rpc::ProviderOwnerId, Vec<u8>), u64> =
+            HashMap::new();
+        let mut provider_ownership = ProviderOwnership::default();
 
         // Logical request ID → FindRequest.  Both DHT queries map here.
         let mut pending_finds: HashMap<u64, FindRequest> = HashMap::new();
@@ -548,7 +779,55 @@ impl Net {
         tokio::pin!(walk_timer);
 
         loop {
+            let find_delivery = send_next_find_provider(pending_find_deliveries(&pending_finds));
+            let find_cancellation =
+                wait_for_next_find_cancellation(pending_find_cancellations(&pending_finds));
+
             tokio::select! {
+                request_id = find_cancellation => {
+                    cancel_find_request(
+                        request_id.expect("find cancellation future requires a request"),
+                        &mut self.swarm,
+                        &mut find_query_to_req,
+                        &mut pending_finds,
+                        &mut pending_peer_routing,
+                        &mut routed_peers,
+                    );
+                }
+                delivery = find_delivery => {
+                    let (request_id, peer_id, sent) =
+                        delivery.expect("find delivery future only completes with a provider");
+                    let mut cancel = !sent;
+                    if sent {
+                        if let Some(request) = pending_finds.get_mut(&request_id) {
+                            let delivered = request
+                                .pending
+                                .pop_front()
+                                .expect("selected find delivery disappeared");
+                            debug_assert_eq!(delivered.peer_id, peer_id);
+                            request.delivered = request.delivered.saturating_add(1);
+                            cancel = request.delivered >= request.limit;
+                        }
+                    }
+
+                    if cancel {
+                        cancel_find_request(
+                            request_id,
+                            &mut self.swarm,
+                            &mut find_query_to_req,
+                            &mut pending_finds,
+                            &mut pending_peer_routing,
+                            &mut routed_peers,
+                        );
+                    } else if find_request_work_complete(
+                        request_id,
+                        &pending_finds,
+                        &pending_peer_routing,
+                    ) {
+                        pending_finds.remove(&request_id);
+                        routed_peers.remove(&request_id);
+                    }
+                }
                 event = self.swarm.select_next_some() => {
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
@@ -654,17 +933,36 @@ impl Net {
                                 DhtSource::Wan, id, result, &step,
                                 &mut self.swarm,
                                 &mut pending_provides, &mut provide_query_to_req,
+                                &mut pending_provider_claims, &mut provider_ownership,
                                 &mut pending_finds, &mut find_query_to_req,
                                 &mut peer_addr_book, &mut pending_peer_routing,
                                 &mut routed_peers,
                             );
                             if step.last {
-                                cleanup_query(
+                                let cleanup = cleanup_query(
                                     DhtSource::Wan, id,
                                     &mut provide_query_to_req, &mut pending_provides,
+                                    &mut pending_provider_claims,
                                     &mut find_query_to_req, &mut pending_finds,
                                     &mut pending_peer_routing, &mut routed_peers,
                                 );
+                                if let Some(outcome) = cleanup.provide {
+                                    apply_provide_outcome(
+                                        outcome,
+                                        &mut provider_ownership,
+                                        &mut self.swarm,
+                                    );
+                                }
+                                if let Some(request_id) = cleanup.completed_find {
+                                    cancel_find_request(
+                                        request_id,
+                                        &mut self.swarm,
+                                        &mut find_query_to_req,
+                                        &mut pending_finds,
+                                        &mut pending_peer_routing,
+                                        &mut routed_peers,
+                                    );
+                                }
                             }
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Kad(ref ev)) => {
@@ -678,17 +976,36 @@ impl Net {
                                 DhtSource::Lan, id, result, &step,
                                 &mut self.swarm,
                                 &mut pending_provides, &mut provide_query_to_req,
+                                &mut pending_provider_claims, &mut provider_ownership,
                                 &mut pending_finds, &mut find_query_to_req,
                                 &mut peer_addr_book, &mut pending_peer_routing,
                                 &mut routed_peers,
                             );
                             if step.last {
-                                cleanup_query(
+                                let cleanup = cleanup_query(
                                     DhtSource::Lan, id,
                                     &mut provide_query_to_req, &mut pending_provides,
+                                    &mut pending_provider_claims,
                                     &mut find_query_to_req, &mut pending_finds,
                                     &mut pending_peer_routing, &mut routed_peers,
                                 );
+                                if let Some(outcome) = cleanup.provide {
+                                    apply_provide_outcome(
+                                        outcome,
+                                        &mut provider_ownership,
+                                        &mut self.swarm,
+                                    );
+                                }
+                                if let Some(request_id) = cleanup.completed_find {
+                                    cancel_find_request(
+                                        request_id,
+                                        &mut self.swarm,
+                                        &mut find_query_to_req,
+                                        &mut pending_finds,
+                                        &mut pending_peer_routing,
+                                        &mut routed_peers,
+                                    );
+                                }
                             }
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::KadLan(ref ev)) => {
@@ -818,17 +1135,50 @@ impl Net {
                                 }
                             }
                         }
-                        Some(SwarmCommand::KadProvide { key, reply }) => {
+                        Some(SwarmCommand::KadProvide { owner, key, reply }) => {
+                            if let Some(req_id) = pending_provider_claims.get(&(owner, key.clone())) {
+                                if let Some(request) = pending_provides.get_mut(req_id) {
+                                    request.add_owner(owner, reply);
+                                    continue;
+                                }
+                            }
+
+                            if let Some(req_id) = pending_provides
+                                .iter()
+                                .find_map(|(id, request)| (request.key == key).then_some(*id))
+                            {
+                                provider_ownership.claim(owner, key.clone());
+                                pending_provider_claims.insert((owner, key.clone()), req_id);
+                                pending_provides
+                                    .get_mut(&req_id)
+                                    .expect("pending provider request disappeared")
+                                    .add_owner(owner, reply);
+                                continue;
+                            }
+
+                            if provider_ownership.contains(owner, &key) {
+                                let _ = reply.send(Ok(()));
+                                continue;
+                            }
+
+                            let first_owner = provider_ownership.claim(owner, key.clone());
+                            if !first_owner {
+                                // Another live owner already keeps both local
+                                // DHT registrations eligible for republication.
+                                let _ = reply.send(Ok(()));
+                                continue;
+                            }
+
                             let req_id = next_request_id;
                             next_request_id += 1;
 
                             let record_key = kad::RecordKey::new(&key);
                             let beh = self.swarm.behaviour_mut();
 
-                            let mut req = ProvideRequest::new(reply);
+                            let mut req = ProvideRequest::new(owner, key.clone(), reply);
 
                             // WAN provide
-                            match beh.kad.start_providing(record_key.clone()) {
+                            match start_owned_providing(&mut beh.kad, record_key.clone()) {
                                 Ok(qid) => {
                                     provide_query_to_req.insert((DhtSource::Wan, qid), req_id);
                                 }
@@ -838,8 +1188,8 @@ impl Net {
                                 }
                             }
 
-                            // LAN provide (fire-and-forget semantics, but tracked)
-                            match beh.kad_lan.start_providing(record_key) {
+                            // LAN registration has the same owner and lifetime.
+                            match start_owned_providing(&mut beh.kad_lan, record_key) {
                                 Ok(qid) => {
                                     provide_query_to_req.insert((DhtSource::Lan, qid), req_id);
                                 }
@@ -850,15 +1200,59 @@ impl Net {
                             }
 
                             if req.wan_done && req.lan_done {
-                                req.finalize();
+                                apply_provide_outcome(
+                                    req.finalize(),
+                                    &mut provider_ownership,
+                                    &mut self.swarm,
+                                );
                             } else {
+                                pending_provider_claims.insert((owner, key), req_id);
                                 pending_provides.insert(req_id, req);
                             }
                         }
-                        Some(SwarmCommand::KadFindProviders { key, reply }) => {
-                            let req_id = next_request_id;
-                            next_request_id += 1;
+                        Some(SwarmCommand::KadReleaseProviderOwner { owner }) => {
+                            let final_keys = provider_ownership.release_owner(owner);
+                            for key in final_keys {
+                                stop_local_providing(&mut self.swarm, &key);
+                            }
 
+                            let pending_ids: Vec<u64> = pending_provides
+                                .iter()
+                                .filter_map(|(id, request)| {
+                                    request.owners.contains(&owner).then_some(*id)
+                                })
+                                .collect();
+                            for request_id in pending_ids {
+                                let remove_request = if let Some(request) = pending_provides.get_mut(&request_id) {
+                                    pending_provider_claims.remove(&(owner, request.key.clone()));
+                                    request.release_owner(
+                                        owner,
+                                        "provider owner epoch ended during provide",
+                                    );
+                                    request.owners.is_empty()
+                                } else {
+                                    false
+                                };
+                                if remove_request {
+                                    pending_provides.remove(&request_id);
+                                }
+                            }
+                        }
+                        Some(SwarmCommand::KadFindProviders {
+                            request,
+                            key,
+                            count,
+                            reply,
+                            cancel,
+                        }) => {
+                            if count == 0 {
+                                drop(reply);
+                                continue;
+                            }
+                            if *cancel.borrow() {
+                                drop(reply);
+                                continue;
+                            }
                             let record_key = kad::RecordKey::new(&key);
                             let beh = self.swarm.behaviour_mut();
 
@@ -866,20 +1260,25 @@ impl Net {
 
                             // WAN query
                             let wan_qid = beh.kad.get_providers(record_key.clone());
-                            find_query_to_req.insert((DhtSource::Wan, wan_qid), req_id);
+                            find_query_to_req.insert((DhtSource::Wan, wan_qid), request.0);
                             remaining += 1;
 
                             // LAN query
                             let lan_qid = beh.kad_lan.get_providers(record_key);
-                            find_query_to_req.insert((DhtSource::Lan, lan_qid), req_id);
+                            find_query_to_req.insert((DhtSource::Lan, lan_qid), request.0);
                             remaining += 1;
 
-                            pending_finds.insert(req_id, FindRequest {
+                            pending_finds.insert(request.0, FindRequest {
                                 sender: reply,
+                                cancellation: cancel,
                                 seen: HashSet::new(),
+                                queued_peers: HashSet::new(),
+                                pending: VecDeque::new(),
                                 remaining,
+                                limit: find_provider_limit(count),
+                                delivered: 0,
                             });
-                            routed_peers.insert(req_id, HashSet::new());
+                            routed_peers.insert(request.0, HashSet::new());
                         }
                         None => {
                             break;
@@ -908,6 +1307,125 @@ impl Net {
 // Extracted Kad event handler (shared by WAN and LAN)
 // ---------------------------------------------------------------------------
 
+fn start_owned_providing(
+    behaviour: &mut kad::Behaviour<kad::store::MemoryStore>,
+    key: kad::RecordKey,
+) -> Result<kad::QueryId, String> {
+    let query = behaviour
+        .start_providing(key.clone())
+        .map_err(|error| format!("{error:?}"))?;
+    let stored = behaviour
+        .store_mut()
+        .provided()
+        .any(|record| record.key == key);
+    if !stored {
+        if let Some(mut query) = behaviour.query_mut(&query) {
+            query.finish();
+        }
+        return Err("local provider store rejected the Wetware host record".into());
+    }
+    Ok(query)
+}
+
+fn stop_local_providing(swarm: &mut libp2p::swarm::Swarm<Behaviour>, key: &[u8]) {
+    let record_key = kad::RecordKey::new(&key);
+    let behaviour = swarm.behaviour_mut();
+    behaviour.kad.stop_providing(&record_key);
+    behaviour.kad_lan.stop_providing(&record_key);
+}
+
+fn apply_provide_outcome(
+    outcome: ProvideOutcome,
+    ownership: &mut ProviderOwnership,
+    swarm: &mut libp2p::swarm::Swarm<Behaviour>,
+) {
+    if let ProvideOutcome::Failed { owners, key } = outcome {
+        let mut final_owner = false;
+        for owner in owners {
+            final_owner |= ownership.release_key(owner, &key);
+        }
+        if final_owner {
+            stop_local_providing(swarm, &key);
+        }
+    }
+}
+
+fn finish_kad_query(
+    source: DhtSource,
+    query: kad::QueryId,
+    swarm: &mut libp2p::swarm::Swarm<Behaviour>,
+) {
+    let query = match source {
+        DhtSource::Wan => swarm.behaviour_mut().kad.query_mut(&query),
+        DhtSource::Lan => swarm.behaviour_mut().kad_lan.query_mut(&query),
+    };
+    if let Some(mut query) = query {
+        query.finish();
+    }
+}
+
+fn cancel_find_request(
+    request_id: u64,
+    swarm: &mut libp2p::swarm::Swarm<Behaviour>,
+    find_query_to_req: &mut HashMap<DhtQueryKey, u64>,
+    pending_finds: &mut HashMap<u64, FindRequest>,
+    pending_peer_routing: &mut HashMap<DhtQueryKey, (PeerId, Option<u64>)>,
+    routed_peers: &mut HashMap<u64, HashSet<PeerId>>,
+) {
+    let provider_queries: Vec<DhtQueryKey> = find_query_to_req
+        .iter()
+        .filter_map(|(query, owner)| (*owner == request_id).then_some(*query))
+        .collect();
+    for (source, query) in provider_queries {
+        find_query_to_req.remove(&(source, query));
+        finish_kad_query(source, query, swarm);
+    }
+
+    let route_queries: Vec<DhtQueryKey> = pending_peer_routing
+        .iter()
+        .filter_map(|(query, (_, owner))| (*owner == Some(request_id)).then_some(*query))
+        .collect();
+    for (source, query) in route_queries {
+        pending_peer_routing.remove(&(source, query));
+        finish_kad_query(source, query, swarm);
+    }
+
+    pending_finds.remove(&request_id);
+    routed_peers.remove(&request_id);
+}
+
+fn finish_find_provider_queries(
+    request_id: u64,
+    swarm: &mut libp2p::swarm::Swarm<Behaviour>,
+    find_query_to_req: &mut HashMap<DhtQueryKey, u64>,
+    pending_finds: &mut HashMap<u64, FindRequest>,
+) {
+    let provider_queries: Vec<DhtQueryKey> = find_query_to_req
+        .iter()
+        .filter_map(|(query, owner)| (*owner == request_id).then_some(*query))
+        .collect();
+    for (source, query) in provider_queries {
+        find_query_to_req.remove(&(source, query));
+        finish_kad_query(source, query, swarm);
+    }
+    if let Some(request) = pending_finds.get_mut(&request_id) {
+        request.remaining = 0;
+    }
+}
+
+fn find_request_work_complete(
+    request_id: u64,
+    pending_finds: &HashMap<u64, FindRequest>,
+    pending_peer_routing: &HashMap<DhtQueryKey, (PeerId, Option<u64>)>,
+) -> bool {
+    pending_finds
+        .get(&request_id)
+        .is_some_and(|request| request.remaining == 0 && request.pending.is_empty())
+        && !pending_peer_routing
+            .values()
+            .any(|(_, owner)| *owner == Some(request_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_kad_event(
     source: DhtSource,
@@ -917,6 +1435,8 @@ fn handle_kad_event(
     swarm: &mut libp2p::swarm::Swarm<Behaviour>,
     pending_provides: &mut HashMap<u64, ProvideRequest>,
     provide_query_to_req: &mut HashMap<DhtQueryKey, u64>,
+    pending_provider_claims: &mut HashMap<(rpc::ProviderOwnerId, Vec<u8>), u64>,
+    provider_ownership: &mut ProviderOwnership,
     pending_finds: &mut HashMap<u64, FindRequest>,
     find_query_to_req: &mut HashMap<DhtQueryKey, u64>,
     peer_addr_book: &mut HashMap<PeerId, Vec<Multiaddr>>,
@@ -924,6 +1444,8 @@ fn handle_kad_event(
     routed_peers: &mut HashMap<u64, HashSet<PeerId>>,
 ) {
     let key = (source, id);
+    let mut cancel_find = None;
+    let mut finish_provider_find = None;
     let label = match source {
         DhtSource::Wan => "WAN",
         DhtSource::Lan => "LAN",
@@ -947,7 +1469,10 @@ fn handle_kad_event(
                 if let Some(req) = pending_provides.get_mut(&req_id) {
                     if req.record(source, Ok(())) {
                         if let Some(req) = pending_provides.remove(&req_id) {
-                            req.finalize();
+                            for owner in &req.owners {
+                                pending_provider_claims.remove(&(*owner, req.key.clone()));
+                            }
+                            apply_provide_outcome(req.finalize(), provider_ownership, swarm);
                         }
                     }
                 }
@@ -959,7 +1484,10 @@ fn handle_kad_event(
                 if let Some(req) = pending_provides.get_mut(&req_id) {
                     if req.record(source, Err(format!("{e:?}"))) {
                         if let Some(req) = pending_provides.remove(&req_id) {
-                            req.finalize();
+                            for owner in &req.owners {
+                                pending_provider_claims.remove(&(*owner, req.key.clone()));
+                            }
+                            apply_provide_outcome(req.finalize(), provider_ownership, swarm);
                         }
                     }
                 }
@@ -976,9 +1504,8 @@ fn handle_kad_event(
             );
             if let Some(&req_id) = find_query_to_req.get(&key) {
                 if let Some(find_req) = pending_finds.get_mut(&req_id) {
-                    let routed = routed_peers.entry(req_id).or_default();
                     for provider in &providers {
-                        if !find_req.seen.insert(*provider) {
+                        if !find_req.select_provider(*provider) {
                             continue;
                         }
 
@@ -996,13 +1523,8 @@ fn handle_kad_event(
                                 addr_count = addrs.len(),
                                 "Provider discovered with addresses"
                             );
-                            let _ = find_req.sender.send(PeerInfo {
-                                peer_id: provider.to_bytes(),
-                                addrs: addrs.iter().map(|a| a.to_vec()).collect(),
-                            });
-                        } else if !routed.contains(provider)
-                            && !pending_peer_routing.values().any(|(p, _)| p == provider)
-                        {
+                            find_req.queue_resolved_provider(*provider, &addrs);
+                        } else {
                             tracing::debug!(
                                 dht = label,
                                 peer = %provider,
@@ -1016,6 +1538,11 @@ fn handle_kad_event(
                             let lan_qid = beh.kad_lan.get_closest_peers(*provider);
                             pending_peer_routing
                                 .insert((DhtSource::Lan, lan_qid), (*provider, Some(req_id)));
+                        }
+
+                        if find_req.selection_complete() {
+                            finish_provider_find = Some(req_id);
+                            break;
                         }
                     }
                 }
@@ -1057,12 +1584,9 @@ fn handle_kad_event(
                         .extend(info.addrs.iter().cloned());
                     // Deliver the now-addressable provider to the owning find request.
                     if let Some(req_id) = owner_req {
-                        if let Some(find_req) = pending_finds.get(&req_id) {
+                        if let Some(find_req) = pending_finds.get_mut(&req_id) {
                             if !info.addrs.is_empty() {
-                                let _ = find_req.sender.send(PeerInfo {
-                                    peer_id: target.to_bytes(),
-                                    addrs: info.addrs.iter().map(|a| a.to_vec()).collect(),
-                                });
+                                find_req.queue_resolved_provider(target, &info.addrs);
                             }
                         }
                     }
@@ -1074,6 +1598,11 @@ fn handle_kad_event(
                         "Peer routing: target not found in closest peers"
                     );
                 }
+                if let Some(req_id) = owner_req {
+                    if find_request_work_complete(req_id, pending_finds, pending_peer_routing) {
+                        cancel_find = Some(req_id);
+                    }
+                }
             }
         }
         kad::QueryResult::GetClosestPeers(Err(ref e)) => {
@@ -1084,11 +1613,29 @@ fn handle_kad_event(
                     }
                 }
                 tracing::warn!(dht = label, peer = %target, "Peer routing query failed: {e:?}");
+                if let Some(req_id) = owner_req {
+                    if find_request_work_complete(req_id, pending_finds, pending_peer_routing) {
+                        cancel_find = Some(req_id);
+                    }
+                }
             }
         }
         _ => {
             tracing::debug!(dht = label, "Kad query progress (other): {result:?}");
         }
+    }
+    if let Some(request_id) = finish_provider_find {
+        finish_find_provider_queries(request_id, swarm, find_query_to_req, pending_finds);
+    }
+    if let Some(request_id) = cancel_find {
+        cancel_find_request(
+            request_id,
+            swarm,
+            find_query_to_req,
+            pending_finds,
+            pending_peer_routing,
+            routed_peers,
+        );
     }
     tracing::debug!(
         dht = label,
@@ -1100,27 +1647,38 @@ fn handle_kad_event(
 }
 
 /// Clean up maps when a DHT query finishes (`step.last == true`).
-/// For find_providers, decrement `remaining` and close the channel when both
-/// DHT queries are done.
+/// For find_providers, decrement `remaining` and finish after both provider
+/// queries and any bounded provider address-resolution queries are done.
+#[derive(Default)]
+struct QueryCleanup {
+    provide: Option<ProvideOutcome>,
+    completed_find: Option<u64>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cleanup_query(
     source: DhtSource,
     id: kad::QueryId,
     provide_query_to_req: &mut HashMap<DhtQueryKey, u64>,
     pending_provides: &mut HashMap<u64, ProvideRequest>,
+    pending_provider_claims: &mut HashMap<(rpc::ProviderOwnerId, Vec<u8>), u64>,
     find_query_to_req: &mut HashMap<DhtQueryKey, u64>,
     pending_finds: &mut HashMap<u64, FindRequest>,
     pending_peer_routing: &mut HashMap<DhtQueryKey, (PeerId, Option<u64>)>,
     routed_peers: &mut HashMap<u64, HashSet<PeerId>>,
-) {
+) -> QueryCleanup {
     let key = (source, id);
+    let mut cleanup = QueryCleanup::default();
 
     // Provide cleanup
     if let Some(req_id) = provide_query_to_req.remove(&key) {
         // If no more queries reference this request, finalize it.
         if !provide_query_to_req.values().any(|&r| r == req_id) {
             if let Some(req) = pending_provides.remove(&req_id) {
-                req.finalize();
+                for owner in &req.owners {
+                    pending_provider_claims.remove(&(*owner, req.key.clone()));
+                }
+                cleanup.provide = Some(req.finalize());
             }
         }
     }
@@ -1129,16 +1687,18 @@ fn cleanup_query(
     if let Some(req_id) = find_query_to_req.remove(&key) {
         if let Some(find_req) = pending_finds.get_mut(&req_id) {
             find_req.remaining = find_req.remaining.saturating_sub(1);
-            if find_req.remaining == 0 {
-                // Both DHTs done — drop the sender to close the channel.
-                pending_finds.remove(&req_id);
-                routed_peers.remove(&req_id);
-            }
+        }
+        if find_request_work_complete(req_id, pending_finds, pending_peer_routing) {
+            // Provider discovery and its bounded address resolution are done.
+            pending_finds.remove(&req_id);
+            routed_peers.remove(&req_id);
+            cleanup.completed_find = Some(req_id);
         }
     }
 
     // Peer routing cleanup (compound key removes the specific entry).
     pending_peer_routing.remove(&key);
+    cleanup
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,6 +1844,11 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
+    fn find_cancellation_receiver() -> watch::Receiver<bool> {
+        let (_sender, receiver) = watch::channel(false);
+        receiver
+    }
+
     // -------------------------------------------------------------------
     // is_lan_addr / is_lan_ip
     // -------------------------------------------------------------------
@@ -1374,12 +1939,12 @@ mod tests {
     #[test]
     fn test_provide_request_first_success_wins() {
         let (tx, mut rx) = oneshot::channel();
-        let mut req = ProvideRequest::new(tx);
+        let mut req = ProvideRequest::new(rpc::ProviderOwnerId(1), b"key".to_vec(), tx);
 
         // WAN succeeds first
         assert!(!req.record(DhtSource::Wan, Ok(())));
         // Reply already sent
-        assert!(req.reply.is_none());
+        assert!(req.replies.is_empty());
         // LAN result comes later
         assert!(req.record(DhtSource::Lan, Err("no peers".into())));
 
@@ -1390,15 +1955,51 @@ mod tests {
     #[test]
     fn test_provide_request_both_fail_sends_wan_error() {
         let (tx, mut rx) = oneshot::channel();
-        let mut req = ProvideRequest::new(tx);
+        let mut req = ProvideRequest::new(rpc::ProviderOwnerId(1), b"key".to_vec(), tx);
 
         assert!(!req.record(DhtSource::Lan, Err("lan fail".into())));
         assert!(req.record(DhtSource::Wan, Err("wan fail".into())));
-        req.finalize();
+        assert!(matches!(req.finalize(), ProvideOutcome::Failed { .. }));
 
         let result = rx.try_recv().unwrap();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "wan fail");
+    }
+
+    #[test]
+    fn provide_request_lan_success_survives_wan_failure() {
+        let (tx, mut rx) = oneshot::channel();
+        let mut request = ProvideRequest::new(rpc::ProviderOwnerId(1), b"key".to_vec(), tx);
+
+        assert!(!request.record(DhtSource::Lan, Ok(())));
+        assert!(request.record(DhtSource::Wan, Err("wan fail".into())));
+        assert!(matches!(request.finalize(), ProvideOutcome::Active));
+        assert!(rx.try_recv().expect("provide response").is_ok());
+    }
+
+    #[test]
+    fn failed_pending_provide_rolls_back_every_joined_owner() {
+        let first = rpc::ProviderOwnerId(1);
+        let second = rpc::ProviderOwnerId(2);
+        let (first_tx, mut first_rx) = oneshot::channel();
+        let (second_tx, mut second_rx) = oneshot::channel();
+        let mut request = ProvideRequest::new(first, b"key".to_vec(), first_tx);
+        request.add_owner(second, second_tx);
+
+        assert!(!request.record(DhtSource::Wan, Err("wan fail".into())));
+        assert!(request.record(DhtSource::Lan, Err("lan fail".into())));
+        match request.finalize() {
+            ProvideOutcome::Failed { owners, key } => {
+                assert_eq!(
+                    HashSet::<_>::from_iter(owners),
+                    HashSet::from([first, second])
+                );
+                assert_eq!(key, b"key");
+            }
+            ProvideOutcome::Active => panic!("failed dual-DHT request became active"),
+        }
+        assert!(first_rx.try_recv().expect("first reply").is_err());
+        assert!(second_rx.try_recv().expect("second reply").is_err());
     }
 
     // -------------------------------------------------------------------
@@ -1407,11 +2008,16 @@ mod tests {
 
     #[test]
     fn test_find_request_dedup_across_dhts() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1);
         let mut find = FindRequest {
             sender: tx,
+            cancellation: find_cancellation_receiver(),
             seen: HashSet::new(),
+            queued_peers: HashSet::new(),
+            pending: VecDeque::new(),
             remaining: 2,
+            limit: 1,
+            delivered: 0,
         };
 
         let peer_bytes = vec![0u8; 32]; // dummy peer ID bytes
@@ -1424,10 +2030,12 @@ mod tests {
         assert!(!find.seen.insert(peer_id));
 
         // Send one provider through
-        let _ = find.sender.send(PeerInfo {
-            peer_id: peer_bytes.clone(),
-            addrs: vec![],
-        });
+        find.sender
+            .try_send(PeerInfo {
+                peer_id: peer_bytes.clone(),
+                addrs: vec![],
+            })
+            .expect("single-slot channel has capacity");
 
         assert!(rx.try_recv().is_ok());
 
@@ -1438,18 +2046,207 @@ mod tests {
         assert_eq!(find.remaining, 0);
     }
 
+    #[tokio::test]
+    async fn find_request_retains_multi_provider_batch_while_handoff_is_busy() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(PeerInfo {
+            peer_id: b"occupied".to_vec(),
+            addrs: Vec::new(),
+        })
+        .await
+        .expect("occupy the single-slot handoff");
+
+        let mut request = FindRequest {
+            sender: tx,
+            cancellation: find_cancellation_receiver(),
+            seen: HashSet::new(),
+            queued_peers: HashSet::new(),
+            pending: VecDeque::new(),
+            remaining: 2,
+            limit: 3,
+            delivered: 0,
+        };
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().expect("address");
+        let peers = [PeerId::random(), PeerId::random(), PeerId::random()];
+        for peer in peers {
+            assert!(request.select_provider(peer));
+            request.queue_resolved_provider(peer, std::slice::from_ref(&address));
+        }
+
+        assert!(request.selection_complete());
+        assert_eq!(request.pending.len(), 3);
+        assert_eq!(
+            rx.recv().await.expect("occupied result").peer_id,
+            b"occupied"
+        );
+
+        for expected in peers {
+            let provider = request.pending.front().expect("pending provider").clone();
+            request
+                .sender
+                .send(provider.info)
+                .await
+                .expect("handoff accepts pending provider");
+            let delivered = request
+                .pending
+                .pop_front()
+                .expect("remove delivered provider");
+            assert_eq!(delivered.peer_id, expected);
+            assert_eq!(
+                rx.recv().await.expect("receive pending provider").peer_id,
+                expected.to_bytes()
+            );
+        }
+        assert!(request.pending.is_empty());
+    }
+
+    #[test]
+    fn find_request_caps_untrusted_count_at_the_kad_replication_bound() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut request = FindRequest {
+            sender,
+            cancellation: find_cancellation_receiver(),
+            seen: HashSet::new(),
+            queued_peers: HashSet::new(),
+            pending: VecDeque::new(),
+            remaining: 2,
+            limit: find_provider_limit(u32::MAX),
+            delivered: 0,
+        };
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().expect("address");
+
+        for _ in 0..KAD_REPLICATION_FACTOR {
+            let peer = PeerId::random();
+            assert!(request.select_provider(peer));
+            request.queue_resolved_provider(peer, std::slice::from_ref(&address));
+        }
+        assert!(!request.select_provider(PeerId::random()));
+        assert_eq!(request.pending.len(), KAD_REPLICATION_FACTOR);
+        assert_eq!(request.seen.len(), KAD_REPLICATION_FACTOR);
+    }
+
+    #[tokio::test]
+    async fn slow_find_handoff_does_not_block_another_request() {
+        let (slow_sender, mut slow_receiver) = mpsc::channel(1);
+        slow_sender
+            .send(PeerInfo {
+                peer_id: b"occupied".to_vec(),
+                addrs: Vec::new(),
+            })
+            .await
+            .expect("occupy slow handoff");
+        let (fast_sender, mut fast_receiver) = mpsc::channel(1);
+        let slow_peer = PeerId::random();
+        let fast_peer = PeerId::random();
+
+        let requests = HashMap::from([
+            (
+                1,
+                FindRequest {
+                    sender: slow_sender,
+                    cancellation: find_cancellation_receiver(),
+                    seen: HashSet::from([slow_peer]),
+                    queued_peers: HashSet::from([slow_peer]),
+                    pending: VecDeque::from([PendingProvider {
+                        peer_id: slow_peer,
+                        info: PeerInfo {
+                            peer_id: slow_peer.to_bytes(),
+                            addrs: Vec::new(),
+                        },
+                    }]),
+                    remaining: 2,
+                    limit: 1,
+                    delivered: 0,
+                },
+            ),
+            (
+                2,
+                FindRequest {
+                    sender: fast_sender,
+                    cancellation: find_cancellation_receiver(),
+                    seen: HashSet::from([fast_peer]),
+                    queued_peers: HashSet::from([fast_peer]),
+                    pending: VecDeque::from([PendingProvider {
+                        peer_id: fast_peer,
+                        info: PeerInfo {
+                            peer_id: fast_peer.to_bytes(),
+                            addrs: Vec::new(),
+                        },
+                    }]),
+                    remaining: 2,
+                    limit: 1,
+                    delivered: 0,
+                },
+            ),
+        ]);
+
+        let delivery = tokio::time::timeout(
+            Duration::from_secs(1),
+            send_next_find_provider(pending_find_deliveries(&requests)),
+        )
+        .await
+        .expect("writable Finder request was blocked")
+        .expect("pending delivery");
+        assert_eq!(delivery, (2, fast_peer, true));
+        assert_eq!(
+            fast_receiver
+                .recv()
+                .await
+                .expect("fast provider delivery")
+                .peer_id,
+            fast_peer.to_bytes()
+        );
+        assert_eq!(
+            slow_receiver
+                .recv()
+                .await
+                .expect("occupied slow handoff")
+                .peer_id,
+            b"occupied"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_cancellation_token_identifies_the_request_without_a_command() {
+        let (cancel_sender, cancel_receiver) = watch::channel(false);
+        let (sender, _receiver) = mpsc::channel(1);
+        let requests = HashMap::from([(
+            17,
+            FindRequest {
+                sender,
+                cancellation: cancel_receiver,
+                seen: HashSet::new(),
+                queued_peers: HashSet::new(),
+                pending: VecDeque::new(),
+                remaining: 2,
+                limit: 1,
+                delivered: 0,
+            },
+        )]);
+
+        cancel_sender.send_replace(true);
+        let canceled = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_next_find_cancellation(pending_find_cancellations(&requests)),
+        )
+        .await
+        .expect("Finder cancellation token was not observed");
+        assert_eq!(canceled, Some(17));
+    }
+
     // -------------------------------------------------------------------
     // cleanup_query
     // -------------------------------------------------------------------
 
     #[test]
     fn test_cleanup_find_providers_closes_on_both_done() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<PeerInfo>();
+        let (tx, mut rx) = mpsc::channel::<PeerInfo>(1);
 
         let mut pending_finds: HashMap<u64, FindRequest> = HashMap::new();
         let mut find_query_to_req: HashMap<DhtQueryKey, u64> = HashMap::new();
         let mut provide_query_to_req: HashMap<DhtQueryKey, u64> = HashMap::new();
         let mut pending_provides: HashMap<u64, ProvideRequest> = HashMap::new();
+        let mut pending_provider_claims = HashMap::new();
         let mut pending_peer_routing: HashMap<DhtQueryKey, (PeerId, Option<u64>)> = HashMap::new();
         let mut routed: HashMap<u64, HashSet<PeerId>> = HashMap::new();
 
@@ -1463,18 +2260,24 @@ mod tests {
             req_id,
             FindRequest {
                 sender: tx,
+                cancellation: find_cancellation_receiver(),
                 seen: HashSet::new(),
+                queued_peers: HashSet::new(),
+                pending: VecDeque::new(),
                 remaining: 2,
+                limit: 10,
+                delivered: 0,
             },
         );
         routed.insert(req_id, HashSet::new());
 
         // WAN finishes first — channel should stay open.
-        cleanup_query(
+        let _ = cleanup_query(
             DhtSource::Wan,
             wan_qid,
             &mut provide_query_to_req,
             &mut pending_provides,
+            &mut pending_provider_claims,
             &mut find_query_to_req,
             &mut pending_finds,
             &mut pending_peer_routing,
@@ -1484,11 +2287,12 @@ mod tests {
         assert!(rx.try_recv().is_err()); // not closed yet
 
         // LAN finishes — channel should close.
-        cleanup_query(
+        let _ = cleanup_query(
             DhtSource::Lan,
             lan_qid,
             &mut provide_query_to_req,
             &mut pending_provides,
+            &mut pending_provider_claims,
             &mut find_query_to_req,
             &mut pending_finds,
             &mut pending_peer_routing,
@@ -1498,6 +2302,101 @@ mod tests {
         assert!(!routed.contains_key(&req_id));
         // Channel is closed now — recv returns None
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn find_completion_waits_for_address_resolution() {
+        let request_id = 7;
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut pending_finds = HashMap::from([(
+            request_id,
+            FindRequest {
+                sender,
+                cancellation: find_cancellation_receiver(),
+                seen: HashSet::new(),
+                queued_peers: HashSet::new(),
+                pending: VecDeque::new(),
+                remaining: 0,
+                limit: 1,
+                delivered: 0,
+            },
+        )]);
+        let query: kad::QueryId = unsafe { std::mem::transmute(3u64) };
+        let mut pending_peer_routing = HashMap::from([(
+            (DhtSource::Wan, query),
+            (PeerId::random(), Some(request_id)),
+        )]);
+
+        assert!(!find_request_work_complete(
+            request_id,
+            &pending_finds,
+            &pending_peer_routing,
+        ));
+        pending_peer_routing.clear();
+        assert!(find_request_work_complete(
+            request_id,
+            &pending_finds,
+            &pending_peer_routing,
+        ));
+        pending_finds.remove(&request_id);
+    }
+
+    #[test]
+    fn provider_ownership_stops_only_after_final_owner() {
+        let key = b"cid-multihash".to_vec();
+        let first = rpc::ProviderOwnerId(1);
+        let second = rpc::ProviderOwnerId(2);
+        let mut ownership = ProviderOwnership::default();
+
+        assert!(ownership.claim(first, key.clone()));
+        assert!(
+            !ownership.claim(first, key.clone()),
+            "duplicate claim is idempotent"
+        );
+        assert!(
+            !ownership.claim(second, key.clone()),
+            "second owner shares provision"
+        );
+        assert!(!ownership.release_key(first, &key));
+        assert!(ownership.contains(second, &key));
+        assert!(ownership.release_key(second, &key));
+        assert!(ownership.by_key.is_empty());
+        assert!(ownership.by_owner.is_empty());
+    }
+
+    #[test]
+    fn provider_owner_release_cleans_all_keys_without_affecting_other_owner() {
+        let first = rpc::ProviderOwnerId(1);
+        let second = rpc::ProviderOwnerId(2);
+        let shared = b"shared".to_vec();
+        let exclusive = b"exclusive".to_vec();
+        let mut ownership = ProviderOwnership::default();
+        ownership.claim(first, shared.clone());
+        ownership.claim(second, shared.clone());
+        ownership.claim(first, exclusive.clone());
+
+        assert_eq!(ownership.release_owner(first), vec![exclusive]);
+        assert!(ownership.contains(second, &shared));
+        assert_eq!(ownership.release_owner(second), vec![shared]);
+    }
+
+    #[test]
+    fn libp2p_stop_providing_removes_local_republication_source() {
+        let peer = PeerId::random();
+        let store = kad::store::MemoryStore::new(peer);
+        let config = kad::Config::new(kad::PROTOCOL_NAME);
+        let mut behaviour = kad::Behaviour::with_config(peer, store, config);
+        let key = kad::RecordKey::new(b"owned-provider");
+
+        start_owned_providing(&mut behaviour, key.clone()).expect("start local provision");
+        assert_eq!(behaviour.store_mut().provided().count(), 1);
+
+        behaviour.stop_providing(&key);
+        assert_eq!(
+            behaviour.store_mut().provided().count(),
+            0,
+            "removed local records cannot enter a later republication cycle"
+        );
     }
 
     // -------------------------------------------------------------------
