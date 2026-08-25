@@ -173,9 +173,9 @@ async fn test_kubo_bootstrap_entry() {
 /// Verify the CID → multihash → Kad RecordKey pipeline with a real CID
 /// produced by Kubo.
 ///
-/// This exercises the same key-derivation logic used by `RoutingImpl::provide`
-/// and `RoutingImpl::find_providers` (via `cid_to_kad_key`), ensuring that
-/// CIDs returned by Kubo's `add` endpoint are valid Kad keys.
+/// This exercises the same CID-to-multihash conversion used by
+/// `AnnouncerImpl::provide` and `FinderImpl::find_providers`, ensuring that CIDs
+/// returned by Kubo's `add` endpoint are valid Kad keys.
 #[tokio::test]
 async fn test_real_cid_to_kad_record_key() {
     if !ipfs_available().await {

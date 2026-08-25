@@ -8,7 +8,7 @@
 //! `system::serve()`.
 //!
 //! **`serve`**: provides on the DHT, discovers peers via
-//! `routing.find_providers()`, dials them via `VatClient` to get typed
+//! `Finder.findProviders()`, dials them via `VatClient` to get typed
 //! ChessEngine capabilities, and plays random games logging replays.
 
 use std::cell::RefCell;
@@ -105,22 +105,6 @@ fn short_id(peer_id: &[u8]) -> String {
     } else {
         h
     }
-}
-
-async fn routing_key(
-    routing: &routing_capnp::routing::Client,
-    service: &str,
-) -> Result<String, capnp::Error> {
-    let mut req = routing.hash_request();
-    req.get().set_data(service.as_bytes());
-    let resp = req.send().promise.await?;
-    let key = resp
-        .get()?
-        .get_key()?
-        .to_str()
-        .map_err(|e| capnp::Error::failed(e.to_string()))?
-        .to_string();
-    Ok(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +295,7 @@ impl routing_capnp::provider_sink::Server for RpcDialingSink {
     fn provider(
         self: Rc<Self>,
         params: routing_capnp::provider_sink::ProviderParams,
+        _results: routing_capnp::provider_sink::ProviderResults,
     ) -> Promise<(), capnp::Error> {
         let peer_id = pry!(pry!(pry!(params.get()).get_info()).get_peer_id()).to_vec();
 
@@ -521,7 +506,9 @@ async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> 
     let results = grants_resp.get()?;
     let caps = results.get_caps()?;
     let host: system_capnp::host::Client = get_initial_grant(&caps, "host")?;
-    let routing: routing_capnp::routing::Client = get_initial_grant(&caps, "routing")?;
+    let announcer: routing_capnp::announcer::Client =
+        get_initial_grant(&caps, "routing-announcer")?;
+    let finder: routing_capnp::finder::Client = get_initial_grant(&caps, "routing-finder")?;
 
     // Get network capabilities — vat_client for typed capability dialing.
     let network_resp = host.network_request().send().promise.await?;
@@ -536,8 +523,13 @@ async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> 
 
     log::info!("service: looking for opponent...");
 
-    let service_key = routing_key(&routing, CHESS_SERVICE).await?;
+    let service_key = routing_key::derive(CHESS_SERVICE.as_bytes());
     log::info!("service: routing key {service_key}");
+
+    // The host owns registration and republication until this authority epoch ends.
+    let mut provide_req = announcer.provide_request();
+    provide_req.get().set_key(&service_key);
+    provide_req.send().promise.await?;
 
     // Discovery loop with exponential backoff + jitter.
     let seen = Rc::new(RefCell::new(HashSet::<Vec<u8>>::new()));
@@ -548,18 +540,13 @@ async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> 
     loop {
         let prev_seen = seen.borrow().len();
 
-        // Re-provide (DHT records expire).
-        let mut provide_req = routing.provide_request();
-        provide_req.get().set_key(&service_key);
-        provide_req.send().promise.await?;
-
         // Search for peers; RpcDialingSink dials new ones via RPC.
         let sink: routing_capnp::provider_sink::Client = capnp_rpc::new_client(RpcDialingSink {
             vat_client: vat_client.clone(),
             self_id: self_id.clone(),
             seen: seen.clone(),
         });
-        let mut fp_req = routing.find_providers_request();
+        let mut fp_req = finder.find_providers_request();
         {
             let mut b = fp_req.get();
             b.set_key(&service_key);

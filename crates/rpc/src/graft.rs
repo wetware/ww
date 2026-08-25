@@ -248,7 +248,8 @@ impl auth_capnp::signer::Server for EpochGuardedDomainSigner {
 // HostGraftBuilder — GraftBuilder for the concrete stem graft response
 // ---------------------------------------------------------------------------
 
-/// Fills the graft response with epoch-guarded Host, Runtime, Routing, HttpClient, and node identity.
+/// Fills the graft response with epoch-guarded Host, Runtime, provider routing,
+/// HttpClient, and node identity.
 ///
 /// **Runtime singleton**: the builder holds a pre-created `runtime::Client` that
 /// points to a single `RuntimeImpl` backend. Every graft clones this client, so
@@ -341,12 +342,15 @@ impl HostGraftBuilder {
         }
         let host: system_capnp::host::Client = capnp_rpc::new_client(host_impl);
 
-        let routing: routing_capnp::routing::Client =
-            capnp_rpc::new_client(super::routing::RoutingImpl::new(
-                self.swarm_cmd_tx.clone(),
-                guard.clone(),
-                self.ipfs_client.clone(),
-            ));
+        let finder: routing_capnp::finder::Client = capnp_rpc::new_client(
+            super::routing::FinderImpl::new(self.swarm_cmd_tx.clone(), guard.clone()),
+        );
+        let mut announcer_impl =
+            super::routing::AnnouncerImpl::new(self.swarm_cmd_tx.clone(), guard.clone());
+        if let Some(scope) = self.registration_scope.clone() {
+            announcer_impl = announcer_impl.with_registration_scope(scope);
+        }
+        let announcer: routing_capnp::announcer::Client = capnp_rpc::new_client(announcer_impl);
 
         // Collect all capabilities into a flat list of Export entries.
         let mut entries = Vec::new();
@@ -364,7 +368,8 @@ impl HostGraftBuilder {
             "runtime",
             self.runtime_client.clone().client,
         )?);
-        entries.push(NamedCapability::new("routing", routing.client)?);
+        entries.push(NamedCapability::new("routing-finder", finder.client)?);
+        entries.push(NamedCapability::new("routing-announcer", announcer.client)?);
         let authority: auth_capnp::authority::Client =
             capnp_rpc::new_client(authority::AuthorityServer::new(guard.clone()));
         entries.push(NamedCapability::new("authority", authority.client)?);
@@ -801,7 +806,8 @@ mod tests {
             "identity",
             "host",
             "runtime",
-            "routing",
+            "routing-finder",
+            "routing-announcer",
             "authority",
             "ipfs",
             "http-client",
@@ -814,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn external_graft_names_remain_exactly_unchanged() {
+    fn external_graft_names_expose_split_provider_authority() {
         let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(test_epoch(1));
         let guard = EpochGuard {
             issued_seq: 1,
@@ -865,7 +871,8 @@ mod tests {
                 "identity",
                 "host",
                 "runtime",
-                "routing",
+                "routing-finder",
+                "routing-announcer",
                 "authority",
                 "ipfs"
             ]
@@ -1238,7 +1245,8 @@ mod tests {
                     "identity",
                     "host",
                     "runtime",
-                    "routing",
+                    "routing-finder",
+                    "routing-announcer",
                     "authority",
                     "ipfs",
                     "http-client",
@@ -1248,7 +1256,7 @@ mod tests {
                         "pid0 RPC bootstrap lost {expected}: {names:?}"
                     );
                 }
-                assert_eq!(names.len(), 7);
+                assert_eq!(names.len(), 8);
                 readiness_gate
                     .kernel_ready()
                     .expect("commit current pid0 generation");

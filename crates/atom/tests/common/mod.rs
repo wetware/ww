@@ -86,7 +86,7 @@ impl GraftBuilder for StubSessionBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// Stub servers for all 5 graft capabilities (Identity, Host, Runtime, Routing, HttpClient)
+// Stub servers for all 6 graft capabilities
 // ---------------------------------------------------------------------------
 
 /// Stub Identity: returns unimplemented for all methods.
@@ -163,37 +163,35 @@ impl http_capnp::http_client::Server for StubHttpClient {
     }
 }
 
-/// Stub Routing: returns unimplemented for all methods.
-pub struct StubRouting;
+/// Stub Finder: returns unimplemented for provider discovery.
+pub struct StubFinder;
 
 #[allow(refining_impl_trait)]
-impl routing_capnp::routing::Server for StubRouting {
-    fn provide(
-        self: capnp::capability::Rc<Self>,
-        _params: routing_capnp::routing::ProvideParams,
-        _results: routing_capnp::routing::ProvideResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("stub routing".into()))
-    }
-
+impl routing_capnp::finder::Server for StubFinder {
     fn find_providers(
         self: capnp::capability::Rc<Self>,
-        _params: routing_capnp::routing::FindProvidersParams,
-        _results: routing_capnp::routing::FindProvidersResults,
+        _params: routing_capnp::finder::FindProvidersParams,
+        _results: routing_capnp::finder::FindProvidersResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("stub routing".into()))
-    }
-
-    fn hash(
-        self: capnp::capability::Rc<Self>,
-        _params: routing_capnp::routing::HashParams,
-        _results: routing_capnp::routing::HashResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("stub routing".into()))
+        Promise::err(capnp::Error::unimplemented("stub finder".into()))
     }
 }
 
-/// GraftBuilder that populates ALL 5 graft capabilities with stubs (Export list format).
+/// Stub Announcer: returns unimplemented for provider announcement.
+pub struct StubAnnouncer;
+
+#[allow(refining_impl_trait)]
+impl routing_capnp::announcer::Server for StubAnnouncer {
+    fn provide(
+        self: capnp::capability::Rc<Self>,
+        _params: routing_capnp::announcer::ProvideParams,
+        _results: routing_capnp::announcer::ProvideResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("stub announcer".into()))
+    }
+}
+
+/// GraftBuilder that populates all six graft capabilities with stubs.
 /// Used to verify that graft() returns every capability field.
 pub struct FullStubSessionBuilder;
 
@@ -208,10 +206,11 @@ impl GraftBuilder for FullStubSessionBuilder {
         let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(StubRuntime {
             guard: guard.clone(),
         });
-        let routing: routing_capnp::routing::Client = capnp_rpc::new_client(StubRouting);
+        let finder: routing_capnp::finder::Client = capnp_rpc::new_client(StubFinder);
+        let announcer: routing_capnp::announcer::Client = capnp_rpc::new_client(StubAnnouncer);
         let http_client: http_capnp::http_client::Client = capnp_rpc::new_client(StubHttpClient);
 
-        let mut caps = builder.reborrow().init_caps(5);
+        let mut caps = builder.reborrow().init_caps(6);
 
         let mut e = caps.reborrow().get(0);
         e.set_name("identity");
@@ -226,10 +225,14 @@ impl GraftBuilder for FullStubSessionBuilder {
         e.init_cap().set_as_capability(runtime.client.hook);
 
         let mut e = caps.reborrow().get(3);
-        e.set_name("routing");
-        e.init_cap().set_as_capability(routing.client.hook);
+        e.set_name("routing-finder");
+        e.init_cap().set_as_capability(finder.client.hook);
 
         let mut e = caps.reborrow().get(4);
+        e.set_name("routing-announcer");
+        e.init_cap().set_as_capability(announcer.client.hook);
+
+        let mut e = caps.reborrow().get(5);
         e.set_name("http-client");
         e.init_cap().set_as_capability(http_client.client.hook);
 

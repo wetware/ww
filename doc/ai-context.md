@@ -66,15 +66,19 @@ granted entries):
 |------------|---------|
 | Host | Peer identity, addresses, peer management |
 | Runtime | Load WASM binaries, obtain scoped Executors |
-| Routing | Kademlia DHT (provide, findProviders) |
+| Finder (`routing-finder`) | Bounded, deduplicated Kademlia provider discovery |
+| Announcer (`routing-announcer`) | Announce the Wetware host PeerID for an owner epoch |
 | Identity | Host-side signing (private key never enters WASM) |
 | HttpClient | Outbound HTTP requests |
 | StreamListener / StreamDialer | P2P byte streams for raw cells |
 | VatListener / VatClient | Cap'n Proto RPC for capnp cells |
 
-Grant authoring must prefer an image-bound Executor over Runtime, scoped Signer over Identity,
-  attenuated methods over broad Host/Routing, and a capability protocol over
-  bearer tokens in args/env.
+Canonical CIDv1/raw/BLAKE3 routing-key derivation is the optional pure
+`wetware:routing/key@0.1.0` WIT import. It is not a capability reference.
+
+Grant authoring must prefer an image-bound Executor over Runtime, scoped Signer
+over Identity, Finder without Announcer when observation is sufficient, and a
+capability protocol over bearer tokens in args/env.
 
 Quick start:
 ```

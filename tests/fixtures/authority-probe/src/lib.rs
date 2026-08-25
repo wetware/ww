@@ -41,6 +41,7 @@ mod http_capnp {
 }
 
 type InitialGrants = membrane_capnp::initial_grants::Client;
+const PROVIDER_KEY: &str = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
 
 #[derive(Clone)]
 struct NamedCap {
@@ -160,18 +161,15 @@ async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value
                     .to_owned();
                 Ok(json!({"executor_obtained": true, "executor_cid": cid}))
             }
-            "routing" => {
-                let routing: routing_capnp::routing::Client = find_cap(&caps, &requested)?;
-                let mut hash = routing.hash_request();
-                hash.get().set_data(b"authority-probe");
-                let response = hash.send().promise.await?;
-                let key = response
-                    .get()?
-                    .get_key()?
-                    .to_str()
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?
-                    .to_owned();
-                Ok(json!({"hash": key}))
+            "routing-finder" => {
+                let finder: routing_capnp::finder::Client = find_cap(&caps, &requested)?;
+                let (providers, done) = call_finder(&finder, 0).await?;
+                Ok(json!({"providers": providers, "done": done}))
+            }
+            "routing-announcer" => {
+                let announcer: routing_capnp::announcer::Client = find_cap(&caps, &requested)?;
+                call_announcer(&announcer).await?;
+                Ok(json!({"provide": true}))
             }
             "identity" => {
                 let identity: auth_capnp::identity::Client = find_cap(&caps, &requested)?;
@@ -455,7 +453,8 @@ fn run_invoke_all() {
         for name in [
             "host",
             "runtime",
-            "routing",
+            "routing-finder",
+            "routing-announcer",
             "authority",
             "identity",
             "ipfs",
@@ -486,6 +485,7 @@ impl routing_capnp::provider_sink::Server for ProviderSink {
     fn provider(
         self: Rc<Self>,
         _params: routing_capnp::provider_sink::ProviderParams,
+        _results: routing_capnp::provider_sink::ProviderResults,
     ) -> Promise<(), capnp::Error> {
         self.providers.set(self.providers.get() + 1);
         Promise::ok(())
@@ -501,65 +501,83 @@ impl routing_capnp::provider_sink::Server for ProviderSink {
     }
 }
 
-fn run_routing() {
+async fn call_finder(
+    finder: &routing_capnp::finder::Client,
+    count: u32,
+) -> Result<(u32, bool), capnp::Error> {
+    let providers = Rc::new(Cell::new(0));
+    let done = Rc::new(Cell::new(false));
+    let sink: routing_capnp::provider_sink::Client = capnp_rpc::new_client(ProviderSink {
+        providers: providers.clone(),
+        done: done.clone(),
+    });
+    let mut find = finder.find_providers_request();
+    find.get().set_key(PROVIDER_KEY);
+    find.get().set_count(count);
+    find.get().set_sink(sink);
+    find.send().promise.await?;
+    Ok((providers.get(), done.get()))
+}
+
+async fn call_announcer(announcer: &routing_capnp::announcer::Client) -> Result<(), capnp::Error> {
+    let mut provide = announcer.provide_request();
+    provide.get().set_key(PROVIDER_KEY);
+    provide.send().promise.await.map(|_| ())
+}
+
+fn run_provider_routing(mode: &'static str) {
     system::run(|initial_grants: InitialGrants| async move {
         let result: Result<Value, capnp::Error> = async {
             let caps = read_initial_grants(&initial_grants).await?;
-            let routing: routing_capnp::routing::Client = find_cap(&caps, "routing")?;
-
-            let mut hash = routing.hash_request();
-            hash.get().set_data(b"authority-probe-routing");
-            let hash = hash.send().promise.await?;
-            let key = hash
-                .get()?
-                .get_key()?
-                .to_str()
-                .map_err(|error| capnp::Error::failed(error.to_string()))?
-                .to_owned();
-
-            let mut provide = routing.provide_request();
-            provide.get().set_key(&key);
-            provide.send().promise.await?;
-
-            let providers = Rc::new(Cell::new(0));
-            let done = Rc::new(Cell::new(false));
-            let sink: routing_capnp::provider_sink::Client = capnp_rpc::new_client(ProviderSink {
-                providers: providers.clone(),
-                done: done.clone(),
-            });
-            let mut find = routing.find_providers_request();
-            find.get().set_key(&key);
-            find.get().set_count(3);
-            find.get().set_sink(sink);
-            find.send().promise.await?;
-
-            let mut publish = routing.publish_request();
-            publish.get().set_name("");
-            publish.get().set_cid("");
-            publish.get().set_expected_current("");
-            let publish_reached = publish.send().promise.await.is_err();
-
-            let mut write = routing.write_file_request();
-            write.get().set_base_cid("");
-            write.get().set_path("authority-probe");
-            write.get().set_data(b"mutable");
-            write.get().set_create_parents(true);
-            let mutable_rpc_reached = write.send().promise.await.is_err();
-
-            Ok(json!({
-                "hash": key,
-                "provide": true,
-                "find_providers": true,
-                "providers": providers.get(),
-                "done": done.get(),
-                "publish_rpc_reached": publish_reached,
-                "mutable_rpc_reached": mutable_rpc_reached,
-            }))
+            match mode {
+                "routing-finder" => {
+                    let finder: routing_capnp::finder::Client = find_cap(&caps, "routing-finder")?;
+                    let (providers, done) = call_finder(&finder, 3).await?;
+                    let wrong: routing_capnp::announcer::Client =
+                        find_cap(&caps, "routing-finder")?;
+                    let announcer_cast_rejected = call_announcer(&wrong).await.is_err();
+                    Ok(json!({
+                        "find_providers": true,
+                        "providers": providers,
+                        "done": done,
+                        "announcer_cast_rejected": announcer_cast_rejected,
+                    }))
+                }
+                "routing-announcer" => {
+                    let announcer: routing_capnp::announcer::Client =
+                        find_cap(&caps, "routing-announcer")?;
+                    call_announcer(&announcer).await?;
+                    let wrong: routing_capnp::finder::Client =
+                        find_cap(&caps, "routing-announcer")?;
+                    let finder_cast_rejected = call_finder(&wrong, 0).await.is_err();
+                    Ok(json!({
+                        "provide": true,
+                        "finder_cast_rejected": finder_cast_rejected,
+                    }))
+                }
+                "routing-both" => {
+                    let finder: routing_capnp::finder::Client = find_cap(&caps, "routing-finder")?;
+                    let announcer: routing_capnp::announcer::Client =
+                        find_cap(&caps, "routing-announcer")?;
+                    call_announcer(&announcer).await?;
+                    let (providers, done) = call_finder(&finder, 3).await?;
+                    Ok(json!({
+                        "provide": true,
+                        "find_providers": true,
+                        "providers": providers,
+                        "done": done,
+                        "explicit_refs": ["routing-finder", "routing-announcer"],
+                    }))
+                }
+                _ => Err(capnp::Error::failed(format!(
+                    "unknown provider-routing probe mode: {mode}"
+                ))),
+            }
         }
         .await;
         emit(match result {
-            Ok(detail) => json!({"mode": "routing", "ok": true, "detail": detail}),
-            Err(error) => json!({"mode": "routing", "ok": false, "error": text_error(error)}),
+            Ok(detail) => json!({"mode": mode, "ok": true, "detail": detail}),
+            Err(error) => json!({"mode": mode, "ok": false, "error": text_error(error)}),
         });
         Ok(())
     });
@@ -804,7 +822,9 @@ impl Guest for AuthorityProbe {
             Some("trusted-lattice") => run_trusted_lattice(),
             Some("late-delegation") => run_late_delegation(),
             Some("invoke-all") => run_invoke_all(),
-            Some("routing") => run_routing(),
+            Some("routing-finder") => run_provider_routing("routing-finder"),
+            Some("routing-announcer") => run_provider_routing("routing-announcer"),
+            Some("routing-both") => run_provider_routing("routing-both"),
             Some("descendant") => run_descendant(),
             Some("raw-host") => run_raw_host(),
             Some("substrate") => run_substrate(),

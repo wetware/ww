@@ -12,6 +12,7 @@ pub mod image;
 pub mod loaders;
 pub mod mount;
 pub mod proc;
+pub mod routing_key;
 pub mod sched;
 pub mod vfs;
 

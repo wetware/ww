@@ -659,39 +659,6 @@ impl HttpClient {
             .map(str::to_owned)
             .ok_or_else(|| anyhow::anyhow!("IPFS resolve response missing Path field"))
     }
-
-    /// Publish a CID under this node's IPNS key.
-    ///
-    /// Calls `/api/v0/name/publish` on the IPFS node. The path should be an
-    /// IPFS path (e.g., "/ipfs/QmHash...").
-    ///
-    /// The `key` parameter selects which IPNS key to publish under
-    /// (default: "self" for the node's identity key).
-    pub async fn name_publish(&self, path: &str, key: &str) -> anyhow::Result<String> {
-        let url = format!(
-            "{}/api/v0/name/publish?arg={}&key={}",
-            self.base_url, path, key
-        );
-        let response = self
-            .http_client
-            .post(&url)
-            .send()
-            .await
-            .context("IPNS name publish request failed")?;
-        let status = response.status();
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .context("Failed to parse name publish response")?;
-        if !status.is_success() {
-            let msg = body["Message"].as_str().unwrap_or("unknown error");
-            anyhow::bail!("IPNS name publish failed ({}): {}", status, msg);
-        }
-        body["Name"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("name publish response missing Name field"))
-    }
 }
 
 #[cfg(test)]

@@ -95,10 +95,16 @@ allowlist.
 | **authority** | Construct a policy-bound `Terminal` over one explicit capability |
 | **host** | Peer identity, listen addresses, connected peers, network access |
 | **runtime** | Load WASM binaries and obtain scoped Executors (with compilation caching) |
-| **routing** | Kademlia DHT: provide and find content/services |
+| **routing-finder** | Find Kademlia providers through the observational `routing::Finder` interface |
+| **routing-announcer** | Announce the Wetware host PeerID through `routing::Announcer` |
 | **ipfs** | Read `/ipfs`, `/ipns`, or `/ipld` content through a `ByteStream` |
 | **http-client** | Outbound HTTP requests, gated by `--http-dial` allowlist |
 Application-specific entries use their parent-chosen grant-map keys.
+
+`routing-finder` and `routing-announcer` are separate references. Delegating
+one does not delegate the other. Canonical routing-key derivation is the
+optional pure `wetware:routing/key@0.1.0` WIT import, not an RPC capability or
+graft export.
 
 The wire-side `StreamListener` / `StreamDialer` / `VatListener` /
 `VatClient` interfaces are reached via `host.network()` rather than
@@ -139,20 +145,19 @@ node's network, pin and materialize blocks on disk, occupy cache budget, affect
 cache timing, and cause eviction/unpin work. Those bounded cache effects are
 intentional substrate effects, not node-control authority.
 
-### Content mutation (explicit capability API)
+### Provider routing and content control
 
-Writes go through the explicit `Routing` capability, not plain filesystem
-reads.
+`routing::Finder` authorizes bounded provider discovery. `routing::Announcer`
+authorizes provider assertions under the Wetware host PeerID. Announcer
+registrations remain local only while at least one owner lease is active. The
+final owner release stops WAN and LAN registration and future republication;
+records already distributed to other peers expire naturally.
 
-- `Routing.mkdir(baseCid, path, parents)` returns a new root CID.
-- `Routing.writeFile(baseCid, path, data, createParents)` returns a new root CID.
-- `Routing.remove(baseCid, path, recursive)` returns a new root CID.
-- `Routing.publish(name, cid, expectedCurrent)` returns the published IPFS path.
-
-Semantics:
-- Mutations are **CID-transform operations**: input root CID + operation -> output root CID.
-- No hidden mutable global root is kept in the daemon.
-- IPNS publish supports compare-and-set conflict checks via `expected-current`.
+No current guest capability provides persistent content mutation or IPNS
+publication. The removed broad `Routing` interface formerly contained
+`mkdir`, `writeFile`, `remove`, `resolve`, and `publish`. WASI `/tmp` remains
+private and ephemeral. Read-only image and `/ipfs` access do not acquire the
+removed CID-transform semantics.
 
 ## Local overrides
 
@@ -210,7 +215,7 @@ Schema definitions live in `capnp/`:
 - **`stem.capnp`** — Epoch and provenance metadata
 - **`auth.capnp`** — Terminal, Signer, Identity, Authority policy constructor
 - **`membrane.capnp`** — trusted-root Membrane, child InitialGrants, Export
-- **`routing.capnp`** — Kademlia DHT (provide, findProviders, hash)
+- **`routing.capnp`** — independent Kademlia provider `Finder` and `Announcer`
 - **`http.capnp`** — HttpClient
 
 Build scripts generate typed Rust bindings. Exported capabilities cross

@@ -1,61 +1,36 @@
-# Content routing capability backed by the in-process Kademlia client.
+# Narrow provider-routing capabilities backed by the in-process Kademlia client.
 #
-# Mirrors Go's coreiface.RoutingAPI (provide/findProviders only).
-# Data transfer flows through the WASI virtual filesystem, not a capability.
-# DHT key-value store (putValue/getValue) is deferred.
+# Finder and Announcer are independent object capabilities. Canonical routing-key
+# derivation is a pure Component Model import, not a Cap'n Proto capability.
 #
-# Epoch-scoped: the host wraps the implementation with an EpochGuard so all
-# methods fail with stale-epoch once the epoch advances.
+# Both capabilities are epoch-scoped. The host wraps each implementation with an
+# EpochGuard so calls fail after the authority epoch advances.
 
-@0xa7c3e8f1d4b29065;
+@0xbb7178bb658e44b6;
 
 struct ProviderInfo {
-  peerId @0 :Data;       # libp2p peer ID, serialized.
-  addrs  @1 :List(Data); # Multiaddrs for this provider, each serialized.
+  peerId @0 :Data;       # Serialized libp2p PeerID.
+  addrs  @1 :List(Data); # Serialized multiaddrs for the provider.
 }
 
 interface ProviderSink {
-  provider @0 (info :ProviderInfo) -> stream;
-  # Called once per discovered provider.  -> stream enables
-  # Cap'n Proto flow control (backpressure).
+  provider @0 (info :ProviderInfo) -> ();
+  # Called once per unique provider. Each response applies backpressure and
+  # reports sink closure before Finder requests another result.
 
   done @1 ();
-  # Signals that the search is complete.  Errors from earlier
-  # provider() calls surface here.
+  # Signals that the finite lookup has completed.
 }
 
-interface Routing {
+interface Finder @0xebb8ace9d47ae6a8 {
+  findProviders @0 (key :Text, count :UInt32, sink :ProviderSink) -> ();
+  # `count` is the requested maximum number of unique provider peers.
+  # A count of zero launches no network query and returns no peers.
+  # Wetware applies a host maximum of 16 provider results.
+}
+
+interface Announcer @0xf52674c78f631b2f {
   provide @0 (key :Text) -> ();
-  # Announce this node as a provider for the given CID.
-
-  findProviders @1 (key :Text, count :UInt32, sink :ProviderSink) -> ();
-  # Stream providers for a CID into the caller-supplied sink.
-
-  hash @2 (data :Data) -> (key :Text);
-  # Compute a deterministic CID (v1, raw codec, sha256) from data.
-  # Local operation — does not touch the network or Kubo.
-
-  resolve @3 (name :Text) -> (path :Text);
-  # Resolve an IPNS name to an IPFS path via Kubo.
-  # Returns e.g. "/ipfs/bafyrei..."
-
-  mkdir @4 (baseCid :Text, path :Text, parents :Bool) -> (rootCid :Text);
-  # Build a new UnixFS directory root by creating `path` relative to
-  # `baseCid`. Returns the new root CID. No global mutable root is used.
-
-  writeFile @5 (baseCid :Text, path :Text, data :Data, createParents :Bool) -> (rootCid :Text);
-  # Build a new UnixFS root by writing file bytes at `path` relative to
-  # `baseCid` (overwrite if present). Returns the new root CID.
-
-  remove @6 (baseCid :Text, path :Text, recursive :Bool) -> (rootCid :Text);
-  # Build a new UnixFS root by removing `path` relative to `baseCid`.
-  # Returns the new root CID.
-
-  publish @7 (name :Text, cid :Text, expectedCurrent :Text) -> (publishedPath :Text);
-  # Publish `/ipfs/<cid>` under IPNS `name`.
-  #
-  # Conflict semantics:
-  # - if `expectedCurrent` is empty, publish unconditionally.
-  # - if set, `name` must currently resolve to `expectedCurrent` (or fail).
-  #   This is a compare-and-set guard to avoid silent last-write-wins.
+  # Announce the Wetware host PeerID as a provider for the CID. Local provider
+  # registration and republication stop after the owning authority epoch ends.
 }

@@ -87,8 +87,9 @@ is mounted. The host preopens the merged FHS image directory at `/` with
 When IPFS caching is active, filesystem operations are intercepted by
 `fs_intercept` to resolve content from IPFS transparently.
 
-**Constraint**: Guests cannot write to the filesystem. All writes must go
-through capabilities (IPFS, ByteStream, etc.).
+**Constraint**: Image and `/ipfs` content is read-only. Each process has a
+private ephemeral writable `/tmp`. No current guest capability commits `/tmp`
+or performs persistent UnixFS mutation.
 
 ## Custom Interfaces
 
@@ -116,6 +117,20 @@ semantics on the RPC channel.
 **Availability**: Only present when the host enables data streams
 (`Builder::with_data_streams()`). Guests spawned without data streams
 (e.g., byte-pump handlers) will get an error on `create-connection`.
+
+### wetware:routing/key@0.1.0 (optional)
+
+This pure host import derives the canonical provider-routing CID for caller
+supplied bytes.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `derive` | `(data: list<u8>) -> string` | Return canonical CIDv1/raw/BLAKE3-256 text. |
+
+The algorithm uses BLAKE3-256, multihash code `0x1e`, and raw codec `0x55`.
+The import grants no object-capability authority. A component must declare the
+`wetware:routing/key@0.1.0` import to receive its bindings. Components that do
+not declare it instantiate normally. The Rust wrapper crate is `routing-key`.
 
 ### wetware:kernel-runtime/readiness@1.0.0 (private PID0 ABI)
 
@@ -174,7 +189,8 @@ child through `Executor.spawn` or a listener's registration-time grant list.
 | `identity` | `auth_capnp::identity` | Host-side signing. |
 | `host` | `system_capnp::host` | Node identity and network interfaces. |
 | `runtime` | `system_capnp::runtime` | Load WASM binaries and obtain Executors. |
-| `routing` | `routing_capnp::routing` | DHT operations such as providing and finding providers. |
+| `routing-finder` | `routing_capnp::finder` | Find a bounded number of unique DHT providers. |
+| `routing-announcer` | `routing_capnp::announcer` | Announce the Wetware host PeerID as a DHT provider. |
 | `authority` | `auth_capnp::authority` | Construct a policy-bound `Terminal` over an explicit capability. |
 | `ipfs` | `system_capnp::ipfs` | Read `/ipfs`, `/ipns`, or `/ipld` content through a `ByteStream`. |
 | `http-client` | `http_capnp::http_client` | Make outbound HTTP requests to the configured host allowlist. |
@@ -194,6 +210,10 @@ host advances its epoch. Repeated `InitialGrants.get()` calls return the same
 recorded references; fresh authority requires explicit ancestor re-delegation
 or child respawn. Non-host grants keep their own normal lifetime semantics.
 
+`routing-finder` and `routing-announcer` are independently delegable. The
+optional routing-key WIT import is not part of `Membrane.graft()` or
+`InitialGrants`.
+
 ## Cap'n Proto RPC (system.capnp)
 
 Full interface reference for the capabilities available to guests.
@@ -206,6 +226,17 @@ Full interface reference for the capabilities available to guests.
 | `addrs` | `() -> (addrs: List(Data))` | Multiaddrs this node listens on. |
 | `peers` | `() -> (peers: List(PeerInfo))` | Currently connected peers. |
 | `network` | `() -> (streamListener, streamDialer, vatListener, vatClient, httpListener)` | Get network interfaces (byte-stream + RPC + HTTP modes). |
+
+### Provider routing (`routing.capnp`)
+
+| Interface | Method | Signature | Description |
+|-----------|--------|-----------|-------------|
+| `Finder` | `findProviders` | `(key: Text, count: UInt32, sink: ProviderSink) -> ()` | Deliver at most `count` unique WAN/LAN provider PeerIDs through a single-slot handoff. The swarm selects and retains at most `min(count, 16)` results. `count == 0` starts no query. A per-request token stops remaining work after sink failure, epoch expiry, or the 30-second deadline. The deadline also includes command admission. |
+| `Announcer` | `provide` | `(key: Text) -> ()` | Announce the Wetware host PeerID on WAN and LAN. Local registration and republication stop after the final owner epoch ends. |
+
+The removed broad `Routing` interface is not available. Guests have no
+provider-routing methods for IPNS resolution or publication, persistent
+UnixFS mutation, or CID derivation.
 
 ### Runtime
 

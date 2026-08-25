@@ -3,7 +3,7 @@
 //! Demonstrates:
 //!   - HttpClient capability for outbound HTTP (domain-scoped)
 //!   - Subcommand dispatch (cell / serve / consume)
-//!   - DHT discovery via routing.provide()/findProviders()
+//!   - DHT discovery via independent Announcer and Finder capabilities
 //!
 //! Three modes, selected by subcommand:
 //!
@@ -71,7 +71,10 @@ fn get_initial_grant<T: capnp::capability::FromClientHook>(
 ) -> Result<T, capnp::Error> {
     for i in 0..caps.len() {
         let entry = caps.get(i);
-        let n = entry.get_name()?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let n = entry
+            .get_name()?
+            .to_str()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
         if n == name {
             return entry.get_cap().get_as_capability::<T>();
         }
@@ -88,22 +91,6 @@ fn short_id(peer_id: &[u8]) -> String {
     } else {
         h
     }
-}
-
-async fn routing_key(
-    routing: &routing_capnp::routing::Client,
-    service: &str,
-) -> Result<String, capnp::Error> {
-    let mut req = routing.hash_request();
-    req.get().set_data(service.as_bytes());
-    let resp = req.send().promise.await?;
-    let key = resp
-        .get()?
-        .get_key()?
-        .to_str()
-        .map_err(|e| capnp::Error::failed(e.to_string()))?
-        .to_string();
-    Ok(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -312,8 +299,7 @@ fn run_cell() {
     system::serve(client.client, |initial_grants: InitialGrants| async move {
         let grants_resp = initial_grants.get_request().send().promise.await?;
         let caps = grants_resp.get()?.get_caps()?;
-        let http: http_capnp::http_client::Client =
-            get_initial_grant(&caps, "http-client")?;
+        let http: http_capnp::http_client::Client = get_initial_grant(&caps, "http-client")?;
 
         if let Err(e) = fetch_prices(&http, &cache).await {
             log::warn!("cell: initial price fetch failed: {e}");
@@ -343,31 +329,26 @@ async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> 
     let results = grants_resp.get()?;
     let caps = results.get_caps()?;
     let host: system_capnp::host::Client = get_initial_grant(&caps, "host")?;
-    let routing: routing_capnp::routing::Client = get_initial_grant(&caps, "routing")?;
+    let announcer: routing_capnp::announcer::Client =
+        get_initial_grant(&caps, "routing-announcer")?;
 
     let id_resp = host.id_request().send().promise.await?;
     let self_id = id_resp.get()?.get_peer_id()?.to_vec();
     log::info!("oracle: peer {}", short_id(&self_id));
     log::info!("oracle: service name {ORACLE_SERVICE}");
-    let service_key = routing_key(&routing, ORACLE_SERVICE).await?;
+    let service_key = routing_key::derive(ORACLE_SERVICE.as_bytes());
     log::info!("oracle: routing key {service_key}");
 
     // Provide service-name routing key on DHT for discovery.
-    let mut provide_req = routing.provide_request();
+    let mut provide_req = announcer.provide_request();
     provide_req.get().set_key(&service_key);
     provide_req.send().promise.await?;
     log::info!("oracle: provided on DHT");
 
-    // Keep running: re-provide on DHT (records expire).
-    let mut cooldown_ms: u64 = 30_000;
+    // Keep the epoch alive. The host owns registration and republication.
     loop {
-        let mut provide_req = routing.provide_request();
-        provide_req.get().set_key(&service_key);
-        let _ = provide_req.send().promise.await;
-
-        let pause = wasip2::clocks::monotonic_clock::subscribe_duration(cooldown_ms * 1_000_000);
+        let pause = wasip2::clocks::monotonic_clock::subscribe_duration(60_000_000_000);
         pause.block();
-        cooldown_ms = cooldown_ms.min(60_000);
     }
 }
 
@@ -386,6 +367,7 @@ impl routing_capnp::provider_sink::Server for OracleSink {
     fn provider(
         self: Rc<Self>,
         params: routing_capnp::provider_sink::ProviderParams,
+        _results: routing_capnp::provider_sink::ProviderResults,
     ) -> Promise<(), capnp::Error> {
         let peer_id = pry!(pry!(pry!(params.get()).get_info()).get_peer_id()).to_vec();
 
@@ -425,8 +407,7 @@ async fn query_oracle(
     req.get().set_protocol(ORACLE_SERVICE);
     let resp = req.send().promise.await?;
     let dialed = resp.get()?.get_cap();
-    let oracle: oracle_capnp::price_oracle::Client =
-        dialed.get_as_capability()?;
+    let oracle: oracle_capnp::price_oracle::Client = dialed.get_as_capability()?;
 
     // Query available pairs.
     let pairs_resp = oracle.get_pairs_request().send().promise.await?;
@@ -460,7 +441,7 @@ async fn run_consumer(initial_grants: InitialGrants) -> Result<(), capnp::Error>
     let results = grants_resp.get()?;
     let caps = results.get_caps()?;
     let host: system_capnp::host::Client = get_initial_grant(&caps, "host")?;
-    let routing: routing_capnp::routing::Client = get_initial_grant(&caps, "routing")?;
+    let finder: routing_capnp::finder::Client = get_initial_grant(&caps, "routing-finder")?;
 
     let network_resp = host.network_request().send().promise.await?;
     let network = network_resp.get()?;
@@ -470,7 +451,7 @@ async fn run_consumer(initial_grants: InitialGrants) -> Result<(), capnp::Error>
     let self_id = id_resp.get()?.get_peer_id()?.to_vec();
     log::info!("consumer: peer {}", short_id(&self_id));
     log::info!("consumer: looking for oracle providers...");
-    let service_key = routing_key(&routing, ORACLE_SERVICE).await?;
+    let service_key = routing_key::derive(ORACLE_SERVICE.as_bytes());
     log::info!("consumer: routing key {service_key}");
 
     let seen = Rc::new(RefCell::new(std::collections::HashSet::<Vec<u8>>::new()));
@@ -486,7 +467,7 @@ async fn run_consumer(initial_grants: InitialGrants) -> Result<(), capnp::Error>
             self_id: self_id.clone(),
             seen: seen.clone(),
         });
-        let mut fp_req = routing.find_providers_request();
+        let mut fp_req = finder.find_providers_request();
         {
             let mut b = fp_req.get();
             b.set_key(&service_key);
@@ -523,8 +504,7 @@ fn run_http() -> Result<(), ()> {
     system::run(|initial_grants: InitialGrants| async move {
         let grants_resp = initial_grants.get_request().send().promise.await?;
         let grants = grants_resp.get()?.get_caps()?;
-        let http: http_capnp::http_client::Client =
-            get_initial_grant(&grants, "http-client")?;
+        let http: http_capnp::http_client::Client = get_initial_grant(&grants, "http-client")?;
 
         let cache = init_cache();
         if let Err(e) = fetch_prices(&http, &cache).await {
@@ -575,15 +555,13 @@ fn build_json_response(cache: &PriceCache, query: &str) -> String {
             "confidence".into(),
             serde_json::Value::from(entry.confidence),
         );
-        obj.insert(
-            "timestamp".into(),
-            serde_json::Value::from(entry.timestamp),
-        );
+        obj.insert("timestamp".into(), serde_json::Value::from(entry.timestamp));
         pairs.insert(name.clone(), serde_json::Value::Object(obj));
     }
 
     let root = serde_json::json!({ "pairs": pairs });
-    serde_json::to_string_pretty(&root).unwrap_or_else(|_| r#"{"error":"json serialization"}"#.into())
+    serde_json::to_string_pretty(&root)
+        .unwrap_or_else(|_| r#"{"error":"json serialization"}"#.into())
 }
 
 // ---------------------------------------------------------------------------

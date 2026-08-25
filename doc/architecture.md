@@ -43,8 +43,9 @@ HOST PROCESS
 ```
 
 The PID0 graft contains the host-provided capabilities appropriate for the
-node configuration, including identity, host, runtime, routing, authority,
-IPFS, and optional HTTP client. Local PID0 grafting has no `AuthPolicy`.
+node configuration, including identity, host, runtime, independent
+`routing-finder` and `routing-announcer` references, authority, IPFS, and
+optional HTTP client. Local PID0 grafting has no `AuthPolicy`.
 Authenticated vat publication remains separate: each inbound stream receives
 a fresh `Terminal` that verifies login before returning policy-selected service
 authority.
@@ -86,7 +87,7 @@ Consequently an ordinary child cannot reacquire host authority through its
 bootstrap, lexical capture, runtime propagation, arbitrary-name resolution,
 or the known fallback paths.
 
-## Routing and interposition
+## Capability routing, provider routing, and interposition
 
 Grants are opaque Cap'n Proto references. The grants-only bootstrap forwards
 neither calls nor authority: it returns the selected references as-is.
@@ -101,6 +102,29 @@ The local `receiverHosted` path collapse is preserved. An attenuation wrapper
 is an intentional interposition point; it restricts a granted reference rather
 than converting the child bootstrap into a forwarding membrane. Cross-node
 three-phase handoff remains an upstream limitation.
+
+Provider routing uses two narrow Cap'n Proto capabilities. `routing::Finder`
+observes provider records through bounded WAN and LAN queries.
+`routing::Announcer` asserts that the Wetware host PeerID provides a CID. A
+parent can delegate one reference without delegating the other.
+
+Finder deduplicates PeerIDs across both DHTs, limits delivery to the caller's
+`count`, and uses a single-slot transfer to the streaming sink. The swarm
+retains at most `min(count, 16)` selected results while that slot is occupied.
+Sink failure, epoch expiry, and a 30-second deadline cancel the remaining
+provider and peer-routing queries through a per-request cancellation token. The
+deadline includes swarm-command admission.
+
+Each Announcer has an owner lease. Duplicate provision by one lease is
+idempotent. Multiple leases can own the same CID. The final owner release
+removes the local WAN and LAN provider records, which stops future
+republication. Remote records already propagated through Kademlia expire
+naturally.
+
+Canonical routing-key derivation is not an RPC capability. Components can
+optionally import `wetware:routing/key@0.1.0`, which computes
+CIDv1/raw/BLAKE3-256 text without a graft, membrane, or epoch guard. Components
+that omit the import do not receive its bindings.
 
 ## Epoch and PID0 lifecycle
 
@@ -216,6 +240,10 @@ a 48-hour lifetime, five-minute TTL, four-hour refresh interval, one-minute
 initial delay, and five-minute retry delay. A followed third-party IPNS Stem
 never creates a publisher.
 
+Guest provider routing does not expose IPNS resolution, publication, or host
+signing authority. Removing the legacy guest `Routing.publish` method does not
+change this host-owned HTTP Routing V1 lifecycle.
+
 ## Fixed execution substrate
 
 Every child has local computation, args and environment selected at spawn,
@@ -227,10 +255,10 @@ byte-loaded `Executor` gets a private empty read-only root. Every child has a
 private writable `/tmp`, cleaned up with its lifecycle.
 
 Optional host CAS wiring can make known-CID content readable. It does not
-provide enumeration, mutation, MFS/IPNS, pin management, publishing, routing,
-or arbitrary dialing. A read may nevertheless use node network, disk, cache,
-and eviction resources. Known CIDs are copyable bearer locators, not
-confidential object references.
+provide enumeration, mutation, MFS/IPNS, pin management, publishing, provider
+discovery, provider announcement, or arbitrary dialing. A read may nevertheless
+use node network, disk, cache, and eviction resources. Known CIDs are copyable
+bearer locators, not confidential object references.
 
 ## Security claim and boundary
 

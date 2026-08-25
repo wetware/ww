@@ -28,7 +28,8 @@ interface Membrane @0xdb52c25106bc2c5e {
   # Pure capability provisioning (ocap model). Having a Membrane reference IS
   # authorization — no signer needed. Wrap in Terminal(Membrane) to gate access.
   #
-  # Canonical names: "identity", "host", "runtime", "routing", "http-client", "ipfs".
+  # Canonical names: "identity", "host", "runtime", "routing-finder",
+  # "routing-announcer", "http-client", "ipfs".
   # Trusted pid0 may also receive explicitly configured extras.
   #
   # Listener/Dialer accessed via host.network().

@@ -28,7 +28,7 @@ fn main() {
 
     // ── Pass 1: shared schemas ──────────────────────────────────────
     // Compile the system-level .capnp files that every guest needs:
-    // Host, Executor, IPFS, Routing, etc. These produce Rust modules
+    // Host, Executor, Finder, Announcer, etc. These produce Rust modules
     // like `system_capnp::executor::Client`.
     capnpc::CompilerCommand::new()
         .src_prefix(&capnp_dir)

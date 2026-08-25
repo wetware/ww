@@ -366,14 +366,14 @@ async fn test_terminal_missing_signer_rejected() {
     assert!(result.get_session().is_err());
 }
 
-/// Helper: create a Membrane client with all 5 capabilities populated.
+/// Helper: create a Membrane client with all six capabilities populated.
 fn full_stub_membrane(rx: watch::Receiver<Epoch>) -> membrane_capnp::membrane::Client {
     new_client(MembraneServer::new(rx, FullStubSessionBuilder))
 }
 
-/// Verify that graft() returns all 5 capabilities: identity, host, runtime, routing, http-client.
+/// Verify that graft() returns both routing capabilities as independent refs.
 #[tokio::test]
-async fn test_graft_returns_all_five_capabilities() {
+async fn test_graft_returns_all_six_capabilities() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
@@ -392,16 +392,17 @@ async fn test_graft_returns_all_five_capabilities() {
     let results = graft_resp.get().expect("graft results");
     let caps = results.get_caps().expect("caps");
 
-    // All 5 capabilities must be present by name.
-    assert_eq!(caps.len(), 5, "expected 5 capabilities");
+    assert_eq!(caps.len(), 6, "expected 6 capabilities");
     let _identity: auth_capnp::identity::Client =
         get_graft_cap(&caps, "identity").expect("identity capability should be present");
     let _host: system_capnp::host::Client =
         get_graft_cap(&caps, "host").expect("host capability should be present");
     let runtime: system_capnp::runtime::Client =
         get_graft_cap(&caps, "runtime").expect("runtime capability should be present");
-    let _routing: routing_capnp::routing::Client =
-        get_graft_cap(&caps, "routing").expect("routing capability should be present");
+    let _finder: routing_capnp::finder::Client =
+        get_graft_cap(&caps, "routing-finder").expect("Finder capability should be present");
+    let _announcer: routing_capnp::announcer::Client =
+        get_graft_cap(&caps, "routing-announcer").expect("Announcer capability should be present");
     let _http_client: http_capnp::http_client::Client =
         get_graft_cap(&caps, "http-client").expect("http-client capability should be present");
 
