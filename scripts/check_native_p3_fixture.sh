@@ -7,6 +7,7 @@ readonly EXPECTED_SDK_VERSION="34.0"
 readonly EXPECTED_LLVM_VERSION="23.1.0"
 readonly EXPECTED_COMPONENT_LD_VERSION="wasm-component-ld 0.5.30"
 readonly EXPECTED_WASM_TOOLS_VERSION="wasm-tools 1.258.0"
+readonly EXPECTED_WASM_TOOLS_VERSION_PATTERN='^wasm-tools 1\.258\.0( \([0-9a-f]{9} [0-9]{4}-[0-9]{2}-[0-9]{2}\))?$'
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
@@ -51,8 +52,12 @@ if ! "$wasm_ld" --version | grep -q "^LLD $EXPECTED_LLVM_VERSION "; then
   exit 1
 fi
 
-if [[ "$("$wasm_tools" --version)" != "$EXPECTED_WASM_TOOLS_VERSION" ]]; then
-  echo "$wasm_tools must be $EXPECTED_WASM_TOOLS_VERSION" >&2
+wasm_tools_version="$("$wasm_tools" --version)"
+# Release binaries include their short Git hash and build date; Cargo-installed
+# binaries report only the package version.
+if [[ ! "$wasm_tools_version" =~ $EXPECTED_WASM_TOOLS_VERSION_PATTERN ]]; then
+  printf '%s must report %s (reported: %s)\n' \
+    "$wasm_tools" "$EXPECTED_WASM_TOOLS_VERSION" "$wasm_tools_version" >&2
   exit 1
 fi
 
