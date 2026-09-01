@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **The host now uses Wasmtime 48.0.1 while production Cells remain on WASI
+  P2.** Filesystem permission and component import inspection calls use the
+  Wasmtime 48 APIs without changing Cell scheduling or filesystem policy. A
+  pinned, isolated `wasm32-wasip3` async fixture now validates the forthcoming
+  native P3 build lane and rejects WASI 0.2 imports in CI.
 - **Breaking: provider routing now uses independent object capabilities.** The
   legacy broad `Routing` interface and `routing` graft are replaced by
   provider discovery through `routing::Finder` (`routing-finder`) and host

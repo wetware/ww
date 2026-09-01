@@ -17,10 +17,10 @@ serde_json = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
 dirs = { workspace = true }
-cap-std = "3.4"
+cap-std = "4.0"
 wasmtime = { workspace = true, features = ["call-hook"] }
-wasmtime-wasi = "45.0.0"
-wasmtime-wasi-io = "45.0.0"
+wasmtime-wasi = { version = "=48.0.1", default-features = false, features = ["p2"] }
+wasmtime-wasi-io = "=48.0.1"
 tempfile = { workspace = true }
 
 # Workspace crates

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use wasmtime::component::Component;
-use wasmtime::{Cache, CacheConfig, Config, Engine};
+use wasmtime::{Cache, CacheConfig, Config, Engine, OperatorCost, VariableOperatorCost};
 
 /// Directory for Wasmtime's persistent compilation cache.
 pub const CWASM_DIR_ENV: &str = "WW_CWASM_DIR";
@@ -166,9 +166,16 @@ impl EngineFactory {
         let mut config = Config::new();
         // Fuel: cooperative preemption for guests (Trap::OutOfFuel).
         config.consume_fuel(true);
+        // Wasmtime 46 added size-dependent fuel charges for bulk operations.
+        // Wasmtime 45 charged only the flat operator cost. Keep that policy so
+        // the Cell fuel estimator sees the same instruction accounting.
+        config.operator_cost(wasmtime_45_operator_cost());
         // Epoch: the ExecutorPool's tick task calls Engine::increment_epoch()
         // to reach every Store's epoch_deadline_callback.
         config.epoch_interruption(true);
+        // Production remains WASI P2. Wasmtime 48 enables the component-model
+        // async proposal by default when concurrency support is compiled in.
+        config.wasm_component_model_async(false);
         if let Some(cache) = &self.cache {
             config.cache(Some(cache.clone()));
         }
@@ -197,6 +204,30 @@ impl EngineFactory {
             stores,
             component_compilations: self.component_compilations.load(Ordering::Relaxed),
         }
+    }
+}
+
+fn wasmtime_45_operator_cost() -> OperatorCost {
+    OperatorCost {
+        variable: VariableOperatorCost {
+            memory_copy_per_byte: 0,
+            memory_fill_per_byte: 0,
+            memory_init_per_byte: 0,
+            memory_grow_per_page: 0,
+            table_copy_per_element: 0,
+            table_fill_per_element: 0,
+            table_init_per_element: 0,
+            table_grow_per_element: 0,
+            array_copy_per_element: 0,
+            array_fill_per_element: 0,
+            array_new_data_per_element: 0,
+            array_init_data_per_element: 0,
+            array_new_elem_per_element: 0,
+            array_init_elem_per_element: 0,
+            array_new_default_per_element: 0,
+            array_new_per_element: 0,
+        },
+        ..OperatorCost::default()
     }
 }
 
@@ -233,6 +264,55 @@ mod tests {
 
     fn component_bytes() -> Vec<u8> {
         wat::parse_str("(component)").expect("minimal component")
+    }
+
+    fn memory_fill_fuel(factory: &EngineFactory, length: i32) -> u64 {
+        let engine = factory.engine().expect("engine");
+        let module = wasmtime::Module::new(
+            &engine,
+            r#"
+                (module
+                    (memory 1)
+                    (func (export "fill") (param i32)
+                        i32.const 0
+                        i32.const 0
+                        local.get 0
+                        memory.fill))
+            "#,
+        )
+        .expect("memory.fill module");
+        let mut store = wasmtime::Store::new(&engine, ());
+        store.set_epoch_deadline(u64::MAX);
+        let initial_fuel = 10_000;
+        store.set_fuel(initial_fuel).expect("initial fuel");
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instance");
+        instance
+            .get_typed_func::<i32, ()>(&mut store, "fill")
+            .expect("fill export")
+            .call(&mut store, length)
+            .expect("memory.fill call");
+        initial_fuel - store.get_fuel().expect("remaining fuel")
+    }
+
+    #[test]
+    fn bulk_operation_fuel_matches_wasmtime_45_flat_accounting() {
+        let factory = EngineFactory::from_settings(Ok(None));
+        assert_eq!(
+            memory_fill_fuel(&factory, 0),
+            memory_fill_fuel(&factory, 4096)
+        );
+    }
+
+    #[test]
+    fn production_engine_rejects_component_model_async() {
+        let factory = EngineFactory::from_settings(Ok(None));
+        let engine = factory.engine().expect("engine");
+        let error = Component::new(&engine, "(component (type (func async)))")
+            .expect_err("production engine must reject component-model async");
+        assert!(
+            format!("{error:#}").contains("component model async feature"),
+            "unexpected validation error: {error:#}"
+        );
     }
 
     #[test]
