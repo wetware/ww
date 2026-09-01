@@ -106,6 +106,7 @@ jobs:
       run: |
         cargo fmt --all -- --check
         cargo fmt --manifest-path std/kernel/Cargo.toml -- --check
+        cargo fmt --manifest-path tests/fixtures/native-p3/Cargo.toml -- --check
 
     - name: Check IPFS release publish scripts
       run: |
@@ -116,7 +117,7 @@ jobs:
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh
+          shellcheck scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh
         fi
 
   clippy:
@@ -202,6 +203,46 @@ jobs:
     - name: Build host workspace test binaries
       run: cargo build --workspace --tests
 
+  native-p3-fixture:
+    name: Native wasm32-wasip3 fixture
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install pinned Rust nightly
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        toolchain: nightly-2026-08-30
+        components: rust-src
+
+    - name: Install pinned WASI P3 tools
+      run: |
+        set -euo pipefail
+        tool_dir="$RUNNER_TEMP/native-p3-tools"
+        sdk_archive="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux.tar.gz"
+        wasm_tools_archive="$RUNNER_TEMP/wasm-tools-1.258.0-x86_64-linux.tar.gz"
+        mkdir -p "$tool_dir"
+
+        curl -fL \
+          https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz \
+          -o "$sdk_archive"
+        echo "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4  $sdk_archive" \
+          | sha256sum --check --strict
+        tar -xzf "$sdk_archive" -C "$tool_dir"
+
+        curl -fL \
+          https://github.com/bytecodealliance/wasm-tools/releases/download/v1.258.0/wasm-tools-1.258.0-x86_64-linux.tar.gz \
+          -o "$wasm_tools_archive"
+        echo "b52d14eb74a4852cc249369bd4480c2b2fdd876145f41db51ff52269ded240ce  $wasm_tools_archive" \
+          | sha256sum --check --strict
+        tar -xzf "$wasm_tools_archive" -C "$tool_dir"
+
+        echo "WASI_SDK_PATH=$tool_dir/wasi-sdk-34.0-x86_64-linux" >> "$GITHUB_ENV"
+        echo "WASM_TOOLS=$tool_dir/wasm-tools-1.258.0-x86_64-linux/wasm-tools" >> "$GITHUB_ENV"
+
+    - name: Build and validate native P3 fixture
+      run: make test-p3-fixture
+
   test:
     name: Test
     needs: [build]
@@ -266,7 +307,11 @@ jobs:
     - name: Build embedded WASI std and test fixtures
       run: |
         make std
-        make -C examples/echo
+        make examples
+        test -s std/kernel/bin/main.wasm
+        test -s std/status/bin/status.wasm
+        test -s examples/echo/bin/echo.wasm
+        test -s examples/discovery/bin/discovery.wasm
 
     - name: Run host workspace tests (hot cache from build job)
       run: cargo test --workspace
@@ -313,6 +358,7 @@ jobs:
       if: ${{ always() }}
       run: |
         cargo test --manifest-path std/kernel/Cargo.toml
+        cargo test --manifest-path std/status/Cargo.toml
 
   build-architecture-map:
     name: Build architecture map
@@ -377,7 +423,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && github.ref == 'refs/heads/master')
-    needs: [fmt, clippy, solidity, build]
+    needs: [fmt, clippy, solidity, build, native-p3-fixture]
     runs-on: ubuntu-latest
 
     steps:

@@ -50,6 +50,7 @@ impl IpfsFilesystemView<'_> {
 // ── Accessor function ──────────────────────────────────────────────
 
 fn ipfs_filesystem(state: &mut ComponentRunStates) -> IpfsFilesystemView<'_> {
+    state.mark_host_call();
     // Split borrow across distinct fields of ComponentRunStates.
     IpfsFilesystemView {
         ctx: state.wasi_ctx.filesystem(),
@@ -103,7 +104,7 @@ impl IpfsFilesystemView<'_> {
         path: &str,
         flags: types::DescriptorFlags,
     ) -> FsResult<Resource<types::Descriptor>> {
-        use wasmtime_wasi::{DirPerms, FilePerms, OpenMode};
+        use wasmtime_wasi::{FsPerms, OpenMode};
 
         // Reject writes — CidTree is immutable
         if flags.contains(types::DescriptorFlags::WRITE) {
@@ -157,8 +158,8 @@ impl IpfsFilesystemView<'_> {
                 .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
 
                 let wasi_file = wasmtime_wasi::filesystem::File::new(
-                    file,
-                    FilePerms::READ,
+                    file.into_std(),
+                    FsPerms::ReadOnly,
                     OpenMode::READ,
                     false,
                 );
@@ -203,9 +204,8 @@ impl IpfsFilesystemView<'_> {
                     cap_std::fs::Dir::open_ambient_dir(&staging_dir, cap_std::ambient_authority())
                         .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
                 let wasi_dir = wasmtime_wasi::filesystem::Dir::new(
-                    dir,
-                    DirPerms::READ,
-                    FilePerms::READ,
+                    dir.into_std_file(),
+                    FsPerms::ReadOnly,
                     OpenMode::READ,
                     false,
                 );
@@ -231,7 +231,7 @@ impl IpfsFilesystemView<'_> {
         _oflags: types::OpenFlags,
         flags: types::DescriptorFlags,
     ) -> FsResult<Resource<types::Descriptor>> {
-        use wasmtime_wasi::{DirPerms, FilePerms, OpenMode};
+        use wasmtime_wasi::{FsPerms, OpenMode};
 
         // Reject writes — /ipfs/ is content-addressed and immutable
         if flags.contains(types::DescriptorFlags::WRITE) {
@@ -291,9 +291,8 @@ impl IpfsFilesystemView<'_> {
                 cap_std::fs::Dir::open_ambient_dir(&target_path, cap_std::ambient_authority())
                     .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
             let wasi_dir = wasmtime_wasi::filesystem::Dir::new(
-                dir,
-                DirPerms::READ,
-                FilePerms::READ,
+                dir.into_std_file(),
+                FsPerms::ReadOnly,
                 OpenMode::READ,
                 false,
             );
@@ -307,8 +306,12 @@ impl IpfsFilesystemView<'_> {
             .open(target_path.file_name().unwrap_or_default())
             .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
 
-            let wasi_file =
-                wasmtime_wasi::filesystem::File::new(file, FilePerms::READ, OpenMode::READ, false);
+            let wasi_file = wasmtime_wasi::filesystem::File::new(
+                file.into_std(),
+                FsPerms::ReadOnly,
+                OpenMode::READ,
+                false,
+            );
             wasmtime_wasi::filesystem::Descriptor::File(wasi_file)
         };
 

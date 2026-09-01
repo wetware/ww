@@ -6,7 +6,7 @@
 WASM_TARGET := wasm32-wasip2
 
 .PHONY: all host std kernel status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
-.PHONY: publish-std try-publish-std publish test-deps test test-wasm authority-probe
+.PHONY: publish-std try-publish-std publish test-deps test test-wasm test-p3-fixture authority-probe
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
 
@@ -22,6 +22,9 @@ test-deps:
 
 test: test-deps
 	cargo test --workspace
+
+test-p3-fixture:
+	bash scripts/check_native_p3_fixture.sh
 
 # Build the disposable real-WASM adversarial guest used by the T1 confinement
 # harness. The integration test also builds it on demand in a separate target

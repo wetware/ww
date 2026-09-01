@@ -12,7 +12,7 @@ use wasmtime_wasi::p2::add_to_linker_async;
 use wasmtime_wasi::p2::bindings::{Command as WasiCliCommand, CommandPre as WasiCliCommandPre};
 use wasmtime_wasi::p2::pipe::{AsyncReadStream, AsyncWriteStream};
 use wasmtime_wasi::WasiCtxBuilder;
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_io::streams::{DynInputStream, DynOutputStream};
 
 // Generate bindings from WIT file
@@ -214,15 +214,35 @@ pub struct ComponentRunStates {
     pub(crate) writable_fs_descriptors: std::collections::HashSet<u32>,
     /// EWMA fuel estimator, refuels at host call boundaries.
     pub fuel_estimator: FuelEstimator,
+    /// True after a linked guest import reaches its host implementation.
+    ///
+    /// Wasmtime 48 also emits `CallHook` events for internal libcalls, fuel
+    /// yields, and epoch yields. The returning hook consumes this marker so
+    /// those internal transitions do not change the host-call EWMA.
+    // TODO(P3): Re-audit this bool/return-hook scheme before enabling Component
+    // Model async or P3. It assumes current non-concurrent P2 execution and no
+    // independently outstanding host-call return markers.
+    host_call_pending: bool,
     /// Present only for the trusted PID0 process. Ordinary child linkers omit
     /// the corresponding WIT import entirely.
     pub kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
+}
+
+impl ComponentRunStates {
+    pub(crate) fn mark_host_call(&mut self) {
+        self.host_call_pending = true;
+    }
+
+    fn take_host_call(&mut self) -> bool {
+        std::mem::take(&mut self.host_call_pending)
+    }
 }
 
 impl pid0_runtime::wetware::kernel_runtime::readiness::Host for ComponentRunStates {
     fn kernel_ready(
         &mut self,
     ) -> Result<(), pid0_runtime::wetware::kernel_runtime::readiness::ReadyError> {
+        self.mark_host_call();
         let gate = self
             .kernel_ready_gate
             .as_ref()
@@ -233,6 +253,7 @@ impl pid0_runtime::wetware::kernel_runtime::readiness::Host for ComponentRunStat
 
 impl routing_key_runtime::wetware::routing::key::Host for ComponentRunStates {
     fn derive(&mut self, data: Vec<u8>) -> String {
+        self.mark_host_call();
         crate::routing_key::derive(&data).to_string()
     }
 }
@@ -262,6 +283,7 @@ fn add_routing_key_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<
 // Required for WASI IO to work.
 impl WasiView for ComponentRunStates {
     fn ctx(&mut self) -> WasiCtxView<'_> {
+        self.mark_host_call();
         WasiCtxView {
             ctx: &mut self.wasi_ctx,
             table: &mut self.resource_table,
@@ -308,7 +330,7 @@ fn configure_process_filesystem(
 ) -> Result<ProcessFilesystem> {
     let image_root = if let Some(tree) = cid_tree {
         wasi_builder
-            .preopened_dir(tree.staging_dir(), "/", DirPerms::READ, FilePerms::READ)
+            .preopened_dir(tree.staging_dir(), "/", FsPerms::ReadOnly)
             .map_err(|e| anyhow!("failed to preopen CidTree staging dir at /: {e}"))?;
         tracing::debug!(
             staging = %tree.staging_dir().display(),
@@ -319,7 +341,7 @@ fn configure_process_filesystem(
         let root = tempfile::TempDir::new()
             .map_err(|e| anyhow!("failed to create private process image root: {e}"))?;
         wasi_builder
-            .preopened_dir(root.path(), "/", DirPerms::READ, FilePerms::READ)
+            .preopened_dir(root.path(), "/", FsPerms::ReadOnly)
             .map_err(|e| anyhow!("failed to preopen private image root at /: {e}"))?;
         Some(root)
     };
@@ -327,13 +349,31 @@ fn configure_process_filesystem(
     let scratch = tempfile::TempDir::new()
         .map_err(|e| anyhow!("failed to create private process scratch: {e}"))?;
     wasi_builder
-        .preopened_dir(scratch.path(), "/tmp", DirPerms::all(), FilePerms::all())
+        .preopened_dir(scratch.path(), "/tmp", FsPerms::ReadWrite)
         .map_err(|e| anyhow!("failed to preopen private process scratch at /tmp: {e}"))?;
 
     Ok(ProcessFilesystem {
         image_root,
         scratch,
     })
+}
+
+fn install_host_return_fuel_hook(store: &mut Store<ComponentRunStates>) {
+    store.call_hook(|mut ctx, hook| {
+        if matches!(hook, CallHook::ReturningFromHost) && ctx.data_mut().take_host_call() {
+            let remaining = ctx.get_fuel().unwrap_or(0);
+            ctx.data_mut().fuel_estimator.host_calls_this_epoch += 1;
+            let new_budget = ctx.data_mut().fuel_estimator.on_host_return(remaining);
+            ctx.set_fuel(new_budget)?;
+            tracing::debug!(
+                new_budget,
+                remaining,
+                avg_ratio = ctx.data().fuel_estimator.avg_ratio(),
+                "fuel.refuel"
+            );
+        }
+        Ok(())
+    });
 }
 
 /// A WASIP2 program supplied as bytes or as a component compiled for the
@@ -604,7 +644,11 @@ impl Proc {
             .stdout(stdout_stream)
             .stderr(stderr_stream)
             .envs(&envs)
-            .args(&args);
+            .args(&args)
+            // Wasmtime 45 allowed TCP and UDP socket creation by default.
+            // Wasmtime 48 defaults both switches to false.
+            .allow_tcp(true)
+            .allow_udp(true);
 
         // Anchor the guest's WASI filesystem at `/` so wasi-libc has a
         // starting descriptor for absolute-path resolution. The preopened
@@ -630,6 +674,7 @@ impl Proc {
             cid_tree,
             writable_fs_descriptors: std::collections::HashSet::new(),
             fuel_estimator: fuel_estimator.unwrap_or_else(|| FuelEstimator::new(INITIAL_FUEL)),
+            host_call_pending: false,
             kernel_ready_gate,
         };
 
@@ -691,31 +736,17 @@ impl Proc {
         });
         store.set_epoch_deadline(1);
 
-        // EWMA refueling hook: fires on every ReturningFromHost transition.
+        // EWMA refueling hook: observes linked guest imports when they return.
         //
         // The estimator tracks the consumed/budget ratio via EWMA and sizes
         // the budget inversely.  set_fuel() reloads the tank so the guest can
-        // continue.  This hook does NOT fire on fuel-yield events (those go
-        // through Poll::Pending); it fires when the guest makes a deliberate
-        // host call (WASI import, etc.).
+        // continue. Wasmtime 48 also emits these hooks for internal libcalls
+        // and fuel/epoch yields. Linked imports mark the Store state from
+        // their host implementation; the hook ignores unmarked transitions.
         //
         // Compute-bound cells that don't make host calls are refueled by the
         // epoch_deadline_callback above to prevent Trap::OutOfFuel.
-        store.call_hook(|mut ctx, hook| {
-            if matches!(hook, CallHook::ReturningFromHost) {
-                let remaining = ctx.get_fuel().unwrap_or(0);
-                ctx.data_mut().fuel_estimator.host_calls_this_epoch += 1;
-                let new_budget = ctx.data_mut().fuel_estimator.on_host_return(remaining);
-                ctx.set_fuel(new_budget)?;
-                tracing::debug!(
-                    new_budget,
-                    remaining,
-                    avg_ratio = ctx.data().fuel_estimator.avg_ratio(),
-                    "fuel.refuel"
-                );
-            }
-            Ok(())
-        });
+        install_host_return_fuel_hook(&mut store);
 
         // Instantiate it as a normal component. The canonical engine has
         // Wasmtime's optional persistent cache configured, so this path stays
@@ -744,7 +775,7 @@ impl Proc {
         for (name, item) in component_type.imports(&engine) {
             tracing::trace!(name, item = ?item, "Guest component import");
             if name == "wetware:streams/streams" {
-                if let ComponentItem::ComponentInstance(instance) = item {
+                if let ComponentItem::ComponentInstance(instance) = item.ty {
                     for (export_name, export_item) in instance.exports(&engine) {
                         tracing::trace!(
                             name,
@@ -810,13 +841,17 @@ fn add_streams_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> 
     streams_instance.resource(
         "connection",
         ResourceType::host::<ConnectionState>(),
-        |_, _| Ok(()),
+        |mut store, _| {
+            store.data_mut().mark_host_call();
+            Ok(())
+        },
     )?;
 
     streams_instance.func_wrap_async(
         "create-connection",
         |mut store: StoreContextMut<'_, ComponentRunStates>, (): ()| {
             Box::new(async move {
+                store.data_mut().mark_host_call();
                 tracing::debug!("streams#create-connection invoked");
                 let state = store.data_mut();
                 let guest_stream = state
@@ -847,6 +882,7 @@ fn add_streams_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> 
         |mut store: StoreContextMut<'_, ComponentRunStates>,
          (connection,): (Resource<ConnectionState>,)| {
             Box::new(async move {
+                store.data_mut().mark_host_call();
                 tracing::debug!("streams#connection.get-input-stream invoked");
                 let stream = {
                     let conn_state = store.data_mut().resource_table.get_mut(&connection)?;
@@ -869,6 +905,7 @@ fn add_streams_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> 
         |mut store: StoreContextMut<'_, ComponentRunStates>,
          (connection,): (Resource<ConnectionState>,)| {
             Box::new(async move {
+                store.data_mut().mark_host_call();
                 tracing::debug!("streams#connection.get-output-stream invoked");
                 let stream = {
                     let conn_state = store.data_mut().resource_table.get_mut(&connection)?;
@@ -1007,6 +1044,7 @@ mod tests {
             cid_tree: None,
             writable_fs_descriptors: std::collections::HashSet::new(),
             fuel_estimator: FuelEstimator::new(INITIAL_FUEL),
+            host_call_pending: false,
             kernel_ready_gate: None,
         }
     }
@@ -1072,8 +1110,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn routing_key_wit_call_matches_golden_vector_and_is_deterministic() {
+    async fn linked_routing_key_probe() -> (
+        Store<ComponentRunStates>,
+        wasmtime::component::TypedFunc<(), (String,)>,
+    ) {
         let engine = crate::engine::wasm_engine().expect("component engine");
         let component = Component::new(&engine, ROUTING_KEY_PROBE_COMPONENT)
             .expect("routing-key probe component");
@@ -1081,7 +1121,11 @@ mod tests {
         add_routing_key_to_linker(&mut linker).expect("install routing-key import");
         let mut store = Store::new(&engine, component_test_state());
         store.set_fuel(INITIAL_FUEL).expect("routing-key test fuel");
+        store
+            .fuel_async_yield_interval(Some(YIELD_INTERVAL))
+            .expect("routing-key yield interval");
         store.set_epoch_deadline(1);
+        install_host_return_fuel_hook(&mut store);
         let instance = linker
             .instantiate_async(&mut store, &component)
             .await
@@ -1089,6 +1133,12 @@ mod tests {
         let probe = instance
             .get_typed_func::<(), (String,)>(&mut store, "probe")
             .expect("typed routing-key probe export");
+        (store, probe)
+    }
+
+    #[tokio::test]
+    async fn routing_key_wit_call_matches_golden_vector_and_is_deterministic() {
+        let (mut store, probe) = linked_routing_key_probe().await;
 
         for _ in 0..2 {
             let (key,) = probe
@@ -1100,6 +1150,54 @@ mod tests {
                 "bafkr4ifcoue3f52zpzpz2xei7dqhs3gajm326llyljbwisxkwea7hbowyy"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn linked_production_host_import_marks_and_refuels_once() {
+        let (mut store, probe) = linked_routing_key_probe().await;
+
+        probe
+            .call_async(&mut store, ())
+            .await
+            .expect("call linked production routing-key import");
+
+        assert!(store.data().fuel_estimator.initialized);
+        assert_eq!(store.data().fuel_estimator.host_calls_this_epoch, 1);
+        assert!(!store.data().host_call_pending);
+    }
+
+    #[tokio::test]
+    async fn internal_fuel_yields_do_not_update_host_call_ewma() {
+        let engine = crate::engine::wasm_engine().expect("component engine");
+        let module = wasmtime::Module::new(
+            &engine,
+            r#"
+                (module
+                    (func (export "spin")
+                        (loop $spin
+                            br $spin)))
+            "#,
+        )
+        .expect("spinning core module");
+        let mut store = Store::new(&engine, component_test_state());
+        store.set_fuel(35).expect("spinning test fuel");
+        store
+            .fuel_async_yield_interval(Some(10))
+            .expect("spinning test yield interval");
+        install_host_return_fuel_hook(&mut store);
+        let instance = wasmtime::Linker::new(&engine)
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate spinning core module");
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .expect("spin export");
+
+        spin.call_async(&mut store, ())
+            .await
+            .expect_err("spinning core module must exhaust fuel");
+        assert!(!store.data().fuel_estimator.initialized);
+        assert_eq!(store.data().fuel_estimator.host_calls_this_epoch, 0);
     }
 
     #[test]

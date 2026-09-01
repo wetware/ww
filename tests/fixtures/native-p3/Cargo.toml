@@ -1,0 +1,18 @@
+[package]
+name = "native-p3-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.61.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
