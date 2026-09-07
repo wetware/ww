@@ -11,6 +11,7 @@ pub mod fs_intercept;
 pub mod image;
 pub mod loaders;
 pub mod mount;
+pub mod p3;
 pub mod proc;
 pub mod routing_key;
 pub mod sched;

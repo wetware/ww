@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Dormant WASI P3 host transport and filesystem adapters are available for
+  the future guest cutover.** `wetware:transport@0.2.0` grants one ordered byte
+  connection with bounded backpressure, host flush-gated write completion,
+  independent orderly half-close, and sanitized transport failures. P2 and P3
+  adapters share lazy read-only CidTree/IPFS materialization and writable
+  `/tmp`. Shared filesystem policy validates directory CIDs and entry names
+  before staging-path use. Native P3 fixtures cover transport, owner-abort
+  cleanup, filesystem policy, and ABI/import validation. Production guests
+  remain P2-only.
 - **The host now uses Wasmtime 48.0.1 while production Cells remain on WASI
   P2.** Filesystem permission and component import inspection calls use the
   Wasmtime 48 APIs without changing Cell scheduling or filesystem policy. A

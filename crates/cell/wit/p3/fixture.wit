@@ -1,0 +1,27 @@
+package wetware:transport@0.2.0;
+
+/// Test-only exports for the dormant P3 host substrate.
+interface fixture {
+    record filesystem-observation {
+        image: list<u8>,
+        missing-rejected: bool,
+        traversal-rejected: bool,
+        image-write-rejected: bool,
+        scratch: list<u8>,
+    }
+
+    exchange: async func(outgoing: list<u8>) -> list<u8>;
+    receive-then-send: async func(outgoing: list<u8>) -> list<u8>;
+    send: async func(outgoing: list<u8>);
+    drop-incoming: async func(outgoing: list<u8>) -> bool;
+    orderly-close: async func() -> bool;
+    abnormal-failure: async func() -> string;
+    second-open: async func() -> string;
+    wait-on-live-resources: async func();
+    filesystem: async func() -> filesystem-observation;
+}
+
+world host-substrate-test {
+    import connection;
+    export fixture;
+}

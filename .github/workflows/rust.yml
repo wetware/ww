@@ -209,12 +209,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
+      with:
+        submodules: recursive
 
     - name: Install pinned Rust nightly
       uses: dtolnay/rust-toolchain@nightly
       with:
         toolchain: nightly-2026-08-30
         components: rust-src
+
+    - uses: ./.github/actions/setup-capnp
 
     - name: Install pinned WASI P3 tools
       run: |

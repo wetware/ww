@@ -1,9 +1,0 @@
-package wetware:p3-fixture@0.1.0;
-
-interface probe {
-    ping: async func(input: u32) -> u32;
-}
-
-world fixture {
-    export probe;
-}

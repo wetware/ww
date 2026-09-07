@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
+bytes = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 arc-swap = "1"
@@ -19,7 +20,7 @@ rand = { workspace = true }
 dirs = { workspace = true }
 cap-std = "4.0"
 wasmtime = { workspace = true, features = ["call-hook"] }
-wasmtime-wasi = { version = "=48.0.1", default-features = false, features = ["p2"] }
+wasmtime-wasi = { version = "=48.0.1", default-features = false, features = ["p2", "p3"] }
 wasmtime-wasi-io = "=48.0.1"
 tempfile = { workspace = true }
 
