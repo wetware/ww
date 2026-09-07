@@ -137,24 +137,31 @@ impl CidTree {
     /// 2. Staging disk (hit → populate LRU, return)
     /// 3. IPFS daemon `ls()` (populate both caches, return)
     pub async fn ls_dir(&self, cid: &str) -> Result<Vec<DirEntry>> {
+        let canonical = cid
+            .parse::<cid::Cid>()
+            .with_context(|| format!("invalid directory CID: {cid}"))?
+            .to_string();
+
         // Tier 1: in-memory LRU
         if let Some(entries) = self
             .dir_cache
             .lock()
             .ok()
-            .and_then(|mut c| c.get(cid).cloned())
+            .and_then(|mut c| c.get(&canonical).cloned())
         {
             return Ok(entries);
         }
 
         // Tier 2: staging disk
-        let disk_path = self.staging_dir.join(format!("{cid}{DIRLIST_SUFFIX}"));
+        let disk_path = self
+            .staging_dir
+            .join(format!("{canonical}{DIRLIST_SUFFIX}"));
         if disk_path.exists() {
             if let Ok(data) = std::fs::read_to_string(&disk_path) {
                 if let Ok(entries) = serde_json::from_str::<Vec<DirEntry>>(&data) {
                     // Populate LRU from disk
                     if let Ok(mut cache) = self.dir_cache.lock() {
-                        cache.put(cid.to_string(), entries.clone());
+                        cache.put(canonical.clone(), entries.clone());
                     }
                     return Ok(entries);
                 }
@@ -162,12 +169,12 @@ impl CidTree {
         }
 
         // Tier 3: IPFS daemon
-        let ipfs_path = format!("/ipfs/{cid}");
+        let ipfs_path = format!("/ipfs/{canonical}");
         let raw_entries = self
             .ipfs
             .ls(&ipfs_path)
             .await
-            .with_context(|| format!("ls failed for CID {cid}"))?;
+            .with_context(|| format!("ls failed for CID {canonical}"))?;
 
         let entries: Vec<DirEntry> = raw_entries
             .into_iter()
@@ -193,7 +200,7 @@ impl CidTree {
 
         // Populate LRU
         if let Ok(mut cache) = self.dir_cache.lock() {
-            cache.put(cid.to_string(), entries.clone());
+            cache.put(canonical, entries.clone());
         }
 
         Ok(entries)
@@ -363,6 +370,9 @@ impl std::fmt::Debug for CidTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_path_traversal_rejected() {
@@ -394,5 +404,114 @@ mod tests {
         assert_eq!(deserialized.len(), 2);
         assert_eq!(deserialized[0].name, "bin");
         assert_eq!(deserialized[1].entry_type, EntryType::File);
+    }
+
+    #[tokio::test]
+    async fn resolve_path_rejects_invalid_intermediate_directory_cid_before_io() {
+        let root_cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+        let root = tempfile::TempDir::new().unwrap();
+        let staging = root.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::create_dir(staging.join("segment")).unwrap();
+        let entries = vec![DirEntry {
+            name: "hostile".to_string(),
+            cid: "segment/../../escaped".to_string(),
+            entry_type: EntryType::Dir,
+            size: 0,
+        }];
+        std::fs::write(
+            staging.join(format!("{root_cid}{DIRLIST_SUFFIX}")),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let server_lookups = Arc::clone(&lookups);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_lookups.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0u8; 4096];
+            let bytes_read = stream.read(&mut request).await.unwrap();
+            assert!(bytes_read > 0, "Kubo request must not be empty");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"Objects\":[{\"Links\":[]}]}",
+                )
+                .await
+                .unwrap();
+        });
+        let tree = CidTree::new(
+            root_cid.to_string(),
+            ipfs::HttpClient::new(format!("http://{address}")),
+            staging.clone(),
+        );
+
+        let error = tree
+            .resolve_path("hostile/child")
+            .await
+            .expect_err("an invalid intermediate directory CID must fail resolution");
+
+        assert!(
+            error.to_string().contains("invalid directory CID"),
+            "unexpected resolution error: {error:#}"
+        );
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            0,
+            "an invalid CID must not reach Kubo"
+        );
+        assert!(
+            !root
+                .path()
+                .join(format!("escaped{DIRLIST_SUFFIX}"))
+                .exists(),
+            "an invalid CID must not create a cache file outside staging"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "resolution must not create any path outside staging"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn valid_cid_representations_share_canonical_directory_cache_identity() {
+        let canonical = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
+        let parsed = canonical.parse::<cid::Cid>().unwrap();
+        let alternate = parsed
+            .to_string_of_base(cid::multibase::Base::Base58Btc)
+            .unwrap();
+        assert_ne!(alternate, canonical);
+
+        let staging = tempfile::TempDir::new().unwrap();
+        let entries = vec![DirEntry {
+            name: "child".to_string(),
+            cid: canonical.to_string(),
+            entry_type: EntryType::File,
+            size: 7,
+        }];
+        let disk_path = staging.path().join(format!("{canonical}{DIRLIST_SUFFIX}"));
+        std::fs::write(&disk_path, serde_json::to_vec(&entries).unwrap()).unwrap();
+        let tree = CidTree::new(
+            alternate,
+            ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
+            staging.path().to_path_buf(),
+        );
+
+        let resolved = tree.resolve_path("child").await.unwrap();
+        assert!(matches!(
+            resolved,
+            ResolvedNode::CidFile { cid, size: 7 } if cid == canonical
+        ));
+
+        std::fs::remove_file(disk_path).unwrap();
+        let cached = tree.ls_dir(canonical).await.unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].name, "child");
     }
 }

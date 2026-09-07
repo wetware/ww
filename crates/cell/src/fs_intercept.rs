@@ -257,17 +257,18 @@ pub(crate) async fn materialize_cid_tree_descriptor(
         ResolvedNode::CidFile { cid, .. } => {
             let cache = cache.ok_or(MaterializeError::Io)?;
             let parsed = cid.parse::<cid::Cid>().map_err(|_| MaterializeError::Io)?;
+            let canonical_cid = parsed.to_string();
             cache.ensure(&parsed).await.map_err(|error| {
-                tracing::warn!(%cid, %error, "CidTree cache ensure failed");
+                tracing::warn!(%canonical_cid, %error, "CidTree cache ensure failed");
                 MaterializeError::Io
             })?;
-            let staging_path = cache.staging_dir().join(&cid);
+            let staging_path = cache.staging_dir().join(&canonical_cid);
             if !staging_path.exists() {
                 cache
                     .fetch_to_path(&parsed, &staging_path)
                     .await
                     .map_err(|error| {
-                        tracing::warn!(%cid, %error, "CidTree stream fetch failed");
+                        tracing::warn!(%canonical_cid, %error, "CidTree stream fetch failed");
                         MaterializeError::Io
                     })?;
             }
@@ -1284,6 +1285,48 @@ mod tests {
         assert!(matches!(result, Err(MaterializeError::Invalid)));
         assert!(!root.path().join("escaped").exists());
         assert_eq!(std::fs::read_dir(staging).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn cid_tree_file_materialization_uses_canonical_cid_path() {
+        let content = b"confined file content";
+        let (cid, pinner) = test_cid_and_pinner(content);
+        let escape_root = tempfile::TempDir::new().unwrap();
+        let escaped_parent = escape_root.path().join("escaped");
+        let escaped_path = escaped_parent.join("ipfs").join(cid.to_string());
+        let hostile_cid = format!("{}/ipfs/{cid}", escaped_parent.display());
+
+        let tree_staging = tempfile::TempDir::new().unwrap();
+        let entries = vec![crate::vfs::DirEntry {
+            name: "hostile-file".to_string(),
+            cid: hostile_cid,
+            entry_type: crate::vfs::EntryType::File,
+            size: content.len() as u64,
+        }];
+        std::fs::write(
+            tree_staging.path().join(format!("{cid}.dirlist.json")),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let tree = CidTree::new(
+            cid.to_string(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
+            tree_staging.path().to_path_buf(),
+        );
+        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        let canonical_path = cache.staging_dir().join(cid.to_string());
+
+        let descriptor =
+            materialize_cid_tree_descriptor(Some(&cache), &tree, "hostile-file", false)
+                .await
+                .unwrap();
+        drop(descriptor);
+
+        assert_eq!(std::fs::read(&canonical_path).unwrap(), content);
+        assert!(
+            !escaped_path.exists(),
+            "a parseable CID string must not escape the cache staging directory"
+        );
     }
 
     // ── Mock pinner for integration tests ──────────────────────────
