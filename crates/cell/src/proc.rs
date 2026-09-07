@@ -202,7 +202,7 @@ pub struct ComponentRunStates {
     /// `Shared` shares a global pinset cache; `Isolated` gets a private one.
     /// The staging directory for IPFS content is owned by the cache mode itself:
     /// host-wide shared dir for `Shared`, per-process dir for `Isolated`.
-    pub cache_mode: Option<cache::CacheMode>,
+    pub cache_mode: Option<Arc<cache::CacheMode>>,
     /// Virtual filesystem tree (lazy CID-based resolution).
     /// When `Some`, the guest filesystem is backed by a CidTree
     /// instead of a preopened host directory.
@@ -592,6 +592,7 @@ impl Proc {
             mode,
             fuel_estimator,
         } = init;
+        let cache_mode = cache_mode.map(Arc::new);
         let (cid_tree, kernel_ready_gate) = match mode {
             ConstructionMode::Ordinary => (None, None),
             ConstructionMode::Kernel {

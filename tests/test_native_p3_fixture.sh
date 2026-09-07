@@ -48,9 +48,11 @@ EOF
 cat >"$BIN_DIR/cargo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-artifact="$CARGO_TARGET_DIR/wasm32-wasip3/release/native_p3_fixture.wasm"
-mkdir -p "$(dirname "$artifact")"
-: >"$artifact"
+if [[ " $* " == *" --target wasm32-wasip3 "* ]]; then
+  artifact="$CARGO_TARGET_DIR/wasm32-wasip3/release/native_p3_fixture.wasm"
+  mkdir -p "$(dirname "$artifact")"
+  : >"$artifact"
+fi
 EOF
 
 cat >"$WASM_TOOLS" <<'EOF'

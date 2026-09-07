@@ -90,7 +90,7 @@ env \
 component_wit="$("$wasm_tools" component wit "$artifact")"
 printf '%s\n' "$component_wit"
 
-if printf '%s\n' "$component_wit" | grep -Eq '@0\.2\.'; then
+if printf '%s\n' "$component_wit" | grep -Eq 'wasi:[^[:space:];]*@0\.2\.'; then
   echo "native P3 fixture contains a WASI 0.2 reference" >&2
   exit 1
 fi
@@ -128,3 +128,11 @@ if [[ -n "$unexpected_imports" ]]; then
 fi
 
 echo "native P3 fixture validated with $extracted_import_count WASI 0.3.x imports"
+
+if printf '%s\n' "$component_wit" | grep -q 'import wasi:sockets'; then
+  echo "native P3 fixture unexpectedly imports WASI sockets" >&2
+  exit 1
+fi
+
+WW_NATIVE_P3_FIXTURE="$artifact" \
+  cargo test -p cell 'p3::tests::p3_' -- --ignored --test-threads=1

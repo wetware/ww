@@ -182,6 +182,67 @@ Host-side `RpcSystem` instances run as local Tokio tasks. `kernel::Generation`
 starts the kernel driver. `ExecutorImpl` starts ordinary-child drivers in
 `src/launcher.rs`.
 
+## Dormant WASI P3 host substrate
+
+`crates/cell/src/p3.rs` defines the host transport that the future atomic P3
+cutover will use. Current production Cells do not dispatch through this code.
+They continue to use the P2 process-local channel and guest scheduling above.
+
+The versioned `wetware:transport/connection@0.2.0` interface grants one ordered
+bidirectional byte connection. The guest supplies the outgoing P3 stream. The
+host returns the incoming P3 stream and a whole-connection completion future.
+The interface exposes no address selection, socket creation, pollable,
+scheduler state, or explicit flush operation. A second `open` call returns the
+fixed `connection already opened` failure.
+
+Each direction uses an independent bounded Tokio duplex stream with a 64 KiB
+capacity. P3 stream backpressure suspends a writer when the corresponding
+duplex buffer is full. The adapter does not add a payload queue. Bytes retain
+their order in each direction.
+
+The host output consumer reports a P3 write as complete only after the
+underlying `AsyncWrite` accepts the corresponding bytes and `poll_flush`
+returns success. The consumer retains the pending P3 operation across a
+pending flush. The guest does not need a transport-specific flush function.
+
+Directional close and connection completion have these meanings:
+
+| Event | Other direction | Connection completion |
+|---|---|---|
+| Guest drops outgoing | Host reads EOF | Waits for incoming direction |
+| Host closes its writer | Guest reads EOF | Waits for outgoing direction |
+| Guest drops incoming | Host writes fail locally | Waits for outgoing direction, then `Ok` |
+| Both directions close normally | Closed | `Ok` |
+| Underlying read, write, or flush fails | Terminates | `failed(string)` |
+
+The error string is diagnostic only. The adapter selects fixed messages. It
+does not include host paths, addresses, implementation type names, secrets, or
+debug output.
+
+The native P3 regression fixture aborts the task that owns
+`Store::run_concurrent` and its Store while a stream read, a capacity-blocked
+stream write, and a monotonic-clock wait are live. Owner abort completes within
+the test bound. Both transport adapters drop, and the host observes EOF. The
+test adds no guest resource-order workaround or host polling timer.
+
+Wasmtime 48 only hard-cancels a concurrent guest task by dropping its Store.
+Dropping the host call future does not cancel that guest task. Concurrent-state
+emptiness therefore cannot be inspected after the supported hard-cancellation
+path because the Store no longer exists. PR-3 must add real `capnp_rpc`
+pending-request cancellation coverage.
+
+The same dormant harness shadows Wasmtime's P3 filesystem `open-at` method.
+Shared ABI-neutral policy code resolves `CidTree` and explicit `/ipfs` paths,
+materializes immutable content lazily, rejects writes, and confines host path
+joins. Standard P3 filesystem methods handle descriptors and the private
+read-write `/tmp` preopen. Store teardown releases descriptors and removes the
+private scratch and isolated-cache directories.
+
+The fixture links only its imported WASI P3 CLI, clock, and filesystem
+interfaces plus the Wetware transport. The linker does not register WASI
+sockets. `scripts/check_native_p3_fixture.sh` validates the component, rejects
+non-0.3.x WASI imports, rejects socket imports, and runs the host regressions.
+
 ## Executor scheduling
 
 `ExecutorPool` in `src/services.rs` runs worker OS threads. Each worker has a

@@ -1,9 +1,9 @@
 //! WASI filesystem interceptor for `/ipfs/` paths and CidTree-backed virtual FS.
 //!
-//! When a `CidTree` is present (virtual mode), ALL filesystem operations resolve
-//! paths lazily through the content-addressed tree. File content is materialized
-//! to a staging directory on demand, then opened as a real `cap-std` file
-//! descriptor so all subsequent reads delegate to wasmtime-wasi's standard impl.
+//! When a `CidTree` is present (virtual mode), `open-at` resolves paths lazily
+//! through the content-addressed tree. File content is materialized to a staging
+//! directory on demand, then opened as a real `cap-std` file descriptor so all
+//! subsequent descriptor operations delegate to wasmtime-wasi's standard impl.
 //!
 //! When no CidTree is present, falls back to the original behavior: intercepts
 //! only explicit `/ipfs/<CID>/…` paths via the pinset cache.
@@ -32,7 +32,7 @@ impl HasData for IpfsFilesystem {
 pub(crate) struct IpfsFilesystemView<'a> {
     pub ctx: &'a mut WasiFilesystemCtx,
     pub table: &'a mut wasmtime::component::ResourceTable,
-    pub cache_mode: &'a Option<cache::CacheMode>,
+    pub cache_mode: &'a Option<Arc<cache::CacheMode>>,
     pub cid_tree: &'a Option<Arc<CidTree>>,
     pub writable_descriptors: &'a mut std::collections::HashSet<u32>,
 }
@@ -61,6 +61,52 @@ fn ipfs_filesystem(state: &mut ComponentRunStates) -> IpfsFilesystemView<'_> {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "used by the dormant P3 linker and its artifact test lane"
+)]
+pub(crate) trait FilesystemHostState: Send + Sized + 'static {
+    fn intercepted_filesystem(&mut self) -> IpfsFilesystemView<'_>;
+    fn wasi_filesystem_getter(
+    ) -> for<'a> fn(&'a mut Self) -> <wasmtime_wasi::filesystem::WasiFilesystem as HasData>::Data<'a>;
+    fn wasi_filesystem_access<'a>(
+        store: wasmtime::StoreContextMut<'a, Self>,
+    ) -> Access<'a, Self, wasmtime_wasi::filesystem::WasiFilesystem>;
+}
+
+fn component_wasi_filesystem(
+    state: &mut ComponentRunStates,
+) -> <WasiFilesystem as HasData>::Data<'_> {
+    state.mark_host_call();
+    WasiFilesystemCtxView {
+        ctx: state.wasi_ctx.filesystem(),
+        table: &mut state.resource_table,
+    }
+}
+
+impl FilesystemHostState for ComponentRunStates {
+    fn intercepted_filesystem(&mut self) -> IpfsFilesystemView<'_> {
+        ipfs_filesystem(self)
+    }
+
+    fn wasi_filesystem_getter() -> for<'a> fn(&'a mut Self) -> <WasiFilesystem as HasData>::Data<'a>
+    {
+        component_wasi_filesystem
+    }
+
+    fn wasi_filesystem_access<'a>(
+        store: wasmtime::StoreContextMut<'a, Self>,
+    ) -> Access<'a, Self, WasiFilesystem> {
+        Access::new(store, |state| component_wasi_filesystem(state))
+    }
+}
+
+fn p3_wasi_access<'a, T: FilesystemHostState>(
+    store: wasmtime::StoreContextMut<'a, T>,
+) -> Access<'a, T, WasiFilesystem> {
+    T::wasi_filesystem_access(store)
+}
+
 // ── CID path parsing ───────────────────────────────────────────────
 
 /// Parsed IPFS path: CID + optional subpath.
@@ -79,8 +125,9 @@ pub(crate) fn parse_ipfs_path(path: &str) -> Option<IpfsCidPath> {
         None => (rest, ""),
     };
 
-    // Reject path traversal: any ".." component could escape the staging directory.
-    if subpath.split('/').any(|seg| seg == "..") {
+    // Reject every absolute or non-normal component before joining this path
+    // to a host staging directory.
+    if !subpath.is_empty() && !is_confined_relative_path(subpath) {
         return None;
     }
 
@@ -91,235 +138,259 @@ pub(crate) fn parse_ipfs_path(path: &str) -> Option<IpfsCidPath> {
     })
 }
 
-// ── CidTree-backed open ───────────────────────────────────────────
+enum OpenRoute {
+    CidTree(Arc<CidTree>, String),
+    Ipfs(IpfsCidPath),
+    Wasi,
+}
+
+fn route_open(cid_tree: Option<&Arc<CidTree>>, path: &str) -> OpenRoute {
+    if let Some(cid_tree) = cid_tree {
+        let rooted_subpath = parse_ipfs_path(path)
+            .filter(|parsed| parsed.cid.to_string() == *cid_tree.root_cid())
+            .map(|parsed| parsed.subpath);
+        let is_other_ipfs = parse_ipfs_path(path)
+            .map(|parsed| parsed.cid.to_string() != *cid_tree.root_cid())
+            .unwrap_or(false);
+        if !is_other_ipfs {
+            return OpenRoute::CidTree(
+                Arc::clone(cid_tree),
+                rooted_subpath.unwrap_or_else(|| path.to_string()),
+            );
+        }
+    }
+
+    match parse_ipfs_path(path) {
+        Some(path) => OpenRoute::Ipfs(path),
+        None => OpenRoute::Wasi,
+    }
+}
+
+fn is_confined_relative_path(path: &str) -> bool {
+    use std::path::Component;
+
+    !std::path::Path::new(path).is_absolute()
+        && std::path::Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn open_read_only_path(
+    path: &std::path::Path,
+) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
+    use wasmtime_wasi::filesystem::{Descriptor, Dir, File};
+    use wasmtime_wasi::{FsPerms, OpenMode};
+
+    let metadata = std::fs::metadata(path).map_err(|_| MaterializeError::Io)?;
+    if metadata.is_dir() {
+        let dir = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
+            .map_err(|_| MaterializeError::Io)?;
+        Ok(Descriptor::Dir(Dir::new(
+            dir.into_std_file(),
+            FsPerms::ReadOnly,
+            OpenMode::READ,
+            false,
+        )))
+    } else {
+        let file = cap_std::fs::Dir::open_ambient_dir(
+            path.parent().unwrap_or(path),
+            cap_std::ambient_authority(),
+        )
+        .map_err(|_| MaterializeError::Io)?
+        .open(path.file_name().unwrap_or_default())
+        .map_err(|_| MaterializeError::Io)?;
+        Ok(Descriptor::File(File::new(
+            file.into_std(),
+            FsPerms::ReadOnly,
+            OpenMode::READ,
+            false,
+        )))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaterializeError {
+    Invalid,
+    Io,
+    NoEntry,
+    NotPermitted,
+}
+
+impl From<MaterializeError> for types::ErrorCode {
+    fn from(error: MaterializeError) -> Self {
+        match error {
+            MaterializeError::Invalid => Self::Invalid,
+            MaterializeError::Io => Self::Io,
+            MaterializeError::NoEntry => Self::NoEntry,
+            MaterializeError::NotPermitted => Self::NotPermitted,
+        }
+    }
+}
+
+impl From<MaterializeError> for p3_types::ErrorCode {
+    fn from(error: MaterializeError) -> Self {
+        match error {
+            MaterializeError::Invalid => Self::Invalid,
+            MaterializeError::Io => Self::Io,
+            MaterializeError::NoEntry => Self::NoEntry,
+            MaterializeError::NotPermitted => Self::NotPermitted,
+        }
+    }
+}
+
+pub(crate) async fn materialize_cid_tree_descriptor(
+    cache: Option<&cache::CacheMode>,
+    cid_tree: &CidTree,
+    path: &str,
+    write_requested: bool,
+) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
+    if write_requested {
+        return Err(MaterializeError::NotPermitted);
+    }
+
+    let resolved = cid_tree.resolve_path(path).await.map_err(|error| {
+        tracing::debug!(path, %error, "CidTree path resolution failed");
+        MaterializeError::NoEntry
+    })?;
+
+    match resolved {
+        ResolvedNode::CidFile { cid, .. } => {
+            let cache = cache.ok_or(MaterializeError::Io)?;
+            let parsed = cid.parse::<cid::Cid>().map_err(|_| MaterializeError::Io)?;
+            cache.ensure(&parsed).await.map_err(|error| {
+                tracing::warn!(%cid, %error, "CidTree cache ensure failed");
+                MaterializeError::Io
+            })?;
+            let staging_path = cache.staging_dir().join(&cid);
+            if !staging_path.exists() {
+                cache
+                    .fetch_to_path(&parsed, &staging_path)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(%cid, %error, "CidTree stream fetch failed");
+                        MaterializeError::Io
+                    })?;
+            }
+            if !staging_path.exists() {
+                return Err(MaterializeError::Io);
+            }
+            open_read_only_path(&staging_path)
+        }
+        ResolvedNode::CidDir { cid } => {
+            let parsed = cid.parse::<cid::Cid>().map_err(|error| {
+                tracing::warn!(%cid, %error, "CidTree directory has an invalid CID");
+                MaterializeError::Invalid
+            })?;
+            let canonical_cid = parsed.to_string();
+            let staging_dir = cid_tree.staging_dir().join(format!("dir-{canonical_cid}"));
+            if !staging_dir.exists() {
+                std::fs::create_dir_all(&staging_dir).map_err(|_| MaterializeError::Io)?;
+                if let Ok(entries) = cid_tree.ls_dir(&canonical_cid).await {
+                    for entry in entries {
+                        if !is_confined_relative_path(&entry.name)
+                            || std::path::Path::new(&entry.name).components().count() != 1
+                        {
+                            tracing::warn!(name = %entry.name, "rejected unconfined CidTree entry");
+                            return Err(MaterializeError::Invalid);
+                        }
+                        let entry_path = staging_dir.join(&entry.name);
+                        match entry.entry_type {
+                            crate::vfs::EntryType::Dir => {
+                                std::fs::create_dir_all(entry_path)
+                                    .map_err(|_| MaterializeError::Io)?;
+                            }
+                            _ => {
+                                let file = std::fs::File::create(entry_path)
+                                    .map_err(|_| MaterializeError::Io)?;
+                                file.set_len(entry.size).map_err(|_| MaterializeError::Io)?;
+                            }
+                        }
+                    }
+                }
+            }
+            open_read_only_path(&staging_dir)
+        }
+    }
+}
+
+pub(crate) async fn materialize_ipfs_descriptor(
+    cache: Option<&cache::CacheMode>,
+    ipfs_path: &IpfsCidPath,
+    write_requested: bool,
+) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
+    if write_requested {
+        return Err(MaterializeError::NotPermitted);
+    }
+    if !ipfs_path.subpath.is_empty() && !is_confined_relative_path(&ipfs_path.subpath) {
+        return Err(MaterializeError::Invalid);
+    }
+
+    let cache = cache.ok_or(MaterializeError::NoEntry)?;
+    cache.ensure(&ipfs_path.cid).await.map_err(|error| {
+        tracing::warn!(cid = %ipfs_path.cid, %error, "IPFS cache ensure failed");
+        MaterializeError::Io
+    })?;
+    let staging_path = cache.staging_dir().join(ipfs_path.cid.to_string());
+    let target_path = if ipfs_path.subpath.is_empty() {
+        staging_path
+    } else {
+        staging_path.join(&ipfs_path.subpath)
+    };
+    if !target_path.exists() {
+        let result = if ipfs_path.subpath.is_empty() {
+            cache.fetch_to_path(&ipfs_path.cid, &target_path).await
+        } else {
+            cache
+                .fetch_path_to_path(&ipfs_path.cid, &ipfs_path.subpath, &target_path)
+                .await
+        };
+        result.map_err(|error| {
+            tracing::warn!(cid = %ipfs_path.cid, subpath = %ipfs_path.subpath, %error, "IPFS stream fetch failed");
+            MaterializeError::Io
+        })?;
+    }
+    if !target_path.exists() {
+        return Err(MaterializeError::NoEntry);
+    }
+    open_read_only_path(&target_path)
+}
 
 impl IpfsFilesystemView<'_> {
-    /// Handle an `open_at` for a path resolved through the CidTree.
-    ///
-    /// Resolves the path to a CID (or local override), fetches the content
-    /// to staging if needed, and opens a real cap-std file descriptor.
     async fn open_via_cid_tree(
         &mut self,
         cid_tree: &CidTree,
         path: &str,
         flags: types::DescriptorFlags,
     ) -> FsResult<Resource<types::Descriptor>> {
-        use wasmtime_wasi::{FsPerms, OpenMode};
-
-        // Reject writes — CidTree is immutable
-        if flags.contains(types::DescriptorFlags::WRITE) {
-            return Err(types::ErrorCode::NotPermitted.into());
-        }
-
-        let resolved = cid_tree.resolve_path(path).await.map_err(|e| {
-            tracing::debug!(path = %path, err = %e, "CidTree path resolution failed");
-            FsError::from(types::ErrorCode::NoEntry)
-        })?;
-
-        match resolved {
-            ResolvedNode::CidFile { cid, .. } => {
-                // Materialize file content to staging via PinsetCache, then open real FD.
-                let cache = self
-                    .cache_mode
-                    .as_ref()
-                    .ok_or_else(|| -> FsError { types::ErrorCode::Io.into() })?;
-
-                let cid_parsed: cid::Cid = cid
-                    .parse()
-                    .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-
-                cache.ensure(&cid_parsed).await.map_err(|e| {
-                    tracing::warn!(cid = %cid, err = %e, "CidTree cache ensure failed");
-                    FsError::from(types::ErrorCode::Io)
-                })?;
-
-                let staging_path = cache.staging_dir().join(&cid);
-                if !staging_path.exists() {
-                    cache
-                        .fetch_to_path(&cid_parsed, &staging_path)
-                        .await
-                        .map_err(|e| {
-                            tracing::warn!(cid = %cid, err = %e, "CidTree stream fetch failed");
-                            FsError::from(types::ErrorCode::Io)
-                        })?;
-
-                    if !staging_path.exists() {
-                        tracing::warn!(cid = %cid, "CidTree stream fetch did not materialize file");
-                        return Err(FsError::from(types::ErrorCode::Io));
-                    }
-                }
-
-                let file = cap_std::fs::Dir::open_ambient_dir(
-                    staging_path.parent().unwrap_or(&staging_path),
-                    cap_std::ambient_authority(),
-                )
-                .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?
-                .open(staging_path.file_name().unwrap_or_default())
-                .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-
-                let wasi_file = wasmtime_wasi::filesystem::File::new(
-                    file.into_std(),
-                    FsPerms::ReadOnly,
-                    OpenMode::READ,
-                    false,
-                );
-                let descriptor = wasmtime_wasi::filesystem::Descriptor::File(wasi_file);
-                self.table
-                    .push(descriptor)
-                    .map_err(|_| -> FsError { types::ErrorCode::Io.into() })
-            }
-            ResolvedNode::CidDir { cid } => {
-                // Create a staging directory populated with stub entries from
-                // CidTree::ls_dir(). Directories are real subdirs. Files are
-                // sparse stubs with correct size (truncate to reported size)
-                // so stat() and readdir() return accurate metadata.
-                // Actual file content is fetched lazily on open_at.
-                let staging_dir = cid_tree.staging_dir().join(format!("dir-{cid}"));
-                if !staging_dir.exists() {
-                    std::fs::create_dir_all(&staging_dir)
-                        .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-
-                    if let Ok(entries) = cid_tree.ls_dir(&cid).await {
-                        for entry in &entries {
-                            let entry_path = staging_dir.join(&entry.name);
-                            match &entry.entry_type {
-                                crate::vfs::EntryType::Dir => {
-                                    let _ = std::fs::create_dir_all(&entry_path);
-                                }
-                                _ => {
-                                    // Create stub file with correct size via truncate.
-                                    // The file is sparse (no disk blocks allocated for
-                                    // zeroes on most filesystems).
-                                    let f = std::fs::File::create(&entry_path)
-                                        .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-                                    f.set_len(entry.size)
-                                        .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let dir =
-                    cap_std::fs::Dir::open_ambient_dir(&staging_dir, cap_std::ambient_authority())
-                        .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-                let wasi_dir = wasmtime_wasi::filesystem::Dir::new(
-                    dir.into_std_file(),
-                    FsPerms::ReadOnly,
-                    OpenMode::READ,
-                    false,
-                );
-                let descriptor = wasmtime_wasi::filesystem::Descriptor::Dir(wasi_dir);
-                self.table
-                    .push(descriptor)
-                    .map_err(|_| -> FsError { types::ErrorCode::Io.into() })
-            }
-        }
+        let descriptor = materialize_cid_tree_descriptor(
+            self.cache_mode.as_deref(),
+            cid_tree,
+            path,
+            flags.contains(types::DescriptorFlags::WRITE),
+        )
+        .await
+        .map_err(|error| FsError::from(types::ErrorCode::from(error)))?;
+        self.table
+            .push(descriptor)
+            .map_err(|_| types::ErrorCode::Io.into())
     }
-}
 
-// ── open_at interception (original IPFS path handler) ─────────────
-
-impl IpfsFilesystemView<'_> {
-    /// Handle an `open_at` for an IPFS path.
-    ///
-    /// Ensures the CID is cached, materializes content to the staging dir,
-    /// and opens it as a real file descriptor.
     async fn open_ipfs(
         &mut self,
         ipfs_path: IpfsCidPath,
-        _oflags: types::OpenFlags,
+        _open_flags: types::OpenFlags,
         flags: types::DescriptorFlags,
     ) -> FsResult<Resource<types::Descriptor>> {
-        use wasmtime_wasi::{FsPerms, OpenMode};
-
-        // Reject writes — /ipfs/ is content-addressed and immutable
-        if flags.contains(types::DescriptorFlags::WRITE) {
-            return Err(types::ErrorCode::NotPermitted.into());
-        }
-
-        let cache = self
-            .cache_mode
-            .as_ref()
-            .ok_or_else(|| -> FsError { types::ErrorCode::NoEntry.into() })?;
-
-        // Ensure CID is pinned in IPFS
-        cache.ensure(&ipfs_path.cid).await.map_err(|e| {
-            tracing::warn!(cid = %ipfs_path.cid, err = %e, "IPFS cache ensure failed");
-            FsError::from(types::ErrorCode::Io)
-        })?;
-
-        // Materialize to staging directory (local filesystem is our cache).
-        // Staging dir is owned by the CacheMode: shared for Shared, per-proc for Isolated.
-        let staging_path = cache.staging_dir().join(ipfs_path.cid.to_string());
-        let target_path = if ipfs_path.subpath.is_empty() {
-            staging_path.clone()
-        } else {
-            staging_path.join(&ipfs_path.subpath)
-        };
-
-        // Skip fetch if already staged (disk cache hit)
-        if !target_path.exists() {
-            let fetch_result = if ipfs_path.subpath.is_empty() {
-                cache.fetch_to_path(&ipfs_path.cid, &target_path).await
-            } else {
-                cache
-                    .fetch_path_to_path(&ipfs_path.cid, &ipfs_path.subpath, &target_path)
-                    .await
-            };
-            fetch_result.map_err(|e| {
-                tracing::warn!(
-                    cid = %ipfs_path.cid,
-                    subpath = %ipfs_path.subpath,
-                    err = %e,
-                    "IPFS stream fetch failed"
-                );
-                FsError::from(types::ErrorCode::Io)
-            })?;
-        }
-
-        if !target_path.exists() {
-            return Err(types::ErrorCode::NoEntry.into());
-        }
-
-        // Open as a real filesystem descriptor
-        let meta = std::fs::metadata(&target_path)
-            .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-
-        let descriptor = if meta.is_dir() {
-            let dir =
-                cap_std::fs::Dir::open_ambient_dir(&target_path, cap_std::ambient_authority())
-                    .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-            let wasi_dir = wasmtime_wasi::filesystem::Dir::new(
-                dir.into_std_file(),
-                FsPerms::ReadOnly,
-                OpenMode::READ,
-                false,
-            );
-            wasmtime_wasi::filesystem::Descriptor::Dir(wasi_dir)
-        } else {
-            let file = cap_std::fs::Dir::open_ambient_dir(
-                target_path.parent().unwrap_or(&target_path),
-                cap_std::ambient_authority(),
-            )
-            .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?
-            .open(target_path.file_name().unwrap_or_default())
-            .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-
-            let wasi_file = wasmtime_wasi::filesystem::File::new(
-                file.into_std(),
-                FsPerms::ReadOnly,
-                OpenMode::READ,
-                false,
-            );
-            wasmtime_wasi::filesystem::Descriptor::File(wasi_file)
-        };
-
-        let fd = self
-            .table
+        let descriptor = materialize_ipfs_descriptor(
+            self.cache_mode.as_deref(),
+            &ipfs_path,
+            flags.contains(types::DescriptorFlags::WRITE),
+        )
+        .await
+        .map_err(|error| FsError::from(types::ErrorCode::from(error)))?;
+        self.table
             .push(descriptor)
-            .map_err(|_| -> FsError { types::ErrorCode::Io.into() })?;
-        Ok(fd)
+            .map_err(|_| types::ErrorCode::Io.into())
     }
 }
 
@@ -468,37 +539,16 @@ impl types::HostDescriptor for IpfsFilesystemView<'_> {
             return Ok(opened);
         }
 
-        // CidTree-rooted paths resolve through the virtual filesystem.
-        // Guests build `$WW_ROOT/…` paths which wasi-libc turns into
-        // relative `ipfs/<root_cid>/…`; route those through CidTree so
-        // directory CIDs work (open_ipfs is file-only and fails loudly
-        // for directories).
-        if let Some(ref cid_tree) = self.cid_tree {
-            let rooted_subpath = parse_ipfs_path(&path)
-                .filter(|p| p.cid.to_string() == *cid_tree.root_cid())
-                .map(|p| p.subpath);
-            let target = rooted_subpath.unwrap_or_else(|| {
-                // Non-ipfs path: resolve directly against the CidTree root.
-                path.clone()
-            });
-            // Only skip CidTree for paths that explicitly reference a
-            // different CID — those are content-addressed leaf fetches
-            // and belong in open_ipfs.
-            let is_other_ipfs = parse_ipfs_path(&path)
-                .map(|p| p.cid.to_string() != *cid_tree.root_cid())
-                .unwrap_or(false);
-            if !is_other_ipfs {
-                let cid_tree = Arc::clone(cid_tree);
+        match route_open(self.cid_tree.as_ref(), &path) {
+            OpenRoute::CidTree(cid_tree, target) => {
                 tracing::debug!(path = %target, "CidTree open_at");
                 return self.open_via_cid_tree(&cid_tree, &target, flags).await;
             }
-        }
-
-        // Intercept explicit /ipfs/<leaf_cid>/… paths (no CidTree active,
-        // or CidTree active but the cid doesn't match root).
-        if let Some(ipfs_path) = parse_ipfs_path(&path) {
-            tracing::debug!(cid = %ipfs_path.cid, subpath = %ipfs_path.subpath, "Intercepting IPFS open_at");
-            return self.open_ipfs(ipfs_path, oflags, flags).await;
+            OpenRoute::Ipfs(ipfs_path) => {
+                tracing::debug!(cid = %ipfs_path.cid, subpath = %ipfs_path.subpath, "Intercepting IPFS open_at");
+                return self.open_ipfs(ipfs_path, oflags, flags).await;
+            }
+            OpenRoute::Wasi => {}
         }
 
         // Delegate to standard filesystem
@@ -672,6 +722,462 @@ pub(crate) fn override_filesystem_linker(linker: &mut Linker<ComponentRunStates>
     Ok(())
 }
 
+// ── WASI P3 adapter ───────────────────────────────────────────────
+
+use wasmtime::component::{Access, Accessor, FutureReader, StreamReader};
+use wasmtime::AsContextMut as _;
+use wasmtime_wasi::filesystem::WasiFilesystem;
+use wasmtime_wasi::p3::bindings::filesystem::{preopens as p3_preopens, types as p3_types};
+use wasmtime_wasi::p3::filesystem::{
+    FilesystemError as P3FilesystemError, FilesystemResult as P3FilesystemResult,
+};
+
+fn p3_wasi_accessor<T: FilesystemHostState>(
+    store: &Accessor<T, IpfsFilesystem>,
+) -> Accessor<T, WasiFilesystem> {
+    store.with_getter::<WasiFilesystem>(T::wasi_filesystem_getter())
+}
+
+impl p3_types::Host for IpfsFilesystemView<'_> {
+    fn convert_error_code(
+        &mut self,
+        error: P3FilesystemError,
+    ) -> wasmtime::Result<p3_types::ErrorCode> {
+        error.downcast()
+    }
+}
+
+impl p3_types::HostDescriptor for IpfsFilesystemView<'_> {
+    fn drop(
+        &mut self,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+    ) -> wasmtime::Result<()> {
+        self.writable_descriptors.remove(&descriptor.rep());
+        p3_types::HostDescriptor::drop(&mut self.as_wasi_view(), descriptor)
+    }
+}
+
+impl p3_preopens::Host for IpfsFilesystemView<'_> {
+    fn get_directories(
+        &mut self,
+    ) -> wasmtime::Result<Vec<(Resource<wasmtime_wasi::filesystem::Descriptor>, String)>> {
+        let directories = p3_preopens::Host::get_directories(&mut self.as_wasi_view())?;
+        for (descriptor, path) in &directories {
+            if path == "/tmp" {
+                self.writable_descriptors.insert(descriptor.rep());
+            }
+        }
+        Ok(directories)
+    }
+}
+
+impl<T: FilesystemHostState> p3_types::HostDescriptorWithStore<T> for IpfsFilesystem {
+    fn read_via_stream(
+        mut store: Access<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        offset: p3_types::Filesize,
+    ) -> wasmtime::Result<(
+        StreamReader<u8>,
+        FutureReader<Result<(), p3_types::ErrorCode>>,
+    )> {
+        let wasi = p3_wasi_access(store.as_context_mut());
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::read_via_stream(
+            wasi, descriptor, offset,
+        )
+    }
+
+    fn write_via_stream(
+        mut store: Access<'_, T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        data: StreamReader<u8>,
+        offset: p3_types::Filesize,
+    ) -> wasmtime::Result<FutureReader<Result<(), p3_types::ErrorCode>>> {
+        let wasi = p3_wasi_access(store.as_context_mut());
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::write_via_stream(
+            wasi, descriptor, data, offset,
+        )
+    }
+
+    fn append_via_stream(
+        mut store: Access<'_, T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        data: StreamReader<u8>,
+    ) -> wasmtime::Result<FutureReader<Result<(), p3_types::ErrorCode>>> {
+        let wasi = p3_wasi_access(store.as_context_mut());
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::append_via_stream(
+            wasi, descriptor, data,
+        )
+    }
+
+    async fn advise(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        offset: p3_types::Filesize,
+        length: p3_types::Filesize,
+        advice: p3_types::Advice,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::advise(
+            &p3_wasi_accessor(store),
+            descriptor,
+            offset,
+            length,
+            advice,
+        )
+        .await
+    }
+
+    async fn sync_data(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::sync_data(
+            &p3_wasi_accessor(store),
+            descriptor,
+        )
+        .await
+    }
+
+    async fn get_flags(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+    ) -> P3FilesystemResult<p3_types::DescriptorFlags> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::get_flags(
+            &p3_wasi_accessor(store),
+            descriptor,
+        )
+        .await
+    }
+
+    async fn get_type(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+    ) -> P3FilesystemResult<p3_types::DescriptorType> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::get_type(
+            &p3_wasi_accessor(store),
+            descriptor,
+        )
+        .await
+    }
+
+    async fn set_size(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        size: p3_types::Filesize,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::set_size(
+            &p3_wasi_accessor(store),
+            descriptor,
+            size,
+        )
+        .await
+    }
+
+    async fn set_times(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        data_access_timestamp: p3_types::NewTimestamp,
+        data_modification_timestamp: p3_types::NewTimestamp,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::set_times(
+            &p3_wasi_accessor(store),
+            descriptor,
+            data_access_timestamp,
+            data_modification_timestamp,
+        )
+        .await
+    }
+
+    fn read_directory(
+        mut store: Access<'_, T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+    ) -> wasmtime::Result<(
+        StreamReader<p3_types::DirectoryEntry>,
+        FutureReader<Result<(), p3_types::ErrorCode>>,
+    )> {
+        let wasi = p3_wasi_access(store.as_context_mut());
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::read_directory(wasi, descriptor)
+    }
+
+    async fn sync(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::sync(
+            &p3_wasi_accessor(store),
+            descriptor,
+        )
+        .await
+    }
+
+    async fn create_directory_at(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        path: String,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::create_directory_at(
+            &p3_wasi_accessor(store),
+            descriptor,
+            path,
+        )
+        .await
+    }
+
+    async fn stat(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+    ) -> P3FilesystemResult<p3_types::DescriptorStat> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::stat(
+            &p3_wasi_accessor(store),
+            descriptor,
+        )
+        .await
+    }
+
+    async fn stat_at(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        path_flags: p3_types::PathFlags,
+        path: String,
+    ) -> P3FilesystemResult<p3_types::DescriptorStat> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::stat_at(
+            &p3_wasi_accessor(store),
+            descriptor,
+            path_flags,
+            path,
+        )
+        .await
+    }
+
+    async fn set_times_at(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        path_flags: p3_types::PathFlags,
+        path: String,
+        data_access_timestamp: p3_types::NewTimestamp,
+        data_modification_timestamp: p3_types::NewTimestamp,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::set_times_at(
+            &p3_wasi_accessor(store),
+            descriptor,
+            path_flags,
+            path,
+            data_access_timestamp,
+            data_modification_timestamp,
+        )
+        .await
+    }
+
+    async fn link_at(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        old_path_flags: p3_types::PathFlags,
+        old_path: String,
+        new_descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        new_path: String,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::link_at(
+            &p3_wasi_accessor(store),
+            descriptor,
+            old_path_flags,
+            old_path,
+            new_descriptor,
+            new_path,
+        )
+        .await
+    }
+
+    async fn open_at(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        path_flags: p3_types::PathFlags,
+        path: String,
+        open_flags: p3_types::OpenFlags,
+        flags: p3_types::DescriptorFlags,
+    ) -> P3FilesystemResult<Resource<wasmtime_wasi::filesystem::Descriptor>> {
+        let writable = store.with(|mut access| {
+            access
+                .get()
+                .writable_descriptors
+                .contains(&descriptor.rep())
+        });
+        if writable {
+            let opened = <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::open_at(
+                &p3_wasi_accessor(store),
+                descriptor,
+                path_flags,
+                path,
+                open_flags,
+                flags,
+            )
+            .await?;
+            store.with(|mut access| {
+                access.get().writable_descriptors.insert(opened.rep());
+            });
+            return Ok(opened);
+        }
+
+        let (cache, route) = store.with(|mut access| {
+            let view = access.get();
+            (
+                view.cache_mode.clone(),
+                route_open(view.cid_tree.as_ref(), &path),
+            )
+        });
+        let write_requested = flags.contains(p3_types::DescriptorFlags::WRITE);
+        let descriptor = match route {
+            OpenRoute::CidTree(cid_tree, target) => {
+                materialize_cid_tree_descriptor(
+                    cache.as_deref(),
+                    &cid_tree,
+                    &target,
+                    write_requested,
+                )
+                .await
+            }
+            OpenRoute::Ipfs(ipfs_path) => {
+                materialize_ipfs_descriptor(cache.as_deref(), &ipfs_path, write_requested).await
+            }
+            OpenRoute::Wasi => {
+                return <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::open_at(
+                    &p3_wasi_accessor(store),
+                    descriptor,
+                    path_flags,
+                    path,
+                    open_flags,
+                    flags,
+                )
+                .await;
+            }
+        }
+        .map_err(|error| P3FilesystemError::from(p3_types::ErrorCode::from(error)))?;
+
+        store
+            .with(|mut access| access.get().table.push(descriptor))
+            .map_err(P3FilesystemError::from)
+    }
+
+    async fn readlink_at(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        path: String,
+    ) -> P3FilesystemResult<String> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::readlink_at(
+            &p3_wasi_accessor(store),
+            descriptor,
+            path,
+        )
+        .await
+    }
+
+    async fn remove_directory_at(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        path: String,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::remove_directory_at(
+            &p3_wasi_accessor(store),
+            descriptor,
+            path,
+        )
+        .await
+    }
+
+    async fn rename_at(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        old_path: String,
+        new_descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        new_path: String,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::rename_at(
+            &p3_wasi_accessor(store),
+            descriptor,
+            old_path,
+            new_descriptor,
+            new_path,
+        )
+        .await
+    }
+
+    async fn symlink_at(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        old_path: String,
+        new_path: String,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::symlink_at(
+            &p3_wasi_accessor(store),
+            descriptor,
+            old_path,
+            new_path,
+        )
+        .await
+    }
+
+    async fn unlink_file_at(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        path: String,
+    ) -> P3FilesystemResult<()> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::unlink_file_at(
+            &p3_wasi_accessor(store),
+            descriptor,
+            path,
+        )
+        .await
+    }
+
+    async fn is_same_object(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        other: Resource<wasmtime_wasi::filesystem::Descriptor>,
+    ) -> wasmtime::Result<bool> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::is_same_object(
+            &p3_wasi_accessor(store),
+            descriptor,
+            other,
+        )
+        .await
+    }
+
+    async fn metadata_hash(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+    ) -> P3FilesystemResult<p3_types::MetadataHashValue> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::metadata_hash(
+            &p3_wasi_accessor(store),
+            descriptor,
+        )
+        .await
+    }
+
+    async fn metadata_hash_at(
+        store: &Accessor<T, Self>,
+        descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
+        path_flags: p3_types::PathFlags,
+        path: String,
+    ) -> P3FilesystemResult<p3_types::MetadataHashValue> {
+        <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::metadata_hash_at(
+            &p3_wasi_accessor(store),
+            descriptor,
+            path_flags,
+            path,
+        )
+        .await
+    }
+}
+
+#[allow(dead_code, reason = "used by the dormant P3 artifact test lane")]
+pub(crate) fn override_p3_filesystem_linker<T: FilesystemHostState>(
+    linker: &mut Linker<T>,
+) -> Result<()> {
+    linker.allow_shadowing(true);
+    p3_types::add_to_linker::<T, IpfsFilesystem>(linker, T::intercepted_filesystem)?;
+    p3_preopens::add_to_linker::<T, IpfsFilesystem>(linker, T::intercepted_filesystem)?;
+    linker.allow_shadowing(false);
+    Ok(())
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -723,6 +1229,61 @@ mod tests {
         // Valid subpaths still work
         assert!(parse_ipfs_path(&format!("ipfs/{cid_str}/sub/file.txt")).is_some());
         assert!(parse_ipfs_path(&format!("ipfs/{cid_str}/file..name")).is_some());
+    }
+
+    #[tokio::test]
+    async fn cid_tree_rejects_unconfined_directory_entry_names() {
+        let cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+        let staging = tempfile::TempDir::new().unwrap();
+        let entries = vec![crate::vfs::DirEntry {
+            name: "../escaped".to_string(),
+            cid: cid.to_string(),
+            entry_type: crate::vfs::EntryType::File,
+            size: 1,
+        }];
+        std::fs::write(
+            staging.path().join(format!("{cid}.dirlist.json")),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let tree = CidTree::new(
+            cid.to_string(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
+            staging.path().to_path_buf(),
+        );
+
+        let result = materialize_cid_tree_descriptor(None, &tree, "", false).await;
+        assert!(matches!(result, Err(MaterializeError::Invalid)));
+        assert!(!staging.path().join("escaped").exists());
+    }
+
+    #[tokio::test]
+    async fn cid_tree_rejects_unconfined_directory_cid() {
+        let root_cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+        let root = tempfile::TempDir::new().unwrap();
+        let staging = root.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        let entries = vec![crate::vfs::DirEntry {
+            name: "hostile".to_string(),
+            cid: "segment/../../escaped".to_string(),
+            entry_type: crate::vfs::EntryType::Dir,
+            size: 0,
+        }];
+        std::fs::write(
+            staging.join(format!("{root_cid}.dirlist.json")),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let tree = CidTree::new(
+            root_cid.to_string(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
+            staging.clone(),
+        );
+
+        let result = materialize_cid_tree_descriptor(None, &tree, "hostile", false).await;
+        assert!(matches!(result, Err(MaterializeError::Invalid)));
+        assert!(!root.path().join("escaped").exists());
+        assert_eq!(std::fs::read_dir(staging).unwrap().count(), 1);
     }
 
     // ── Mock pinner for integration tests ──────────────────────────
@@ -798,7 +1359,7 @@ mod tests {
     struct TestHarness {
         wasi_ctx: wasmtime_wasi::WasiCtx,
         resource_table: wasmtime::component::ResourceTable,
-        cache_mode: Option<cache::CacheMode>,
+        cache_mode: Option<Arc<cache::CacheMode>>,
         cid_tree: Option<Arc<CidTree>>,
         writable_descriptors: std::collections::HashSet<u32>,
     }
@@ -808,7 +1369,7 @@ mod tests {
             Self {
                 wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
                 resource_table: wasmtime::component::ResourceTable::new(),
-                cache_mode,
+                cache_mode: cache_mode.map(Arc::new),
                 cid_tree: None,
                 writable_descriptors: std::collections::HashSet::new(),
             }

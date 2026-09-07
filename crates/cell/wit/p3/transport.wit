@@ -1,0 +1,18 @@
+package wetware:transport@0.2.0;
+
+/// One authority-granted ordered bidirectional byte connection.
+interface connection {
+    /// An abnormal transport failure.  The string is diagnostic only.
+    variant transport-error {
+        failed(string),
+    }
+
+    /// Attach the guest's outgoing stream and receive the host's incoming
+    /// stream plus whole-connection completion.
+    ///
+    /// The host grants exactly one successful call per component instance.
+    /// Stream EOF or dropping either stream represents orderly directional
+    /// closure.  The completion future resolves to `ok` after both directions
+    /// close orderly, or `err` after an abnormal failure or misuse.
+    open: func(outgoing: stream<u8>) -> tuple<stream<u8>, future<result<_, transport-error>>>;
+}
