@@ -8,14 +8,16 @@ capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 futures   = { workspace = true }
 log       = { workspace = true }
-wasip2    = { workspace = true }
+wit-bindgen = { workspace = true }
 hex       = { workspace = true }
-rand      = { workspace = true }
 routing-key = { workspace = true }
 system    = { path = "../../std/system" }
 
 [lib]
 crate-type = ["cdylib"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rand = { workspace = true }
 
 [dev-dependencies]
 tokio      = { workspace = true, features = ["rt", "macros", "io-util"] }

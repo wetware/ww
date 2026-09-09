@@ -19,8 +19,32 @@ Compile a guest project to WASM.
 ww build [PATH]
 ```
 
-Targets `wasm32-wasip2` and places the artifact at `boot/main.wasm`
-inside the project. Defaults to the current directory.
+Targets native `wasm32-wasip3`, validates the component and its imports, then
+places the artifact at `bin/<project>.wasm`. Defaults to the current directory.
+
+`ww build` rejects WASI 0.2 and socket imports. The command uses the pinned P3
+toolchain described below.
+
+### Native WASI P3 toolchain
+
+Install Rust nightly `nightly-2026-08-30` with `rust-src`:
+
+```sh
+rustup toolchain install nightly-2026-08-30 \
+  --profile minimal \
+  --component rust-src
+```
+
+Download and extract WASI SDK 34.0. Download `wasm-tools` 1.258.0. Then set:
+
+```sh
+export WASI_SDK_PATH=/path/to/wasi-sdk-34.0-<arch>-<os>
+export WASM_TOOLS=/path/to/wasm-tools
+```
+
+`WASM_TOOLS` is optional when the pinned executable is on `PATH`. Do not run
+`rustup target add wasm32-wasip3`. The build compiles the Tier 3 standard
+library from `rust-src`.
 
 ## ww run
 
@@ -176,9 +200,10 @@ Check the development environment for required and optional tools.
 ww doctor
 ```
 
-Verifies: Rust toolchain, `wasm32-wasip2` target, Cargo. Optionally
-checks for Kubo (IPFS) and Ollama (LLM). Exit 0 if all required
-checks pass.
+Verifies Cargo and the pinned native WASI P3 toolchain. The toolchain check
+includes Rust nightly, `rust-src`, WASI SDK, `wasm-component-ld`, LLD, and
+`wasm-tools`. The command also checks optional Kubo and Ollama installations.
+Exit 0 if all required checks pass.
 
 ## ww perform
 

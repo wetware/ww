@@ -1,6 +1,6 @@
 package wetware:transport@0.2.0;
 
-/// Test-only exports for the dormant P3 host substrate.
+/// Test-only exports for the production P3 host-adapter fixture.
 interface fixture {
     record filesystem-observation {
         image: list<u8>,

@@ -7,9 +7,7 @@ edition = "2021"
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 futures = { workspace = true }
-log = { workspace = true }
-wasip2 = { workspace = true }
-wit-bindgen = "0.41.0"
+wit-bindgen = { workspace = true }
 
 [build-dependencies]
 capnpc = { workspace = true }

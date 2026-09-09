@@ -21,6 +21,37 @@
 
 use std::io::Read;
 
+#[doc(hidden)]
+pub mod bindings {
+    wit_bindgen::generate!({
+        path: "../../std/system/wit",
+        world: "sync-command",
+        generate_all,
+        export_macro_name: "__export_wagi_guest",
+        pub_export_macro: true,
+    });
+}
+
+pub use bindings::__export_wagi_guest;
+
+/// Synchronous WAGI entry point.
+pub trait Guest {
+    fn run() -> Result<(), ()>;
+}
+
+/// Export a synchronous handler through the selective P3 CLI entry point.
+#[macro_export]
+macro_rules! export {
+    ($ty:ident) => {
+        impl $crate::bindings::exports::wasi::cli::run::Guest for $ty {
+            async fn run() -> Result<(), ()> {
+                <$ty as $crate::Guest>::run()
+            }
+        }
+        $crate::__export_wagi_guest!($ty with_types_in $crate::bindings);
+    };
+}
+
 /// The HTTP method (GET, POST, etc.) from `REQUEST_METHOD`.
 pub fn method() -> String {
     std::env::var("REQUEST_METHOD").unwrap_or_default()
@@ -98,6 +129,48 @@ pub fn respond_bytes(status: u16, headers: &[(&str, &str)], body: &[u8]) {
     let _ = write!(out, "\r\n");
     let _ = out.write_all(body);
     let _ = out.flush();
+}
+
+/// Write a CGI response and await P3 stdout completion.
+///
+/// WASIp3's raw file-descriptor flush is a no-op. Finite async cells must use
+/// `write-via-stream` so their final buffered bytes reach the host before the
+/// exported root future completes.
+pub async fn respond_bytes_async(
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<(), String> {
+    use std::io::Write;
+    use wit_bindgen::StreamResult;
+
+    let mut response = Vec::new();
+    write!(response, "Status: {status} {}\r\n", reason_phrase(status))
+        .map_err(|error| error.to_string())?;
+    for (key, value) in headers {
+        write!(response, "{key}: {value}\r\n").map_err(|error| error.to_string())?;
+    }
+    response.extend_from_slice(b"\r\n");
+    response.extend_from_slice(body);
+
+    let (mut writer, outgoing) = bindings::wit_stream::new();
+    let completion = bindings::wasi::cli::stdout::write_via_stream(outgoing);
+    while !response.is_empty() {
+        let (status, remaining) = writer.write(response).await;
+        response = remaining.into_vec();
+        match status {
+            StreamResult::Complete(count) if count > 0 => {}
+            StreamResult::Complete(_) => {
+                return Err("P3 stdout accepted no response bytes".to_string());
+            }
+            StreamResult::Dropped => return Err("P3 stdout was dropped".to_string()),
+            StreamResult::Cancelled => return Err("P3 stdout write was cancelled".to_string()),
+        }
+    }
+    drop(writer);
+    completion
+        .await
+        .map_err(|error| format!("P3 stdout failed: {error:?}"))
 }
 
 fn reason_phrase(status: u16) -> &'static str {

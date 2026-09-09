@@ -13,6 +13,7 @@
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
+use cell::proc::FuelObserver;
 use tokio::sync::watch;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
@@ -22,9 +23,17 @@ use ww::services::{ExecutorPool, SpawnRequest};
 
 const DISCOVERY_WASM_PATH: &str = "examples/discovery/bin/discovery.wasm";
 
-/// Skip the test if the WASM binary hasn't been built.
-fn load_discovery_wasm() -> Option<Vec<u8>> {
-    std::fs::read(DISCOVERY_WASM_PATH).ok()
+fn load_discovery_wasm() -> Vec<u8> {
+    let bytes = std::fs::read(DISCOVERY_WASM_PATH).unwrap_or_else(|error| {
+        panic!(
+            "required WASM artifact {DISCOVERY_WASM_PATH} is missing: {error}; run `make discovery` before `cargo test`"
+        )
+    });
+    assert!(
+        !bytes.is_empty(),
+        "required WASM artifact {DISCOVERY_WASM_PATH} is empty"
+    );
+    bytes
 }
 
 /// Spawn a discovery cell on the executor pool and return a Greeter client.
@@ -34,8 +43,11 @@ fn load_discovery_wasm() -> Option<Vec<u8>> {
 async fn spawn_greeter_on_pool(
     pool: &ExecutorPool,
     wasm: Vec<u8>,
-) -> greeter_capnp::greeter::Client {
+) -> (greeter_capnp::greeter::Client, FuelObserver) {
     let (test_end, cell_end) = tokio::io::duplex(64 * 1024);
+    let engine = pool.engine();
+    let fuel_observer = FuelObserver::default();
+    let worker_fuel_observer = fuel_observer.clone();
 
     pool.spawn(SpawnRequest {
         name: "discovery-test".into(),
@@ -52,12 +64,13 @@ async fn spawn_greeter_on_pool(
                     issued_seq: 1,
                     receiver: epoch_rx.clone(),
                 };
-                let runtime = ww::launcher::create_runtime_client(
+                let runtime = ww::launcher::create_runtime_client_with_fuel_observer(
                     false,
                     guard,
-                    None,
+                    Some(engine),
                     None,
                     CachePolicy::Shared,
+                    worker_fuel_observer,
                 );
 
                 // Load WASM via runtime to get an Executor.
@@ -132,25 +145,114 @@ async fn spawn_greeter_on_pool(
     // Yield to let the RPC task start.
     tokio::task::yield_now().await;
 
-    greeter
+    (greeter, fuel_observer)
 }
 
 #[tokio::test]
-async fn test_discovery_cell_greet() {
-    let wasm = match load_discovery_wasm() {
-        Some(w) => w,
-        None => {
-            eprintln!("SKIP: discovery WASM not built (run `make discovery`)");
-            return;
-        }
-    };
+async fn spaced_requests_on_the_ticked_engine_retain_fuel_for_a_large_response() {
+    let wasm = load_discovery_wasm();
 
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (_shutdown_tx, shutdown_rx) = watch::channel(());
             let pool = ExecutorPool::new(1, shutdown_rx);
-            let greeter = spawn_greeter_on_pool(&pool, wasm).await;
+            let (greeter, fuel_observer) = spawn_greeter_on_pool(&pool, wasm).await;
+
+            for request_number in 0..60 {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                let name = format!("spaced-request-{request_number}");
+                let mut request = greeter.greet_request();
+                request.get().set_name(&name);
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    request.send().promise,
+                )
+                .await
+                .unwrap_or_else(|_| panic!("spaced greet {request_number} timed out"))
+                .unwrap_or_else(|error| panic!("spaced greet {request_number} failed: {error}"));
+                let greeting = response
+                    .get()
+                    .expect("spaced greet results")
+                    .get_greeting()
+                    .expect("spaced greeting text")
+                    .to_str()
+                    .expect("spaced greeting UTF-8");
+                assert!(
+                    greeting.contains(&name),
+                    "spaced greet {request_number} returned an unexpected response"
+                );
+            }
+
+            let fuel_trajectory = fuel_observer.observations();
+            assert!(
+                fuel_trajectory.len() >= 30,
+                "spaced traffic observed too few production epoch callbacks: {fuel_trajectory:?}"
+            );
+            assert!(
+                fuel_trajectory
+                    .iter()
+                    .any(|sample| sample.measured_consumption > 0),
+                "production epoch callbacks did not measure guest work: {fuel_trajectory:?}"
+            );
+            let steady_start = fuel_trajectory.len().saturating_sub(20);
+            let steady = &fuel_trajectory[steady_start..];
+            assert!(
+                steady.iter().any(|sample| {
+                    sample.host_calls_this_epoch == 0
+                        && sample.measured_consumption > 0
+                        && sample.budget >= 9_000_000
+                }),
+                "steady traffic did not exercise a consuming unmarked epoch with a retained high budget: {steady:?}"
+            );
+            assert!(
+                steady.iter().all(|sample| sample.budget >= 9_000_000),
+                "I/O-bound production fuel trajectory decayed: {steady:?}"
+            );
+            assert!(
+                steady.last().is_some_and(|sample| sample.avg_ratio < 100),
+                "I/O-bound production fuel ratio stayed high: {steady:?}"
+            );
+
+            let name = "x".repeat(256 * 1024);
+            let mut request = greeter.greet_request();
+            request.get().set_name(&name);
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(60), request.send().promise)
+                    .await
+                    .expect("large greet after spaced traffic timed out")
+                    .expect("large greet after spaced traffic failed");
+            let greeting = response
+                .get()
+                .expect("large greet results")
+                .get_greeting()
+                .expect("large greeting text");
+
+            assert!(
+                greeting.len() > 64 * 1024,
+                "response did not exceed the bounded P3 transport capacity"
+            );
+            assert!(
+                greeting
+                    .to_str()
+                    .expect("large greeting UTF-8")
+                    .contains(&name),
+                "large greeting did not preserve the request payload"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_discovery_cell_greet() {
+    let wasm = load_discovery_wasm();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_shutdown_tx, shutdown_rx) = watch::channel(());
+            let pool = ExecutorPool::new(1, shutdown_rx);
+            let (greeter, _fuel_observer) = spawn_greeter_on_pool(&pool, wasm).await;
 
             // Call greet() and verify the response.
             // Generous timeout: debug-mode wasmtime compilation of the
@@ -189,34 +291,35 @@ async fn test_discovery_cell_greet() {
 }
 
 #[tokio::test]
-async fn test_discovery_cell_greet_multiple() {
-    let wasm = match load_discovery_wasm() {
-        Some(w) => w,
-        None => {
-            eprintln!("SKIP: discovery WASM not built (run `make discovery`)");
-            return;
-        }
-    };
+async fn concurrent_rpc_calls_complete_while_application_clock_is_pending() {
+    let wasm = load_discovery_wasm();
 
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (_shutdown_tx, shutdown_rx) = watch::channel(());
             let pool = ExecutorPool::new(1, shutdown_rx);
-            let greeter = spawn_greeter_on_pool(&pool, wasm).await;
+            let (greeter, _fuel_observer) = spawn_greeter_on_pool(&pool, wasm).await;
 
-            // Multiple calls on the same cell should all succeed.
-            // First call covers wasmtime compilation (can take 5–10s in debug
-            // builds, longer under cargo's parallel test load); subsequent
-            // calls should be fast but share the same budget.
-            for name in &["Alice", "Bob", "Charlie"] {
-                let mut req = greeter.greet_request();
-                req.get().set_name(name);
-                let resp =
-                    tokio::time::timeout(std::time::Duration::from_secs(60), req.send().promise)
-                        .await
-                        .expect("greet timed out")
-                        .expect("greet RPC failed");
+            // The discovery guest's application branch is suspended on a P3
+            // monotonic-clock Future. These requests enter one live guest
+            // RpcSystem before that independent clock completes.
+            let requests = ["Alice", "Bob", "Charlie"].map(|name| {
+                let mut request = greeter.greet_request();
+                request.get().set_name(name);
+                async move {
+                    let response = tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        request.send().promise,
+                    )
+                    .await
+                    .expect("concurrent greet timed out")
+                    .expect("concurrent greet RPC failed");
+                    (name, response)
+                }
+            });
+
+            for (name, resp) in futures::future::join_all(requests).await {
                 let greeting = resp
                     .get()
                     .unwrap()
@@ -227,9 +330,49 @@ async fn test_discovery_cell_greet_multiple() {
 
                 assert!(
                     greeting.contains(&format!("Hello, {name}!")),
-                    "unexpected greeting for {name}: {greeting}"
+                    "unexpected concurrent greeting for {name}: {greeting}"
                 );
             }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn response_larger_than_p3_transport_capacity_completes() {
+    let wasm = load_discovery_wasm();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_shutdown_tx, shutdown_rx) = watch::channel(());
+            let pool = ExecutorPool::new(1, shutdown_rx);
+            let (greeter, _fuel_observer) = spawn_greeter_on_pool(&pool, wasm).await;
+            let name = "x".repeat(256 * 1024);
+
+            let mut request = greeter.greet_request();
+            request.get().set_name(&name);
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(60), request.send().promise)
+                    .await
+                    .expect("large greet response timed out")
+                    .expect("large greet RPC failed");
+            let greeting = response
+                .get()
+                .expect("large greet results")
+                .get_greeting()
+                .expect("large greeting text");
+
+            assert!(
+                greeting.len() > 64 * 1024,
+                "response did not exceed the bounded P3 transport capacity"
+            );
+            assert!(
+                greeting
+                    .to_str()
+                    .expect("large greeting UTF-8")
+                    .contains(&name),
+                "large greeting did not preserve the request payload"
+            );
         })
         .await;
 }

@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 routing-key = { path = "../../../crates/guest/routing-key" }
-wit-bindgen = "0.41.0"
+wit-bindgen = "=0.61.1"
 
 [lib]
 crate-type = ["cdylib"]

@@ -1,6 +1,6 @@
 package wetware:transport@0.2.0;
 
-/// Production linker world for the dormant transport host adapter.
+/// Production linker world for the authority-granted P3 transport adapter.
 world transport-host {
     import connection;
 }

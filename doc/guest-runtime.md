@@ -1,122 +1,138 @@
 # Guest Runtime
 
-This document specifies the async runtime that drives WASM guest cells and
-PID0. It complements
-[rpc-transport.md](rpc-transport.md) (transport plumbing) and
-[architecture.md](architecture.md) (capability flow). See the
-[WASM guest API reference](api/wasm-guest.md) for the interface tables.
+Wetware runs production Cells as native `wasm32-wasip3` components. Wasmtime
+owns Component Model suspension and resumption. Wetware does not implement a
+guest scheduler.
 
 Primary code references:
-- `std/system/src/lib.rs` — poll loop, WASI stream adapters
-- `std/kernel/src/lib.rs` — active PID0 composition and readiness commit
 
-PID0 additionally imports the versioned private
-`wetware:kernel-runtime/readiness@1.0.0` interface. The native runtime installs
-this interface only on the trusted PID0 linker; ordinary cell linkers omit it.
-Its argument-free `kernel-ready` function (`kernel_ready()` in generated Rust)
-commits the generation recorded by PID0's process-local graft after composition
-completes. Because a WIT host function is not a Cap'n Proto capability value,
-it cannot appear in a graft, be delegated to a child, or cross a network
-connection.
+- `crates/cell/src/engine.rs` configures the production Component Model engine.
+- `crates/cell/src/proc.rs` owns one `Store` and one component instance per Cell.
+- `crates/cell/src/p3.rs` implements the granted P3 transport.
+- `std/system/src/lib.rs` constructs and composes a guest Cap'n Proto session.
+- `std/kernel/src/lib.rs` defines the PID0 application Future.
 
-## Design principles
+See [rpc-transport.md](rpc-transport.md) for transport behavior and
+[api/wasm-guest.md](api/wasm-guest.md) for host interfaces.
 
-1. **Single-threaded, hand-rolled, no external async runtime.**
-   The guest runs as single-threaded WASM (wasm32-wasip2).  There is no
-   tokio, async-std, or executor crate.  The runtime is a hand-written
-   poll loop using `std::task::{Context, Poll, Waker}` and WASI poll.
-   This gives maximal control over scheduling and keeps the binary small.
+## Production execution model
 
-2. **One poll loop drives RPC and guest work.**
-   `poll_loop()` is the single event loop that drives both the capnp-rpc
-   state machine and user futures.  Every guest entry point
-   (`system::run`, `system::serve`, `system::serve_stdio`) delegates to
-   it.  There is exactly one implementation of the poll/flush/block
-   cycle — no duplicated loops.
+Each Cell has one Wasmtime `Store`. `Proc` invokes the generated async
+`wasi:cli/run` export through `Store::run_concurrent`. Component Model async
+tasks can suspend on P3 imports while the host continues to drive the Store.
 
-3. **Guest work and RPC share one cooperative loop.**
-   `system::run` polls the guest's async entry future and the Cap'n Proto RPC
-   system in the same loop. `system::run_with` can add guest pollables such as
-   stdin.
+The host retains the existing executor topology. Each executor OS thread owns
+a current-thread Tokio runtime and a `LocalSet`. Multiple Cell owners can run
+on one executor thread, but each Cell keeps an independent Store, fuel state,
+filesystem state, and transport grant.
 
-## The poll loop
+Wasmtime fuel yields and host epoch ticks control Cell-level execution. This
+policy can stop a compute-bound Cell. The policy does not provide fairness
+between child Futures inside one guest.
 
-`poll_loop` in `std/system/src/lib.rs` is the guest's event loop:
+## Async Rust guest model
 
-```
-fn poll_loop<T>(
-    rpc_system, pollables, extras,
-    poll_work: impl FnMut(&mut Context) -> Poll<T>,
-) -> Result<T, PollLoopExit>
+An async Rust guest exports one generated P3 entry task. The task creates one
+ordinary Rust session Future with three inputs:
+
+```text
+generated wasi:cli/run task
+  `-- session Future
+        |-- P3 transport completion
+        `-- first of
+              |-- capnp_rpc::RpcSystem
+              `-- application Future tree
 ```
 
-Returns the guest result when `poll_work` completes. Returns `PollLoopExit` if
-RPC closes or fails first.
+`std/system` supplies P3 `AsyncRead` and `AsyncWrite` adapters. The crate also
+opens the one-shot transport, constructs `VatNetwork` and `RpcSystem`, obtains
+the host bootstrap, and composes all three session inputs.
 
-Each iteration:
+`RpcSystem` owns request-level Cap'n Proto concurrency. A server method can
+return a request-owned Future through `Promise::from_future`. Wetware does not
+provide detached local task spawning.
 
-```
-1. Reset WRITE_OCCURRED flag
-2. Poll RPC system        (deliver inbound messages)
-3. Poll user work          (run the guest's async entry future)
-4. Poll RPC system again   (flush outbound messages queued by step 3)
-5. Block on WASI poll      (reader + writer, or reader + idle timeout)
-```
+The guest runtime contains no Tokio, custom executor, event loop, parker,
+`PollSet`, readiness registry, fixed liveness timer, task queue, generic spawn,
+or async channel runtime. The `wit-bindgen` `async-spawn` and
+`inter-task-wakeup` features remain disabled.
 
-The **double-poll** (steps 2 + 4) is critical: user work in step 3 may
-queue outbound RPC calls.  Without step 4, those calls are never flushed
-before `wasi_poll` blocks, causing deadlock.  See
-[rpc-transport.md](rpc-transport.md) for deadlock analysis.
+## Root Future completion
 
-### Waker strategy
+The session first selects between `RpcSystem` and the application Future. The
+P3 transport completion participates in the outer session result.
 
-The loop uses `Waker::noop()` from the standard library. The loop polls work on
-every iteration. WASI pollables and the idle timeout provide wakeups.
+- If the application finishes first, `std/system` drops `RpcSystem`. An
+  application error returns immediately. Application success waits for the
+  resulting transport completion.
+- If `RpcSystem` closes first, an orderly peer close maps to the documented
+  session outcome. An RPC error returns immediately. `std/system` drops the
+  application Future, and an orderly RPC result waits for transport completion.
+- If transport completion finishes first, orderly closure succeeds. A
+  `TransportError::Failed` value fails the session.
+- If the host cancels the export or drops the Store, the complete Future tree
+  drops. Store teardown reclaims P3 resources and closes the host transport.
 
-### WASI poll blocking
+The guest does not drain RPC for an arbitrary interval. A completed P3 stream
+write already waits for the underlying host flush.
 
-When the loop makes no progress and has no pending writes, it blocks on
-`wasi_poll::poll([reader, idle_timeout])` with a 100ms safety timeout.
-The timeout guards against missed wakeups from wasmtime's
-`AsyncReadStream` background worker.  See the `IDLE_POLL_TIMEOUT_NS`
-comment in `std/system/src/lib.rs` for details.
+## Supported suspension sources
 
-### WRITE_OCCURRED flag
+First-party async guests suspend on host-visible P3 operations:
 
-A thread-local `Cell<bool>` set by `StreamWriter::poll_write`.  Tracks
-whether any data was written during the current poll cycle so the loop
-knows whether to include the writer pollable in the WASI poll set.
-This replaced a racy `pollable.ready()` check that caused deadlocks.
+- the granted transport input, output, and completion resources;
+- monotonic-clock waits;
+- PID0 standard input;
+- filesystem operations supplied by WASI P3.
 
-## WASI stream adapters
+These operations can resume through Component Model P3 without a Wetware
+scheduler. Current first-party guests have no pure-Rust external wake source
+after the generated task enters Component Model Wait.
 
-`StreamReader` and `StreamWriter` implement `futures::io::AsyncRead` and
-`futures::io::AsyncWrite` over WASI input/output streams.  These are
-required by capnp-rpc's `VatNetwork`.
+The following cases remain outside the runtime contract:
 
-The `futures` crate dependency exists solely for these trait impls —
-the rest of the runtime uses only `std::future` and `std::task`.
+- non-yielding application CPU work blocks same-Cell async progress until a
+  host fuel or epoch boundary returns control;
+- a genuinely synchronous import blocks its Cell;
+- pure-Rust wake sources that are invisible to P3 are unsupported;
+- detached spawn, task handles, and generic async channels are unsupported.
 
-## Entry points
+Future language runtimes can define scheduling above the common P3 substrate.
+They must not change the host transport authority model.
 
-| Function | Purpose |
-|----------|---------|
-| `system::run(f)` | Bootstrap the host-provided capability, run `f`, and drive RPC. |
-| `system::serve(bootstrap, f)` | Same as `run`, but also exports `bootstrap` to host. |
-| `system::serve_stdio(bootstrap)` | Export cap over WASI stdin/stdout (no Membrane). |
+## PID0
 
-All three delegate to `poll_loop`.
+PID0 uses the same root-Future model. Its application branch grafts host
+capabilities, loads the standard composition, and commits readiness. PID0 then
+waits for P3 standard input when `WW_TTY` is set. A daemon PID0 awaits forever.
 
-## Non-goals
+The standard-input wait is asynchronous. Input resumes the application branch,
+and EOF completes an interactive PID0 successfully. Production PID0 uses
+`system::run`, so it exports no guest bootstrap capability after initialization.
+The host `HttpListener` serves `/status` through a separate status Cell. Route
+availability does not prove PID0 guest-server progress.
 
-- **No guest task pool.** The runtime polls one guest entry future. Guest code
-  that needs additional I/O readiness can register pollables through
-  `system::run_with`.
+PID0 alone imports
+`wetware:kernel-runtime/readiness@1.0.0`. The host installs this interface only
+on the trusted PID0 linker. The function commits the generation already bound
+to PID0's process-local graft.
 
-- **No tokio / async-std.**  The WASM target doesn't support OS I/O
-  primitives these runtimes require.  The hand-rolled loop integrates
-  directly with WASI poll, which is the correct abstraction for
-  wasm32-wasip2.
+## Synchronous Cells
 
-- **No timers (yet).**  The idle timeout is internal to the poll loop.
-  A future guest API could expose WASI `subscribe-duration` pollables.
+Synchronous Cells use a P3 CLI export but do not link `std/system` or construct
+an `RpcSystem`. Echo, counter, snap-hello-rs, and the routing-key probe remain
+runtime-free unless their own behavior needs RPC.
+
+The `wasm32-wasip3` target does not imply that every guest uses async RPC. It
+defines the common Component Model ABI and lets synchronous guests use only
+their declared interfaces.
+
+## Architecture guardrails
+
+Do not add guest polling to repair a missing wake. First identify whether the
+operation exposes a P3 waitable and whether the generated task owns that
+waitable.
+
+Do not enable `async-spawn` or `inter-task-wakeup` without a current guest that
+requires the corresponding semantics. Do not add a P2 compatibility path for
+new guests.

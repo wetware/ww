@@ -10,11 +10,10 @@
 //!   *             → 405 Method Not Allowed
 
 use wagi_guest as wagi;
-use wasip2::exports::cli::run::Guest;
 
 struct CounterCell;
 
-impl Guest for CounterCell {
+impl wagi::Guest for CounterCell {
     fn run() -> Result<(), ()> {
         let count: u64 = 0;
         let ct = ("Content-Type", "text/plain");
@@ -29,4 +28,4 @@ impl Guest for CounterCell {
     }
 }
 
-wasip2::cli::command::export!(CounterCell);
+wagi::export!(CounterCell);

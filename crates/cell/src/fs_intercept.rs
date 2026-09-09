@@ -15,9 +15,6 @@ use crate::vfs::{CidTree, ResolvedNode};
 use anyhow::Result;
 use wasmtime::component::{HasData, Linker, Resource};
 use wasmtime_wasi::filesystem::{WasiFilesystemCtx, WasiFilesystemCtxView};
-use wasmtime_wasi::p2::bindings::filesystem::{preopens, types};
-use wasmtime_wasi::p2::{FsError, FsResult};
-use wasmtime_wasi_io::streams::{DynInputStream, DynOutputStream};
 
 // ── Marker type for HasData ────────────────────────────────────────
 
@@ -61,10 +58,6 @@ fn ipfs_filesystem(state: &mut ComponentRunStates) -> IpfsFilesystemView<'_> {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the dormant P3 linker and its artifact test lane"
-)]
 pub(crate) trait FilesystemHostState: Send + Sized + 'static {
     fn intercepted_filesystem(&mut self) -> IpfsFilesystemView<'_>;
     fn wasi_filesystem_getter(
@@ -216,17 +209,6 @@ pub(crate) enum MaterializeError {
     NotPermitted,
 }
 
-impl From<MaterializeError> for types::ErrorCode {
-    fn from(error: MaterializeError) -> Self {
-        match error {
-            MaterializeError::Invalid => Self::Invalid,
-            MaterializeError::Io => Self::Io,
-            MaterializeError::NoEntry => Self::NoEntry,
-            MaterializeError::NotPermitted => Self::NotPermitted,
-        }
-    }
-}
-
 impl From<MaterializeError> for p3_types::ErrorCode {
     fn from(error: MaterializeError) -> Self {
         match error {
@@ -355,375 +337,6 @@ pub(crate) async fn materialize_ipfs_descriptor(
     }
     open_read_only_path(&target_path)
 }
-
-impl IpfsFilesystemView<'_> {
-    async fn open_via_cid_tree(
-        &mut self,
-        cid_tree: &CidTree,
-        path: &str,
-        flags: types::DescriptorFlags,
-    ) -> FsResult<Resource<types::Descriptor>> {
-        let descriptor = materialize_cid_tree_descriptor(
-            self.cache_mode.as_deref(),
-            cid_tree,
-            path,
-            flags.contains(types::DescriptorFlags::WRITE),
-        )
-        .await
-        .map_err(|error| FsError::from(types::ErrorCode::from(error)))?;
-        self.table
-            .push(descriptor)
-            .map_err(|_| types::ErrorCode::Io.into())
-    }
-
-    async fn open_ipfs(
-        &mut self,
-        ipfs_path: IpfsCidPath,
-        _open_flags: types::OpenFlags,
-        flags: types::DescriptorFlags,
-    ) -> FsResult<Resource<types::Descriptor>> {
-        let descriptor = materialize_ipfs_descriptor(
-            self.cache_mode.as_deref(),
-            &ipfs_path,
-            flags.contains(types::DescriptorFlags::WRITE),
-        )
-        .await
-        .map_err(|error| FsError::from(types::ErrorCode::from(error)))?;
-        self.table
-            .push(descriptor)
-            .map_err(|_| types::ErrorCode::Io.into())
-    }
-}
-
-// ── HostDescriptor — delegate everything, intercept open_at ────────
-
-impl types::HostDescriptor for IpfsFilesystemView<'_> {
-    async fn advise(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        offset: types::Filesize,
-        len: types::Filesize,
-        advice: types::Advice,
-    ) -> FsResult<()> {
-        self.as_wasi_view().advise(fd, offset, len, advice).await
-    }
-
-    async fn sync_data(&mut self, fd: Resource<types::Descriptor>) -> FsResult<()> {
-        self.as_wasi_view().sync_data(fd).await
-    }
-
-    async fn get_flags(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-    ) -> FsResult<types::DescriptorFlags> {
-        self.as_wasi_view().get_flags(fd).await
-    }
-
-    async fn get_type(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-    ) -> FsResult<types::DescriptorType> {
-        self.as_wasi_view().get_type(fd).await
-    }
-
-    async fn set_size(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        size: types::Filesize,
-    ) -> FsResult<()> {
-        self.as_wasi_view().set_size(fd, size).await
-    }
-
-    async fn set_times(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        atim: types::NewTimestamp,
-        mtim: types::NewTimestamp,
-    ) -> FsResult<()> {
-        self.as_wasi_view().set_times(fd, atim, mtim).await
-    }
-
-    async fn read(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        len: types::Filesize,
-        offset: types::Filesize,
-    ) -> FsResult<(Vec<u8>, bool)> {
-        self.as_wasi_view().read(fd, len, offset).await
-    }
-
-    async fn write(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        buf: Vec<u8>,
-        offset: types::Filesize,
-    ) -> FsResult<types::Filesize> {
-        self.as_wasi_view().write(fd, buf, offset).await
-    }
-
-    async fn read_directory(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-    ) -> FsResult<Resource<types::DirectoryEntryStream>> {
-        self.as_wasi_view().read_directory(fd).await
-    }
-
-    async fn sync(&mut self, fd: Resource<types::Descriptor>) -> FsResult<()> {
-        self.as_wasi_view().sync(fd).await
-    }
-
-    async fn create_directory_at(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        path: String,
-    ) -> FsResult<()> {
-        self.as_wasi_view().create_directory_at(fd, path).await
-    }
-
-    async fn stat(&mut self, fd: Resource<types::Descriptor>) -> FsResult<types::DescriptorStat> {
-        self.as_wasi_view().stat(fd).await
-    }
-
-    async fn stat_at(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        path_flags: types::PathFlags,
-        path: String,
-    ) -> FsResult<types::DescriptorStat> {
-        self.as_wasi_view().stat_at(fd, path_flags, path).await
-    }
-
-    async fn set_times_at(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        path_flags: types::PathFlags,
-        path: String,
-        atim: types::NewTimestamp,
-        mtim: types::NewTimestamp,
-    ) -> FsResult<()> {
-        self.as_wasi_view()
-            .set_times_at(fd, path_flags, path, atim, mtim)
-            .await
-    }
-
-    async fn link_at(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        old_path_flags: types::PathFlags,
-        old_path: String,
-        new_descriptor: Resource<types::Descriptor>,
-        new_path: String,
-    ) -> FsResult<()> {
-        self.as_wasi_view()
-            .link_at(fd, old_path_flags, old_path, new_descriptor, new_path)
-            .await
-    }
-
-    async fn open_at(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        path_flags: types::PathFlags,
-        path: String,
-        oflags: types::OpenFlags,
-        flags: types::DescriptorFlags,
-    ) -> FsResult<Resource<types::Descriptor>> {
-        // `/tmp` and every descriptor opened beneath it belong to the
-        // process-private scratch preopen, not to the immutable image tree.
-        // Descriptor identity keeps this routing decision out of guest paths
-        // and prevents a child from widening it.
-        if self.writable_descriptors.contains(&fd.rep()) {
-            let opened = self
-                .as_wasi_view()
-                .open_at(fd, path_flags, path, oflags, flags)
-                .await?;
-            self.writable_descriptors.insert(opened.rep());
-            return Ok(opened);
-        }
-
-        match route_open(self.cid_tree.as_ref(), &path) {
-            OpenRoute::CidTree(cid_tree, target) => {
-                tracing::debug!(path = %target, "CidTree open_at");
-                return self.open_via_cid_tree(&cid_tree, &target, flags).await;
-            }
-            OpenRoute::Ipfs(ipfs_path) => {
-                tracing::debug!(cid = %ipfs_path.cid, subpath = %ipfs_path.subpath, "Intercepting IPFS open_at");
-                return self.open_ipfs(ipfs_path, oflags, flags).await;
-            }
-            OpenRoute::Wasi => {}
-        }
-
-        // Delegate to standard filesystem
-        self.as_wasi_view()
-            .open_at(fd, path_flags, path, oflags, flags)
-            .await
-    }
-
-    fn drop(&mut self, fd: Resource<types::Descriptor>) -> wasmtime::Result<()> {
-        self.writable_descriptors.remove(&fd.rep());
-        self.as_wasi_view().drop(fd)
-    }
-
-    async fn readlink_at(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        path: String,
-    ) -> FsResult<String> {
-        self.as_wasi_view().readlink_at(fd, path).await
-    }
-
-    async fn remove_directory_at(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        path: String,
-    ) -> FsResult<()> {
-        self.as_wasi_view().remove_directory_at(fd, path).await
-    }
-
-    async fn rename_at(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        old_path: String,
-        new_fd: Resource<types::Descriptor>,
-        new_path: String,
-    ) -> FsResult<()> {
-        self.as_wasi_view()
-            .rename_at(fd, old_path, new_fd, new_path)
-            .await
-    }
-
-    async fn symlink_at(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        src_path: String,
-        dest_path: String,
-    ) -> FsResult<()> {
-        self.as_wasi_view()
-            .symlink_at(fd, src_path, dest_path)
-            .await
-    }
-
-    async fn unlink_file_at(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        path: String,
-    ) -> FsResult<()> {
-        self.as_wasi_view().unlink_file_at(fd, path).await
-    }
-
-    fn read_via_stream(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        offset: types::Filesize,
-    ) -> FsResult<Resource<DynInputStream>> {
-        self.as_wasi_view().read_via_stream(fd, offset)
-    }
-
-    fn write_via_stream(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        offset: types::Filesize,
-    ) -> FsResult<Resource<DynOutputStream>> {
-        self.as_wasi_view().write_via_stream(fd, offset)
-    }
-
-    fn append_via_stream(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-    ) -> FsResult<Resource<DynOutputStream>> {
-        self.as_wasi_view().append_via_stream(fd)
-    }
-
-    async fn is_same_object(
-        &mut self,
-        a: Resource<types::Descriptor>,
-        b: Resource<types::Descriptor>,
-    ) -> wasmtime::Result<bool> {
-        self.as_wasi_view().is_same_object(a, b).await
-    }
-
-    async fn metadata_hash(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-    ) -> FsResult<types::MetadataHashValue> {
-        self.as_wasi_view().metadata_hash(fd).await
-    }
-
-    async fn metadata_hash_at(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        path_flags: types::PathFlags,
-        path: String,
-    ) -> FsResult<types::MetadataHashValue> {
-        self.as_wasi_view()
-            .metadata_hash_at(fd, path_flags, path)
-            .await
-    }
-}
-
-// ── Host trait (error code conversion) ─────────────────────────────
-
-impl types::Host for IpfsFilesystemView<'_> {
-    fn convert_error_code(&mut self, err: FsError) -> wasmtime::Result<types::ErrorCode> {
-        self.as_wasi_view().convert_error_code(err)
-    }
-
-    fn filesystem_error_code(
-        &mut self,
-        err: Resource<wasmtime::Error>,
-    ) -> wasmtime::Result<Option<types::ErrorCode>> {
-        self.as_wasi_view().filesystem_error_code(err)
-    }
-}
-
-// ── HostDirectoryEntryStream ───────────────────────────────────────
-
-impl types::HostDirectoryEntryStream for IpfsFilesystemView<'_> {
-    async fn read_directory_entry(
-        &mut self,
-        stream: Resource<types::DirectoryEntryStream>,
-    ) -> FsResult<Option<types::DirectoryEntry>> {
-        self.as_wasi_view().read_directory_entry(stream).await
-    }
-
-    fn drop(&mut self, stream: Resource<types::DirectoryEntryStream>) -> wasmtime::Result<()> {
-        types::HostDirectoryEntryStream::drop(&mut self.as_wasi_view(), stream)
-    }
-}
-
-// ── Preopens ───────────────────────────────────────────────────────
-
-impl preopens::Host for IpfsFilesystemView<'_> {
-    fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<types::Descriptor>, String)>> {
-        let directories = self.as_wasi_view().get_directories()?;
-        for (descriptor, path) in &directories {
-            if path == "/tmp" {
-                self.writable_descriptors.insert(descriptor.rep());
-            }
-        }
-        Ok(directories)
-    }
-}
-
-// ── Linker override ────────────────────────────────────────────────
-
-/// Override the filesystem linker bindings with our IPFS interceptor.
-///
-/// Call this AFTER `add_to_linker_async` to replace the standard filesystem
-/// implementation with one that intercepts `/ipfs/` paths.
-pub(crate) fn override_filesystem_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> {
-    // Enable shadowing so we can override the already-registered filesystem bindings
-    linker.allow_shadowing(true);
-
-    types::add_to_linker::<ComponentRunStates, IpfsFilesystem>(linker, ipfs_filesystem)?;
-    preopens::add_to_linker::<ComponentRunStates, IpfsFilesystem>(linker, ipfs_filesystem)?;
-
-    // Restore default (no shadowing) for safety
-    linker.allow_shadowing(false);
-
-    Ok(())
-}
-
-// ── WASI P3 adapter ───────────────────────────────────────────────
 
 use wasmtime::component::{Access, Accessor, FutureReader, StreamReader};
 use wasmtime::AsContextMut as _;
@@ -1168,7 +781,6 @@ impl<T: FilesystemHostState> p3_types::HostDescriptorWithStore<T> for IpfsFilesy
     }
 }
 
-#[allow(dead_code, reason = "used by the dormant P3 artifact test lane")]
 pub(crate) fn override_p3_filesystem_linker<T: FilesystemHostState>(
     linker: &mut Linker<T>,
 ) -> Result<()> {
@@ -1398,265 +1010,70 @@ mod tests {
         (cid, Arc::new(MockPinner { data, path_data }))
     }
 
-    /// Helper: build the view for testing open_ipfs.
-    struct TestHarness {
-        wasi_ctx: wasmtime_wasi::WasiCtx,
-        resource_table: wasmtime::component::ResourceTable,
-        cache_mode: Option<Arc<cache::CacheMode>>,
-        cid_tree: Option<Arc<CidTree>>,
-        writable_descriptors: std::collections::HashSet<u32>,
-    }
-
-    impl TestHarness {
-        fn new(cache_mode: Option<cache::CacheMode>) -> Self {
-            Self {
-                wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
-                resource_table: wasmtime::component::ResourceTable::new(),
-                cache_mode: cache_mode.map(Arc::new),
-                cid_tree: None,
-                writable_descriptors: std::collections::HashSet::new(),
-            }
-        }
-
-        fn view(&mut self) -> IpfsFilesystemView<'_> {
-            IpfsFilesystemView {
-                ctx: self.wasi_ctx.filesystem(),
-                table: &mut self.resource_table,
-                cache_mode: &self.cache_mode,
-                cid_tree: &self.cid_tree,
-                writable_descriptors: &mut self.writable_descriptors,
-            }
-        }
-    }
-
-    // ── Integration tests ──────────────────────────────────────────
-
     #[tokio::test]
-    async fn test_open_ipfs_file_materializes_and_returns_descriptor() {
+    async fn materialize_ipfs_fetches_read_only_content() {
         let content = b"hello ipfs world";
         let (cid, pinner) = test_cid_and_pinner(content);
-
-        let isolated = cache::IsolatedPinset::new(pinner).unwrap();
-        let mut harness = TestHarness::new(Some(cache::CacheMode::Isolated(isolated)));
-
-        let ipfs_path = IpfsCidPath {
+        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        let path = IpfsCidPath {
             cid,
             subpath: String::new(),
         };
-        let fd = harness
-            .view()
-            .open_ipfs(
-                ipfs_path,
-                types::OpenFlags::empty(),
-                types::DescriptorFlags::READ,
-            )
+
+        let descriptor = materialize_ipfs_descriptor(Some(&cache), &path, false)
             .await
-            .expect("open_ipfs should succeed");
-
-        // Descriptor was pushed to the resource table
-        let desc = harness.resource_table.get(&fd);
-        assert!(desc.is_ok(), "descriptor should be in resource table");
-
-        // Content was materialized to staging
-        let staging_file = harness
-            .cache_mode
-            .as_ref()
-            .unwrap()
-            .staging_dir()
-            .join(cid.to_string());
-        assert!(staging_file.exists(), "staging file should exist");
+            .expect("materialize IPFS content");
+        drop(descriptor);
         assert_eq!(
-            std::fs::read(&staging_file).unwrap(),
-            content,
-            "staging file should contain the IPFS content"
+            std::fs::read(cache.staging_dir().join(cid.to_string())).unwrap(),
+            content
         );
     }
 
     #[tokio::test]
-    async fn test_open_ipfs_write_rejected() {
+    async fn materialize_ipfs_rejects_writes_and_missing_cache() {
         let (cid, pinner) = test_cid_and_pinner(b"data");
-        let isolated = cache::IsolatedPinset::new(pinner).unwrap();
-        let mut harness = TestHarness::new(Some(cache::CacheMode::Isolated(isolated)));
-
-        let ipfs_path = IpfsCidPath {
+        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        let path = IpfsCidPath {
             cid,
             subpath: String::new(),
         };
-        let result = harness
-            .view()
-            .open_ipfs(
-                ipfs_path,
-                types::OpenFlags::empty(),
-                types::DescriptorFlags::READ | types::DescriptorFlags::WRITE,
-            )
-            .await;
 
-        assert!(result.is_err(), "write to /ipfs/ should be rejected");
+        assert!(matches!(
+            materialize_ipfs_descriptor(Some(&cache), &path, true).await,
+            Err(MaterializeError::NotPermitted)
+        ));
+        assert!(matches!(
+            materialize_ipfs_descriptor(None, &path, false).await,
+            Err(MaterializeError::NoEntry)
+        ));
     }
 
     #[tokio::test]
-    async fn test_open_ipfs_no_cache_returns_error() {
-        let cid: cid::Cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
-            .parse()
-            .unwrap();
-        let mut harness = TestHarness::new(None); // no cache
-
-        let ipfs_path = IpfsCidPath {
-            cid,
-            subpath: String::new(),
-        };
-        let result = harness
-            .view()
-            .open_ipfs(
-                ipfs_path,
-                types::OpenFlags::empty(),
-                types::DescriptorFlags::READ,
-            )
-            .await;
-
-        assert!(result.is_err(), "open without cache should fail");
-    }
-
-    #[tokio::test]
-    async fn test_open_ipfs_unknown_cid_returns_error() {
-        // Pinner has no data for the CID we'll request
-        let pinner = Arc::new(MockPinner {
-            data: HashMap::new(),
-            path_data: HashMap::new(),
-        });
-        let isolated = cache::IsolatedPinset::new(pinner).unwrap();
-        let mut harness = TestHarness::new(Some(cache::CacheMode::Isolated(isolated)));
-
-        let cid: cid::Cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
-            .parse()
-            .unwrap();
-        let ipfs_path = IpfsCidPath {
-            cid,
-            subpath: String::new(),
-        };
-        let result = harness
-            .view()
-            .open_ipfs(
-                ipfs_path,
-                types::OpenFlags::empty(),
-                types::DescriptorFlags::READ,
-            )
-            .await;
-
-        assert!(result.is_err(), "unknown CID should fail");
-    }
-
-    #[tokio::test]
-    async fn test_open_ipfs_with_shared_cache() {
-        let content = b"shared cache content";
-        let (cid, pinner) = test_cid_and_pinner(content);
-
-        let pinset = Arc::new(cache::PinsetCache::new(pinner, 10 * 1024 * 1024).unwrap());
-        let mut harness = TestHarness::new(Some(cache::CacheMode::Shared(pinset)));
-
-        let ipfs_path = IpfsCidPath {
-            cid,
-            subpath: String::new(),
-        };
-        let fd = harness
-            .view()
-            .open_ipfs(
-                ipfs_path,
-                types::OpenFlags::empty(),
-                types::DescriptorFlags::READ,
-            )
-            .await
-            .expect("open_ipfs with shared cache should succeed");
-
-        assert!(harness.resource_table.get(&fd).is_ok());
-
-        let staging_file = harness
-            .cache_mode
-            .as_ref()
-            .unwrap()
-            .staging_dir()
-            .join(cid.to_string());
-        assert_eq!(std::fs::read(&staging_file).unwrap(), content);
-    }
-
-    #[tokio::test]
-    async fn test_open_ipfs_with_subpath() {
-        // Root CID bytes and subpath bytes intentionally differ.
-        // Regression: open_ipfs must fetch /ipfs/<cid>/<subpath>, not /ipfs/<cid>.
+    async fn materialize_ipfs_fetches_subpath_content() {
         let root_bytes = b"root cid blob bytes";
         let nested_bytes = b"nested file content";
         let (cid, pinner) =
             test_cid_and_pinner_with_subpath(root_bytes, "sub/dir/file.txt", nested_bytes);
-
-        let isolated = cache::IsolatedPinset::new(pinner).unwrap();
-        let mut harness = TestHarness::new(Some(cache::CacheMode::Isolated(isolated)));
-
-        let ipfs_path = IpfsCidPath {
+        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        let path = IpfsCidPath {
             cid,
             subpath: "sub/dir/file.txt".to_string(),
         };
-        let fd = harness
-            .view()
-            .open_ipfs(
-                ipfs_path,
-                types::OpenFlags::empty(),
-                types::DescriptorFlags::READ,
-            )
+
+        let descriptor = materialize_ipfs_descriptor(Some(&cache), &path, false)
             .await
-            .expect("open_ipfs with subpath should succeed");
-
-        assert!(harness.resource_table.get(&fd).is_ok());
-
-        // Verify nested path was created in staging
-        let nested_file = harness
-            .cache_mode
-            .as_ref()
-            .unwrap()
-            .staging_dir()
-            .join(cid.to_string())
-            .join("sub/dir/file.txt");
-        assert!(nested_file.exists(), "nested staging file should exist");
-        assert_eq!(std::fs::read(&nested_file).unwrap(), nested_bytes);
-    }
-
-    #[tokio::test]
-    async fn test_open_ipfs_skips_fetch_on_staging_hit() {
-        let content = b"cached on disk";
-        let (cid, pinner) = test_cid_and_pinner(content);
-
-        let isolated = cache::IsolatedPinset::new(pinner).unwrap();
-        let mut harness = TestHarness::new(Some(cache::CacheMode::Isolated(isolated)));
-
-        // First open: fetches and stages
-        let ipfs_path = IpfsCidPath {
-            cid,
-            subpath: String::new(),
-        };
-        harness
-            .view()
-            .open_ipfs(
-                ipfs_path,
-                types::OpenFlags::empty(),
-                types::DescriptorFlags::READ,
+            .expect("materialize IPFS subpath");
+        drop(descriptor);
+        assert_eq!(
+            std::fs::read(
+                cache
+                    .staging_dir()
+                    .join(cid.to_string())
+                    .join("sub/dir/file.txt")
             )
-            .await
-            .expect("first open should succeed");
-
-        // Second open: should hit staging (file already exists)
-        let ipfs_path = IpfsCidPath {
-            cid,
-            subpath: String::new(),
-        };
-        let fd = harness
-            .view()
-            .open_ipfs(
-                ipfs_path,
-                types::OpenFlags::empty(),
-                types::DescriptorFlags::READ,
-            )
-            .await
-            .expect("second open should hit staging cache");
-
-        assert!(harness.resource_table.get(&fd).is_ok());
+            .unwrap(),
+            nested_bytes
+        );
     }
 }

@@ -46,6 +46,10 @@ jobs:
             - 'std/**'
             - 'crates/guest/**'
             - 'examples/**'
+            - 'scripts/build_wasip3_component.sh'
+            - 'scripts/check_first_party_wasip3.sh'
+            - 'scripts/check_native_p3_fixture.sh'
+            - 'rust-toolchain.toml'
           host:
             - 'src/**'
             - 'crates/**'
@@ -118,7 +122,7 @@ jobs:
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh
+          shellcheck scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh
         fi
 
   clippy:
@@ -133,23 +137,13 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
-        targets: wasm32-wasip2
 
     - uses: ./.github/actions/setup-capnp
 
     - uses: Swatinem/rust-cache@v2
 
-    - name: Build WASI example fixture
-      run: make -C examples/echo
-
     - name: cargo clippy (host workspace)
       run: cargo clippy --workspace --all-targets -- -D warnings
-
-    - name: Check membrane substrate builds for WASI
-      run: cargo check -p wetware-membrane --target wasm32-wasip2
-
-    - name: Clippy kernel WASI component
-      run: cargo clippy --manifest-path std/kernel/Cargo.toml --target wasm32-wasip2 -- -D warnings
 
   solidity:
     name: Solidity (Foundry)
@@ -193,7 +187,7 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
-        targets: x86_64-unknown-linux-gnu, wasm32-wasip2
+        targets: x86_64-unknown-linux-gnu
 
     - uses: ./.github/actions/setup-capnp
 
@@ -204,8 +198,9 @@ jobs:
     - name: Build host workspace test binaries
       run: cargo build --workspace --tests
 
-  native-p3-fixture:
-    name: Native wasm32-wasip3 fixture
+  build-wasm:
+    name: Build native wasm32-wasip3 components
+    needs: [build]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -248,9 +243,27 @@ jobs:
     - name: Build and validate native P3 fixture
       run: make test-p3-fixture
 
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: wasm-p3
+
+    - name: Build and validate first-party P3 components
+      run: make test-wasm
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: wasm-artifacts
+        path: |
+          std/kernel/bin/main.wasm
+          std/status/bin/status.wasm
+          examples/*/bin/
+          target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
+          target/routing-key-probe/wasm32-wasip3/release/routing_key_probe.wasm
+        retention-days: 1
+
   test:
     name: Test
-    needs: [build]
+    needs: [build, build-wasm]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -260,7 +273,7 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
-        targets: x86_64-unknown-linux-gnu, wasm32-wasip2
+        targets: x86_64-unknown-linux-gnu
 
     - uses: ./.github/actions/setup-capnp
 
@@ -309,19 +322,24 @@ jobs:
       with:
         key: build-test
 
-    - name: Build embedded WASI std and test fixtures
+    - name: Download validated P3 components
+      uses: actions/download-artifact@v8
+      with:
+        name: wasm-artifacts
+
+    - name: Check embedded WASI std and test fixtures
       run: |
-        make std
-        make examples
         test -s std/kernel/bin/main.wasm
         test -s std/status/bin/status.wasm
         test -s examples/echo/bin/echo.wasm
         test -s examples/discovery/bin/discovery.wasm
+        test -s target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
 
     - name: Run host workspace tests (hot cache from build job)
       run: cargo test --workspace
       env:
         WW_TEST_REQUIRE_KUBO: "1"
+        WW_USE_PREBUILT_AUTHORITY_PROBE: "1"
 
     - name: Smoke-test Chess authority proof command
       run: |
@@ -422,47 +440,6 @@ jobs:
       uses: actions/deploy-pages@v4
 
   # === Master-only: fan out after checks pass ===
-
-  build-wasm:
-    name: Build WASM components
-    if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'push' && github.ref == 'refs/heads/master')
-    needs: [fmt, clippy, solidity, build, native-p3-fixture]
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v5
-      with:
-        submodules: recursive
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: wasm32-wasip2
-
-    - uses: ./.github/actions/setup-capnp
-      with:
-        cache-key-suffix: wasm
-
-    - uses: Swatinem/rust-cache@v2
-      with:
-        key: wasm-std
-
-    - name: Build WASM std + examples
-      run: make std && make examples
-
-    - name: Test WASM components
-      run: make test-wasm
-
-    - uses: actions/upload-artifact@v7
-      with:
-        name: wasm-artifacts
-        path: |
-          std/kernel/bin/main.wasm
-          std/status/bin/status.wasm
-          examples/*/bin/
-        retention-days: 1
 
   build-binaries:
     name: Build ${{ matrix.artifact }}

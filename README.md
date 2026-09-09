@@ -39,7 +39,7 @@ the explicit `host` grant, which lets the cell report peer identity and peers.
 - **Explicit child grants.** Each ordinary cell starts with a typed bundle of capabilities and nothing else. Parent cells choose which capabilities to hand down; method-level restrictions are enforced on the capability reference and on capabilities reached through it.
 - **Composable membranes.** Tool A calls tool B which calls tool C, each link carrying an explicit capability set. The membrane is the boundary at every hop. See [examples/oracle/](examples/oracle/) for the runnable version.
 - **Content-addressed code.** Cells are identified by CID. The binary that ran is the binary you pinned; no swap-under-the-rug between generation and execution.
-- **WASM cell scale.** ~10ms spawn, KB-scale binaries, language-agnostic via `wasm32-wasip2`. Per-call sandboxing is only feasible because cells are cheap; microVM cold-start is too slow for that.
+- **WASM cell scale.** ~10ms spawn, KB-scale binaries, language-agnostic via native `wasm32-wasip3` components. Per-call sandboxing is only feasible because cells are cheap; microVM cold-start is too slow for that.
 - **P2P capability sharing.** A cell can export a typed capability to a peer over libp2p. Service names locate a stream; they do not authorize its caller. A deployer can publish a `Terminal` that authenticates a login identity and issues only the method authority selected for that identity.
 
 ## Quickstart
@@ -54,11 +54,12 @@ Or build from source:
 
 ```bash
 ww doctor                         # check your dev environment
-rustup target add wasm32-wasip2   # one-time
+rustup toolchain install nightly-2026-08-30 --component rust-src
 make                              # build everything (host + std + examples)
 ```
 
-Requires a Rust toolchain with the `wasm32-wasip2` target. Optional: [Kubo](https://docs.ipfs.tech/install/) for IPFS resolution and DHT-based peer discovery.
+Guest builds use the pinned native P3 toolchain. `ww doctor` reports missing
+WASI SDK, `component-ld`, or `wasm-tools` dependencies. Optional: [Kubo](https://docs.ipfs.tech/install/) for IPFS resolution and DHT-based peer discovery.
 
 ### Run a node
 
@@ -95,14 +96,16 @@ ancestor explicitly re-delegates fresh references or respawns the child.
 
 ### Cell modes
 
-WASM processes ("cells") run with zero ambient authority. Their stdio is wired to a transport based on `WW_CELL_MODE`:
+WASM processes ("cells") run with zero ambient authority. Async RPC Cells use
+the granted P3 transport. `WW_CELL_MODE` identifies separate application
+plumbing:
 
-| Mode | stdio carries | Use case |
-|------|--------------|----------|
-| `vat` | Cap'n Proto RPC | Long-lived capability services |
-| `raw` | libp2p stream bytes | Long-lived byte/session protocols |
-| `http` | CGI (WAGI) | Stateless HTTP request adapters |
-| *(absent)* | Host RPC channel | pid0 kernel, full membrane graft |
+| Mode | stdio carries | Host wiring |
+|------|--------------|-------------|
+| `vat` | application-defined | Serves an existing guest capability |
+| `raw` | raw libp2p stream bytes | Long-lived byte/session listener |
+| `http` | CGI env vars + stdin/stdout | Stateless WAGI request adapter |
+| *(absent)* | process input/output | Process-local P3 RPC; PID0 receives a `Membrane` |
 
 ## Standard ports
 

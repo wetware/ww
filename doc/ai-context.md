@@ -14,20 +14,21 @@ run as WASM processes called **Cells** with zero ambient authority --
 they can only do what they've been explicitly granted capabilities
 to do.
 
-**Cells** are the unit of computation.  Each Cell is a WASM binary
-whose stdio is wired to a transport by the host.  The `WW_CELL_MODE`
-envvar tells the guest what plumbing it's running under:
+**Cells** are the unit of computation. Each Cell is a native
+`wasm32-wasip3` component. Async RPC Cells receive one capability-granted
+`wetware:transport@0.2.0` connection. Byte and HTTP handlers also use stdio.
+The `WW_CELL_MODE` envvar identifies application plumbing:
 
 | `WW_CELL_MODE` | stdio carries | Host wires up |
 |----------------|--------------|---------------|
-| `vat` | Cap'n Proto RPC | `/ww/0.1.0/vat/{protocol}` named service |
+| `vat` | application-defined | `/ww/0.1.0/vat/{protocol}` serves an existing guest capability |
 | `raw` | raw libp2p stream bytes | `/ww/0.1.0/stream/{protocol}` listener |
 | `http` | CGI env vars + stdin/stdout | WAGI (CGI for WASM) |
-| absent | Cap'n Proto RPC (host channel) | pid0 -- full Membrane graft |
+| absent | process input/output | process-local P3 RPC transport; PID0 receives a `Membrane` |
 
 The trusted PID0 implementation is `std/kernel`, which is embedded in `ww` by
-default. Its stdio is the Host's Cap'n Proto RPC channel, not a libp2p stream.
-It alone receives the process-local, graft-capable `Membrane`.
+default. PID0 uses the granted P3 transport for Cap'n Proto RPC. It alone
+receives the process-local, graft-capable `Membrane`.
 
 Architecture (three layers):
 - **Host** (`ww` binary): boots a libp2p swarm, prepares each effective
@@ -82,13 +83,17 @@ capability protocol over bearer tokens in args/env.
 
 Quick start:
 ```
-rustup target add wasm32-wasip2
+rustup toolchain install nightly-2026-08-30 --component rust-src
 make
 cargo run -- run --http-listen 127.0.0.1:2080 std/status
 curl http://127.0.0.1:2080/status
 ```
 
-Concurrency model (E-ordering):
+Guest async model: Wasmtime P3 drives one generated task. `std/system` selects
+one real `RpcSystem` with the application Future. Wetware has no guest
+scheduler, polling timer, spawn API, or channel runtime.
+
+Cap'n Proto concurrency model (E-ordering):
 Method calls on a single Cap'n Proto object are serialized -- no
 races within an object.  Calls across objects are independent and
 concurrent.  Pipelining lets you chain calls on promises.  No locks,

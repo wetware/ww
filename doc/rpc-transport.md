@@ -1,53 +1,143 @@
-# RPC Transport: Host Channels and Network Services
+# RPC Transport
 
-Wetware uses Cap'n Proto RPC in two distinct places:
+Wetware uses Cap'n Proto RPC over two distinct byte transports:
 
-- Each WASM process has an in-memory host channel for its bootstrap and
-  delegated capabilities.
-- Published vat services run Cap'n Proto RPC over named libp2p streams.
+- Each Cell receives one authority-granted in-memory host connection.
+- Published vat services use named libp2p streams.
 
-Raw byte-stream services also use named libp2p streams, but they do not add a
-Cap'n Proto vat unless the application implements one over stdin/stdout.
+Raw byte-stream services also use named libp2p streams. They do not create a
+Cap'n Proto vat unless the application implements that protocol.
 
-Primary implementation references:
+Primary code references:
 
-- `crates/cell/src/proc.rs` — in-memory host/guest stream creation
-- `src/kernel.rs` — trusted kernel startup and host-side RPC driver
-- `src/launcher.rs` — ordinary-child startup and host-side RPC driver
-- `crates/rpc/src/graft.rs` — PID0 and ordinary-child bootstraps
-- `std/system/src/lib.rs` — guest-side RPC session and poll loop
-- `crates/rpc/src/vat_listener.rs` and `crates/rpc/src/vat_client.rs` — network vats
-- `crates/rpc/src/stream_listener.rs` and `crates/rpc/src/stream_dialer.rs` — byte streams
-- `capnp/membrane.capnp` and `capnp/system.capnp` — public capability interfaces
+- `crates/cell/src/p3.rs` implements the Cell transport.
+- `crates/cell/src/proc.rs` places the transport grant in one Cell Store.
+- `src/kernel.rs` drives the PID0 host-side `RpcSystem`.
+- `src/launcher.rs` drives ordinary-child host-side `RpcSystem` instances.
+- `std/system/src/lib.rs` constructs the guest-side session.
+- `crates/rpc/src/graft.rs` defines PID0 and child bootstraps.
+- `crates/rpc/src/vat_listener.rs` and `vat_client.rs` implement network vats.
+- `crates/rpc/src/stream_listener.rs` and `stream_dialer.rs` implement byte streams.
 
-## Process-local host channel
+## Process-local P3 connection
 
-Every PID0 or ordinary-child process starts with a bidirectional in-memory
-stream created by `cell::proc::Builder::with_data_streams()`. The host retains
-one end. The guest receives the other end through
-`wetware:streams/streams@0.1.0`.
+`Builder` creates two bounded 64 KiB directions. The host receives a
+`HostTransport`. The Store receives a one-shot `GrantedTransport` through
+`wetware:transport/connection@0.2.0`.
 
 ```text
-Host                                      WASM guest
-----                                      ----------
-tokio::io::DuplexStream                   wetware:streams connection
-        |                                 WASI input/output streams
-        v                                         |
-VatNetwork + RpcSystem <--- Cap'n Proto RPC ----> VatNetwork + RpcSystem
+host RpcSystem                              guest RpcSystem
+      |                                          |
+HostTransport <--- two bounded directions ---> P3 stream resources
+                    64 KiB each                  |
+                                       wetware:transport connection
 ```
 
-The stream has no libp2p or OS-socket hop. `crates/cell/src/proc.rs` exposes
-the guest end as WASI stream resources and returns the host end through
-`DataStreamHandles`.
+The grant authorizes exactly one host-to-Cell byte connection. The interface
+contains no address, dial operation, socket operation, scheduler state,
+pollable, or explicit flush function. A second `open` call returns the fixed
+`connection already opened` failure.
 
-### PID0 bootstrap
+The host retains the conceptual session used before the P3 migration. PID0's
+host side serves a `Membrane`. An ordinary child's host side serves the
+immutable `InitialGrants` record selected by its parent.
 
-`kernel::Generation` passes the host stream halves to
-`build_kernel_membrane_rpc()`. The host serves a process-local `Membrane` as
-the bootstrap capability.
+The PID0 bootstrap direction carries host authority into PID0. Production PID0
+uses `system::run` and does not export a guest bootstrap capability.
 
-PID0 calls `Membrane.graft()`, which returns `List(Export)`. The canonical
-exports are:
+## Guest session
+
+`RpcSession::connect` performs these operations:
+
+1. Open the granted transport once.
+2. Adapt its P3 byte streams to `futures::io::AsyncRead` and `AsyncWrite`.
+3. Construct a Cap'n Proto `VatNetwork` and real `RpcSystem`.
+4. Bootstrap the host `Membrane` or `InitialGrants` capability.
+5. Optionally expose one guest bootstrap capability to the host.
+
+The generated P3 task composes `RpcSystem` and transport completion with the
+application Future. `TransportError::Failed` fails the root. Orderly transport
+closure remains successful. Wasmtime P3 drives all waits. The guest does not
+poll `wasi:io/poll`, run a timer-based pump, or own an event loop.
+
+`Process.bootstrap()` returns the guest capability supplied to `system::serve`.
+That capability differs from the host bootstrap received by the guest.
+
+## Backpressure and completed writes
+
+Each direction has an independent 64 KiB Tokio duplex buffer. The adapter adds
+no payload queue. A write that exceeds available capacity remains pending until
+the host consumes bytes.
+
+The host output consumer reports a guest write as complete only after two
+events occur:
+
+1. The underlying host `AsyncWrite` accepts all bytes for that P3 operation.
+2. `poll_flush` returns success.
+
+This rule protects a final completed message when the application Future
+finishes immediately after the write. The root Future does not add an RPC drain
+delay.
+
+## Cancellation during a pending flush
+
+Wetware uses fail-on-cancel semantics for an accepted write whose host flush is
+pending. Cancelling that P3 operation fails the connection with the fixed
+`transport flush cancelled` diagnostic.
+
+The adapter does not claim that the accepted bytes reached a downstream peer.
+The connection cannot continue after an operation loses ownership of a pending
+flush. Store teardown then drops both adapters and closes the host transport.
+This rule avoids both silent success and a detached flush task.
+
+## Directional close and failure
+
+| Event | Other direction | Connection completion |
+|---|---|---|
+| Guest drops outgoing | Host reads EOF | Waits for incoming direction |
+| Host closes its writer | Guest reads EOF | Waits for outgoing direction |
+| Guest drops incoming | Host writes fail locally | Waits for outgoing, then `Ok` |
+| Both directions close normally | Closed | `Ok` |
+| Read, write, or flush fails | Terminates | `failed(string)` |
+| Pending flush is cancelled | Terminates | `failed("transport flush cancelled")` |
+
+Diagnostics are fixed strings. They do not contain host paths, addresses,
+implementation type names, secrets, or debug output.
+
+## Store and RPC cancellation
+
+Wasmtime 48 hard-cancels a concurrent component task when its owning Store is
+dropped. `Proc` owns the Store and the `Store::run_concurrent` Future together.
+Process abort therefore drops the generated root Future, guest `RpcSystem`,
+pending request Futures, P3 resources, and both transport adapters.
+
+Wetware does not use Cap'n Proto `Disconnector` as a graceful-shutdown driver.
+Structured drop is the process shutdown policy. The host-side driver remains
+owned by the process lifecycle and closes when that lifecycle ends.
+
+After Store teardown, Wetware gives the child host `RpcSystem` a one-second
+`RPC_EOF_GRACE` to observe transport EOF. If the `RpcSystem` does not finish in
+that interval, the process lifecycle aborts it as a malformed-peer fallback.
+
+## WASI authority
+
+The production linker registers only the P3 packages used by first-party
+components: CLI, clocks, filesystem, random, and the Wetware imports.
+Production does not register `wasi:sockets`. The granted transport remains the
+only guest RPC or network path.
+
+Linker registration and resource grant are separate controls. All Cells have
+explicit stdin, stdout, and stderr resources. PID0 can receive terminal-backed
+stdin. Filesystem preopens expose an immutable image root and a private
+writable `/tmp`. PID0 alone receives the private readiness import.
+
+Build validation prints every component's WIT, rejects WASI 0.2 imports, and
+rejects `wasi:sockets` imports.
+
+## PID0 bootstrap
+
+The host serves a process-local `Membrane` to PID0. `Membrane.graft()` returns
+the canonical exports available for the current generation:
 
 - `identity`, when a signing key is configured;
 - `host`;
@@ -58,228 +148,56 @@ exports are:
 - `ipfs`;
 - `http-client`, when an outbound HTTP allowlist is configured.
 
-The host can also append explicitly configured extra exports. Graft-issued
-host capabilities use the PID0 generation's epoch guard.
+Graft-issued host capabilities retain PID0's `EpochGuard`.
 
-### Ordinary-child bootstrap
+## Ordinary-child bootstrap
 
-`src/launcher.rs` passes the host stream halves and the child's
-`InitialAuthorityRecord` to `build_initial_authority_rpc()`. The host serves
-`InitialGrants`, whose `get()` method returns exactly the immutable
-parent-selected `List(Export)`.
+The host serves `InitialGrants` to an ordinary child. `InitialGrants.get()`
+returns exactly the immutable `List(Export)` selected by the parent. The host
+does not add PID0 exports to this record.
 
-An ordinary child does not receive `Membrane.graft()`. The host does not add
-PID0 exports to the child's record.
+An ordinary child cannot call `Membrane.graft()`. A child receives fresh host
+authority only through explicit ancestor delegation or a new process.
 
-### Guest setup
+## Network service boundary
 
-`RpcSession::connect()` in `std/system/src/lib.rs` performs the guest setup:
-
-1. Call `create_connection()` once.
-2. Take the connection's input and output streams once.
-3. Wrap the streams in `StreamReader` and `StreamWriter`.
-4. Construct the guest `VatNetwork` and `RpcSystem`.
-5. Bootstrap the host-provided `Membrane` or `InitialGrants` capability.
-
-`system::run()` drives the RPC system with an async guest closure.
-`system::run_with()` also includes caller-provided `PollSet` entries.
-`system::serve()` additionally exports one guest bootstrap capability.
-The parent can retrieve that guest export through `Process.bootstrap()`.
-
-`system::serve_stdio()` is separate. It serves a guest capability over WASI
-stdin/stdout and does not connect to the process-local host bootstrap.
-
-## Network protocol boundary
-
-Wetware publishes network services only below these protocol prefixes:
+Wetware publishes services only below these protocol prefixes:
 
 | Prefix | Payload | Host capabilities |
-|--------|---------|-------------------|
-| `/ww/0.1.0/vat/{protocol}` | Cap'n Proto RPC | `VatListener`, `VatClient` |
-| `/ww/0.1.0/stream/{protocol}` | Application-defined bytes | `StreamListener`, `StreamDialer` |
-
-The bare `/ww/0.1.0` compatibility publication no longer exists. The
-process-local PID0 `Membrane` is not a network bootstrap.
-
-Protocol names are locators. They do not carry authority or schema identity.
-The protocol constructors reject empty names and names that contain `/`.
-
-### Vat services
-
-`VatListener` publishes an existing capability. It does not load or spawn a
-WASM process.
-
-- `serveRaw(cap, protocol)` accepts a vat stream and exposes `cap` directly.
-  This method is the explicit unauthenticated escape hatch.
-- `serveAuthenticated(cap, protocol, policy)` creates a fresh, single-use
-  `Terminal` for each inbound stream. The `Terminal` releases policy-selected
-  authority only after login succeeds within the configured deadline.
-
-Both methods stop their accept loops when their epoch guard becomes stale.
-Connection budgets limit concurrent inbound streams.
-
-`VatClient.dial(peer, protocol)` opens the named vat stream and returns the
-remote bootstrap capability. `connect()` in `crates/rpc/src/vat_dial.rs`
-starts the client-side `RpcSystem` driver before returning the capability. The
-caller's first typed method response reports bootstrap or transport failure.
-
-```text
-publisher                                         remote peer
----------                                         -----------
-existing capability
-        |
-VatListener.serveAuthenticated()
-        |
-fresh Terminal <--- /ww/0.1.0/vat/{protocol} ---> VatClient.dial()
-```
-
-### Byte-stream services
-
-`StreamListener.listen(executor, protocol, caps)` registers a named byte-stream
-handler. For each inbound `/ww/0.1.0/stream/{protocol}` connection, the
-listener:
-
-1. spawns one process through the supplied `Executor`;
-2. copies the registration-time `List(Export)` into the child's initial grants;
-3. pumps the network stream to the child's stdin;
-4. pumps the child's stdout to the network stream.
-
-`StreamDialer.dial(peer, protocol)` opens the named stream and returns a
-bidirectional `ByteStream` capability. The bytes have application-defined
-semantics.
-
-This raw stream path differs from vat publication. `StreamListener` spawns a
-process and wires bytes. `VatListener` serves an existing capability through a
-Cap'n Proto `RpcSystem`.
-
-### HTTP registration
-
-`HttpListener.listen(executor, prefix, caps)` is another explicit registration
-path. It creates an HTTP route, spawns one process per request, supplies CGI
-environment variables and request bytes, and reads the CGI response from
-stdout. The host does not select HTTP, byte-stream, or vat behavior from a
-WASM custom section.
-
-## Guest scheduling
-
-WASM guests use the cooperative `poll_loop` in `std/system/src/lib.rs`. Each
-cycle performs these actions:
-
-1. Poll the guest `RpcSystem` for inbound work.
-2. Poll the application future.
-3. If the cycle wrote RPC bytes, poll the `RpcSystem` again to flush them.
-4. Block in `wasi:io/poll` on the RPC reader, optional writer, additional
-   `PollSet` entries, or the idle timeout.
-
-The second RPC poll is required after application work queues an outbound
-call. Without that poll, the guest can block before it sends the request.
-
-The writer participates in the poll set only after a write attempt. Otherwise,
-the loop includes a 100 ms monotonic-clock pollable as protection against a
-missed host-stream wakeup.
-
-Host-side `RpcSystem` instances run as local Tokio tasks. `kernel::Generation`
-starts the kernel driver. `ExecutorImpl` starts ordinary-child drivers in
-`src/launcher.rs`.
-
-## Dormant WASI P3 host substrate
-
-`crates/cell/src/p3.rs` defines the host transport that the future atomic P3
-cutover will use. Current production Cells do not dispatch through this code.
-They continue to use the P2 process-local channel and guest scheduling above.
-
-The versioned `wetware:transport/connection@0.2.0` interface grants one ordered
-bidirectional byte connection. The guest supplies the outgoing P3 stream. The
-host returns the incoming P3 stream and a whole-connection completion future.
-The interface exposes no address selection, socket creation, pollable,
-scheduler state, or explicit flush operation. A second `open` call returns the
-fixed `connection already opened` failure.
-
-Each direction uses an independent bounded Tokio duplex stream with a 64 KiB
-capacity. P3 stream backpressure suspends a writer when the corresponding
-duplex buffer is full. The adapter does not add a payload queue. Bytes retain
-their order in each direction.
-
-The host output consumer reports a P3 write as complete only after the
-underlying `AsyncWrite` accepts the corresponding bytes and `poll_flush`
-returns success. The consumer retains the pending P3 operation across a
-pending flush. The guest does not need a transport-specific flush function.
-
-Directional close and connection completion have these meanings:
-
-| Event | Other direction | Connection completion |
 |---|---|---|
-| Guest drops outgoing | Host reads EOF | Waits for incoming direction |
-| Host closes its writer | Guest reads EOF | Waits for outgoing direction |
-| Guest drops incoming | Host writes fail locally | Waits for outgoing direction, then `Ok` |
-| Both directions close normally | Closed | `Ok` |
-| Underlying read, write, or flush fails | Terminates | `failed(string)` |
+| `/ww/0.1.0/vat/{protocol}` | Cap'n Proto RPC | `VatListener`, `VatClient` |
+| `/ww/0.1.0/stream/{protocol}` | Application bytes | `StreamListener`, `StreamDialer` |
 
-The error string is diagnostic only. The adapter selects fixed messages. It
-does not include host paths, addresses, implementation type names, secrets, or
-debug output.
+Protocol names locate streams. They do not grant authority or identify a
+schema. Constructors reject empty names and names that contain `/`.
 
-The native P3 regression fixture aborts the task that owns
-`Store::run_concurrent` and its Store while a stream read, a capacity-blocked
-stream write, and a monotonic-clock wait are live. Owner abort completes within
-the test bound. Both transport adapters drop, and the host observes EOF. The
-test adds no guest resource-order workaround or host polling timer.
+`VatListener` publishes an existing capability. `serveRaw` is the explicit
+unauthenticated path. `serveAuthenticated` creates a fresh single-use
+`Terminal` for each connection and releases policy-selected authority after
+login. Epoch expiry stops both accept loops.
 
-Wasmtime 48 only hard-cancels a concurrent guest task by dropping its Store.
-Dropping the host call future does not cancel that guest task. Concurrent-state
-emptiness therefore cannot be inspected after the supported hard-cancellation
-path because the Store no longer exists. PR-3 must add real `capnp_rpc`
-pending-request cancellation coverage.
+`VatClient.dial` starts its client-side `RpcSystem` before a typed method waits
+for a result. The first typed response reports bootstrap or transport failure.
 
-The same dormant harness shadows Wasmtime's P3 filesystem `open-at` method.
-Shared ABI-neutral policy code resolves `CidTree` and explicit `/ipfs` paths,
-materializes immutable content lazily, rejects writes, and confines host path
-joins. Standard P3 filesystem methods handle descriptors and the private
-read-write `/tmp` preopen. Store teardown releases descriptors and removes the
-private scratch and isolated-cache directories.
+`StreamListener.listen` spawns one process per inbound stream, supplies the
+registration-time initial grants, and pumps bytes through process stdin and
+stdout. `StreamDialer.dial` returns a bidirectional `ByteStream` capability.
 
-The fixture links only its imported WASI P3 CLI, clock, and filesystem
-interfaces plus the Wetware transport. The linker does not register WASI
-sockets. `scripts/check_native_p3_fixture.sh` validates the component, rejects
-non-0.3.x WASI imports, rejects socket imports, and runs the host regressions.
+`HttpListener.listen` creates an HTTP route, spawns one process per request,
+supplies CGI environment variables and request bytes, and reads the CGI
+response from stdout. The host never selects these modes from a WASM custom
+section.
 
-## Executor scheduling
+## Forward-progress constraints
 
-`ExecutorPool` in `src/services.rs` runs worker OS threads. Each worker has a
-current-thread Tokio runtime and a `LocalSet` because WASM stores and Cap'n
-Proto clients are local tasks. The pool assigns new cells to the least-loaded
-worker and uses round-robin assignment for equal loads.
+A live async Cell can serve Cap'n Proto requests while its application Future
+waits on supported P3 operations. Component Model P3 and the generated bindings
+drive suspension and resumption.
 
-Scheduled cells use Wasmtime fuel for cooperative yielding. See
-[fuel-scheduling.md](designs/fuel-scheduling.md) for the scheduling policy.
+The host must continue to drive the process-local `RpcSystem`. The guest root
+Future must retain its `RpcSystem`. Network vat clients must start their driver
+before awaiting derived promises. Application protocols must avoid call cycles
+where both peers await callbacks that neither side can poll.
 
-## Backpressure and lifetime
-
-The process-local duplex stream uses `PIPE_BUFFER_SIZE` from
-`crates/cell/src/proc.rs`. Guest writes obey the WASI output stream's
-`check_write()` budget. Network byte-stream pumps use bounded chunks and wait
-for their readers and writers.
-
-The host keeps each process-local `RpcSystem` driver alive with the process.
-Dropping the driver closes the RPC path. Guest code must keep `system::run()`,
-`system::run_with()`, or `system::serve()` active while it awaits RPC promises.
-
-`Process.bootstrap()` is parent-held authority exported by a guest through
-`system::serve()`. It is distinct from the host-provided `InitialGrants`
-bootstrap that the ordinary child receives.
-
-## Deadlock constraints
-
-The following constraints keep RPC progress possible:
-
-- The host must poll the process's `RpcSystem` while the process is active.
-- The guest must poll its `RpcSystem` while it awaits derived promises.
-- The guest poll loop must flush calls queued by the application future before
-  it blocks on WASI pollables.
-- A vat dialer must start its `RpcSystem` before awaiting a derived promise.
-- Application protocols must avoid call cycles in which both peers wait for
-  callbacks that neither peer can poll.
-
-Host-side vat clients use `connect()` in `crates/rpc/src/vat_dial.rs` for the
-required driver-before-await ordering. Guest code uses the `system` crate
-entry points instead of constructing an undriven `RpcSystem`.
+Non-yielding CPU work and synchronous blocking imports stop same-Cell async
+progress. Host fuel and epoch interruption still control Cell teardown.

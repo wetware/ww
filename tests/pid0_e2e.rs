@@ -10,7 +10,7 @@
 
 mod support;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -257,6 +257,12 @@ impl RunningNode {
         drop(self.stdin.take());
     }
 
+    fn write_stdin(&mut self, bytes: &[u8]) {
+        let stdin = self.stdin.as_mut().expect("child stdin is open");
+        stdin.write_all(bytes).expect("write child stdin");
+        stdin.flush().expect("flush child stdin");
+    }
+
     fn logs(&self) -> String {
         read_capture(&self.output)
     }
@@ -295,18 +301,27 @@ async fn version(client: &reqwest::Client, admin_addr: SocketAddr) -> Value {
         .expect("parse /version JSON")
 }
 
-async fn assert_status_route(client: &reqwest::Client, http_addr: SocketAddr) {
-    let status: Value = client
+async fn assert_status_route(client: &reqwest::Client, http_addr: SocketAddr, node: &RunningNode) {
+    let response = client
         .get(format!("http://{http_addr}/status"))
         .timeout(Duration::from_secs(20))
         .send()
         .await
-        .expect("query Rust PID0 /status route")
-        .error_for_status()
-        .expect("/status should return HTTP 200")
-        .json()
-        .await
-        .expect("parse /status JSON");
+        .expect("query Rust PID0 /status route");
+    let response_status = response.status();
+    let body = response.text().await.expect("read /status body");
+    assert_eq!(
+        response_status,
+        reqwest::StatusCode::OK,
+        "/status failed; body={body:?}\n{}",
+        node.logs()
+    );
+    let status: Value = serde_json::from_str(&body).unwrap_or_else(|error| {
+        panic!(
+            "parse /status JSON: {error}; body={body:?}\n{}",
+            node.logs()
+        )
+    });
     assert_eq!(status["status"], "ok");
     assert!(
         status["peer_id"]
@@ -320,23 +335,40 @@ async fn assert_status_cell(
     client: &reqwest::Client,
     http_addr: SocketAddr,
     expected_cell_cid: &cid::Cid,
+    node: &RunningNode,
 ) {
     let response = client
         .get(format!("http://{http_addr}/status"))
         .timeout(Duration::from_secs(20))
         .send()
         .await
-        .expect("query Rust PID0 /status route")
-        .error_for_status()
-        .expect("/status should return HTTP 200");
+        .expect("query Rust PID0 /status route");
+    let response_status = response.status();
     let observed_cell_cid = response
         .headers()
         .get("X-Wetware-Cell")
-        .expect("/status response omitted X-Wetware-Cell")
-        .to_str()
-        .expect("X-Wetware-Cell must be UTF-8");
-    assert_eq!(observed_cell_cid, expected_cell_cid.to_string());
-    let status: Value = response.json().await.expect("parse /status JSON");
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.text().await.expect("read /status body");
+    assert_eq!(
+        response_status,
+        reqwest::StatusCode::OK,
+        "/status failed; body={body:?}\n{}",
+        node.logs()
+    );
+    let expected_cell_cid = expected_cell_cid.to_string();
+    assert_eq!(
+        observed_cell_cid.as_deref(),
+        Some(expected_cell_cid.as_str()),
+        "/status response had an invalid X-Wetware-Cell header; body={body:?}\n{}",
+        node.logs()
+    );
+    let status: Value = serde_json::from_str(&body).unwrap_or_else(|error| {
+        panic!(
+            "parse /status JSON: {error}; body={body:?}\n{}",
+            node.logs()
+        )
+    });
     assert_eq!(status["status"], "ok");
     assert!(
         status["peer_id"]
@@ -945,7 +977,7 @@ async fn wait_for_pin_release(client: &reqwest::Client, kubo_addr: SocketAddr, c
 mod rust_lifecycle {
     use super::*;
 
-    async fn boot_and_tty_driver() {
+    async fn tty_stdin_and_status_route_driver() {
         let _guard = e2e_lock().await;
         let status_wasm = required_artifact(STATUS_WASM_PATH);
         assert!(
@@ -998,7 +1030,28 @@ mod rust_lifecycle {
             blake3::hash(&kernel_wasm).to_hex().to_string(),
             "the host must report the exact selected pid0 artifact"
         );
-        assert_status_cell(&client, http_addr, &ww::kernel::runtime_cid(&status_wasm)).await;
+        // `/status` exercises the host HttpListener registration and a
+        // separate status Cell. Production PID0 exports no guest bootstrap,
+        // so this request does not probe a PID0-served capability.
+        assert_status_cell(
+            &client,
+            http_addr,
+            &ww::kernel::runtime_cid(&status_wasm),
+            &node,
+        )
+        .await;
+
+        node.write_stdin(b"p3-input-resume-probe\n");
+        wait_for_log(&mut node, "terminal input", "received").await;
+        // The PID0 log above proves non-EOF P3 stdin resumed its application
+        // branch. This second request separately proves route liveness.
+        assert_status_cell(
+            &client,
+            http_addr,
+            &ww::kernel::runtime_cid(&status_wasm),
+            &node,
+        )
+        .await;
 
         // Stdin EOF ends the interactive PID0 with exit 0, and the host
         // propagates that exact code.
@@ -1067,7 +1120,7 @@ mod rust_lifecycle {
         let ready_url = format!("http://{admin_addr}/readyz");
 
         wait_for_ready(&client, &ready_url, &mut node).await;
-        assert_status_cell(&client, http_addr, &cid_a).await;
+        assert_status_cell(&client, http_addr, &cid_a, &node).await;
 
         let second = atom.set_head(&epoch2.cid).await;
         assert!(
@@ -1105,7 +1158,7 @@ mod rust_lifecycle {
 
         let recovered = wait_for_ready(&client, &ready_url, &mut node).await;
         assert_eq!(recovered["phase"], "ready");
-        assert_status_cell(&client, http_addr, &cid_b).await;
+        assert_status_cell(&client, http_addr, &cid_b, &node).await;
         wait_for_pin_release(&client, kubo_addr, &epoch1.cid).await;
         assert!(
             node.try_wait().is_none(),
@@ -1160,7 +1213,7 @@ mod rust_lifecycle {
         let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
         let ready_url = format!("http://{admin_addr}/readyz");
         wait_for_ready(&client, &ready_url, &mut node).await;
-        assert_status_cell(&client, http_addr, &cid_a).await;
+        assert_status_cell(&client, http_addr, &cid_a, &node).await;
 
         // Each mined head is polled from finalized-depth chain state. Mine the
         // intermediate update before the final update to exercise both local
@@ -1174,7 +1227,7 @@ mod rust_lifecycle {
 
         wait_for_not_ready(&client, admin_addr, &mut node).await;
         wait_for_ready(&client, &ready_url, &mut node).await;
-        assert_status_cell(&client, http_addr, &cid_c).await;
+        assert_status_cell(&client, http_addr, &cid_c, &node).await;
         assert!(
             node.try_wait().is_none(),
             "daemon exited during rapid updates\n{}",
@@ -1243,7 +1296,7 @@ mod rust_lifecycle {
         let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
         let ready_url = format!("http://{admin_addr}/readyz");
         wait_for_ready(&client, &ready_url, &mut node).await;
-        assert_status_cell(&client, http_addr, &cid_a).await;
+        assert_status_cell(&client, http_addr, &cid_a, &node).await;
 
         atom.set_head(&invalid.cid).await;
         wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
@@ -1312,8 +1365,8 @@ mod rust_lifecycle {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rust_pid0_boot_and_tty() {
-        boot_and_tty_driver().await;
+    async fn rust_pid0_tty_input_resumes_guest_status_route_remains_live_and_eof_exits_zero() {
+        tty_stdin_and_status_route_driver().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1395,7 +1448,7 @@ async fn local_kernel_path_reaches_ready_and_cli_overrides_env() {
         identity["kernel_wasm_blake3"],
         blake3::hash(&selected_kernel).to_hex().to_string()
     );
-    assert_status_route(&client, http_addr).await;
+    assert_status_route(&client, http_addr, &node).await;
 
     node.close_stdin();
     let exit = node.wait(EXIT_TIMEOUT).await;
@@ -1475,7 +1528,7 @@ async fn kubo_cid_kernel_reaches_ready_and_reports_source_and_runtime_cids() {
         identity["kernel_cid"],
         ww::kernel::runtime_cid(&kernel_wasm).to_string()
     );
-    assert_status_route(&client, http_addr).await;
+    assert_status_route(&client, http_addr, &node).await;
 
     node.close_stdin();
     let exit = node.wait(EXIT_TIMEOUT).await;
@@ -1548,7 +1601,7 @@ async fn host_transient_epoch_preparation_recovers_without_restoring_old_generat
             let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
             let ready_url = format!("http://{admin_addr}/readyz");
             wait_for_ready(&client, &ready_url, &mut node).await;
-            assert_status_cell(&client, http_addr, &cid_a).await;
+            assert_status_cell(&client, http_addr, &cid_a, &node).await;
             atom.set_head(&epoch2.cid).await;
             wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
             let deadline = Instant::now() + INVALIDATION_TIMEOUT;
@@ -1562,11 +1615,21 @@ async fn host_transient_epoch_preparation_recovers_without_restoring_old_generat
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            while count_log_lines(&node.logs(), "Transient deployment preparation failure") < 2 {
+                assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node)
+                    .await;
+                assert!(
+                    Instant::now() < deadline,
+                    "Host did not report two retries\n{}",
+                    node.logs()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node).await;
 
             release_tx.send(true).unwrap();
             wait_for_ready(&client, &ready_url, &mut node).await;
-            assert_status_cell(&client, http_addr, &cid_b).await;
+            assert_status_cell(&client, http_addr, &cid_b, &node).await;
             let logs = node.logs();
             assert!(
                 count_log_lines(&logs, "Transient deployment preparation failure") >= 2,
@@ -1611,7 +1674,7 @@ async fn host_epoch_preparation_supersession_activates_only_latest_target() {
             let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
             let ready_url = format!("http://{admin_addr}/readyz");
             wait_for_ready(&client, &ready_url, &mut node).await;
-            assert_status_cell(&client, http_addr, &cid_a).await;
+            assert_status_cell(&client, http_addr, &cid_a, &node).await;
 
             atom.set_head(&epoch2.cid).await;
             wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
@@ -1626,7 +1689,7 @@ async fn host_epoch_preparation_supersession_activates_only_latest_target() {
             atom.set_head(&epoch3.cid).await;
             wait_for_log(&mut node, "Advancing deployment epoch", "seq=2").await;
             wait_for_ready(&client, &ready_url, &mut node).await;
-            assert_status_cell(&client, http_addr, &cid_c).await;
+            assert_status_cell(&client, http_addr, &cid_c, &node).await;
             wait_for_pin_release(&client, kubo_addr, &epoch2.cid).await;
             let logs = node.logs();
             assert_eq!(
@@ -1733,7 +1796,7 @@ async fn superseded_pending_generation_converges_to_the_newer_epoch() {
                 "superseded generation did not converge within the test bound\n{}",
                 node.logs()
             );
-            assert_status_cell(&client, http_addr, &cid_c).await;
+            assert_status_cell(&client, http_addr, &cid_c, &node).await;
             let logs = node.logs();
             assert!(
                 !logs.contains("event_code=2"),
