@@ -20,8 +20,16 @@
 
 use capnp::capability::FromClientHook;
 use std::future::Future;
-use wasip2::cli::stderr::get_stderr;
-use wasip2::exports::cli::run::Guest;
+use system::Guest;
+
+#[cfg(target_arch = "wasm32")]
+mod wasi {
+    wit_bindgen::generate!({
+        path: "../system/wit",
+        world: "monotonic",
+        generate_all,
+    });
+}
 
 #[allow(dead_code)]
 mod system_capnp {
@@ -33,7 +41,11 @@ mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
 
-#[allow(dead_code, clippy::match_single_binding)]
+#[allow(
+    dead_code,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
 mod auth_capnp {
     include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
 }
@@ -81,10 +93,7 @@ impl log::Log for StderrLogger {
         true
     }
     fn log(&self, record: &log::Record<'_>) {
-        let stderr = get_stderr();
-        let _ = stderr.blocking_write_and_flush(
-            format!("[status][{}] {}\n", record.level(), record.args()).as_bytes(),
-        );
+        eprintln!("[status][{}] {}", record.level(), record.args());
     }
     fn flush(&self) {}
 }
@@ -118,45 +127,11 @@ async fn timeout_future<F>(future: F, timeout_ns: u64) -> Option<F::Output>
 where
     F: Future,
 {
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-
-    struct WasiDeadline<F> {
-        future: Pin<Box<F>>,
-        deadline_ns: u64,
+    let deadline = wasi::wasi::clocks::monotonic_clock::wait_for(timeout_ns);
+    match futures::future::select(Box::pin(future), Box::pin(deadline)).await {
+        futures::future::Either::Left((value, _)) => Some(value),
+        futures::future::Either::Right(((), _)) => None,
     }
-
-    impl<F> Future for WasiDeadline<F>
-    where
-        F: Future,
-    {
-        type Output = Option<F::Output>;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            if wasip2::clocks::monotonic_clock::now() >= self.deadline_ns {
-                return Poll::Ready(None);
-            }
-
-            let this = self.as_mut().get_mut();
-            match this.future.as_mut().poll(cx) {
-                Poll::Ready(value) => Poll::Ready(Some(value)),
-                Poll::Pending => {
-                    if wasip2::clocks::monotonic_clock::now() >= this.deadline_ns {
-                        Poll::Ready(None)
-                    } else {
-                        Poll::Pending
-                    }
-                }
-            }
-        }
-    }
-
-    let deadline_ns = wasip2::clocks::monotonic_clock::now().saturating_add(timeout_ns);
-    WasiDeadline {
-        future: Box::pin(future),
-        deadline_ns,
-    }
-    .await
 }
 
 async fn host_id(host: &system_capnp::host::Client) -> Option<String> {
@@ -217,7 +192,7 @@ async fn build_status_json(host_cap: Option<system_capnp::host::Client>) -> Stri
     serde_json::to_string(&body).unwrap_or_else(|_| r#"{"status":"err","reason":"json"}"#.into())
 }
 
-fn run_http() -> Result<(), ()> {
+async fn run_http() -> Result<(), ()> {
     use wagi_guest as wagi;
 
     system::run(|initial_grants: InitialGrants| async move {
@@ -229,29 +204,30 @@ fn run_http() -> Result<(), ()> {
         }
 
         let json = build_status_json(host_cap).await;
-        // `respond_bytes` flushes explicitly; plain `respond` uses `print!`
-        // and can lose buffered bytes on cell teardown (the body sat in
-        // the stdout buffer while only the headers shipped).
-        wagi::respond_bytes(
+        wagi::respond_bytes_async(
             200,
             &[("Content-Type", "application/json")],
             json.as_bytes(),
-        );
+        )
+        .await
+        .map_err(capnp::Error::failed)?;
         Ok(())
-    });
-
-    Ok(())
+    })
+    .await
+    .map_err(|error| {
+        log::error!("status RPC failed: {error}");
+    })
 }
 
 struct StatusGuest;
 
 impl Guest for StatusGuest {
-    fn run() -> Result<(), ()> {
+    async fn run() -> Result<(), ()> {
         init_logging();
 
         // HTTP/WAGI mode: detected by CGI env var presence.
         if std::env::var("REQUEST_METHOD").is_ok() {
-            return run_http();
+            return run_http().await;
         }
 
         // Non-WAGI invocation: not a supported mode for status. Exit cleanly.
@@ -260,7 +236,7 @@ impl Guest for StatusGuest {
     }
 }
 
-wasip2::cli::command::export!(StatusGuest);
+system::export!(StatusGuest);
 
 #[cfg(test)]
 mod tests {

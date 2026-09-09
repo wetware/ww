@@ -4,9 +4,10 @@ This document covers the design and rationale of the cooperative fuel
 scheduler that multiplexes WASM cells onto executor worker threads.
 
 Primary code references:
-- `src/sched.rs` — constants
-- `src/cell/proc.rs` — `FuelEstimator`, call_hook, epoch_deadline_callback
-- `src/runtime.rs` — `ExecutorPool`, epoch tick task
+
+- `crates/cell/src/sched.rs` — constants
+- `crates/cell/src/proc.rs` — `FuelEstimator`, call hook, epoch callback
+- `src/services.rs` — `ExecutorPool` and epoch tick task
 
 ## Problem
 
@@ -39,6 +40,15 @@ At each `ReturningFromHost` boundary (a WASI import completing):
 consumed = budget - remaining
 ratio    = consumed * RATIO_SCALE / budget     // 0..1000
 ```
+
+Wasmtime also emits call hooks for internal libcalls and fuel or epoch yields.
+The Store therefore records one marker for each live `CallingHost` frame. A
+linked import marks only its current frame. The matching `ReturningFromHost`
+pops that frame and updates EWMA only when the frame is marked.
+
+The frame stack preserves nested or overlapping P3 transitions. Two live
+imports cannot collapse into one boolean marker, and an unmarked internal
+return cannot consume a marked outer frame.
 
 ### EWMA update
 
@@ -96,20 +106,20 @@ The estimator observes the remaining fuel, updates the EWMA, and reloads
 the store with the new budget.  This is the fast path for cells that
 make frequent host calls.
 
-Each call increments `host_calls_this_epoch` to signal the epoch
-callback that this cell is already being observed.
+Each marked return increments `host_calls_this_epoch`. The epoch callback then
+knows that the call hook already observed the Cell during this epoch.
 
 ### Path 2 — epoch_deadline_callback (compute-bound cells)
 
 Fires every `EPOCH_TICK_MS` (10 ms) when the epoch tick task calls
-`Engine::increment_epoch()`.  This is the safety net for cells that
-never (or rarely) make host calls — without it, a pure-compute cell
-would exhaust its fuel and trap.
+`Engine::increment_epoch()`. This path observes and refuels Cells that have no
+linked host-call return during the epoch.
 
 The callback checks `host_calls_this_epoch`:
 
-- **Zero** — cell is compute-bound.  Observe full consumption
-  (`on_host_return(0)`) so the EWMA converges toward MIN_FUEL.
+- **Zero** — pass the Store's actual remaining fuel to `on_host_return`.
+  Component Model I/O with low consumption stays near `MAX_FUEL`. Work that
+  consumes most of its budget converges toward `MIN_FUEL`.
 - **Non-zero** — cell made host calls; the call_hook already updated the
   EWMA.  Just refuel without re-observing (prevents double-counting).
 

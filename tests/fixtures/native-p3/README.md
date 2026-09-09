@@ -1,10 +1,10 @@
 # Native WASI P3 fixture
 
-This isolated fixture exercises the dormant production P3 host substrate. Its
+This isolated fixture exercises the production P3 host adapters. Its
 async exports cover ordered transport, bounded backpressure, delayed flush,
 half-close, abnormal failure, `Store::run_concurrent` owner abort, and CidTree
-filesystem policy. The guest contains no Tokio, custom scheduler, PollSet, parker, or
-production dispatch.
+filesystem policy. The guest contains no Tokio, custom scheduler, `PollSet`,
+parker, Cap'n Proto RPC, or first-party application composition.
 
 The build lane pins this tuple:
 
@@ -43,12 +43,14 @@ The command builds
 `target/native-p3-fixture/wasm32-wasip3/release/native_p3_fixture.wasm`.
 The command then runs `wasm-tools validate --features all`, prints the
 component WIT, and rejects every WASI import that is not version `0.3.x`.
-The command also rejects WASI socket imports and runs the ignored host artifact
-tests with `WW_NATIVE_P3_FIXTURE` set to the validated component.
+The command also rejects WASI socket imports and interfaces outside the
+fixture-specific allowlist. It then runs the ignored host artifact tests with
+`WW_NATIVE_P3_FIXTURE` set to the validated component.
 
 The fixture uses real P3 streams, futures, clocks, and filesystem calls. It
-does not contain Cap'n Proto. PR-3 must add real-RPC cancellation coverage when
-the guest runtime moves to the ordinary Rust root future.
+isolates the host adapters from the production Cap'n Proto guest session.
+Production RPC concurrency, transport-failure propagation, and cancellation
+coverage live in the ordinary Cell integration tests.
 
 Do not run `rustup target add wasm32-wasip3`. Rustup does not distribute the
 Tier 3 target's standard library. This lane builds the standard library from

@@ -186,9 +186,9 @@ usable by trusted FHS configuration or a future Warrant/ICME adapter.
 **Depends on:** Dual DHT (architecturally orthogonal but LAN DHT should exist first so mDNS has a routing table to feed)
 
 ## Multi-language WAGI examples (Go, Python)
-**What:** WAGI cell examples in Go (via TinyGo) and Python (via componentize-py). Proves that any language compiling to wasm32-wasip2 can serve HTTP through Wetware.
+**What:** WAGI cell examples in Go and Python after their toolchains emit compatible native WASI P3 components.
 **Why:** The WAGI model's main selling point is language-agnostic WAGI cells. Rust-only examples don't demonstrate this.
-**Context:** TinyGo targets wasm32-wasip2 natively. componentize-py wraps CPython into a WASI component. Both toolchains are maturing but have sharp edges. Defer until toolchains stabilize and the Rust WAGI path is proven in production.
+**Context:** The production host accepts P3 components only. Defer until these language toolchains support the required P3 CLI ABI and import policy.
 **Effort:** M
 **Priority:** P3
 **Depends on:** WAGI host implementation (done)
@@ -244,7 +244,7 @@ usable by trusted FHS configuration or a future Warrant/ICME adapter.
 ## Write doc/ARCHITECTURE.md (daemon runtime topology overview)
 **What:** A 10-minute-readable overview of the daemon's runtime topology for new contributors and re-onboarding founders. Cover: (a) the Service-based pattern (`src/services.rs`) — each long-lived component on its own thread with `current_thread + LocalSet`; (b) the singleton-backing-state + per-connection-dispatcher pattern (`HostImpl`, `RuntimeImpl` are thin dispatchers; expensive state in shared `Send + Clone` references); (c) ExecutorPool — M workers, mpsc-distributed `SpawnRequest`s, shared `Arc<Engine>`; (d) fuel/epoch scheduling — cooperative yield, atomic epoch bumps, refuel via `epoch_deadline_callback`; (e) membrane graft model — `HostGraftBuilder` assembles each graft, and Cap'n Proto clients are `!Send`, so capability routing is single-threaded; (f) the Cap'n Proto surface exposed by `Host::network()`, including HTTP, byte-stream, and authenticated vat transport. Diagrams in ASCII per project convention.
 **Why:** Three architectural mistakes in the lthibault/ww-shell-usable design session were re-derivations of things the codebase already knows but doesn't document: (1) wrongly assumed daemon main was the runtime everything lived on (true in form, but every long-lived component is on its own thread); (2) muddled the "where does cap state live" question (HostImpl per-connection vs. singleton state); (3) framed pre-warm as "spawn idle cell" rather than "compile cache at startup." All three would have been caught by a 10-minute architecture overview. Each subsequent contributor saves the re-derivation cost.
-**Context:** Reference points: `src/services.rs` (Service trait, ExecutorPool, worker_loop); `crates/rpc/src/lib.rs` (`HostImpl` and the test-only `build_test_peer_rpc` fixture); `src/launcher.rs:42-130` (RuntimeImpl singleton); `std/system/src/lib.rs:570-680` (cell-side serve() and poll_loop). Existing `doc/architecture.md` covers the conceptual stack (cells/membranes/ocap) — the new doc complements it with daemon runtime mechanics, doesn't duplicate.
+**Context:** Reference points: `src/services.rs` (Service trait, ExecutorPool, worker loop); `crates/rpc/src/lib.rs` (`HostImpl` and test fixtures); `src/launcher.rs` (Runtime and Process lifecycle); `std/system/src/lib.rs` (P3 session composition). Existing `doc/architecture.md` covers the conceptual stack. The new doc must complement it without duplication.
 **Effort:** M (human) → S-M (CC, with a /design-consultation pass to set scope)
 **Priority:** P2 (offsets onboarding cost; each deferred day is another contributor onboarding into ambiguity)
 **Depends on:** none

@@ -11,12 +11,17 @@
 //!
 //! Requires pre-built status WASM: `make -C std/status`.
 
+#[path = "support/ticked_executor.rs"]
+mod ticked_executor;
+
 use tokio::sync::{mpsc, watch};
 
 use ww::dispatcher::wagi;
 use ww::launcher::create_runtime_client;
 use ww::rpc::{CachePolicy, NetworkState};
 use ww::system_capnp;
+
+use ticked_executor::TickedExecutor;
 
 const STATUS_WASM_PATH: &str = "std/status/bin/status.wasm";
 
@@ -65,8 +70,16 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
             let stream_control = libp2p_stream::Behaviour::new().new_control();
 
             let (swarm_tx, _swarm_rx) = mpsc::channel(16);
-            let runtime =
-                create_runtime_client(false, guard.clone(), None, None, CachePolicy::Shared);
+            // The real status Cell runs on the production shared Engine. The
+            // retained ExecutorPool advances its epoch every 10 ms.
+            let ticked = TickedExecutor::new();
+            let runtime = create_runtime_client(
+                false,
+                guard.clone(),
+                Some(ticked.engine()),
+                None,
+                CachePolicy::Shared,
+            );
             let host: system_capnp::host::Client = capnp_rpc::new_client(ww::rpc::HostImpl::new(
                 network_state,
                 swarm_tx,

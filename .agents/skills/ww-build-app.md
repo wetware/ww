@@ -68,8 +68,12 @@ Based on discovery, produce a concrete design.  Cover:
   endpoints. For byte streams, define the wire format.
 - **Image layout**: what goes in `bin/`, `svc/`, `etc/`.
   Reference `doc/images.md`.
-- **Build pipeline**: source → WASI P2 component. Reference
-  `examples/counter/Makefile` as a Rust template.
+- **Build pipeline**: source → native `wasm32-wasip3` component. Select the
+  async `guest` world for a Cap'n Proto session or the runtime-free
+  `sync-command` world for finite stdio work. Reference
+  `examples/counter/Makefile` and `scripts/build_wasip3_component.sh`. Declare
+  the artifact's exact import allowlist; the build rejects WASI 0.2, socket,
+  and out-of-allowlist imports.
 - **Capability map**: which capabilities each agent needs.  Flag
   anything that could be attenuated.  Reference `doc/capabilities.md`.
 - **Membrane design**: what pid0 exports, what children receive.

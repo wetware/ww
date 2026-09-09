@@ -20,8 +20,16 @@ use capnp_rpc::pry;
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
 use shakmaty::{Chess, EnPassantMode, Position};
-use wasip2::cli::stderr::get_stderr;
-use wasip2::exports::cli::run::Guest;
+use system::Guest;
+
+#[cfg(target_arch = "wasm32")]
+mod wasi {
+    wit_bindgen::generate!({
+        path: "../../std/system/wit",
+        world: "monotonic-random",
+        generate_all,
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Cap'n Proto generated modules
@@ -122,10 +130,7 @@ impl log::Log for StderrLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let stderr = get_stderr();
-        let _ = stderr.blocking_write_and_flush(
-            format!("[{}] {}\n", record.level(), record.args()).as_bytes(),
-        );
+        eprintln!("[{}] {}", record.level(), record.args());
     }
 
     fn flush(&self) {}
@@ -269,15 +274,40 @@ impl chess_capnp::chess_engine::Server for ChessEngineImpl {
 /// Creates a ChessEngine and exports it as the bootstrap capability.
 /// The host bridges this cap to the connecting peer. The process stays
 /// alive until the host drops the connection.
-fn run_cell() {
+async fn run_cell() -> Result<(), capnp::Error> {
     let engine = ChessEngineImpl::new();
     let client: chess_capnp::chess_engine::Client = capnp_rpc::new_client(engine);
     log::info!("cell: exporting ChessEngine via RPC");
     system::serve(client.client, |_initial_grants: InitialGrants| async move {
         // Keep alive until the host drops the RPC connection.
-        // drive_rpc_with_future exits when rpc_done becomes true.
+        // The root future exits when the RPC system completes.
         std::future::pending().await
-    });
+    })
+    .await
+}
+
+async fn sleep_ns(duration: u64) {
+    #[cfg(target_arch = "wasm32")]
+    wasi::wasi::clocks::monotonic_clock::wait_for(duration).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = duration;
+        std::future::pending::<()>().await;
+    }
+}
+
+fn random_below(upper: u64) -> u64 {
+    assert!(upper > 0, "random range is not empty");
+    #[cfg(target_arch = "wasm32")]
+    let value = wasi::wasi::random::random::get_random_u64();
+    #[cfg(not(target_arch = "wasm32"))]
+    let value = rand::random::<u64>();
+    value % upper
+}
+
+#[cfg(test)]
+fn random_index(upper: usize) -> usize {
+    random_below(upper as u64) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -313,10 +343,7 @@ impl routing_capnp::provider_sink::Server for RpcDialingSink {
                 log::error!("game vs {} failed: {e}", short_id(&peer));
             }
             // Pause between games so the output is readable.
-            let pause = wasip2::clocks::monotonic_clock::subscribe_duration(
-                5_000_000_000, // 5s
-            );
-            pause.block();
+            sleep_ns(5_000_000_000).await;
             Ok(())
         })
     }
@@ -399,7 +426,7 @@ async fn play_rpc_game(
         }
 
         let white_move = moves
-            .get(rand::random_range(0..moves.len()))?
+            .get(random_below(moves.len() as u64) as u32)?
             .to_str()
             .map_err(|e| capnp::Error::failed(format!("invalid move UTF-8: {e}")))?
             .to_string();
@@ -449,7 +476,7 @@ async fn play_rpc_game(
         }
 
         let black_move = moves
-            .get(rand::random_range(0..moves.len()))?
+            .get(random_below(moves.len() as u64) as u32)?
             .to_str()
             .map_err(|e| capnp::Error::failed(format!("invalid move UTF-8: {e}")))?
             .to_string();
@@ -563,11 +590,8 @@ async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> 
             cooldown_ms = (cooldown_ms * 2).min(MAX_MS);
         }
 
-        let delay_ms = cooldown_ms / 2 + rand::random_range(0..=cooldown_ms / 2);
-        let pause = wasip2::clocks::monotonic_clock::subscribe_duration(
-            delay_ms * 1_000_000, // ms -> ns
-        );
-        pause.block();
+        let delay_ms = cooldown_ms / 2 + random_below(cooldown_ms / 2 + 1);
+        sleep_ns(delay_ms * 1_000_000).await;
     }
 }
 
@@ -578,26 +602,29 @@ async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> 
 struct ChessGuest;
 
 impl Guest for ChessGuest {
-    fn run() -> Result<(), ()> {
+    async fn run() -> Result<(), ()> {
         init_logging();
-        match std::env::args().nth(1).as_deref() {
+        let result = match std::env::args().nth(1).as_deref() {
             Some("serve") => {
                 log::info!("chess: serve — discovery + game loop");
                 system::run(|initial_grants: InitialGrants| async move {
                     run_service(initial_grants).await
-                });
+                })
+                .await
             }
             _ => {
                 // Default (no args): cell mode — export the ChessEngine capability.
-                run_cell();
+                run_cell().await
             }
-        }
-        Ok(())
+        };
+        result.map_err(|error| {
+            log::error!("chess RPC failed: {error}");
+        })
     }
 }
 
 #[cfg(target_arch = "wasm32")]
-wasip2::cli::command::export!(ChessGuest);
+system::export!(ChessGuest);
 
 // ---------------------------------------------------------------------------
 // Unit tests (native, no RPC needed)
@@ -693,7 +720,7 @@ mod tests {
             if moves.is_empty() {
                 break;
             }
-            let white_move = &moves[rand::random_range(0..moves.len())];
+            let white_move = &moves[random_index(moves.len())];
             engine.apply(white_move).unwrap();
             move_num += 1;
 
@@ -706,7 +733,7 @@ mod tests {
             if moves.is_empty() {
                 break;
             }
-            let black_move = &moves[rand::random_range(0..moves.len())];
+            let black_move = &moves[random_index(moves.len())];
             engine.apply(black_move).unwrap();
 
             if engine.status() != GameStatus::Ongoing || move_num >= max_moves {
@@ -883,7 +910,7 @@ mod tests {
                     }
 
                     let m = moves
-                        .get(rand::random_range(0..moves.len()))
+                        .get(random_below(moves.len() as u64) as u32)
                         .unwrap()
                         .to_str()
                         .unwrap();
@@ -911,7 +938,7 @@ mod tests {
                     }
 
                     let m = moves
-                        .get(rand::random_range(0..moves.len()))
+                        .get(random_below(moves.len() as u64) as u32)
                         .unwrap()
                         .to_str()
                         .unwrap();
@@ -964,7 +991,7 @@ mod tests {
         // Must produce values in [cooldown/2, cooldown].
         for cooldown in [BASE_MS, 4_000, 64_000, MAX_MS] {
             for _ in 0..500 {
-                let delay = cooldown / 2 + rand::random_range(0..=cooldown / 2);
+                let delay = cooldown / 2 + random_below(cooldown / 2 + 1);
                 assert!(
                     delay >= cooldown / 2,
                     "delay {delay} < floor {} (cooldown={cooldown})",
@@ -980,7 +1007,7 @@ mod tests {
         // After capping at MAX_MS, the jitter must never exceed it.
         let cooldown = MAX_MS;
         for _ in 0..1000 {
-            let delay = cooldown / 2 + rand::random_range(0..=cooldown / 2);
+            let delay = cooldown / 2 + random_below(cooldown / 2 + 1);
             assert!(delay <= MAX_MS, "delay {delay} exceeds MAX_MS {MAX_MS}");
         }
     }

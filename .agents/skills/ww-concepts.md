@@ -44,7 +44,10 @@ Wetware addresses it.  One concept at a time.
 Key files: `doc/architecture.md`, `doc/api/wasm-guest.md`, and
 `capnp/system.capnp`
 
-A Cell is a WASI P2 component that runs in the WASM sandbox.
+A Cell is a native WASI P3 component that runs in the WASM sandbox. Async
+Cells use Wasmtime P3 suspension and one generated root Future. Synchronous
+Cells can use the smaller `sync-command` world without `std/system` or Cap'n
+Proto RPC.
 Transport is selected when a capability holder registers or publishes a
 service. The host does not infer transport from a WASM custom section.
 
@@ -79,12 +82,12 @@ Present one row at a time, explain each, check in.
 
 | Unix | Wetware | Key difference |
 |------|---------|---------------|
-| process | Cell | Cell = WASM binary in a sandbox.  No ambient env, no fs, no sockets.  A process can do anything the OS allows; a Cell can only do what its capabilities permit. |
+| process | Cell | Cell = WASM binary in a sandbox. No ambient env, host filesystem, or sockets. The linker provides only declared P3 interfaces. A process can do anything the OS allows; a Cell can only do what its capabilities permit. |
 | fork/exec | `runtime.load(wasm)` → `executor.spawn()` | Parent explicitly passes capabilities to child.  No inheritance of open fds, env vars, or fs access — you grant exactly what the child needs. |
 | file descriptor | Cap'n Proto client | Both are opaque handles.  But Unix fds live in a global namespace (paths) — any process can `open("/etc/passwd")`.  A capnp client is unforgeable and can only be obtained by explicit handoff. |
 | syscall table | Membrane → `graft()` | Both are the interface to kernel services. The syscall table is fixed and ambient. `graft()` returns a `List(Export)` of named capability references. Only trusted PID0 receives the graft-capable `Membrane`. |
 | `ioctl(fd, ...)` | method call on cap | Both operate on a handle. Cap'n Proto calls are typed, async, and pipelined. A caller can pipeline `Executor.spawn()` on the result of `Runtime.load(wasm)`. |
-| filesystem | WASI VFS over IPFS + `$WW_ROOT` | No writable local fs in the sandbox.  Content is read through the WASI virtual filesystem — `open("$WW_ROOT/bin/foo.wasm")` transparently resolves `/ipfs/<cid>/...` paths.  Content-addressed, not capability-gated. |
+| filesystem | WASI VFS over IPFS + `$WW_ROOT` | The immutable image root is read through the P3 virtual filesystem. A private writable `/tmp` is the only writable preopen. Content is content-addressed, not ambient host filesystem access. |
 | `open()` returns fd | `graft()` returns `List(Export)` | `open()` grants access to anything the path resolves to. `graft()` returns named references such as `identity`, `host`, `runtime`, `routing`, `authority`, and `ipfs`; `http-client` is conditional. Omitted exports are absent, not null. |
 | signals | epoch lifecycle | Unix signals are fire-and-forget. An epoch advance makes host-issued capabilities stale. The Host terminates the old PID0 and starts a fresh PID0 for the new generation. |
 | pipe | `ByteStream` (`capnp/system.capnp`) | Both connect two processes via read/write.  But ByteStream is a capability — it can be passed to third parties, attenuated, or revoked. |

@@ -1,4 +1,4 @@
-# Dormant P3 host WIT
+# Production P3 host WIT
 
 `transport.wit` is the production contract for one authority-granted ordered
 bidirectional byte connection. `fixture.wit` adds test-only exports for the
@@ -9,5 +9,6 @@ explicit flush verb to the transport interface. The Rust host adapter owns
 bounded buffering, backpressure, flush-gated completion, half-close, and
 sanitized failure behavior.
 
-Current production Cells still import `wetware:streams@0.1.0` through WASI P2.
-The P3 package remains dormant until the atomic guest cutover.
+Production Cells import this interface through `std/system`. `Proc` places one
+`GrantedTransport` in each Store and returns the matching `HostTransport` to
+the host-side Cap'n Proto driver.

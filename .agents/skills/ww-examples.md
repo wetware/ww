@@ -48,7 +48,9 @@ Walk through together:
 2. **Why it matters**: `StreamListener.listen()` wires each connection to a
    guest through stdin/stdout.
 3. **Build it**: run `make -C examples/echo` yourself and show the
-   output. No schema is needed for this byte protocol.
+   output. Echo uses the runtime-free P3 `sync-command` world. It does not
+   import the Wetware transport or link Cap'n Proto RPC. No schema is needed
+   for this byte protocol.
 4. **See it tested**: `examples/echo_handler_e2e.rs` shows how the
    host spawns and exercises it.
 
@@ -86,9 +88,9 @@ Walk through together:
 4. **Per-request spawn**: each request gets a fresh instance.  Counter
    resets — that's expected for the demo.
 
-⚗️ **Name the win**: "You've seen the guest side of WAGI: compile a WASI P2
-component that speaks FastCGI. An `HttpListener.listen()` registration supplies
-the route and per-request process plumbing."
+⚗️ **Name the win**: "You've seen the guest side of WAGI: compile a native
+WASI P3 component that speaks FastCGI. An `HttpListener.listen()` registration
+supplies the route and per-request process plumbing."
 
 Check in: "Ready for the big one (Chess), or want to dig into
 something here first?"

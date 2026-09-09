@@ -42,8 +42,8 @@ If they want to browse, show the menu:
 >     across crates (`doc/capnp-cross-crate.md`)
 > 9. **Guest API** — WASI bindings for guest WASM modules
 >     (`doc/api/wasm-guest.md`)
-> 10. **Guest runtime** — poll loop, Cap'n Proto RPC, and WASI
->     integration (`doc/guest-runtime.md`)
+> 10. **Guest runtime** — WASI P3 root Future, Cap'n Proto RPC, and
+>     `sync-command` distinction (`doc/guest-runtime.md`)
 > 11. **Design docs** — historical and current design records
 >     (`doc/designs/`; check each document's status header)
 

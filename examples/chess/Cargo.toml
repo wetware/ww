@@ -8,9 +8,8 @@ capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 futures   = { workspace = true }
 log       = { workspace = true }
-wasip2    = { workspace = true }
+wit-bindgen = { workspace = true }
 shakmaty  = "0.27"
-rand      = { workspace = true }
 hex       = { workspace = true }
 routing-key = { workspace = true }
 system    = { path = "../../std/system" }
@@ -19,6 +18,7 @@ system    = { path = "../../std/system" }
 authority = { package = "wetware-authority", path = "../../crates/authority" }
 membrane = { package = "wetware-membrane", path = "../../crates/membrane" }
 tokio = { workspace = true, features = ["sync", "time"] }
+rand = { workspace = true }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -8,8 +8,7 @@ edition = "2021"
 [dependencies]
 capnp = "0.25.3"
 log = "0.4.29"
-wasip2 = "1.0.2"
-wit-bindgen = "0.41.0"
+wit-bindgen = "=0.61.1"
 system = { path = "../system" }
 
 [lib]

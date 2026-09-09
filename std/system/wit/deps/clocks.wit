@@ -1,0 +1,16 @@
+package wasi:clocks@0.3.0;
+
+interface types {
+    type duration = u64;
+}
+
+interface monotonic-clock {
+    use types.{duration};
+
+    type mark = u64;
+
+    now: func() -> mark;
+    get-resolution: func() -> duration;
+    wait-until: async func(when: mark);
+    wait-for: async func(how-long: duration);
+}

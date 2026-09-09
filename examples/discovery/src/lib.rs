@@ -18,8 +18,16 @@ use std::rc::Rc;
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
-use wasip2::cli::stderr::get_stderr;
-use wasip2::exports::cli::run::Guest;
+use system::Guest;
+
+#[cfg(target_arch = "wasm32")]
+mod wasi {
+    wit_bindgen::generate!({
+        path: "../../std/system/wit",
+        world: "monotonic-random",
+        generate_all,
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Cap'n Proto generated modules
@@ -114,10 +122,7 @@ impl log::Log for StderrLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let stderr = get_stderr();
-        let _ = stderr.blocking_write_and_flush(
-            format!("[{}] {}\n", record.level(), record.args()).as_bytes(),
-        );
+        eprintln!("[{}] {}", record.level(), record.args());
     }
 
     fn flush(&self) {}
@@ -158,7 +163,7 @@ impl greeter_capnp::greeter::Server for GreeterImpl {
 // Cell mode — RPC capability export via system::serve()
 // ---------------------------------------------------------------------------
 
-fn run_cell() {
+async fn run_cell() -> Result<(), capnp::Error> {
     // In cell mode we need the host's peer ID for the greeting.
     // The peer ID is passed via environment variable by the host.
     let peer_id = std::env::var("WW_PEER_ID")
@@ -170,8 +175,29 @@ fn run_cell() {
     let client: greeter_capnp::greeter::Client = capnp_rpc::new_client(greeter);
     log::info!("cell: exporting Greeter via RPC");
     system::serve(client.client, |_initial_grants: InitialGrants| async move {
-        std::future::pending().await
-    });
+        sleep_ns(u64::MAX).await;
+        Ok(())
+    })
+    .await
+}
+
+async fn sleep_ns(duration: u64) {
+    #[cfg(target_arch = "wasm32")]
+    wasi::wasi::clocks::monotonic_clock::wait_for(duration).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = duration;
+        std::future::pending::<()>().await;
+    }
+}
+
+fn random_below(upper: u64) -> u64 {
+    assert!(upper > 0, "random range is not empty");
+    #[cfg(target_arch = "wasm32")]
+    let value = wasi::wasi::random::random::get_random_u64();
+    #[cfg(not(target_arch = "wasm32"))]
+    let value = rand::random::<u64>();
+    value % upper
 }
 
 // ---------------------------------------------------------------------------
@@ -312,9 +338,8 @@ async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> 
             cooldown_ms = (cooldown_ms * 2).min(MAX_MS);
         }
 
-        let delay_ms = cooldown_ms / 2 + rand::random_range(0..=cooldown_ms / 2);
-        let pause = wasip2::clocks::monotonic_clock::subscribe_duration(delay_ms * 1_000_000);
-        pause.block();
+        let delay_ms = cooldown_ms / 2 + random_below(cooldown_ms / 2 + 1);
+        sleep_ns(delay_ms * 1_000_000).await;
     }
 }
 
@@ -325,25 +350,28 @@ async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> 
 struct DiscoveryGuest;
 
 impl Guest for DiscoveryGuest {
-    fn run() -> Result<(), ()> {
+    async fn run() -> Result<(), ()> {
         init_logging();
-        match std::env::args().nth(1).as_deref() {
+        let result = match std::env::args().nth(1).as_deref() {
             Some("serve") => {
                 log::info!("discovery: serve — DHT provide + peer discovery");
                 system::run(|initial_grants: InitialGrants| async move {
                     run_service(initial_grants).await
-                });
+                })
+                .await
             }
             _ => {
                 // Default (no args): cell mode — export the Greeter capability.
-                run_cell();
+                run_cell().await
             }
-        }
-        Ok(())
+        };
+        result.map_err(|error| {
+            log::error!("discovery RPC failed: {error}");
+        })
     }
 }
 
-wasip2::cli::command::export!(DiscoveryGuest);
+system::export!(DiscoveryGuest);
 
 // ---------------------------------------------------------------------------
 // Unit tests
@@ -482,7 +510,7 @@ mod tests {
     fn test_jitter_within_bounds() {
         for cooldown in [BASE_MS, 4_000, 64_000, MAX_MS] {
             for _ in 0..500 {
-                let delay = cooldown / 2 + rand::random_range(0..=cooldown / 2);
+                let delay = cooldown / 2 + random_below(cooldown / 2 + 1);
                 assert!(delay >= cooldown / 2);
                 assert!(delay <= cooldown);
             }

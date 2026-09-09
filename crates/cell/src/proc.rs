@@ -1,35 +1,24 @@
 use anyhow::{anyhow, Result};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
-use wasmtime::component::bindgen;
-use wasmtime::component::{
-    types::ComponentItem, Component, HasSelf, Linker, Resource, ResourceTable, ResourceType,
-};
-use wasmtime::StoreContextMut;
+use tokio::sync::{Mutex, OwnedMutexGuard};
+use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{CallHook, Engine, Store};
-use wasmtime_wasi::cli::{AsyncStdinStream, AsyncStdoutStream};
-use wasmtime_wasi::p2::add_to_linker_async;
-use wasmtime_wasi::p2::bindings::{Command as WasiCliCommand, CommandPre as WasiCliCommandPre};
-use wasmtime_wasi::p2::pipe::{AsyncReadStream, AsyncWriteStream};
+use wasmtime_wasi::cli::{AsyncStdinStream, IsTerminal, StdoutStream};
+use wasmtime_wasi::p3::bindings::{Command as WasiCliCommand, CommandPre as WasiCliCommandPre};
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_io::streams::{DynInputStream, DynOutputStream};
-
-// Generate bindings from WIT file
-// Resources are defined within the interface
-bindgen!({
-    world: "streams-world",
-    path: "wit",
-    with: {
-        "wasi:io/streams@0.2.9.input-stream": wasmtime_wasi_io::streams::DynInputStream,
-        "wasi:io/streams@0.2.9.output-stream": wasmtime_wasi_io::streams::DynOutputStream,
-    },
-});
 
 mod pid0_runtime {
     wasmtime::component::bindgen!({
         world: "pid0",
         path: "../../std/kernel/wit",
+        with: {
+            "wasi": wasmtime_wasi::p3::bindings,
+        },
     });
 }
 
@@ -39,12 +28,6 @@ mod routing_key_runtime {
         path: "../guest/routing-key/wit",
     });
 }
-
-// Import generated types - Connection is a Resource type alias
-use exports::wetware::streams::streams::Connection;
-
-pub const BUFFER_SIZE: usize = 1024;
-const PIPE_BUFFER_SIZE: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Fuel metering
@@ -83,10 +66,11 @@ pub struct FuelEstimator {
     avg_ratio: u64,
     /// False until the first on_host_return observation.
     initialized: bool,
-    /// Host calls observed since the last epoch tick.  The epoch callback
-    /// only updates the EWMA when this is zero (genuinely compute-bound).
-    /// Cells that make host calls are already handled by the call_hook,
-    /// so the epoch callback just refuels without double-observing.
+    /// Host calls observed since the last epoch tick. Cells that make linked
+    /// host calls are already handled by the call hook, so the epoch callback
+    /// refuels them without double-observing. An unmarked epoch still records
+    /// measured consumption because Component Model builtins do not mark
+    /// `HostCallFrames`.
     host_calls_this_epoch: u32,
     /// Per-cell ceiling for the EWMA budget (default: MAX_FUEL).
     max_fuel: u64,
@@ -95,6 +79,43 @@ pub struct FuelEstimator {
     /// Total fuel budget from a oneshot quote.  `None` = unlimited (scheduled cell).
     /// When this reaches 0 the epoch callback stops refueling and the cell traps.
     remaining_budget: Option<u64>,
+}
+
+/// One observation from the production epoch fuel callback.
+///
+/// This type supports production-path integration tests. Recording is disabled
+/// unless a caller explicitly installs a [`FuelObserver`] on the process.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FuelEpochObservation {
+    pub current_fuel: u64,
+    pub measured_consumption: u64,
+    pub host_calls_this_epoch: u32,
+    pub budget: u64,
+    pub avg_ratio: u64,
+}
+
+/// Opt-in observer for production epoch fuel callbacks.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct FuelObserver {
+    observations: Arc<std::sync::Mutex<Vec<FuelEpochObservation>>>,
+}
+
+impl FuelObserver {
+    fn record(&self, observation: FuelEpochObservation) {
+        self.observations
+            .lock()
+            .expect("fuel observer lock poisoned")
+            .push(observation);
+    }
+
+    pub fn observations(&self) -> Vec<FuelEpochObservation> {
+        self.observations
+            .lock()
+            .expect("fuel observer lock poisoned")
+            .clone()
+    }
 }
 
 impl FuelEstimator {
@@ -170,6 +191,19 @@ impl FuelEstimator {
         new_budget
     }
 
+    /// Record one epoch boundary and return the next fuel budget.
+    ///
+    /// Linked host calls already record their observation in the call hook.
+    /// Otherwise, use the Store's actual remaining fuel. This distinguishes
+    /// low-consumption Component Model I/O from genuinely compute-bound work.
+    fn on_epoch_tick(&mut self, remaining: u64) -> u64 {
+        if self.host_calls_this_epoch == 0 {
+            self.on_host_return(remaining);
+        }
+        self.host_calls_this_epoch = 0;
+        self.budget
+    }
+
     /// Returns the current budget.
     pub fn budget(&self) -> u64 {
         self.budget
@@ -184,6 +218,146 @@ impl FuelEstimator {
 type BoxAsyncRead = Box<dyn AsyncRead + Send + Sync + Unpin + 'static>;
 type BoxAsyncWrite = Box<dyn AsyncWrite + Send + Sync + Unpin + 'static>;
 
+enum SharedWriterState {
+    Ready(Arc<Mutex<BoxAsyncWrite>>),
+    Locking(Pin<Box<dyn Future<Output = OwnedMutexGuard<BoxAsyncWrite>> + Send + Sync + 'static>>),
+    Locked(OwnedMutexGuard<BoxAsyncWrite>),
+    Closed,
+}
+
+struct SharedWriter {
+    state: SharedWriterState,
+}
+
+impl SharedWriter {
+    fn new(writer: Arc<Mutex<BoxAsyncWrite>>) -> Self {
+        Self {
+            state: SharedWriterState::Ready(writer),
+        }
+    }
+
+    fn poll_lock(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        loop {
+            match &mut self.state {
+                SharedWriterState::Ready(writer) => {
+                    self.state = SharedWriterState::Locking(Box::pin(writer.clone().lock_owned()));
+                }
+                SharedWriterState::Locking(lock) => match lock.as_mut().poll(cx) {
+                    Poll::Ready(guard) => self.state = SharedWriterState::Locked(guard),
+                    Poll::Pending => return Poll::Pending,
+                },
+                SharedWriterState::Locked(_) => return Poll::Ready(()),
+                SharedWriterState::Closed => unreachable!("shared writer entered a closed state"),
+            }
+        }
+    }
+
+    fn with_guard<T>(
+        &mut self,
+        operation: impl FnOnce(Pin<&mut BoxAsyncWrite>) -> Poll<std::io::Result<T>>,
+    ) -> Poll<std::io::Result<T>> {
+        let SharedWriterState::Locked(mut guard) =
+            std::mem::replace(&mut self.state, SharedWriterState::Closed)
+        else {
+            unreachable!("shared writer operation requires its lock")
+        };
+        let result = operation(Pin::new(&mut *guard));
+        if result.is_ready() {
+            let writer = OwnedMutexGuard::mutex(&guard).clone();
+            drop(guard);
+            self.state = SharedWriterState::Ready(writer);
+        } else {
+            self.state = SharedWriterState::Locked(guard);
+        }
+        result
+    }
+}
+
+impl AsyncWrite for SharedWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        ready!(self.poll_lock(cx));
+        self.with_guard(|mut writer| writer.as_mut().poll_write(cx, bytes))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        ready!(self.poll_lock(cx));
+        self.with_guard(|mut writer| writer.as_mut().poll_flush(cx))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        ready!(self.poll_lock(cx));
+        self.with_guard(|mut writer| writer.as_mut().poll_shutdown(cx))
+    }
+}
+
+/// P3 stdio writes directly to the configured host writer.
+///
+/// Wasmtime 48's buffered `AsyncStdoutStream` reports its queued flush before
+/// the background writer completes it. A finite P3 command can then lose its
+/// final bytes when Store teardown aborts that writer. This adapter serializes
+/// independent P3 handles and preserves `AsyncWrite::poll_flush` completion.
+struct FlushGatedStdoutStream {
+    writer: Arc<Mutex<BoxAsyncWrite>>,
+}
+
+impl FlushGatedStdoutStream {
+    fn new(writer: BoxAsyncWrite) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(writer)),
+        }
+    }
+}
+
+impl IsTerminal for FlushGatedStdoutStream {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for FlushGatedStdoutStream {
+    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
+        Box::new(SharedWriter::new(self.writer.clone()))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct HostCallFrames {
+    frames: Vec<bool>,
+}
+
+impl HostCallFrames {
+    pub(crate) fn mark(&mut self) {
+        if let Some(frame) = self.frames.last_mut() {
+            *frame = true;
+        }
+    }
+
+    pub(crate) fn on_call_hook(&mut self, hook: CallHook) -> bool {
+        match hook {
+            CallHook::CallingHost => {
+                self.frames.push(false);
+                false
+            }
+            CallHook::ReturningFromHost => self.frames.pop().unwrap_or(false),
+            CallHook::CallingWasm | CallHook::ReturningFromWasm => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn depth(&self) -> usize {
+        self.frames.len()
+    }
+}
+
 // Required for WASI IO to work.
 pub struct ComponentRunStates {
     pub wasi_ctx: WasiCtx,
@@ -196,8 +370,8 @@ pub struct ComponentRunStates {
     pub image_root: Option<tempfile::TempDir>,
     /// Process-private writable scratch preopened at `/tmp`.
     pub scratch: tempfile::TempDir,
-    // Guest-side bidirectional stream used to build WASI io/streams resources.
-    pub data_stream: Option<tokio::io::DuplexStream>,
+    /// Single-use, capability-granted P3 transport endpoint.
+    pub(crate) granted_transport: crate::p3::GrantedTransport,
     /// Cache mode for this process. `None` means no cache (default).
     /// `Shared` shares a global pinset cache; `Isolated` gets a private one.
     /// The staging directory for IPFS content is owned by the cache mode itself:
@@ -214,15 +388,13 @@ pub struct ComponentRunStates {
     pub(crate) writable_fs_descriptors: std::collections::HashSet<u32>,
     /// EWMA fuel estimator, refuels at host call boundaries.
     pub fuel_estimator: FuelEstimator,
-    /// True after a linked guest import reaches its host implementation.
+    /// Opt-in production callback observations used by integration tests.
+    fuel_observer: Option<FuelObserver>,
+    /// Real-import markers paired with live `CallingHost` hook frames.
     ///
-    /// Wasmtime 48 also emits `CallHook` events for internal libcalls, fuel
-    /// yields, and epoch yields. The returning hook consumes this marker so
-    /// those internal transitions do not change the host-call EWMA.
-    // TODO(P3): Re-audit this bool/return-hook scheme before enabling Component
-    // Model async or P3. It assumes current non-concurrent P2 execution and no
-    // independently outstanding host-call return markers.
-    host_call_pending: bool,
+    /// P3 may have more than one outstanding host transition. A marker on each
+    /// frame keeps nested transitions from collapsing into one observation.
+    host_call_frames: HostCallFrames,
     /// Present only for the trusted PID0 process. Ordinary child linkers omit
     /// the corresponding WIT import entirely.
     pub kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
@@ -230,11 +402,7 @@ pub struct ComponentRunStates {
 
 impl ComponentRunStates {
     pub(crate) fn mark_host_call(&mut self) {
-        self.host_call_pending = true;
-    }
-
-    fn take_host_call(&mut self) -> bool {
-        std::mem::take(&mut self.host_call_pending)
+        self.host_call_frames.mark();
     }
 }
 
@@ -280,6 +448,14 @@ fn add_routing_key_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<
     Ok(())
 }
 
+fn add_pid0_readiness_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> {
+    pid0_runtime::wetware::kernel_runtime::readiness::add_to_linker::<
+        ComponentRunStates,
+        HasSelf<ComponentRunStates>,
+    >(linker, |state| state)?;
+    Ok(())
+}
+
 // Required for WASI IO to work.
 impl WasiView for ComponentRunStates {
     fn ctx(&mut self) -> WasiCtxView<'_> {
@@ -291,10 +467,11 @@ impl WasiView for ComponentRunStates {
     }
 }
 
-// Internal connection representation that stores stream wrappers
-struct ConnectionState {
-    input_stream: Option<DynInputStream>,
-    output_stream: Option<DynOutputStream>,
+impl crate::p3::TransportHostState for ComponentRunStates {
+    fn granted_transport(&mut self) -> &mut crate::p3::GrantedTransport {
+        self.mark_host_call();
+        &mut self.granted_transport
+    }
 }
 
 struct ProcInit {
@@ -305,10 +482,11 @@ struct ProcInit {
     stdin: BoxAsyncRead,
     stdout: BoxAsyncWrite,
     stderr: BoxAsyncWrite,
-    data_stream: tokio::io::DuplexStream,
+    granted_transport: crate::p3::GrantedTransport,
     cache_mode: Option<cache::CacheMode>,
     mode: ConstructionMode,
     fuel_estimator: Option<FuelEstimator>,
+    fuel_observer: Option<FuelObserver>,
 }
 
 enum ConstructionMode {
@@ -358,9 +536,46 @@ fn configure_process_filesystem(
     })
 }
 
+/// Link the production P3 authority surface without registering sockets.
+fn add_p3_wasi_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> {
+    use wasmtime_wasi::cli::{WasiCli, WasiCliView};
+    use wasmtime_wasi::clocks::{WasiClocks, WasiClocksView};
+    use wasmtime_wasi::filesystem::{WasiFilesystem, WasiFilesystemView};
+    use wasmtime_wasi::p3::bindings::{cli, clocks, filesystem, random};
+    use wasmtime_wasi::random::{WasiRandom, WasiRandomView};
+
+    let cli = <ComponentRunStates as WasiCliView>::cli;
+    cli::exit::add_to_linker::<_, WasiCli>(linker, cli)?;
+    cli::environment::add_to_linker::<_, WasiCli>(linker, cli)?;
+    cli::stdin::add_to_linker::<_, WasiCli>(linker, cli)?;
+    cli::stdout::add_to_linker::<_, WasiCli>(linker, cli)?;
+    cli::stderr::add_to_linker::<_, WasiCli>(linker, cli)?;
+    // Rust's `IsTerminal` implementation imports these query interfaces.
+    // Ordinary Cells receive no terminal resources from their `WasiCtx`.
+    cli::terminal_input::add_to_linker::<_, WasiCli>(linker, cli)?;
+    cli::terminal_output::add_to_linker::<_, WasiCli>(linker, cli)?;
+    cli::terminal_stdin::add_to_linker::<_, WasiCli>(linker, cli)?;
+    cli::terminal_stdout::add_to_linker::<_, WasiCli>(linker, cli)?;
+    cli::terminal_stderr::add_to_linker::<_, WasiCli>(linker, cli)?;
+
+    let clocks = <ComponentRunStates as WasiClocksView>::clocks;
+    clocks::types::add_to_linker::<_, WasiClocks>(linker, clocks)?;
+    clocks::monotonic_clock::add_to_linker::<_, WasiClocks>(linker, clocks)?;
+    clocks::system_clock::add_to_linker::<_, WasiClocks>(linker, clocks)?;
+
+    let filesystem = <ComponentRunStates as WasiFilesystemView>::filesystem;
+    filesystem::types::add_to_linker::<_, WasiFilesystem>(linker, filesystem)?;
+    filesystem::preopens::add_to_linker::<_, WasiFilesystem>(linker, filesystem)?;
+
+    let random = <ComponentRunStates as WasiRandomView>::random;
+    random::random::add_to_linker::<_, WasiRandom>(linker, random)?;
+    random::insecure_seed::add_to_linker::<_, WasiRandom>(linker, random)?;
+    Ok(())
+}
+
 fn install_host_return_fuel_hook(store: &mut Store<ComponentRunStates>) {
     store.call_hook(|mut ctx, hook| {
-        if matches!(hook, CallHook::ReturningFromHost) && ctx.data_mut().take_host_call() {
+        if ctx.data_mut().host_call_frames.on_call_hook(hook) {
             let remaining = ctx.get_fuel().unwrap_or(0);
             ctx.data_mut().fuel_estimator.host_calls_this_epoch += 1;
             let new_budget = ctx.data_mut().fuel_estimator.on_host_return(remaining);
@@ -376,8 +591,7 @@ fn install_host_return_fuel_hook(store: &mut Store<ComponentRunStates>) {
     });
 }
 
-/// A WASIP2 program supplied as bytes or as a component compiled for the
-/// builder's engine.
+/// A native P3 program supplied as bytes or compiled for the builder's engine.
 pub enum Program {
     Bytes(Vec<u8>),
     Precompiled(Arc<Component>),
@@ -387,8 +601,8 @@ pub enum Program {
 ///
 /// Use [`Builder::ordinary`] for an ordinary child with a private root. Use
 /// [`Builder::kernel`] for a kernel Cell with an authoritative `CidTree` root
-/// and the private readiness import. Both modes always install live duplex
-/// `wetware:streams` transport.
+/// and the private readiness import. Both modes install one capability-granted
+/// `wetware:transport` endpoint.
 pub struct Builder {
     env: Vec<String>,
     args: Vec<String>,
@@ -398,33 +612,30 @@ pub struct Builder {
     stdin: BoxAsyncRead,
     stdout: BoxAsyncWrite,
     stderr: BoxAsyncWrite,
-    data_stream: tokio::io::DuplexStream,
+    granted_transport: crate::p3::GrantedTransport,
     cache_mode: Option<cache::CacheMode>,
     mode: ConstructionMode,
     fuel_estimator: Option<FuelEstimator>,
+    fuel_observer: Option<FuelObserver>,
 }
 
-/// Handles for accessing the host-side of data streams.
-///
-/// These allow the host to read from and write to the data streams
-/// that are exposed to the guest via the connection resource.
+/// Handle for the host side of the capability-granted transport.
 pub struct DataStreamHandles {
-    /// Host-side duplex stream for RPC transport.
-    host_stream: Option<tokio::io::DuplexStream>,
+    host_transport: Option<crate::p3::HostTransport>,
 }
 
 impl DataStreamHandles {
-    pub fn take_host_stream(&mut self) -> Option<tokio::io::DuplexStream> {
-        self.host_stream.take()
+    pub fn take_host_stream(&mut self) -> Option<crate::p3::HostTransport> {
+        self.host_transport.take()
     }
 
     pub fn take_host_split(
         &mut self,
     ) -> Option<(
-        tokio::io::ReadHalf<tokio::io::DuplexStream>,
-        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        tokio::io::ReadHalf<crate::p3::HostTransport>,
+        tokio::io::WriteHalf<crate::p3::HostTransport>,
     )> {
-        self.host_stream.take().map(tokio::io::split)
+        self.host_transport.take().map(tokio::io::split)
     }
 }
 
@@ -482,9 +693,9 @@ impl Builder {
         W1: AsyncWrite + Send + Sync + Unpin + 'static,
         W2: AsyncWrite + Send + Sync + Unpin + 'static,
     {
-        let (host_stream, guest_stream) = tokio::io::duplex(PIPE_BUFFER_SIZE);
+        let (host_transport, granted_transport) = crate::p3::HostTransport::bounded_pair();
         let handles = DataStreamHandles {
-            host_stream: Some(host_stream),
+            host_transport: Some(host_transport),
         };
         let builder = Self {
             env: Vec::new(),
@@ -495,10 +706,11 @@ impl Builder {
             stdin: Box::new(stdin),
             stdout: Box::new(stdout),
             stderr: Box::new(stderr),
-            data_stream: guest_stream,
+            granted_transport,
             cache_mode: None,
             mode,
             fuel_estimator: None,
+            fuel_observer: None,
         };
         (builder, handles)
     }
@@ -546,6 +758,13 @@ impl Builder {
         self
     }
 
+    /// Install opt-in observation of the production epoch fuel callback.
+    #[doc(hidden)]
+    pub fn with_fuel_observer(mut self, observer: FuelObserver) -> Self {
+        self.fuel_observer = Some(observer);
+        self
+    }
+
     /// Build the host-side process representation.
     pub async fn build(self) -> Result<Proc> {
         Proc::new(ProcInit {
@@ -556,10 +775,11 @@ impl Builder {
             stdin: self.stdin,
             stdout: self.stdout,
             stderr: self.stderr,
-            data_stream: self.data_stream,
+            granted_transport: self.granted_transport,
             cache_mode: self.cache_mode,
             mode: self.mode,
             fuel_estimator: self.fuel_estimator,
+            fuel_observer: self.fuel_observer,
         })
         .await
     }
@@ -587,10 +807,11 @@ impl Proc {
             stdin,
             stdout,
             stderr,
-            data_stream,
+            granted_transport,
             cache_mode,
             mode,
             fuel_estimator,
+            fuel_observer,
         } = init;
         let cache_mode = cache_mode.map(Arc::new);
         let (cid_tree, kernel_ready_gate) = match mode {
@@ -600,10 +821,9 @@ impl Proc {
                 readiness_gate,
             } => (Some(root), Some(readiness_gate)),
         };
-
         let stdin_stream = AsyncStdinStream::new(stdin);
-        let stdout_stream = AsyncStdoutStream::new(BUFFER_SIZE, stdout);
-        let stderr_stream = AsyncStdoutStream::new(BUFFER_SIZE, stderr);
+        let stdout_stream = FlushGatedStdoutStream::new(stdout);
+        let stderr_stream = FlushGatedStdoutStream::new(stderr);
 
         // Build a Wasmtime engine with two settings for cooperative scheduling:
         //   consume_fuel       — enables instruction counting; without this,
@@ -619,20 +839,18 @@ impl Proc {
             Arc::new(crate::engine::wasm_engine()?)
         };
         let mut linker = Linker::new(&engine);
-        add_to_linker_async(&mut linker)?;
+        add_p3_wasi_to_linker(&mut linker)?;
+        crate::p3::add_transport_to_linker(&mut linker)?;
         add_routing_key_to_linker(&mut linker)?;
         if kernel_ready_gate.is_some() {
-            pid0_runtime::Pid0::add_to_linker::<ComponentRunStates, HasSelf<ComponentRunStates>>(
-                &mut linker,
-                |state| state,
-            )?;
+            add_pid0_readiness_to_linker(&mut linker)?;
         }
 
         // Override filesystem bindings when CidTree or cache is active.
         // CidTree mode: ALL filesystem ops resolve through the virtual tree.
         // Cache-only mode: only `/ipfs/` paths are intercepted.
         if cid_tree.is_some() || cache_mode.is_some() {
-            crate::fs_intercept::override_filesystem_linker(&mut linker)?;
+            crate::fs_intercept::override_p3_filesystem_linker(&mut linker)?;
         }
 
         // Prepare environment variables as key-value pairs
@@ -645,11 +863,7 @@ impl Proc {
             .stdout(stdout_stream)
             .stderr(stderr_stream)
             .envs(&envs)
-            .args(&args)
-            // Wasmtime 45 allowed TCP and UDP socket creation by default.
-            // Wasmtime 48 defaults both switches to false.
-            .allow_tcp(true)
-            .allow_udp(true);
+            .args(&args);
 
         // Anchor the guest's WASI filesystem at `/` so wasi-libc has a
         // starting descriptor for absolute-path resolution. The preopened
@@ -663,19 +877,18 @@ impl Proc {
 
         let wasi = wasi_builder.build();
 
-        add_streams_to_linker(&mut linker)?;
-
         let state = ComponentRunStates {
             wasi_ctx: wasi,
             resource_table: ResourceTable::new(),
             image_root: filesystem.image_root,
             scratch: filesystem.scratch,
-            data_stream: Some(data_stream),
+            granted_transport,
             cache_mode,
             cid_tree,
             writable_fs_descriptors: std::collections::HashSet::new(),
             fuel_estimator: fuel_estimator.unwrap_or_else(|| FuelEstimator::new(INITIAL_FUEL)),
-            host_call_pending: false,
+            fuel_observer,
+            host_call_frames: HostCallFrames::default(),
             kernel_ready_gate,
         };
 
@@ -722,17 +935,28 @@ impl Proc {
                 );
             }
 
-            if est.host_calls_this_epoch == 0 {
-                // No host calls this epoch — cell is compute-bound.
-                // Observe full consumption so EWMA converges toward MIN_FUEL.
-                est.on_host_return(0);
-            }
-            // I/O cells: the call_hook already updated the EWMA.
-            // Just refuel, don't double-observe.
-            est.host_calls_this_epoch = 0;
-            let budget = est.budget();
+            let measured_consumption = est.budget.saturating_sub(current_fuel);
+            let host_calls_this_epoch = est.host_calls_this_epoch;
+            let budget = est.on_epoch_tick(current_fuel);
+            let avg_ratio = est.avg_ratio();
             ctx.set_fuel(budget)?;
-            tracing::trace!(budget, "fuel.epoch_refuel");
+            if let Some(observer) = ctx.data().fuel_observer.as_ref() {
+                observer.record(FuelEpochObservation {
+                    current_fuel,
+                    measured_consumption,
+                    host_calls_this_epoch,
+                    budget,
+                    avg_ratio,
+                });
+            }
+            tracing::trace!(
+                budget,
+                current_fuel,
+                measured_consumption,
+                host_calls_this_epoch,
+                avg_ratio,
+                "fuel.epoch_refuel"
+            );
             Ok(wasmtime::UpdateDeadline::Continue(1))
         });
         store.set_epoch_deadline(1);
@@ -775,18 +999,6 @@ impl Proc {
         );
         for (name, item) in component_type.imports(&engine) {
             tracing::trace!(name, item = ?item, "Guest component import");
-            if name == "wetware:streams/streams" {
-                if let ComponentItem::ComponentInstance(instance) = item.ty {
-                    for (export_name, export_item) in instance.exports(&engine) {
-                        tracing::trace!(
-                            name,
-                            export = export_name,
-                            item = ?export_item,
-                            "Guest streams instance export"
-                        );
-                    }
-                }
-            }
         }
         for (name, item) in component_type.exports(&engine) {
             tracing::trace!(name, item = ?item, "Guest component export");
@@ -823,118 +1035,97 @@ impl Proc {
 
     /// Invoke the guest's `wasi:cli/run#run` export and wait for completion.
     pub async fn run(mut self) -> Result<()> {
-        self.command
-            .wasi_cli_run()
-            .call_run(&mut self.store)
+        let command = self.command;
+        let result = self
+            .store
+            .run_concurrent(async move |access| command.wasi_cli_run().call_run(access).await)
             .await
-            .map_err(|e| anyhow!("failed to call `wasi:cli/run`: {e}"))?
-            .map_err(|()| anyhow!("guest returned non-zero exit status"))
+            .map_err(|error| anyhow!("P3 command event loop failed: {error}"))?
+            .map_err(|error| anyhow!("failed to call `wasi:cli/run`: {error}"))?;
+        result.map_err(|()| anyhow!("guest returned non-zero exit status"))
     }
-}
-
-/// Add the streams interface to the Wasmtime linker
-///
-/// This exports the wetware:streams interface, allowing guests to create
-/// connection resources and access bidirectional data streams.
-fn add_streams_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> {
-    let mut streams_instance = linker.instance("wetware:streams/streams@0.1.0")?;
-
-    streams_instance.resource(
-        "connection",
-        ResourceType::host::<ConnectionState>(),
-        |mut store, _| {
-            store.data_mut().mark_host_call();
-            Ok(())
-        },
-    )?;
-
-    streams_instance.func_wrap_async(
-        "create-connection",
-        |mut store: StoreContextMut<'_, ComponentRunStates>, (): ()| {
-            Box::new(async move {
-                store.data_mut().mark_host_call();
-                tracing::debug!("streams#create-connection invoked");
-                let state = store.data_mut();
-                let guest_stream = state
-                    .data_stream
-                    .take()
-                    .ok_or_else(|| wasmtime::Error::msg("data streams not enabled"))?;
-
-                let (guest_read, guest_write) = tokio::io::split(guest_stream);
-                let input_stream: DynInputStream = Box::new(AsyncReadStream::new(guest_read));
-                let output_stream: DynOutputStream =
-                    Box::new(AsyncWriteStream::new(PIPE_BUFFER_SIZE, guest_write));
-
-                let conn_state = ConnectionState {
-                    input_stream: Some(input_stream),
-                    output_stream: Some(output_stream),
-                };
-
-                let conn_resource = state.resource_table.push(conn_state)?;
-                let connection = Connection::try_from_resource(conn_resource, &mut store)?;
-                tracing::debug!("streams#create-connection: connection ready");
-                Ok((connection,))
-            })
-        },
-    )?;
-
-    streams_instance.func_wrap_async(
-        "[method]connection.get-input-stream",
-        |mut store: StoreContextMut<'_, ComponentRunStates>,
-         (connection,): (Resource<ConnectionState>,)| {
-            Box::new(async move {
-                store.data_mut().mark_host_call();
-                tracing::debug!("streams#connection.get-input-stream invoked");
-                let stream = {
-                    let conn_state = store.data_mut().resource_table.get_mut(&connection)?;
-                    conn_state
-                        .input_stream
-                        .take()
-                        .ok_or_else(|| wasmtime::Error::msg("input stream already taken"))?
-                };
-
-                let state = store.data_mut();
-                let resource = state.resource_table.push(stream)?;
-                tracing::debug!("streams#connection.get-input-stream: resource ready");
-                Ok((resource,))
-            })
-        },
-    )?;
-
-    streams_instance.func_wrap_async(
-        "[method]connection.get-output-stream",
-        |mut store: StoreContextMut<'_, ComponentRunStates>,
-         (connection,): (Resource<ConnectionState>,)| {
-            Box::new(async move {
-                store.data_mut().mark_host_call();
-                tracing::debug!("streams#connection.get-output-stream invoked");
-                let stream = {
-                    let conn_state = store.data_mut().resource_table.get_mut(&connection)?;
-                    conn_state
-                        .output_stream
-                        .take()
-                        .ok_or_else(|| wasmtime::Error::msg("output stream already taken"))?
-                };
-
-                let state = store.data_mut();
-                let resource = state.resource_table.push(stream)?;
-                tracing::debug!("streams#connection.get-output-stream: resource ready");
-                Ok((resource,))
-            })
-        },
-    )?;
-
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::OnceLock;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
+
+    struct PendingFlushWriter {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        flush_open: Arc<AtomicBool>,
+        flush_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    }
+
+    struct FailingTransportReader;
+
+    impl AsyncRead for FailingTransportReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "injected transport read failure",
+            )))
+        }
+    }
+
+    struct FailingTransportWriter;
+
+    impl AsyncWrite for FailingTransportWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected transport write failure",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected transport flush failure",
+            )))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PendingFlushWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.bytes
+                .lock()
+                .expect("pending-flush byte lock")
+                .extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.flush_open.load(Ordering::Acquire) {
+                Poll::Ready(Ok(()))
+            } else {
+                *self.flush_waker.lock().expect("pending-flush waker lock") =
+                    Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
 
     const ROUTING_KEY_PROBE_COMPONENT: &str = r#"
         (component
@@ -1003,6 +1194,24 @@ mod tests {
               (realloc (func $libc "realloc")))))
     "#;
 
+    const P3_NOOP_COMMAND: &str = r#"
+        (component
+          (core func $task-return (canon task.return (result (result))))
+          (core module $noop
+            (import "" "task-return" (func $task-return (param i32)))
+            (func (export "run")
+              i32.const 0
+              call $task-return))
+          (core instance $instance
+            (instantiate $noop
+              (with "" (instance
+                (export "task-return" (func $task-return))))))
+          (func $run async (result (result))
+            (canon lift (core func $instance "run") async))
+          (instance (export (interface "wasi:cli/run@0.3.0"))
+            (export "run" (func $run))))
+    "#;
+
     struct EpochTicker {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -1011,11 +1220,15 @@ mod tests {
     impl EpochTicker {
         fn start(engine: Arc<Engine>) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
-            let thread_stop = stop.clone();
+            let thread_stop = Arc::clone(&stop);
             let thread = std::thread::spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
-                    engine.increment_epoch();
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        crate::sched::EPOCH_TICK_MS,
+                    ));
+                    if !thread_stop.load(Ordering::Acquire) {
+                        engine.increment_epoch();
+                    }
                 }
             });
             Self {
@@ -1034,91 +1247,73 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn p3_stdio_flush_waits_for_the_underlying_host_writer() {
+        use tokio::io::AsyncWriteExt;
+
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flush_open = Arc::new(AtomicBool::new(false));
+        let flush_waker = Arc::new(std::sync::Mutex::new(None));
+        let stdout = FlushGatedStdoutStream::new(Box::new(PendingFlushWriter {
+            bytes: bytes.clone(),
+            flush_open: flush_open.clone(),
+            flush_waker: flush_waker.clone(),
+        }));
+        let mut writer = Box::into_pin(stdout.async_stream());
+
+        writer.as_mut().write_all(b"final response").await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                writer.as_mut().flush()
+            )
+            .await
+            .is_err(),
+            "P3 stdio flush completed before the host writer"
+        );
+
+        flush_open.store(true, Ordering::Release);
+        flush_waker
+            .lock()
+            .expect("pending-flush waker lock")
+            .take()
+            .expect("pending flush registered no waker")
+            .wake();
+        writer.as_mut().flush().await.unwrap();
+        assert_eq!(
+            bytes.lock().expect("pending-flush byte lock").as_slice(),
+            b"final response"
+        );
+    }
+
     fn component_test_state() -> ComponentRunStates {
+        let (_host, granted_transport) = crate::p3::HostTransport::bounded_pair();
         ComponentRunStates {
             wasi_ctx: WasiCtxBuilder::new().build(),
             resource_table: ResourceTable::new(),
             image_root: None,
             scratch: tempfile::TempDir::new().expect("component test scratch"),
-            data_stream: None,
+            granted_transport,
             cache_mode: None,
             cid_tree: None,
             writable_fs_descriptors: std::collections::HashSet::new(),
             fuel_estimator: FuelEstimator::new(INITIAL_FUEL),
-            host_call_pending: false,
+            fuel_observer: None,
+            host_call_frames: HostCallFrames::default(),
             kernel_ready_gate: None,
         }
     }
 
-    fn routing_key_probe_wasm() -> &'static PathBuf {
-        static PROBE: OnceLock<PathBuf> = OnceLock::new();
-        PROBE.get_or_init(|| {
-            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-            let target = root.join("target/routing-key-probe");
-            let status = Command::new(env!("CARGO"))
-                .current_dir(&root)
-                .env("CARGO_TARGET_DIR", &target)
-                .args([
-                    "build",
-                    "--locked",
-                    "--manifest-path",
-                    "tests/fixtures/routing-key-probe/Cargo.toml",
-                    "--target",
-                    "wasm32-wasip2",
-                    "--release",
-                ])
-                .status()
-                .expect("launch cargo to build routing-key wrapper probe");
-            assert!(status.success(), "routing-key wrapper probe build failed");
-            let wasm = target.join("wasm32-wasip2/release/routing_key_probe.wasm");
-            assert!(
-                wasm.is_file(),
-                "routing-key probe missing: {}",
-                wasm.display()
-            );
-            wasm
-        })
-    }
-
-    #[tokio::test]
-    async fn routing_key_guest_wrapper_matches_golden_vector() {
-        let engine = crate::engine::wasm_engine().expect("component engine");
-        let component = Component::from_file(&engine, routing_key_probe_wasm())
-            .expect("routing-key wrapper probe component");
-        let mut linker = Linker::new(&engine);
-        add_to_linker_async(&mut linker).expect("install WASI imports");
-        add_routing_key_to_linker(&mut linker).expect("install routing-key import");
-        let mut store = Store::new(&engine, component_test_state());
-        store.set_fuel(INITIAL_FUEL).expect("routing-key test fuel");
-        store.set_epoch_deadline(1);
-        let instance = linker
-            .instantiate_async(&mut store, &component)
-            .await
-            .expect("instantiate routing-key wrapper probe");
-        let probe = instance
-            .get_typed_func::<(), (String,)>(&mut store, "probe")
-            .expect("typed routing-key wrapper probe export");
-
-        for _ in 0..2 {
-            let (key,) = probe
-                .call_async(&mut store, ())
-                .await
-                .expect("call routing-key wrapper probe");
-            assert_eq!(
-                key,
-                "bafkr4ifcoue3f52zpzpz2xei7dqhs3gajm326llyljbwisxkwea7hbowyy"
-            );
-        }
-    }
-
-    async fn linked_routing_key_probe() -> (
+    async fn linked_routing_key_probe_bytes(
+        bytes: &[u8],
+    ) -> (
         Store<ComponentRunStates>,
         wasmtime::component::TypedFunc<(), (String,)>,
     ) {
         let engine = crate::engine::wasm_engine().expect("component engine");
-        let component = Component::new(&engine, ROUTING_KEY_PROBE_COMPONENT)
-            .expect("routing-key probe component");
+        let component = Component::new(&engine, bytes).expect("routing-key probe component");
         let mut linker = Linker::new(&engine);
+        add_p3_wasi_to_linker(&mut linker).expect("install P3 WASI imports");
         add_routing_key_to_linker(&mut linker).expect("install routing-key import");
         let mut store = Store::new(&engine, component_test_state());
         store.set_fuel(INITIAL_FUEL).expect("routing-key test fuel");
@@ -1135,6 +1330,13 @@ mod tests {
             .get_typed_func::<(), (String,)>(&mut store, "probe")
             .expect("typed routing-key probe export");
         (store, probe)
+    }
+
+    async fn linked_routing_key_probe() -> (
+        Store<ComponentRunStates>,
+        wasmtime::component::TypedFunc<(), (String,)>,
+    ) {
+        linked_routing_key_probe_bytes(ROUTING_KEY_PROBE_COMPONENT.as_bytes()).await
     }
 
     #[tokio::test]
@@ -1154,6 +1356,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compiled_routing_key_guest_wrapper_matches_golden_vector() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let artifact =
+            root.join("target/routing-key-probe/wasm32-wasip3/release/routing_key_probe.wasm");
+        if !artifact.is_file() {
+            let status = std::process::Command::new("make")
+                .current_dir(&root)
+                .arg("routing-key-probe")
+                .status()
+                .expect("launch routing-key-probe build");
+            assert!(status.success(), "routing-key-probe build failed");
+        }
+        let bytes = std::fs::read(&artifact)
+            .unwrap_or_else(|error| panic!("read {}: {error}", artifact.display()));
+        let (mut store, probe) = linked_routing_key_probe_bytes(&bytes).await;
+
+        for _ in 0..2 {
+            let (key,) = probe
+                .call_async(&mut store, ())
+                .await
+                .expect("call compiled routing-key probe");
+            assert_eq!(
+                key,
+                "bafkr4ifcoue3f52zpzpz2xei7dqhs3gajm326llyljbwisxkwea7hbowyy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn real_p3_transport_failure_reaches_the_cell_root() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let artifact =
+            root.join("target/authority-probe/wasm32-wasip3/release/authority_probe.wasm");
+        assert!(
+            artifact.is_file(),
+            "authority-probe artifact missing; run `make authority-probe`: {}",
+            artifact.display()
+        );
+        let bytes = std::fs::read(&artifact)
+            .unwrap_or_else(|error| panic!("read {}: {error}", artifact.display()));
+        let engine = Arc::new(crate::engine::wasm_engine().expect("component engine"));
+        let _ticker = EpochTicker::start(Arc::clone(&engine));
+        let (stderr_read, stderr_write) = tokio::io::duplex(64 * 1024);
+        let (mut builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytes),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            stderr_write,
+        );
+        builder.granted_transport =
+            crate::p3::GrantedTransport::from_parts(FailingTransportReader, FailingTransportWriter);
+        let proc = builder
+            .with_engine(engine)
+            .with_args(vec!["authority-probe".into(), "enumerate".into()])
+            .build()
+            .await
+            .expect("build transport-failure P3 probe");
+
+        let run_error = tokio::time::timeout(std::time::Duration::from_secs(5), proc.run())
+            .await
+            .expect("transport-failure P3 probe timed out")
+            .expect_err("transport failure must fail the Cell root");
+        assert!(
+            run_error
+                .to_string()
+                .contains("guest returned non-zero exit status"),
+            "unexpected Cell root error: {run_error:#}"
+        );
+
+        let mut stderr = Vec::new();
+        let mut stderr_read = stderr_read;
+        stderr_read
+            .read_to_end(&mut stderr)
+            .await
+            .expect("read transport-failure stderr");
+        let stderr = String::from_utf8(stderr).expect("transport-failure stderr UTF-8");
+        assert!(
+            stderr.contains("P3 transport failed: transport read failed")
+                || stderr.contains("P3 transport failed: transport write failed"),
+            "guest did not report the transport completion error: {stderr:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn linked_production_host_import_marks_and_refuels_once() {
         let (mut store, probe) = linked_routing_key_probe().await;
 
@@ -1164,7 +1450,40 @@ mod tests {
 
         assert!(store.data().fuel_estimator.initialized);
         assert_eq!(store.data().fuel_estimator.host_calls_this_epoch, 1);
-        assert!(!store.data().host_call_pending);
+        assert!(store.data().host_call_frames.is_empty());
+    }
+
+    #[test]
+    fn concurrent_host_call_frames_do_not_collapse_markers() {
+        let mut state = component_test_state();
+
+        assert!(!state.host_call_frames.on_call_hook(CallHook::CallingHost));
+        state.mark_host_call();
+        assert!(!state.host_call_frames.on_call_hook(CallHook::CallingHost));
+        state.mark_host_call();
+        assert!(state
+            .host_call_frames
+            .on_call_hook(CallHook::ReturningFromHost));
+        assert!(state
+            .host_call_frames
+            .on_call_hook(CallHook::ReturningFromHost));
+        assert!(state.host_call_frames.is_empty());
+    }
+
+    #[test]
+    fn unmarked_nested_host_frame_cannot_consume_outer_marker() {
+        let mut state = component_test_state();
+
+        assert!(!state.host_call_frames.on_call_hook(CallHook::CallingHost));
+        state.mark_host_call();
+        assert!(!state.host_call_frames.on_call_hook(CallHook::CallingHost));
+        assert!(!state
+            .host_call_frames
+            .on_call_hook(CallHook::ReturningFromHost));
+        assert!(state
+            .host_call_frames
+            .on_call_hook(CallHook::ReturningFromHost));
+        assert!(state.host_call_frames.is_empty());
     }
 
     #[tokio::test]
@@ -1231,11 +1550,7 @@ mod tests {
 
         let mut pid0 = Linker::new(&engine);
         add_routing_key_to_linker(&mut pid0).expect("PID0 routing-key import");
-        pid0_runtime::Pid0::add_to_linker::<ComponentRunStates, HasSelf<ComponentRunStates>>(
-            &mut pid0,
-            |state| state,
-        )
-        .expect("install private PID0 import");
+        add_pid0_readiness_to_linker(&mut pid0).expect("install private PID0 import");
         pid0.instantiate_pre(&component)
             .expect("PID0 linker satisfies routing-key import");
     }
@@ -1245,12 +1560,8 @@ mod tests {
         use wit_parser::{ManglingAndAbi, Resolve};
 
         let mut resolve = Resolve::default();
-        let package = resolve
-            .push_str(
-                "kernel.wit",
-                include_str!("../../../std/kernel/wit/kernel.wit"),
-            )
-            .expect("parse private kernel WIT");
+        let wit = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std/kernel/wit");
+        let (package, _) = resolve.push_dir(wit).expect("parse private kernel WIT");
         let world = resolve
             .select_world(&[package], Some("pid0"))
             .expect("select private PID0 world");
@@ -1271,7 +1582,8 @@ mod tests {
         let component = Component::from_binary(&engine, &private_kernel_import_component())
             .expect("private import component");
 
-        let ordinary = Linker::<ComponentRunStates>::new(&engine);
+        let mut ordinary = Linker::<ComponentRunStates>::new(&engine);
+        add_p3_wasi_to_linker(&mut ordinary).expect("install ordinary P3 WASI imports");
         let error = match ordinary.instantiate_pre(&component) {
             Ok(_) => panic!("ordinary child linker must not satisfy private PID0 import"),
             Err(error) => error,
@@ -1284,11 +1596,8 @@ mod tests {
         );
 
         let mut pid0 = Linker::<ComponentRunStates>::new(&engine);
-        pid0_runtime::Pid0::add_to_linker::<ComponentRunStates, HasSelf<ComponentRunStates>>(
-            &mut pid0,
-            |state| state,
-        )
-        .expect("install private PID0 import");
+        add_p3_wasi_to_linker(&mut pid0).expect("install PID0 P3 WASI imports");
+        add_pid0_readiness_to_linker(&mut pid0).expect("install private PID0 import");
         pid0.instantiate_pre(&component)
             .expect("PID0 linker satisfies private readiness import");
     }
@@ -1408,34 +1717,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_data_stream_handles_full_duplex() {
-        let (builder, mut handles) = Builder::ordinary(
-            Program::Bytes(vec![0]),
-            tokio::io::empty(),
-            tokio::io::sink(),
-            tokio::io::sink(),
-        );
-
-        let guest_stream = builder.data_stream;
-        let host_stream = handles
-            .take_host_stream()
-            .expect("host stream should be configured");
-
-        let (mut host_read, mut host_write) = tokio::io::split(host_stream);
-        let (mut guest_read, mut guest_write) = tokio::io::split(guest_stream);
-
-        host_write.write_all(b"ping").await.unwrap();
-        let mut buf = [0u8; 4];
-        guest_read.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"ping");
-
-        guest_write.write_all(b"pong").await.unwrap();
-        let mut buf = [0u8; 4];
-        host_read.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"pong");
-    }
-
-    #[tokio::test]
     async fn test_data_stream_handles_take_host_split() {
         let (_builder, mut handles) = Builder::ordinary(
             Program::Bytes(vec![0]),
@@ -1457,7 +1738,7 @@ mod tests {
         let bytecode = wat::parse_str(include_str!(
             "../../../tests/fixtures/spinning-component.wat"
         ))
-        .expect("parse spinning component fixture");
+        .expect("parse P3 spinning component fixture");
         let engine = Arc::new(crate::engine::wasm_engine().expect("component engine"));
         let (builder, _handles) = Builder::ordinary(
             Program::Bytes(bytecode),
@@ -1466,10 +1747,10 @@ mod tests {
             tokio::io::sink(),
         );
         let mut proc = builder
-            .with_engine(engine.clone())
+            .with_engine(Arc::clone(&engine))
             .build()
             .await
-            .expect("build spinning component");
+            .expect("build P3 spinning component");
 
         // Remove fuel-based cooperative yields so task cancellation can only
         // become observable after Wasmtime handles an engine epoch deadline.
@@ -1480,7 +1761,7 @@ mod tests {
             .set_fuel(u64::MAX)
             .expect("set non-exhausting test fuel");
         let epoch_observed = Arc::new(AtomicBool::new(false));
-        let callback_observed = epoch_observed.clone();
+        let callback_observed = Arc::clone(&epoch_observed);
         proc.store.epoch_deadline_callback(move |_context| {
             callback_observed.store(true, Ordering::Release);
             Ok(wasmtime::UpdateDeadline::Yield(1))
@@ -1488,30 +1769,112 @@ mod tests {
         proc.store.set_epoch_deadline(1);
 
         let mut proc_task = tokio::spawn(async move { proc.run().await });
-        let _ticker = EpochTicker::start(engine);
+        let _ticker = EpochTicker::start(Arc::clone(&engine));
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !epoch_observed.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("spinning guest did not reach an epoch interruption");
+        .expect("P3 spinning guest did not reach an epoch interruption");
+
         assert!(
             !proc_task.is_finished(),
-            "spinning guest exited before cancellation"
+            "P3 spinning guest exited before cancellation"
         );
+        let started = std::time::Instant::now();
+        proc_task.abort();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), &mut proc_task)
+            .await
+            .expect("P3 compute-bound cancellation exceeded timeout")
+            .expect_err("aborted P3 process task must return JoinError");
+        assert!(error.is_cancelled());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        let noop = wat::parse_str(P3_NOOP_COMMAND).expect("parse P3 no-op component");
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(noop),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let healthy_proc = builder
+            .with_engine(Arc::clone(&engine))
+            .build()
+            .await
+            .expect("build second P3 component on shared Engine");
+        tokio::time::timeout(std::time::Duration::from_secs(5), healthy_proc.run())
+            .await
+            .expect("second P3 component did not complete")
+            .expect("second P3 component failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_config_busy_loop_can_be_aborted_and_shared_engine_remains_healthy() {
+        let bytecode = wat::parse_str(include_str!(
+            "../../../tests/fixtures/spinning-component.wat"
+        ))
+        .expect("parse P3 spinning component fixture");
+        let engine = Arc::new(crate::engine::wasm_engine().expect("component engine"));
+        // Production starts the shared Engine ticker before it admits Cells.
+        let _ticker = EpochTicker::start(Arc::clone(&engine));
+        let fuel_observer = FuelObserver::default();
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytecode),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let proc = builder
+            .with_engine(Arc::clone(&engine))
+            .with_fuel_observer(fuel_observer.clone())
+            .build()
+            .await
+            .expect("build production-config P3 spinning component");
+
+        let mut proc_task = tokio::spawn(async move { proc.run().await });
+        // Epoch callbacks run only while the Store executes the export. Two
+        // observations prove that the non-terminating guest remained active
+        // across production Engine ticks and exercised `Continue(1)`.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fuel_observer.observations().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("production epoch callback did not observe the compute-bound guest");
+        if proc_task.is_finished() {
+            let result = (&mut proc_task)
+                .await
+                .expect("production-config P3 task panicked");
+            panic!("production-config P3 spinning guest exited before cancellation: {result:?}");
+        }
 
         let started = std::time::Instant::now();
         proc_task.abort();
         let error = tokio::time::timeout(std::time::Duration::from_secs(5), &mut proc_task)
             .await
-            .expect("busy-loop cancellation exceeded timeout")
-            .expect_err("aborted busy-loop task must return JoinError");
+            .expect("production-config P3 cancellation exceeded timeout")
+            .expect_err("aborted production-config P3 task must return JoinError");
         assert!(error.is_cancelled());
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "busy-loop cancellation exceeded bound"
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        let noop = wat::parse_str(P3_NOOP_COMMAND).expect("parse P3 no-op component");
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(noop),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
         );
+        let healthy_proc = builder
+            .with_engine(Arc::clone(&engine))
+            .build()
+            .await
+            .expect("build healthy P3 component on shared Engine");
+        tokio::time::timeout(std::time::Duration::from_secs(5), healthy_proc.run())
+            .await
+            .expect("healthy P3 component did not complete")
+            .expect("healthy P3 component failed");
     }
 
     // =========================================================================
@@ -1571,6 +1934,42 @@ mod tests {
             "ratio should be near 1000, got {}",
             est.avg_ratio()
         );
+        assert_eq!(est.budget(), MIN_FUEL);
+    }
+
+    #[test]
+    fn unmarked_low_consumption_epochs_retain_a_high_budget() {
+        let mut est = FuelEstimator::new(INITIAL_FUEL);
+        let mut trajectory = Vec::with_capacity(60);
+
+        for _ in 0..60 {
+            let remaining = est.budget().saturating_sub(1_000);
+            trajectory.push(est.on_epoch_tick(remaining));
+        }
+
+        assert!(
+            trajectory.iter().all(|budget| *budget >= MAX_FUEL * 9 / 10),
+            "low-consumption epoch trajectory decayed: {trajectory:?}"
+        );
+        assert_eq!(trajectory[0], 9_990_000);
+        assert_eq!(trajectory[1], MAX_FUEL);
+        assert_eq!(trajectory[59], MAX_FUEL);
+        assert!(
+            est.avg_ratio() < 5,
+            "low-consumption epoch ratio must stay near zero: {}",
+            est.avg_ratio()
+        );
+    }
+
+    #[test]
+    fn unmarked_compute_bound_epochs_converge_to_minimum_budget() {
+        let mut est = FuelEstimator::new(INITIAL_FUEL);
+
+        for _ in 0..60 {
+            est.on_epoch_tick(0);
+        }
+
+        assert!(est.avg_ratio() > 990);
         assert_eq!(est.budget(), MIN_FUEL);
     }
 

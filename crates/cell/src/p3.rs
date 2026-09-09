@@ -1,13 +1,4 @@
-//! Dormant WASI P3 host substrate.
-//!
-//! Production [`crate::proc::Proc`] still dispatches WASI P2 components.  This
-//! module contains the versioned P3 transport adapter and the isolated harness
-//! that exercises the host surface required by the future atomic cutover.
-
-#![allow(
-    dead_code,
-    reason = "the production-quality P3 substrate remains dormant until the atomic cutover"
-)]
+//! Native WASI P3 transport host and its isolated regression harness.
 
 use bytes::BytesMut;
 use core::pin::Pin;
@@ -66,7 +57,7 @@ pub(crate) struct GrantedTransport {
 }
 
 /// Host side of the two independently closable bounded byte directions.
-pub(crate) struct HostTransport {
+pub struct HostTransport {
     reader: tokio::io::DuplexStream,
     writer: tokio::io::DuplexStream,
 }
@@ -194,6 +185,30 @@ struct InputProducer {
     completion: DirectionCompletion,
 }
 
+enum InputReadResult {
+    Bytes(usize),
+    Closed,
+}
+
+impl InputProducer {
+    fn poll_read(&mut self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<InputReadResult> {
+        let mut buffer = ReadBuf::new(bytes);
+        match self.reader.as_mut().poll_read(cx, &mut buffer) {
+            Poll::Ready(Ok(())) if buffer.filled().is_empty() => {
+                self.completion.finish(Ok(()));
+                Poll::Ready(InputReadResult::Closed)
+            }
+            Poll::Ready(Ok(())) => Poll::Ready(InputReadResult::Bytes(buffer.filled().len())),
+            Poll::Ready(Err(_)) => {
+                self.completion
+                    .finish(Err(TransportFailure("transport read failed")));
+                Poll::Ready(InputReadResult::Closed)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl<D> StreamProducer<D> for InputProducer {
     type Item = u8;
     type Buffer = BytesMut;
@@ -210,28 +225,12 @@ impl<D> StreamProducer<D> for InputProducer {
         }
 
         let mut destination = destination.as_direct(store, STREAM_BUFFER_CAPACITY);
-        let result = {
-            let mut buffer = ReadBuf::new(destination.remaining());
-            match self.reader.as_mut().poll_read(cx, &mut buffer) {
-                Poll::Ready(Ok(())) => Poll::Ready(Ok(buffer.filled().len())),
-                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-                Poll::Pending => Poll::Pending,
-            }
-        };
-        match result {
-            Poll::Ready(Ok(0)) => {
-                self.completion.finish(Ok(()));
-                Poll::Ready(Ok(StreamResult::Dropped))
-            }
-            Poll::Ready(Ok(count)) => {
+        match self.poll_read(cx, destination.remaining()) {
+            Poll::Ready(InputReadResult::Bytes(count)) => {
                 destination.mark_written(count);
                 Poll::Ready(Ok(StreamResult::Completed))
             }
-            Poll::Ready(Err(_)) => {
-                self.completion
-                    .finish(Err(TransportFailure("transport read failed")));
-                Poll::Ready(Ok(StreamResult::Dropped))
-            }
+            Poll::Ready(InputReadResult::Closed) => Poll::Ready(Ok(StreamResult::Dropped)),
             Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
             Poll::Pending => Poll::Pending,
         }
@@ -246,6 +245,9 @@ struct OutputConsumer {
 
 impl Drop for OutputConsumer {
     fn drop(&mut self) {
+        // Policy A: cancellation after the host accepts bytes, but before the
+        // required flush completes, fails the whole connection. Reporting an
+        // orderly close here could acknowledge a final message that was lost.
         if self.flush_pending && self.completion.sender.is_some() {
             self.completion
                 .finish(Err(TransportFailure("transport flush cancelled")));
@@ -440,6 +442,10 @@ mod tests {
         wasi: WasiCtx,
         table: ResourceTable,
         transport: GrantedTransport,
+        host_call_frames: crate::proc::HostCallFrames,
+        host_call_entries: Arc<AtomicUsize>,
+        host_call_returns: Arc<AtomicUsize>,
+        peak_host_call_depth: Arc<AtomicUsize>,
         cache_mode: Option<Arc<CacheMode>>,
         cid_tree: Option<Arc<CidTree>>,
         writable_descriptors: std::collections::HashSet<u32>,
@@ -450,6 +456,7 @@ mod tests {
 
     impl WasiView for HarnessState {
         fn ctx(&mut self) -> WasiCtxView<'_> {
+            self.host_call_frames.mark();
             WasiCtxView {
                 ctx: &mut self.wasi,
                 table: &mut self.table,
@@ -459,11 +466,13 @@ mod tests {
 
     impl TransportHostState for HarnessState {
         fn granted_transport(&mut self) -> &mut GrantedTransport {
+            self.host_call_frames.mark();
             &mut self.transport
         }
     }
 
     fn harness_wasi_filesystem(state: &mut HarnessState) -> WasiFilesystemCtxView<'_> {
+        state.host_call_frames.mark();
         WasiFilesystemCtxView {
             ctx: state.wasi.filesystem(),
             table: &mut state.table,
@@ -472,6 +481,7 @@ mod tests {
 
     impl FilesystemHostState for HarnessState {
         fn intercepted_filesystem(&mut self) -> IpfsFilesystemView<'_> {
+            self.host_call_frames.mark();
             IpfsFilesystemView {
                 ctx: self.wasi.filesystem(),
                 table: &mut self.table,
@@ -505,6 +515,10 @@ mod tests {
             wasi: builder.build(),
             table: ResourceTable::new(),
             transport,
+            host_call_frames: crate::proc::HostCallFrames::default(),
+            host_call_entries: Arc::new(AtomicUsize::new(0)),
+            host_call_returns: Arc::new(AtomicUsize::new(0)),
+            peak_host_call_depth: Arc::new(AtomicUsize::new(0)),
             cache_mode: None,
             cid_tree: None,
             writable_descriptors: std::collections::HashSet::new(),
@@ -534,6 +548,26 @@ mod tests {
         add_transport_to_linker(&mut linker)?;
 
         let mut store = Store::new(&engine, state);
+        store.call_hook(|mut context, hook| {
+            if matches!(hook, wasmtime::CallHook::CallingHost) {
+                context
+                    .data()
+                    .host_call_entries
+                    .fetch_add(1, Ordering::Release);
+            }
+            if context.data_mut().host_call_frames.on_call_hook(hook) {
+                context
+                    .data()
+                    .host_call_returns
+                    .fetch_add(1, Ordering::Release);
+            }
+            let depth = context.data().host_call_frames.depth();
+            context
+                .data()
+                .peak_host_call_depth
+                .fetch_max(depth, Ordering::Release);
+            Ok(())
+        });
         let instance =
             fixture_bindings::HostSubstrateTest::instantiate_async(&mut store, &component, &linker)
                 .await?;
@@ -684,6 +718,129 @@ mod tests {
             cx: &mut Context<'_>,
         ) -> Poll<std::io::Result<()>> {
             Pin::new(&mut self.writer).poll_shutdown(cx)
+        }
+    }
+
+    struct ReadFailure;
+
+    impl AsyncRead for ReadFailure {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other(
+                "sensitive reader path: /not/guest/visible",
+            )))
+        }
+    }
+
+    struct FlushFailure;
+
+    impl AsyncWrite for FlushFailure {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other(
+                "sensitive writer path: /not/guest/visible",
+            )))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn input_producer_read_failure_is_sanitized() {
+        let observer = Arc::new(TransportObserver::default());
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let mut producer = InputProducer {
+            reader: Box::pin(ReadFailure),
+            completion: DirectionCompletion::new(completion_tx, observer),
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut bytes = [0; 1];
+
+        assert!(matches!(
+            producer.poll_read(&mut cx, &mut bytes),
+            Poll::Ready(InputReadResult::Closed)
+        ));
+        let error = tokio::time::timeout(TEST_TIMEOUT, completion_rx)
+            .await
+            .expect("read failure completion hung");
+        match completion_result(error) {
+            Err(TransportError::Failed(message)) => {
+                assert_eq!(message, "transport read failed");
+            }
+            Ok(()) => panic!("read failure reported orderly completion"),
+        }
+    }
+
+    #[tokio::test]
+    async fn output_consumer_flush_failure_is_sanitized() {
+        let observer = Arc::new(TransportObserver::default());
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let mut consumer = OutputConsumer {
+            writer: Box::pin(FlushFailure),
+            completion: DirectionCompletion::new(completion_tx, observer),
+            flush_pending: false,
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+        assert!(matches!(
+            consumer.poll_flush(&mut cx, false),
+            Poll::Ready(Ok(StreamResult::Dropped))
+        ));
+        let error = tokio::time::timeout(TEST_TIMEOUT, completion_rx)
+            .await
+            .expect("flush failure completion hung");
+        match completion_result(error) {
+            Err(TransportError::Failed(message)) => {
+                assert_eq!(message, "transport flush failed");
+            }
+            Ok(()) => panic!("flush failure reported orderly completion"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_flush_cancellation_fails_the_connection() {
+        let (_reader, writer) = tokio::io::duplex(STREAM_BUFFER_CAPACITY);
+        let flush_open = Arc::new(AtomicBool::new(false));
+        let pending_flush_polls = Arc::new(AtomicUsize::new(0));
+        let flush_waker = Arc::new(Mutex::new(None::<Waker>));
+        let observer = Arc::new(TransportObserver::default());
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let mut consumer = OutputConsumer {
+            writer: Box::pin(FlushGate {
+                writer,
+                open: flush_open,
+                pending_polls: Arc::clone(&pending_flush_polls),
+                waker: flush_waker,
+            }),
+            completion: DirectionCompletion::new(completion_tx, observer),
+            flush_pending: false,
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+        assert!(matches!(consumer.poll_flush(&mut cx, false), Poll::Pending));
+        assert_eq!(pending_flush_polls.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            consumer.poll_flush(&mut cx, true),
+            Poll::Ready(Ok(StreamResult::Dropped))
+        ));
+        let error = completion_result(completion_rx.await)
+            .expect_err("pending flush cancellation must fail the connection");
+        match error {
+            TransportError::Failed(message) => {
+                assert_eq!(message, "transport flush cancelled");
+            }
         }
     }
 
@@ -858,7 +1015,13 @@ mod tests {
     async fn p3_run_concurrent_owner_abort_drops_transport_without_hang() -> Result<()> {
         let (mut host, grant) = HostTransport::bounded_pair();
         let observer = grant.observer();
-        let (mut store, instance) = instantiate(transport_state(grant)?).await?;
+        let state = transport_state(grant)?;
+        let host_call_entries = Arc::clone(&state.host_call_entries);
+        let host_call_returns = Arc::clone(&state.host_call_returns);
+        let peak_host_call_depth = Arc::clone(&state.peak_host_call_depth);
+        let (mut store, instance) = instantiate(state).await?;
+        let initial_host_call_entries = host_call_entries.load(Ordering::Acquire);
+        let initial_host_call_returns = host_call_returns.load(Ordering::Acquire);
         // Wasmtime 48 only hard-cancels a concurrent guest task by dropping
         // its Store. Aborting this owner task drops run_concurrent and Store
         // together without adding a guest resource-order workaround.
@@ -876,11 +1039,17 @@ mod tests {
         tokio::time::timeout(TEST_TIMEOUT, async {
             while observer.active_adapters.load(Ordering::Acquire) != 2
                 || observer.consumed_bytes.load(Ordering::Acquire) < STREAM_BUFFER_CAPACITY
+                || host_call_entries.load(Ordering::Acquire) < initial_host_call_entries + 2
+                || host_call_returns.load(Ordering::Acquire) < initial_host_call_returns + 1
             {
                 tokio::task::yield_now().await;
             }
         })
         .await?;
+        // Wasmtime 48 brackets each synchronous VM-to-host transition before
+        // it returns control to the concurrent task scheduler. The transport
+        // and clock operations overlap, while their CallHook frames do not.
+        assert_eq!(peak_host_call_depth.load(Ordering::Acquire), 1);
         assert!(!task.is_finished(), "owner task finished before abort");
         task.abort();
         let cancelled = tokio::time::timeout(TEST_TIMEOUT, task).await?;
@@ -969,6 +1138,10 @@ mod tests {
                 wasi: builder.build(),
                 table: ResourceTable::new(),
                 transport,
+                host_call_frames: crate::proc::HostCallFrames::default(),
+                host_call_entries: Arc::new(AtomicUsize::new(0)),
+                host_call_returns: Arc::new(AtomicUsize::new(0)),
+                peak_host_call_depth: Arc::new(AtomicUsize::new(0)),
                 cache_mode: Some(cache),
                 cid_tree: Some(tree),
                 writable_descriptors: std::collections::HashSet::new(),

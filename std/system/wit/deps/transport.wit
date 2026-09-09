@@ -1,0 +1,9 @@
+package wetware:transport@0.2.0;
+
+interface connection {
+    variant transport-error {
+        failed(string),
+    }
+
+    open: func(outgoing: stream<u8>) -> tuple<stream<u8>, future<result<_, transport-error>>>;
+}

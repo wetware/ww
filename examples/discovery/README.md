@@ -14,7 +14,7 @@ A Greeter guest for named vat RPC and service-name DHT discovery.
 ## Build
 
 ```sh
-rustup target add wasm32-wasip2
+rustup toolchain install nightly-2026-08-30 --component rust-src
 make discovery
 ```
 

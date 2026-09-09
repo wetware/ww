@@ -3,8 +3,8 @@
 This document covers the tokio runtime layout inside `ww`. For the
 overall thread-per-subsystem rationale, see
 [`src/services.rs`](../src/services.rs); for the on-the-wire RPC
-plumbing, see [rpc-transport.md](rpc-transport.md); for the guest-side
-async runtime, see [guest-runtime.md](guest-runtime.md).
+plumbing, see [rpc-transport.md](rpc-transport.md); for the P3 guest
+execution model, see [guest-runtime.md](guest-runtime.md).
 
 ## Thread-per-subsystem
 

@@ -4,10 +4,9 @@ The SDK for WASM agents running inside the wetware host environment.
 
 ## What it is
 
-When a WASM agent is executed by `ww`, it runs inside a sandbox that communicates
-with the host over a WASI stream pair. This crate abstracts that connection into a
-Cap'n Proto RPC session, letting guest code call host capabilities using ordinary
-`async/await`.
+When `ww` executes a WASM agent, the agent receives a capability-granted
+`wetware:transport/connection@0.2.0` resource. This crate converts that P3
+connection into a Cap'n Proto RPC session for ordinary `async/await` code.
 
 ## Entry points
 
@@ -34,9 +33,8 @@ the host-provided `InitialGrants` received by the child.
 
 ## Relationship to the kernel
 
-The trusted pid0 kernel is the exception: it receives a process-local root
-`Membrane`, whose graft includes a distinct ordinary `Membrane` for publication.
-PID0 uses `serve()` to export that ordinary membrane policy surface. Its private
-`kernel_ready()` host import is separate from `system`, absent from ordinary-cell
-linkers, and cannot be re-exported as a capability. Ordinary agents receive only
+The trusted PID0 kernel receives a process-local root `Membrane` in its initial
+grants. PID0 calls `system::run()` and exports no guest bootstrap capability
+after initialization. Its private `kernel_ready()` host import is separate from
+`system` and absent from ordinary-Cell linkers. Ordinary agents receive only
 `InitialGrants` and use `run()` unless they also export a capability.

@@ -1,11 +1,15 @@
 (component
   (core module $spinning
-    (func (export "run") (result i32)
+    (memory 1)
+    (func (export "run")
       (loop $spin
-        br $spin)
-      i32.const 0))
+        i32.const 0
+        i32.const 0
+        i32.const 65536
+        memory.fill
+        br $spin)))
   (core instance $instance (instantiate $spinning))
-  (func $run (result (result))
-    (canon lift (core func $instance "run")))
-  (instance (export (interface "wasi:cli/run@0.2.0"))
+  (func $run async (result (result))
+    (canon lift (core func $instance "run") async))
+  (instance (export (interface "wasi:cli/run@0.3.0"))
     (export "run" (func $run))))

@@ -21,8 +21,16 @@ use std::rc::Rc;
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
-use wasip2::cli::stderr::get_stderr;
-use wasip2::exports::cli::run::Guest;
+use system::Guest;
+
+#[cfg(target_arch = "wasm32")]
+mod wasi {
+    wit_bindgen::generate!({
+        path: "../../std/system/wit",
+        world: "monotonic-random",
+        generate_all,
+    });
+}
 
 // Cap'n Proto generated modules
 #[allow(dead_code)]
@@ -35,7 +43,11 @@ mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
 
-#[allow(dead_code, clippy::match_single_binding)]
+#[allow(
+    dead_code,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
 mod auth_capnp {
     include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
 }
@@ -108,10 +120,7 @@ impl log::Log for StderrLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let stderr = get_stderr();
-        let _ = stderr.blocking_write_and_flush(
-            format!("[{}] {}\n", record.level(), record.args()).as_bytes(),
-        );
+        eprintln!("[{}] {}", record.level(), record.args());
     }
 
     fn flush(&self) {}
@@ -289,7 +298,7 @@ async fn fetch_prices(
 /// Creates a PriceOracle and exports it as the bootstrap capability.
 /// Fetches prices via HttpClient in the background. The process stays
 /// alive until the host drops the connection.
-fn run_cell() {
+async fn run_cell() -> Result<(), capnp::Error> {
     let cache = init_cache();
     let oracle = PriceOracleImpl {
         cache: cache.clone(),
@@ -308,16 +317,34 @@ fn run_cell() {
         // Keep fetching prices while the RPC connection is alive.
         let mut cooldown_ms: u64 = 30_000;
         loop {
-            let pause =
-                wasip2::clocks::monotonic_clock::subscribe_duration(cooldown_ms * 1_000_000);
-            pause.block();
+            sleep_ns(cooldown_ms * 1_000_000).await;
 
             if let Err(e) = fetch_prices(&http, &cache).await {
                 log::warn!("cell: price refresh failed: {e}");
             }
             cooldown_ms = cooldown_ms.min(60_000);
         }
-    });
+    })
+    .await
+}
+
+async fn sleep_ns(duration: u64) {
+    #[cfg(target_arch = "wasm32")]
+    wasi::wasi::clocks::monotonic_clock::wait_for(duration).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = duration;
+        std::future::pending::<()>().await;
+    }
+}
+
+fn random_below(upper: u64) -> u64 {
+    assert!(upper > 0, "random range is not empty");
+    #[cfg(target_arch = "wasm32")]
+    let value = wasi::wasi::random::random::get_random_u64();
+    #[cfg(not(target_arch = "wasm32"))]
+    let value = rand::random::<u64>();
+    value % upper
 }
 
 // ---------------------------------------------------------------------------
@@ -347,8 +374,7 @@ async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> 
 
     // Keep the epoch alive. The host owns registration and republication.
     loop {
-        let pause = wasip2::clocks::monotonic_clock::subscribe_duration(60_000_000_000);
-        pause.block();
+        sleep_ns(60_000_000_000).await;
     }
 }
 
@@ -484,9 +510,8 @@ async fn run_consumer(initial_grants: InitialGrants) -> Result<(), capnp::Error>
             cooldown_ms = (cooldown_ms * 2).min(MAX_MS);
         }
 
-        let delay_ms = cooldown_ms / 2 + rand::random_range(0..=cooldown_ms / 2);
-        let pause = wasip2::clocks::monotonic_clock::subscribe_duration(delay_ms * 1_000_000);
-        pause.block();
+        let delay_ms = cooldown_ms / 2 + random_below(cooldown_ms / 2 + 1);
+        sleep_ns(delay_ms * 1_000_000).await;
     }
 }
 
@@ -496,9 +521,9 @@ async fn run_consumer(initial_grants: InitialGrants) -> Result<(), capnp::Error>
 
 /// WAGI cell handler: read initial grants, fetch prices, respond with JSON.
 ///
-/// stdin/stdout carry CGI (body in, response out). The Cap'n Proto RPC runs
-/// over the `wetware:streams` side-channel — no conflict.
-fn run_http() -> Result<(), ()> {
+/// stdin/stdout carry CGI. Cap'n Proto uses the capability-granted P3
+/// `wetware:transport` connection, so the streams do not conflict.
+async fn run_http() -> Result<(), ()> {
     use wagi_guest as wagi;
 
     system::run(|initial_grants: InitialGrants| async move {
@@ -521,9 +546,11 @@ fn run_http() -> Result<(), ()> {
         let json = build_json_response(&cache, &query);
         wagi::respond(200, &[("Content-Type", "application/json")], &json);
         Ok(())
-    });
-
-    Ok(())
+    })
+    .await
+    .map_err(|error| {
+        log::error!("oracle HTTP RPC failed: {error}");
+    })
 }
 
 /// Build a JSON response from the price cache.
@@ -571,38 +598,42 @@ fn build_json_response(cache: &PriceCache, query: &str) -> String {
 struct OracleGuest;
 
 impl Guest for OracleGuest {
-    fn run() -> Result<(), ()> {
+    async fn run() -> Result<(), ()> {
         init_logging();
 
         // HTTP/WAGI mode: detected by CGI env var presence.
         // HttpListener injects REQUEST_METHOD; vat publication does not.
         if std::env::var("REQUEST_METHOD").is_ok() {
-            return run_http();
+            return run_http().await;
         }
 
-        match std::env::args().nth(1).as_deref() {
+        let result = match std::env::args().nth(1).as_deref() {
             Some("serve") => {
                 log::info!("oracle: serve — DHT provide loop");
                 system::run(|initial_grants: InitialGrants| async move {
                     run_service(initial_grants).await
-                });
+                })
+                .await
             }
             Some("consume") => {
                 log::info!("oracle: consume — discover + query prices");
                 system::run(|initial_grants: InitialGrants| async move {
                     run_consumer(initial_grants).await
-                });
+                })
+                .await
             }
             _ => {
                 // Default (no args): cell mode — export the PriceOracle capability.
-                run_cell();
+                run_cell().await
             }
-        }
-        Ok(())
+        };
+        result.map_err(|error| {
+            log::error!("oracle RPC failed: {error}");
+        })
     }
 }
 
-wasip2::cli::command::export!(OracleGuest);
+system::export!(OracleGuest);
 
 // ---------------------------------------------------------------------------
 // Unit tests

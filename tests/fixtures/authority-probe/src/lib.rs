@@ -8,8 +8,18 @@ use std::io::IsTerminal;
 use std::rc::Rc;
 
 use capnp::capability::{Client as AnyClient, FromClientHook, Promise};
+use capnp_rpc::pry;
 use serde_json::{json, Value};
-use wasip2::exports::cli::run::Guest;
+use system::Guest;
+
+#[cfg(target_arch = "wasm32")]
+mod wasi {
+    wit_bindgen::generate!({
+        path: "../../../std/system/wit",
+        world: "monotonic-random",
+        generate_all,
+    });
+}
 
 #[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod system_capnp {
@@ -41,6 +51,32 @@ mod http_capnp {
 }
 
 type InitialGrants = membrane_capnp::initial_grants::Client;
+
+fn random_u64() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasi::wasi::random::random::get_random_u64()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rand::random::<u64>()
+    }
+}
+
+fn monotonic_now() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasi::wasi::clocks::monotonic_clock::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    }
+}
 const PROVIDER_KEY: &str = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
 
 #[derive(Clone)]
@@ -102,7 +138,7 @@ fn optional_result<T: serde::Serialize, E: std::fmt::Display>(
     result.map(value_or_error).unwrap_or(Value::Null)
 }
 
-fn run_enumerate() {
+async fn run_enumerate() -> Result<(), capnp::Error> {
     system::run(|initial_grants: InitialGrants| async move {
         let first = read_initial_grants(&initial_grants).await;
         let second = read_initial_grants(&initial_grants).await;
@@ -112,7 +148,48 @@ fn run_enumerate() {
             "second": value_or_error(second.as_ref().map(|caps| names(caps))),
         }));
         Ok(())
-    });
+    })
+    .await
+}
+
+struct ReentrantListener;
+
+#[allow(refining_impl_trait)]
+impl system_capnp::vat_listener::Server for ReentrantListener {
+    fn serve_raw(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::vat_listener::ServeRawParams,
+        _results: system_capnp::vat_listener::ServeRawResults,
+    ) -> Promise<(), capnp::Error> {
+        let callback = pry!(pry!(params.get())
+            .get_cap()
+            .get_as_capability::<capnp::capability::Client>());
+        let callback = system_capnp::host::Client::new(callback.hook);
+
+        Promise::from_future(async move {
+            callback.id_request().send().promise.await?;
+            Ok(())
+        })
+    }
+
+    fn serve_authenticated(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::vat_listener::ServeAuthenticatedParams,
+        _results: system_capnp::vat_listener::ServeAuthenticatedResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented(
+            "authority probe only implements serveRaw".into(),
+        ))
+    }
+}
+
+async fn run_reentrant_callback() -> Result<(), capnp::Error> {
+    let listener: system_capnp::vat_listener::Client = capnp_rpc::new_client(ReentrantListener);
+    system::serve(
+        listener.client,
+        |_initial_grants: InitialGrants| async move { std::future::pending().await },
+    )
+    .await
 }
 
 async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value {
@@ -252,15 +329,16 @@ async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value
     }
 }
 
-fn run_invoke() {
+async fn run_invoke() -> Result<(), capnp::Error> {
     let requested = std::env::var("WW_PROBE_CAP").unwrap_or_else(|_| "host".to_owned());
     system::run(|initial_grants: InitialGrants| async move {
         emit(invoke_named(initial_grants, requested).await);
         Ok(())
-    });
+    })
+    .await
 }
 
-fn run_arbitrary_name() {
+async fn run_arbitrary_name() -> Result<(), capnp::Error> {
     let requested =
         std::env::var("WW_PROBE_NAME").unwrap_or_else(|_| "definitely-not-granted".to_owned());
     system::run(|initial_grants: InitialGrants| async move {
@@ -287,10 +365,11 @@ fn run_arbitrary_name() {
         };
         emit(value);
         Ok(())
-    });
+    })
+    .await
 }
 
-fn run_alias_redelivery() {
+async fn run_alias_redelivery() -> Result<(), capnp::Error> {
     system::run(|initial_grants: InitialGrants| async move {
         let result: Result<Value, capnp::Error> = async {
             let deliveries = [
@@ -319,10 +398,11 @@ fn run_alias_redelivery() {
             }
         });
         Ok(())
-    });
+    })
+    .await
 }
 
-fn run_attenuated() {
+async fn run_attenuated() -> Result<(), capnp::Error> {
     system::run(|initial_grants: InitialGrants| async move {
         let result: Result<Value, capnp::Error> = async {
             let caps = read_initial_grants(&initial_grants).await?;
@@ -350,10 +430,11 @@ fn run_attenuated() {
             Err(error) => json!({"mode": "attenuated", "ok": false, "error": text_error(error)}),
         });
         Ok(())
-    });
+    })
+    .await
 }
 
-fn run_trusted_lattice() {
+async fn run_trusted_lattice() -> Result<(), capnp::Error> {
     let image = std::env::var("WW_PROBE_IMAGE")
         .unwrap_or_else(|_| "runtime-selected-image".to_owned())
         .into_bytes();
@@ -401,10 +482,41 @@ fn run_trusted_lattice() {
             }
         });
         Ok(())
-    });
+    })
+    .await
 }
 
-fn run_late_delegation() {
+async fn run_epoch_http_listen() -> Result<(), capnp::Error> {
+    system::run(|initial_grants: InitialGrants| async move {
+        let result: Result<(), capnp::Error> = async {
+            let caps = read_initial_grants(&initial_grants).await?;
+            let host: system_capnp::host::Client = find_cap(&caps, "host")?;
+            let executor: system_capnp::executor::Client = find_cap(&caps, "bound-executor")?;
+            let network = host.network_request().send().promise.await?;
+            let listener = network.get()?.get_http_listener()?;
+            let mut listen = listener.listen_request();
+            listen.get().set_executor(executor);
+            listen.get().set_prefix("/epoch-probe");
+            listen.get().init_caps(0);
+            listen.send().promise.await?;
+            Ok(())
+        }
+        .await;
+
+        emit(match result {
+            Ok(()) => json!({"mode": "epoch-http-listen", "ok": true}),
+            Err(error) => json!({
+                "mode": "epoch-http-listen",
+                "ok": false,
+                "error": text_error(error),
+            }),
+        });
+        Ok(())
+    })
+    .await
+}
+
+async fn run_late_delegation() -> Result<(), capnp::Error> {
     system::run(|initial_grants: InitialGrants| async move {
         let result: Result<Value, capnp::Error> = async {
             let initial = read_initial_grants(&initial_grants).await?;
@@ -443,10 +555,11 @@ fn run_late_delegation() {
             }
         });
         Ok(())
-    });
+    })
+    .await
 }
 
-fn run_invoke_all() {
+async fn run_invoke_all() -> Result<(), capnp::Error> {
     system::run(|initial_grants: InitialGrants| async move {
         let mut results = Vec::new();
         let mut usable = Vec::new();
@@ -472,7 +585,8 @@ fn run_invoke_all() {
             "results": results,
         }));
         Ok(())
-    });
+    })
+    .await
 }
 
 struct ProviderSink {
@@ -525,7 +639,7 @@ async fn call_announcer(announcer: &routing_capnp::announcer::Client) -> Result<
     provide.send().promise.await.map(|_| ())
 }
 
-fn run_provider_routing(mode: &'static str) {
+async fn run_provider_routing(mode: &'static str) -> Result<(), capnp::Error> {
     system::run(|initial_grants: InitialGrants| async move {
         let result: Result<Value, capnp::Error> = async {
             let caps = read_initial_grants(&initial_grants).await?;
@@ -580,7 +694,8 @@ fn run_provider_routing(mode: &'static str) {
             Err(error) => json!({"mode": mode, "ok": false, "error": text_error(error)}),
         });
         Ok(())
-    });
+    })
+    .await
 }
 
 async fn read_all(stream: system_capnp::byte_stream::Client) -> Result<Vec<u8>, capnp::Error> {
@@ -597,7 +712,7 @@ async fn read_all(stream: system_capnp::byte_stream::Client) -> Result<Vec<u8>, 
     }
 }
 
-fn run_descendant() {
+async fn run_descendant() -> Result<(), capnp::Error> {
     let http_url = std::env::var("WW_PROBE_HTTP_URL").ok();
     system::run(|initial_grants: InitialGrants| async move {
         let result: Result<Value, capnp::Error> = async {
@@ -674,10 +789,11 @@ fn run_descendant() {
             Err(error) => json!({"mode": "descendant", "ok": false, "error": text_error(error)}),
         });
         Ok(())
-    });
+    })
+    .await
 }
 
-fn run_raw_host() {
+async fn run_raw_host() -> Result<(), capnp::Error> {
     system::run(|host: system_capnp::host::Client| async move {
         let result = host.id_request().send().promise.await;
         emit(match result {
@@ -689,10 +805,11 @@ fn run_raw_host() {
             Err(error) => json!({"mode": "raw-host", "ok": false, "error": text_error(error)}),
         });
         Ok(())
-    });
+    })
+    .await
 }
 
-fn run_substrate() {
+async fn run_substrate() -> Result<(), capnp::Error> {
     system::run(|_initial_grants: InitialGrants| async move {
         let args: Vec<String> = std::env::args().collect();
         let env: Vec<(String, String)> = std::env::vars().collect();
@@ -711,7 +828,7 @@ fn run_substrate() {
         let ipfs_mutation = cid_path
             .as_deref()
             .map(|path| std::fs::write(path, b"authority-probe").map_err(text_error));
-        let scratch_path = format!("/tmp/authority-probe-{}", rand::random::<u64>());
+        let scratch_path = format!("/tmp/authority-probe-{}", random_u64());
         let scratch = std::fs::write(&scratch_path, b"scratch")
             .and_then(|_| std::fs::read(&scratch_path))
             .map(|bytes| bytes == b"scratch")
@@ -740,15 +857,16 @@ fn run_substrate() {
                     .map(|d| d.as_nanos())
                     .unwrap_or_default()
                     .to_string(),
-                "monotonic_nanos": wasip2::clocks::monotonic_clock::now(),
+                "monotonic_nanos": monotonic_now(),
             },
-            "random_u64": rand::random::<u64>(),
+            "random_u64": random_u64(),
         }));
         Ok(())
-    });
+    })
+    .await
 }
 
-fn run_scratch_observe() {
+async fn run_scratch_observe() -> Result<(), capnp::Error> {
     system::run(|_initial_grants: InitialGrants| async move {
         let path = "/tmp/authority-probe-private";
         let observed_before_write = std::path::Path::new(path).exists();
@@ -759,10 +877,11 @@ fn run_scratch_observe() {
             "write": value_or_error(write),
         }));
         Ok(())
-    });
+    })
+    .await
 }
 
-fn run_scratch_parent() {
+async fn run_scratch_parent() -> Result<(), capnp::Error> {
     system::run(|initial_grants: InitialGrants| async move {
         let result: Result<Value, capnp::Error> = async {
             let caps = read_initial_grants(&initial_grants).await?;
@@ -807,33 +926,38 @@ fn run_scratch_parent() {
             }
         });
         Ok(())
-    });
+    })
+    .await
 }
 
 struct AuthorityProbe;
 
 impl Guest for AuthorityProbe {
-    fn run() -> Result<(), ()> {
-        match std::env::args().nth(1).as_deref() {
-            Some("invoke") => run_invoke(),
-            Some("arbitrary-name") => run_arbitrary_name(),
-            Some("alias-redelivery") => run_alias_redelivery(),
-            Some("attenuated") => run_attenuated(),
-            Some("trusted-lattice") => run_trusted_lattice(),
-            Some("late-delegation") => run_late_delegation(),
-            Some("invoke-all") => run_invoke_all(),
-            Some("routing-finder") => run_provider_routing("routing-finder"),
-            Some("routing-announcer") => run_provider_routing("routing-announcer"),
-            Some("routing-both") => run_provider_routing("routing-both"),
-            Some("descendant") => run_descendant(),
-            Some("raw-host") => run_raw_host(),
-            Some("substrate") => run_substrate(),
-            Some("scratch-observe") => run_scratch_observe(),
-            Some("scratch-parent") => run_scratch_parent(),
-            _ => run_enumerate(),
-        }
-        Ok(())
+    async fn run() -> Result<(), ()> {
+        let result = match std::env::args().nth(1).as_deref() {
+            Some("invoke") => run_invoke().await,
+            Some("arbitrary-name") => run_arbitrary_name().await,
+            Some("alias-redelivery") => run_alias_redelivery().await,
+            Some("attenuated") => run_attenuated().await,
+            Some("trusted-lattice") => run_trusted_lattice().await,
+            Some("epoch-http-listen") => run_epoch_http_listen().await,
+            Some("late-delegation") => run_late_delegation().await,
+            Some("invoke-all") => run_invoke_all().await,
+            Some("routing-finder") => run_provider_routing("routing-finder").await,
+            Some("routing-announcer") => run_provider_routing("routing-announcer").await,
+            Some("routing-both") => run_provider_routing("routing-both").await,
+            Some("descendant") => run_descendant().await,
+            Some("raw-host") => run_raw_host().await,
+            Some("substrate") => run_substrate().await,
+            Some("scratch-observe") => run_scratch_observe().await,
+            Some("scratch-parent") => run_scratch_parent().await,
+            Some("reentrant-callback") => run_reentrant_callback().await,
+            _ => run_enumerate().await,
+        };
+        result.map_err(|error| {
+            eprintln!("authority probe RPC failed: {error}");
+        })
     }
 }
 
-wasip2::cli::command::export!(AuthorityProbe);
+system::export!(AuthorityProbe);

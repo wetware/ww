@@ -13,4 +13,5 @@ interface readiness {
 
 world pid0 {
     import readiness;
+    import wasi:cli/stdin@0.3.0;
 }

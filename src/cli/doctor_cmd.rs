@@ -1,5 +1,7 @@
 use anyhow::Result;
 
+use super::p3_toolchain;
+
 /// Check the development environment.
 #[allow(clippy::unused_async)]
 pub(super) async fn doctor() -> Result<()> {
@@ -21,23 +23,13 @@ pub(super) async fn doctor() -> Result<()> {
         }
     }
 
-    // Required: wasm32-wasip2 target
-    let targets = std::process::Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output();
-    match targets {
-        Ok(out) if out.status.success() => {
-            let list = String::from_utf8_lossy(&out.stdout);
-            if list.contains("wasm32-wasip2") {
-                println!("  wasm32-wasip2 target ........ OK");
-            } else {
-                println!("  wasm32-wasip2 target ........ MISSING");
-                println!("    Fix: rustup target add wasm32-wasip2");
-                all_required_ok = false;
-            }
-        }
-        _ => {
-            println!("  wasm32-wasip2 target ........ UNKNOWN (rustup not found)");
+    // Required: pinned native WASI P3 toolchain
+    match p3_toolchain::Toolchain::discover_and_validate() {
+        Ok(_) => println!("  Native WASI P3 toolchain .... OK"),
+        Err(error) => {
+            println!("  Native WASI P3 toolchain .... MISSING");
+            println!("    {error:#}");
+            println!("    See: doc/cli.md#native-wasi-p3-toolchain");
             all_required_ok = false;
         }
     }

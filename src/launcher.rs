@@ -8,7 +8,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
@@ -20,7 +22,7 @@ use ::authority::EpochGuard;
 
 use crate::services::CompileRequest;
 use crate::system_capnp;
-use cell::proc::FuelEstimator;
+use cell::proc::{FuelEstimator, FuelObserver};
 use cell::{Builder, Proc, Program};
 use rpc::{
     graft, ByteStreamImpl, CachePolicy, InitialAuthorityRecord, ProcessBootstrapControl,
@@ -33,6 +35,18 @@ use rpc::{
 /// CPU spent on untrusted guest code while still accommodating larger
 /// practical WASM guests.
 const MAX_WASM_BYTES: usize = 8 * 1024 * 1024;
+const RPC_EOF_GRACE: Duration = Duration::from_secs(1);
+
+static RPC_EOF_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of malformed-peer fallbacks that aborted a child host RpcSystem.
+///
+/// This counter makes the one-second EOF grace path observable in tests and
+/// diagnostics without changing process completion semantics.
+#[doc(hidden)]
+pub fn rpc_eof_fallback_count() -> u64 {
+    RPC_EOF_FALLBACKS.load(Ordering::Relaxed)
+}
 
 // =========================================================================
 // RuntimeImpl — system-wide WASM compilation + execution runtime
@@ -65,6 +79,8 @@ pub struct RuntimeImpl {
     /// publishing, routing, or network-dial API. Reads can still consume node
     /// network, disk, pin/cache budget, and eviction work.
     pinset_cache: Option<Arc<cache::PinsetCache>>,
+    /// Optional integration-test observation of production fuel callbacks.
+    fuel_observer: Option<FuelObserver>,
 }
 
 impl RuntimeImpl {
@@ -85,6 +101,7 @@ impl RuntimeImpl {
             wasm_debug: self.wasm_debug,
             guard: self.guard.clone(),
             pinset_cache: self.pinset_cache.clone(),
+            fuel_observer: self.fuel_observer.clone(),
         })
     }
 }
@@ -131,7 +148,15 @@ pub fn create_runtime_client(
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
 ) -> system_capnp::runtime::Client {
-    create_runtime_client_with_pinset(wasm_debug, guard, engine, compile_tx, cache_policy, None)
+    create_runtime_client_with_options(
+        wasm_debug,
+        guard,
+        engine,
+        compile_tx,
+        cache_policy,
+        None,
+        None,
+    )
 }
 
 /// Create a Runtime whose Executors receive the fixed known-CID read
@@ -147,6 +172,47 @@ pub fn create_runtime_client_with_pinset(
     cache_policy: CachePolicy,
     pinset_cache: Option<Arc<cache::PinsetCache>>,
 ) -> system_capnp::runtime::Client {
+    create_runtime_client_with_options(
+        wasm_debug,
+        guard,
+        engine,
+        compile_tx,
+        cache_policy,
+        pinset_cache,
+        None,
+    )
+}
+
+/// Create a Runtime with opt-in observation of production fuel callbacks.
+#[doc(hidden)]
+pub fn create_runtime_client_with_fuel_observer(
+    wasm_debug: bool,
+    guard: EpochGuard,
+    engine: Option<Arc<wasmtime::Engine>>,
+    compile_tx: Option<mpsc::Sender<CompileRequest>>,
+    cache_policy: CachePolicy,
+    fuel_observer: FuelObserver,
+) -> system_capnp::runtime::Client {
+    create_runtime_client_with_options(
+        wasm_debug,
+        guard,
+        engine,
+        compile_tx,
+        cache_policy,
+        None,
+        Some(fuel_observer),
+    )
+}
+
+fn create_runtime_client_with_options(
+    wasm_debug: bool,
+    guard: EpochGuard,
+    engine: Option<Arc<wasmtime::Engine>>,
+    compile_tx: Option<mpsc::Sender<CompileRequest>>,
+    cache_policy: CachePolicy,
+    pinset_cache: Option<Arc<cache::PinsetCache>>,
+    fuel_observer: Option<FuelObserver>,
+) -> system_capnp::runtime::Client {
     let runtime = RuntimeImpl {
         wasm_debug,
         guard,
@@ -155,6 +221,7 @@ pub fn create_runtime_client_with_pinset(
         engine: engine.unwrap_or_else(build_wasmtime_engine),
         compile_tx,
         pinset_cache,
+        fuel_observer,
     };
     capnp_rpc::new_client(runtime)
 }
@@ -274,6 +341,7 @@ pub struct ExecutorImpl {
     wasm_debug: bool,
     guard: EpochGuard,
     pinset_cache: Option<Arc<cache::PinsetCache>>,
+    fuel_observer: Option<FuelObserver>,
 }
 
 /// Owns every resource whose lifetime is exactly one running child.
@@ -327,7 +395,7 @@ impl OwnedChildLifecycle {
                     }
                 }
             } else {
-                break match proc_run.await {
+                break match (&mut proc_run).await {
                     Ok(()) => 0,
                     Err(error) => {
                         tracing::error!("executor: child process failed: {error}");
@@ -337,8 +405,12 @@ impl OwnedChildLifecycle {
             }
         };
 
-        self.stop_auxiliary_tasks().await;
+        // Drop the Store and its guest transport before stopping the host RPC
+        // system. This closes the peer side of the connection and cancels all
+        // guest-owned RPC questions.
+        drop(proc_run);
         self.bootstrap_control.clear();
+        self.stop_auxiliary_tasks().await;
         // Keep the immutable record live through process execution, then
         // release it after child RPC and the stored guest bootstrap are gone
         // but before reporting exit to the parent.
@@ -361,14 +433,24 @@ impl OwnedChildLifecycle {
     async fn stop_auxiliary_tasks(&mut self) {
         let rpc_task = self.rpc_task.take();
         let stderr_task = self.stderr_task.take();
-        if let Some(task) = &rpc_task {
-            task.abort();
-        }
         if let Some(task) = &stderr_task {
             task.abort();
         }
-        if let Some(task) = rpc_task {
-            let _ = task.await;
+        if let Some(mut task) = rpc_task {
+            // Let `RpcSystem` observe transport EOF so it drops dispatched
+            // server futures. The timeout bounds teardown for a malformed peer.
+            if tokio::time::timeout(RPC_EOF_GRACE, &mut task)
+                .await
+                .is_err()
+            {
+                RPC_EOF_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    grace_ms = RPC_EOF_GRACE.as_millis() as u64,
+                    "executor: child host RpcSystem missed EOF grace; aborting fallback"
+                );
+                task.abort();
+                let _ = task.await;
+            }
         }
         if let Some(task) = stderr_task {
             let _ = task.await;
@@ -464,6 +546,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
         let engine = self.engine.clone();
         let wasm_debug = self.wasm_debug;
         let pinset_cache = self.pinset_cache.clone();
+        let fuel_observer = self.fuel_observer.clone();
 
         Promise::from_future(async move {
             let (host_stderr, guest_stderr) = io::duplex(64 * 1024);
@@ -488,6 +571,9 @@ impl system_capnp::executor::Server for ExecutorImpl {
                 .with_wasm_debug(wasm_debug);
             if let Some(est) = fuel_estimator {
                 builder = builder.with_fuel_estimator(est);
+            }
+            if let Some(observer) = fuel_observer {
+                builder = builder.with_fuel_observer(observer);
             }
             if let Some(pinset_cache) = pinset_cache {
                 builder = builder.with_cache(cache::CacheMode::Shared(pinset_cache));
