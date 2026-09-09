@@ -161,7 +161,7 @@ cargo_args=(
   build
   --locked
   --manifest-path "$manifest"
-  -Z build-std=std,panic_abort
+  -Z "build-std=std,panic_abort"
   --target wasm32-wasip3
   --release
 )
