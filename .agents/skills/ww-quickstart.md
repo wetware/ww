@@ -16,8 +16,11 @@ orientation, see `/ww-onboard` instead.
 
 First, check prerequisites yourself:
 - `rustc --version` — Rust toolchain installed?
-- `rustup target list --installed | grep wasm32-wasip2` — present?
-  If missing, run `rustup target add wasm32-wasip2`.
+- `ww doctor` — pinned native WASI P3 toolchain available?
+
+Guest builds require nightly `nightly-2026-08-30` with `rust-src`, WASI SDK
+34.0, and `wasm-tools` 1.258.0. Do not install `wasm32-wasip3` through rustup;
+the build compiles the Tier 3 standard library from `rust-src`.
 
 Then run `make` yourself. It builds the host binary, both kernels, the shell,
 and examples. The first build takes longer.

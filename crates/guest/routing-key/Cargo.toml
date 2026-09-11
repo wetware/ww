@@ -5,4 +5,4 @@ edition = "2021"
 description = "Optional guest binding for Wetware routing-key derivation"
 
 [dependencies]
-wit-bindgen = "0.41.0"
+wit-bindgen = { workspace = true }

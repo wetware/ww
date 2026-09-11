@@ -173,9 +173,11 @@ impl EngineFactory {
         // Epoch: the ExecutorPool's tick task calls Engine::increment_epoch()
         // to reach every Store's epoch_deadline_callback.
         config.epoch_interruption(true);
-        // Production remains WASI P2. Wasmtime 48 enables the component-model
-        // async proposal by default when concurrency support is compiled in.
-        config.wasm_component_model_async(false);
+        // Native WASI P3 components use the Component Model async ABI and
+        // concurrent task support. Every Cell still owns exactly one Store.
+        config.wasm_component_model_async(true);
+        config.wasm_component_model_async_stackful(true);
+        config.wasm_component_model_threading(true);
         if let Some(cache) = &self.cache {
             config.cache(Some(cache.clone()));
         }
@@ -304,15 +306,11 @@ mod tests {
     }
 
     #[test]
-    fn production_engine_rejects_component_model_async() {
+    fn production_engine_accepts_component_model_async() {
         let factory = EngineFactory::from_settings(Ok(None));
         let engine = factory.engine().expect("engine");
-        let error = Component::new(&engine, "(component (type (func async)))")
-            .expect_err("production engine must reject component-model async");
-        assert!(
-            format!("{error:#}").contains("component model async feature"),
-            "unexpected validation error: {error:#}"
-        );
+        Component::new(&engine, "(component (type (func async)))")
+            .expect("production engine must accept component-model async");
     }
 
     #[test]

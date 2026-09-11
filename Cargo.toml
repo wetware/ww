@@ -15,10 +15,10 @@ members = [
     "examples/discovery",
 ]
 exclude = [
-    "std/kernel",        # Default WASI pid0 guest — targets wasm32-wasip2
-    "examples/echo",     # WASI guest — targets wasm32-wasip2, not host
-    "examples/counter",  # WASI guest — targets wasm32-wasip2, not host
-    "examples/oracle",   # WASI guest — targets wasm32-wasip2, not host
+    "std/kernel",        # Default native WASI P3 pid0 guest
+    "examples/echo",     # Native WASI P3 guest, not a host crate
+    "examples/counter",  # Native WASI P3 guest, not a host crate
+    "examples/oracle",   # Native WASI P3 guest, not a host crate
 ]
 
 [workspace.dependencies]
@@ -49,8 +49,8 @@ tokio = "1.48.0"
 tokio-util = "0.7.17"
 tracing = "0.1"
 tracing-subscriber = "0.3.20"
-wasip2 = "1.0.2"
 wasmtime = "=48.0.1"
+wit-bindgen = "=0.61.1"
 
 [package]
 name = "ww"

@@ -1,0 +1,24 @@
+package wetware:system@0.3.0;
+
+/// Minimal command world for asynchronous Wetware RPC guests.
+world guest {
+    import wetware:transport/connection@0.2.0;
+    export wasi:cli/run@0.3.0;
+}
+
+/// Selective monotonic-clock imports for guests with timed application work.
+world monotonic {
+    import wasi:clocks/monotonic-clock@0.3.0;
+}
+
+/// Selective clock and random imports for timed application loops.
+world monotonic-random {
+    import wasi:clocks/monotonic-clock@0.3.0;
+    import wasi:random/random@0.3.0;
+}
+
+/// Minimal entry point for finite guests that do not use the RPC transport.
+world sync-command {
+    import wasi:cli/stdout@0.3.0;
+    export wasi:cli/run@0.3.0;
+}

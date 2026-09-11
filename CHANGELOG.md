@@ -7,20 +7,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
-- **Dormant WASI P3 host transport and filesystem adapters are available for
-  the future guest cutover.** `wetware:transport@0.2.0` grants one ordered byte
-  connection with bounded backpressure, host flush-gated write completion,
-  independent orderly half-close, and sanitized transport failures. P2 and P3
-  adapters share lazy read-only CidTree/IPFS materialization and writable
+- **Production Cells now use native WASI P3.** Wasmtime 48.0.1 invokes each
+  asynchronous `wasi:cli/run@0.3.0` export with `Store::run_concurrent`.
+  `std/system` composes the P3 transport completion, Cap'n Proto `RpcSystem`,
+  and application Future under one root Future. Wasmtime owns suspension and
+  resumption; the deleted P2 guest scheduler, poll loop, and compatibility path
+  are not retained. Synchronous stdio Cells use the separate `sync-command`
+  world and do not link `std/system` or Cap'n Proto RPC. On child teardown, the
+  host drops the Store, gives the host `RpcSystem` one second to observe normal
+  transport EOF, and logs and aborts the task only as a bounded malformed-peer
+  fallback.
+- **The P3 transport, filesystem, and build lanes are production paths.**
+  `wetware:transport@0.2.0` grants one ordered byte connection with bounded
+  backpressure, host flush-gated write completion, independent orderly
+  half-close, and sanitized transport failures. The P3 filesystem adapter
+  provides lazy read-only CidTree/IPFS materialization and writable private
   `/tmp`. Shared filesystem policy validates directory CIDs and entry names
-  before staging-path use. Native P3 fixtures cover transport, owner-abort
-  cleanup, filesystem policy, and ABI/import validation. Production guests
-  remain P2-only.
-- **The host now uses Wasmtime 48.0.1 while production Cells remain on WASI
-  P2.** Filesystem permission and component import inspection calls use the
-  Wasmtime 48 APIs without changing Cell scheduling or filesystem policy. A
-  pinned, isolated `wasm32-wasip3` async fixture now validates the forthcoming
-  native P3 build lane and rejects WASI 0.2 imports in CI.
+  before staging-path use. The pinned `wasm32-wasip3` build lane applies an
+  artifact-specific import allowlist and rejects WASI 0.2 and socket imports.
+  Native P3 fixtures cover transport, owner-abort cleanup, filesystem policy,
+  and ABI/import validation.
 - **Breaking: provider routing now uses independent object capabilities.** The
   legacy broad `Routing` interface and `routing` graft are replaced by
   provider discovery through `routing::Finder` (`routing-finder`) and host

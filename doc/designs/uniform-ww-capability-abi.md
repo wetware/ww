@@ -41,7 +41,7 @@ These public schemas carry Synapse:
 - `Process.bootstrap() -> (synapse)`
 - `VatListener.serve(synapse, protocol)`
 - `VatClient.dial(peer, protocol) -> (synapse)`
-- std/system helpers such as `serve` and `serve_stdio`
+- `std/system` session helpers such as `run` and `serve`
 
 `Export.name` remains the local binding key. It is not type authority.
 

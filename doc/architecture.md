@@ -1,7 +1,7 @@
 # Architecture
 
 This is the current architecture reference for Wetware's authority model.
-For Cap'n Proto stream plumbing, polling, and deadlock analysis, see
+For Cap'n Proto stream plumbing, P3 suspension, and deadlock analysis, see
 [rpc-transport.md](rpc-transport.md). For the capability surface and
 attenuation rules, see [capabilities.md](capabilities.md).
 

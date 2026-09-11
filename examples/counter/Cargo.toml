@@ -9,6 +9,4 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-wasip2 = "1.0.2"
-wit-bindgen = "0.41.0"
 wagi-guest = { path = "../../crates/wagi-guest" }

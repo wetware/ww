@@ -6,6 +6,9 @@
 //! receive their immutable grants through the distinct `InitialGrants`
 //! interface.
 
+#[path = "support/ticked_executor.rs"]
+mod ticked_executor;
+
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,7 +25,10 @@ use ww::launcher::{create_runtime_client, create_runtime_client_with_pinset};
 use ww::rpc::CachePolicy;
 use ww::system_capnp;
 
+use ticked_executor::TickedExecutor;
+
 const CAPNP_FORK_REVISION: &str = "c6eecf42da63296e5bf628251935cf5af09d80be";
+const USE_PREBUILT_AUTHORITY_PROBE_ENV: &str = "WW_USE_PREBUILT_AUTHORITY_PROBE";
 const SENSITIVE_CAPS: &[&str] = &[
     "host",
     "runtime",
@@ -54,34 +60,120 @@ fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/authority-probe")
 }
 
+fn require_probe_wasm(
+    wasm: PathBuf,
+    use_prebuilt: bool,
+    build: impl FnOnce() -> Result<(), String>,
+) -> PathBuf {
+    if !use_prebuilt {
+        build().unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    let metadata = std::fs::metadata(&wasm).unwrap_or_else(|error| {
+        panic!(
+            "required authority-probe artifact {} is missing: {error}",
+            wasm.display()
+        )
+    });
+    assert!(
+        metadata.is_file(),
+        "required authority-probe artifact is not a file: {}",
+        wasm.display()
+    );
+    assert!(
+        metadata.len() > 0,
+        "required authority-probe artifact is empty: {}",
+        wasm.display()
+    );
+    wasm
+}
+
 fn probe_wasm() -> &'static PathBuf {
     static PROBE: OnceLock<PathBuf> = OnceLock::new();
     PROBE.get_or_init(|| {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let target = root.join("target/authority-probe");
-        let status = Command::new(env!("CARGO"))
-            .current_dir(root)
-            .env("CARGO_TARGET_DIR", &target)
-            .args([
-                "build",
-                "--locked",
-                "--manifest-path",
-                "tests/fixtures/authority-probe/Cargo.toml",
-                "--target",
-                "wasm32-wasip2",
-                "--release",
-            ])
-            .status()
-            .expect("launch cargo to build real-WASM authority probe");
-        assert!(status.success(), "authority probe build failed");
-        let wasm = target.join("wasm32-wasip2/release/authority_probe.wasm");
-        assert!(wasm.is_file(), "probe artifact missing: {}", wasm.display());
-        wasm
+        let wasm = target.join("wasm32-wasip3/release/authority_probe.wasm");
+        let use_prebuilt = std::env::var(USE_PREBUILT_AUTHORITY_PROBE_ENV).as_deref() == Ok("1");
+        require_probe_wasm(wasm, use_prebuilt, || {
+            let status = Command::new("make")
+                .current_dir(root)
+                .arg("authority-probe")
+                .status()
+                .map_err(|error| format!("failed to launch authority-probe build: {error}"))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("authority-probe build failed with {status}"))
+            }
+        })
     })
 }
 
 fn probe_bytes() -> Vec<u8> {
     std::fs::read(probe_wasm()).expect("read authority-probe WASM")
+}
+
+#[test]
+fn default_probe_mode_builds_before_accepting_the_artifact() {
+    let temp = tempfile::tempdir().expect("create probe tempdir");
+    let wasm = temp.path().join("authority_probe.wasm");
+    let build_called = Cell::new(false);
+
+    let selected = require_probe_wasm(wasm.clone(), false, || {
+        build_called.set(true);
+        std::fs::write(&wasm, b"fresh authority probe").map_err(|error| error.to_string())
+    });
+
+    assert!(build_called.get(), "default mode did not invoke the build");
+    assert_eq!(selected, wasm);
+}
+
+#[test]
+fn default_probe_mode_rejects_a_failed_build_and_missing_output() {
+    let temp = tempfile::tempdir().expect("create probe tempdir");
+    let wasm = temp.path().join("authority_probe.wasm");
+    std::fs::write(&wasm, b"stale authority probe").expect("write stale probe");
+
+    let failure = std::panic::catch_unwind(|| {
+        require_probe_wasm(wasm.clone(), false, || {
+            Err("intentional build failure".into())
+        })
+    });
+
+    assert!(failure.is_err(), "build failure accepted a stale artifact");
+
+    std::fs::remove_file(&wasm).expect("remove stale probe");
+    let failure = std::panic::catch_unwind(|| require_probe_wasm(wasm, false, || Ok(())));
+    assert!(failure.is_err(), "missing build output was accepted");
+}
+
+#[test]
+fn prebuilt_probe_mode_accepts_a_nonempty_artifact_without_building() {
+    let temp = tempfile::tempdir().expect("create probe tempdir");
+    let wasm = temp.path().join("authority_probe.wasm");
+    std::fs::write(&wasm, b"validated authority probe").expect("write prebuilt probe");
+
+    let selected = require_probe_wasm(wasm.clone(), true, || {
+        panic!("prebuilt mode invoked the build")
+    });
+
+    assert_eq!(selected, wasm);
+}
+
+#[test]
+fn prebuilt_probe_mode_rejects_missing_and_empty_artifacts() {
+    let temp = tempfile::tempdir().expect("create probe tempdir");
+    let missing = temp.path().join("missing.wasm");
+    let empty = temp.path().join("empty.wasm");
+    std::fs::write(&empty, []).expect("write empty probe");
+
+    for wasm in [missing, empty] {
+        let failure = std::panic::catch_unwind(|| {
+            require_probe_wasm(wasm, true, || panic!("prebuilt mode invoked the build"))
+        });
+        assert!(failure.is_err(), "invalid prebuilt artifact was accepted");
+    }
 }
 
 #[derive(Default)]
@@ -95,6 +187,7 @@ struct Harness {
     backend_counts: Rc<BackendCounts>,
     backend_url: String,
     _epoch_tx: watch::Sender<authority::Epoch>,
+    _ticked: TickedExecutor,
 }
 
 async fn probe_backend() -> (String, Rc<BackendCounts>) {
@@ -159,25 +252,38 @@ async fn harness(wasm: &[u8]) -> Harness {
         issued_seq: 1,
         receiver: epoch_rx.clone(),
     };
-    let runtime = create_runtime_client(false, guard, None, None, CachePolicy::Shared);
+    // Authority probes are production P3 Cells. Retain the ExecutorPool so
+    // its worker advances the shared Engine epoch for the harness lifetime.
+    let ticked = TickedExecutor::new();
+    let runtime = create_runtime_client(
+        false,
+        guard,
+        Some(ticked.engine()),
+        None,
+        CachePolicy::Shared,
+    );
     let executor = load_executor(&runtime, wasm).await;
     Harness {
         executor,
         backend_counts,
         backend_url,
         _epoch_tx: epoch_tx,
+        _ticked: ticked,
     }
 }
 
-async fn fixed_epoch_zero_executor(wasm: &[u8]) -> system_capnp::executor::Client {
+async fn fixed_epoch_zero_executor(
+    wasm: &[u8],
+) -> (system_capnp::executor::Client, TickedExecutor) {
+    let ticked = TickedExecutor::new();
     let runtime = create_runtime_client(
         false,
         fixed_epoch_zero_guard(),
-        None,
+        Some(ticked.engine()),
         None,
         CachePolicy::Isolated,
     );
-    load_executor(&runtime, wasm).await
+    (load_executor(&runtime, wasm).await, ticked)
 }
 
 async fn load_executor(
@@ -329,6 +435,56 @@ struct GatedDropTrackedHost {
     dropped: Rc<Cell<bool>>,
     started: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
+}
+
+struct PendingRequestDropGuard {
+    dropped: Rc<Cell<bool>>,
+}
+
+impl Drop for PendingRequestDropGuard {
+    fn drop(&mut self) {
+        self.dropped.set(true);
+    }
+}
+
+struct CancellationTrackedHost {
+    request_dropped: Rc<Cell<bool>>,
+    started: Arc<tokio::sync::Notify>,
+}
+
+struct GatedCidExecutor {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::executor::Server for GatedCidExecutor {
+    async fn cid(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::executor::CidParams,
+        mut results: system_capnp::executor::CidResults,
+    ) -> Result<(), capnp::Error> {
+        self.started.notify_one();
+        self.release.notified().await;
+        results.get().set_cid(KNOWN_CID);
+        Ok(())
+    }
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::host::Server for CancellationTrackedHost {
+    async fn id(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::host::IdParams,
+        _results: system_capnp::host::IdResults,
+    ) -> Result<(), capnp::Error> {
+        let _request_drop_guard = PendingRequestDropGuard {
+            dropped: self.request_dropped.clone(),
+        };
+        self.started.notify_one();
+        std::future::pending::<()>().await;
+        unreachable!("the pending request must end only when its Future is dropped")
+    }
 }
 
 impl Drop for GatedDropTrackedHost {
@@ -546,6 +702,58 @@ fn probe_can_invoke_a_test_local_parent_capability_when_explicitly_supplied() {
         .await;
         assert_eq!(report["ok"], true, "parent probe failed: {report}");
         assert_eq!(calls.get(), 1);
+    });
+}
+
+#[test]
+fn request_owned_guest_server_future_can_call_back_into_the_host() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let process = spawn_probe(&harness.executor, "reentrant-callback", &[], &[])
+            .await
+            .expect("spawn reentrant P3 probe");
+        let response = process
+            .bootstrap_request()
+            .send()
+            .promise
+            .await
+            .expect("read reentrant probe bootstrap");
+        let listener_cap = response
+            .get()
+            .expect("bootstrap results")
+            .get_cap()
+            .get_as_capability::<capnp::capability::Client>()
+            .expect("bootstrap capability");
+        let listener = system_capnp::vat_listener::Client::new(listener_cap.hook);
+        let (callback, calls) = counting_host(b"reentrant-callback");
+
+        let mut request = listener.serve_raw_request();
+        request
+            .get()
+            .init_cap()
+            .set_as_capability(callback.cap.hook);
+        request.get().set_protocol("test-only");
+        tokio::time::timeout(std::time::Duration::from_secs(5), request.send().promise)
+            .await
+            .expect("request-owned reentrant callback timed out")
+            .expect("request-owned reentrant callback failed");
+        assert_eq!(calls.get(), 1, "guest did not call the host capability");
+
+        process
+            .kill_request()
+            .send()
+            .promise
+            .await
+            .expect("kill reentrant probe");
+        let wait = process
+            .wait_request()
+            .send()
+            .promise
+            .await
+            .expect("wait for reentrant probe");
+        assert_eq!(wait.get().expect("wait results").get_exit_code(), 137);
     });
 }
 
@@ -854,6 +1062,161 @@ fn parent_local_drop_does_not_revoke_record_pinned_authority() {
 }
 
 #[test]
+fn process_kill_tears_down_store_with_pending_real_p3_rpc_request() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let eof_fallbacks_before = ww::launcher::rpc_eof_fallback_count();
+        let harness = harness(&wasm).await;
+        let request_dropped = Rc::new(Cell::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let host: system_capnp::host::Client = capnp_rpc::new_client(CancellationTrackedHost {
+            request_dropped: request_dropped.clone(),
+            started: started.clone(),
+        });
+        let grant = Grant {
+            name: "tracked".into(),
+            cap: host.client,
+        };
+
+        let call_started = started.notified();
+        let process = spawn_probe(
+            &harness.executor,
+            "invoke",
+            &[("WW_PROBE_CAP", "tracked")],
+            std::slice::from_ref(&grant),
+        )
+        .await
+        .expect("spawn P3 request-cancellation probe");
+        call_started.await;
+        drop(grant);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            process.kill_request().send().promise,
+        )
+        .await
+        .expect("process.kill exceeded the cancellation bound")
+        .expect("process.kill RPC failed");
+
+        let wait = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            process.wait_request().send().promise,
+        )
+        .await
+        .expect("P3 process teardown exceeded the cancellation bound")
+        .expect("process.wait RPC failed");
+        assert_eq!(
+            wait.get().expect("wait results").get_exit_code(),
+            137,
+            "process.kill must select the production killed-process outcome"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !request_dropped.get() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the pending host RPC Future survived process teardown");
+        assert_eq!(
+            ww::launcher::rpc_eof_fallback_count(),
+            eof_fallbacks_before,
+            "normal Store teardown must let the host RpcSystem observe EOF before fallback"
+        );
+    });
+}
+
+#[test]
+fn epoch_revocation_rejects_an_in_flight_production_p3_capability_call() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let epoch = authority::Epoch {
+            seq: 1,
+            head: b"revocable-host".to_vec(),
+            root: None,
+        };
+        let (epoch_tx, epoch_rx) = watch::channel(epoch);
+        let guard = authority::EpochGuard {
+            issued_seq: 1,
+            receiver: epoch_rx,
+        };
+        let registry = ww::dispatcher::server::new_registry();
+        let network_state = ww::rpc::NetworkState::new();
+        let (swarm_tx, _swarm_rx) = tokio::sync::mpsc::channel(1);
+        let stream_control = libp2p_stream::Behaviour::new().new_control();
+        let host: system_capnp::host::Client = capnp_rpc::new_client(
+            ww::rpc::HostImpl::new(network_state, swarm_tx, false, guard, Some(stream_control))
+                .with_route_registry(registry.clone()),
+        );
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let executor: system_capnp::executor::Client = capnp_rpc::new_client(GatedCidExecutor {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let grants = [
+            Grant {
+                name: "host".into(),
+                cap: host.client,
+            },
+            Grant {
+                name: "bound-executor".into(),
+                cap: executor.client,
+            },
+        ];
+
+        let call_started = started.notified();
+        let process = spawn_probe(&harness.executor, "epoch-http-listen", &[], &grants)
+            .await
+            .expect("spawn epoch-revocation P3 probe");
+        tokio::time::timeout(std::time::Duration::from_secs(5), call_started)
+            .await
+            .expect("HttpListener CID preflight did not become pending");
+
+        epoch_tx.send_replace(authority::Epoch {
+            seq: 2,
+            head: b"replacement-host".to_vec(),
+            root: None,
+        });
+        release.notify_one();
+
+        let stdout = process
+            .stdout_request()
+            .send()
+            .promise
+            .await
+            .expect("process.stdout")
+            .get()
+            .expect("stdout results")
+            .get_stream()
+            .expect("stdout stream");
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), read_all(stdout))
+            .await
+            .expect("epoch-revocation P3 probe timed out")
+            .expect("read epoch-revocation probe");
+        let report: Value = serde_json::from_slice(&output).expect("epoch-revocation JSON");
+        assert_eq!(
+            report["ok"], false,
+            "stale call unexpectedly succeeded: {report}"
+        );
+        assert!(
+            report["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("staleEpoch")),
+            "pending call did not fail with staleEpoch: {report}"
+        );
+        assert!(
+            registry.read().expect("route registry lock").is_empty(),
+            "stale in-flight listen call installed a route"
+        );
+    });
+}
+
+#[test]
 fn child_exit_releases_record_owned_grant_references() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
@@ -1003,10 +1366,11 @@ fn explicitly_wired_known_cid_read_has_path_only_authority_and_node_effects() {
             unpins: AtomicUsize::new(0),
         });
         let cache = Arc::new(cache::PinsetCache::new(pinner.clone(), 1024).unwrap());
+        let ticked = TickedExecutor::new();
         let runtime = create_runtime_client_with_pinset(
             false,
             fixed_epoch_zero_guard(),
-            None,
+            Some(ticked.engine()),
             None,
             CachePolicy::Isolated,
             Some(cache.clone()),
@@ -1440,7 +1804,7 @@ fn fixed_epoch_zero_runtime_has_no_raw_host_fallback() {
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
-        let executor = fixed_epoch_zero_executor(&wasm).await;
+        let (executor, _ticked) = fixed_epoch_zero_executor(&wasm).await;
         let report = probe_report(&executor, "raw-host", &[], &[]).await;
         assert_ne!(
             report["ok"], true,

@@ -25,7 +25,7 @@ ww run . --stem 0xAddr --rpc-url http://... --ws-url ws://...
 | Command | What it does |
 |---------|-------------|
 | `ww init NAME` | Scaffold a new cell guest project |
-| `ww build [PATH]` | Compile to wasm32-wasip2, place in boot/main.wasm |
+| `ww build [PATH]` | Compile a native `wasm32-wasip3` component into `bin/` |
 | `ww run [MOUNT...]` | Boot a node; mounts are `source[:target]` |
 | `ww push [PATH]` | Snapshot FHS tree to IPFS, optionally update on-chain HEAD |
 | `ww keygen` | Generate Ed25519 identity (prints to stdout) |
@@ -38,15 +38,15 @@ ww run . --stem 0xAddr --rpc-url http://... --ws-url ws://...
 
 ## Cell modes
 
-Cells are WASM binaries whose stdio is wired to a transport.
-`WW_CELL_MODE` env var tells the guest what's connected:
+Async RPC Cells use the capability-granted P3 transport. `WW_CELL_MODE` tells
+the guest which separate application plumbing the Host configured:
 
-| Mode | stdio carries | Use case |
-|------|--------------|----------|
-| `vat` | Cap'n Proto RPC | Service mesh, capability exchange |
-| `raw` | libp2p stream bytes | Low-level protocols |
-| `http` | CGI (WAGI) | HTTP request handlers |
-| *(absent)* | Host RPC channel | pid0 kernel — full membrane graft |
+| Mode | stdio carries | Host wiring |
+|------|--------------|-------------|
+| `vat` | application-defined | Serves an existing guest capability |
+| `raw` | raw libp2p stream bytes | Low-level protocols |
+| `http` | CGI env vars + stdin/stdout | HTTP request handlers |
+| *(absent)* | process input/output | Process-local P3 RPC; PID0 receives a `Membrane` |
 
 ## Architecture (three layers)
 

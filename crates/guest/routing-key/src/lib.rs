@@ -4,6 +4,7 @@ mod bindings {
     wit_bindgen::generate!({
         path: "wit",
         world: "key-client",
+        generate_all,
     });
 }
 

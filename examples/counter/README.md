@@ -12,7 +12,7 @@ A WAGI guest that handles FastCGI records over WASI stdin and stdout.
 ## Build
 
 ```sh
-rustup target add wasm32-wasip2
+rustup toolchain install nightly-2026-08-30 --component rust-src
 make counter
 ```
 

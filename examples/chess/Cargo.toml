@@ -8,9 +8,8 @@ capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 futures   = { workspace = true }
 log       = { workspace = true }
-wasip2    = { workspace = true }
+wit-bindgen = { workspace = true }
 shakmaty  = "0.27"
-rand      = { workspace = true }
 hex       = { workspace = true }
 routing-key = { workspace = true }
 system    = { path = "../../std/system" }
@@ -28,6 +27,7 @@ libp2p-core = { workspace = true }
 libp2p-identity = { version = "0.2", features = ["ed25519"] }
 libp2p-stream = { workspace = true }
 tempfile = "3"
+rand = { workspace = true }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

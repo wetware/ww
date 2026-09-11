@@ -13,6 +13,7 @@ use libp2p::Multiaddr;
 mod daemon_cmd;
 mod doctor_cmd;
 mod ns_cmd;
+mod p3_toolchain;
 
 use ww::cell::image;
 #[cfg(test)]
@@ -95,8 +96,8 @@ enum Commands {
 
     /// Build a guest project, placing artifacts in bin/.
     ///
-    /// Compiles a Rust project targeting wasm32-wasip2 and copies the
-    /// artifact into the project's FHS root at boot/main.wasm.
+    /// Compiles a Rust project targeting native wasm32-wasip3 and copies the
+    /// artifact into the project's FHS root at bin/<project>.wasm.
     ///
     /// Expects Cargo.toml at the root of <path>.
     Build {
@@ -335,8 +336,8 @@ enum Commands {
 
     /// Check the development environment for required and optional tools.
     ///
-    /// Verifies that the Rust toolchain, wasm32-wasip2 target, and Cargo
-    /// are installed. Optionally checks for Kubo (IPFS) and Ollama (LLM).
+    /// Verifies the pinned native wasm32-wasip3 toolchain and Cargo.
+    /// Optionally checks for Kubo (IPFS) and Ollama (LLM).
     ///
     /// Exit code 0 if all required checks pass; 1 otherwise.
     /// Optional checks never cause a non-zero exit.
@@ -1042,7 +1043,6 @@ edition = "2021"
 capnp     = "0.25.3"
 capnp-rpc = "0.25.0"
 log       = "0.4"
-wasip2    = "1.0.2"
 system    = {{ path = "../../std/system" }}
 
 [lib]
@@ -1112,7 +1112,7 @@ fn main() {{
             r#"use std::rc::Rc;
 
 use capnp::capability::Promise;
-use wasip2::exports::cli::run::Guest;
+use system::Guest;
 
 #[allow(dead_code)]
 mod system_capnp {{
@@ -1198,8 +1198,8 @@ impl {name}_capnp::{snake_name}::Server for {iface_name}Impl {{
 struct {iface_name}Guest;
 
 impl Guest for {iface_name}Guest {{
-    fn run() -> Result<(), ()> {{
-        match std::env::args().nth(1).as_deref() {{
+    async fn run() -> Result<(), ()> {{
+        let result = match std::env::args().nth(1).as_deref() {{
             Some("serve") => {{
                 log::info!("{name}: serve");
                 system::run(|initial_grants: InitialGrants| async move {{
@@ -1215,7 +1215,8 @@ impl Guest for {iface_name}Guest {{
                     // TODO: provide on DHT, discover peers, etc.
 
                     Ok(())
-                }});
+                }})
+                .await
             }}
             _ => {{
                 // Default (no args): export the service capability.
@@ -1224,14 +1225,17 @@ impl Guest for {iface_name}Guest {{
                 log::info!("{name}: cell mode");
                 system::serve(client.client, |_initial_grants: InitialGrants| async move {{
                     std::future::pending().await
-                }});
+                }})
+                .await
             }}
-        }}
-        Ok(())
+        }};
+        result.map_err(|error| {{
+            log::error!("{name} RPC failed: {{error}}");
+        }})
     }}
 }}
 
-wasip2::cli::command::export!({iface_name}Guest);
+system::export!({iface_name}Guest);
 "#,
             snake_name = name.replace('-', "_"),
         );
@@ -1264,41 +1268,30 @@ wasip2::cli::command::export!({iface_name}Guest);
 
         println!("Building WASM artifact for: {}", path.display());
 
-        // Run cargo build for wasm32-wasip2 target
+        let toolchain = p3_toolchain::Toolchain::discover_and_validate()
+            .context("Native WASI P3 toolchain is unavailable. Run 'ww doctor' for details")?;
+        let target_root = path.join("target");
+
         let output = std::process::Command::new("cargo")
-            .args([
-                "build",
-                "--target",
-                "wasm32-wasip2",
-                "--release",
-                "--manifest-path",
-                cargo_toml
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid path"))?,
-            ])
+            .arg(format!("+{}", p3_toolchain::NIGHTLY))
+            .args(["build", "-Z", "build-std=std,panic_abort"])
+            .args(["--target", "wasm32-wasip3", "--release"])
+            .arg("--manifest-path")
+            .arg(&cargo_toml)
+            .env("CARGO_TARGET_WASM32_WASIP3_LINKER", &toolchain.component_ld)
+            .env("CARGO_ENCODED_RUSTFLAGS", toolchain.encoded_rustflags())
+            .env("CARGO_TARGET_DIR", &target_root)
             .output()
             .context("Failed to execute cargo build")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
 
-            if stderr.contains("cannot find `wasm32-wasip2` target")
-                || stderr.contains("target `wasm32-wasip2` not installed")
-                || stderr.contains("target `wasm32-wasip1` not installed")
-            {
-                bail!(
-                    "wasm32-wasip2 target is not installed.\n\
-                     \n\
-                     Install it with:\n\
-                       rustup target add wasm32-wasip2"
-                );
-            }
-
             bail!("cargo build failed:\n{}", stderr);
         }
 
         // Find the built WASM artifact
-        let target_dir = path.join("target/wasm32-wasip2/release");
+        let target_dir = target_root.join("wasm32-wasip3/release");
         let mut wasm_file = None;
 
         // Look for the first .wasm file (or the crate name if it matches)
@@ -1317,6 +1310,7 @@ wasip2::cli::command::export!({iface_name}Guest);
                 target_dir.display()
             )
         })?;
+        toolchain.validate_component(&src_wasm)?;
 
         // Copy WASM to bin/<name>.wasm
         let bin_dir = path.join("bin");

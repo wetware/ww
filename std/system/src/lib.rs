@@ -1,58 +1,19 @@
-//! Guest runtime for Wetware WASM cells.
+//! Guest-side Cap'n Proto transport for asynchronous Wetware cells.
 //!
-//! # Execution Model
-//!
-//! Each WASM guest runs inside a single-threaded wasmtime `Store` on a
-//! tokio `LocalSet` worker.  The host spawns two tasks on the same
-//! `LocalSet`: the WASM guest (via `call_run_async`) and a Cap'n Proto
-//! RPC system that bridges the guest's data streams to the host's
-//! membrane.
-//!
-//! Cooperative scheduling works through two mechanisms:
-//!
-//! 1. **Fuel yield** (`fuel_async_yield_interval`): wasmtime suspends
-//!    the guest every 10K instructions (see `sched::YIELD_INTERVAL`),
-//!    returning `Poll::Pending` from `call_run_async`.  This gives the
-//!    host-side RPC task time to process messages.
-//!
-//! 2. **WASI poll**: when the guest calls `wasi:io/poll#poll`, wasmtime
-//!    makes a host call that yields back to the tokio executor.  The
-//!    host-side RPC task can run during this yield.
-//!
-//! The `poll_loop` function is the guest's cooperative scheduler.  It
-//! alternates between polling the capnp RPC system (to process inbound
-//! messages) and polling user work (the guest's async entry point).
-//!
-//! # Why `Waker::noop()`?
-//!
-//! The poll loop creates a noop waker because WASI poll is the real
-//! wakeup mechanism, not the Rust waker.  When `StreamReader::poll_read`
-//! returns `Pending` with an empty buffer, it calls `wake_by_ref()` —
-//! but this is a no-op.  The actual wakeup happens when `wasi_poll::poll`
-//! returns because the reader pollable is ready.  This is correct for
-//! single-threaded WASM where there's no cross-task notification needed.
-//!
-//! # Write-flush invariant
-//!
-//! The `WRITE_OCCURRED` thread-local tracks whether the RPC system or
-//! user work wrote bytes during the current poll cycle.  If writes
-//! occurred, the loop polls the RPC system again (to flush outbound
-//! messages) and includes the writer pollable in the WASI poll set.
-//! If no writes occurred, only the reader and an idle timeout are polled.
-//!
-//! The idle timeout (100ms) is a safety net for missed wakeups: the
-//! host's `AsyncReadStream` background task can race with the
-//! foreground pollable check, causing a missed wakeup that would
-//! otherwise block the guest indefinitely.
+//! The Component Model polls one root future. The root future composes the
+//! Cap'n Proto [`RpcSystem`], transport completion, and guest application.
+//! P3 streams and application waitables provide all wakeups.
 
 use capnp::capability::FromClientHook;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
-use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
+use wit_bindgen::{
+    StreamReader as WasiStreamReader, StreamResult, StreamWriter as WasiStreamWriter,
+};
 
 #[allow(dead_code, clippy::extra_unused_type_parameters)]
 pub mod membrane_capnp {
@@ -128,271 +89,220 @@ pub fn get_graft_cap<C: FromClientHook>(caps: &Caps<'_>, name: &str) -> Result<C
     })
 }
 
-// Tracks whether any data was written during the current poll cycle.
-// Single-threaded WASM, so a thread-local Cell<bool> is race-free.
-thread_local! {
-    static WRITE_OCCURRED: Cell<bool> = const { Cell::new(false) };
-}
-
-mod bindings {
+#[doc(hidden)]
+pub mod bindings {
     wit_bindgen::generate!({
-        path: "../../crates/cell/wit",
-        world: "guest-streams",
-        with: {
-            "wasi:io/error@0.2.9": wasip2::io::error,
-            "wasi:io/poll@0.2.9": wasip2::io::poll,
-            "wasi:io/streams@0.2.9": wasip2::io::streams,
-        },
+        path: "wit",
+        world: "guest",
+        generate_all,
+        export_macro_name: "__export_system_guest",
+        pub_export_macro: true,
     });
 }
 
-use bindings::wetware::streams::streams::create_connection;
-use wasip2::io::poll as wasi_poll;
-use wasip2::io::streams::{
-    InputStream as WasiInputStream, OutputStream as WasiOutputStream, Pollable as WasiPollable,
-    StreamError as WasiStreamError,
-};
+pub use bindings::__export_system_guest;
+pub use bindings::exports::wasi::cli::run::Guest;
 
-pub struct StreamReader {
-    stream: WasiInputStream,
+/// Export a type that implements the selective P3 [`Guest`] entry point.
+#[macro_export]
+macro_rules! export {
+    ($ty:ident) => {
+        $crate::__export_system_guest!($ty with_types_in $crate::bindings);
+    };
+}
+
+type ReadFuture = Pin<Box<dyn Future<Output = (WasiStreamReader<u8>, StreamResult, Vec<u8>)>>>;
+
+struct StreamReader {
+    stream: Option<WasiStreamReader<u8>>,
+    pending: Option<ReadFuture>,
     buffer: Vec<u8>,
     offset: usize,
+    closed: bool,
 }
 
 impl StreamReader {
-    pub fn new(stream: WasiInputStream) -> Self {
+    fn new(stream: WasiStreamReader<u8>) -> Self {
         Self {
-            stream,
+            stream: Some(stream),
+            pending: None,
             buffer: Vec::new(),
             offset: 0,
+            closed: false,
         }
     }
 
-    pub fn pollable(&self) -> WasiPollable {
-        self.stream.subscribe()
+    fn copy_buffered(&mut self, output: &mut [u8]) -> Option<usize> {
+        if self.offset == self.buffer.len() {
+            return None;
+        }
+        let count = output.len().min(self.buffer.len() - self.offset);
+        output[..count].copy_from_slice(&self.buffer[self.offset..self.offset + count]);
+        self.offset += count;
+        if self.offset == self.buffer.len() {
+            self.buffer.clear();
+            self.offset = 0;
+        }
+        Some(count)
     }
 }
 
 impl futures::io::AsyncRead for StreamReader {
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut [u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        if self.offset < self.buffer.len() {
-            let available = &self.buffer[self.offset..];
-            let to_copy = available.len().min(buf.len());
-            buf[..to_copy].copy_from_slice(&available[..to_copy]);
-            self.offset += to_copy;
-            if self.offset >= self.buffer.len() {
-                self.buffer.clear();
-                self.offset = 0;
-            }
-            return std::task::Poll::Ready(Ok(to_copy));
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if output.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if let Some(count) = this.copy_buffered(output) {
+            return Poll::Ready(Ok(count));
+        }
+        if this.closed {
+            return Poll::Ready(Ok(0));
         }
 
-        let len = buf.len() as u64;
-        match self.stream.read(len) {
-            Ok(bytes) => {
-                if bytes.is_empty() {
-                    cx.waker().wake_by_ref();
-                    return std::task::Poll::Pending;
+        loop {
+            if this.pending.is_none() {
+                let mut stream = this.stream.take().expect("P3 input stream is available");
+                let capacity = output.len().max(16 * 1024);
+                this.pending = Some(Box::pin(async move {
+                    let (status, bytes) = stream.read(Vec::with_capacity(capacity)).await;
+                    (stream, status, bytes)
+                }));
+            }
+
+            let result = match this
+                .pending
+                .as_mut()
+                .expect("P3 read is pending")
+                .as_mut()
+                .poll(cx)
+            {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => result,
+            };
+            this.pending = None;
+            this.stream = Some(result.0);
+            this.buffer = result.2;
+            this.offset = 0;
+
+            match result.1 {
+                StreamResult::Complete(_) if this.buffer.is_empty() => continue,
+                StreamResult::Complete(_) => {
+                    return Poll::Ready(Ok(this
+                        .copy_buffered(output)
+                        .expect("completed P3 read contains bytes")));
                 }
-                self.buffer = bytes;
-                self.offset = 0;
-                let available = &self.buffer[self.offset..];
-                let to_copy = available.len().min(buf.len());
-                buf[..to_copy].copy_from_slice(&available[..to_copy]);
-                self.offset += to_copy;
-                std::task::Poll::Ready(Ok(to_copy))
+                StreamResult::Dropped => {
+                    this.closed = true;
+                    if this.buffer.is_empty() {
+                        return Poll::Ready(Ok(0));
+                    }
+                    return Poll::Ready(Ok(this
+                        .copy_buffered(output)
+                        .expect("final P3 read contains bytes")));
+                }
+                StreamResult::Cancelled => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "P3 transport read was cancelled",
+                    )));
+                }
             }
-            Err(WasiStreamError::Closed) => std::task::Poll::Ready(Ok(0)),
-            Err(err) => std::task::Poll::Ready(Err(std::io::Error::other(format!(
-                "stream read error: {:?}",
-                err
-            )))),
         }
     }
 }
 
-pub struct StreamWriter {
-    stream: WasiOutputStream,
-}
+type WriteFuture = Pin<Box<dyn Future<Output = (WasiStreamWriter<u8>, StreamResult, Vec<u8>)>>>;
 
-impl StreamWriter {
-    pub fn new(stream: WasiOutputStream) -> Self {
-        Self { stream }
-    }
-
-    pub fn pollable(&self) -> WasiPollable {
-        self.stream.subscribe()
-    }
+struct StreamWriter {
+    stream: Option<WasiStreamWriter<u8>>,
+    pending: Option<WriteFuture>,
 }
 
 impl futures::io::AsyncWrite for StreamWriter {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        if buf.is_empty() {
-            return std::task::Poll::Ready(Ok(0));
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if bytes.is_empty() {
+            return Poll::Ready(Ok(0));
         }
-        match self.stream.check_write() {
-            Ok(0) => {
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-            Ok(budget) => {
-                let to_write = buf.len().min(budget as usize);
-                match self.stream.write(&buf[..to_write]) {
-                    Ok(_written) => {
-                        WRITE_OCCURRED.with(|f| f.set(true));
-                        std::task::Poll::Ready(Ok(to_write))
-                    }
-                    Err(WasiStreamError::Closed) => std::task::Poll::Ready(Ok(0)),
-                    Err(err) => std::task::Poll::Ready(Err(std::io::Error::other(format!(
-                        "stream write error: {:?}",
-                        err
-                    )))),
+
+        let this = self.get_mut();
+        if this.pending.is_none() {
+            let mut stream = match this.stream.take() {
+                Some(stream) => stream,
+                None => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "P3 transport output is closed",
+                    )));
                 }
+            };
+            let bytes = bytes.to_vec();
+            this.pending = Some(Box::pin(async move {
+                let (status, remaining) = stream.write(bytes).await;
+                (stream, status, remaining.into_vec())
+            }));
+        }
+
+        let (stream, status, remaining) = match this
+            .pending
+            .as_mut()
+            .expect("P3 write is pending")
+            .as_mut()
+            .poll(cx)
+        {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(result) => result,
+        };
+        this.pending = None;
+
+        match status {
+            StreamResult::Complete(count) => {
+                this.stream = Some(stream);
+                debug_assert_eq!(count + remaining.len(), bytes.len());
+                Poll::Ready(Ok(count))
             }
-            Err(WasiStreamError::Closed) => std::task::Poll::Ready(Ok(0)),
-            Err(err) => std::task::Poll::Ready(Err(std::io::Error::other(format!(
-                "stream write error: {:?}",
-                err
-            )))),
+            StreamResult::Dropped => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "P3 transport output was dropped",
+            ))),
+            StreamResult::Cancelled => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "P3 transport write was cancelled",
+            ))),
         }
     }
 
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.stream.flush() {
-            Ok(()) => std::task::Poll::Ready(Ok(())),
-            Err(WasiStreamError::Closed) => std::task::Poll::Ready(Ok(())),
-            Err(err) => std::task::Poll::Ready(Err(std::io::Error::other(format!(
-                "stream flush error: {:?}",
-                err
-            )))),
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let Some(pending) = this.pending.as_mut() {
+            if pending.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            this.pending = None;
         }
-    }
-
-    fn poll_close(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.stream.flush() {
-            Ok(()) => std::task::Poll::Ready(Ok(())),
-            Err(WasiStreamError::Closed) => std::task::Poll::Ready(Ok(())),
-            Err(err) => std::task::Poll::Ready(Err(std::io::Error::other(format!(
-                "stream close error: {:?}",
-                err
-            )))),
-        }
-    }
-}
-
-pub struct StreamPollables {
-    pub reader: WasiPollable,
-    pub writer: WasiPollable,
-}
-
-/// Additional pollables to include in the guest's poll set.
-///
-/// `poll_loop` always waits on the RPC transport internally.
-/// `PollSet` holds extra streams the guest wants serviced concurrently
-/// (stdin, listeners, extra channels, etc.).
-pub struct PollSet {
-    pollables: Vec<WasiPollable>,
-    /// Keeps source objects (streams, readers, etc.) alive so their child
-    /// pollables remain valid for the lifetime of the poll set.
-    _keep_alive: Vec<Box<dyn std::any::Any>>,
-}
-
-impl PollSet {
-    pub fn new() -> Self {
-        Self {
-            pollables: Vec::new(),
-            _keep_alive: Vec::new(),
-        }
-    }
-
-    pub fn push(&mut self, p: WasiPollable) {
-        self.pollables.push(p);
-    }
-
-    /// Push a pollable along with the source object it was derived from.
-    ///
-    /// The source is kept alive for the lifetime of the `PollSet`, preventing
-    /// WASI "resource has children" errors when the parent stream would
-    /// otherwise be dropped before its child pollable.
-    pub fn push_with_source<T: 'static>(&mut self, p: WasiPollable, source: T) {
-        self.pollables.push(p);
-        self._keep_alive.push(Box::new(source));
-    }
-}
-
-impl Default for PollSet {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Safety-net timeout for idle poll cycles.
-///
-/// When the polling loop has no pending writes and made no progress, it blocks
-/// on the reader pollable alone.  The host streams large responses (e.g. 1 MB
-/// handler WASM) in chunks via wasmtime's `AsyncReadStream`, whose background
-/// task can race with the foreground pollable check — causing a missed wakeup
-/// that would block the guest indefinitely.
-///
-/// Adding a `wasi:clocks/monotonic-clock.subscribe-duration` pollable to the
-/// poll set provides a guaranteed wakeup (per the WASI spec, this is the
-/// canonical way to add a timeout to a poll).  In the common case the reader
-/// fires first and latency is unaffected; if a wakeup is missed, the timeout
-/// fires and the loop retries.
-///
-/// The pollable is created once before each loop and reused across iterations.
-/// Because clock pollables are level-triggered (stay ready once elapsed), we
-/// refresh only when the timeout actually fires.
-const IDLE_POLL_TIMEOUT_NS: u64 = 100_000_000; // 100ms
-
-fn new_idle_timeout() -> WasiPollable {
-    wasip2::clocks::monotonic_clock::subscribe_duration(IDLE_POLL_TIMEOUT_NS)
-}
-
-pub struct GuestStreams {
-    pub reader: StreamReader,
-    pub writer: StreamWriter,
-    pub pollables: StreamPollables,
-}
-
-pub fn connect_streams() -> GuestStreams {
-    let connection = create_connection();
-    let input_stream = connection.get_input_stream();
-    let output_stream = connection.get_output_stream();
-
-    let reader = StreamReader::new(input_stream);
-    let writer = StreamWriter::new(output_stream);
-    let pollables = StreamPollables {
-        reader: reader.pollable(),
-        writer: writer.pollable(),
-    };
-
-    GuestStreams {
-        reader,
-        writer,
-        pollables,
+        this.stream = None;
+        Poll::Ready(Ok(()))
     }
 }
 
 pub struct RpcSession<C> {
     pub rpc_system: RpcSystem<Side>,
     pub client: C,
-    pub pollables: StreamPollables,
-    pub poll_set: PollSet,
+    completion: wit_bindgen::FutureReader<
+        Result<(), bindings::wetware::transport::connection::TransportError>,
+    >,
 }
 
 impl<C: FromClientHook> RpcSession<C> {
@@ -401,347 +311,117 @@ impl<C: FromClientHook> RpcSession<C> {
     }
 
     /// Connect and export `bootstrap` as this vat's bootstrap capability.
-    ///
-    /// The host can retrieve the exported cap via `rpc_system.bootstrap(Side::Client)`.
-    /// Pass `None` for guests that do not export a capability (equivalent to `connect()`).
     pub fn connect_with_export(bootstrap: Option<capnp::capability::Client>) -> Self {
-        let streams = connect_streams();
-        let pollables = streams.pollables;
-        let network = VatNetwork::new(
-            streams.reader,
-            streams.writer,
-            Side::Client,
-            Default::default(),
-        );
+        let (output, outgoing) = bindings::wit_stream::new();
+        let (input, completion) = bindings::wetware::transport::connection::open(outgoing);
+        let reader = StreamReader::new(input);
+        let writer = StreamWriter {
+            stream: Some(output),
+            pending: None,
+        };
+        let network = VatNetwork::new(reader, writer, Side::Client, Default::default());
         let mut rpc_system = RpcSystem::new(Box::new(network), bootstrap);
         let client = rpc_system.bootstrap(Side::Server);
         Self {
             rpc_system,
             client,
-            pollables,
-            poll_set: PollSet::new(),
-        }
-    }
-
-    /// Register additional pollables to service concurrently with RPC.
-    pub fn with_poll_set(mut self, poll_set: PollSet) -> Self {
-        self.poll_set = poll_set;
-        self
-    }
-
-    /// Clean up resources in WASI-safe order at process exit.
-    ///
-    /// WASI-P2 enforces that child resources (pollables) are dropped
-    /// before their parents (streams).  Pollables are children of the
-    /// streams inside `rpc_system`, so we drop them first.
-    ///
-    /// Cap'n Proto destructors are then leaked (`mem::forget`) because
-    /// they try to close handles that the host has already torn down.
-    ///
-    /// Note: `serve_and_run` uses the same pattern inline (not this method)
-    /// because it also owns a `future` that must be dropped between
-    /// `poll_set` and `pollables`. See the teardown block in that function.
-    pub fn forget(self) {
-        // 1. Drop child resources (pollables) before parent streams.
-        drop(self.poll_set);
-        drop(self.pollables);
-        // 2. Leak Cap'n Proto objects to avoid close-after-teardown panics.
-        std::mem::forget(self.client);
-        std::mem::forget(self.rpc_system);
-    }
-}
-
-/// Why the poll loop exited without the user future completing.
-///
-/// The `cycle` field counts how many poll-loop iterations completed before
-/// the RPC connection died.  Low values (< 5) mean the connection dropped
-/// during bootstrap; high values mean it dropped mid-request.
-#[derive(Debug)]
-pub enum PollLoopExit {
-    /// RPC connection closed cleanly (remote side hung up).
-    RpcClosed { cycle: u64 },
-    /// RPC connection closed with an error.
-    RpcError { cycle: u64, error: capnp::Error },
-}
-
-impl PollLoopExit {
-    pub fn cycle(&self) -> u64 {
-        match self {
-            PollLoopExit::RpcClosed { cycle } => *cycle,
-            PollLoopExit::RpcError { cycle, .. } => *cycle,
+            completion,
         }
     }
 }
 
-impl std::fmt::Display for PollLoopExit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PollLoopExit::RpcClosed { cycle } => {
-                write!(
-                    f,
-                    "RPC connection closed by host (after {cycle} poll cycles)"
-                )
-            }
-            PollLoopExit::RpcError { cycle, error } => {
-                write!(f, "RPC connection error after {cycle} poll cycles: {error}")
-            }
-        }
-    }
-}
-
-/// Core poll loop: drive RPC alongside user work until one side finishes.
-///
-/// Each iteration: reset write flag → poll RPC → poll user work → flush
-/// RPC writes → block on WASI I/O.
-///
-/// Returns `Ok(value)` when `poll_work` returns `Poll::Ready(value)`.
-/// Returns `Err(PollLoopExit)` if the RPC connection closes first.
-fn poll_loop<T>(
-    rpc_system: &mut RpcSystem<Side>,
-    pollables: &StreamPollables,
-    extras: &PollSet,
-    mut poll_work: impl FnMut(&mut Context<'_>) -> Poll<T>,
-) -> Result<T, PollLoopExit> {
-    let mut rpc_done = false;
-    let mut rpc_exit: Option<PollLoopExit> = None;
-    let mut idle_timeout = new_idle_timeout();
-    let mut cycle: u64 = 0;
-    loop {
-        let mut cx = Context::from_waker(Waker::noop());
-        WRITE_OCCURRED.with(|f| f.set(false));
-
-        // ── Phase 1: Drive RPC (process inbound messages) ──
-        if !rpc_done {
-            if let Poll::Ready(result) = Pin::new(&mut *rpc_system).poll(&mut cx) {
-                rpc_done = true;
-                rpc_exit = Some(match result {
-                    Ok(()) => PollLoopExit::RpcClosed { cycle },
-                    Err(e) => PollLoopExit::RpcError { cycle, error: e },
-                });
-            }
-        }
-
-        // ── Phase 2: Drive user work ──
-        if let Poll::Ready(val) = poll_work(&mut cx) {
-            return Ok(val);
-        }
-
-        // ── Phase 3: Flush writes ──
-        //
-        // User work may have queued outbound RPC messages.  Poll the RPC
-        // system again so those bytes reach the StreamWriter before we
-        // decide whether to wait on the writer pollable.
-        let wrote = WRITE_OCCURRED.with(|f| f.get());
-        if !rpc_done && wrote {
-            if let Poll::Ready(result) = Pin::new(&mut *rpc_system).poll(&mut cx) {
-                rpc_done = true;
-                rpc_exit = Some(match result {
-                    Ok(()) => PollLoopExit::RpcClosed { cycle },
-                    Err(e) => PollLoopExit::RpcError { cycle, error: e },
-                });
-            }
-        }
-
-        if rpc_done {
-            return Err(rpc_exit.unwrap_or(PollLoopExit::RpcClosed { cycle }));
-        }
-
-        // ── Phase 4: Block on WASI I/O ──
-        //
-        // Build a poll set from the RPC transport + any extra pollables
-        // registered by the guest (stdin, listeners, etc.).
-        // If writes occurred, include the writer so the host can drain it.
-        // Otherwise, include the idle timeout as a missed-wakeup safety net.
-        let mut wasi_set: Vec<&WasiPollable> = Vec::with_capacity(2 + extras.pollables.len() + 1);
-        wasi_set.push(&pollables.reader);
-        if wrote {
-            wasi_set.push(&pollables.writer);
-        }
-        for p in &extras.pollables {
-            wasi_set.push(p);
-        }
-        if !wrote {
-            wasi_set.push(&idle_timeout);
-        }
-        wasi_poll::poll(&wasi_set);
-        if !wrote && idle_timeout.ready() {
-            idle_timeout = new_idle_timeout();
-        }
-
-        cycle += 1;
-    }
-}
-
-/// Export a bootstrap capability over WASI stdin/stdout.
-///
-/// This is for handler processes spawned by `Server.serve()`. The host wires
-/// the handler's stdin/stdout to a libp2p stream. This function sets up a
-/// Cap'n Proto RPC VatNetwork over stdin/stdout and exports the given
-/// bootstrap capability. The remote peer bootstraps it to obtain the service.
-///
-/// Unlike [`serve`], this function does NOT use the wetware:streams connection.
-/// It reads/writes directly from WASI stdin/stdout and drives the RPC system
-/// until the connection closes. No host capabilities are available — if the
-/// handler needs IPFS/routing, it should use `system::run()` over data_streams
-/// instead.
-///
-/// # Example
-///
-/// ```no_run
-/// let bootstrap: capnp::capability::Client =
-///     todo!("construct the service capability exported by this guest");
-/// system::serve_stdio(bootstrap);
-/// ```
-pub fn serve_stdio(bootstrap: capnp::capability::Client) {
-    let stdin = wasip2::cli::stdin::get_stdin();
-    let stdout = wasip2::cli::stdout::get_stdout();
-
-    let reader = StreamReader::new(stdin);
-    let writer = StreamWriter::new(stdout);
-    let pollables = StreamPollables {
-        reader: reader.pollable(),
-        writer: writer.pollable(),
-    };
-
-    let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
-    let mut rpc_system = RpcSystem::new(Box::new(network), Some(bootstrap));
-
-    // Drive RPC only (no user future) — poll_loop returns Err when RPC closes.
-    let empty_extras = PollSet::new();
-    if let Err(ref exit @ PollLoopExit::RpcError { .. }) =
-        poll_loop(&mut rpc_system, &pollables, &empty_extras, |_| {
-            Poll::<()>::Pending
-        })
-    {
-        log::error!("serve_stdio: {exit}");
-    }
-
-    // WASI-P2 teardown: leak Cap'n Proto objects to avoid close-after-teardown
-    // panics. At process exit the host reclaims all handles; running Cap'n Proto
-    // destructors would try to close handles the host already tore down.
-    // Pollables are also leaked here (no user future owns them, so no
-    // parent-before-child ordering issue unlike serve_and_run / Session::forget).
-    // See also: Session::forget() and the serve_and_run teardown block below.
-    std::mem::forget(rpc_system);
-    std::mem::forget(pollables);
-}
-
-/// Run a guest program with an async entry point, exporting a bootstrap capability.
-///
-/// Like [`run`], but the guest also provides `bootstrap` as its own bootstrap
-/// capability on the RPC connection.  The host can retrieve it via
-/// `rpc_system.bootstrap(Side::Client)`.
-///
-/// Use this when the guest needs to export a capability back to the host.
-///
-/// # Example
-///
-/// ```no_run
-/// let bootstrap: capnp::capability::Client =
-///     todo!("construct the bootstrap capability exported by this guest");
-/// system::serve(bootstrap, |host: capnp::capability::Client| async move {
-///     // ... use host capabilities while exporting bootstrap to the host ...
-///     let _ = host;
-///     Ok::<(), capnp::Error>(())
-/// });
-/// ```
-pub fn serve<C, F, Fut>(bootstrap: capnp::capability::Client, f: F)
+/// Run an application while exporting a bootstrap capability.
+pub async fn serve<C, F, Fut>(
+    bootstrap: capnp::capability::Client,
+    f: F,
+) -> Result<(), capnp::Error>
 where
-    C: FromClientHook + Clone,
+    C: FromClientHook,
     F: FnOnce(C) -> Fut,
     Fut: Future<Output = Result<(), capnp::Error>>,
 {
-    run_with_session(RpcSession::<C>::connect_with_export(Some(bootstrap)), f)
+    drive_session(RpcSession::<C>::connect_with_export(Some(bootstrap)), f).await
 }
 
-/// Run a guest program with an async entry point.
-///
-/// Sets up the RPC session, bootstraps the host-provided capability, and drives
-/// the provided async closure to completion alongside the RPC system.
-/// Handles all resource cleanup automatically.
-///
-/// For pid0 the host-provided capability is the graft-capable `Membrane`.
-/// Ordinary children receive the distinct grants-only `InitialGrants`.
-///
-/// # Example
-///
-/// ```no_run
-/// system::run(|initial_grants: capnp::capability::Client| async move {
-///     // Cast to the generated InitialGrants client type in ordinary guests.
-///     let _ = initial_grants;
-///     Ok::<(), capnp::Error>(())
-/// });
-/// ```
-pub fn run<C, F, Fut>(f: F)
+/// Run an application with the host-provided bootstrap capability.
+pub async fn run<C, F, Fut>(f: F) -> Result<(), capnp::Error>
 where
-    C: FromClientHook + Clone,
+    C: FromClientHook,
     F: FnOnce(C) -> Fut,
     Fut: Future<Output = Result<(), capnp::Error>>,
 {
-    run_with_session(RpcSession::<C>::connect(), f)
+    drive_session(RpcSession::<C>::connect(), f).await
 }
 
-/// Like [`run`], but with additional pollables in the poll set.
-///
-/// Use when the guest needs to service extra streams (e.g. stdin)
-/// concurrently with the RPC connection.
-pub fn run_with<C, F, Fut>(poll_set: PollSet, f: F)
+async fn drive_session<C, F, Fut>(session: RpcSession<C>, f: F) -> Result<(), capnp::Error>
 where
-    C: FromClientHook + Clone,
+    C: FromClientHook,
     F: FnOnce(C) -> Fut,
     Fut: Future<Output = Result<(), capnp::Error>>,
 {
-    run_with_session(RpcSession::<C>::connect().with_poll_set(poll_set), f)
+    let RpcSession {
+        rpc_system,
+        client,
+        completion,
+    } = session;
+    let application = f(client);
+    let transport = async move { transport_completion_result(completion.await) };
+    select_session(transport, rpc_system, application).await
 }
 
-fn run_with_session<C, F, Fut>(mut session: RpcSession<C>, f: F)
-where
-    C: FromClientHook + Clone,
-    F: FnOnce(C) -> Fut,
-    Fut: Future<Output = Result<(), capnp::Error>>,
-{
-    let client = session.client.clone();
-    let mut future = Box::pin(f(client));
+fn transport_completion_result(
+    result: Result<(), bindings::wetware::transport::connection::TransportError>,
+) -> Result<(), capnp::Error> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(bindings::wetware::transport::connection::TransportError::Failed(message)) => Err(
+            capnp::Error::failed(format!("P3 transport failed: {message}")),
+        ),
+    }
+}
 
-    match poll_loop(
-        &mut session.rpc_system,
-        &session.pollables,
-        &session.poll_set,
-        |cx| future.as_mut().poll(cx),
-    ) {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            log::error!("guest error: {e}");
-        }
-        Err(exit) => {
-            log::error!("guest aborted: {exit}");
+async fn select_session<Transport, Rpc, App>(
+    transport: Transport,
+    rpc: Rpc,
+    application: App,
+) -> Result<(), capnp::Error>
+where
+    Transport: Future<Output = Result<(), capnp::Error>>,
+    Rpc: Future<Output = Result<(), capnp::Error>>,
+    App: Future<Output = Result<(), capnp::Error>>,
+{
+    let root = futures::future::select(Box::pin(rpc), Box::pin(application));
+    match futures::future::select(Box::pin(transport), Box::pin(root)).await {
+        futures::future::Either::Left((transport_result, _)) => transport_result,
+        futures::future::Either::Right((root_result, transport)) => {
+            let root_result = match root_result {
+                futures::future::Either::Left((result, application)) => {
+                    drop(application);
+                    result
+                }
+                futures::future::Either::Right((result, rpc)) => {
+                    drop(rpc);
+                    result
+                }
+            };
+            match root_result {
+                Err(error) => Err(error),
+                Ok(()) => transport.await,
+            }
         }
     }
+}
 
-    // WASI-P2 teardown — resource ordering matters.
-    //
-    // WASI-P2 enforces that child resources (pollables) must be dropped before
-    // their parents (streams inside rpc_system). Rust's default drop order
-    // (reverse declaration) doesn't guarantee this, so we do it manually.
-    //
-    // Order:
-    //   1. poll_set    — owns references to pollables, must go first
-    //   2. future      — may capture streams whose pollables are in poll_set
-    //   3. pollables   — children of streams in rpc_system
-    //   4. forget client + rpc_system — leak Cap'n Proto objects; their
-    //      destructors try to close handles the host has already torn down
-    //      at process exit, causing panics
-    //
-    // This is the same pattern as Session::forget(), but we also own `future`
-    // which must be dropped between poll_set and pollables.
-    // See also: Session::forget() and the serve_stdio teardown above.
-    let poll_set = session.poll_set;
-    let pollables = session.pollables;
-    drop(poll_set);
-    drop(future);
-    drop(pollables);
-    std::mem::forget(session.client);
-    std::mem::forget(session.rpc_system);
+#[cfg(test)]
+async fn select_root<Rpc, App>(rpc: Rpc, application: App) -> Result<(), capnp::Error>
+where
+    Rpc: Future<Output = Result<(), capnp::Error>>,
+    App: Future<Output = Result<(), capnp::Error>>,
+{
+    match futures::future::select(Box::pin(rpc), Box::pin(application)).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right((result, _)) => result,
+    }
 }
 
 #[cfg(test)]
@@ -749,6 +429,88 @@ mod graft_tests {
     use capnp::traits::{Imbue, ImbueMut};
 
     use super::*;
+
+    fn failed(message: &str) -> capnp::Error {
+        capnp::Error::failed(message.to_string())
+    }
+
+    #[test]
+    fn application_first_success_is_root_success() {
+        let result = futures::executor::block_on(select_root(
+            std::future::pending(),
+            std::future::ready(Ok(())),
+        ));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn application_first_error_is_root_error() {
+        let result = futures::executor::block_on(select_root(
+            std::future::pending(),
+            std::future::ready(Err(failed("application failed"))),
+        ));
+        assert!(result
+            .expect_err("application error")
+            .to_string()
+            .contains("application failed"));
+    }
+
+    #[test]
+    fn rpc_first_clean_close_is_root_success() {
+        let result = futures::executor::block_on(select_root(
+            std::future::ready(Ok(())),
+            std::future::pending(),
+        ));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rpc_first_error_is_root_error() {
+        let result = futures::executor::block_on(select_root(
+            std::future::ready(Err(failed("RPC failed"))),
+            std::future::pending(),
+        ));
+        assert!(result
+            .expect_err("RPC error")
+            .to_string()
+            .contains("RPC failed"));
+    }
+
+    #[test]
+    fn transport_failure_is_root_error() {
+        let result = transport_completion_result(Err(
+            bindings::wetware::transport::connection::TransportError::Failed(
+                "transport write failed".to_string(),
+            ),
+        ));
+        assert!(result
+            .expect_err("transport failure")
+            .to_string()
+            .contains("P3 transport failed: transport write failed"));
+    }
+
+    #[test]
+    fn orderly_transport_completion_is_root_success() {
+        let result = futures::executor::block_on(select_session(
+            std::future::ready(Ok(())),
+            std::future::ready(Ok(())),
+            std::future::pending(),
+        ));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn transport_error_wins_over_simultaneous_clean_rpc_close() {
+        let result = futures::executor::block_on(select_session(
+            std::future::ready(Err(failed("transport failed"))),
+            std::future::ready(Ok(())),
+            std::future::pending(),
+        ));
+        assert!(result
+            .expect_err("transport failure")
+            .to_string()
+            .contains("transport failed"));
+    }
 
     struct TestMembrane;
 

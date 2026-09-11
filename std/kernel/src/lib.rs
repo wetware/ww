@@ -7,9 +7,8 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use system::{get_graft_cap, membrane_capnp};
-use wasip2::cli::stderr::get_stderr;
-use wasip2::exports::cli::run::Guest;
+use system::{get_graft_cap, membrane_capnp, Guest};
+use wit_bindgen::StreamResult;
 
 #[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod system_capnp {
@@ -34,6 +33,7 @@ mod kernel_runtime {
     wit_bindgen::generate!({
         path: "wit",
         world: "pid0",
+        generate_all,
     });
 }
 
@@ -55,10 +55,7 @@ impl log::Log for StderrLogger {
 
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
-            let stderr = get_stderr();
-            let _ = stderr.blocking_write_and_flush(
-                format!("[kernel][{}] {}\n", record.level(), record.args()).as_bytes(),
-            );
+            eprintln!("[kernel][{}] {}", record.level(), record.args());
         }
     }
 
@@ -211,13 +208,16 @@ async fn initialize(membrane: &Membrane) -> Result<(), capnp::Error> {
     Ok(())
 }
 
-fn wait_for_tty_exit() {
-    let stdin = wasip2::cli::stdin::get_stdin();
+async fn wait_for_tty_exit() {
+    let (mut stdin, _completion) = kernel_runtime::wasi::cli::stdin::read_via_stream();
     loop {
-        match stdin.blocking_read(4096) {
-            Ok(bytes) if bytes.is_empty() => return,
-            Ok(_) => {}
-            Err(_) => return,
+        let (status, bytes) = stdin.read(Vec::with_capacity(4096)).await;
+        match status {
+            StreamResult::Complete(_) if !bytes.is_empty() => {
+                log::info!("terminal input received");
+            }
+            StreamResult::Complete(_) => continue,
+            StreamResult::Dropped | StreamResult::Cancelled => return,
         }
     }
 }
@@ -237,20 +237,20 @@ async fn run_kernel(membrane: Membrane) -> Result<(), capnp::Error> {
     }
 
     if std::env::var("WW_TTY").is_ok() {
-        wait_for_tty_exit();
+        wait_for_tty_exit().await;
         Ok(())
     } else {
         std::future::pending().await
     }
 }
 
-fn run_impl() -> Result<(), ()> {
+async fn run_impl() -> Result<(), ()> {
     init_logging();
 
     let initialization_failed = Rc::new(Cell::new(false));
     let callback_failed = Rc::clone(&initialization_failed);
 
-    system::run(move |membrane: Membrane| {
+    let run_result = system::run(move |membrane: Membrane| {
         let callback_failed = Rc::clone(&callback_failed);
         async move {
             match run_kernel(membrane).await {
@@ -261,9 +261,14 @@ fn run_impl() -> Result<(), ()> {
                 }
             }
         }
-    });
+    })
+    .await;
 
-    if initialization_failed.get() {
+    if let Err(error) = &run_result {
+        log::error!("kernel RPC failed: {error}");
+    }
+
+    if initialization_failed.get() || run_result.is_err() {
         Err(())
     } else {
         Ok(())
@@ -273,12 +278,12 @@ fn run_impl() -> Result<(), ()> {
 struct Kernel;
 
 impl Guest for Kernel {
-    fn run() -> Result<(), ()> {
-        run_impl()
+    async fn run() -> Result<(), ()> {
+        run_impl().await
     }
 }
 
-wasip2::cli::command::export!(Kernel);
+system::export!(Kernel);
 
 #[cfg(test)]
 mod tests {

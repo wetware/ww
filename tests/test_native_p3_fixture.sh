@@ -51,7 +51,7 @@ set -euo pipefail
 if [[ " $* " == *" --target wasm32-wasip3 "* ]]; then
   artifact="$CARGO_TARGET_DIR/wasm32-wasip3/release/native_p3_fixture.wasm"
   mkdir -p "$(dirname "$artifact")"
-  : >"$artifact"
+  printf 'component' >"$artifact"
 fi
 EOF
 
@@ -65,13 +65,47 @@ case "${1:-}" in
   validate)
     ;;
   component)
-    cat <<'WIT'
+    case "${MOCK_COMPONENT_WIT_CASE:-valid}" in
+      valid)
+        cat <<'WIT'
 package root:component;
 
 world root {
   import wasi:cli/environment@0.3.0;
 }
 WIT
+        ;;
+      p2)
+        cat <<'WIT'
+package root:component;
+
+world root {
+  import wasi:cli/environment@0.2.6;
+}
+WIT
+        ;;
+      sockets)
+        cat <<'WIT'
+package root:component;
+
+world root {
+  import wasi:sockets/types@0.3.0;
+}
+WIT
+        ;;
+      unexpected)
+        cat <<'WIT'
+package root:component;
+
+world root {
+  import example:ambient/network@1.0.0;
+}
+WIT
+        ;;
+      *)
+        exit 2
+        ;;
+    esac
     ;;
   *)
     exit 2
@@ -89,6 +123,7 @@ chmod +x \
 
 run_check() {
   local version="$1"
+  local wit_case="${2:-valid}"
 
   env \
     PATH="$BIN_DIR:$PATH" \
@@ -96,6 +131,7 @@ run_check() {
     WASM_TOOLS="$WASM_TOOLS" \
     P3_TARGET_DIR="$TARGET_DIR" \
     MOCK_WASM_TOOLS_VERSION="$version" \
+    MOCK_COMPONENT_WIT_CASE="$wit_case" \
     "$CHECK_SCRIPT"
 }
 
@@ -114,4 +150,22 @@ if run_check 'wasm-tools 1.258.0 (untrusted metadata)' >/dev/null 2>&1; then
   fail 'malformed release metadata was accepted'
 fi
 
-echo 'PASS: native-P3 tool version checks'
+if output="$(run_check 'wasm-tools 1.258.0' p2 2>&1)"; then
+  fail 'a WASI 0.2 import was accepted'
+fi
+grep -Fq 'contains a WASI 0.2 reference' <<<"$output" \
+  || fail "unexpected WASI 0.2 rejection message: $output"
+
+if output="$(run_check 'wasm-tools 1.258.0' sockets 2>&1)"; then
+  fail 'a WASI socket import was accepted'
+fi
+grep -Fq 'unexpectedly imports WASI sockets' <<<"$output" \
+  || fail "unexpected socket rejection message: $output"
+
+if output="$(run_check 'wasm-tools 1.258.0' unexpected 2>&1)"; then
+  fail 'an import outside the component allowlist was accepted'
+fi
+grep -Fq 'has imports outside its allowlist' <<<"$output" \
+  || fail "unexpected allowlist rejection message: $output"
+
+echo 'PASS: native-P3 tool and import checks'

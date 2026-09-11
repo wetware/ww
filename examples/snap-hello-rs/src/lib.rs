@@ -27,7 +27,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use wagi_guest as wagi;
-use wasip2::exports::cli::run::Guest;
 
 mod jfs;
 
@@ -86,7 +85,7 @@ fn compute_target_url() -> String {
 
 /// Current UTC time formatted compactly for the ping response. We avoid
 /// a chrono dep in the cell — `SystemTime` from std is sufficient and
-/// works under wasip2 via `wasi:clocks/wall-clock`.
+/// works under WASI P3 via `wasi:clocks/system-clock`.
 fn now_utc_string() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -180,7 +179,7 @@ fn snap_text_for_greeting(method: &str, greeting: &str) -> String {
 
 struct SnapCell;
 
-impl Guest for SnapCell {
+impl wagi::Guest for SnapCell {
     fn run() -> Result<(), ()> {
         let accept = wagi::header("Accept").unwrap_or_default();
         let method = wagi::method();
@@ -235,7 +234,7 @@ impl Guest for SnapCell {
     }
 }
 
-wasip2::cli::command::export!(SnapCell);
+wagi::export!(SnapCell);
 
 #[cfg(test)]
 mod tests {
