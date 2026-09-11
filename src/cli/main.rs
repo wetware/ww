@@ -136,6 +136,11 @@ enum Commands {
         )]
         listen: Vec<Multiaddr>,
 
+        /// Known libp2p peer address used to seed Kademlia. The address must
+        /// end in `/p2p/<peer-id>`. Repeat to provide more than one seed.
+        #[arg(long, value_name = "MULTIADDR")]
+        bootstrap: Vec<Multiaddr>,
+
         /// Enable WASM debug info for guest processes
         #[arg(long)]
         wasm_debug: bool,
@@ -751,6 +756,7 @@ impl Commands {
                 mounts: mount_args,
                 namespace_root,
                 listen,
+                bootstrap,
                 wasm_debug,
                 kernel,
                 identity,
@@ -798,6 +804,7 @@ impl Commands {
                     identity_path,
                     insecure_ephemeral,
                     listen,
+                    bootstrap,
                     wasm_debug,
                     kernel_source,
                     stem,
@@ -1462,6 +1469,7 @@ system::export!({iface_name}Guest);
         identity: Option<PathBuf>,
         insecure_ephemeral: bool,
         listen: Vec<Multiaddr>,
+        bootstrap: Vec<Multiaddr>,
         wasm_debug: bool,
         kernel_source: ww::kernel::Source,
         stem: Option<String>,
@@ -1829,7 +1837,8 @@ system::export!({iface_name}Guest);
         // automatic bootstrap walk (triggered when entries < K) will
         // discover additional peers if needed.
         tracing::debug!("fetching kubo swarm peers...");
-        let kubo_peers: Vec<(libp2p::PeerId, Multiaddr)> = match ipfs_client.swarm_peers().await {
+        let mut kubo_peers: Vec<(libp2p::PeerId, Multiaddr)> = match ipfs_client.swarm_peers().await
+        {
             Ok(raw) => {
                 use rand::seq::SliceRandom;
                 let mut parsed: Vec<_> = raw
@@ -1853,6 +1862,15 @@ system::export!({iface_name}Guest);
                 Vec::new()
             }
         };
+
+        for bootstrap_addr in bootstrap {
+            let mut address = bootstrap_addr;
+            let peer_id = match address.pop() {
+                Some(libp2p::multiaddr::Protocol::P2p(peer_id)) if !address.is_empty() => peer_id,
+                _ => bail!("--bootstrap must be a transport address ending in /p2p/<peer-id>"),
+            };
+            kubo_peers.push((peer_id, address));
+        }
 
         tracing::debug!("kubo peers fetched");
 

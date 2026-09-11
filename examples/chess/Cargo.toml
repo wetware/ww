@@ -17,7 +17,16 @@ system    = { path = "../../std/system" }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 authority = { package = "wetware-authority", path = "../../crates/authority" }
 membrane = { package = "wetware-membrane", path = "../../crates/membrane" }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "io-util"] }
+tokio-util = { workspace = true, features = ["compat"] }
+macroquad = "0.4"
+ww = { path = "../.." }
+anyhow = { workspace = true }
+ed25519-dalek = { workspace = true }
+libp2p-core = { workspace = true }
+libp2p-identity = { version = "0.2", features = ["ed25519"] }
+libp2p-stream = { workspace = true }
+tempfile = "3"
 rand = { workspace = true }
 
 [lib]

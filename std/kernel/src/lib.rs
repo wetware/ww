@@ -43,6 +43,7 @@ type Membrane = membrane_capnp::membrane::Client;
 
 const STATUS_COMPONENT_PATH: &str = "bin/status.wasm";
 const STATUS_ROUTE: &str = "/status";
+const APP_BINARY_PATH: &str = "boot/main.wasm";
 const INITIAL_INIT_FAILED: &str = "INITIAL_INIT_FAILED";
 
 struct StderrLogger;
@@ -118,6 +119,65 @@ async fn install_status_route(
     Ok(())
 }
 
+/// If boot/main.wasm exists, load it and spawn with "serve" arg and standard grants.
+async fn spawn_app_service(
+    host: &system_capnp::host::Client,
+    runtime: &system_capnp::runtime::Client,
+    finder: capnp::capability::Client,
+    announcer: capnp::capability::Client,
+) -> Result<(), capnp::Error> {
+    let root = std::env::var("WW_ROOT")
+        .map_err(|error| capnp::Error::failed(format!("WW_ROOT is not set: {error}")))?;
+    let path = if root == "/" {
+        format!("/{APP_BINARY_PATH}")
+    } else {
+        format!("{}/{APP_BINARY_PATH}", root.trim_end_matches('/'))
+    };
+
+    let wasm = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::info!("no app binary at {path}: {e}");
+            return Ok(());
+        }
+    };
+
+    log::info!("loading app service from {path}");
+
+    // Load the WASM binary to get an executor.
+    let mut load = runtime.load_request();
+    load.get().set_wasm(&wasm);
+    let executor = load.send().pipeline.get_executor();
+
+    // WASI receives this list verbatim, including argv[0]. The service entry
+    // point expects its mode in argv[1].
+    let mut spawn = executor.spawn_request();
+    {
+        let mut args = spawn.get().init_args(2);
+        args.set(0, "app");
+        args.set(1, "serve");
+    }
+    {
+        let mut caps = spawn.get().init_caps(3);
+
+        let mut host_cap = caps.reborrow().get(0);
+        host_cap.set_name("host");
+        write_cap(host_cap.init_cap(), host.clone().client);
+
+        let mut finder_cap = caps.reborrow().get(1);
+        finder_cap.set_name("routing-finder");
+        write_cap(finder_cap.init_cap(), finder);
+
+        let mut announcer_cap = caps.reborrow().get(2);
+        announcer_cap.set_name("routing-announcer");
+        write_cap(announcer_cap.init_cap(), announcer);
+    }
+    spawn.send().promise.await?;
+    log::info!("spawned app service from {path}");
+
+    Ok(())
+}
+
 async fn initialize(membrane: &Membrane) -> Result<(), capnp::Error> {
     let graft_response = membrane.graft_request().send().promise.await?;
     let caps = graft_response.get()?.get_caps()?;
@@ -126,6 +186,25 @@ async fn initialize(membrane: &Membrane) -> Result<(), capnp::Error> {
     let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
 
     install_status_route(&host, &runtime).await?;
+
+    // Spawn app service if boot/main.wasm exists.
+    // Routing caps may not be available in all configurations (e.g. tests),
+    // so we silently skip if they're missing.
+    let finder: Result<capnp::capability::Client, _> = get_graft_cap(&caps, "routing-finder");
+    let announcer: Result<capnp::capability::Client, _> = get_graft_cap(&caps, "routing-announcer");
+    match (finder, announcer) {
+        (Ok(finder), Ok(announcer)) => {
+            spawn_app_service(&host, &runtime, finder, announcer).await?;
+        }
+        (f, a) => {
+            log::info!(
+                "skipping app service: finder={} announcer={}",
+                if f.is_ok() { "ok" } else { "missing" },
+                if a.is_ok() { "ok" } else { "missing" }
+            );
+        }
+    }
+
     Ok(())
 }
 
