@@ -11,7 +11,7 @@ ROOT := ../..
 .PHONY: all clean
 
 all:
-	$(CARGO) build -p chess --target $(WASM_TARGET) --release
+	$(CARGO) build -p chess --lib --target $(WASM_TARGET) --release
 	@mkdir -p bin
 	cp $(ROOT)/target/$(WASM_TARGET)/release/chess.wasm bin/chess-demo.wasm
 

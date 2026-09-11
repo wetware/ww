@@ -18,6 +18,7 @@ use std::rc::Rc;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use shakmaty::fen::Fen;
+use shakmaty::san::San;
 use shakmaty::uci::UciMove;
 use shakmaty::{Chess, EnPassantMode, Position};
 use wasip2::cli::stderr::get_stderr;
@@ -312,11 +313,6 @@ impl routing_capnp::provider_sink::Server for RpcDialingSink {
             if let Err(e) = play_rpc_against_peer(&vat_client, &self_id, &peer).await {
                 log::error!("game vs {} failed: {e}", short_id(&peer));
             }
-            // Pause between games so the output is readable.
-            let pause = wasip2::clocks::monotonic_clock::subscribe_duration(
-                5_000_000_000, // 5s
-            );
-            pause.block();
             Ok(())
         })
     }
@@ -377,6 +373,9 @@ async fn play_rpc_game(
 
     let mut move_num = 0u32;
     let mut prev_cid: Option<String> = None;
+    let mut local_pos = Chess::default();
+    let mut san_moves: Vec<String> = Vec::new();
+    let result_str: &str;
 
     /// Format the `"prev"` portion of a replay node.
     fn prev_field(cid: &Option<String>) -> String {
@@ -395,6 +394,7 @@ async fn play_rpc_game(
             let node = format!(r#"{{"result":"0-1",{}}}"#, prev_field(&prev_cid));
             prev_cid = log_replay_node(&node).or(prev_cid);
             log::info!("game {us} vs {them}: {them} wins after {move_num} moves");
+            result_str = "0-1";
             break;
         }
 
@@ -414,13 +414,24 @@ async fn play_rpc_game(
                 "white move {white_move} rejected: {reason}"
             )));
         }
+
+        // Convert white UCI move to SAN and advance local position.
+        let uci_parsed: UciMove = white_move
+            .parse()
+            .map_err(|e| capnp::Error::failed(format!("UCI parse: {e}")))?;
+        let m = uci_parsed
+            .to_move(&local_pos)
+            .map_err(|e| capnp::Error::failed(format!("UCI to move: {e}")))?;
+        let white_san = San::from_move(&local_pos, &m).to_string();
+        san_moves.push(white_san.clone());
+        local_pos.play_unchecked(&m);
         move_num += 1;
 
         // Check status after white's move.
         let status_resp = engine.get_status_request().send().promise.await?;
         let status = status_resp.get()?.get_status()?;
         if status != GameStatus::Ongoing {
-            let result_str = match status {
+            result_str = match status {
                 GameStatus::Checkmate => "1-0",
                 _ => "1/2-1/2",
             };
@@ -429,7 +440,7 @@ async fn play_rpc_game(
                 prev_field(&prev_cid)
             );
             prev_cid = log_replay_node(&node).or(prev_cid);
-            log::info!("game {us} vs {them}: {us} wins after {move_num} moves ({white_move})");
+            log::info!("game {us} vs {them}: {us} wins after {move_num} moves ({white_san})");
             break;
         }
 
@@ -445,6 +456,7 @@ async fn play_rpc_game(
             );
             prev_cid = log_replay_node(&node).or(prev_cid);
             log::info!("game {us} vs {them}: {us} wins after {move_num} moves");
+            result_str = "1-0";
             break;
         }
 
@@ -465,19 +477,29 @@ async fn play_rpc_game(
             )));
         }
 
+        // Convert black UCI move to SAN and advance local position.
+        let uci_parsed: UciMove = black_move
+            .parse()
+            .map_err(|e| capnp::Error::failed(format!("UCI parse: {e}")))?;
+        let m = uci_parsed
+            .to_move(&local_pos)
+            .map_err(|e| capnp::Error::failed(format!("UCI to move: {e}")))?;
+        let black_san = San::from_move(&local_pos, &m).to_string();
+        san_moves.push(black_san.clone());
+        local_pos.play_unchecked(&m);
         // Publish this move pair as a node in the replay linked list.
         let node = format!(
             r#"{{"n":{move_num},"w":"{white_move}","b":"{black_move}",{}}}"#,
             prev_field(&prev_cid)
         );
         prev_cid = log_replay_node(&node).or(prev_cid);
-        log::info!("  {move_num}. {white_move} {black_move}");
+        log::info!("  {move_num}. {white_san} {black_san}");
 
         // Check status after black's move.
         let status_resp = engine.get_status_request().send().promise.await?;
         let status = status_resp.get()?.get_status()?;
         if status != GameStatus::Ongoing {
-            let result_str = match status {
+            result_str = match status {
                 GameStatus::Checkmate => "0-1",
                 _ => "1/2-1/2",
             };
@@ -487,6 +509,44 @@ async fn play_rpc_game(
             break;
         }
     }
+
+    // Emit PGN for external capture.
+    let mut pgn = String::new();
+    pgn.push_str("---PGN_START---\n");
+    pgn.push_str("[Event \"Wetware Chess\"]\n");
+    pgn.push_str("[Site \"Distributed\"]\n");
+    pgn.push_str(&format!("[White \"{us}\"]\n"));
+    pgn.push_str(&format!("[Black \"{them}\"]\n"));
+    pgn.push_str(&format!("[Result \"{result_str}\"]\n"));
+    pgn.push('\n');
+    let mut line_len = 0usize;
+    for (i, san) in san_moves.iter().enumerate() {
+        let token = if i % 2 == 0 {
+            format!("{}. {san}", i / 2 + 1)
+        } else {
+            san.clone()
+        };
+        if i == 0 {
+            pgn.push_str(&token);
+            line_len = token.len();
+        } else if line_len + 1 + token.len() > 80 {
+            pgn.push('\n');
+            pgn.push_str(&token);
+            line_len = token.len();
+        } else {
+            pgn.push(' ');
+            pgn.push_str(&token);
+            line_len += 1 + token.len();
+        }
+    }
+    if line_len + 1 + result_str.len() > 80 {
+        pgn.push('\n');
+    } else {
+        pgn.push(' ');
+    }
+    pgn.push_str(result_str);
+    pgn.push_str("\n---PGN_END---");
+    log::info!("{pgn}");
 
     // Log the root CID — the tip of the replay linked list.
     if let Some(cid) = &prev_cid {
@@ -514,6 +574,15 @@ async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> 
     let network_resp = host.network_request().send().promise.await?;
     let network = network_resp.get()?;
     let vat_client = network.get_vat_client()?;
+    let vat_listener = network.get_vat_listener()?;
+
+    // Publish this node's engine before announcing it. Discovery identifies
+    // peers; VatListener is what makes the chess protocol dialable on them.
+    let engine: chess_capnp::chess_engine::Client = capnp_rpc::new_client(ChessEngineImpl::new());
+    let mut serve = vat_listener.serve_raw_request();
+    serve.get().init_cap().set_as_capability(engine.client.hook);
+    serve.get().set_protocol(CHESS_SERVICE);
+    serve.send().promise.await?;
 
     // Resolve peer identity.
     let id_resp = host.id_request().send().promise.await?;
