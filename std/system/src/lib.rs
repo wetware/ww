@@ -15,24 +15,55 @@ use wit_bindgen::{
     StreamReader as WasiStreamReader, StreamResult, StreamWriter as WasiStreamWriter,
 };
 
-#[allow(dead_code, clippy::extra_unused_type_parameters)]
-pub mod membrane_capnp {
-    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
+#[allow(
+    dead_code,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
+pub mod system_capnp {
+    include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
 }
 
-/// The named capability list returned by `Membrane.graft`.
-pub type Caps<'a> = capnp::struct_list::Reader<'a, membrane_capnp::export::Owned>;
+#[allow(
+    dead_code,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
+pub mod routing_capnp {
+    include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
+}
+
+#[allow(
+    dead_code,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
+pub mod auth_capnp {
+    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
+}
+
+#[allow(
+    dead_code,
+    clippy::extra_unused_type_parameters,
+    clippy::match_single_binding
+)]
+pub mod http_capnp {
+    include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
+}
+
+/// Application-defined named capabilities returned in `Membrane.extras`.
+pub type Extras<'a> = capnp::struct_list::Reader<'a, system_capnp::export::Owned>;
 
 /// A typed failure to read or resolve one capability from a graft response.
 #[derive(Debug)]
-pub enum GraftError {
+pub enum ExtraError {
     InvalidResponse(capnp::Error),
     InvalidName(capnp::Error),
     InvalidCapability(capnp::Error),
     NotFound { name: String },
 }
 
-impl std::fmt::Display for GraftError {
+impl std::fmt::Display for ExtraError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidResponse(error)
@@ -45,7 +76,7 @@ impl std::fmt::Display for GraftError {
     }
 }
 
-impl std::error::Error for GraftError {
+impl std::error::Error for ExtraError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidResponse(error)
@@ -56,35 +87,35 @@ impl std::error::Error for GraftError {
     }
 }
 
-impl From<GraftError> for capnp::Error {
-    fn from(error: GraftError) -> Self {
+impl From<ExtraError> for capnp::Error {
+    fn from(error: ExtraError) -> Self {
         match error {
-            GraftError::InvalidResponse(error)
-            | GraftError::InvalidName(error)
-            | GraftError::InvalidCapability(error) => error,
-            GraftError::NotFound { name } => {
+            ExtraError::InvalidResponse(error)
+            | ExtraError::InvalidName(error)
+            | ExtraError::InvalidCapability(error) => error,
+            ExtraError::NotFound { name } => {
                 capnp::Error::failed(format!("capability '{name}' not found in graft response"))
             }
         }
     }
 }
 
-/// Look up a typed capability by name from a graft response.
-pub fn get_graft_cap<C: FromClientHook>(caps: &Caps<'_>, name: &str) -> Result<C, GraftError> {
-    for index in 0..caps.len() {
-        let entry = caps.get(index);
-        let entry_name = entry.get_name().map_err(GraftError::InvalidResponse)?;
+/// Look up a typed application capability by name in `Membrane.extras`.
+pub fn get_extra<C: FromClientHook>(extras: &Extras<'_>, name: &str) -> Result<C, ExtraError> {
+    for index in 0..extras.len() {
+        let entry = extras.get(index);
+        let entry_name = entry.get_name().map_err(ExtraError::InvalidResponse)?;
         let entry_name = entry_name
             .to_str()
-            .map_err(|error| GraftError::InvalidName(capnp::Error::failed(error.to_string())))?;
+            .map_err(|error| ExtraError::InvalidName(capnp::Error::failed(error.to_string())))?;
         if entry_name == name {
             return entry
                 .get_cap()
                 .get_as_capability::<C>()
-                .map_err(GraftError::InvalidCapability);
+                .map_err(ExtraError::InvalidCapability);
         }
     }
-    Err(GraftError::NotFound {
+    Err(ExtraError::NotFound {
         name: name.to_string(),
     })
 }
@@ -515,51 +546,51 @@ mod graft_tests {
     struct TestMembrane;
 
     #[allow(refining_impl_trait)]
-    impl membrane_capnp::membrane::Server for TestMembrane {
+    impl system_capnp::membrane::Server for TestMembrane {
         fn graft(
             self: capnp::capability::Rc<Self>,
-            _params: membrane_capnp::membrane::GraftParams,
-            _results: membrane_capnp::membrane::GraftResults,
+            _params: system_capnp::membrane::GraftParams,
+            mut results: system_capnp::membrane::GraftResults,
         ) -> capnp::capability::Promise<(), capnp::Error> {
+            results.get().set_peer_id(b"test-peer");
             capnp::capability::Promise::ok(())
         }
     }
 
     #[test]
     fn resolves_a_named_capability() {
-        let client: membrane_capnp::membrane::Client = capnp_rpc::new_client(TestMembrane);
+        let client: system_capnp::membrane::Client = capnp_rpc::new_client(TestMembrane);
         let expected_ptr = client.client.hook.get_ptr();
         let mut message = capnp::message::Builder::new_default();
         let mut cap_table = Vec::new();
         {
-            let mut results =
-                message.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
-            results.imbue_mut(&mut cap_table);
-            let mut entry = results.reborrow().init_caps(1).get(0);
-            entry.set_name("host");
+            let mut graft =
+                message.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
+            graft.imbue_mut(&mut cap_table);
+            let mut entry = graft.reborrow().init_extras(1).get(0);
+            entry.set_name("application");
             entry.init_cap().set_as_capability(client.client.hook);
         }
-        let mut results = message
-            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
+        let mut graft = message
+            .get_root_as_reader::<system_capnp::membrane::graft_results::Reader<'_>>()
             .unwrap();
-        results.imbue(&cap_table);
-        let caps = results.get_caps().unwrap();
+        graft.imbue(&cap_table);
+        let caps = graft.get_extras().unwrap();
 
         let found: capnp::capability::Client =
-            get_graft_cap(&caps, "host").expect("named capability");
+            get_extra(&caps, "application").expect("named capability");
         assert_eq!(found.hook.get_ptr(), expected_ptr);
     }
 
     #[test]
     fn missing_names_return_a_typed_error() {
         let mut message = capnp::message::Builder::new_default();
-        let _: capnp::struct_list::Builder<'_, membrane_capnp::export::Owned> =
-            message.initn_root(0);
-        let caps = message.get_root_as_reader::<Caps<'_>>().unwrap();
+        let _: capnp::struct_list::Builder<'_, system_capnp::export::Owned> = message.initn_root(0);
+        let caps = message.get_root_as_reader::<Extras<'_>>().unwrap();
 
         assert!(matches!(
-            get_graft_cap::<capnp::capability::Client>(&caps, "runtime"),
-            Err(GraftError::NotFound { name }) if name == "runtime"
+            get_extra::<capnp::capability::Client>(&caps, "runtime"),
+            Err(ExtraError::NotFound { name }) if name == "runtime"
         ));
     }
 
@@ -567,17 +598,17 @@ mod graft_tests {
     fn invalid_utf8_names_fail_closed() {
         let mut message = capnp::message::Builder::new_default();
         {
-            let mut caps: capnp::struct_list::Builder<'_, membrane_capnp::export::Owned> =
+            let mut caps: capnp::struct_list::Builder<'_, system_capnp::export::Owned> =
                 message.initn_root(1);
             caps.reborrow()
                 .get(0)
                 .set_name(capnp::text::Reader(&[0xff]));
         }
-        let caps = message.get_root_as_reader::<Caps<'_>>().unwrap();
+        let caps = message.get_root_as_reader::<Extras<'_>>().unwrap();
 
         assert!(matches!(
-            get_graft_cap::<capnp::capability::Client>(&caps, "host"),
-            Err(GraftError::InvalidName(_))
+            get_extra::<capnp::capability::Client>(&caps, "application"),
+            Err(ExtraError::InvalidName(_))
         ));
     }
 }

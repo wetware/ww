@@ -1,76 +1,85 @@
 # Cross-Crate Cap'n Proto Schema Sharing
 
-## Problem
+## Rust type identity
 
-capnpc generates Rust trait types (e.g. `Server`, `Client`) per crate. If two
-crates both compile the same `.capnp` file, their generated traits are
-**distinct types** — a struct implementing crate A's `Server` trait does not
-satisfy crate B's `Server` trait, even though the schema is identical.
+`capnpc` generates Rust traits and client types in the crate that runs the
+compiler. Two crates that compile the same schema get distinct Rust types.
+Identical schema IDs make the wire protocols compatible, but they do not make
+the generated Rust traits interchangeable.
 
-Concretely: `stem` compiles `stem.capnp` and exports `MembraneServer` which
-implements `stem::stem_capnp::membrane::Server`. If `rs` also compiles
-`stem.capnp`, it gets its own `rs::stem_capnp::membrane::Server` — and stem's
-`MembraneServer` doesn't implement it.
+Host-side crates therefore use one owner for shared generated types.
+`crates/authority` compiles the repository schemas and exposes modules such as
+`authority::system_capnp`, `authority::auth_capnp`, and
+`authority::routing_capnp`. Host crates such as `crates/rpc` import those
+modules instead of compiling another host-side copy.
 
-## Solution: `crate_provides`
+Guest crates are separate WASM link units. Each guest can compile the shared
+schema graph locally because Rust values do not cross the process boundary.
+The stable Cap'n Proto schema IDs provide wire compatibility between the host
+and each guest.
 
-capnpc (≥ 0.17.2) has `CompilerCommand::crate_provides(crate_name, file_ids)`.
-This tells the code generator: "don't generate code for these schema files;
-instead, emit `use` statements that reference the named crate's generated
-modules."
+## Current schema graph
 
-```rust
-// rs/build.rs
-capnpc::CompilerCommand::new()
-    .file("capnp/peer.capnp")
-    .file("capnp/membrane.capnp")   // imports stem.capnp
-    .crate_provides("stem", [0x9bce094a026970c4]) // stem.capnp file ID
-    .run()
-    .expect("failed to compile capnp schemas");
-```
-
-The file ID is the `@0x...` annotation at the top of each `.capnp` file:
+`capnp/system.capnp` defines the typed `Membrane` bootstrap and imports three
+schemas:
 
 ```capnp
-# stem.capnp
-@0x9bce094a026970c4;
+using AuthSchema = import "auth.capnp";
+using RoutingSchema = import "routing.capnp";
+using HttpSchema = import "http.capnp";
 ```
 
-## Requirements
+A crate that generates `system_capnp.rs` must also generate the imported
+`auth_capnp.rs`, `routing_capnp.rs`, and `http_capnp.rs` modules. The compiler
+must resolve all four files from one stable source prefix.
 
-1. **The `.capnp` file must still be on disk.** capnpc needs it for import
-   resolution when other schemas (e.g. `membrane.capnp`) reference it. We
-   vendor `stem.capnp` into `rs/capnp/` for this reason.
+```rust
+let schemas = [
+    "system.capnp",
+    "routing.capnp",
+    "auth.capnp",
+    "http.capnp",
+];
 
-2. **The providing crate must expose its generated module.** stem does this via:
-   ```rust
-   pub mod stem_capnp {
-       include!(concat!(env!("OUT_DIR"), "/capnp/stem_capnp.rs"));
-   }
-   ```
-
-3. **The consuming crate depends on the provider normally** (via `Cargo.toml`).
-   No special dependency features needed.
-
-## How it works in this project
-
-- **stem** compiles `stem.capnp` → generates `stem::stem_capnp` with
-  `Membrane`, `Session`, `StatusPoller`, `Epoch`, etc.
-- **rs** compiles `membrane.capnp` (which imports `stem.capnp`) but declares
-  `crate_provides("stem", ...)` for `stem.capnp`. capnpc generates code for
-  `membrane.capnp` only, with references like `stem::stem_capnp::membrane::*`.
-- rs uses `stem::membrane::MembraneServer` directly — no trait mismatch because
-  both sides share the same generated `stem::stem_capnp` types.
-
-## What NOT to do
-
-Don't compile the same `.capnp` in both crates without `crate_provides`. You'll
-get a confusing `E0277` error like:
-
-```
-the trait `stem_capnp::membrane::Server<…>` is not implemented for `MembraneServer<…>`
-note: `MembraneServer<…>` implements similarly named trait
-      `stem::stem_capnp::membrane::Server`, but not `stem_capnp::membrane::Server<…>`
+let mut compiler = capnpc::CompilerCommand::new();
+compiler.src_prefix(&capnp_dir);
+for schema in schemas {
+    compiler.file(capnp_dir.join(schema));
+}
+compiler.run().expect("failed to compile shared schemas");
 ```
 
-The fix is always `crate_provides` — not reimplementing the server locally.
+Compile `stem.capnp` in the same command only when the crate also uses its
+epoch and provenance types. `system.capnp` does not import `stem.capnp`.
+
+The standalone `membrane.capnp` schema no longer exists. `Membrane`, `Export`,
+`Network`, `Routing`, `Executor`, and the listener interfaces all live in
+`system.capnp`.
+
+## `crate_provides`
+
+`CompilerCommand::crate_provides(crate_name, file_ids)` redirects references
+to schema files whose generated Rust modules already belong to another crate.
+First-party build scripts use this declaration for Cap'n Proto's standard
+schema file:
+
+```rust
+.crate_provides("capnp", [0xa93fc509624c72d9])
+```
+
+`crate_provides` does not merge two copies of a project schema into one Rust
+type. If a server implementation and its caller exchange generated Rust types
+inside one native crate graph, both must import the same provider module.
+
+## Build-script requirements
+
+1. Use the repository `capnp/` directory as `src_prefix`.
+2. Compile every imported project schema that must have a Rust module.
+3. Emit `cargo:rerun-if-changed` for every compiled schema.
+4. Use one provider crate for generated types shared inside a Rust crate graph.
+5. Compile guest-local copies only across an RPC process boundary.
+
+If a generated file refers to a missing module such as `crate::auth_capnp`, add
+the imported schema to the same compiler command. If Rust reports two similarly
+named but incompatible `Server` traits, remove the duplicate project-schema
+generation and import the provider crate's generated module.

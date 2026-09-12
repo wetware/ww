@@ -52,11 +52,6 @@ mod auth_capnp {
     include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
 }
 
-#[allow(dead_code, clippy::extra_unused_type_parameters)]
-mod membrane_capnp {
-    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
-}
-
 #[allow(dead_code)]
 mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
@@ -74,28 +69,7 @@ mod greeter_capnp {
 
 const GREETER_SERVICE: &str = "greeter";
 
-/// Host-provided closed delivery of this child's immutable initial grants.
-type InitialGrants = membrane_capnp::initial_grants::Client;
-
-/// Look up a typed capability by name from the initial grants list.
-fn get_initial_grant<T: capnp::capability::FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
-    name: &str,
-) -> Result<T, capnp::Error> {
-    for i in 0..caps.len() {
-        let entry = caps.get(i);
-        let n = entry
-            .get_name()?
-            .to_str()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        if n == name {
-            return entry.get_cap().get_as_capability::<T>();
-        }
-    }
-    Err(capnp::Error::failed(format!(
-        "required initial grant '{name}' is missing"
-    )))
-}
+type Membrane = system_capnp::membrane::Client;
 
 /// Short peer ID for human-readable logs (last 4 bytes = 8 hex chars).
 fn short_id(peer_id: &[u8]) -> String {
@@ -174,7 +148,7 @@ async fn run_cell() -> Result<(), capnp::Error> {
     let greeter = GreeterImpl { peer_id };
     let client: greeter_capnp::greeter::Client = capnp_rpc::new_client(greeter);
     log::info!("cell: exporting Greeter via RPC");
-    system::serve(client.client, |_initial_grants: InitialGrants| async move {
+    system::serve(client.client, |_membrane: Membrane| async move {
         sleep_ns(u64::MAX).await;
         Ok(())
     })
@@ -280,21 +254,25 @@ async fn greet_peer(
 // Service mode — discovery loop with VatClient
 // ---------------------------------------------------------------------------
 
-async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> {
-    let grants_resp = initial_grants.get_request().send().promise.await?;
-    let results = grants_resp.get()?;
-    let caps = results.get_caps()?;
-    let host: system_capnp::host::Client = get_initial_grant(&caps, "host")?;
-    let announcer: routing_capnp::announcer::Client =
-        get_initial_grant(&caps, "routing-announcer")?;
-    let finder: routing_capnp::finder::Client = get_initial_grant(&caps, "routing-finder")?;
+async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
+    let graft_response = membrane.graft_request().send().promise.await?;
+    let graft = graft_response.get()?;
+    if !graft.has_peer_id() {
+        return Err(capnp::Error::failed(
+            "Membrane.graft result is missing required peerId".into(),
+        ));
+    }
+    let self_id = graft.get_peer_id()?.to_vec();
+    if self_id.is_empty() {
+        return Err(capnp::Error::failed(
+            "Membrane.graft result contains an empty peerId".into(),
+        ));
+    }
+    let vat_client = graft.get_network()?.get_vat().get_dialer()?;
+    let routing = graft.get_routing()?;
+    let announcer = routing.get_announcer()?;
+    let finder = routing.get_finder()?;
 
-    let network_resp = host.network_request().send().promise.await?;
-    let network = network_resp.get()?;
-    let vat_client = network.get_vat_client()?;
-
-    let id_resp = host.id_request().send().promise.await?;
-    let self_id = id_resp.get()?.get_peer_id()?.to_vec();
     log::info!("service: peer {}", short_id(&self_id));
     log::info!("service: name {GREETER_SERVICE}");
     log::info!("service: looking for peers...");
@@ -355,10 +333,7 @@ impl Guest for DiscoveryGuest {
         let result = match std::env::args().nth(1).as_deref() {
             Some("serve") => {
                 log::info!("discovery: serve — DHT provide + peer discovery");
-                system::run(|initial_grants: InitialGrants| async move {
-                    run_service(initial_grants).await
-                })
-                .await
+                system::run(|membrane: Membrane| async move { run_service(membrane).await }).await
             }
             _ => {
                 // Default (no args): cell mode — export the Greeter capability.

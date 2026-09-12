@@ -8,7 +8,7 @@ Two-node chess over libp2p RPC capabilities.
 - authenticated `VatListener` publication
 - typed `VatClient` calls
 - pure service-name routing-key derivation
-- independent DHT Announcer and Finder grants
+- independent `routing.announcer` and `routing.finder` fields from one `Membrane`
 - distinct Reader and Player method authority over one game
 
 ## Build

@@ -7,11 +7,9 @@
 mod common;
 
 use atom::auth_capnp;
-use atom::membrane_capnp;
 use atom::system_capnp;
 use atom::{AtomIndexer, Epoch, IndexerConfig, MembraneServer, TerminalServer};
 use auth::SigningDomain;
-use authority::{get_graft_cap, http_capnp, routing_capnp};
 use capnp_rpc::new_client;
 use common::{deploy_atom, set_head, spawn_anvil, FullStubSessionBuilder, StubSessionBuilder};
 use ed25519_dalek::SigningKey;
@@ -75,7 +73,7 @@ fn observed_to_epoch(ev: &atom::HeadUpdatedObserved) -> Epoch {
 }
 
 /// Helper: create a Membrane client (no auth — pure ocap).
-fn stub_membrane(rx: watch::Receiver<Epoch>) -> membrane_capnp::membrane::Client {
+fn stub_membrane(rx: watch::Receiver<Epoch>) -> system_capnp::membrane::Client {
     new_client(MembraneServer::new(rx, StubSessionBuilder))
 }
 
@@ -83,9 +81,9 @@ fn stub_membrane(rx: watch::Receiver<Epoch>) -> membrane_capnp::membrane::Client
 fn terminal_membrane(
     rx: watch::Receiver<Epoch>,
     vk: ed25519_dalek::VerifyingKey,
-) -> auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> {
+) -> auth_capnp::terminal::Client<system_capnp::membrane::Owned> {
     let membrane = stub_membrane(rx.clone());
-    new_client(TerminalServer::<membrane_capnp::membrane::Owned>::new(
+    new_client(TerminalServer::<system_capnp::membrane::Owned>::new(
         vk,
         membrane,
         SigningDomain::terminal_membrane(),
@@ -188,9 +186,7 @@ async fn test_membrane_graft_runtime_against_anvil() {
         .await
         .expect("graft RPC");
     let graft_response = graft_rpc_response.get().expect("graft results");
-    let graft_caps = graft_response.get_caps().expect("caps");
-    let runtime: system_capnp::runtime::Client =
-        get_graft_cap(&graft_caps, "runtime").expect("runtime");
+    let runtime = graft_response.get_runtime().expect("runtime");
 
     // Verify runtime works under current epoch (shutdown succeeds).
     runtime
@@ -231,9 +227,7 @@ async fn test_membrane_graft_no_auth() {
         .await
         .expect("graft RPC");
     let results = graft_resp.get().expect("graft results");
-    let graft_caps = results.get_caps().expect("caps");
-    let runtime: system_capnp::runtime::Client =
-        get_graft_cap(&graft_caps, "runtime").expect("runtime");
+    let runtime = results.get_runtime().expect("runtime");
 
     // Verify runtime works (shutdown succeeds under current epoch).
     runtime
@@ -269,9 +263,7 @@ async fn test_membrane_stale_epoch_then_recovery_no_chain() {
         .await
         .expect("graft RPC");
     let graft_results = graft_resp.get().expect("graft results");
-    let graft_caps = graft_results.get_caps().expect("caps");
-    let runtime: system_capnp::runtime::Client =
-        get_graft_cap(&graft_caps, "runtime").expect("runtime");
+    let runtime = graft_results.get_runtime().expect("runtime");
 
     runtime
         .shutdown_request()
@@ -298,9 +290,7 @@ async fn test_membrane_stale_epoch_then_recovery_no_chain() {
         .await
         .expect("re-graft RPC");
     let results2 = graft_resp2.get().expect("re-graft results");
-    let caps2 = results2.get_caps().expect("caps");
-    let runtime2: system_capnp::runtime::Client =
-        get_graft_cap(&caps2, "runtime").expect("runtime");
+    let runtime2 = results2.get_runtime().expect("runtime");
 
     runtime2
         .shutdown_request()
@@ -366,14 +356,14 @@ async fn test_terminal_missing_signer_rejected() {
     assert!(result.get_session().is_err());
 }
 
-/// Helper: create a Membrane client with all six capabilities populated.
-fn full_stub_membrane(rx: watch::Receiver<Epoch>) -> membrane_capnp::membrane::Client {
+/// Helper: create a Membrane client with typed fields and one dynamic extra.
+fn full_stub_membrane(rx: watch::Receiver<Epoch>) -> system_capnp::membrane::Client {
     new_client(MembraneServer::new(rx, FullStubSessionBuilder))
 }
 
-/// Verify that graft() returns both routing capabilities as independent refs.
+/// Verify that graft() returns typed authority and keeps dynamic extras separate.
 #[tokio::test]
-async fn test_graft_returns_all_six_capabilities() {
+async fn test_graft_returns_typed_capabilities_and_dynamic_extras() {
     let epoch = Epoch {
         seq: 1,
         head: b"head".to_vec(),
@@ -390,21 +380,26 @@ async fn test_graft_returns_all_six_capabilities() {
         .await
         .expect("graft RPC");
     let results = graft_resp.get().expect("graft results");
-    let caps = results.get_caps().expect("caps");
-
-    assert_eq!(caps.len(), 6, "expected 6 capabilities");
-    let _identity: auth_capnp::identity::Client =
-        get_graft_cap(&caps, "identity").expect("identity capability should be present");
-    let _host: system_capnp::host::Client =
-        get_graft_cap(&caps, "host").expect("host capability should be present");
-    let runtime: system_capnp::runtime::Client =
-        get_graft_cap(&caps, "runtime").expect("runtime capability should be present");
-    let _finder: routing_capnp::finder::Client =
-        get_graft_cap(&caps, "routing-finder").expect("Finder capability should be present");
-    let _announcer: routing_capnp::announcer::Client =
-        get_graft_cap(&caps, "routing-announcer").expect("Announcer capability should be present");
-    let _http_client: http_capnp::http_client::Client =
-        get_graft_cap(&caps, "http-client").expect("http-client capability should be present");
+    assert_eq!(results.get_peer_id().expect("peer ID"), b"typed-peer-id");
+    assert!(results.has_identity());
+    assert!(results.has_runtime());
+    let routing = results.get_routing().expect("routing");
+    assert!(routing.has_finder());
+    assert!(routing.has_announcer());
+    let network = results.get_network().expect("network");
+    assert!(network.get_http().has_dialer());
+    let extras = results.get_extras().expect("extras");
+    assert_eq!(extras.len(), 1);
+    assert_eq!(
+        extras
+            .get(0)
+            .get_name()
+            .expect("extra name")
+            .to_str()
+            .expect("UTF-8 extra"),
+        "application-extra"
+    );
+    let runtime = results.get_runtime().expect("runtime");
 
     // Verify runtime actually works (shutdown succeeds).
     runtime
@@ -436,13 +431,13 @@ async fn test_terminal_over_stream_pair() {
     let (_tx, rx) = watch::channel(epoch);
     let membrane = full_stub_membrane(rx.clone());
 
-    let terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
+    let terminal = TerminalServer::<system_capnp::membrane::Owned>::new(
         vk,
         membrane,
         SigningDomain::terminal_membrane(),
         rx,
     );
-    let terminal_client: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+    let terminal_client: auth_capnp::terminal::Client<system_capnp::membrane::Owned> =
         new_client(terminal);
 
     let (client_stream, server_stream) = tokio::io::duplex(4096);
@@ -461,7 +456,7 @@ async fn test_terminal_over_stream_pair() {
             let client_network = VatNetwork::new(cr, cw, Side::Client, Default::default());
             let mut client_rpc =
                 RpcSystem::new(Box::new(client_network), None::<capnp::capability::Client>);
-            let remote_terminal: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+            let remote_terminal: auth_capnp::terminal::Client<system_capnp::membrane::Owned> =
                 client_rpc.bootstrap(Side::Server);
 
             tokio::task::spawn_local(async move {
@@ -487,7 +482,7 @@ async fn test_terminal_over_stream_pair() {
                 login_result.get_status().expect("known status"),
                 auth_capnp::LoginStatus::Granted
             );
-            let remote_membrane: membrane_capnp::membrane::Client =
+            let remote_membrane: system_capnp::membrane::Client =
                 login_result.get_session().expect("session");
 
             let graft_resp = timeout(
@@ -499,9 +494,7 @@ async fn test_terminal_over_stream_pair() {
             .expect("graft RPC");
 
             let results = graft_resp.get().expect("graft results");
-            let stream_caps = results.get_caps().expect("caps");
-            let runtime: system_capnp::runtime::Client =
-                get_graft_cap(&stream_caps, "runtime").expect("runtime");
+            let runtime = results.get_runtime().expect("runtime");
             timeout(
                 Duration::from_secs(5),
                 runtime.shutdown_request().send().promise,
@@ -533,13 +526,13 @@ async fn test_terminal_over_stream_wrong_key_rejected() {
     let (_tx, rx) = watch::channel(epoch);
     let membrane = full_stub_membrane(rx.clone());
 
-    let terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
+    let terminal = TerminalServer::<system_capnp::membrane::Owned>::new(
         host_vk,
         membrane,
         SigningDomain::terminal_membrane(),
         rx,
     );
-    let terminal_client: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+    let terminal_client: auth_capnp::terminal::Client<system_capnp::membrane::Owned> =
         new_client(terminal);
 
     let (client_stream, server_stream) = tokio::io::duplex(4096);
@@ -557,7 +550,7 @@ async fn test_terminal_over_stream_wrong_key_rejected() {
             let client_network = VatNetwork::new(cr, cw, Side::Client, Default::default());
             let mut client_rpc =
                 RpcSystem::new(Box::new(client_network), None::<capnp::capability::Client>);
-            let remote_terminal: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+            let remote_terminal: auth_capnp::terminal::Client<system_capnp::membrane::Owned> =
                 client_rpc.bootstrap(Side::Server);
 
             tokio::task::spawn_local(async move {

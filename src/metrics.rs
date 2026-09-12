@@ -828,20 +828,21 @@ mod tests {
         let state = test_state();
         {
             let mut rpc = state.rpc_metrics.write().unwrap();
-            rpc.observe("host.id", 0.005);
-            rpc.observe("host.id", 0.050);
+            rpc.observe("stat.snapshot", 0.005);
+            rpc.observe("stat.snapshot", 0.050);
         }
         let output = render_metrics(&state);
         // 0.005s falls in le=0.005 bucket (<=)
-        assert!(
-            output.contains("ww_rpc_duration_seconds_bucket{method=\"host.id\",le=\"0.005\"} 1")
-        );
+        assert!(output
+            .contains("ww_rpc_duration_seconds_bucket{method=\"stat.snapshot\",le=\"0.005\"} 1"));
         // 0.050s falls in le=0.05 bucket
-        assert!(output.contains("ww_rpc_duration_seconds_bucket{method=\"host.id\",le=\"0.05\"} 2"));
+        assert!(output
+            .contains("ww_rpc_duration_seconds_bucket{method=\"stat.snapshot\",le=\"0.05\"} 2"));
         // +Inf always has all observations
-        assert!(output.contains("ww_rpc_duration_seconds_bucket{method=\"host.id\",le=\"+Inf\"} 2"));
-        assert!(output.contains("ww_rpc_duration_seconds_count{method=\"host.id\"} 2"));
-        assert!(output.contains("ww_rpc_calls_total{method=\"host.id\"} 2"));
+        assert!(output
+            .contains("ww_rpc_duration_seconds_bucket{method=\"stat.snapshot\",le=\"+Inf\"} 2"));
+        assert!(output.contains("ww_rpc_duration_seconds_count{method=\"stat.snapshot\"} 2"));
+        assert!(output.contains("ww_rpc_calls_total{method=\"stat.snapshot\"} 2"));
     }
 
     #[test]

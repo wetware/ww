@@ -24,10 +24,7 @@ use crate::services::CompileRequest;
 use crate::system_capnp;
 use cell::proc::{FuelEstimator, FuelObserver};
 use cell::{Builder, Proc, Program};
-use rpc::{
-    graft, ByteStreamImpl, CachePolicy, InitialAuthorityRecord, ProcessBootstrapControl,
-    ProcessImpl, StreamMode,
-};
+use rpc::{graft, ByteStreamImpl, CachePolicy, ProcessBootstrapControl, ProcessImpl, StreamMode};
 
 /// Maximum WASM binary size accepted by the Executor.
 ///
@@ -39,7 +36,7 @@ const RPC_EOF_GRACE: Duration = Duration::from_secs(1);
 
 static RPC_EOF_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
-/// Number of malformed-peer fallbacks that aborted a child host RpcSystem.
+/// Number of malformed-peer fallbacks that aborted a child RPC system.
 ///
 /// This counter makes the one-second EOF grace path observable in tests and
 /// diagnostics without changing process completion semantics.
@@ -327,8 +324,9 @@ impl system_capnp::runtime::Server for RuntimeImpl {
 // ExecutorImpl — attenuated capability bound to one WASM binary
 // =========================================================================
 
-/// An Executor bound to a specific WASM binary. Each `spawn(args, env)` creates
-/// a fresh WASI process from the stored bytecode with the given args and env.
+/// An Executor bound to a specific WASM binary. Each
+/// `spawn(args, env, membrane)` creates a fresh WASI process from the stored
+/// bytecode with the given arguments, environment, and Membrane.
 ///
 /// This is the attenuated capability in the OCAP model: the holder can spawn
 /// workers but cannot load arbitrary code. Args and env are late-bound per-spawn,
@@ -346,14 +344,12 @@ pub struct ExecutorImpl {
 
 /// Owns every resource whose lifetime is exactly one running child.
 ///
-/// The task running this value is the authority-record lifetime boundary:
-/// process exit or kill aborts child RPC/stderr work and releases the record.
-/// Grant references cannot keep the process or its RPC task alive.
+/// The task running this value owns the delegated authority through child exit.
 struct OwnedChildLifecycle {
     proc: Option<Proc>,
     rpc_task: Option<tokio::task::JoinHandle<()>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
-    record: Option<InitialAuthorityRecord>,
+    membrane: Option<system_capnp::membrane::Client>,
     bootstrap_control: ProcessBootstrapControl,
     kill_rx: tokio::sync::watch::Receiver<bool>,
     exit_tx: Option<tokio::sync::oneshot::Sender<i32>>,
@@ -411,10 +407,9 @@ impl OwnedChildLifecycle {
         drop(proc_run);
         self.bootstrap_control.clear();
         self.stop_auxiliary_tasks().await;
-        // Keep the immutable record live through process execution, then
-        // release it after child RPC and the stored guest bootstrap are gone
-        // but before reporting exit to the parent.
-        drop(self.record.take());
+        // Release the delegated Membrane after child RPC and the stored guest
+        // bootstrap are gone but before reporting exit to the parent.
+        drop(self.membrane.take());
         tracing::info!("executor: child process exited with code {exit_code}");
         if let Some(exit_tx) = self.exit_tx.take() {
             let _ = exit_tx.send(exit_code);
@@ -446,7 +441,7 @@ impl OwnedChildLifecycle {
                 RPC_EOF_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     grace_ms = RPC_EOF_GRACE.as_millis() as u64,
-                    "executor: child host RpcSystem missed EOF grace; aborting fallback"
+                    "executor: child RPC system missed EOF grace; aborting fallback"
                 );
                 task.abort();
                 let _ = task.await;
@@ -467,7 +462,7 @@ impl Drop for OwnedChildLifecycle {
 /// Armed only until the Process capability is installed in the spawn result.
 ///
 /// If the RPC call is cancelled or errors during that handoff, aborting the
-/// owner task drops the process, streams, record, and child RPC task together.
+/// owner task drops the process, streams, Membrane, and child RPC task together.
 struct SpawnHandoffGuard {
     abort_handle: Option<tokio::task::AbortHandle>,
     kill_tx: tokio::sync::watch::Sender<bool>,
@@ -536,10 +531,14 @@ impl system_capnp::executor::Server for ExecutorImpl {
             None // Default: scheduled (unlimited)
         };
 
-        // Final child-admission chokepoint: decode, validate, and retain the
-        // complete immutable record before stdio allocation or process build.
-        // Promise/pipelined/broken references remain opaque here.
-        let initial_authority = pry!(params.get_caps().and_then(InitialAuthorityRecord::decode));
+        // Retain the exact Membrane supplied by the parent. The host forwards
+        // this object unchanged as the child's bootstrap capability.
+        if !params.has_membrane() {
+            return Promise::err(capnp::Error::failed(
+                "executor.spawn: membrane is required".into(),
+            ));
+        }
+        let child_membrane = pry!(params.get_membrane());
 
         let bytecode = self.bytecode.clone();
         let component = self.component.clone();
@@ -588,11 +587,8 @@ impl system_capnp::executor::Server for ExecutorImpl {
                 .take_host_split()
                 .ok_or_else(|| capnp::Error::failed("host stream missing".into()))?;
 
-            // Every Runtime/Executor configuration uses the same bounded,
-            // record-served child authority model. There is no raw Host
-            // fallback when epoch or stream wiring is absent.
             let (child_rpc_system, guest_bootstrap) =
-                graft::build_initial_authority_rpc(reader, writer, initial_authority.clone());
+                graft::build_child_membrane_rpc(reader, writer, child_membrane.clone());
 
             let rpc_task = tokio::task::spawn_local(child_rpc_system.map(|_| ()));
             let stderr_task = tokio::task::spawn_local(async move {
@@ -625,7 +621,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
                     proc: Some(proc),
                     rpc_task: Some(rpc_task),
                     stderr_task: Some(stderr_task),
-                    record: Some(initial_authority),
+                    membrane: Some(child_membrane),
                     bootstrap_control,
                     kill_rx,
                     exit_tx: Some(exit_tx),
@@ -714,7 +710,7 @@ mod tests {
                     .collect();
 
                 // Model the production owner task after process construction:
-                // process, RPC task, streams, and record are all captured by
+                // process, RPC task, streams, and Membrane are all captured by
                 // the one abort target guarded until Process handoff.
                 let lifecycle_task = tokio::task::spawn_local(async move {
                     let _resources = resources;

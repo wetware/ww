@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 capnp = "0.25.3"
+capnp-rpc = "0.25.0"
 log = "0.4.29"
 wit-bindgen = "=0.61.1"
 system = { path = "../system" }

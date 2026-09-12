@@ -1,7 +1,5 @@
-//! Cap'n Proto RPC for host-provided capabilities.
-//!
-//! The Host capability is served to each WASM guest over in-memory duplex
-//! streams (no TCP listener).
+//! Cap'n Proto RPC for host-provided capabilities over per-Cell in-memory
+//! duplex streams.
 #![cfg(not(target_arch = "wasm32"))]
 
 pub mod connection_budget;
@@ -9,7 +7,6 @@ pub mod dispatch;
 pub mod graft;
 pub mod http_client;
 pub mod http_listener;
-pub mod initial_authority;
 pub mod keys;
 pub mod named_capability;
 pub mod routing;
@@ -26,7 +23,6 @@ pub use connection_budget::{
 };
 pub mod wagi;
 
-pub use initial_authority::InitialAuthorityRecord;
 pub use named_capability::{decode_exports, encode_exports, NamedCapabilities, NamedCapability};
 
 use std::cell::RefCell;
@@ -42,13 +38,7 @@ use capnp_rpc::twoparty::VatNetwork;
 #[cfg(test)]
 use capnp_rpc::RpcSystem;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-#[cfg(test)]
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock};
-#[cfg(test)]
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-
-use authority::EpochGuard;
 
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use tokio::sync::oneshot;
@@ -154,9 +144,8 @@ pub struct NatProbeEvent {
 
 #[derive(Clone, Debug)]
 pub struct NetworkSnapshot {
-    pub local_peer_id: Vec<u8>,
     pub listen_addrs: Vec<Vec<u8>>,
-    pub known_peers: Vec<PeerInfo>,
+    pub connected_peer_count: u32,
     pub nat_status: NatReachability,
     pub nat_probe_events: Vec<NatProbeEvent>,
 }
@@ -171,6 +160,7 @@ pub enum NatReachability {
 
 #[derive(Clone, Debug)]
 pub struct NetworkState {
+    local_peer_id: Arc<[u8]>,
     inner: Arc<RwLock<NetworkSnapshot>>,
     listen_addr_notify: Arc<Notify>,
 }
@@ -193,13 +183,13 @@ impl NetworkState {
 
     pub fn from_peer_id(peer_id: Vec<u8>) -> Self {
         let snapshot = NetworkSnapshot {
-            local_peer_id: peer_id,
             listen_addrs: Vec::new(),
-            known_peers: Vec::new(),
+            connected_peer_count: 0,
             nat_status: NatReachability::Unknown,
             nat_probe_events: Vec::new(),
         };
         Self {
+            local_peer_id: peer_id.into(),
             inner: Arc::new(RwLock::new(snapshot)),
             listen_addr_notify: Arc::new(Notify::new()),
         }
@@ -209,9 +199,8 @@ impl NetworkState {
         self.inner.read().await.clone()
     }
 
-    pub async fn set_local_peer_id(&self, peer_id: Vec<u8>) {
-        let mut guard = self.inner.write().await;
-        guard.local_peer_id = peer_id;
+    pub fn local_peer_id(&self) -> &[u8] {
+        &self.local_peer_id
     }
 
     pub async fn add_listen_addr(&self, addr: Vec<u8>) {
@@ -245,9 +234,9 @@ impl NetworkState {
         guard.listen_addrs.retain(|a| a != addr);
     }
 
-    pub async fn set_known_peers(&self, peers: Vec<PeerInfo>) {
+    pub async fn set_connected_peer_count(&self, count: usize) {
         let mut guard = self.inner.write().await;
-        guard.known_peers = peers;
+        guard.connected_peer_count = count.try_into().unwrap_or(u32::MAX);
     }
 
     pub async fn set_nat_status(&self, status: NatReachability) {
@@ -521,163 +510,6 @@ impl system_capnp::process::Server for ProcessImpl {
     }
 }
 
-#[allow(dead_code)] // swarm_cmd_tx and wasm_debug reserved for future Host methods
-pub struct HostImpl {
-    network_state: NetworkState,
-    swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
-    wasm_debug: bool,
-    guard: EpochGuard,
-    stream_control: Option<libp2p_stream::Control>,
-    route_registry: Option<crate::dispatch::RouteRegistry>,
-    /// Host-internal view of the trusted pid0 execution-generation lifetime.
-    /// Its sender is owned outside every exported capability, so a route
-    /// cannot keep its issuing generation alive.
-    registration_scope: Option<tokio::sync::watch::Receiver<()>>,
-}
-
-impl HostImpl {
-    pub fn new(
-        network_state: NetworkState,
-        swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
-        wasm_debug: bool,
-        guard: EpochGuard,
-        stream_control: Option<libp2p_stream::Control>,
-    ) -> Self {
-        Self {
-            network_state,
-            swarm_cmd_tx,
-            wasm_debug,
-            guard,
-            stream_control,
-            route_registry: None,
-            registration_scope: None,
-        }
-    }
-
-    /// Set the HTTP route registry for WAGI service integration.
-    pub fn with_route_registry(mut self, registry: crate::dispatch::RouteRegistry) -> Self {
-        self.route_registry = Some(registry);
-        self
-    }
-
-    /// Attach host-internal execution-generation state. Child-visible
-    /// capabilities receive no sender or locator for it.
-    pub(crate) fn with_registration_scope(
-        mut self,
-        scope: tokio::sync::watch::Receiver<()>,
-    ) -> Self {
-        self.registration_scope = Some(scope);
-        self
-    }
-
-    fn check_epoch(&self) -> Result<(), capnp::Error> {
-        self.guard.check()
-    }
-}
-
-#[allow(refining_impl_trait)]
-impl system_capnp::host::Server for HostImpl {
-    fn id(
-        self: capnp::capability::Rc<Self>,
-        _params: system_capnp::host::IdParams,
-        mut results: system_capnp::host::IdResults,
-    ) -> Promise<(), capnp::Error> {
-        pry!(self.check_epoch());
-        let network_state = self.network_state.clone();
-        Promise::from_future(async move {
-            let snapshot = network_state.snapshot().await;
-            results.get().set_peer_id(&snapshot.local_peer_id);
-            Ok(())
-        })
-    }
-
-    fn addrs(
-        self: capnp::capability::Rc<Self>,
-        _params: system_capnp::host::AddrsParams,
-        mut results: system_capnp::host::AddrsResults,
-    ) -> Promise<(), capnp::Error> {
-        pry!(self.check_epoch());
-        let network_state = self.network_state.clone();
-        Promise::from_future(async move {
-            let snapshot = network_state.snapshot().await;
-            let mut list = results.get().init_addrs(snapshot.listen_addrs.len() as u32);
-            for (i, addr) in snapshot.listen_addrs.iter().enumerate() {
-                list.set(i as u32, addr);
-            }
-            Ok(())
-        })
-    }
-
-    fn peers(
-        self: capnp::capability::Rc<Self>,
-        _params: system_capnp::host::PeersParams,
-        mut results: system_capnp::host::PeersResults,
-    ) -> Promise<(), capnp::Error> {
-        pry!(self.check_epoch());
-        let network_state = self.network_state.clone();
-        Promise::from_future(async move {
-            let snapshot = network_state.snapshot().await;
-            let mut list = results.get().init_peers(snapshot.known_peers.len() as u32);
-            for (i, peer) in snapshot.known_peers.iter().enumerate() {
-                let mut entry = list.reborrow().get(i as u32);
-                entry.set_peer_id(&peer.peer_id);
-                let mut addrs = entry.init_addrs(peer.addrs.len() as u32);
-                for (j, addr) in peer.addrs.iter().enumerate() {
-                    addrs.set(j as u32, addr);
-                }
-            }
-            Ok(())
-        })
-    }
-
-    fn network(
-        self: capnp::capability::Rc<Self>,
-        _params: system_capnp::host::NetworkParams,
-        mut results: system_capnp::host::NetworkResults,
-    ) -> Promise<(), capnp::Error> {
-        pry!(self.check_epoch());
-        let guard = self.guard.clone();
-        let stream_control = match &self.stream_control {
-            Some(c) => c.clone(),
-            None => {
-                return Promise::err(capnp::Error::failed(
-                    "network() not available on this Host".into(),
-                ))
-            }
-        };
-        let stream_listener: system_capnp::stream_listener::Client = capnp_rpc::new_client(
-            stream_listener::StreamListenerImpl::new(stream_control.clone(), guard.clone()),
-        );
-        let stream_dialer: system_capnp::stream_dialer::Client = capnp_rpc::new_client(
-            stream_dialer::StreamDialerImpl::new(stream_control.clone(), guard.clone()),
-        );
-        let vat_listener: system_capnp::vat_listener::Client = capnp_rpc::new_client(
-            vat_listener::VatListenerImpl::new(stream_control.clone(), guard.clone()),
-        );
-        let vat_client: system_capnp::vat_client::Client = capnp_rpc::new_client(
-            vat_client::VatClientImpl::new(stream_control, guard.clone()),
-        );
-        let registry = self
-            .route_registry
-            .clone()
-            .unwrap_or_else(crate::dispatch::new_registry);
-        let http_listener: system_capnp::http_listener::Client =
-            if let Some(scope) = self.registration_scope.clone() {
-                capnp_rpc::new_client(http_listener::HttpListenerImpl::new_scoped(
-                    guard, registry, scope,
-                ))
-            } else {
-                capnp_rpc::new_client(http_listener::HttpListenerImpl::new(guard, registry))
-            };
-        results.get().set_stream_listener(stream_listener);
-        results.get().set_stream_dialer(stream_dialer);
-        results.get().set_vat_listener(vat_listener);
-        results.get().set_vat_client(vat_client);
-        results.get().set_http_listener(http_listener);
-        Promise::ok(())
-    }
-}
-
 // =========================================================================
 // CachePolicy — operator-level runtime cache configuration
 // =========================================================================
@@ -696,37 +528,9 @@ pub enum CachePolicy {
 }
 
 #[cfg(test)]
-pub(crate) fn build_test_peer_rpc<R, W>(
-    reader: R,
-    writer: W,
-    network_state: NetworkState,
-    swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
-    wasm_debug: bool,
-) -> RpcSystem<Side>
-where
-    R: AsyncRead + Unpin + 'static,
-    W: AsyncWrite + Unpin + 'static,
-{
-    let host: system_capnp::host::Client = capnp_rpc::new_client(HostImpl::new(
-        network_state,
-        swarm_cmd_tx,
-        wasm_debug,
-        EpochGuard::fixed(authority::Epoch::zero()),
-        None,
-    ));
-
-    let rpc_network = VatNetwork::new(
-        reader.compat(),
-        writer.compat_write(),
-        Side::Server,
-        Default::default(),
-    );
-    RpcSystem::new(Box::new(rpc_network), Some(host.client))
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use authority::EpochGuard;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     /// A throwaway capability for tests that exercise protocol/validation logic
@@ -738,128 +542,36 @@ mod tests {
         bs.client
     }
 
-    /// Helper: spin up server + client over in-memory duplex, return Host client.
-    fn setup_rpc() -> (
-        system_capnp::host::Client,
-        tokio::task::JoinHandle<()>,
-        mpsc::Receiver<SwarmCommand>,
-    ) {
-        let (client_stream, server_stream) = io::duplex(8 * 1024);
-        let (client_read, client_write) = io::split(client_stream);
-        let (server_read, server_write) = io::split(server_stream);
-
-        let peer_id = vec![1, 2, 3, 4];
-        let network_state = NetworkState::from_peer_id(peer_id);
-        let (swarm_tx, swarm_rx) = mpsc::channel(16);
-
-        let server_rpc =
-            build_test_peer_rpc(server_read, server_write, network_state, swarm_tx, false);
-
-        let server_handle = tokio::task::spawn_local(async move {
-            let _ = server_rpc.await;
-        });
-
-        let client_network = VatNetwork::new(
-            client_read.compat(),
-            client_write.compat_write(),
-            Side::Client,
-            Default::default(),
-        );
-        let mut client_rpc = RpcSystem::new(Box::new(client_network), None);
-        let host: system_capnp::host::Client = client_rpc.bootstrap(Side::Server);
-        tokio::task::spawn_local(async move {
-            let _ = client_rpc.await;
-        });
-
-        (host, server_handle, swarm_rx)
+    struct TestMembrane {
+        peer_id: Vec<u8>,
     }
 
-    #[tokio::test]
-    async fn test_host_id_returns_peer_id() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
-
-                let resp = host.id_request().send().promise.await.unwrap();
-                let peer_id = resp.get().unwrap().get_peer_id().unwrap();
-                assert_eq!(peer_id, &[1, 2, 3, 4]);
-            })
-            .await;
+    #[allow(refining_impl_trait)]
+    impl system_capnp::membrane::Server for TestMembrane {
+        fn graft(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::membrane::GraftParams,
+            mut results: system_capnp::membrane::GraftResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_peer_id(&self.peer_id);
+            Promise::ok(())
+        }
     }
 
-    #[tokio::test]
-    async fn host_becomes_stale_after_epoch_advance() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let (epoch_tx, guard) = test_epoch_guard(1);
-                let (swarm_tx, _swarm_rx) = mpsc::channel(1);
-                let host: system_capnp::host::Client = capnp_rpc::new_client(HostImpl::new(
-                    NetworkState::from_peer_id(vec![1, 2, 3, 4]),
-                    swarm_tx,
-                    false,
-                    guard,
-                    None,
-                ));
-
-                host.id_request()
-                    .send()
-                    .promise
-                    .await
-                    .expect("fresh Host must answer");
-                epoch_tx.send_replace(authority::Epoch {
-                    seq: 2,
-                    head: Vec::new(),
-                    root: None,
-                });
-                assert!(
-                    host.id_request().send().promise.await.is_err(),
-                    "Host must reject calls after its epoch advances"
-                );
-            })
-            .await;
+    fn test_membrane(peer_id: &[u8]) -> system_capnp::membrane::Client {
+        capnp_rpc::new_client(TestMembrane {
+            peer_id: peer_id.to_vec(),
+        })
     }
-
-    #[tokio::test]
-    async fn test_host_addrs_initially_empty() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
-
-                let resp = host.addrs_request().send().promise.await.unwrap();
-                let addrs = resp.get().unwrap().get_addrs().unwrap();
-                assert_eq!(addrs.len(), 0);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_host_peers_initially_empty() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
-
-                let resp = host.peers_request().send().promise.await.unwrap();
-                let peers = resp.get().unwrap().get_peers().unwrap();
-                assert_eq!(peers.len(), 0);
-            })
-            .await;
-    }
-
-    // Echo tests removed — echo method deleted from API.
-    // Runtime.load() and Executor.spawn() are tested via integration tests
-    // that compile real WASM (not mockable in unit tests without a wasmtime Engine).
 
     #[tokio::test]
     async fn test_network_state_snapshot() {
         let state = NetworkState::from_peer_id(vec![42]);
 
         let snap = state.snapshot().await;
-        assert_eq!(snap.local_peer_id, vec![42]);
+        assert_eq!(state.local_peer_id(), &[42]);
         assert!(snap.listen_addrs.is_empty());
-        assert!(snap.known_peers.is_empty());
+        assert_eq!(snap.connected_peer_count, 0);
     }
 
     #[tokio::test]
@@ -901,34 +613,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_network_state_set_known_peers() {
+    async fn test_network_state_set_connected_peer_count() {
         let state = NetworkState::from_peer_id(vec![1]);
-
-        let peers = vec![
-            PeerInfo {
-                peer_id: vec![2],
-                addrs: vec![vec![10]],
-            },
-            PeerInfo {
-                peer_id: vec![3],
-                addrs: vec![vec![20], vec![30]],
-            },
-        ];
-        state.set_known_peers(peers).await;
+        state.set_connected_peer_count(2).await;
 
         let snap = state.snapshot().await;
-        assert_eq!(snap.known_peers.len(), 2);
-        assert_eq!(snap.known_peers[0].peer_id, vec![2]);
-        assert_eq!(snap.known_peers[1].addrs.len(), 2);
+        assert_eq!(snap.connected_peer_count, 2);
     }
 
-    #[tokio::test]
-    async fn test_network_state_set_peer_id() {
+    #[test]
+    fn test_network_state_peer_id_is_stable_metadata() {
         let state = NetworkState::from_peer_id(vec![1]);
-        state.set_local_peer_id(vec![99]).await;
-
-        let snap = state.snapshot().await;
-        assert_eq!(snap.local_peer_id, vec![99]);
+        assert_eq!(state.local_peer_id(), &[1]);
     }
 
     #[tokio::test]
@@ -1080,8 +776,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                // Use the Host cap as the bootstrap capability.
-                let (host, _server, _rx) = setup_rpc();
+                let membrane = test_membrane(&[1, 2, 3, 4]);
 
                 let (stdin, stdout, stderr, exit_rx, kill_tx) = dummy_process_parts();
                 let process_impl = ProcessImpl::with_bootstrap(
@@ -1089,7 +784,7 @@ mod tests {
                     stdout,
                     stderr,
                     exit_rx,
-                    host.client.clone(),
+                    membrane.client.clone(),
                     kill_tx,
                 );
                 let process = setup_process_rpc(process_impl);
@@ -1134,7 +829,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
+                let membrane = test_membrane(&[1, 2, 3, 4]);
 
                 let (stdin, stdout, stderr, exit_rx, kill_tx) = dummy_process_parts();
                 let process_impl = ProcessImpl::with_bootstrap(
@@ -1142,7 +837,7 @@ mod tests {
                     stdout,
                     stderr,
                     exit_rx,
-                    host.client.clone(),
+                    membrane.client.clone(),
                     kill_tx,
                 );
                 let process = setup_process_rpc(process_impl);
@@ -1165,14 +860,14 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
+                let membrane = test_membrane(&[1, 2, 3, 4]);
                 let (stdin, stdout, stderr, exit_rx, kill_tx) = dummy_process_parts();
                 let (process_impl, control) = ProcessImpl::with_controlled_bootstrap(
                     stdin,
                     stdout,
                     stderr,
                     exit_rx,
-                    host.client,
+                    membrane.client,
                     kill_tx,
                 );
                 let process = setup_process_rpc(process_impl);
@@ -1201,15 +896,14 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
+                let membrane = test_membrane(&[1, 2, 3, 4]);
 
-                // Create a "delayed" host cap using new_future_client.
+                // Create a delayed Membrane capability using new_future_client.
                 // This simulates a pipelined cap that resolves after 200ms.
-                let host_clone = host.clone();
-                let delayed_host: system_capnp::host::Client =
+                let delayed_membrane: system_capnp::membrane::Client =
                     capnp_rpc::new_future_client(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        Ok::<_, capnp::Error>(host_clone)
+                        Ok::<_, capnp::Error>(membrane)
                     });
 
                 // Store the delayed cap in ProcessImpl.
@@ -1219,7 +913,7 @@ mod tests {
                     stdout,
                     stderr,
                     exit_rx,
-                    delayed_host.client.clone(),
+                    delayed_membrane.client.clone(),
                     kill_tx,
                 );
                 let process = setup_process_rpc(process_impl);
@@ -1231,27 +925,6 @@ mod tests {
                     .get_cap()
                     .get_as_capability::<capnp::capability::Client>()
                     .unwrap();
-            })
-            .await;
-    }
-
-    // =========================================================================
-    // Host.network() tests
-    // =========================================================================
-
-    #[tokio::test]
-    async fn test_host_network_errors_without_stream_control() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                // setup_rpc() creates a fixed epoch-zero Host without stream control.
-                let (host, _server, _rx) = setup_rpc();
-
-                let result = host.network_request().send().promise.await;
-                assert!(
-                    result.is_err(),
-                    "network() should fail without stream control"
-                );
             })
             .await;
     }
@@ -1311,15 +984,15 @@ mod tests {
     // These test the full capability bridge pattern used by VatListener/VatClient
     // without requiring libp2p or WASM. We simulate the bridge with duplex streams:
     //
-    //   Cell (Host cap)
+    //   Cell (Membrane cap)
     //       ↓ bootstrap cap
     //   Process.bootstrap()
     //       ↓ cap over duplex
-    //   Host bridge (Side::Server, bootstrap = cell_cap)
+    //   Capability bridge (Side::Server, bootstrap = cell_cap)
     //       ↓ duplex stream
     //   Remote peer (Side::Client, bootstraps → gets cell_cap)
     //       ↓
-    //   Uses the cap (id request)
+    //   Uses the cap (graft request)
 
     /// Simulate the host bridge: serve a bootstrap cap over a duplex stream,
     /// return the "remote peer" side client that bootstrapped from it.
@@ -1330,7 +1003,7 @@ mod tests {
         let (bridge_read, bridge_write) = io::split(bridge_stream);
         let (peer_read, peer_write) = io::split(peer_stream);
 
-        // Host bridge side: serve the cell's cap.
+        // Bridge side: serve the cell's cap.
         let bridge_network = VatNetwork::new(
             bridge_read.compat(),
             bridge_write.compat_write(),
@@ -1365,19 +1038,24 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                // 1. Create a Host cap (the "cell's exported cap").
-                let (host, _server, _rx) = setup_rpc();
+                // 1. Create a Membrane cap (the cell's exported cap).
+                let membrane = test_membrane(&[1, 2, 3, 4]);
 
                 // 2. Bridge the internal cap directly; public bootstrap carries the cap.
-                let bootstrap_cap = host.client.clone();
+                let bootstrap_cap = membrane.client.clone();
 
                 // 3. Bridge: serve it over a duplex (simulates the libp2p stream bridge).
-                let (remote_host, _bridge): (system_capnp::host::Client, _) =
+                let (remote_membrane, _bridge): (system_capnp::membrane::Client, _) =
                     setup_bridge(bootstrap_cap);
 
                 // 4. Remote peer uses the cap through the bridge.
-                let id_resp = remote_host.id_request().send().promise.await.unwrap();
-                let peer_id = id_resp.get().unwrap().get_peer_id().unwrap();
+                let response = remote_membrane
+                    .graft_request()
+                    .send()
+                    .promise
+                    .await
+                    .unwrap();
+                let peer_id = response.get().unwrap().get_peer_id().unwrap();
                 assert_eq!(peer_id, &[1, 2, 3, 4]);
             })
             .await;
@@ -1389,17 +1067,22 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
+                let membrane = test_membrane(&[1, 2, 3, 4]);
 
-                let bootstrap_cap = host.client.clone();
+                let bootstrap_cap = membrane.client.clone();
 
-                let (remote_host, _bridge): (system_capnp::host::Client, _) =
+                let (remote_membrane, _bridge): (system_capnp::membrane::Client, _) =
                     setup_bridge(bootstrap_cap);
 
                 // Make 5 calls through the bridge.
                 for _ in 0..5 {
-                    let id_resp = remote_host.id_request().send().promise.await.unwrap();
-                    let peer_id = id_resp.get().unwrap().get_peer_id().unwrap();
+                    let response = remote_membrane
+                        .graft_request()
+                        .send()
+                        .promise
+                        .await
+                        .unwrap();
+                    let peer_id = response.get().unwrap().get_peer_id().unwrap();
                     assert_eq!(peer_id, &[1, 2, 3, 4]);
                 }
             })
@@ -1412,17 +1095,17 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
+                let membrane = test_membrane(&[1, 2, 3, 4]);
 
-                let bootstrap_cap = host.client.clone();
+                let bootstrap_cap = membrane.client.clone();
 
-                let (remote_host, _bridge): (system_capnp::host::Client, _) =
+                let (remote_membrane, _bridge): (system_capnp::membrane::Client, _) =
                     setup_bridge(bootstrap_cap);
 
                 // Fire 5 calls concurrently (pipelined), then collect results.
                 let mut futures = Vec::new();
                 for _ in 0..5 {
-                    futures.push(remote_host.id_request().send().promise);
+                    futures.push(remote_membrane.graft_request().send().promise);
                 }
 
                 for fut in futures {
@@ -1441,22 +1124,20 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (host, _server, _rx) = setup_rpc();
-
                 // Create two independent process+bridge chains.
-                let mut remote_hosts = Vec::new();
-                for _ in 0..2 {
-                    let cap = host.client.clone();
+                let mut remote_membranes = Vec::new();
+                for peer_id in [vec![1, 2, 3, 4], vec![5, 6, 7, 8]] {
+                    let cap = test_membrane(&peer_id).client;
 
-                    let (remote, _bridge): (system_capnp::host::Client, _) = setup_bridge(cap);
-                    remote_hosts.push(remote);
+                    let (remote, _bridge): (system_capnp::membrane::Client, _) = setup_bridge(cap);
+                    remote_membranes.push(remote);
                 }
 
                 // Both bridges work independently.
-                for remote in &remote_hosts {
-                    let id_resp = remote.id_request().send().promise.await.unwrap();
-                    let peer_id = id_resp.get().unwrap().get_peer_id().unwrap();
-                    assert_eq!(peer_id, &[1, 2, 3, 4]);
+                for (remote, expected) in remote_membranes.iter().zip([[1, 2, 3, 4], [5, 6, 7, 8]])
+                {
+                    let response = remote.graft_request().send().promise.await.unwrap();
+                    assert_eq!(response.get().unwrap().get_peer_id().unwrap(), expected);
                 }
             })
             .await;
@@ -1492,7 +1173,6 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (_host, _server, _rx) = setup_rpc();
                 let (_tx, guard) = test_epoch_guard(1);
                 let listener_impl =
                     vat_listener::VatListenerImpl::new(dummy_stream_control(), guard);
@@ -1557,7 +1237,6 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (_host, _server, _rx) = setup_rpc();
                 let (tx, guard) = test_epoch_guard(1);
                 let listener_impl =
                     vat_listener::VatListenerImpl::new(dummy_stream_control(), guard);
@@ -1619,7 +1298,6 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (_host, _server, _rx) = setup_rpc();
                 let (_tx, guard) = test_epoch_guard(1);
                 // Share the same Behaviour so both listeners see the same protocol registry.
                 let behaviour = libp2p_stream::Behaviour::new();
@@ -1665,7 +1343,6 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (_host, _server, _rx) = setup_rpc();
                 let (_tx, guard) = test_epoch_guard(1);
                 let listener_impl =
                     vat_listener::VatListenerImpl::new(dummy_stream_control(), guard);
@@ -1695,21 +1372,21 @@ mod tests {
         // cell-side RPC system we directly control, then abort() it.
         //
         // Topology:
-        //   cell RPC (Side::Server, serves Host)
+        //   cell RPC (Side::Server, serves Membrane)
         //       ↓ bootstrap
-        //   cell_cap (client ref to Host)
+        //   cell_cap (client ref to Membrane)
         //       ↓ bridged over
         //   bridge RPC (Side::Server, bootstrap = cell_cap)
         //       ↓ bootstrap
-        //   remote_host (remote peer's view)
+        //   remote_membrane (remote peer's view)
         //
         // We abort the cell RPC task, which drops the RPC system,
-        // closes the duplex half, and disconnects the Host cap.
+        // closes the duplex half, and disconnects the Membrane cap.
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                // Create a Host cap to serve as the cell's exported cap.
-                let (host, _server, _rx) = setup_rpc();
+                // Create a Membrane cap to serve as the cell's exported cap.
+                let membrane = test_membrane(&[1, 2, 3, 4]);
 
                 // Set up a cell-side RPC system we control.
                 let (cell_stream, host_stream) = io::duplex(8 * 1024);
@@ -1722,7 +1399,7 @@ mod tests {
                     Side::Server,
                     Default::default(),
                 );
-                let cell_rpc = RpcSystem::new(Box::new(cell_network), Some(host.client));
+                let cell_rpc = RpcSystem::new(Box::new(cell_network), Some(membrane.client));
                 let cell_task = tokio::task::spawn_local(async move {
                     let _ = cell_rpc.await;
                 });
@@ -1734,19 +1411,24 @@ mod tests {
                     Default::default(),
                 );
                 let mut client_rpc = RpcSystem::new(Box::new(client_network), None);
-                let cell_cap: system_capnp::host::Client = client_rpc.bootstrap(Side::Server);
+                let cell_cap: system_capnp::membrane::Client = client_rpc.bootstrap(Side::Server);
                 let cell_cap = cell_cap.client;
                 tokio::task::spawn_local(async move {
                     let _ = client_rpc.await;
                 });
 
                 // Bridge the cell cap to a remote peer.
-                let (remote_host, _bridge): (system_capnp::host::Client, _) =
+                let (remote_membrane, _bridge): (system_capnp::membrane::Client, _) =
                     setup_bridge(cell_cap);
 
                 // Verify it works while alive.
-                let id_resp = remote_host.id_request().send().promise.await.unwrap();
-                let peer_id = id_resp.get().unwrap().get_peer_id().unwrap();
+                let response = remote_membrane
+                    .graft_request()
+                    .send()
+                    .promise
+                    .await
+                    .unwrap();
+                let peer_id = response.get().unwrap().get_peer_id().unwrap();
                 assert_eq!(peer_id, &[1, 2, 3, 4]);
 
                 // Kill the cell's RPC system.
@@ -1757,7 +1439,7 @@ mod tests {
                 // Call through the bridge should now fail.
                 let result = tokio::time::timeout(
                     std::time::Duration::from_millis(500),
-                    remote_host.id_request().send().promise,
+                    remote_membrane.graft_request().send().promise,
                 )
                 .await;
 

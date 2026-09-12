@@ -29,6 +29,11 @@ fn setup_runtime() -> system_capnp::runtime::Client {
     )
 }
 
+fn minimal_membrane() -> system_capnp::membrane::Client {
+    let (_sender, receiver) = tokio::sync::watch::channel(authority::Epoch::zero());
+    authority::membrane_client(receiver, b"test-peer")
+}
+
 /// Load echo WASM via runtime.load() and spawn a cell, returning its Process capability.
 async fn spawn_echo_cell(
     runtime: &system_capnp::runtime::Client,
@@ -43,6 +48,7 @@ async fn spawn_echo_cell(
 
     // executor.spawn(args, env) → Process
     let mut req = executor.spawn_request();
+    req.get().set_membrane(minimal_membrane());
     {
         let mut env = req.get().init_env(1);
         env.set(0, format!("WW_LABEL={label}").as_str());

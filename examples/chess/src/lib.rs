@@ -54,11 +54,6 @@ mod auth_capnp {
     include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
 }
 
-#[allow(dead_code, clippy::extra_unused_type_parameters)]
-mod membrane_capnp {
-    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
-}
-
 #[allow(dead_code)]
 mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
@@ -82,28 +77,7 @@ authority::impl_terminal_session_pipeline!(chess_capnp::chess_engine::Client);
 
 const CHESS_SERVICE: &str = "chess";
 
-/// Host-provided closed delivery of this child's immutable initial grants.
-type InitialGrants = membrane_capnp::initial_grants::Client;
-
-/// Look up a typed capability by name from the initial grants list.
-fn get_initial_grant<T: capnp::capability::FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
-    name: &str,
-) -> Result<T, capnp::Error> {
-    for i in 0..caps.len() {
-        let entry = caps.get(i);
-        let n = entry
-            .get_name()?
-            .to_str()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        if n == name {
-            return entry.get_cap().get_as_capability::<T>();
-        }
-    }
-    Err(capnp::Error::failed(format!(
-        "required initial grant '{name}' is missing"
-    )))
-}
+type Membrane = system_capnp::membrane::Client;
 
 /// Short peer ID for human-readable logs (last 4 bytes = 8 hex chars).
 fn short_id(peer_id: &[u8]) -> String {
@@ -278,7 +252,7 @@ async fn run_cell() -> Result<(), capnp::Error> {
     let engine = ChessEngineImpl::new();
     let client: chess_capnp::chess_engine::Client = capnp_rpc::new_client(engine);
     log::info!("cell: exporting ChessEngine via RPC");
-    system::serve(client.client, |_initial_grants: InitialGrants| async move {
+    system::serve(client.client, |_membrane: Membrane| async move {
         // Keep alive until the host drops the RPC connection.
         // The root future exits when the RPC system completes.
         std::future::pending().await
@@ -363,8 +337,8 @@ impl routing_capnp::provider_sink::Server for RpcDialingSink {
 // ---------------------------------------------------------------------------
 
 /// Log a replay node. Previously published to IPFS; now just logged.
-/// IPFS content access is not an initial grant — cells use
-/// the WASI virtual filesystem (CidTree) instead.
+/// This path does not request Membrane IPFS authority. Cells use the WASI
+/// virtual filesystem (CidTree) for content access instead.
 fn log_replay_node(json: &str) -> Option<String> {
     log::debug!("replay: {json}");
     None
@@ -528,23 +502,25 @@ async fn play_rpc_game(
 // Service mode — discovery loop with VatClient
 // ---------------------------------------------------------------------------
 
-async fn run_service(initial_grants: InitialGrants) -> Result<(), capnp::Error> {
-    let grants_resp = initial_grants.get_request().send().promise.await?;
-    let results = grants_resp.get()?;
-    let caps = results.get_caps()?;
-    let host: system_capnp::host::Client = get_initial_grant(&caps, "host")?;
-    let announcer: routing_capnp::announcer::Client =
-        get_initial_grant(&caps, "routing-announcer")?;
-    let finder: routing_capnp::finder::Client = get_initial_grant(&caps, "routing-finder")?;
+async fn run_service(membrane: Membrane) -> Result<(), capnp::Error> {
+    let graft_response = membrane.graft_request().send().promise.await?;
+    let graft = graft_response.get()?;
+    if !graft.has_peer_id() {
+        return Err(capnp::Error::failed(
+            "Membrane.graft result is missing required peerId".into(),
+        ));
+    }
+    let self_id = graft.get_peer_id()?.to_vec();
+    if self_id.is_empty() {
+        return Err(capnp::Error::failed(
+            "Membrane.graft result contains an empty peerId".into(),
+        ));
+    }
+    let vat_client = graft.get_network()?.get_vat().get_dialer()?;
+    let routing = graft.get_routing()?;
+    let announcer = routing.get_announcer()?;
+    let finder = routing.get_finder()?;
 
-    // Get network capabilities — vat_client for typed capability dialing.
-    let network_resp = host.network_request().send().promise.await?;
-    let network = network_resp.get()?;
-    let vat_client = network.get_vat_client()?;
-
-    // Resolve peer identity.
-    let id_resp = host.id_request().send().promise.await?;
-    let self_id = id_resp.get()?.get_peer_id()?.to_vec();
     log::info!("service: peer {}", short_id(&self_id));
     log::info!("service: name {CHESS_SERVICE}");
 
@@ -607,10 +583,7 @@ impl Guest for ChessGuest {
         let result = match std::env::args().nth(1).as_deref() {
             Some("serve") => {
                 log::info!("chess: serve — discovery + game loop");
-                system::run(|initial_grants: InitialGrants| async move {
-                    run_service(initial_grants).await
-                })
-                .await
+                system::run(|membrane: Membrane| async move { run_service(membrane).await }).await
             }
             _ => {
                 // Default (no args): cell mode — export the ChessEngine capability.

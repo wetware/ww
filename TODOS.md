@@ -39,17 +39,12 @@ capabilities, fails closed pending the deferred schema-association design (D24).
 **Priority:** P3
 **Depends on:** AutoNAT v2 node-level parity wiring
 
-## Status cell: host.peers() blocks for ~20s on first request
-**What:** The std/status cell's first GET response takes ~20 seconds before returning. After that, subsequent responses are presumably fast (didn't measure). The latency is from `host_peer_count()` (`std/status/src/lib.rs:110-114`) calling `host.peers_request().send().promise.await` which blocks until the libp2p swarm has populated peer counts. On a freshly-deployed pod the swarm needs time to bootstrap to 300+ peers, so the first `host.peers()` call sits there.
-**Why:** Discovered while verifying the snap-hello-rs deploy on master.wetware.run (lthibault/ipns-mount-fix branch, 2026-05-04). curl to `/status` timed out at 15s; bumping curl timeout to 30s revealed the response did eventually return (200, peer_count=317, time_total=20.4s). The snap cell next door responds instantly because it doesn't make host calls. The 20s latency is invisible during normal operation but pathological at cold-start: any monitoring or readiness check that hits /status with a sub-15s timeout will flap.
-**Context:** Three plausible fixes, in order of effort:
-  1. **Bound the timeout in the cell.** Wrap `host_peer_count` (and `host_id`, `host_addrs`) in a `tokio::time::timeout(Duration::from_millis(500), ...)`. Returns `null` on timeout per the existing graceful-degradation contract. ~10 lines, no host changes. Best for v1.
-  2. **Cache peer count at the host.** `host.peers()` capability returns a snapshot stored on the swarm side, refreshed periodically rather than computed per-call. Bigger change, helps any cell that calls peers().
-  3. **Wait-for-bootstrap signal.** Don't register the /status route until the swarm has at least N peers OR a bootstrap timeout elapsed. Cleanest semantics but requires plumbing a readiness channel into HttpListener.
-The cleanest near-term fix is (1). The latency was hidden in production until master.wetware.run actually got traffic on /status, which only started happening after the lthibault/ipns-mount-fix deploy registered the route.
-**Effort:** S (option 1) → L (option 2 or 3)
-**Priority:** P2 (visible, but only on first request after pod restart)
-**Depends on:** none
+## ~~Status cell: peer count blocks on first request~~ ✅
+**Resolved:** `NetworkState` now stores the native connected-peer count.
+`Stat.snapshot()` returns the count and listen addresses without peer records.
+The status Cell applies one 500 ms timeout to the snapshot and degrades both
+mutable fields to `null` on failure.
+**Priority:** —
 
 ## Revisit automated release promotion after the manual-promotion POC
 **What:** Consider bot-created promotion PRs, artifact attestations, a restricted deploy identity, drift detection, and deliberate auto-merge/rollback criteria only after the manual POC has generated real operational signal.
@@ -209,10 +204,10 @@ usable by trusted FHS configuration or a future Warrant/ICME adapter.
 **Priority:** P3
 **Depends on:** CidTree virtual filesystem (src/vfs.rs)
 
-## Cap'n Proto schema-boundary refactor (stem/auth/membrane/system) (#509)
-**What:** Refactor schema ownership so epoch/provenance types stay in `stem.capnp`, auth/session types move to `auth.capnp`, membrane transport types (`Membrane`, `Export`) move to `membrane.capnp`, and core host/runtime/listener contracts remain in `system.capnp`.
-**Why:** `stem.capnp` currently mixes unrelated concerns and `system.capnp` imports `stem.Export` for core spawn/listener surfaces, which obscures ownership boundaries and complicates protocol evolution.
-**Context:** This is a staged-compat migration, not a redesign. Keep authority semantics unchanged (`Terminal(Membrane)` and no new ambient privileges), preserve runtime behavior, and plan explicit compatibility for schema type IDs. Vat addresses are service-name locators and should not be coupled back to schema CIDs. Must audit all capnp build scripts and generated-module consumers (`crates/authority`, `std/kernel`, `std/status`, examples, CLI template scaffolding) plus Synapse descriptor introspection paths.
+## ~~Cap'n Proto schema-boundary refactor (stem/auth/membrane/system) (#509)~~ ✅
+**Resolved:** `system.capnp` now owns the typed `Membrane` surface with
+`Stat`, grouped `Network`, `Routing`, and application-only `Export`. Spawn and
+listener APIs propagate one `Membrane` capability.
 **Effort:** L
 **Priority:** P2
 **Depends on:** issue #509 design approval, cross-crate capnp migration plan, compatibility decision for schema/type IDs
@@ -242,9 +237,9 @@ usable by trusted FHS configuration or a future Warrant/ICME adapter.
 **Depends on:** IPFS-first distribution (this plan), stem infrastructure
 
 ## Write doc/ARCHITECTURE.md (daemon runtime topology overview)
-**What:** A 10-minute-readable overview of the daemon's runtime topology for new contributors and re-onboarding founders. Cover: (a) the Service-based pattern (`src/services.rs`) — each long-lived component on its own thread with `current_thread + LocalSet`; (b) the singleton-backing-state + per-connection-dispatcher pattern (`HostImpl`, `RuntimeImpl` are thin dispatchers; expensive state in shared `Send + Clone` references); (c) ExecutorPool — M workers, mpsc-distributed `SpawnRequest`s, shared `Arc<Engine>`; (d) fuel/epoch scheduling — cooperative yield, atomic epoch bumps, refuel via `epoch_deadline_callback`; (e) membrane graft model — `HostGraftBuilder` assembles each graft, and Cap'n Proto clients are `!Send`, so capability routing is single-threaded; (f) the Cap'n Proto surface exposed by `Host::network()`, including HTTP, byte-stream, and authenticated vat transport. Diagrams in ASCII per project convention.
-**Why:** Three architectural mistakes in the lthibault/ww-shell-usable design session were re-derivations of things the codebase already knows but doesn't document: (1) wrongly assumed daemon main was the runtime everything lived on (true in form, but every long-lived component is on its own thread); (2) muddled the "where does cap state live" question (HostImpl per-connection vs. singleton state); (3) framed pre-warm as "spawn idle cell" rather than "compile cache at startup." All three would have been caught by a 10-minute architecture overview. Each subsequent contributor saves the re-derivation cost.
-**Context:** Reference points: `src/services.rs` (Service trait, ExecutorPool, worker loop); `crates/rpc/src/lib.rs` (`HostImpl` and test fixtures); `src/launcher.rs` (Runtime and Process lifecycle); `std/system/src/lib.rs` (P3 session composition). Existing `doc/architecture.md` covers the conceptual stack. The new doc must complement it without duplication.
+**What:** A 10-minute-readable overview of the daemon's runtime topology for new contributors and re-onboarding founders. Cover: (a) the Service-based pattern (`src/services.rs`) — each long-lived component on its own thread with `current_thread + LocalSet`; (b) singleton backing state with per-connection dispatchers; (c) ExecutorPool — M workers, mpsc-distributed `SpawnRequest`s, shared `Arc<Engine>`; (d) fuel/epoch scheduling — cooperative yield, atomic epoch bumps, refuel via `epoch_deadline_callback`; (e) `RootMembraneBuilder`, typed graft fields, and single-threaded Cap'n Proto capability routing; (f) grouped network leaves for HTTP, byte-stream, and authenticated vat transport.
+**Why:** Three architectural mistakes in the lthibault/ww-shell-usable design session were re-derivations of things the codebase already knows but doesn't document: (1) wrongly assumed daemon main was the runtime everything lived on (true in form, but every long-lived component is on its own thread); (2) muddled the "where does cap state live" question (per-capability RPC server values vs. shared singleton state); (3) framed pre-warm as "spawn idle cell" rather than "compile cache at startup." All three would have been caught by a 10-minute architecture overview. Each subsequent contributor saves the re-derivation cost.
+**Context:** Reference points: `src/services.rs` (Service trait, ExecutorPool, worker loop); `crates/rpc/src/graft.rs` (`RootMembraneBuilder`); `src/launcher.rs` (Runtime and Process lifecycle); `std/system/src/lib.rs` (P3 session composition). Existing `doc/architecture.md` covers the conceptual stack. The new doc must complement it without duplication.
 **Effort:** M (human) → S-M (CC, with a /design-consultation pass to set scope)
 **Priority:** P2 (offsets onboarding cost; each deferred day is another contributor onboarding into ambiguity)
 **Depends on:** none

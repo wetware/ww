@@ -48,8 +48,6 @@ pub use authority::auth_capnp;
 #[cfg(not(target_arch = "wasm32"))]
 pub use authority::http_capnp;
 #[cfg(not(target_arch = "wasm32"))]
-pub use authority::membrane_capnp;
-#[cfg(not(target_arch = "wasm32"))]
 pub use authority::routing_capnp;
 #[cfg(not(target_arch = "wasm32"))]
 pub use authority::stem_capnp;

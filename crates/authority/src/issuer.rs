@@ -298,7 +298,7 @@ mod tests {
     use libp2p_core::SignedEnvelope;
 
     use super::*;
-    use crate::{membrane_capnp, membrane_client};
+    use crate::{membrane_client, system_capnp};
 
     fn epoch(seq: u64) -> Epoch {
         Epoch {
@@ -319,7 +319,7 @@ mod tests {
         profile.set_name(profile_name);
         let mut methods = profile.init_methods(1);
         let mut method = methods.reborrow().get(0);
-        method.set_interface_id(membrane_capnp::membrane::Client::TYPE_ID);
+        method.set_interface_id(system_capnp::membrane::Client::TYPE_ID);
         method.set_ordinal(0);
 
         let mut recipients = policy.init_recipients(1);
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn policy_compilation_reports_truncated_nested_fields_as_malformed() {
         let profile = b"selected-profile\0";
-        let interface_id = membrane_capnp::membrane::Client::TYPE_ID.to_le_bytes();
+        let interface_id = system_capnp::membrane::Client::TYPE_ID.to_le_bytes();
 
         let cases = [
             (
@@ -490,7 +490,7 @@ mod tests {
         let mut methods = profile.init_methods(METHOD_COUNT);
         for index in 0..METHOD_COUNT {
             let mut method = methods.reborrow().get(index);
-            method.set_interface_id(membrane_capnp::membrane::Client::TYPE_ID);
+            method.set_interface_id(system_capnp::membrane::Client::TYPE_ID);
             method.set_ordinal(u16::try_from(index).expect("fixture method ordinal fits u16"));
         }
         let mut recipients = policy.init_recipients(RECIPIENT_COUNT);
@@ -513,7 +513,7 @@ mod tests {
             let first = bindings.get(&recipient_key(0)).expect("first recipient");
             assert_eq!(first.methods.len(), METHOD_COUNT as usize);
             assert!(first.methods.contains(&MethodKey::new(
-                membrane_capnp::membrane::Client::TYPE_ID,
+                system_capnp::membrane::Client::TYPE_ID,
                 u16::try_from(METHOD_COUNT - 1).expect("fixture method ordinal fits u16"),
             )));
 
@@ -550,7 +550,7 @@ mod tests {
                 };
                 let authority: auth_capnp::authority::Client =
                     capnp_rpc::new_client(AuthorityServer::new(guard));
-                let session = membrane_client(epoch_rx);
+                let session = membrane_client(epoch_rx, b"test-peer");
                 let mut request = authority.guard_request();
                 request
                     .get()
@@ -591,7 +591,7 @@ mod tests {
                     .expect("policy reader");
                 let authorization = KeyMethodAuthorization::from_policy(epoch_rx.clone(), policy)
                     .expect("compiled policy");
-                let session = membrane_client(epoch_rx.clone());
+                let session = membrane_client(epoch_rx.clone(), b"test-peer");
                 let terminal: auth_capnp::terminal::Client<auth_capnp::opaque_session::Owned> =
                     capnp_rpc::new_client(TerminalServer::with_policy(
                         Box::new(authorization.clone()),
@@ -612,7 +612,7 @@ mod tests {
                     login.get_status().expect("known status"),
                     auth_capnp::LoginStatus::Granted
                 );
-                let issued = membrane_capnp::membrane::Client {
+                let issued = system_capnp::membrane::Client {
                     client: login.get_session().expect("issued session").client,
                 };
                 issued

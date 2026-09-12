@@ -28,6 +28,11 @@ fn setup_runtime() -> system_capnp::runtime::Client {
     )
 }
 
+fn minimal_membrane() -> system_capnp::membrane::Client {
+    let (_sender, receiver) = tokio::sync::watch::channel(authority::Epoch::zero());
+    authority::membrane_client(receiver, b"test-peer")
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: Mechanism — stdin close causes cell exit
 // ---------------------------------------------------------------------------
@@ -60,6 +65,7 @@ async fn test_stdin_close_exits_echo_cell() {
             let executor = load_resp.get().unwrap().get_executor().unwrap();
 
             let mut spawn_req = executor.spawn_request();
+            spawn_req.get().set_membrane(minimal_membrane());
             spawn_req.get().init_args(0);
             spawn_req.get().init_env(0);
             let resp = spawn_req

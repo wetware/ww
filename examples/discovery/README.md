@@ -8,7 +8,7 @@ A Greeter guest for named vat RPC and service-name DHT discovery.
 - explicit ungated `VatListener.serveRaw` publication for this fixture
 - typed `VatClient` dialing
 - pure service-name routing-key derivation
-- independent `routing-announcer` and `routing-finder` grants
+- independent `routing.announcer` and `routing.finder` fields from one `Membrane`
 - service and consumer execution modes
 
 ## Build

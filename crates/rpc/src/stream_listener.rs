@@ -11,9 +11,7 @@ use capnp_rpc::pry;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::StreamExt;
 
-use crate::{
-    decode_exports, encode_exports, inbound_connection_budget, ConnectionBudget, NamedCapabilities,
-};
+use crate::{inbound_connection_budget, ConnectionBudget};
 use authority::system_capnp;
 
 pub struct StreamListenerImpl {
@@ -55,10 +53,12 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
         let protocol_suffix = protocol_str.to_string();
         let stream_protocol = pry!(super::stream_protocol(&protocol_suffix));
 
-        // Decode once at registration. `NamedCapabilities` is immutable, so
-        // each connection receives a clone of this fixed grant template and
-        // cannot widen it after registration.
-        let grant_template = pry!(params.get_caps().and_then(decode_exports));
+        if !params.has_membrane() {
+            return Promise::err(capnp::Error::failed(
+                "stream listener: membrane is required".into(),
+            ));
+        }
+        let membrane = pry!(params.get_membrane());
 
         let mut control = self.stream_control.clone();
         let mut incoming = pry!(control
@@ -100,14 +100,14 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
                         };
                         let executor = executor.clone();
                         let protocol = protocol_suffix.clone();
-                        let caps = grant_template.clone();
+                        let membrane = membrane.clone();
                         tokio::task::spawn_local(async move {
                             let _permit = permit;
                             let _handle_span = tracing::info_span!(
                                 "stream.handle",
                                 protocol = protocol.as_str(),
                             ).entered();
-                            if let Err(e) = handle_connection(executor, caps, stream, &protocol).await {
+                            if let Err(e) = handle_connection(executor, membrane, stream, &protocol).await {
                                 tracing::error!("Stream cell connection error: {e}");
                             }
                         });
@@ -133,11 +133,11 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
 /// stdin/stdout between the libp2p stream and the process.
 async fn handle_connection(
     executor: system_capnp::executor::Client,
-    caps: NamedCapabilities,
+    membrane: system_capnp::membrane::Client,
     stream: libp2p::Stream,
     protocol: &str,
 ) -> Result<(), capnp::Error> {
-    let process = spawn_connection_child(&executor, &caps).await?;
+    let process = spawn_connection_child(&executor, membrane).await?;
 
     // Get stdin (write-only) and stdout (read-only) ByteStream clients.
     let stdin_resp = process.stdin_request().send().promise.await?;
@@ -173,14 +173,11 @@ async fn handle_connection(
 
 async fn spawn_connection_child(
     executor: &system_capnp::executor::Client,
-    caps: &NamedCapabilities,
+    membrane: system_capnp::membrane::Client,
 ) -> Result<system_capnp::process::Client, capnp::Error> {
     // Spawn cell process via Executor.spawn().
     let mut spawn_req = executor.spawn_request();
-    if !caps.is_empty() {
-        let caps_builder = spawn_req.get().init_caps(caps.len() as u32);
-        encode_exports(caps, caps_builder)?;
-    }
+    spawn_req.get().set_membrane(membrane);
     let response = spawn_req.send().promise.await?;
     response.get()?.get_process()
 }
@@ -253,11 +250,12 @@ pub(crate) async fn pump_stdout_to_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use authority::{GraftBuilder, MembraneServer};
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     struct RecordingExecutor {
-        observed_grants: Rc<RefCell<Vec<Vec<String>>>>,
+        observed_membranes: Rc<RefCell<Vec<system_capnp::membrane::Client>>>,
     }
 
     #[allow(refining_impl_trait)]
@@ -268,39 +266,168 @@ mod tests {
             _results: system_capnp::executor::SpawnResults,
         ) -> Promise<(), capnp::Error> {
             let params = pry!(params.get());
-            let grants = pry!(params.get_caps().and_then(decode_exports));
-            self.observed_grants
-                .borrow_mut()
-                .push(grants.iter().map(|entry| entry.name().to_owned()).collect());
+            let membrane = pry!(params.get_membrane());
+            self.observed_membranes.borrow_mut().push(membrane);
             Promise::err(capnp::Error::failed(
                 "recording executor has no process".into(),
             ))
         }
     }
 
+    struct ExtrasBuilder {
+        capability: capnp::capability::Client,
+        grafts: Rc<Cell<u32>>,
+    }
+
+    impl GraftBuilder for ExtrasBuilder {
+        fn build(
+            &self,
+            _guard: &EpochGuard,
+            mut builder: system_capnp::membrane::graft_results::Builder<'_>,
+        ) -> Result<(), capnp::Error> {
+            let graft = self.grafts.get() + 1;
+            self.grafts.set(graft);
+            builder.set_peer_id(&graft.to_be_bytes());
+            let mut extra = builder.reborrow().init_extras(1).get(0);
+            extra.set_name("application-extra");
+            extra
+                .init_cap()
+                .set_as_capability(self.capability.clone().hook);
+            Ok(())
+        }
+    }
+
+    fn test_membrane(grafts: Rc<Cell<u32>>) -> system_capnp::membrane::Client {
+        let epoch = authority::Epoch {
+            seq: 1,
+            head: Vec::new(),
+            root: None,
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(epoch);
+        let capability: system_capnp::executor::Client = capnp_rpc::new_client(RecordingExecutor {
+            observed_membranes: Rc::new(RefCell::new(Vec::new())),
+        });
+        capnp_rpc::new_client(MembraneServer::new(
+            rx,
+            ExtrasBuilder {
+                capability: capability.client,
+                grafts,
+            },
+        ))
+    }
+
+    fn test_guard() -> EpochGuard {
+        let epoch = authority::Epoch {
+            seq: 1,
+            head: Vec::new(),
+            root: None,
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(epoch);
+        EpochGuard {
+            issued_seq: 1,
+            receiver: rx,
+        }
+    }
+
     #[tokio::test]
-    async fn registration_caps_are_a_fixed_template_for_every_connection_child() {
+    async fn listener_registration_does_not_graft_the_supplied_membrane() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let observed_grants = Rc::new(RefCell::new(Vec::new()));
+                let grafts = Rc::new(Cell::new(0));
+                let membrane = test_membrane(grafts.clone());
+                let observed_membranes = Rc::new(RefCell::new(Vec::new()));
+                let executor: system_capnp::executor::Client =
+                    capnp_rpc::new_client(RecordingExecutor { observed_membranes });
+                let listener: system_capnp::stream_listener::Client =
+                    capnp_rpc::new_client(StreamListenerImpl::new(
+                        libp2p_stream::Behaviour::new().new_control(),
+                        test_guard(),
+                    ));
+                let mut request = listener.listen_request();
+                request.get().set_executor(executor);
+                request.get().set_protocol("stateful-forwarding-test");
+                request.get().set_membrane(membrane);
+
+                request
+                    .send()
+                    .promise
+                    .await
+                    .expect("register stream listener");
+
+                assert_eq!(
+                    grafts.get(),
+                    0,
+                    "stream registration must not inspect the supplied Membrane"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn spawn_connection_child_forwards_stateful_membrane_for_each_connection() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let observed_membranes = Rc::new(RefCell::new(Vec::new()));
                 let executor: system_capnp::executor::Client =
                     capnp_rpc::new_client(RecordingExecutor {
-                        observed_grants: observed_grants.clone(),
+                        observed_membranes: observed_membranes.clone(),
                     });
-                let grant_template =
-                    NamedCapabilities::try_from_pairs([("only-grant", executor.clone().client)])
-                        .expect("fixed grant template");
+                let grafts = Rc::new(Cell::new(0));
+                let membrane = test_membrane(grafts.clone());
 
                 for _ in 0..2 {
-                    let result = spawn_connection_child(&executor, &grant_template).await;
+                    let result = spawn_connection_child(&executor, membrane.clone()).await;
                     assert!(result.is_err(), "recording executor intentionally rejects");
                 }
 
+                let observed = observed_membranes.take();
                 assert_eq!(
-                    observed_grants.borrow().as_slice(),
-                    &[vec!["only-grant".to_owned()], vec!["only-grant".to_owned()]],
-                    "each connection must instantiate the same immutable registration template"
+                    observed.len(),
+                    2,
+                    "each connection must receive the registration-time Membrane"
+                );
+                assert_eq!(
+                    grafts.get(),
+                    0,
+                    "stream child spawning must forward without grafting"
+                );
+                for (index, membrane) in observed.into_iter().enumerate() {
+                    let response = membrane
+                        .graft_request()
+                        .send()
+                        .promise
+                        .await
+                        .expect("delegated Membrane graft");
+                    let extras = response
+                        .get()
+                        .expect("graft results")
+                        .get_extras()
+                        .expect("extras");
+                    assert_eq!(extras.len(), 1);
+                    assert_eq!(
+                        response
+                            .get()
+                            .expect("graft results")
+                            .get_peer_id()
+                            .expect("stateful peerId"),
+                        &((index + 1) as u32).to_be_bytes()
+                    );
+                    assert_eq!(
+                        extras
+                            .get(0)
+                            .get_name()
+                            .expect("extra name")
+                            .to_str()
+                            .expect("UTF-8 extra"),
+                        "application-extra"
+                    );
+                }
+                assert_eq!(
+                    grafts.get(),
+                    2,
+                    "each stream child must reach the supplied Membrane server"
                 );
             })
             .await;

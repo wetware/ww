@@ -6,7 +6,7 @@ A gas-price guest with typed vat RPC and HTTP/WAGI execution modes.
 
 - Cap'n Proto vat RPC with `WW_CELL_MODE=vat`
 - WAGI with `WW_CELL_MODE=http`
-- outbound requests through an explicit `HttpClient` grant
+- outbound requests through the typed `network.http.dialer` field
 - pure service-name routing-key derivation
 - Announcer-only provider mode and Finder-only consumer mode
 - cache and JSON response behavior

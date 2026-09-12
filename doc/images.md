@@ -18,7 +18,7 @@ PID0 does not select it automatically.
 ## Rust PID0 boot flow
 
 The shipped Rust PID0 reads `bin/status.wasm`, loads the component, registers
-`/status`, grants `host`, and commits kernel readiness. The Rust PID0 does not
+`/status`, passes a narrow `Membrane` with `peerId` and `Stat`, and commits kernel readiness. The Rust PID0 does not
 evaluate an init directory.
 
 ## Mount sources

@@ -8,13 +8,18 @@ fn main() {
         .join("capnp")
         .canonicalize()
         .expect("capnp dir not found");
-    let membrane_schema = capnp_dir.join("membrane.capnp");
+    let schemas = ["system.capnp", "routing.capnp", "auth.capnp", "http.capnp"];
+    let mut compiler = capnpc::CompilerCommand::new();
+    compiler.src_prefix(&capnp_dir);
+    for schema in schemas {
+        compiler.file(capnp_dir.join(schema));
+    }
+    compiler.run().expect("failed to compile system.capnp");
 
-    capnpc::CompilerCommand::new()
-        .src_prefix(&capnp_dir)
-        .file(&membrane_schema)
-        .run()
-        .expect("failed to compile membrane.capnp");
-
-    println!("cargo:rerun-if-changed={}", membrane_schema.display());
+    for schema in schemas {
+        println!(
+            "cargo:rerun-if-changed={}",
+            capnp_dir.join(schema).display()
+        );
+    }
 }

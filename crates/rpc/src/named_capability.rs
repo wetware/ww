@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use authority::membrane_capnp;
+use authority::system_capnp;
 
 /// One validated name bound to an opaque Cap'n Proto capability reference.
 #[derive(Clone)]
@@ -90,7 +90,7 @@ impl NamedCapabilities {
 
 /// Decode and validate a wire `List(Export)` without resolving capabilities.
 pub fn decode_exports(
-    reader: capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
+    reader: capnp::struct_list::Reader<'_, system_capnp::export::Owned>,
 ) -> Result<NamedCapabilities, capnp::Error> {
     let mut entries = Vec::with_capacity(reader.len() as usize);
     for (index, entry) in reader.iter().enumerate() {
@@ -129,7 +129,7 @@ pub fn decode_exports(
 /// Encode validated capabilities into an exactly-sized wire `List(Export)`.
 pub fn encode_exports(
     capabilities: &NamedCapabilities,
-    mut builder: capnp::struct_list::Builder<'_, membrane_capnp::export::Owned>,
+    mut builder: capnp::struct_list::Builder<'_, system_capnp::export::Owned>,
 ) -> Result<(), capnp::Error> {
     if builder.len() as usize != capabilities.len() {
         return Err(capnp::Error::failed(format!(
@@ -146,7 +146,7 @@ pub fn encode_exports(
 
 pub(crate) fn encode_export(
     capability: &NamedCapability,
-    mut builder: membrane_capnp::export::Builder<'_>,
+    mut builder: system_capnp::export::Builder<'_>,
 ) {
     builder.set_name(capability.name());
     builder
@@ -174,19 +174,18 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
-    struct HostStub {
+    struct RuntimeStub {
         calls: Rc<Cell<u32>>,
     }
 
     #[allow(refining_impl_trait)]
-    impl system_capnp::host::Server for HostStub {
-        fn id(
+    impl system_capnp::runtime::Server for RuntimeStub {
+        fn shutdown(
             self: capnp::capability::Rc<Self>,
-            _params: system_capnp::host::IdParams,
-            mut results: system_capnp::host::IdResults,
+            _params: system_capnp::runtime::ShutdownParams,
+            _results: system_capnp::runtime::ShutdownResults,
         ) -> Promise<(), capnp::Error> {
             self.calls.set(self.calls.get() + 1);
-            results.get().set_peer_id(b"named-capability");
             Promise::ok(())
         }
     }
@@ -276,9 +275,9 @@ mod tests {
         }
     }
 
-    fn host_cap(calls: Rc<Cell<u32>>) -> capnp::capability::Client {
-        let host: system_capnp::host::Client = capnp_rpc::new_client(HostStub { calls });
-        host.client
+    fn runtime_cap(calls: Rc<Cell<u32>>) -> capnp::capability::Client {
+        let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub { calls });
+        runtime.client
     }
 
     fn roundtrip(capabilities: &NamedCapabilities) -> NamedCapabilities {
@@ -286,16 +285,16 @@ mod tests {
         let mut cap_table = Vec::new();
         {
             let mut results =
-                message.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
+                message.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
             results.imbue_mut(&mut cap_table);
-            let exports = results.reborrow().init_caps(capabilities.len() as u32);
+            let exports = results.reborrow().init_extras(capabilities.len() as u32);
             encode_exports(capabilities, exports).expect("encode exports");
         }
         let mut results = message
-            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
-            .expect("initial grants results reader");
+            .get_root_as_reader::<system_capnp::membrane::graft_results::Reader<'_>>()
+            .expect("graft results reader");
         results.imbue(&cap_table);
-        decode_exports(results.get_caps().expect("exports reader")).expect("decode exports")
+        decode_exports(results.get_extras().expect("extras reader")).expect("decode exports")
     }
 
     #[test]
@@ -309,22 +308,23 @@ mod tests {
     fn encode_decode_preserves_exact_names_and_callable_references() {
         let calls = Rc::new(Cell::new(0));
         let capabilities =
-            NamedCapabilities::try_from_pairs([("host", host_cap(calls.clone()))]).unwrap();
+            NamedCapabilities::try_from_pairs([("application-cap", runtime_cap(calls.clone()))])
+                .unwrap();
         let decoded = roundtrip(&capabilities);
         let entry = decoded.iter().next().unwrap();
-        assert_eq!(entry.name(), "host");
+        assert_eq!(entry.name(), "application-cap");
         assert_eq!(
             calls.get(),
             0,
             "encoding and decoding must not invoke the retained capability"
         );
 
-        let host = system_capnp::host::Client {
+        let runtime = system_capnp::runtime::Client {
             client: entry.capability().clone(),
         };
         let local = tokio::task::LocalSet::new();
         local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
-            host.id_request().send().promise.await.unwrap();
+            runtime.shutdown_request().send().promise.await.unwrap();
         });
         assert_eq!(calls.get(), 1);
     }
@@ -333,8 +333,8 @@ mod tests {
     fn repeated_encoding_returns_the_same_named_set() {
         let calls = Rc::new(Cell::new(0));
         let capabilities = NamedCapabilities::try_from_pairs([
-            ("first", host_cap(calls.clone())),
-            ("second", host_cap(calls)),
+            ("first", runtime_cap(calls.clone())),
+            ("second", runtime_cap(calls)),
         ])
         .unwrap();
         for decoded in [roundtrip(&capabilities), roundtrip(&capabilities)] {
@@ -350,15 +350,15 @@ mod tests {
 
     #[test]
     fn empty_names_fail_closed_without_treating_labels_as_paths() {
-        let error = NamedCapabilities::try_from_pairs([("", host_cap(Rc::new(Cell::new(0))))])
+        let error = NamedCapabilities::try_from_pairs([("", runtime_cap(Rc::new(Cell::new(0))))])
             .err()
             .expect("empty name must fail");
         assert!(error.to_string().contains("capability name"));
 
         let labels = NamedCapabilities::try_from_pairs([
-            ("path/like", host_cap(Rc::new(Cell::new(0)))),
-            ("two words", host_cap(Rc::new(Cell::new(0)))),
-            ("κλειδί", host_cap(Rc::new(Cell::new(0)))),
+            ("path/like", runtime_cap(Rc::new(Cell::new(0)))),
+            ("two words", runtime_cap(Rc::new(Cell::new(0)))),
+            ("κλειδί", runtime_cap(Rc::new(Cell::new(0)))),
         ])
         .expect("nonempty UTF-8 labels are valid");
         assert_eq!(
@@ -369,22 +369,22 @@ mod tests {
 
     #[test]
     fn invalid_utf8_wire_names_fail_closed() {
-        let cap = host_cap(Rc::new(Cell::new(0)));
+        let cap = runtime_cap(Rc::new(Cell::new(0)));
         let mut message = capnp::message::Builder::new_default();
         let mut cap_table = Vec::new();
         {
             let mut results =
-                message.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
+                message.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
             results.imbue_mut(&mut cap_table);
-            let mut entry = results.reborrow().init_caps(1).get(0);
+            let mut entry = results.reborrow().init_extras(1).get(0);
             entry.set_name(capnp::text::Reader(&[0xff]));
             entry.init_cap().set_as_capability(cap.hook);
         }
         let mut results = message
-            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
+            .get_root_as_reader::<system_capnp::membrane::graft_results::Reader<'_>>()
             .unwrap();
         results.imbue(&cap_table);
-        let error = decode_exports(results.get_caps().unwrap())
+        let error = decode_exports(results.get_extras().unwrap())
             .err()
             .expect("invalid UTF-8 names must fail");
         assert!(error.to_string().contains("invalid UTF-8 name"));
@@ -392,14 +392,14 @@ mod tests {
 
     #[test]
     fn duplicate_wire_names_fail_closed() {
-        let cap = host_cap(Rc::new(Cell::new(0)));
+        let cap = runtime_cap(Rc::new(Cell::new(0)));
         let mut message = capnp::message::Builder::new_default();
         let mut cap_table = Vec::new();
         {
             let mut results =
-                message.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
+                message.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
             results.imbue_mut(&mut cap_table);
-            let mut exports = results.reborrow().init_caps(2);
+            let mut exports = results.reborrow().init_extras(2);
             for index in 0..2 {
                 let mut entry = exports.reborrow().get(index);
                 entry.set_name("duplicate");
@@ -407,10 +407,10 @@ mod tests {
             }
         }
         let mut results = message
-            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
+            .get_root_as_reader::<system_capnp::membrane::graft_results::Reader<'_>>()
             .unwrap();
         results.imbue(&cap_table);
-        let error = decode_exports(results.get_caps().unwrap())
+        let error = decode_exports(results.get_extras().unwrap())
             .err()
             .expect("duplicate names must fail");
         assert!(error.to_string().contains("duplicate capability name"));
@@ -421,13 +421,13 @@ mod tests {
         let mut missing = capnp::message::Builder::new_default();
         {
             let mut results =
-                missing.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
-            results.reborrow().init_caps(1).get(0).set_name("missing");
+                missing.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
+            results.reborrow().init_extras(1).get(0).set_name("missing");
         }
         let results = missing
-            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
+            .get_root_as_reader::<system_capnp::membrane::graft_results::Reader<'_>>()
             .unwrap();
-        let error = decode_exports(results.get_caps().unwrap())
+        let error = decode_exports(results.get_extras().unwrap())
             .err()
             .expect("missing capability must be rejected");
         assert!(error.to_string().contains("missing its capability"));
@@ -435,8 +435,8 @@ mod tests {
         let mut malformed = capnp::message::Builder::new_default();
         {
             let mut results =
-                malformed.init_root::<membrane_capnp::initial_grants::get_results::Builder<'_>>();
-            let mut entry = results.reborrow().init_caps(1).get(0);
+                malformed.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
+            let mut entry = results.reborrow().init_extras(1).get(0);
             entry.set_name("malformed");
             entry
                 .init_cap()
@@ -444,15 +444,15 @@ mod tests {
                 .unwrap();
         }
         let results = malformed
-            .get_root_as_reader::<membrane_capnp::initial_grants::get_results::Reader<'_>>()
+            .get_root_as_reader::<system_capnp::membrane::graft_results::Reader<'_>>()
             .unwrap();
-        assert!(decode_exports(results.get_caps().unwrap()).is_err());
+        assert!(decode_exports(results.get_extras().unwrap()).is_err());
     }
 
     #[test]
     fn same_capability_under_two_names_succeeds_and_invokes_one_server() {
         let calls = Rc::new(Cell::new(0));
-        let cap = host_cap(calls.clone());
+        let cap = runtime_cap(calls.clone());
         let decoded = roundtrip(
             &NamedCapabilities::try_from_pairs([("alias-a", cap.clone()), ("alias-b", cap)])
                 .unwrap(),
@@ -460,10 +460,10 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
             for entry in decoded.iter() {
-                let host = system_capnp::host::Client {
+                let runtime = system_capnp::runtime::Client {
                     client: entry.capability().clone(),
                 };
-                host.id_request().send().promise.await.unwrap();
+                runtime.shutdown_request().send().promise.await.unwrap();
             }
         });
         assert_eq!(calls.get(), 2);

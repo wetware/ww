@@ -76,7 +76,8 @@ Based on discovery, produce a concrete design.  Cover:
   and out-of-allowlist imports.
 - **Capability map**: which capabilities each agent needs.  Flag
   anything that could be attenuated.  Reference `doc/capabilities.md`.
-- **Membrane design**: what pid0 exports, what children receive.
+- **Membrane design**: which typed graft fields and `extras` each process
+  receives, and which `Membrane` crosses each spawn or listener boundary.
   Reference `doc/architecture.md`, section "The Membrane pattern".
 - **Coordination model**: standalone, multi-node, or epoch-managed?
 

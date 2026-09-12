@@ -81,6 +81,8 @@ async fn spawn_greeter_on_pool(
 
                 // Spawn the cell in cell mode (no args = default).
                 let mut req = executor.spawn_request();
+                req.get()
+                    .set_membrane(authority::membrane_client(epoch_rx, b"test-peer"));
                 {
                     let mut env = req.get().init_env(1);
                     env.set(0, "WW_PEER_ID=deadbeefcafebabe");

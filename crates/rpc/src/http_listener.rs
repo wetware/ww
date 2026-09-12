@@ -23,7 +23,6 @@ use std::{fmt, time::Duration};
 use tokio::sync::mpsc;
 
 use crate::dispatch::{self, CgiRequest, CgiResponse, RegistrationId, RouteEntry, RouteRegistry};
-use crate::{decode_exports, encode_exports, NamedCapabilities};
 use authority::system_capnp;
 
 /// Maximum response size from a cell process (16 MiB).
@@ -200,10 +199,12 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
             format!("/{prefix}")
         };
 
-        // Decode once at registration. `NamedCapabilities` is immutable, so
-        // every request receives the same fixed grant template and the
-        // listener cannot widen it after registration.
-        let grant_template = pry!(reader.get_caps().and_then(decode_exports));
+        if !reader.has_membrane() {
+            return Promise::err(capnp::Error::failed(
+                "HTTP listener: membrane is required".into(),
+            ));
+        }
+        let membrane = pry!(reader.get_membrane());
 
         let guard = self.guard.clone();
         let registry = self.registry.clone();
@@ -243,7 +244,7 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
                     epoch_rx,
                     registration_scope,
                     executor,
-                    caps: grant_template,
+                    membrane,
                     cell_cid,
                 },
                 rx,
@@ -260,7 +261,7 @@ struct DispatchLoop {
     epoch_rx: tokio::sync::watch::Receiver<authority::Epoch>,
     registration_scope: Option<tokio::sync::watch::Receiver<()>>,
     executor: system_capnp::executor::Client,
-    caps: NamedCapabilities,
+    membrane: system_capnp::membrane::Client,
     cell_cid: String,
 }
 
@@ -290,11 +291,11 @@ async fn dispatch_loop(
             break;
         }
         let executor = dispatch.executor.clone();
-        let caps = dispatch.caps.clone();
+        let membrane = dispatch.membrane.clone();
         let cell_cid = dispatch.cell_cid.clone();
         // Handle each request concurrently.
         tokio::task::spawn_local(async move {
-            let mut response = handle_one_request(&executor, &caps, &req).await;
+            let mut response = handle_one_request(&executor, &membrane, &req).await;
             response
                 .headers
                 .push(("X-Wetware-Cell".to_string(), cell_cid));
@@ -352,19 +353,19 @@ async fn wait_for_registration_expiry(
 /// Spawn a cell, pipe stdin/stdout, parse CGI response.
 async fn handle_one_request(
     executor: &system_capnp::executor::Client,
-    caps: &NamedCapabilities,
+    membrane: &system_capnp::membrane::Client,
     req: &CgiRequest,
 ) -> CgiResponse {
-    handle_one_request_with_timeout(executor, caps, req, WAGI_REQUEST_TIMEOUT).await
+    handle_one_request_with_timeout(executor, membrane, req, WAGI_REQUEST_TIMEOUT).await
 }
 
 async fn handle_one_request_with_timeout(
     executor: &system_capnp::executor::Client,
-    caps: &NamedCapabilities,
+    membrane: &system_capnp::membrane::Client,
     req: &CgiRequest,
     timeout: Duration,
 ) -> CgiResponse {
-    match spawn_and_run(executor, caps, req, timeout).await {
+    match spawn_and_run(executor, membrane, req, timeout).await {
         Ok(stdout) => match crate::wagi::parse_cgi_response(&stdout) {
             Ok(cgi) => CgiResponse {
                 status: cgi.status_code,
@@ -413,14 +414,11 @@ impl From<capnp::Error> for WagiRequestError {
 
 /// Spawn a cell via Executor, write body to stdin, read stdout.
 ///
-/// Per-request CGI env vars (REQUEST_METHOD, PATH_INFO, etc.) are passed via
-/// `executor.spawn(args, env, caps, ...)` — this is the late-binding pattern that the
-/// Runtime+Executor API was designed for. `caps` carries explicit registration
-/// grants into the spawned cell's `InitialGrants` bootstrap, so a WAGI cell
-/// receives only the registration-time grant template.
+/// Per-request CGI environment variables pass through `Executor.spawn`.
+/// The request carries the registration-time Membrane unchanged.
 async fn spawn_and_run(
     executor: &system_capnp::executor::Client,
-    caps: &NamedCapabilities,
+    membrane: &system_capnp::membrane::Client,
     req: &CgiRequest,
     timeout: Duration,
 ) -> Result<Vec<u8>, WagiRequestError> {
@@ -442,10 +440,7 @@ async fn spawn_and_run(
             env_list.set(i as u32, e);
         }
     }
-    if !caps.is_empty() {
-        let caps_builder = spawn_req.get().init_caps(caps.len() as u32);
-        encode_exports(caps, caps_builder)?;
-    }
+    spawn_req.get().set_membrane(membrane.clone());
     let spawn_resp = spawn_req.send().promise.await?;
     let process = spawn_resp.get()?.get_process()?;
 
@@ -519,8 +514,9 @@ mod tests {
     use super::*;
     use crate::dispatch::new_registry;
     use crate::{ByteStreamImpl, ProcessImpl, StreamMode};
+    use authority::{GraftBuilder, MembraneServer};
     use capnp::private::capability::ResponseHook;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use tokio::io::{self, AsyncWriteExt};
     use tokio::sync::{oneshot, watch};
@@ -543,6 +539,78 @@ mod tests {
             receiver: rx,
         };
         (tx, guard)
+    }
+
+    fn minimal_membrane() -> system_capnp::membrane::Client {
+        let epoch = authority::Epoch {
+            seq: 1,
+            head: Vec::new(),
+            root: None,
+        };
+        let (_tx, rx) = watch::channel(epoch);
+        authority::membrane_client(rx, b"test-peer")
+    }
+
+    struct ExtrasBuilder {
+        capability: capnp::capability::Client,
+    }
+
+    impl GraftBuilder for ExtrasBuilder {
+        fn build(
+            &self,
+            _guard: &EpochGuard,
+            mut builder: system_capnp::membrane::graft_results::Builder<'_>,
+        ) -> Result<(), capnp::Error> {
+            builder.set_peer_id(b"test-peer");
+            let mut extra = builder.reborrow().init_extras(1).get(0);
+            extra.set_name("application-extra");
+            extra
+                .init_cap()
+                .set_as_capability(self.capability.clone().hook);
+            Ok(())
+        }
+    }
+
+    fn extras_membrane() -> system_capnp::membrane::Client {
+        let epoch = authority::Epoch {
+            seq: 1,
+            head: Vec::new(),
+            root: None,
+        };
+        let (_tx, rx) = watch::channel(epoch);
+        capnp_rpc::new_client(MembraneServer::new(
+            rx,
+            ExtrasBuilder {
+                capability: stub_executor().client,
+            },
+        ))
+    }
+
+    struct StatefulBuilder {
+        grafts: Rc<Cell<u32>>,
+    }
+
+    impl GraftBuilder for StatefulBuilder {
+        fn build(
+            &self,
+            _guard: &EpochGuard,
+            mut builder: system_capnp::membrane::graft_results::Builder<'_>,
+        ) -> Result<(), capnp::Error> {
+            let graft = self.grafts.get() + 1;
+            self.grafts.set(graft);
+            builder.set_peer_id(&graft.to_be_bytes());
+            Ok(())
+        }
+    }
+
+    fn stateful_membrane(grafts: Rc<Cell<u32>>) -> system_capnp::membrane::Client {
+        let epoch = authority::Epoch {
+            seq: 1,
+            head: Vec::new(),
+            root: None,
+        };
+        let (_tx, rx) = watch::channel(epoch);
+        capnp_rpc::new_client(MembraneServer::new(rx, StatefulBuilder { grafts }))
     }
 
     fn guard_for(
@@ -573,6 +641,7 @@ mod tests {
         let mut req = listener.listen_request();
         req.get().set_executor(stub_executor());
         req.get().set_prefix(prefix);
+        req.get().set_membrane(minimal_membrane());
         req.send()
             .promise
             .await
@@ -621,10 +690,7 @@ mod tests {
         });
     }
 
-    /// Stub Executor that errors on spawn — fine for tests that only verify
-    /// `listen` accepts caps + registers the route. Per-request cap propagation
-    /// (caps reaching `executor.spawn`) needs the kernel/cell-builder integration
-    /// path and is covered there, not here.
+    /// Stub Executor that errors on spawn. Route-registration tests do not spawn.
     struct StubExecutor;
 
     #[allow(refining_impl_trait)]
@@ -652,7 +718,7 @@ mod tests {
     }
 
     struct RecordingExecutor {
-        observed_grants: Rc<RefCell<Vec<Vec<String>>>>,
+        observed_membranes: Rc<RefCell<Vec<system_capnp::membrane::Client>>>,
     }
 
     #[allow(refining_impl_trait)]
@@ -663,10 +729,8 @@ mod tests {
             mut results: system_capnp::executor::SpawnResults,
         ) -> Promise<(), capnp::Error> {
             let params = pry!(params.get());
-            let grants = pry!(params.get_caps().and_then(decode_exports));
-            self.observed_grants
-                .borrow_mut()
-                .push(grants.iter().map(|entry| entry.name().to_owned()).collect());
+            let membrane = pry!(params.get_membrane());
+            self.observed_membranes.borrow_mut().push(membrane);
 
             let (stdout_stream, mut stdout_writer) = io::duplex(1024);
             tokio::task::spawn_local(async move {
@@ -768,6 +832,7 @@ mod tests {
         let mut request = listener.listen_request();
         request.get().set_executor(executor);
         request.get().set_prefix("/preflight");
+        request.get().set_membrane(minimal_membrane());
         gate_tx.send(()).expect("release CID preflight");
         let error = match request.send().promise.await {
             Ok(_) => panic!("failed CID preflight must reject listen"),
@@ -974,8 +1039,7 @@ mod tests {
     ) -> CgiResponse {
         let executor = executor_for_process(process);
         let req = test_request();
-        handle_one_request_with_timeout(&executor, &NamedCapabilities::default(), &req, timeout)
-            .await
+        handle_one_request_with_timeout(&executor, &minimal_membrane(), &req, timeout).await
     }
 
     #[tokio::test]
@@ -1093,11 +1157,9 @@ mod tests {
             .await;
     }
 
-    /// `HttpListener.listen` should accept an empty caps list and register
-    /// the route — the explicit zero-grant case
-    /// (e.g. `(perform host :listen (cell image :grants {}) "/path")`).
+    /// `HttpListener.listen` accepts a Membrane with no delegated authority.
     #[tokio::test]
-    async fn test_http_listener_listen_with_empty_caps_registers_route() {
+    async fn test_http_listener_listen_with_minimal_membrane_registers_route() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1110,53 +1172,12 @@ mod tests {
                 let mut req = listener.listen_request();
                 req.get().set_executor(stub_executor());
                 req.get().set_prefix("/status");
-                // No caps set — empty list (default).
+                req.get().set_membrane(minimal_membrane());
 
                 req.send()
                     .promise
                     .await
-                    .expect("listen with empty caps should succeed");
-
-                let routes = registry.read().expect("registry not poisoned");
-                assert!(
-                    routes.contains_key("/status"),
-                    "route /status should be registered"
-                );
-            })
-            .await;
-    }
-
-    /// `HttpListener.listen` should accept a non-empty caps list (the init.d
-    /// explicit-grant case) and still register the route. This is the
-    /// shape the kernel emits for
-    /// `(perform host :listen (cell image :grants {:host host}) "/path")`.
-    #[tokio::test]
-    async fn test_http_listener_listen_with_caps_registers_route() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let (_tx, guard) = test_epoch_guard();
-                let registry = new_registry();
-                let listener_impl = HttpListenerImpl::new(guard, registry.clone());
-                let listener: system_capnp::http_listener::Client =
-                    capnp_rpc::new_client(listener_impl);
-
-                let mut req = listener.listen_request();
-                req.get().set_executor(stub_executor());
-                req.get().set_prefix("/status");
-                {
-                    let mut caps_builder = req.get().init_caps(1);
-                    let mut entry = caps_builder.reborrow().get(0);
-                    entry.set_name("host");
-                    entry
-                        .init_cap()
-                        .set_as_capability(stub_executor().client.hook);
-                }
-
-                req.send()
-                    .promise
-                    .await
-                    .expect("listen with non-empty caps should succeed");
+                    .expect("listen with a minimal Membrane should succeed");
 
                 let routes = registry.read().expect("registry not poisoned");
                 assert!(
@@ -1168,7 +1189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_caps_are_a_fixed_template_for_every_request_child() {
+    async fn test_http_listener_listen_without_membrane_fails_closed() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1176,27 +1197,78 @@ mod tests {
                 let registry = new_registry();
                 let listener: system_capnp::http_listener::Client =
                     capnp_rpc::new_client(HttpListenerImpl::new(guard, registry.clone()));
-                let observed_grants = Rc::new(RefCell::new(Vec::new()));
+
+                let mut request = listener.listen_request();
+                request.get().set_executor(stub_executor());
+                request.get().set_prefix("/missing-membrane");
+
+                assert!(request.send().promise.await.is_err());
+                assert!(registry.read().expect("registry lock").is_empty());
+            })
+            .await;
+    }
+
+    /// `HttpListener.listen` accepts a Membrane with a dynamic application extra.
+    #[tokio::test]
+    async fn test_http_listener_listen_with_extras_membrane_registers_route() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_tx, guard) = test_epoch_guard();
+                let registry = new_registry();
+                let listener_impl = HttpListenerImpl::new(guard, registry.clone());
+                let listener: system_capnp::http_listener::Client =
+                    capnp_rpc::new_client(listener_impl);
+
+                let mut req = listener.listen_request();
+                req.get().set_executor(stub_executor());
+                req.get().set_prefix("/status");
+                req.get().set_membrane(extras_membrane());
+
+                req.send()
+                    .promise
+                    .await
+                    .expect("listen with dynamic extras should succeed");
+
+                let routes = registry.read().expect("registry not poisoned");
+                assert!(
+                    routes.contains_key("/status"),
+                    "route /status should be registered"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn registration_membrane_is_reused_for_every_request_child() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_tx, guard) = test_epoch_guard();
+                let registry = new_registry();
+                let listener: system_capnp::http_listener::Client =
+                    capnp_rpc::new_client(HttpListenerImpl::new(guard, registry.clone()));
+                let observed_membranes = Rc::new(RefCell::new(Vec::new()));
                 let executor: system_capnp::executor::Client =
                     capnp_rpc::new_client(RecordingExecutor {
-                        observed_grants: observed_grants.clone(),
+                        observed_membranes: observed_membranes.clone(),
                     });
 
+                let grafts = Rc::new(Cell::new(0));
                 let mut listen = listener.listen_request();
                 listen.get().set_executor(executor);
                 listen.get().set_prefix("/fixed");
-                {
-                    let mut entry = listen.get().init_caps(1).get(0);
-                    entry.set_name("only-grant");
-                    entry
-                        .init_cap()
-                        .set_as_capability(stub_executor().client.hook);
-                }
+                listen.get().set_membrane(stateful_membrane(grafts.clone()));
                 listen
                     .send()
                     .promise
                     .await
-                    .expect("register fixed grant template");
+                    .expect("register fixed Membrane");
+                assert_eq!(
+                    grafts.get(),
+                    0,
+                    "HTTP registration must not inspect the supplied Membrane"
+                );
 
                 let route = registry
                     .read()
@@ -1224,10 +1296,30 @@ mod tests {
                     }));
                 }
 
+                let observed = observed_membranes.take();
+                assert_eq!(observed.len(), 2);
                 assert_eq!(
-                    observed_grants.borrow().as_slice(),
-                    &[vec!["only-grant".to_owned()], vec!["only-grant".to_owned()]],
-                    "each request must instantiate the same immutable registration template"
+                    grafts.get(),
+                    0,
+                    "HTTP child spawning must forward without grafting"
+                );
+                for (index, membrane) in observed.into_iter().enumerate() {
+                    let response = membrane
+                        .graft_request()
+                        .send()
+                        .promise
+                        .await
+                        .expect("delegated Membrane graft");
+                    let graft = response.get().expect("graft results");
+                    assert_eq!(
+                        graft.get_peer_id().expect("stateful peerId"),
+                        &((index + 1) as u32).to_be_bytes()
+                    );
+                }
+                assert_eq!(
+                    grafts.get(),
+                    2,
+                    "each HTTP child must reach the supplied Membrane server"
                 );
             })
             .await;
@@ -1257,6 +1349,7 @@ mod tests {
                 let mut req = listener.listen_request();
                 req.get().set_executor(stub_executor());
                 req.get().set_prefix("/status");
+                req.get().set_membrane(minimal_membrane());
 
                 let result = req.send().promise.await;
                 assert!(
@@ -1448,6 +1541,7 @@ mod tests {
                 let mut request = listener.listen_request();
                 request.get().set_executor(stub_executor());
                 request.get().set_prefix("/status");
+                request.get().set_membrane(minimal_membrane());
                 request
                     .send()
                     .promise

@@ -2,8 +2,8 @@
 //!
 //! - **Epoch** -- a monotonic sequence number anchored to on-chain state
 //! - **EpochGuard** -- checks whether a capability's epoch is still current
-//! - **MembraneServer** -- server that issues epoch-scoped sessions via `graft()`
-//! - **SessionBuilder** -- trait for injecting domain-specific capabilities into sessions
+//! - **MembraneServer** -- server that exposes epoch-scoped authority through `graft()`
+//! - **GraftBuilder** -- trait for populating domain-specific graft fields
 
 #[allow(unused_parens, clippy::match_single_binding)]
 pub mod system_capnp {
@@ -33,15 +33,6 @@ pub mod auth_capnp {
     include!(concat!(env!("OUT_DIR"), "/capnp/auth_capnp.rs"));
 }
 
-#[allow(
-    unused_parens,
-    clippy::extra_unused_type_parameters,
-    clippy::match_single_binding
-)]
-pub mod membrane_capnp {
-    include!(concat!(env!("OUT_DIR"), "/capnp/membrane_capnp.rs"));
-}
-
 #[allow(unused_parens, clippy::match_single_binding)]
 pub mod http_capnp {
     include!(concat!(env!("OUT_DIR"), "/capnp/http_capnp.rs"));
@@ -65,7 +56,7 @@ macro_rules! impl_terminal_session_pipeline {
     };
 }
 
-impl_terminal_session_pipeline!(membrane_capnp::membrane::Client);
+impl_terminal_session_pipeline!(system_capnp::membrane::Client);
 impl_terminal_session_pipeline!(auth_capnp::opaque_session::Client);
 
 #[cfg(test)]
@@ -85,7 +76,7 @@ mod wire_type_id_tests {
     use capnp::traits::HasTypeId;
 
     #[test]
-    fn split_schema_type_ids_are_pinned_for_wire_compat() {
+    fn schema_type_ids_are_pinned() {
         assert_eq!(
             <crate::auth_capnp::signer::Client as HasTypeId>::TYPE_ID,
             0xafaf_af94_68b6_a274
@@ -107,12 +98,28 @@ mod wire_type_id_tests {
             0xd119_09df_3e52_3d41
         );
         assert_eq!(
-            <crate::membrane_capnp::export::Reader<'static> as HasTypeId>::TYPE_ID,
+            <crate::system_capnp::export::Reader<'static> as HasTypeId>::TYPE_ID,
             0xbb8d_5590_cb2f_3d2e
         );
         assert_eq!(
-            <crate::membrane_capnp::membrane::Client as HasTypeId>::TYPE_ID,
+            <crate::system_capnp::membrane::Client as HasTypeId>::TYPE_ID,
             0xdb52_c251_06bc_2c5e
+        );
+        assert_eq!(
+            <crate::system_capnp::node_stat::Reader<'static> as HasTypeId>::TYPE_ID,
+            0xa003_44c4_66fb_1f93
+        );
+        assert_eq!(
+            <crate::system_capnp::stat::Client as HasTypeId>::TYPE_ID,
+            0xa7b9_b759_cc17_f8ca
+        );
+        assert_eq!(
+            <crate::system_capnp::network::Reader<'static> as HasTypeId>::TYPE_ID,
+            0xebd3_804c_6353_4aaf
+        );
+        assert_eq!(
+            <crate::system_capnp::routing::Reader<'static> as HasTypeId>::TYPE_ID,
+            0xbd90_34a6_f00b_9064
         );
         assert_eq!(
             <crate::routing_capnp::finder::Client as HasTypeId>::TYPE_ID,
@@ -143,7 +150,7 @@ pub use call_guard::{call_failure_code, stale_epoch_error, CallFailureCode};
 pub use epoch::{Epoch, EpochGuard};
 pub use issuer::{AuthorityServer, KeyMethodAuthorization, PolicyCompileError};
 pub use kernel_ready::{KernelReadyError, KernelReadyGate};
-pub use membrane::{get_graft_cap, membrane_client, GraftBuilder, MembraneServer, NoExtension};
+pub use membrane::{get_extra, membrane_client, GraftBuilder, MembraneServer, NoExtension};
 pub use terminal::{
     AllowAllPolicy, AuthPolicy, AuthenticatedIdentity, AuthorizationError, FixedSessionPolicy,
     LocalPolicyFuture, SessionGrant, SessionTemplate, TerminalServer, DEFAULT_POLICY_TIMEOUT,

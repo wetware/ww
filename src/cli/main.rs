@@ -1075,7 +1075,6 @@ fn main() {{
         .file(capnp_dir.join("system.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("auth.capnp"))
-        .file(capnp_dir.join("membrane.capnp"))
         .file(capnp_dir.join("stem.capnp"))
         .file(capnp_dir.join("http.capnp"))
         .run()
@@ -1088,7 +1087,7 @@ fn main() {{
         .run()
         .expect("failed to compile {name}.capnp");
 
-    for schema in &["system", "routing", "auth", "membrane", "stem", "http"] {{
+    for schema in &["system", "routing", "auth", "stem", "http"] {{
         println!(
             "cargo:rerun-if-changed={{}}",
             capnp_dir.join(format!("{{schema}}.capnp")).display()
@@ -1123,11 +1122,6 @@ mod auth_capnp {{
 }}
 
 #[allow(dead_code)]
-mod membrane_capnp {{
-    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
-}}
-
-#[allow(dead_code)]
 mod routing_capnp {{
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
 }}
@@ -1142,24 +1136,7 @@ mod {name}_capnp {{
     include!(concat!(env!("OUT_DIR"), "/{name}_capnp.rs"));
 }}
 
-type InitialGrants = membrane_capnp::initial_grants::Client;
-
-/// Look up a typed capability by name from the initial grants list.
-fn get_initial_grant<T: capnp::capability::FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
-    name: &str,
-) -> Result<T, capnp::Error> {{
-    for i in 0..caps.len() {{
-        let entry = caps.get(i);
-        let n = entry.get_name()?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?;
-        if n == name {{
-            return entry.get_cap().get_as_capability::<T>();
-        }}
-    }}
-    Err(capnp::Error::failed(format!(
-        "required initial grant '{{name}}' is missing"
-    )))
-}}
+type Membrane = system_capnp::membrane::Client;
 
 // ---------------------------------------------------------------------------
 // {iface_name} implementation
@@ -1195,16 +1172,7 @@ impl Guest for {iface_name}Guest {{
         let result = match std::env::args().nth(1).as_deref() {{
             Some("serve") => {{
                 log::info!("{name}: serve");
-                system::run(|initial_grants: InitialGrants| async move {{
-                    let grants_resp = initial_grants.get_request().send().promise.await?;
-                    let grants = grants_resp.get()?.get_caps()?;
-                    let host: system_capnp::host::Client =
-                        get_initial_grant(&grants, "host")?;
-
-                    let id_resp = host.id_request().send().promise.await?;
-                    let peer_id = id_resp.get()?.get_peer_id()?;
-                    log::info!("{name}: peer {{:?}}", peer_id);
-
+                system::run(|_membrane: Membrane| async move {{
                     // TODO: provide on DHT, discover peers, etc.
 
                     Ok(())
@@ -1216,7 +1184,7 @@ impl Guest for {iface_name}Guest {{
                 let impl_ = {iface_name}Impl;
                 let client: {name}_capnp::{snake_name}::Client = capnp_rpc::new_client(impl_);
                 log::info!("{name}: cell mode");
-                system::serve(client.client, |_initial_grants: InitialGrants| async move {{
+                system::serve(client.client, |_membrane: Membrane| async move {{
                     std::future::pending().await
                 }})
                 .await

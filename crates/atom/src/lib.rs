@@ -6,7 +6,6 @@
 //! The host's `stem::atom::Source` owns authoritative finalized-depth polling.
 
 pub use authority::auth_capnp;
-pub use authority::membrane_capnp;
 pub use authority::stem_capnp;
 pub use authority::system_capnp;
 pub use authority::{
