@@ -183,30 +183,48 @@ mod tests {
 
     use std::time::Duration;
 
-    use crate::{build_test_peer_rpc, NetworkState, SwarmCommand};
     use authority::system_capnp;
+    use capnp::capability::Promise;
+    use capnp_rpc::rpc_twoparty_capnp::Side;
+    use capnp_rpc::twoparty::VatNetwork;
+    use capnp_rpc::RpcSystem;
     use tokio::io;
-    use tokio::sync::mpsc;
-    use tokio_util::compat::TokioAsyncWriteCompatExt;
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-    /// Helper: spin up a server-side `host::Client` over a duplex pair and
-    /// return the *client-side* half of the duplex for the test to dial.
-    fn make_host_server(
-        local_peer_id: Vec<u8>,
-    ) -> (io::DuplexStream, mpsc::Receiver<SwarmCommand>) {
+    struct TestMembrane {
+        peer_id: Vec<u8>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::membrane::Server for TestMembrane {
+        fn graft(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::membrane::GraftParams,
+            mut results: system_capnp::membrane::GraftResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_peer_id(&self.peer_id);
+            Promise::ok(())
+        }
+    }
+
+    /// Serve one typed Membrane over a duplex pair and return the dial side.
+    fn make_membrane_server(peer_id: Vec<u8>) -> io::DuplexStream {
         let (client_stream, server_stream) = io::duplex(8 * 1024);
         let (server_read, server_write) = io::split(server_stream);
-
-        let network_state = NetworkState::from_peer_id(local_peer_id);
-        let (swarm_tx, swarm_rx) = mpsc::channel(16);
-
-        let server_rpc =
-            build_test_peer_rpc(server_read, server_write, network_state, swarm_tx, false);
+        let membrane: system_capnp::membrane::Client =
+            capnp_rpc::new_client(TestMembrane { peer_id });
+        let network = VatNetwork::new(
+            server_read.compat(),
+            server_write.compat_write(),
+            Side::Server,
+            Default::default(),
+        );
+        let server_rpc = RpcSystem::new(Box::new(network), Some(membrane.client));
         tokio::task::spawn_local(async move {
             let _ = server_rpc.await;
         });
 
-        (client_stream, swarm_rx)
+        client_stream
     }
 
     /// Regression test for the original `ww shell` 30s handshake bug
@@ -221,20 +239,20 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (client_stream, _swarm_rx) = make_host_server(vec![1, 2, 3, 4]);
+                let client_stream = make_membrane_server(vec![1, 2, 3, 4]);
 
-                let conn: VatDial<system_capnp::host::Client> =
+                let conn: VatDial<system_capnp::membrane::Client> =
                     connect(client_stream.compat_write());
 
                 // First method call drives the Bootstrap roundtrip.
                 // If `connect` didn't spawn the driver, this hangs forever.
                 let resp = tokio::time::timeout(
                     Duration::from_secs(2),
-                    conn.bootstrap.id_request().send().promise,
+                    conn.bootstrap.graft_request().send().promise,
                 )
                 .await
                 .expect("method call should not time out — driver must be running")
-                .expect("id RPC should succeed");
+                .expect("graft RPC should succeed");
                 let peer_id = resp.get().unwrap().get_peer_id().unwrap();
                 assert_eq!(peer_id, &[1, 2, 3, 4]);
             })
@@ -249,15 +267,15 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (client_stream, _swarm_rx) = make_host_server(vec![9, 8, 7, 6]);
+                let client_stream = make_membrane_server(vec![9, 8, 7, 6]);
 
-                let conn: VatDial<system_capnp::host::Client> =
+                let conn: VatDial<system_capnp::membrane::Client> =
                     connect(client_stream.compat_write());
 
                 // First call.
                 let resp = tokio::time::timeout(
                     Duration::from_secs(2),
-                    conn.bootstrap.id_request().send().promise,
+                    conn.bootstrap.graft_request().send().promise,
                 )
                 .await
                 .expect("first call")
@@ -267,7 +285,7 @@ mod tests {
                 // Second call must also succeed.
                 let resp2 = tokio::time::timeout(
                     Duration::from_secs(2),
-                    conn.bootstrap.id_request().send().promise,
+                    conn.bootstrap.graft_request().send().promise,
                 )
                 .await
                 .expect("second call")

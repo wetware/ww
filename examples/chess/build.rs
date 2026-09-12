@@ -28,8 +28,8 @@ fn main() {
 
     // ── Pass 1: shared schemas ──────────────────────────────────────
     // Compile the system-level .capnp files that every guest needs:
-    // Host, Executor, Finder, Announcer, etc. These produce Rust modules
-    // like `system_capnp::executor::Client`.
+    // Membrane, Executor, Finder, Announcer, etc. These produce Rust modules
+    // such as `system_capnp::executor::Client`.
     capnpc::CompilerCommand::new()
         .src_prefix(&capnp_dir)
         // schema.capnp types live in the `capnp` crate
@@ -38,7 +38,6 @@ fn main() {
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("http.capnp"))
         .file(capnp_dir.join("auth.capnp"))
-        .file(capnp_dir.join("membrane.capnp"))
         .file(capnp_dir.join("stem.capnp"))
         .run()
         .expect("failed to compile shared capnp schemas");
@@ -52,7 +51,7 @@ fn main() {
 
     // ── Cargo rebuild triggers ──────────────────────────────────────
     // Re-run this build script whenever any schema file changes.
-    for schema in &["system", "routing", "auth", "membrane", "http", "stem"] {
+    for schema in &["system", "routing", "auth", "http", "stem"] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()

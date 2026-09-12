@@ -36,13 +36,12 @@ references exist where*:
 
 | Surface | What it controls | How to change it |
 |---------|------------------|------------------|
-| **Initial grants** | Which RPC capability references enter an ordinary child | Set the `caps` list on `Executor.spawn` or listener registration; respawn |
+| **Child Membrane** | Which typed RPC capability references enter an ordinary child | Supply a narrow `Membrane` to `Executor.spawn` or listener registration; respawn |
 | **Terminal authority policy** | Which verified login identity receives which method profile over one application capability | Publish with `VatListener.serveAuthenticated`; the listener creates one `Terminal` per stream |
 | **Image root / CAS wiring** | The fixed read-only root and optional known-CID reads | Select the execution context; respawn |
 
-Trusted pid0 receives the host graft; each ordinary child receives only its
-immutable `InitialAuthorityRecord`, constructed from the parent's explicit
-grants and delivered through `InitialGrants.get()`. The root Atom binding flows
+Trusted PID0 receives a broad root `Membrane`. Each ordinary child receives
+only the `Membrane` reference supplied by its parent. The root Atom binding flows
 through `ww::stem::atom::Source`. When the Atom value changes, the host first
 broadcasts an authoritative epoch whose `root` is `None`. That broadcast
 invalidates the old generation's capabilities and causes PID0 teardown before
@@ -81,39 +80,36 @@ client.
 
 ## Capabilities exposed at bootstrap
 
-Trusted pid0 receives the host capabilities below. An ordinary child receives
-only the named references its parent supplied in the `Executor.spawn` caps
-list or a listener's registration-time grant template. Each `Export` entry
-carries an inert name and a capability reference. The reference carries
-authority; the name does not resolve authority. `identity` requires a
-configured signing key. `http-client` requires a non-empty `--http-dial`
-allowlist.
+`Membrane.graft()` returns the typed surface below. Every successful graft has
+a non-empty `peerId`. An ordinary child receives only the authority held by its
+parent-selected `Membrane`; withheld capability pointers are null. `identity`
+requires a configured signing key. The HTTP dialer requires a non-empty
+`--http-dial` allowlist.
 
 | Capability | What it does |
 |------------|--------------|
-| **identity** | Host-side Ed25519 signing (private key never enters WASM) |
+| **peerId** | Stable copied node identity metadata |
+| **stat** | Snapshot listen addresses and connected-peer count without peer records |
+| **network** | Grouped nullable stream, vat, and HTTP listener/dialer references |
+| **routing** | Nullable `Finder` and `Announcer` references |
+| **runtime** | Load WASM binaries and obtain scoped Executors |
 | **authority** | Construct a policy-bound `Terminal` over one explicit capability |
-| **host** | Peer identity, listen addresses, connected peers, network access |
-| **runtime** | Load WASM binaries and obtain scoped Executors (with compilation caching) |
-| **routing-finder** | Find Kademlia providers through the observational `routing::Finder` interface |
-| **routing-announcer** | Announce the Wetware host PeerID through `routing::Announcer` |
+| **identity** | Host-side Ed25519 signing; the private key never enters WASM |
 | **ipfs** | Read `/ipfs`, `/ipns`, or `/ipld` content through a `ByteStream` |
-| **http-client** | Outbound HTTP requests, gated by `--http-dial` allowlist |
-Application-specific entries use their parent-chosen grant-map keys.
+| **extras** | Dynamically named application-defined capability references |
 
-`routing-finder` and `routing-announcer` are separate references. Delegating
+`routing.finder` and `routing.announcer` are separate references. Delegating
 one does not delegate the other. Canonical routing-key derivation is the
 optional pure `wetware:routing/key@0.1.0` WIT import, not an RPC capability or
 graft export.
 
-The wire-side `StreamListener` / `StreamDialer` / `VatListener` /
-`VatClient` interfaces are reached via `host.network()` rather than
-appearing as separate initial grants.
+The wire-side `StreamListener`, `StreamDialer`, `VatListener`, `VatClient`,
+`HttpListener`, and `HttpClient` references are leaves in `network` groups.
 
 Host-issued delegated capabilities are epoch-guarded: they fail with
-`staleEpoch` once the on-chain head advances. An ordinary child cannot
-re-graft. The Host terminates the old PID0 and starts a fresh PID0 for the new
-generation. Epoch guards do not revoke arbitrary capability
+`staleEpoch` once the on-chain head advances. Re-grafting a child Membrane does
+not add authority. The Host terminates the old PID0 and starts a fresh PID0 for
+the new generation. Epoch guards do not revoke arbitrary capability
 references that were not issued by the host.
 
 ### Filesystem content access
@@ -135,8 +131,8 @@ explicit `/ipfs/<cid>/...` paths. The WASI virtual filesystem and its reachable
 CID tree govern guest path I/O. The membrane governs RPC capability authority.
 
 Known-CID cache wiring is execution-context state, not a child-visible control
-capability. A child cannot replace or widen it. The separate `ipfs` graft
-export can be delegated explicitly and provides `Ipfs.read()` through a
+capability. A child cannot replace or widen it. The typed `ipfs` graft field
+can be delegated explicitly and provides `Ipfs.read()` through a
 `ByteStream`; it does not expose cache controls, mutation, pin management,
 publishing, routing, or arbitrary dialing.
 
@@ -172,8 +168,8 @@ of its descendants as mount targets. No such facility exists now.
 
 ## Capability lifecycle
 
-1. Trusted pid0 grafts epoch-scoped host capabilities
-2. A parent constructs each ordinary child's exact named grant set
+1. Trusted PID0 grafts epoch-scoped host capabilities
+2. A parent constructs or selects each ordinary child's narrow `Membrane`
 3. To gate a remotely published capability, trusted configuration attaches
    an explicit policy and publishes the resulting `Terminal(Session)`
 4. An epoch advance stales host-issued guarded capabilities
@@ -210,13 +206,13 @@ Atom remains the source and coordinator of global epoch lifecycle.
 
 Schema definitions live in `capnp/`:
 
-- **`system.capnp`** — Host, Runtime, Executor, Process, ByteStream,
-  StreamListener, StreamDialer, VatListener, VatClient, HttpListener
+- **`system.capnp`** — Membrane, Stat, Network, Routing, Export, Runtime,
+  Executor, Process, ByteStream, StreamListener, StreamDialer, VatListener,
+  VatClient, HttpListener
 - **`stem.capnp`** — Epoch and provenance metadata
 - **`auth.capnp`** — Terminal, Signer, Identity, Authority policy constructor
-- **`membrane.capnp`** — trusted-root Membrane, child InitialGrants, Export
 - **`routing.capnp`** — independent Kademlia provider `Finder` and `Announcer`
 - **`http.capnp`** — HttpClient
 
-Build scripts generate typed Rust bindings. Exported capabilities cross
-membranes as bare references in `Export { name, cap }`.
+Build scripts generate typed Rust bindings. `Export { name, cap }` survives
+only for application-defined `Membrane.extras` entries.

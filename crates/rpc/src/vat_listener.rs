@@ -347,7 +347,7 @@ mod tests {
                     head: vec![1],
                     root: None,
                 });
-                let bootstrap = authority::membrane_client(epoch_rx);
+                let bootstrap = authority::membrane_client(epoch_rx, b"test-peer");
                 let (server_stream, peer_stream) = tokio::io::duplex(64);
                 let (granted_tx, granted_rx) = oneshot::channel();
                 granted_tx.send(()).expect("pre-commit grant signal");

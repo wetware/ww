@@ -15,10 +15,9 @@ Provider routing has three independent surfaces:
 | `routing::Announcer` | Cap'n Proto capability | Assert that the Wetware host PeerID provides a CID |
 | `wetware:routing/key@0.1.0` | Optional WIT host import | Pure canonical CID derivation; no object-capability authority |
 
-The host graft exports `Finder` as `routing-finder` and `Announcer` as
-`routing-announcer`. A parent can delegate either reference without delegating
-the other. The old broad `Routing` capability and the `routing` graft no longer
-exist.
+`Membrane.graft()` returns a `Routing` struct containing nullable `finder` and
+`announcer` references. A parent can delegate either reference without
+delegating the other. `Routing` is a value, not a capability-vending interface.
 
 ## Service discovery pattern
 

@@ -4,24 +4,22 @@
 //! directly through Runtime/Executor; this one routes through the full
 //! HttpListener path:
 //!
-//!   HttpListener.listen(executor, "/status", caps)
+//!   HttpListener.listen(executor, "/status", membrane)
 //!     └─ registers route in RouteRegistry
 //!         └─ dispatch_loop receives CgiRequest via mpsc
-//!             └─ spawn_and_run calls executor.spawn(env, caps)
+//!             └─ spawn_and_run calls executor.spawn(env, membrane)
 //!                 └─ WAGI cell grafts membrane, returns JSON
 //!
-//! The test additionally seeds the non-empty caps list that Rust PID0 supplies.
-//! That fixed registration-time template is the status cell's only host authority; the
-//! dispatcher path must reproduce it for each child without widening or
-//! corruption. A regression would surface here as `peer_id: null` or a CGI
-//! dispatch failure.
+//! The test supplies the narrow peerId+Stat Membrane that status requires.
+//! The dispatcher must forward that exact Membrane to each request child.
 //!
 //! Requires pre-built status WASM: `make -C std/status`.
 
 #[path = "support/ticked_executor.rs"]
 mod ticked_executor;
 
-use tokio::sync::{mpsc, oneshot, watch};
+use capnp::capability::Promise;
+use tokio::sync::{oneshot, watch};
 
 use ww::dispatcher::server::{new_registry, CgiRequest};
 use ww::launcher::create_runtime_client;
@@ -41,8 +39,62 @@ fn synth_peer_id_bytes() -> Vec<u8> {
     libp2p::PeerId::from_public_key(&kp.public()).to_bytes()
 }
 
+#[derive(Clone)]
+struct StatusGraft {
+    network_state: NetworkState,
+}
+
+struct StatusStat {
+    network_state: NetworkState,
+    guard: authority::EpochGuard,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::stat::Server for StatusStat {
+    fn snapshot(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::stat::SnapshotParams,
+        mut results: system_capnp::stat::SnapshotResults,
+    ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.guard.check() {
+            return Promise::err(error);
+        }
+        let network_state = self.network_state.clone();
+        let guard = self.guard.clone();
+        Promise::from_future(async move {
+            let snapshot = network_state.snapshot().await;
+            guard.check()?;
+            let mut stat = results.get().init_stat();
+            let mut addrs = stat
+                .reborrow()
+                .init_listen_addrs(snapshot.listen_addrs.len() as u32);
+            for (index, address) in snapshot.listen_addrs.iter().enumerate() {
+                addrs.set(index as u32, address);
+            }
+            stat.set_connected_peer_count(snapshot.connected_peer_count);
+            Ok(())
+        })
+    }
+}
+
+impl authority::GraftBuilder for StatusGraft {
+    fn build(
+        &self,
+        guard: &authority::EpochGuard,
+        mut builder: system_capnp::membrane::graft_results::Builder<'_>,
+    ) -> Result<(), capnp::Error> {
+        builder.set_peer_id(self.network_state.local_peer_id());
+        let stat: system_capnp::stat::Client = capnp_rpc::new_client(StatusStat {
+            network_state: self.network_state.clone(),
+            guard: guard.clone(),
+        });
+        builder.set_stat(stat);
+        Ok(())
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
-async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id() {
+async fn status_cell_via_http_listener_with_narrow_membrane_returns_status() {
     if !status_wasm_exists() {
         eprintln!("skipping: {STATUS_WASM_PATH} not built (run `make -C std/status` first)");
         return;
@@ -52,9 +104,8 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
     local
         .run_until(async {
             // ── Runtime + executor + HttpListener wiring ────────────────
-            let network_state = NetworkState::new();
             let peer_id_bytes = synth_peer_id_bytes();
-            network_state.set_local_peer_id(peer_id_bytes.clone()).await;
+            let network_state = NetworkState::from_peer_id(peer_id_bytes.clone());
 
             let epoch = authority::Epoch {
                 seq: 1,
@@ -66,9 +117,6 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
                 issued_seq: 1,
                 receiver: epoch_rx.clone(),
             };
-            let stream_control = libp2p_stream::Behaviour::new().new_control();
-
-            let (swarm_tx, _swarm_rx) = mpsc::channel(16);
             // This dispatch path executes the real status Cell, so it must use
             // the same shared, ticked Engine as production.
             let ticked = TickedExecutor::new();
@@ -79,13 +127,9 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
                 None,
                 CachePolicy::Shared,
             );
-            let host: system_capnp::host::Client = capnp_rpc::new_client(ww::rpc::HostImpl::new(
-                network_state,
-                swarm_tx,
-                false,
-                guard.clone(),
-                Some(stream_control),
-            ));
+            let membrane: system_capnp::membrane::Client = capnp_rpc::new_client(
+                authority::MembraneServer::new(epoch_rx, StatusGraft { network_state }),
+            );
 
             // Load the status WASM, get an executor.
             let wasm = std::fs::read(STATUS_WASM_PATH).expect("read status.wasm");
@@ -105,25 +149,16 @@ async fn status_cell_via_http_listener_with_extra_caps_returns_non_null_peer_id(
             let listener: system_capnp::http_listener::Client =
                 capnp_rpc::new_client(listener_impl);
 
-            // Register the route, with a non-empty caps list (mirrors what
-            // the kernel emits for `(perform host :listen
-            // (cell image :grants {:host host}) "/status")`).
+            // Register the route with the status child's narrow Membrane.
             let mut listen_req = listener.listen_request();
             listen_req.get().set_executor(executor);
             listen_req.get().set_prefix("/status");
-            {
-                let mut caps_builder = listen_req.get().init_caps(1);
-                let mut entry = caps_builder.reborrow().get(0);
-                entry.set_name("host");
-                // Registration-time caps are the fixed grant template for
-                // every request child. Status requires only this explicit host.
-                entry.init_cap().set_as_capability(host.client.clone().hook);
-            }
+            listen_req.get().set_membrane(membrane);
             listen_req
                 .send()
                 .promise
                 .await
-                .expect("HttpListener.listen with caps should succeed");
+                .expect("HttpListener.listen with narrow Membrane should succeed");
 
             // ── Dispatch a CGI request through the registry ─────────────
             let tx = {

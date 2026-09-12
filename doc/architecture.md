@@ -8,18 +8,17 @@ attenuation rules, see [capabilities.md](capabilities.md).
 ## Authority model
 
 Wetware runs WASM cells with no ambient node authority. A **grant** is an
-explicit delegation of a Cap'n Proto capability reference. A grant name is a
-parent-chosen local label; it is neither an authorization key nor a service
-lookup mechanism.
+explicit delegation of a Cap'n Proto capability reference. Fixed platform
+authority occupies typed `Membrane.graft()` fields. An application-defined
+capability can use a parent-chosen name in `extras`; that name is neither an
+authorization key nor a service lookup mechanism.
 
-The important distinction is between trusted PID0 and ordinary children:
+PID0 and ordinary children receive the same bootstrap interface:
 
-- **pid0** is trusted by construction. It alone receives the process-local
-  root `Membrane` and calls `Membrane.graft()`. That graft records the current
-  generation in trusted host state.
-- An **ordinary child** receives `InitialGrants`, a host-provided,
-  grants-only bootstrap. `InitialGrants.get()` returns exactly the immutable
-  `InitialAuthorityRecord` selected by its parent.
+- **PID0** is trusted by construction. It receives a broad process-local root
+  `Membrane`. Its first graft records the current generation in host state.
+- An **ordinary child** receives the narrow `Membrane` reference supplied to
+  `Executor.spawn()`. Null fields represent withheld capabilities.
 
 The PID0 `Membrane` is process-local. PID0 does not publish a base compatibility
 payload on bare `/ww/0.1.0`. Authenticated vat services and byte streams remain
@@ -32,20 +31,19 @@ HOST PROCESS
 │
 ├─ pid0 boot
 │  process-local root Membrane → trusted pid0
-│       ├─ Membrane.graft() → epoch-scoped host grants
+│       ├─ Membrane.graft() → epoch-scoped typed authority
 │       └─ private WIT kernel-ready() → commit bound generation
 │
 └─ ordinary child spawn
-   Executor.spawn(explicit named grants)
-       → InitialAuthorityRecord → InitialGrants → ordinary child
-       → fixed substrate + exact grants
-       → (only if granted) Executor → grandchild with another exact grant set
+   Executor.spawn(parent-selected Membrane)
+       → same Membrane reference → ordinary child bootstrap
+       → fixed substrate + exact delegated authority
+       → (only if granted) Executor → grandchild with another Membrane
 ```
 
-The PID0 graft contains the host-provided capabilities appropriate for the
-node configuration, including identity, host, runtime, independent
-`routing-finder` and `routing-announcer` references, authority, IPFS, and
-optional HTTP client. Local PID0 grafting has no `AuthPolicy`.
+The PID0 graft contains `peerId`, `Stat`, grouped network capability
+references, grouped routing references, runtime, authority, optional identity,
+IPFS, and application-defined extras. Local PID0 grafting has no `AuthPolicy`.
 Authenticated vat publication remains separate: each inbound stream receives
 a fresh `Terminal` that verifies login before returning policy-selected service
 authority.
@@ -61,7 +59,8 @@ The Rust PID0 follows one straight-line sequence for each generation:
 
 1. Call `Membrane.graft()` once.
 2. Read `$WW_ROOT/bin/status.wasm`.
-3. Load the status component, grant `host`, and register `/status`.
+3. Load the status component and register `/status` with a narrow `Membrane`
+   containing only `peerId` and `Stat`.
 4. Call the private `kernel_ready()` import.
 5. Normally remain alive until the Host terminates the generation. With
    `WW_TTY`, stdin EOF also ends PID0.
@@ -72,7 +71,7 @@ awareness, PID0 termination, and PID0 replacement.
 The spawn lattice is deliberately small:
 
 ```
-Runtime ──load(WASM bytes)──> Executor ──spawn(args, env, grants)──> Process
+Runtime ──load(WASM bytes)──> Executor ──spawn(args, env, Membrane)──> Process
 ```
 
 `Runtime` authorizes selecting and loading arbitrary code. `Executor` is
@@ -81,16 +80,16 @@ image-bound spawn authority. `Process` is authority over one running child
 `Process.bootstrap()`). A child receives `Runtime`, an `Executor`, or neither
 only through an explicit grant.
 
-The initial record is closed and idempotent. `InitialGrants` exposes no graft,
-refresh, append, arbitrary-name resolution, policy, or parent-channel API.
-Consequently an ordinary child cannot reacquire host authority through its
-bootstrap, lexical capture, runtime propagation, arbitrary-name resolution,
-or the known fallback paths.
+Each `Membrane` server owns only its delegated references. Repeated `graft()`
+calls return the same authority surface and cannot recover omitted authority.
+Every successful graft includes a non-empty `peerId`; missing or empty metadata
+is an error. Fixed platform authority is statically named in the schema. Only
+`extras` retains dynamically named application capabilities.
 
 ## Capability routing, provider routing, and interposition
 
-Grants are opaque Cap'n Proto references. The grants-only bootstrap forwards
-neither calls nor authority: it returns the selected references as-is.
+Delegated capabilities are opaque Cap'n Proto references. A child `Membrane`
+returns its selected references as-is.
 
 - A host-implemented granted capability routes directly to the host.
 - A sibling-implemented capability routes through the host hub to that

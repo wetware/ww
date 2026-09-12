@@ -14,12 +14,11 @@ fn main() {
         .file(capnp_dir.join("system.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("auth.capnp"))
-        .file(capnp_dir.join("membrane.capnp"))
         .file(capnp_dir.join("http.capnp"))
         .run()
         .expect("compile authority-probe schemas");
 
-    for schema in ["system", "routing", "auth", "membrane", "http"] {
+    for schema in ["system", "routing", "auth", "http"] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()

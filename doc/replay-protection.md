@@ -111,8 +111,9 @@ pub fn check(&self) -> Result<(), Error> {
 When deployment accepts an authoritative Stem update, host-issued capabilities
 guarded by the old local epoch fail simultaneously. This does not revoke
 arbitrary non-host capabilities.
-Trusted pid0 may call `Membrane.graft()` again. Ordinary children have no graft
-surface: they receive fresh references only through explicit ancestor
+Trusted PID0 and ordinary children can call their own `Membrane.graft()` again.
+Repeated calls return only the references held by that `Membrane` server.
+Children receive fresh references only through explicit ancestor
 re-delegation or respawn.
 
 This is the runtime backstop. Even if Layers 1 and 2 were somehow bypassed,

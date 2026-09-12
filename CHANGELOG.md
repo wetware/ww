@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **Breaking: every Cell now bootstraps through one typed `Membrane`.**
+  `Membrane.graft()` returns direct `peerId`, `Stat`, grouped `Network`,
+  `Routing`, runtime, authority, identity, IPFS, and application-only `extras`
+  fields. `Executor` and listeners propagate one parent-selected `Membrane`.
+  The mixed guest `Host`, guest `PeerInfo`, `InitialGrants`, and
+  `InitialAuthorityRecord` surfaces are removed. Status receives only
+  `peerId` and `Stat`; `Stat.snapshot()` returns listen addresses and an
+  aggregate connected-peer count without exposing peer topology.
 - **Production Cells now use native WASI P3.** Wasmtime 48.0.1 invokes each
   asynchronous `wasi:cli/run@0.3.0` export with `Store::run_concurrent`.
   `std/system` composes the P3 transport completion, Cap'n Proto `RpcSystem`,

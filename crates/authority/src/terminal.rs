@@ -540,7 +540,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::membrane_capnp;
+    use crate::system_capnp;
     use crate::test_session_capnp::{leaf, structured_session};
     use capnp::capability::Rc as CapRc;
     use ed25519_dalek::SigningKey;
@@ -650,13 +650,13 @@ mod tests {
         vk: VerifyingKey,
         epoch: Epoch,
     ) -> (
-        auth_capnp::terminal::Client<membrane_capnp::membrane::Owned>,
+        auth_capnp::terminal::Client<system_capnp::membrane::Owned>,
         watch::Sender<Epoch>,
     ) {
         let (tx, rx) = watch::channel(epoch);
-        let membrane: membrane_capnp::membrane::Client =
-            crate::membrane::membrane_client(rx.clone());
-        let terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
+        let membrane: system_capnp::membrane::Client =
+            crate::membrane::membrane_client(rx.clone(), b"test-peer");
+        let terminal = TerminalServer::<system_capnp::membrane::Owned>::new(
             vk,
             membrane,
             SigningDomain::terminal_membrane(),
@@ -671,10 +671,10 @@ mod tests {
         let vk = sk.verifying_key();
 
         let (_tx, rx) = watch::channel(test_epoch(1));
-        let membrane: membrane_capnp::membrane::Client =
-            crate::membrane::membrane_client(rx.clone());
+        let membrane: system_capnp::membrane::Client =
+            crate::membrane::membrane_client(rx.clone(), b"test-peer");
 
-        let _terminal = TerminalServer::<membrane_capnp::membrane::Owned>::new(
+        let _terminal = TerminalServer::<system_capnp::membrane::Owned>::new(
             vk,
             membrane,
             SigningDomain::terminal_membrane(),
@@ -685,10 +685,10 @@ mod tests {
     #[test]
     fn terminal_server_constructs_with_custom_policy() {
         let (_tx, rx) = watch::channel(test_epoch(1));
-        let membrane: membrane_capnp::membrane::Client =
-            crate::membrane::membrane_client(rx.clone());
+        let membrane: system_capnp::membrane::Client =
+            crate::membrane::membrane_client(rx.clone(), b"test-peer");
 
-        let _terminal = TerminalServer::<membrane_capnp::membrane::Owned>::with_policy(
+        let _terminal = TerminalServer::<system_capnp::membrane::Owned>::with_policy(
             Box::new(AllowAllPolicy),
             membrane,
             SigningDomain::terminal_membrane(),
@@ -733,7 +733,7 @@ mod tests {
             .run_until(async {
                 let key = SigningKey::generate(&mut rand::rngs::OsRng);
                 let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
-                let membrane = crate::membrane::membrane_client(epoch_rx.clone());
+                let membrane = crate::membrane::membrane_client(epoch_rx.clone(), b"test-peer");
                 let terminal = TerminalServer::new(
                     key.verifying_key(),
                     membrane,
@@ -741,7 +741,7 @@ mod tests {
                     epoch_rx,
                 )
                 .with_proof_timeout(Duration::from_millis(1));
-                let terminal: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+                let terminal: auth_capnp::terminal::Client<system_capnp::membrane::Owned> =
                     capnp_rpc::new_client(terminal);
                 let signer: auth_capnp::signer::Client = capnp_rpc::new_client(HangingSigner);
                 let mut request = terminal.login_request();
@@ -765,7 +765,7 @@ mod tests {
             .run_until(async {
                 let key = SigningKey::generate(&mut rand::rngs::OsRng);
                 let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
-                let membrane = crate::membrane::membrane_client(epoch_rx.clone());
+                let membrane = crate::membrane::membrane_client(epoch_rx.clone(), b"test-peer");
                 let terminal = TerminalServer::new(
                     key.verifying_key(),
                     membrane,
@@ -773,7 +773,7 @@ mod tests {
                     epoch_rx,
                 )
                 .single_use();
-                let terminal: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+                let terminal: auth_capnp::terminal::Client<system_capnp::membrane::Owned> =
                     capnp_rpc::new_client(terminal);
 
                 let first_signer: auth_capnp::signer::Client =
@@ -818,14 +818,14 @@ mod tests {
         authorizations: Rc<Cell<usize>>,
     }
 
-    impl AuthPolicy<membrane_capnp::membrane::Owned> for CoordinatedPolicy {
+    impl AuthPolicy<system_capnp::membrane::Owned> for CoordinatedPolicy {
         fn authorize<'a>(
             &'a self,
             identity: AuthenticatedIdentity,
-            template: SessionTemplate<membrane_capnp::membrane::Owned>,
+            template: SessionTemplate<system_capnp::membrane::Owned>,
         ) -> LocalPolicyFuture<
             'a,
-            Result<SessionGrant<membrane_capnp::membrane::Owned>, AuthorizationError>,
+            Result<SessionGrant<system_capnp::membrane::Owned>, AuthorizationError>,
         > {
             Box::pin(async move {
                 if identity.verifying_key_bytes() != self.expected.to_bytes() {
@@ -847,7 +847,7 @@ mod tests {
             .run_until(async {
                 let key = SigningKey::generate(&mut rand::rngs::OsRng);
                 let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
-                let membrane = crate::membrane::membrane_client(epoch_rx.clone());
+                let membrane = crate::membrane::membrane_client(epoch_rx.clone(), b"test-peer");
                 let authorizations = Rc::new(Cell::new(0));
                 let terminal = TerminalServer::with_policy(
                     Box::new(CoordinatedPolicy {
@@ -860,7 +860,7 @@ mod tests {
                     epoch_rx,
                 )
                 .single_use();
-                let terminal: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+                let terminal: auth_capnp::terminal::Client<system_capnp::membrane::Owned> =
                     capnp_rpc::new_client(terminal);
 
                 let mut first = terminal.login_request();
@@ -923,7 +923,7 @@ mod tests {
                 let expected = SigningKey::generate(&mut rand::rngs::OsRng);
                 let wrong = SigningKey::generate(&mut rand::rngs::OsRng);
                 let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
-                let membrane = crate::membrane::membrane_client(epoch_rx.clone());
+                let membrane = crate::membrane::membrane_client(epoch_rx.clone(), b"test-peer");
                 let (granted_tx, mut granted_rx) = oneshot::channel();
                 let terminal = TerminalServer::new(
                     expected.verifying_key(),
@@ -932,7 +932,7 @@ mod tests {
                     epoch_rx,
                 )
                 .with_grant_notifier(granted_tx);
-                let client: auth_capnp::terminal::Client<membrane_capnp::membrane::Owned> =
+                let client: auth_capnp::terminal::Client<system_capnp::membrane::Owned> =
                     capnp_rpc::new_client(terminal);
 
                 let wrong_signer: auth_capnp::signer::Client =

@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use system::{get_graft_cap, membrane_capnp, Guest};
+use system::Guest;
 use wit_bindgen::StreamResult;
 
 #[allow(dead_code, clippy::extra_unused_type_parameters)]
@@ -25,6 +25,16 @@ mod auth_capnp {
 }
 
 #[allow(dead_code, clippy::extra_unused_type_parameters)]
+mod routing_capnp {
+    include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
+}
+
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
+mod http_capnp {
+    include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
+}
+
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod stem_capnp {
     include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }
@@ -39,7 +49,7 @@ mod kernel_runtime {
 
 use kernel_runtime::wetware::kernel_runtime::readiness::{kernel_ready, ReadyError};
 
-type Membrane = membrane_capnp::membrane::Client;
+type Membrane = system_capnp::membrane::Client;
 
 const STATUS_COMPONENT_PATH: &str = "bin/status.wasm";
 const STATUS_ROUTE: &str = "/status";
@@ -84,12 +94,29 @@ fn status_component_path(root: &str) -> Result<String, capnp::Error> {
     }
 }
 
-fn write_cap(mut builder: capnp::any_pointer::Builder<'_>, client: capnp::capability::Client) {
-    builder.set_as_capability(client.hook);
+struct StatusMembrane {
+    peer_id: Vec<u8>,
+    stat: system_capnp::stat::Client,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::membrane::Server for StatusMembrane {
+    fn graft(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::membrane::GraftParams,
+        mut results: system_capnp::membrane::GraftResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        let mut graft = results.get();
+        graft.set_peer_id(&self.peer_id);
+        graft.set_stat(self.stat.clone());
+        capnp::capability::Promise::ok(())
+    }
 }
 
 async fn install_status_route(
-    host: &system_capnp::host::Client,
+    peer_id: Vec<u8>,
+    stat: system_capnp::stat::Client,
+    listener: system_capnp::http_listener::Client,
     runtime: &system_capnp::runtime::Client,
 ) -> Result<(), capnp::Error> {
     let root = std::env::var("WW_ROOT")
@@ -103,15 +130,11 @@ async fn install_status_route(
     load.get().set_wasm(&wasm);
     let executor = load.send().pipeline.get_executor();
 
-    let network_response = host.network_request().send().promise.await?;
-    let listener = network_response.get()?.get_http_listener()?;
+    let membrane: Membrane = capnp_rpc::new_client(StatusMembrane { peer_id, stat });
     let mut listen = listener.listen_request();
     listen.get().set_executor(executor);
     listen.get().set_prefix(STATUS_ROUTE);
-    let mut grants = listen.get().init_caps(1);
-    let mut host_grant = grants.reborrow().get(0);
-    host_grant.set_name("host");
-    write_cap(host_grant.init_cap(), host.clone().client);
+    listen.get().set_membrane(membrane);
     listen.send().promise.await?;
 
     log::info!("registered {STATUS_ROUTE} with {path}");
@@ -120,12 +143,25 @@ async fn install_status_route(
 
 async fn initialize(membrane: &Membrane) -> Result<(), capnp::Error> {
     let graft_response = membrane.graft_request().send().promise.await?;
-    let caps = graft_response.get()?.get_caps()?;
-
-    let host: system_capnp::host::Client = get_graft_cap(&caps, "host")?;
-    let runtime: system_capnp::runtime::Client = get_graft_cap(&caps, "runtime")?;
-
-    install_status_route(&host, &runtime).await?;
+    let graft = graft_response.get()?;
+    if !graft.has_peer_id() {
+        return Err(capnp::Error::failed(
+            "Membrane.graft result is missing required peerId".into(),
+        ));
+    }
+    let peer_id = graft.get_peer_id()?.to_vec();
+    if peer_id.is_empty() {
+        return Err(capnp::Error::failed(
+            "Membrane.graft result contains an empty peerId".into(),
+        ));
+    }
+    let http = graft.get_network()?.get_http();
+    if http.has_listener() {
+        let stat = graft.get_stat()?;
+        let listener = http.get_listener()?;
+        let runtime = graft.get_runtime()?;
+        install_status_route(peer_id, stat, listener, &runtime).await?;
+    }
     Ok(())
 }
 

@@ -38,9 +38,9 @@ contains no address, dial operation, socket operation, scheduler state,
 pollable, or explicit flush function. A second `open` call returns the fixed
 `connection already opened` failure.
 
-The host retains the conceptual session used before the P3 migration. PID0's
-host side serves a `Membrane`. An ordinary child's host side serves the
-immutable `InitialGrants` record selected by its parent.
+The host retains the conceptual session used before the P3 migration. PID0 and
+ordinary children both bootstrap a `Membrane`. PID0 receives the broad root
+object. Each child receives the object supplied by its parent.
 
 The PID0 bootstrap direction carries host authority into PID0. Production PID0
 uses `system::run` and does not export a guest bootstrap capability.
@@ -52,7 +52,7 @@ uses `system::run` and does not export a guest bootstrap capability.
 1. Open the granted transport once.
 2. Adapt its P3 byte streams to `futures::io::AsyncRead` and `AsyncWrite`.
 3. Construct a Cap'n Proto `VatNetwork` and real `RpcSystem`.
-4. Bootstrap the host `Membrane` or `InitialGrants` capability.
+4. Bootstrap the host-provided `Membrane` capability.
 5. Optionally expose one guest bootstrap capability to the host.
 
 The generated P3 task composes `RpcSystem` and transport completion with the
@@ -137,27 +137,20 @@ rejects `wasi:sockets` imports.
 ## PID0 bootstrap
 
 The host serves a process-local `Membrane` to PID0. `Membrane.graft()` returns
-the canonical exports available for the current generation:
-
-- `identity`, when a signing key is configured;
-- `host`;
-- `runtime`;
-- `routing-finder`;
-- `routing-announcer`;
-- `authority`;
-- `ipfs`;
-- `http-client`, when an outbound HTTP allowlist is configured.
+typed `peerId`, `stat`, `network`, `routing`, `runtime`, `authority`,
+`identity`, and `ipfs` fields. `extras` contains only application-defined
+named capabilities.
 
 Graft-issued host capabilities retain PID0's `EpochGuard`.
 
 ## Ordinary-child bootstrap
 
-The host serves `InitialGrants` to an ordinary child. `InitialGrants.get()`
-returns exactly the immutable `List(Export)` selected by the parent. The host
-does not add PID0 exports to this record.
-
-An ordinary child cannot call `Membrane.graft()`. A child receives fresh host
-authority only through explicit ancestor delegation or a new process.
+The host forwards the `Membrane` supplied to `Executor.spawn()` unchanged as
+the ordinary child's bootstrap. Stream and HTTP listener registrations also
+forward one registration-time `Membrane` to each spawned child. Repeated graft
+calls cannot recover fields omitted by that Membrane implementation. A child
+receives fresh host authority only through explicit ancestor delegation or a
+new process.
 
 ## Network service boundary
 
@@ -179,9 +172,9 @@ login. Epoch expiry stops both accept loops.
 `VatClient.dial` starts its client-side `RpcSystem` before a typed method waits
 for a result. The first typed response reports bootstrap or transport failure.
 
-`StreamListener.listen` spawns one process per inbound stream, supplies the
-registration-time initial grants, and pumps bytes through process stdin and
-stdout. `StreamDialer.dial` returns a bidirectional `ByteStream` capability.
+`StreamListener.listen` spawns one process per inbound stream, forwards the
+registration-time `Membrane`, and pumps bytes through process stdin and stdout.
+`StreamDialer.dial` returns a bidirectional `ByteStream` capability.
 
 `HttpListener.listen` creates an HTTP route, spawns one process per request,
 supplies CGI environment variables and request bytes, and reads the CGI

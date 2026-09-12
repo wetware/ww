@@ -83,18 +83,18 @@ Present one row at a time, explain each, check in.
 | Unix | Wetware | Key difference |
 |------|---------|---------------|
 | process | Cell | Cell = WASM binary in a sandbox. No ambient env, host filesystem, or sockets. The linker provides only declared P3 interfaces. A process can do anything the OS allows; a Cell can only do what its capabilities permit. |
-| fork/exec | `runtime.load(wasm)` → `executor.spawn()` | Parent explicitly passes capabilities to child.  No inheritance of open fds, env vars, or fs access — you grant exactly what the child needs. |
+| fork/exec | `runtime.load(wasm)` → `executor.spawn()` | Parent explicitly passes one `Membrane` to the child. No inheritance of open fds, env vars, or fs access occurs. The child's graft exposes only the selected typed fields and `extras`. |
 | file descriptor | Cap'n Proto client | Both are opaque handles.  But Unix fds live in a global namespace (paths) — any process can `open("/etc/passwd")`.  A capnp client is unforgeable and can only be obtained by explicit handoff. |
-| syscall table | Membrane → `graft()` | Both are the interface to kernel services. The syscall table is fixed and ambient. `graft()` returns a `List(Export)` of named capability references. Only trusted PID0 receives the graft-capable `Membrane`. |
+| syscall table | Membrane → `graft()` | Both are the interface to kernel services. `graft()` returns statically named typed fields. PID0 and children receive different implementations of the same interface. |
 | `ioctl(fd, ...)` | method call on cap | Both operate on a handle. Cap'n Proto calls are typed, async, and pipelined. A caller can pipeline `Executor.spawn()` on the result of `Runtime.load(wasm)`. |
 | filesystem | WASI VFS over IPFS + `$WW_ROOT` | The immutable image root is read through the P3 virtual filesystem. A private writable `/tmp` is the only writable preopen. Content is content-addressed, not ambient host filesystem access. |
-| `open()` returns fd | `graft()` returns `List(Export)` | `open()` grants access to anything the path resolves to. `graft()` returns named references such as `identity`, `host`, `runtime`, `routing`, `authority`, and `ipfs`; `http-client` is conditional. Omitted exports are absent, not null. |
+| `open()` returns fd | `graft()` returns typed fields | `graft()` returns metadata, value structs, and capability references. Withheld capability fields are null. Application-defined capabilities can use `extras`. |
 | signals | epoch lifecycle | Unix signals are fire-and-forget. An epoch advance makes host-issued capabilities stale. The Host terminates the old PID0 and starts a fresh PID0 for the new generation. |
 | pipe | `ByteStream` (`capnp/system.capnp`) | Both connect two processes via read/write.  But ByteStream is a capability — it can be passed to third parties, attenuated, or revoked. |
 | `bind()`/`listen()` | `StreamListener.listen()` / `VatListener.serveAuthenticated()` | Unix: any process can bind any port. Wetware requires an explicit listener capability. Vat publication serves an existing capability and does not spawn a process. |
 | semaphore / mutex | E-ordering (capnp objects) | No explicit locks.  Each capnp object serializes its own method calls — the object IS the lock.  Cross-object calls are concurrent; use pipelining to express ordering. |
 | ring 0 / ring 3 boundary | Membrane | The Membrane is the ring transition.  In x86 the `syscall` instruction crosses from ring 3 to ring 0.  In Wetware, `graft()` crosses from Cell to host.  The Membrane controls what's on the other side — like the IDT controls which kernel handlers userspace can invoke. |
-| init (pid 1) | pid0 (kernel Cell) | Both are the first process that sets up everything else.  pid0 receives the Membrane, decides policy, spawns children with attenuated caps.  The kernel IS a Cell. |
+| init (pid 1) | pid0 (kernel Cell) | Both are the first process that sets up everything else. pid0 receives the root `Membrane`, decides policy, and passes parent-selected `Membrane` references to children. The kernel IS a Cell. |
 
 **The punchline:** the fd analogy is the closest match —
 Cap'n Proto clients really are like userspace file descriptors.
@@ -125,9 +125,8 @@ Then show what capnp adds on top:
    is a global back-channel for minting new fds.  Capnp clients
    have no equivalent — you can't conjure one from a string.
 2. **Typed + composable.**  Fds are bags of bytes with `ioctl`.
-   Capnp clients have typed methods — you can wrap a Host cap
-   to remove `network()` and hand the restricted version to a
-   child.  Same interface, fewer methods.
+   Capnp clients have typed methods. A parent can withhold a `Network` leaf or
+   wrap one granted interface to allow only selected methods.
 3. **Async pipelining.**  Every fd `read()`/`write()` is a
    blocking round-trip.  Capnp lets you chain calls on promises:
    pipeline `Executor.spawn()` on the result of `Runtime.load(wasm)`.
@@ -196,8 +195,8 @@ Key files: `doc/capabilities.md`, `doc/architecture.md`
 
 On-chain coordination: when the epoch advances, host-issued capabilities
 become stale. The Host terminates the old PID0, prepares the effective root,
-and starts one new PID0 for the accepted generation. Ordinary children cannot
-re-graft.
+and starts one new PID0 for the accepted generation. Re-grafting a child
+Membrane cannot recover omitted authority.
 
 ### Images
 

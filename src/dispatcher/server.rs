@@ -244,6 +244,7 @@ mod tests {
                     root: None,
                 });
                 let registry = new_registry();
+                let membrane = authority::membrane_client(epoch_rx.clone(), b"test-peer");
                 let listener: system_capnp::http_listener::Client =
                     capnp_rpc::new_client(rpc::http_listener::HttpListenerImpl::new(
                         EpochGuard {
@@ -257,6 +258,7 @@ mod tests {
                     .get()
                     .set_executor(capnp_rpc::new_client(DispatchTestExecutor));
                 listen.get().set_prefix("/status");
+                listen.get().set_membrane(membrane);
                 listen
                     .send()
                     .promise

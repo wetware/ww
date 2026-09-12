@@ -27,28 +27,27 @@ The `WW_CELL_MODE` envvar identifies application plumbing:
 | absent | process input/output | process-local P3 RPC transport; PID0 receives a `Membrane` |
 
 The trusted PID0 implementation is `std/kernel`, which is embedded in `ww` by
-default. PID0 uses the granted P3 transport for Cap'n Proto RPC. It alone
-receives the process-local, graft-capable `Membrane`.
+default. PID0 uses the granted P3 transport for Cap'n Proto RPC. PID0 receives
+the broad process-local root `Membrane`. Each ordinary child receives the
+parent-selected `Membrane` supplied to its spawn or listener registration.
 
 Architecture (three layers):
 - **Host** (`ww` binary): boots a libp2p swarm, prepares each effective
   `CidTree` root, and owns PID0 replacement across epochs.
 - **Kernel** (`std/kernel`): calls `membrane.graft()` once, loads
-  `$WW_ROOT/bin/status.wasm`, grants `host`, installs `/status`, calls
+  `$WW_ROOT/bin/status.wasm`, passes a narrow status `Membrane`, installs `/status`, calls
   `kernel_ready()`, and normally remains alive until Host termination.
   Interactive `WW_TTY` execution can also end on stdin EOF.
-- **Ordinary children**: spawned with an immutable `InitialAuthorityRecord`
-  delivered by `InitialGrants`; they do not receive `Membrane.graft()`.
+- **Ordinary children**: spawned with the `Membrane` reference selected by the
+  parent. The host forwards that object as the child bootstrap.
 
 Key abstractions:
-- **Membrane**: process-local, graft-capable authority issuance for PID0. It is
-  not the ordinary-child bootstrap or a bare `/ww/0.1.0` network payload.
-- **InitialGrants**: the grants-only ordinary-child bootstrap. It returns the
-  exact parent-selected record and has no refresh, graft, or lookup API.
+- **Membrane**: the common Cell bootstrap interface. Root and child servers
+  return different typed authority surfaces from the same `graft()` method.
 - **Epoch lifecycle**: an advance stales host-issued guarded references. The
   Host terminates the old PID0, prepares the effective root, and starts a fresh
   PID0 for the new generation.
-  Children cannot refresh themselves.
+  Repeated child grafts cannot recover omitted authority.
 - **FHS images**: layers are stacked with per-file union.  Later
   layers override earlier ones.
 - **Cap'n Proto RPC**: bidirectional -- both host and guest can serve
@@ -60,15 +59,17 @@ The Host↔PID0 ABI is version 3. No ABI-v2 compatibility shim exists.
 Wetware does not embed an LLM. "Agent" means any autonomous process: AI,
 human, or script. Wetware controls the authority available to that process.
 
-Capabilities after pid0 grafting (ordinary children receive only explicitly
-granted entries):
+Typed fields after PID0 grafting. Ordinary children receive only fields held by
+their parent-selected Membrane:
 
 | Capability | Purpose |
 |------------|---------|
-| Host | Peer identity, addresses, peer management |
+| peerId | Stable copied node identity metadata |
+| Stat | Current listen addresses and connected-peer count |
+| Network | Grouped nullable stream, vat, and HTTP authority |
 | Runtime | Load WASM binaries, obtain scoped Executors |
-| Finder (`routing-finder`) | Bounded, deduplicated Kademlia provider discovery |
-| Announcer (`routing-announcer`) | Announce the Wetware host PeerID for an owner epoch |
+| Finder (`routing.finder`) | Bounded, deduplicated Kademlia provider discovery |
+| Announcer (`routing.announcer`) | Announce the Wetware host PeerID for an owner epoch |
 | Identity | Host-side signing (private key never enters WASM) |
 | HttpClient | Outbound HTTP requests |
 | StreamListener / StreamDialer | P2P byte streams for raw cells |

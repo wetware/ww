@@ -336,7 +336,7 @@ jobs:
         test -s target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
 
     - name: Run host workspace tests (hot cache from build job)
-      run: cargo test --workspace
+      run: cargo test --workspace -- --test-threads=2
       env:
         WW_TEST_REQUIRE_KUBO: "1"
         WW_USE_PREBUILT_AUTHORITY_PROBE: "1"

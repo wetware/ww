@@ -76,10 +76,10 @@
       "z": 56,
       "group": "THE AUTHORITY PATH",
       "title": "Trusted pid0 kernel",
-      "subtitle": "The only local process that can graft node authority.",
+      "subtitle": "The initial recipient of the root Membrane and root authority.",
       "files": ["std/kernel/src/lib.rs", "src/kernel.rs"],
-      "what": "Pid0 receives the process-local root `Membrane`. The default Rust implementation grafts `host` and `runtime`, installs the `/status` composition, and commits readiness for its captured epoch.",
-      "built": "`src/kernel.rs` resolves pid0 bytes and records their CID. `std/kernel/src/lib.rs` runs the default Rust composition through `system::run`. The private `kernel-ready` import is installed only for pid0."
+      "what": "Pid0 receives the process-local root `Membrane`. The default Rust implementation grafts its typed authority once, installs `/status` with a narrow child `Membrane`, and commits readiness for its captured epoch.",
+      "built": "`src/kernel.rs` resolves pid0 bytes and records their CID. `std/kernel/src/lib.rs` reads `peerId`, `stat`, `network.http.listener`, and `runtime` from the graft. The private `kernel-ready` import is installed only for pid0."
     },
     {
       "key": "status",
@@ -94,8 +94,8 @@
       "title": "Default `/status` composition",
       "subtitle": "The Rust pid0 installs the shipped status cell.",
       "files": ["std/kernel/src/lib.rs"],
-      "what": "The default Rust pid0 reads `bin/status.wasm`, loads it through `Runtime`, and registers the result at `/status`. The status cell receives only the explicit `host` grant. Other guest components need an application-specific composition path.",
-      "built": "`install_status_route` reads the component from the image root, calls `Runtime.load`, and asks the host HTTP listener to register the executor. The pid0 uses the process-local root membrane directly and does not publish it through the composition."
+      "what": "The default Rust pid0 reads `bin/status.wasm`, loads it through `Runtime`, and registers the result at `/status`. The status cell receives a `Membrane` containing only `peerId` and `stat`. Other guest components need an application-specific composition path.",
+      "built": "`install_status_route` reads the component from the image root, calls `Runtime.load`, constructs the narrow status `Membrane`, and passes it to `HttpListener.listen`. The listener forwards that same capability to each request child."
     },
     {
       "key": "runtime",
@@ -124,10 +124,10 @@
       "z": 45,
       "group": "THE AUTHORITY PATH",
       "title": "Image-bound executor",
-      "subtitle": "Spawns a cell with explicit grants.",
+      "subtitle": "Spawns a cell with one explicit Membrane.",
       "files": ["src/launcher.rs"],
-      "what": "`Executor.spawn(args, env, grants)` creates a process for one pinned binary. A child receives the exact parent-selected named grants and fixed computation substrate.",
-      "built": "`src/launcher.rs` bridges Cap’n Proto RPC requests to `cell::Builder`. Executors do not contain a `Runtime` or ambient host authority."
+      "what": "`Executor.spawn(args, env, membrane, fuelPolicy)` creates a process for one pinned binary. The host forwards the exact parent-selected `Membrane` as the child's bootstrap capability.",
+      "built": "`src/launcher.rs` bridges Cap’n Proto RPC requests to `cell::Builder` and retains the supplied `Membrane` for the child lifecycle. Executors do not contain a `Runtime` or ambient node authority."
     },
     {
       "key": "membrane",
@@ -139,11 +139,11 @@
       "h": 70,
       "z": 50,
       "group": "THE AUTHORITY PATH",
-      "title": "Capability membrane",
-      "subtitle": "Attenuates a reference and preserves the restriction.",
-      "files": ["crates/membrane/src/lib.rs", "crates/rpc/src/routing.rs", "capnp/routing.capnp"],
-      "what": "The membrane enforces an allowlist at the Cap’n Proto hook level. It also re-wraps returned, pipelined, and resolved capabilities so an allowed call cannot escape the policy.",
-      "built": "`Policy` checks every call through the wrapped `ClientHook`. `crates/rpc` provides independent provider `Finder` and `Announcer` servers, initial grants, streams, and HTTP listeners. Finder and Announcer remain separately graftable and delegable."
+      "title": "Typed capability Membrane",
+      "subtitle": "Carries one parent-selected authority surface.",
+      "files": ["capnp/system.capnp", "crates/authority/src/membrane.rs", "crates/membrane/src/lib.rs"],
+      "what": "`Membrane.graft()` returns fixed platform authority through typed fields and application-defined capabilities through `extras`. A parent can wrap individual capability references with method policy before placing them in either surface.",
+      "built": "`MembraneServer` populates the graft from the references it holds. `Policy` enforces method allowlists on wrapped `ClientHook` values and re-wraps returned, pipelined, and resolved capabilities."
     },
     {
       "key": "cell",
@@ -158,7 +158,7 @@
       "title": "Isolated WASM cell",
       "subtitle": "A process with no ambient node authority.",
       "files": ["crates/cell/src/lib.rs", "crates/cell/src/routing_key.rs", "crates/guest/routing-key/wit/key.wit"],
-      "what": "A cell has local computation, spawn-selected arguments and environment, stdio, clocks, randomness, and a private writable `/tmp`. Application authority arrives only through explicit grants.",
+      "what": "A cell has local computation, spawn-selected arguments and environment, stdio, clocks, randomness, and a private writable `/tmp`. RPC authority arrives through one parent-selected `Membrane`.",
       "built": "`crates/cell` contains Wasmtime process execution, image mounting, stream plumbing, filesystem interception, fuel scheduling, and virtual filesystems. Components can optionally import pure CIDv1/raw/BLAKE3 routing-key derivation. `WW_CELL_MODE` selects vat, raw, HTTP, or pid0 stdio behavior."
     },
     {
@@ -175,7 +175,7 @@
       "subtitle": "Carries typed capability calls.",
       "files": ["crates/rpc/src/lib.rs", "crates/rpc/src/routing.rs"],
       "what": "RPC connects cells to host-provided capabilities through in-memory duplex streams. It also carries vat service calls over libp2p streams between peers.",
-      "built": "`crates/rpc` implements grafts, initial authority records, named capabilities, independent provider discovery and announcement, stream dialing and listening, WAGI, and connection budgets."
+      "built": "`crates/rpc` implements root graft construction, application-defined `extras`, independent provider discovery and announcement, Membrane-forwarding listeners, WAGI, and connection budgets."
     },
     {
       "key": "swarm",

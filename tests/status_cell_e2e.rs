@@ -2,19 +2,18 @@
 //!
 //! Spawns the real status WASM via Runtime/Executor with WAGI CGI env
 //! vars, reads the CGI response from stdout, asserts the JSON body's
-//! shape AND that `peer_id` is a non-null base58 string.
+//! shape and that required `peer_id` is a non-empty base58 string.
 //!
-//! The `peer_id` non-null assertion is the load-bearing one: it proves
-//! an explicitly supplied `host` grant reaches the WAGI cell's bounded
-//! initial-authority bootstrap. Without it, a regression would let `peer_id:
-//! null` slip through even though the test otherwise "passes."
+//! The `peer_id` assertion proves that the narrow status Membrane
+//! reaches the WAGI cell. The same Membrane supplies a `Stat` capability.
 //!
 //! Requires pre-built status WASM: `make -C std/status`.
 
 #[path = "support/ticked_executor.rs"]
 mod ticked_executor;
 
-use tokio::sync::{mpsc, watch};
+use capnp::capability::Promise;
+use tokio::sync::watch;
 
 use ww::dispatcher::wagi;
 use ww::launcher::create_runtime_client;
@@ -38,8 +37,62 @@ fn synth_peer_id_bytes() -> Vec<u8> {
     libp2p::PeerId::from_public_key(&kp.public()).to_bytes()
 }
 
+#[derive(Clone)]
+struct StatusGraft {
+    network_state: NetworkState,
+}
+
+struct StatusStat {
+    network_state: NetworkState,
+    guard: authority::EpochGuard,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::stat::Server for StatusStat {
+    fn snapshot(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::stat::SnapshotParams,
+        mut results: system_capnp::stat::SnapshotResults,
+    ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.guard.check() {
+            return Promise::err(error);
+        }
+        let network_state = self.network_state.clone();
+        let guard = self.guard.clone();
+        Promise::from_future(async move {
+            let snapshot = network_state.snapshot().await;
+            guard.check()?;
+            let mut stat = results.get().init_stat();
+            let mut addrs = stat
+                .reborrow()
+                .init_listen_addrs(snapshot.listen_addrs.len() as u32);
+            for (index, address) in snapshot.listen_addrs.iter().enumerate() {
+                addrs.set(index as u32, address);
+            }
+            stat.set_connected_peer_count(snapshot.connected_peer_count);
+            Ok(())
+        })
+    }
+}
+
+impl authority::GraftBuilder for StatusGraft {
+    fn build(
+        &self,
+        guard: &authority::EpochGuard,
+        mut builder: system_capnp::membrane::graft_results::Builder<'_>,
+    ) -> Result<(), capnp::Error> {
+        builder.set_peer_id(self.network_state.local_peer_id());
+        let stat: system_capnp::stat::Client = capnp_rpc::new_client(StatusStat {
+            network_state: self.network_state.clone(),
+            guard: guard.clone(),
+        });
+        builder.set_stat(stat);
+        Ok(())
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
-async fn status_cell_serves_json_with_non_null_peer_id() {
+async fn status_cell_serves_json_with_required_peer_id() {
     if !status_wasm_exists() {
         eprintln!("skipping: {STATUS_WASM_PATH} not built (run `make -C std/status` first)");
         return;
@@ -50,12 +103,8 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
         .run_until(async {
             // ── Set up an in-process runtime with a known peer ID ───────
             //
-            // Runtime/Executor carries no ambient host authority. Construct
-            // the one host capability this status child needs and grant it
-            // explicitly in the spawn request below.
-            let network_state = NetworkState::new();
             let peer_id_bytes = synth_peer_id_bytes();
-            network_state.set_local_peer_id(peer_id_bytes.clone()).await;
+            let network_state = NetworkState::from_peer_id(peer_id_bytes.clone());
 
             let epoch = authority::Epoch {
                 seq: 1,
@@ -67,9 +116,6 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
                 issued_seq: 1,
                 receiver: epoch_rx.clone(),
             };
-            let stream_control = libp2p_stream::Behaviour::new().new_control();
-
-            let (swarm_tx, _swarm_rx) = mpsc::channel(16);
             // The real status Cell runs on the production shared Engine. The
             // retained ExecutorPool advances its epoch every 10 ms.
             let ticked = TickedExecutor::new();
@@ -80,13 +126,9 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
                 None,
                 CachePolicy::Shared,
             );
-            let host: system_capnp::host::Client = capnp_rpc::new_client(ww::rpc::HostImpl::new(
-                network_state,
-                swarm_tx,
-                false,
-                guard,
-                Some(stream_control),
-            ));
+            let membrane: system_capnp::membrane::Client = capnp_rpc::new_client(
+                authority::MembraneServer::new(epoch_rx, StatusGraft { network_state }),
+            );
 
             // Load the status WASM.
             let wasm = std::fs::read(STATUS_WASM_PATH).expect("failed to read status.wasm");
@@ -116,12 +158,7 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
                 for (i, e) in env.iter().enumerate() {
                     env_list.set(i as u32, e);
                 }
-                let mut caps = builder.init_caps(1);
-                let mut host_grant = caps.reborrow().get(0);
-                host_grant.set_name("host");
-                host_grant
-                    .init_cap()
-                    .set_as_capability(host.client.clone().hook);
+                builder.set_membrane(membrane);
             }
             let spawn_resp = spawn_req
                 .send()
@@ -214,14 +251,12 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
                 json["version"]
             );
 
-            // CRITICAL: peer_id must be non-null. This is what proves the
-            // `host` cap actually reached the WAGI cell's membrane. If it
-            // came back null, capability propagation regressed and the
-            // engagement starter kit's pitch is hollow.
+            // Missing peer_id means the narrow Membrane did not provide its
+            // required stable metadata.
             let peer_id = json["peer_id"].as_str().unwrap_or_else(|| {
                 panic!(
-                    "peer_id MUST be a non-null base58 string — \
-                     null indicates the host cap did not reach the cell. \
+                    "peer_id MUST be a non-empty base58 string — \
+                     missing metadata indicates the Membrane did not reach the cell. \
                      Body: {body}"
                 )
             });
@@ -238,8 +273,8 @@ async fn status_cell_serves_json_with_non_null_peer_id() {
             );
 
             // listen_addrs and peer_count should be non-null arrays/integers
-            // (NetworkState was seeded with a peer ID; addrs/peers default
-            // to empty but not null).
+            // (NetworkState was seeded with a peer ID; mutable statistics
+            // default to zero values, not null).
             assert!(
                 json["listen_addrs"].is_array(),
                 "listen_addrs should be an array, got: {}",

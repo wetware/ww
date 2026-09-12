@@ -517,7 +517,6 @@ impl Generation {
             writer,
             bootstrap.network_state,
             bootstrap.swarm_cmd_tx,
-            runtime_inputs.wasm_debug,
             guard.receiver.clone(),
             readiness_gate.clone(),
             Some(bootstrap.signing_key),

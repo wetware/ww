@@ -327,7 +327,7 @@ async fn assert_status_route(client: &reqwest::Client, http_addr: SocketAddr, no
         status["peer_id"]
             .as_str()
             .is_some_and(|peer| !peer.is_empty()),
-        "real status cell must receive the host grant: {status}"
+        "real status cell must receive its narrow Membrane: {status}"
     );
 }
 
@@ -374,7 +374,7 @@ async fn assert_status_cell(
         status["peer_id"]
             .as_str()
             .is_some_and(|peer| !peer.is_empty()),
-        "real status cell must receive the host grant: {status}"
+        "real status cell must receive its narrow Membrane: {status}"
     );
 }
 

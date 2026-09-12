@@ -41,16 +41,11 @@ mod auth_capnp {
 }
 
 #[allow(dead_code, clippy::extra_unused_type_parameters)]
-mod membrane_capnp {
-    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
-}
-
-#[allow(dead_code, clippy::extra_unused_type_parameters)]
 mod http_capnp {
     include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
 }
 
-type InitialGrants = membrane_capnp::initial_grants::Client;
+type Membrane = system_capnp::membrane::Client;
 
 fn random_u64() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -85,21 +80,60 @@ struct NamedCap {
     cap: AnyClient,
 }
 
+struct ExtrasMembrane {
+    extras: Vec<NamedCap>,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::membrane::Server for ExtrasMembrane {
+    fn graft(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::membrane::GraftParams,
+        mut results: system_capnp::membrane::GraftResults,
+    ) -> Promise<(), capnp::Error> {
+        let mut graft = results.get();
+        graft.set_peer_id(b"authority-probe-child");
+        let mut extras = graft.init_extras(self.extras.len() as u32);
+        for (index, extra) in self.extras.iter().enumerate() {
+            let mut entry = extras.reborrow().get(index as u32);
+            entry.set_name(&extra.name);
+            entry.init_cap().set_as_capability(extra.cap.clone().hook);
+        }
+        Promise::ok(())
+    }
+}
+
+fn extras_membrane(extras: Vec<NamedCap>) -> Membrane {
+    capnp_rpc::new_client(ExtrasMembrane { extras })
+}
+
 fn text_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-async fn read_initial_grants(grants: &InitialGrants) -> Result<Vec<NamedCap>, capnp::Error> {
-    let response = grants.get_request().send().promise.await?;
-    let caps = response.get()?.get_caps()?;
+async fn read_extras(membrane: &Membrane) -> Result<Vec<NamedCap>, capnp::Error> {
+    let response = membrane.graft_request().send().promise.await?;
+    let caps = response.get()?.get_extras()?;
     let mut result = Vec::with_capacity(caps.len() as usize);
+    let mut names = std::collections::HashSet::with_capacity(caps.len() as usize);
     for entry in caps.iter() {
+        let name = entry
+            .get_name()?
+            .to_str()
+            .map_err(|error| capnp::Error::failed(error.to_string()))?
+            .to_owned();
+        if name.is_empty() {
+            return Err(capnp::Error::failed(
+                "capability name must not be empty".into(),
+            ));
+        }
+        if !names.insert(name.clone()) {
+            return Err(capnp::Error::failed(format!(
+                "duplicate capability name '{name}'"
+            )));
+        }
         result.push(NamedCap {
-            name: entry
-                .get_name()?
-                .to_str()
-                .map_err(|error| capnp::Error::failed(error.to_string()))?
-                .to_owned(),
+            name,
             cap: entry
                 .get_cap()
                 .get_as_capability::<capnp::capability::Client>()?,
@@ -138,10 +172,67 @@ fn optional_result<T: serde::Serialize, E: std::fmt::Display>(
     result.map(value_or_error).unwrap_or(Value::Null)
 }
 
+fn authority_presence(
+    graft: system_capnp::membrane::graft_results::Reader<'_>,
+) -> Result<Value, capnp::Error> {
+    let network = graft.get_network()?;
+    let stream = network.get_stream();
+    let vat = network.get_vat();
+    let http = network.get_http();
+    let routing = graft.get_routing()?;
+    Ok(json!({
+        "stat": graft.has_stat(),
+        "network": {
+            "stream": {
+                "listener": stream.has_listener(),
+                "dialer": stream.has_dialer(),
+            },
+            "vat": {
+                "listener": vat.has_listener(),
+                "dialer": vat.has_dialer(),
+            },
+            "http": {
+                "listener": http.has_listener(),
+                "dialer": http.has_dialer(),
+            },
+        },
+        "routing": {
+            "finder": routing.has_finder(),
+            "announcer": routing.has_announcer(),
+        },
+        "runtime": graft.has_runtime(),
+        "authority": graft.has_authority(),
+        "identity": graft.has_identity(),
+        "ipfs": graft.has_ipfs(),
+    }))
+}
+
+async fn run_inspect_authority() -> Result<(), capnp::Error> {
+    system::run(|membrane: Membrane| async move {
+        let result: Result<Value, capnp::Error> = async {
+            let response = membrane.graft_request().send().promise.await?;
+            authority_presence(response.get()?)
+        }
+        .await;
+        emit(match result {
+            Ok(detail) => {
+                json!({"mode": "inspect-authority", "ok": true, "detail": detail})
+            }
+            Err(error) => json!({
+                "mode": "inspect-authority",
+                "ok": false,
+                "error": text_error(error),
+            }),
+        });
+        Ok(())
+    })
+    .await
+}
+
 async fn run_enumerate() -> Result<(), capnp::Error> {
-    system::run(|initial_grants: InitialGrants| async move {
-        let first = read_initial_grants(&initial_grants).await;
-        let second = read_initial_grants(&initial_grants).await;
+    system::run(|membrane: Membrane| async move {
+        let first = read_extras(&membrane).await;
+        let second = read_extras(&membrane).await;
         emit(json!({
             "mode": "enumerate",
             "first": value_or_error(first.as_ref().map(|caps| names(caps))),
@@ -164,10 +255,12 @@ impl system_capnp::vat_listener::Server for ReentrantListener {
         let callback = pry!(pry!(params.get())
             .get_cap()
             .get_as_capability::<capnp::capability::Client>());
-        let callback = system_capnp::host::Client::new(callback.hook);
+        let callback = system_capnp::runtime::Client::new(callback.hook);
 
         Promise::from_future(async move {
-            callback.id_request().send().promise.await?;
+            let mut load = callback.load_request();
+            load.get().set_wasm(&[]);
+            load.send().promise.await?;
             Ok(())
         })
     }
@@ -185,44 +278,53 @@ impl system_capnp::vat_listener::Server for ReentrantListener {
 
 async fn run_reentrant_callback() -> Result<(), capnp::Error> {
     let listener: system_capnp::vat_listener::Client = capnp_rpc::new_client(ReentrantListener);
-    system::serve(
-        listener.client,
-        |_initial_grants: InitialGrants| async move { std::future::pending().await },
-    )
+    system::serve(listener.client, |_membrane: Membrane| async move {
+        std::future::pending().await
+    })
     .await
 }
 
-async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value {
-    let caps = match read_initial_grants(&initial_grants).await {
-        Ok(caps) => caps,
-        Err(error) => {
-            return json!({"mode": "invoke", "name": requested, "ok": false, "error": text_error(error)});
-        }
-    };
-
+async fn invoke_named(membrane: Membrane, requested: String) -> Value {
     let result: Result<Value, capnp::Error> = async {
+        let response = membrane.graft_request().send().promise.await?;
+        let graft = response.get()?;
+        let caps = graft.get_extras()?;
+        let mut extras = Vec::with_capacity(caps.len() as usize);
+        for entry in caps.iter() {
+            extras.push(NamedCap {
+                name: entry
+                    .get_name()?
+                    .to_str()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?
+                    .to_owned(),
+                cap: entry
+                    .get_cap()
+                    .get_as_capability::<capnp::capability::Client>()?,
+            });
+        }
         match requested.as_str() {
-            "host" => {
-                let host: system_capnp::host::Client = find_cap(&caps, &requested)?;
-                let id = host.id_request().send().promise.await?;
-                let peer_id = id.get()?.get_peer_id()?.to_vec();
-                let network = host.network_request().send().promise.await?;
-                let network = network.get()?;
-                let _ = network.get_stream_listener()?;
-                let _ = network.get_stream_dialer()?;
-                let _ = network.get_vat_listener()?;
-                let _ = network.get_vat_client()?;
-                let _ = network.get_http_listener()?;
-                Ok(json!({"peer_id": peer_id, "network_caps": true}))
+            "peer-id" => {
+                if !graft.has_peer_id() {
+                    return Err(capnp::Error::failed("peerId is withheld".into()));
+                }
+                Ok(json!({"peer_id": graft.get_peer_id()?.to_vec()}))
             }
-            "ambient-parent" | "alias-a" | "alias-b" | "status-source" | "narrow"
-            | "delegated-x" | "tracked" => {
-                let host: system_capnp::host::Client = find_cap(&caps, &requested)?;
-                let id = host.id_request().send().promise.await?;
-                Ok(json!({"peer_id": id.get()?.get_peer_id()?.to_vec()}))
+            "stat" => {
+                if !graft.has_stat() {
+                    return Err(capnp::Error::failed("stat is withheld".into()));
+                }
+                let stat = graft.get_stat()?.snapshot_request().send().promise.await?;
+                let stat = stat.get()?.get_stat()?;
+                Ok(json!({
+                    "listen_addrs": stat.get_listen_addrs()?.len(),
+                    "connected_peer_count": stat.get_connected_peer_count(),
+                }))
             }
             "runtime" => {
-                let runtime: system_capnp::runtime::Client = find_cap(&caps, &requested)?;
+                if !graft.has_runtime() {
+                    return Err(capnp::Error::failed("runtime is withheld".into()));
+                }
+                let runtime = graft.get_runtime()?;
                 let mut load = runtime.load_request();
                 load.get().set_wasm(&[]);
                 let executor = load.send().promise.await?.get()?.get_executor()?;
@@ -239,17 +341,28 @@ async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value
                 Ok(json!({"executor_obtained": true, "executor_cid": cid}))
             }
             "routing-finder" => {
-                let finder: routing_capnp::finder::Client = find_cap(&caps, &requested)?;
+                let routing = graft.get_routing()?;
+                if !routing.has_finder() {
+                    return Err(capnp::Error::failed("routing.finder is withheld".into()));
+                }
+                let finder = routing.get_finder()?;
                 let (providers, done) = call_finder(&finder, 0).await?;
                 Ok(json!({"providers": providers, "done": done}))
             }
             "routing-announcer" => {
-                let announcer: routing_capnp::announcer::Client = find_cap(&caps, &requested)?;
+                let routing = graft.get_routing()?;
+                if !routing.has_announcer() {
+                    return Err(capnp::Error::failed("routing.announcer is withheld".into()));
+                }
+                let announcer = routing.get_announcer()?;
                 call_announcer(&announcer).await?;
                 Ok(json!({"provide": true}))
             }
             "identity" => {
-                let identity: auth_capnp::identity::Client = find_cap(&caps, &requested)?;
+                if !graft.has_identity() {
+                    return Err(capnp::Error::failed("identity is withheld".into()));
+                }
+                let identity = graft.get_identity()?;
                 let mut signer = identity.signer_request();
                 signer.get().set_domain("authority-probe");
                 let signer = signer.send().promise.await?.get()?.get_signer()?;
@@ -260,8 +373,11 @@ async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value
                 Ok(json!({"signature_len": signature_len}))
             }
             "authority" => {
-                let authority: auth_capnp::authority::Client = find_cap(&caps, &requested)?;
-                let session: auth_capnp::opaque_session::Client = find_cap(&caps, "host")?;
+                if !graft.has_authority() {
+                    return Err(capnp::Error::failed("authority is withheld".into()));
+                }
+                let authority = graft.get_authority()?;
+                let session: auth_capnp::opaque_session::Client = find_cap(&extras, "session")?;
                 let mut guard = authority.guard_request();
                 guard.get().set_session(session);
                 {
@@ -286,7 +402,10 @@ async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value
                 }))
             }
             "ipfs" => {
-                let ipfs: system_capnp::ipfs::Client = find_cap(&caps, &requested)?;
+                if !graft.has_ipfs() {
+                    return Err(capnp::Error::failed("ipfs is withheld".into()));
+                }
+                let ipfs = graft.get_ipfs()?;
                 let mut request = ipfs.read_request();
                 request
                     .get()
@@ -302,8 +421,113 @@ async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value
                     "read_bytes": bytes.len(),
                 }))
             }
-            "http-client" => {
-                let http: http_capnp::http_client::Client = find_cap(&caps, &requested)?;
+            "stream-listener" => {
+                let network = graft.get_network()?;
+                if !network.get_stream().has_listener() {
+                    return Err(capnp::Error::failed(
+                        "network.stream.listener is withheld".into(),
+                    ));
+                }
+                let listener = network.get_stream().get_listener()?;
+                let executor: system_capnp::executor::Client = find_cap(&extras, "bound-executor")?;
+                let mut request = listener.listen_request();
+                request.get().set_executor(executor);
+                request.get().set_protocol("authority-probe");
+                request.get().set_membrane(membrane.clone());
+                request.send().promise.await?;
+                Ok(json!({"rpc_reached": true}))
+            }
+            "stream-dialer" => {
+                let network = graft.get_network()?;
+                if !network.get_stream().has_dialer() {
+                    return Err(capnp::Error::failed(
+                        "network.stream.dialer is withheld".into(),
+                    ));
+                }
+                let dialer = network.get_stream().get_dialer()?;
+                let mut request = dialer.dial_request();
+                request.get().set_peer(b"authority-probe-peer");
+                request.get().set_protocol("authority-probe");
+                let stream = request.send().promise.await?.get()?.get_stream()?;
+                let mut read = stream.read_request();
+                read.get().set_max_bytes(1);
+                let bytes = read.send().promise.await?.get()?.get_data()?.to_vec();
+                Ok(json!({"rpc_reached": true, "read_bytes": bytes.len()}))
+            }
+            "vat-listener" => {
+                let network = graft.get_network()?;
+                if !network.get_vat().has_listener() {
+                    return Err(capnp::Error::failed(
+                        "network.vat.listener is withheld".into(),
+                    ));
+                }
+                let listener = network.get_vat().get_listener()?;
+                let executor: system_capnp::executor::Client = find_cap(&extras, "bound-executor")?;
+                let mut request = listener.serve_raw_request();
+                request
+                    .get()
+                    .init_cap()
+                    .set_as_capability(executor.client.hook);
+                request.get().set_protocol("authority-probe");
+                request.send().promise.await?;
+                Ok(json!({"rpc_reached": true}))
+            }
+            "vat-dialer" => {
+                let network = graft.get_network()?;
+                if !network.get_vat().has_dialer() {
+                    return Err(capnp::Error::failed(
+                        "network.vat.dialer is withheld".into(),
+                    ));
+                }
+                let dialer = network.get_vat().get_dialer()?;
+                let mut request = dialer.dial_request();
+                request.get().set_peer(b"authority-probe-peer");
+                request.get().set_protocol("authority-probe");
+                let cap = request
+                    .send()
+                    .promise
+                    .await?
+                    .get()?
+                    .get_cap()
+                    .get_as_capability::<capnp::capability::Client>()?;
+                let executor = system_capnp::executor::Client::new(cap.hook);
+                let cid = executor
+                    .cid_request()
+                    .send()
+                    .promise
+                    .await?
+                    .get()?
+                    .get_cid()?
+                    .to_str()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?
+                    .to_owned();
+                Ok(json!({"rpc_reached": true, "executor_cid": cid}))
+            }
+            "http-listener" => {
+                let network = graft.get_network()?;
+                if !network.get_http().has_listener() {
+                    return Err(capnp::Error::failed(
+                        "network.http.listener is withheld".into(),
+                    ));
+                }
+                let listener = network.get_http().get_listener()?;
+                let executor: system_capnp::executor::Client = find_cap(&extras, "bound-executor")?;
+                let mut request = listener.listen_request();
+                request.get().set_executor(executor);
+                request.get().set_prefix("/authority-probe");
+                request.get().set_membrane(membrane.clone());
+                request.send().promise.await?;
+                Ok(json!({"rpc_reached": true}))
+            }
+            "http-dialer" => {
+                let network = graft.get_network()?;
+                let http_group = network.get_http();
+                if !http_group.has_dialer() {
+                    return Err(capnp::Error::failed(
+                        "network.http.dialer is withheld".into(),
+                    ));
+                }
+                let http = http_group.get_dialer()?;
                 let mut request = http.get_request();
                 let url = std::env::var("WW_PROBE_HTTP_URL")
                     .map_err(|error| capnp::Error::failed(error.to_string()))?;
@@ -314,9 +538,23 @@ async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value
                 let response = request.send().promise.await?;
                 Ok(json!({"rpc_reached": true, "status": response.get()?.get_status()}))
             }
-            other => Err(capnp::Error::failed(format!(
-                "no typed invocation registered for '{other}'"
-            ))),
+            other => {
+                let runtime: system_capnp::runtime::Client = find_cap(&extras, other)?;
+                let mut load = runtime.load_request();
+                load.get().set_wasm(&[]);
+                let executor = load.send().promise.await?.get()?.get_executor()?;
+                let cid = executor
+                    .cid_request()
+                    .send()
+                    .promise
+                    .await?
+                    .get()?
+                    .get_cid()?
+                    .to_str()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?
+                    .to_owned();
+                Ok(json!({"cid": cid}))
+            }
         }
     }
     .await;
@@ -330,9 +568,9 @@ async fn invoke_named(initial_grants: InitialGrants, requested: String) -> Value
 }
 
 async fn run_invoke() -> Result<(), capnp::Error> {
-    let requested = std::env::var("WW_PROBE_CAP").unwrap_or_else(|_| "host".to_owned());
-    system::run(|initial_grants: InitialGrants| async move {
-        emit(invoke_named(initial_grants, requested).await);
+    let requested = std::env::var("WW_PROBE_CAP").unwrap_or_else(|_| "peer-id".to_owned());
+    system::run(|membrane: Membrane| async move {
+        emit(invoke_named(membrane, requested).await);
         Ok(())
     })
     .await
@@ -341,8 +579,8 @@ async fn run_invoke() -> Result<(), capnp::Error> {
 async fn run_arbitrary_name() -> Result<(), capnp::Error> {
     let requested =
         std::env::var("WW_PROBE_NAME").unwrap_or_else(|_| "definitely-not-granted".to_owned());
-    system::run(|initial_grants: InitialGrants| async move {
-        let value = match read_initial_grants(&initial_grants).await {
+    system::run(|membrane: Membrane| async move {
+        let value = match read_extras(&membrane).await {
             Ok(caps) => {
                 let matching: Vec<_> = caps
                     .iter()
@@ -370,21 +608,24 @@ async fn run_arbitrary_name() -> Result<(), capnp::Error> {
 }
 
 async fn run_alias_redelivery() -> Result<(), capnp::Error> {
-    system::run(|initial_grants: InitialGrants| async move {
+    system::run(|membrane: Membrane| async move {
         let result: Result<Value, capnp::Error> = async {
             let deliveries = [
-                read_initial_grants(&initial_grants).await?,
-                read_initial_grants(&initial_grants).await?,
+                read_extras(&membrane).await?,
+                read_extras(&membrane).await?,
             ];
             let mut observed = Vec::new();
             for (delivery, caps) in deliveries.iter().enumerate() {
                 for name in ["alias-a", "alias-b"] {
-                    let host: system_capnp::host::Client = find_cap(caps, name)?;
-                    let response = host.id_request().send().promise.await?;
+                    let runtime: system_capnp::runtime::Client = find_cap(caps, name)?;
+                    let mut load = runtime.load_request();
+                    load.get().set_wasm(&[]);
+                    let executor = load.send().promise.await?.get()?.get_executor()?;
+                    let response = executor.cid_request().send().promise.await?;
                     observed.push(json!({
                         "delivery": delivery + 1,
                         "name": name,
-                        "peer_id": response.get()?.get_peer_id()?.to_vec(),
+                        "cid": response.get()?.get_cid()?.to_str().map_err(|error| capnp::Error::failed(error.to_string()))?,
                     }));
                 }
             }
@@ -403,25 +644,38 @@ async fn run_alias_redelivery() -> Result<(), capnp::Error> {
 }
 
 async fn run_attenuated() -> Result<(), capnp::Error> {
-    system::run(|initial_grants: InitialGrants| async move {
+    system::run(|membrane: Membrane| async move {
         let result: Result<Value, capnp::Error> = async {
-            let caps = read_initial_grants(&initial_grants).await?;
-            let names = names(&caps);
-            let host: system_capnp::host::Client = find_cap(&caps, "attenuated-host")?;
-            let id = host.id_request().send().promise.await?;
-            let peer_id = id.get()?.get_peer_id()?.to_vec();
-            let denied = match host.network_request().send().promise.await {
+            let response = membrane.graft_request().send().promise.await?;
+            let graft = response.get()?;
+            if !graft.has_runtime() {
+                return Err(capnp::Error::failed("runtime is withheld".into()));
+            }
+            let runtime = graft.get_runtime()?;
+            let mut load = runtime.load_request();
+            load.get().set_wasm(&[]);
+            let executor = load.send().promise.await?.get()?.get_executor()?;
+            let cid_denied = match executor.cid_request().send().promise.await {
                 Ok(_) => {
                     return Err(capnp::Error::failed(
-                        "attenuated host unexpectedly allowed network".into(),
+                        "recursively attenuated Executor unexpectedly allowed cid".into(),
+                    ))
+                }
+                Err(error) => error,
+            };
+            let shutdown_denied = match runtime.shutdown_request().send().promise.await {
+                Ok(_) => {
+                    return Err(capnp::Error::failed(
+                        "attenuated runtime unexpectedly allowed shutdown".into(),
                     ))
                 }
                 Err(error) => error,
             };
             Ok(json!({
-                "names": names,
-                "peer_id": peer_id,
-                "denied": denied.to_string(),
+                "extras": names(&read_extras(&membrane).await?),
+                "executor_returned": true,
+                "cid_denied": cid_denied.to_string(),
+                "shutdown_denied": shutdown_denied.to_string(),
             }))
         }
         .await;
@@ -438,10 +692,15 @@ async fn run_trusted_lattice() -> Result<(), capnp::Error> {
     let image = std::env::var("WW_PROBE_IMAGE")
         .unwrap_or_else(|_| "runtime-selected-image".to_owned())
         .into_bytes();
-    system::run(|initial_grants: InitialGrants| async move {
+    system::run(|membrane: Membrane| async move {
         let result: Result<Value, capnp::Error> = async {
-            let caps = read_initial_grants(&initial_grants).await?;
-            let runtime: system_capnp::runtime::Client = find_cap(&caps, "runtime")?;
+            let response = membrane.graft_request().send().promise.await?;
+            let graft = response.get()?;
+            if !graft.has_runtime() {
+                return Err(capnp::Error::failed("runtime is withheld".into()));
+            }
+            let caps = read_extras(&membrane).await?;
+            let runtime = graft.get_runtime()?;
             let bound: system_capnp::executor::Client = find_cap(&caps, "bound-executor")?;
 
             let mut load = runtime.load_request();
@@ -468,7 +727,8 @@ async fn run_trusted_lattice() -> Result<(), capnp::Error> {
                 .map_err(|error| capnp::Error::failed(error.to_string()))?
                 .to_owned();
             Ok(json!({
-                "names": names(&caps),
+                "extras": names(&caps),
+                "runtime": true,
                 "selected_cid": selected_cid,
                 "bound_cid": bound_cid,
                 "different_images": selected_cid != bound_cid,
@@ -487,17 +747,37 @@ async fn run_trusted_lattice() -> Result<(), capnp::Error> {
 }
 
 async fn run_epoch_http_listen() -> Result<(), capnp::Error> {
-    system::run(|initial_grants: InitialGrants| async move {
+    system::run(|membrane: Membrane| async move {
         let result: Result<(), capnp::Error> = async {
-            let caps = read_initial_grants(&initial_grants).await?;
-            let host: system_capnp::host::Client = find_cap(&caps, "host")?;
-            let executor: system_capnp::executor::Client = find_cap(&caps, "bound-executor")?;
-            let network = host.network_request().send().promise.await?;
-            let listener = network.get()?.get_http_listener()?;
+            let response = membrane.graft_request().send().promise.await?;
+            let graft = response.get()?;
+            let caps = graft.get_extras()?;
+            let mut extras = Vec::with_capacity(caps.len() as usize);
+            for entry in caps.iter() {
+                extras.push(NamedCap {
+                    name: entry
+                        .get_name()?
+                        .to_str()
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?
+                        .to_owned(),
+                    cap: entry
+                        .get_cap()
+                        .get_as_capability::<capnp::capability::Client>()?,
+                });
+            }
+            let executor: system_capnp::executor::Client = find_cap(&extras, "bound-executor")?;
+            let network = graft.get_network()?;
+            let http = network.get_http();
+            if !http.has_listener() {
+                return Err(capnp::Error::failed(
+                    "network.http.listener is withheld".into(),
+                ));
+            }
+            let listener = http.get_listener()?;
             let mut listen = listener.listen_request();
             listen.get().set_executor(executor);
             listen.get().set_prefix("/epoch-probe");
-            listen.get().init_caps(0);
+            listen.get().set_membrane(membrane.clone());
             listen.send().promise.await?;
             Ok(())
         }
@@ -517,13 +797,11 @@ async fn run_epoch_http_listen() -> Result<(), capnp::Error> {
 }
 
 async fn run_late_delegation() -> Result<(), capnp::Error> {
-    system::run(|initial_grants: InitialGrants| async move {
+    system::run(|membrane: Membrane| async move {
         let result: Result<Value, capnp::Error> = async {
-            let initial = read_initial_grants(&initial_grants).await?;
+            let initial = read_extras(&membrane).await?;
             let initial_names = names(&initial);
-            let mailbox: system_capnp::host::Client = find_cap(&initial, "mailbox")?;
-            let network = mailbox.network_request().send().promise.await?;
-            let vat_client = network.get()?.get_vat_client()?;
+            let vat_client: system_capnp::vat_client::Client = find_cap(&initial, "mailbox")?;
             let mut receive = vat_client.dial_request();
             receive.get().set_peer(&[]);
             receive.get().set_protocol("late-delegation");
@@ -534,17 +812,27 @@ async fn run_late_delegation() -> Result<(), capnp::Error> {
                 .get()?
                 .get_cap()
                 .get_as_capability::<AnyClient>()?;
-            let delegated: system_capnp::host::Client =
-                system_capnp::host::Client::new(delegated.hook);
-            let response = delegated.id_request().send().promise.await?;
-            let peer_id = response.get()?.get_peer_id()?.to_vec();
-            let after_names = names(&read_initial_grants(&initial_grants).await?);
+            let delegated = system_capnp::runtime::Client::new(delegated.hook);
+            let mut load = delegated.load_request();
+            load.get().set_wasm(&[]);
+            let executor = load.send().promise.await?.get()?.get_executor()?;
+            let cid = executor
+                .cid_request()
+                .send()
+                .promise
+                .await?
+                .get()?
+                .get_cid()?
+                .to_str()
+                .map_err(|error| capnp::Error::failed(error.to_string()))?
+                .to_owned();
+            let after_names = names(&read_extras(&membrane).await?);
             Ok(json!({
                 "initial_names": initial_names,
                 "received_later": ["delegated-x"],
                 "current_holdings": ["mailbox", "delegated-x"],
                 "after_names": after_names,
-                "delegated_peer_id": peer_id,
+                "delegated_cid": cid,
             }))
         }
         .await;
@@ -560,20 +848,26 @@ async fn run_late_delegation() -> Result<(), capnp::Error> {
 }
 
 async fn run_invoke_all() -> Result<(), capnp::Error> {
-    system::run(|initial_grants: InitialGrants| async move {
+    system::run(|membrane: Membrane| async move {
         let mut results = Vec::new();
         let mut usable = Vec::new();
         for name in [
-            "host",
+            "peer-id",
+            "stat",
+            "stream-listener",
+            "stream-dialer",
+            "vat-listener",
+            "vat-dialer",
+            "http-listener",
+            "http-dialer",
             "runtime",
             "routing-finder",
             "routing-announcer",
             "authority",
             "identity",
             "ipfs",
-            "http-client",
         ] {
-            let result = invoke_named(initial_grants.clone(), name.to_owned()).await;
+            let result = invoke_named(membrane.clone(), name.to_owned()).await;
             if result["ok"] == true {
                 usable.push(name);
             }
@@ -640,39 +934,44 @@ async fn call_announcer(announcer: &routing_capnp::announcer::Client) -> Result<
 }
 
 async fn run_provider_routing(mode: &'static str) -> Result<(), capnp::Error> {
-    system::run(|initial_grants: InitialGrants| async move {
+    system::run(|membrane: Membrane| async move {
         let result: Result<Value, capnp::Error> = async {
-            let caps = read_initial_grants(&initial_grants).await?;
+            let response = membrane.graft_request().send().promise.await?;
+            let graft = response.get()?;
+            let routing = graft.get_routing()?;
             match mode {
                 "routing-finder" => {
-                    let finder: routing_capnp::finder::Client = find_cap(&caps, "routing-finder")?;
+                    if !routing.has_finder() {
+                        return Err(capnp::Error::failed("routing.finder is withheld".into()));
+                    }
+                    let finder = routing.get_finder()?;
                     let (providers, done) = call_finder(&finder, 3).await?;
-                    let wrong: routing_capnp::announcer::Client =
-                        find_cap(&caps, "routing-finder")?;
-                    let announcer_cast_rejected = call_announcer(&wrong).await.is_err();
                     Ok(json!({
                         "find_providers": true,
                         "providers": providers,
                         "done": done,
-                        "announcer_cast_rejected": announcer_cast_rejected,
+                        "announcer_withheld": !routing.has_announcer(),
                     }))
                 }
                 "routing-announcer" => {
-                    let announcer: routing_capnp::announcer::Client =
-                        find_cap(&caps, "routing-announcer")?;
+                    if !routing.has_announcer() {
+                        return Err(capnp::Error::failed("routing.announcer is withheld".into()));
+                    }
+                    let announcer = routing.get_announcer()?;
                     call_announcer(&announcer).await?;
-                    let wrong: routing_capnp::finder::Client =
-                        find_cap(&caps, "routing-announcer")?;
-                    let finder_cast_rejected = call_finder(&wrong, 0).await.is_err();
                     Ok(json!({
                         "provide": true,
-                        "finder_cast_rejected": finder_cast_rejected,
+                        "finder_withheld": !routing.has_finder(),
                     }))
                 }
                 "routing-both" => {
-                    let finder: routing_capnp::finder::Client = find_cap(&caps, "routing-finder")?;
-                    let announcer: routing_capnp::announcer::Client =
-                        find_cap(&caps, "routing-announcer")?;
+                    if !routing.has_finder() || !routing.has_announcer() {
+                        return Err(capnp::Error::failed(
+                            "routing finder or announcer is withheld".into(),
+                        ));
+                    }
+                    let finder = routing.get_finder()?;
+                    let announcer = routing.get_announcer()?;
                     call_announcer(&announcer).await?;
                     let (providers, done) = call_finder(&finder, 3).await?;
                     Ok(json!({
@@ -680,7 +979,7 @@ async fn run_provider_routing(mode: &'static str) -> Result<(), capnp::Error> {
                         "find_providers": true,
                         "providers": providers,
                         "done": done,
-                        "explicit_refs": ["routing-finder", "routing-announcer"],
+                        "typed_fields": ["finder", "announcer"],
                     }))
                 }
                 _ => Err(capnp::Error::failed(format!(
@@ -713,10 +1012,9 @@ async fn read_all(stream: system_capnp::byte_stream::Client) -> Result<Vec<u8>, 
 }
 
 async fn run_descendant() -> Result<(), capnp::Error> {
-    let http_url = std::env::var("WW_PROBE_HTTP_URL").ok();
-    system::run(|initial_grants: InitialGrants| async move {
+    system::run(|membrane: Membrane| async move {
         let result: Result<Value, capnp::Error> = async {
-            let caps = read_initial_grants(&initial_grants).await?;
+            let caps = read_extras(&membrane).await?;
             let executor: system_capnp::executor::Client = find_cap(&caps, "restricted-executor")?;
             let narrow = caps.iter().find(|entry| entry.name == "narrow");
 
@@ -727,16 +1025,18 @@ async fn run_descendant() -> Result<(), capnp::Error> {
                 args.set(1, "alias-redelivery");
             }
             alias_request.get().init_env(0);
-            if let Some(narrow) = narrow {
-                let mut grants = alias_request.get().init_caps(2);
-                for (index, name) in ["alias-a", "alias-b"].iter().enumerate() {
-                    let mut entry = grants.reborrow().get(index as u32);
-                    entry.set_name(name);
-                    entry.init_cap().set_as_capability(narrow.cap.clone().hook);
-                }
-            } else {
-                alias_request.get().init_caps(0);
-            }
+            let aliases = narrow
+                .map(|narrow| {
+                    ["alias-a", "alias-b"]
+                        .into_iter()
+                        .map(|name| NamedCap {
+                            name: name.to_owned(),
+                            cap: narrow.cap.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            alias_request.get().set_membrane(extras_membrane(aliases));
             let alias_process = alias_request.send().promise.await?.get()?.get_process()?;
             let alias_stdout = alias_process
                 .stdout_request()
@@ -755,15 +1055,12 @@ async fn run_descendant() -> Result<(), capnp::Error> {
             {
                 let mut args = omitted_request.get().init_args(2);
                 args.set(0, "authority-probe");
-                args.set(1, "invoke-all");
+                args.set(1, "inspect-authority");
             }
-            if let Some(http_url) = http_url {
-                let mut env = omitted_request.get().init_env(1);
-                env.set(0, format!("WW_PROBE_HTTP_URL={http_url}"));
-            } else {
-                omitted_request.get().init_env(0);
-            }
-            omitted_request.get().init_caps(0);
+            omitted_request.get().init_env(0);
+            omitted_request
+                .get()
+                .set_membrane(extras_membrane(Vec::new()));
             let omitted_process = omitted_request.send().promise.await?.get()?.get_process()?;
             let omitted_stdout = omitted_process
                 .stdout_request()
@@ -793,16 +1090,14 @@ async fn run_descendant() -> Result<(), capnp::Error> {
     .await
 }
 
-async fn run_raw_host() -> Result<(), capnp::Error> {
-    system::run(|host: system_capnp::host::Client| async move {
-        let result = host.id_request().send().promise.await;
+async fn run_raw_runtime() -> Result<(), capnp::Error> {
+    system::run(|runtime: system_capnp::runtime::Client| async move {
+        let mut load = runtime.load_request();
+        load.get().set_wasm(&[]);
+        let result = load.send().promise.await;
         emit(match result {
-            Ok(response) => json!({
-                "mode": "raw-host",
-                "ok": true,
-                "peer_id": response.get().and_then(|r| r.get_peer_id()).map(|v| v.to_vec()).unwrap_or_default(),
-            }),
-            Err(error) => json!({"mode": "raw-host", "ok": false, "error": text_error(error)}),
+            Ok(_) => json!({"mode": "raw-runtime", "ok": true}),
+            Err(error) => json!({"mode": "raw-runtime", "ok": false, "error": text_error(error)}),
         });
         Ok(())
     })
@@ -810,7 +1105,7 @@ async fn run_raw_host() -> Result<(), capnp::Error> {
 }
 
 async fn run_substrate() -> Result<(), capnp::Error> {
-    system::run(|_initial_grants: InitialGrants| async move {
+    system::run(|_membrane: Membrane| async move {
         let args: Vec<String> = std::env::args().collect();
         let env: Vec<(String, String)> = std::env::vars().collect();
         let root = std::fs::read_dir("/").map(|entries| {
@@ -867,7 +1162,7 @@ async fn run_substrate() -> Result<(), capnp::Error> {
 }
 
 async fn run_scratch_observe() -> Result<(), capnp::Error> {
-    system::run(|_initial_grants: InitialGrants| async move {
+    system::run(|_membrane: Membrane| async move {
         let path = "/tmp/authority-probe-private";
         let observed_before_write = std::path::Path::new(path).exists();
         let write = std::fs::write(path, b"sibling").map_err(text_error);
@@ -882,9 +1177,9 @@ async fn run_scratch_observe() -> Result<(), capnp::Error> {
 }
 
 async fn run_scratch_parent() -> Result<(), capnp::Error> {
-    system::run(|initial_grants: InitialGrants| async move {
+    system::run(|membrane: Membrane| async move {
         let result: Result<Value, capnp::Error> = async {
-            let caps = read_initial_grants(&initial_grants).await?;
+            let caps = read_extras(&membrane).await?;
             let executor: system_capnp::executor::Client = find_cap(&caps, "restricted-executor")?;
             let path = "/tmp/authority-probe-private";
             std::fs::write(path, b"parent")
@@ -897,7 +1192,7 @@ async fn run_scratch_parent() -> Result<(), capnp::Error> {
                 args.set(1, "scratch-observe");
             }
             spawn.get().init_env(0);
-            spawn.get().init_caps(0);
+            spawn.get().set_membrane(extras_membrane(Vec::new()));
             let child = spawn.send().promise.await?.get()?.get_process()?;
             let stdout = child
                 .stdout_request()
@@ -930,6 +1225,35 @@ async fn run_scratch_parent() -> Result<(), capnp::Error> {
     .await
 }
 
+async fn run_no_graft() -> Result<(), capnp::Error> {
+    system::run(|_membrane: Membrane| async move {
+        emit(json!({"mode": "no-graft", "ok": true}));
+        Ok(())
+    })
+    .await
+}
+
+async fn run_stateful_graft() -> Result<(), capnp::Error> {
+    system::run(|membrane: Membrane| async move {
+        let mut peer_ids = Vec::new();
+        for _ in 0..2 {
+            let response = membrane.graft_request().send().promise.await?;
+            let graft = response.get()?;
+            if !graft.has_peer_id() {
+                return Err(capnp::Error::failed("peerId is missing".into()));
+            }
+            peer_ids.push(graft.get_peer_id()?.to_vec());
+        }
+        emit(json!({
+            "mode": "stateful-graft",
+            "ok": true,
+            "peer_ids": peer_ids,
+        }));
+        Ok(())
+    })
+    .await
+}
+
 struct AuthorityProbe;
 
 impl Guest for AuthorityProbe {
@@ -943,15 +1267,18 @@ impl Guest for AuthorityProbe {
             Some("epoch-http-listen") => run_epoch_http_listen().await,
             Some("late-delegation") => run_late_delegation().await,
             Some("invoke-all") => run_invoke_all().await,
+            Some("inspect-authority") => run_inspect_authority().await,
             Some("routing-finder") => run_provider_routing("routing-finder").await,
             Some("routing-announcer") => run_provider_routing("routing-announcer").await,
             Some("routing-both") => run_provider_routing("routing-both").await,
             Some("descendant") => run_descendant().await,
-            Some("raw-host") => run_raw_host().await,
+            Some("raw-runtime") => run_raw_runtime().await,
             Some("substrate") => run_substrate().await,
             Some("scratch-observe") => run_scratch_observe().await,
             Some("scratch-parent") => run_scratch_parent().await,
             Some("reentrant-callback") => run_reentrant_callback().await,
+            Some("no-graft") => run_no_graft().await,
+            Some("stateful-graft") => run_stateful_graft().await,
             _ => run_enumerate().await,
         };
         result.map_err(|error| {
@@ -961,3 +1288,85 @@ impl Guest for AuthorityProbe {
 }
 
 system::export!(AuthorityProbe);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use capnp::traits::{Imbue, ImbueMut};
+
+    struct LeakedStreamListener;
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::stream_listener::Server for LeakedStreamListener {
+        fn listen(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::stream_listener::ListenParams,
+            _results: system_capnp::stream_listener::ListenResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::ok(())
+        }
+    }
+
+    #[test]
+    fn withheld_authority_is_reported_from_null_typed_pointers() {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut graft =
+                message.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
+            graft.set_peer_id(b"test-peer");
+            graft.init_extras(0);
+        }
+        let graft = message
+            .get_root_as_reader::<system_capnp::membrane::graft_results::Reader<'_>>()
+            .expect("graft reader");
+
+        assert_eq!(
+            authority_presence(graft).expect("inspect typed graft pointers"),
+            json!({
+                "stat": false,
+                "network": {
+                    "stream": {"listener": false, "dialer": false},
+                    "vat": {"listener": false, "dialer": false},
+                    "http": {"listener": false, "dialer": false},
+                },
+                "routing": {"finder": false, "announcer": false},
+                "runtime": false,
+                "authority": false,
+                "identity": false,
+                "ipfs": false,
+            })
+        );
+    }
+
+    #[test]
+    fn listener_presence_is_detected_without_bound_executor_extra() {
+        let listener: system_capnp::stream_listener::Client =
+            capnp_rpc::new_client(LeakedStreamListener);
+        let mut message = capnp::message::Builder::new_default();
+        let mut cap_table = Vec::new();
+        {
+            let mut graft =
+                message.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
+            graft.imbue_mut(&mut cap_table);
+            graft.set_peer_id(b"test-peer");
+            graft
+                .reborrow()
+                .init_network()
+                .init_stream()
+                .set_listener(listener);
+            graft.init_extras(0);
+        }
+        let mut graft = message
+            .get_root_as_reader::<system_capnp::membrane::graft_results::Reader<'_>>()
+            .expect("graft reader");
+        graft.imbue(&cap_table);
+
+        assert_eq!(
+            graft.get_extras().expect("extras").len(),
+            0,
+            "the leaked listener fixture must omit bound-executor"
+        );
+        let presence = authority_presence(graft).expect("inspect typed graft pointers");
+        assert_eq!(presence["network"]["stream"]["listener"], true);
+    }
+}

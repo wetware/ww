@@ -9,7 +9,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use libp2p::core::connection::ConnectedPoint;
 use libp2p::kad;
 use libp2p::kad::store::RecordStore;
 use libp2p::swarm::dial_opts::DialOpts;
@@ -702,7 +701,7 @@ impl Net {
         network_state: NetworkState,
         mut cmd_rx: mpsc::Receiver<SwarmCommand>,
     ) -> Result<()> {
-        let mut known_peers: HashMap<PeerId, PeerInfo> = HashMap::new();
+        let mut connected_peers: HashSet<PeerId> = HashSet::new();
         let mut pending_connects: HashMap<PeerId, Vec<oneshot::Sender<Result<(), String>>>> =
             HashMap::new();
 
@@ -861,26 +860,10 @@ impl Net {
                                 );
                             }
                         }
-                        SwarmEvent::ConnectionEstablished {
-                            peer_id,
-                            endpoint,
-                            ..
-                        } => {
-                            let addrs = match endpoint {
-                                ConnectedPoint::Dialer { address, .. } => vec![address.to_vec()],
-                                ConnectedPoint::Listener { send_back_addr, .. } => {
-                                    vec![send_back_addr.to_vec()]
-                                }
-                            };
-                            known_peers.insert(
-                                peer_id,
-                                PeerInfo {
-                                    peer_id: peer_id.to_bytes(),
-                                    addrs,
-                                },
-                            );
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            connected_peers.insert(peer_id);
                             network_state
-                                .set_known_peers(known_peers.values().cloned().collect())
+                                .set_connected_peer_count(connected_peers.len())
                                 .await;
 
                             if let Some(senders) = pending_connects.remove(&peer_id) {
@@ -889,10 +872,16 @@ impl Net {
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                            known_peers.remove(&peer_id);
+                        SwarmEvent::ConnectionClosed {
+                            peer_id,
+                            num_established,
+                            ..
+                        } => {
+                            if num_established == 0 {
+                                connected_peers.remove(&peer_id);
+                            }
                             network_state
-                                .set_known_peers(known_peers.values().cloned().collect())
+                                .set_connected_peer_count(connected_peers.len())
                                 .await;
                             clear_pending_relay_attempts(
                                 peer_id,

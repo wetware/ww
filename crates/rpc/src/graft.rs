@@ -1,9 +1,8 @@
-//! Membrane-based RPC bootstrap: epoch-scoped Host + Executor + node identity capabilities.
+//! Membrane-based RPC bootstrap for typed epoch-scoped authority.
 //!
-//! Instead of bootstrapping a bare `Host`, the membrane's `graft()` returns
-//! epoch-scoped `Host`, `Executor`, and a node `identity` signer directly as
-//! result fields. All capabilities fail with `staleEpoch` when the epoch
-//! advances.
+//! `graft()` returns stable peer metadata, live node status, grouped network
+//! and routing references, and other typed authority directly. Host-issued
+//! capabilities fail with `staleEpoch` when the epoch advances.
 //!
 //! The `authority` crate owns the Membrane server and epoch machinery.
 //! This module provides the `GraftBuilder` impl that injects wetware-specific
@@ -11,7 +10,7 @@
 
 use std::sync::Arc;
 
-use authority::{auth_capnp, membrane_capnp, Epoch, EpochGuard, GraftBuilder, MembraneServer};
+use authority::{auth_capnp, Epoch, EpochGuard, GraftBuilder, MembraneServer};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -24,10 +23,7 @@ use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::{
-    ByteStreamImpl, InitialAuthorityRecord, NamedCapabilities, NamedCapability, StreamMode,
-    SwarmCommand,
-};
+use crate::{ByteStreamImpl, NamedCapabilities, StreamMode, SwarmCommand};
 use auth::SigningDomain;
 use authority::http_capnp;
 use authority::routing_capnp;
@@ -53,7 +49,7 @@ pub enum KernelEventCode {
 // EpochGuardedIdentity — host-side node identity hub
 // ---------------------------------------------------------------------------
 
-/// Host-side node identity hub provided to the kernel through the Session.
+/// Host-side node identity hub provided through the root Membrane.
 ///
 /// **Security invariant**: the identity secret key never leaves the host process.
 /// The key is never copied into WASM memory or transmitted over the RPC channel.
@@ -66,7 +62,7 @@ pub enum KernelEventCode {
 /// Incoming domain strings are accepted if non-empty — the guest chooses
 /// the signing context. Empty domains are rejected with an RPC error.
 struct EpochGuardedIdentity {
-    /// Pre-converted libp2p keypair (Ed25519 → Keypair done once at session construction).
+    /// Pre-converted libp2p keypair built once for each root graft.
     keypair: Keypair,
     guard: EpochGuard,
 }
@@ -245,27 +241,62 @@ impl auth_capnp::signer::Server for EpochGuardedDomainSigner {
 }
 
 // ---------------------------------------------------------------------------
-// HostGraftBuilder — GraftBuilder for the concrete stem graft response
+// EpochGuardedStat — coherent node observations without peer topology
+// ---------------------------------------------------------------------------
+struct EpochGuardedStat {
+    network_state: NetworkState,
+    guard: EpochGuard,
+}
+
+#[allow(refining_impl_trait)]
+impl system_capnp::stat::Server for EpochGuardedStat {
+    fn snapshot(
+        self: capnp::capability::Rc<Self>,
+        _params: system_capnp::stat::SnapshotParams,
+        mut results: system_capnp::stat::SnapshotResults,
+    ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.guard.check() {
+            return Promise::err(error);
+        }
+        let network_state = self.network_state.clone();
+        let guard = self.guard.clone();
+        Promise::from_future(async move {
+            let snapshot = network_state.snapshot().await;
+            guard.check()?;
+            let mut stat = results.get().init_stat();
+            let mut addrs = stat
+                .reborrow()
+                .init_listen_addrs(snapshot.listen_addrs.len() as u32);
+            for (index, addr) in snapshot.listen_addrs.iter().enumerate() {
+                addrs.set(index as u32, addr);
+            }
+            stat.set_connected_peer_count(snapshot.connected_peer_count);
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RootMembraneBuilder — root authority construction
 // ---------------------------------------------------------------------------
 
-/// Fills the graft response with epoch-guarded Host, Runtime, provider routing,
-/// HttpClient, and node identity.
+/// Builds the root Membrane's epoch-guarded typed authority.
 ///
 /// **Runtime singleton**: the builder holds a pre-created `runtime::Client` that
 /// points to a single `RuntimeImpl` backend. Every graft clones this client, so
-/// all cells (including children) share the same compilation/executor cache.
+/// every graft recipient that receives this reference shares the same
+/// compilation and executor cache.
 #[derive(Clone)]
-pub struct HostGraftBuilder {
+pub struct RootMembraneBuilder {
     network_state: NetworkState,
     swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
-    wasm_debug: bool,
     signing_key: Option<Arc<SigningKey>>,
     stream_control: libp2p_stream::Control,
     allowed_hosts: Vec<String>,
     route_registry: Option<crate::dispatch::RouteRegistry>,
     /// Pre-created Runtime client (singleton — same backend for every graft).
     runtime_client: system_capnp::runtime::Client,
-    /// Additional named capabilities configured for the graft response.
+    /// Application-defined named capabilities configured for `extras`.
     extras: NamedCapabilities,
     /// IPFS HTTP client for Kubo API calls (e.g. IPNS resolution).
     ipfs_client: ipfs::HttpClient,
@@ -275,12 +306,11 @@ pub struct HostGraftBuilder {
     registration_scope: Option<watch::Receiver<()>>,
 }
 
-impl HostGraftBuilder {
+impl RootMembraneBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         network_state: NetworkState,
         swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
-        wasm_debug: bool,
         signing_key: Option<Arc<SigningKey>>,
         stream_control: libp2p_stream::Control,
         allowed_hosts: Vec<String>,
@@ -290,7 +320,6 @@ impl HostGraftBuilder {
         Self {
             network_state,
             swarm_cmd_tx,
-            wasm_debug,
             signing_key,
             stream_control,
             allowed_hosts,
@@ -321,26 +350,72 @@ impl HostGraftBuilder {
     }
 }
 
-impl HostGraftBuilder {
-    fn build_named_capabilities(
+impl RootMembraneBuilder {
+    fn build_graft(
         &self,
         guard: &EpochGuard,
-    ) -> Result<NamedCapabilities, capnp::Error> {
-        // Build the core capabilities.
-        let mut host_impl = super::HostImpl::new(
-            self.network_state.clone(),
-            self.swarm_cmd_tx.clone(),
-            self.wasm_debug,
-            guard.clone(),
-            Some(self.stream_control.clone()),
+        mut builder: system_capnp::membrane::graft_results::Builder<'_>,
+    ) -> Result<(), capnp::Error> {
+        builder.set_peer_id(self.network_state.local_peer_id());
+
+        let stat: system_capnp::stat::Client = capnp_rpc::new_client(EpochGuardedStat {
+            network_state: self.network_state.clone(),
+            guard: guard.clone(),
+        });
+        builder.set_stat(stat);
+
+        let stream_listener: system_capnp::stream_listener::Client =
+            capnp_rpc::new_client(super::stream_listener::StreamListenerImpl::new(
+                self.stream_control.clone(),
+                guard.clone(),
+            ));
+        let stream_dialer: system_capnp::stream_dialer::Client = capnp_rpc::new_client(
+            super::stream_dialer::StreamDialerImpl::new(self.stream_control.clone(), guard.clone()),
         );
-        if let Some(scope) = self.registration_scope.clone() {
-            host_impl = host_impl.with_registration_scope(scope);
+        let vat_listener: system_capnp::vat_listener::Client = capnp_rpc::new_client(
+            super::vat_listener::VatListenerImpl::new(self.stream_control.clone(), guard.clone()),
+        );
+        let vat_dialer: system_capnp::vat_client::Client = capnp_rpc::new_client(
+            super::vat_client::VatClientImpl::new(self.stream_control.clone(), guard.clone()),
+        );
+        let http_listener: Option<system_capnp::http_listener::Client> =
+            match (&self.route_registry, self.registration_scope.clone()) {
+                (Some(registry), Some(scope)) => Some(capnp_rpc::new_client(
+                    super::http_listener::HttpListenerImpl::new_scoped(
+                        guard.clone(),
+                        registry.clone(),
+                        scope,
+                    ),
+                )),
+                (Some(registry), None) => Some(capnp_rpc::new_client(
+                    super::http_listener::HttpListenerImpl::new(guard.clone(), registry.clone()),
+                )),
+                (None, _) => None,
+            };
+        let http_dialer: Option<http_capnp::http_client::Client> = (!self.allowed_hosts.is_empty())
+            .then(|| {
+                capnp_rpc::new_client(super::http_client::EpochGuardedHttpProxy::new(
+                    self.allowed_hosts.clone(),
+                    guard.clone(),
+                ))
+            });
+
+        {
+            let mut network = builder.reborrow().init_network();
+            let mut stream = network.reborrow().init_stream();
+            stream.set_listener(stream_listener);
+            stream.set_dialer(stream_dialer);
+            let mut vat = network.reborrow().init_vat();
+            vat.set_listener(vat_listener);
+            vat.set_dialer(vat_dialer);
+            let mut http = network.init_http();
+            if let Some(listener) = http_listener {
+                http.set_listener(listener);
+            }
+            if let Some(dialer) = http_dialer {
+                http.set_dialer(dialer);
+            }
         }
-        if let Some(ref registry) = self.route_registry {
-            host_impl = host_impl.with_route_registry(registry.clone());
-        }
-        let host: system_capnp::host::Client = capnp_rpc::new_client(host_impl);
 
         let finder: routing_capnp::finder::Client = capnp_rpc::new_client(
             super::routing::FinderImpl::new(self.swarm_cmd_tx.clone(), guard.clone()),
@@ -351,84 +426,41 @@ impl HostGraftBuilder {
             announcer_impl = announcer_impl.with_registration_scope(scope);
         }
         let announcer: routing_capnp::announcer::Client = capnp_rpc::new_client(announcer_impl);
+        let mut routing = builder.reborrow().init_routing();
+        routing.set_finder(finder);
+        routing.set_announcer(announcer);
 
-        // Collect all capabilities into a flat list of Export entries.
-        let mut entries = Vec::new();
-
-        if let Some(sk) = &self.signing_key {
-            let keypair =
-                crate::keys::to_libp2p(sk).map_err(|e| capnp::Error::failed(e.to_string()))?;
-            let identity: auth_capnp::identity::Client =
-                capnp_rpc::new_client(EpochGuardedIdentity::new(keypair, guard.clone()));
-            entries.push(NamedCapability::new("identity", identity.client)?);
-        }
-
-        entries.push(NamedCapability::new("host", host.client)?);
-        entries.push(NamedCapability::new(
-            "runtime",
-            self.runtime_client.clone().client,
-        )?);
-        entries.push(NamedCapability::new("routing-finder", finder.client)?);
-        entries.push(NamedCapability::new("routing-announcer", announcer.client)?);
+        builder.set_runtime(self.runtime_client.clone());
         let authority: auth_capnp::authority::Client =
             capnp_rpc::new_client(authority::AuthorityServer::new(guard.clone()));
-        entries.push(NamedCapability::new("authority", authority.client)?);
-        let ipfs_cap: system_capnp::ipfs::Client = capnp_rpc::new_client(EpochGuardedIpfs {
+        builder.set_authority(authority);
+
+        if let Some(signing_key) = &self.signing_key {
+            let keypair = crate::keys::to_libp2p(signing_key)
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            let identity: auth_capnp::identity::Client =
+                capnp_rpc::new_client(EpochGuardedIdentity::new(keypair, guard.clone()));
+            builder.set_identity(identity);
+        }
+
+        let ipfs: system_capnp::ipfs::Client = capnp_rpc::new_client(EpochGuardedIpfs {
             guard: guard.clone(),
             ipfs_client: self.ipfs_client.clone(),
         });
-        entries.push(NamedCapability::new("ipfs", ipfs_cap.client)?);
+        builder.set_ipfs(ipfs);
 
-        // Only grant http-client if the operator explicitly opted in via --http-dial.
-        if !self.allowed_hosts.is_empty() {
-            let http_client: http_capnp::http_client::Client =
-                capnp_rpc::new_client(super::http_client::EpochGuardedHttpProxy::new(
-                    self.allowed_hosts.clone(),
-                    guard.clone(),
-                ));
-            entries.push(NamedCapability::new("http-client", http_client.client)?);
-        }
-
-        // Additional entries are encoded separately by the graft builder.
-        // Keep ambient graft entries and parent extras as independently
-        // validated sets. Collision policy between those sets remains a graft
-        // concern until the T3 bootstrap cutover.
-        NamedCapabilities::try_from_iter(entries)
+        let extras = builder.reborrow().init_extras(self.extras.len() as u32);
+        crate::encode_exports(&self.extras, extras)
     }
 }
 
-fn export_count(
-    ambient: &NamedCapabilities,
-    extras: &NamedCapabilities,
-) -> Result<u32, capnp::Error> {
-    ambient
-        .len()
-        .checked_add(extras.len())
-        .ok_or_else(|| capnp::Error::failed("too many capability exports for Cap'n Proto".into()))?
-        .try_into()
-        .map_err(|_| capnp::Error::failed("too many capability exports for Cap'n Proto".into()))
-}
-
-fn encode_graft_capabilities(
-    ambient: &NamedCapabilities,
-    extras: &NamedCapabilities,
-    mut builder: capnp::struct_list::Builder<'_, membrane_capnp::export::Owned>,
-) {
-    for (index, capability) in ambient.iter().chain(extras.iter()).enumerate() {
-        crate::named_capability::encode_export(capability, builder.reborrow().get(index as u32));
-    }
-}
-
-impl GraftBuilder for HostGraftBuilder {
+impl GraftBuilder for RootMembraneBuilder {
     fn build(
         &self,
         guard: &EpochGuard,
-        mut builder: membrane_capnp::membrane::graft_results::Builder<'_>,
+        builder: system_capnp::membrane::graft_results::Builder<'_>,
     ) -> Result<(), capnp::Error> {
-        let ambient = self.build_named_capabilities(guard)?;
-        let count = export_count(&ambient, &self.extras)?;
-        encode_graft_capabilities(&ambient, &self.extras, builder.reborrow().init_caps(count));
-        Ok(())
+        self.build_graft(guard, builder)
     }
 }
 
@@ -440,83 +472,48 @@ impl GraftBuilder for HostGraftBuilder {
 // ---------------------------------------------------------------------------
 
 /// A graft-capable Membrane client used by the host and guest RPC constructors.
-pub type GuestMembrane = authority::membrane_capnp::membrane::Client;
-
-/// Host-provided bootstrap received by an ordinary child.
-pub type ChildInitialGrants = authority::membrane_capnp::initial_grants::Client;
+pub type GuestMembrane = system_capnp::membrane::Client;
 
 /// Guest-exported capability imported by the host and exposed only through the
 /// parent-held `Process.bootstrap()` operation.
 pub type GuestExport = capnp::capability::Client;
 
-/// Closed-delivery server for one immutable child authority record.
-struct InitialGrantsServer {
-    record: InitialAuthorityRecord,
-}
-
-#[allow(refining_impl_trait)]
-impl membrane_capnp::initial_grants::Server for InitialGrantsServer {
-    fn get(
-        self: capnp::capability::Rc<Self>,
-        _params: membrane_capnp::initial_grants::GetParams,
-        mut results: membrane_capnp::initial_grants::GetResults,
-    ) -> Promise<(), capnp::Error> {
-        let count = match self.record.grants().len().try_into() {
-            Ok(count) => count,
-            Err(_) => {
-                return Promise::err(capnp::Error::failed(
-                    "too many initial authority grants for Cap'n Proto".into(),
-                ));
-            }
-        };
-        let caps = results.get().init_caps(count);
-        match self.record.encode(caps) {
-            Ok(()) => Promise::ok(()),
-            Err(error) => Promise::err(error),
-        }
-    }
-}
-
-/// Build the sole ordinary-child RPC/bootstrap path.
-///
-/// The bootstrap contains exactly `record`, including when the record is
-/// empty. It has no host/runtime/routing/identity/IPFS/HTTP inputs and no
-/// alternate constructor selected by missing epoch or stream wiring.
-pub fn build_initial_authority_rpc<R, W>(
+/// Build the ordinary-child RPC path around the exact delegated authority.
+#[doc(hidden)]
+pub fn build_child_membrane_rpc<R, W>(
     reader: R,
     writer: W,
-    record: InitialAuthorityRecord,
+    membrane: GuestMembrane,
 ) -> (RpcSystem<Side>, GuestExport)
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
-    let bootstrap: ChildInitialGrants = capnp_rpc::new_client(InitialGrantsServer { record });
     let rpc_network = VatNetwork::new(
         reader.compat(),
         writer.compat_write(),
         Side::Server,
         Default::default(),
     );
-    let mut rpc_system = RpcSystem::new(Box::new(rpc_network), Some(bootstrap.client));
+    let mut rpc_system = RpcSystem::new(Box::new(rpc_network), Some(membrane.client));
     let guest_export: GuestExport = rpc_system.bootstrap(Side::Client);
     (rpc_system, guest_export)
 }
 
 /// Build the trusted pid0 RPC system with its full graft-capable `Membrane`.
 ///
-/// The membrane provides epoch-scoped sessions containing `Host`, `Executor`,
-/// and (when `signing_key` is `Some`) a host-side node identity signer.
+/// The membrane provides epoch-scoped typed authority and, when configured, a
+/// host-side node identity signer.
 ///
 /// When `signing_key` is `Some`, an [`EpochGuardedIdentity`] hub is injected into
-/// every session so the kernel can request domain-scoped signers without holding
+/// every graft so the kernel can request domain-scoped signers without holding
 /// the private key. Auth (if needed) is handled by wrapping in `TerminalServer`
 /// at the transport layer, not here.
 ///
 /// Process-local graft wrapper. Only the trusted PID0 bootstrap receives a
 /// client for this server.
 struct KernelRootGraftBuilder {
-    inner: HostGraftBuilder,
+    inner: RootMembraneBuilder,
     readiness_gate: Arc<authority::KernelReadyGate>,
     intended_seq: u64,
 }
@@ -525,7 +522,7 @@ impl GraftBuilder for KernelRootGraftBuilder {
     fn build(
         &self,
         guard: &EpochGuard,
-        builder: membrane_capnp::membrane::graft_results::Builder<'_>,
+        builder: system_capnp::membrane::graft_results::Builder<'_>,
     ) -> Result<(), capnp::Error> {
         let live_epoch = guard.receiver.borrow();
         if live_epoch.seq != self.intended_seq {
@@ -544,10 +541,8 @@ impl GraftBuilder for KernelRootGraftBuilder {
             issued_seq: self.intended_seq,
             receiver: guard.receiver.clone(),
         };
-        let ambient = self.inner.build_named_capabilities(&intended_guard)?;
-        let count = export_count(&ambient, &self.inner.extras)?;
+        self.inner.build_graft(&intended_guard, builder)?;
         self.readiness_gate.bind_generation(self.intended_seq);
-        encode_graft_capabilities(&ambient, &self.inner.extras, builder.init_caps(count));
         drop(live_epoch);
         Ok(())
     }
@@ -559,7 +554,6 @@ pub fn build_kernel_membrane_rpc<R, W>(
     writer: W,
     network_state: NetworkState,
     swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
-    wasm_debug: bool,
     epoch_rx: watch::Receiver<Epoch>,
     readiness_gate: Arc<authority::KernelReadyGate>,
     signing_key: Option<Arc<SigningKey>>,
@@ -576,10 +570,9 @@ where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
-    let mut root_builder = HostGraftBuilder::new(
+    let mut root_builder = RootMembraneBuilder::new(
         network_state,
         swarm_cmd_tx,
-        wasm_debug,
         signing_key,
         stream_control,
         http_dial,
@@ -627,6 +620,80 @@ mod tests {
     struct RuntimeStub;
     impl system_capnp::runtime::Server for RuntimeStub {}
 
+    struct StatefulMembrane {
+        grafts: Rc<Cell<u32>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::membrane::Server for StatefulMembrane {
+        fn graft(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::membrane::GraftParams,
+            mut results: system_capnp::membrane::GraftResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let graft = self.grafts.get() + 1;
+            self.grafts.set(graft);
+            results.get().set_peer_id(&graft.to_be_bytes());
+            capnp::capability::Promise::ok(())
+        }
+    }
+
+    struct PendingMembrane {
+        grafts: Rc<Cell<u32>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::membrane::Server for PendingMembrane {
+        fn graft(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::membrane::GraftParams,
+            _results: system_capnp::membrane::GraftResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.grafts.set(self.grafts.get() + 1);
+            capnp::capability::Promise::from_future(std::future::pending())
+        }
+    }
+
+    struct FailingMembrane {
+        grafts: Rc<Cell<u32>>,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::membrane::Server for FailingMembrane {
+        fn graft(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::membrane::GraftParams,
+            _results: system_capnp::membrane::GraftResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.grafts.set(self.grafts.get() + 1);
+            capnp::capability::Promise::err(capnp::Error::failed(
+                "supplied-membrane-failure".into(),
+            ))
+        }
+    }
+
+    fn forward_child_membrane(
+        supplied: system_capnp::membrane::Client,
+    ) -> system_capnp::membrane::Client {
+        let (host_stream, guest_stream) = io::duplex(16 * 1024);
+        let (host_reader, host_writer) = io::split(host_stream);
+        let (guest_reader, guest_writer) = io::split(guest_stream);
+        let (host_rpc, _guest_export) =
+            build_child_membrane_rpc(host_reader, host_writer, supplied);
+        tokio::task::spawn_local(host_rpc.map(|_| ()));
+
+        let guest_network = VatNetwork::new(
+            guest_reader.compat(),
+            guest_writer.compat_write(),
+            Side::Client,
+            Default::default(),
+        );
+        let mut guest_rpc = RpcSystem::new(Box::new(guest_network), None);
+        let membrane = guest_rpc.bootstrap(Side::Server);
+        tokio::task::spawn_local(guest_rpc.map(|_| ()));
+        membrane
+    }
+
     #[derive(Clone)]
     struct CountingGraftBuilder {
         grafts: Rc<Cell<u32>>,
@@ -636,10 +703,11 @@ mod tests {
         fn build(
             &self,
             _guard: &EpochGuard,
-            mut builder: membrane_capnp::membrane::graft_results::Builder<'_>,
+            mut builder: system_capnp::membrane::graft_results::Builder<'_>,
         ) -> Result<(), capnp::Error> {
             self.grafts.set(self.grafts.get() + 1);
-            builder.reborrow().init_caps(0);
+            builder.set_peer_id(b"test-peer");
+            builder.reborrow().init_extras(0);
             Ok(())
         }
     }
@@ -653,7 +721,7 @@ mod tests {
         fn build(
             &self,
             guard: &EpochGuard,
-            builder: membrane_capnp::membrane::graft_results::Builder<'_>,
+            builder: system_capnp::membrane::graft_results::Builder<'_>,
         ) -> Result<(), capnp::Error> {
             self.readiness_gate.bind_generation(guard.issued_seq);
             self.inner.build(guard, builder)
@@ -753,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn pid0_builder_still_emits_the_full_host_graft() {
+    fn root_builder_emits_typed_platform_authority() {
         let epoch = Epoch {
             seq: 1,
             head: b"pid0".to_vec(),
@@ -766,10 +834,9 @@ mod tests {
         };
         let (swarm_tx, _swarm_rx) = mpsc::channel(1);
         let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
-        let builder = HostGraftBuilder::new(
+        let builder = RootMembraneBuilder::new(
             NetworkState::from_peer_id(vec![1, 2, 3]),
             swarm_tx,
-            false,
             Some(Arc::new(gen_signing_key())),
             libp2p_stream::Behaviour::new().new_control(),
             vec!["example.com".into()],
@@ -781,46 +848,34 @@ mod tests {
         let mut cap_table = Vec::new();
         {
             let mut results =
-                message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                message.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
             results.imbue_mut(&mut cap_table);
             builder.build(&guard, results).expect("build pid0 graft");
         }
         let mut results = message
-            .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
+            .get_root_as_reader::<system_capnp::membrane::graft_results::Reader<'_>>()
             .expect("read pid0 graft");
         results.imbue(&cap_table);
-        let names: std::collections::HashSet<_> = results
-            .get_caps()
-            .expect("pid0 caps")
-            .iter()
-            .map(|entry| {
-                entry
-                    .get_name()
-                    .expect("cap name")
-                    .to_str()
-                    .expect("UTF-8 cap name")
-                    .to_owned()
-            })
-            .collect();
-        for expected in [
-            "identity",
-            "host",
-            "runtime",
-            "routing-finder",
-            "routing-announcer",
-            "authority",
-            "ipfs",
-            "http-client",
-        ] {
-            assert!(
-                names.contains(expected),
-                "trusted pid0 graft lost required capability {expected}: {names:?}"
-            );
-        }
+        assert_eq!(results.get_peer_id().expect("peer ID"), &[1, 2, 3]);
+        assert!(results.has_stat());
+        assert!(results.has_runtime());
+        assert!(results.has_authority());
+        assert!(results.has_identity());
+        assert!(results.has_ipfs());
+        let network = results.get_network().expect("network");
+        assert!(network.get_stream().has_listener());
+        assert!(network.get_stream().has_dialer());
+        assert!(network.get_vat().has_listener());
+        assert!(network.get_vat().has_dialer());
+        assert!(network.get_http().has_dialer());
+        let routing = results.get_routing().expect("routing");
+        assert!(routing.has_finder());
+        assert!(routing.has_announcer());
+        assert_eq!(results.get_extras().expect("extras").len(), 0);
     }
 
     #[test]
-    fn external_graft_names_expose_split_provider_authority() {
+    fn root_builder_keeps_application_extras_separate_from_typed_authority() {
         let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(test_epoch(1));
         let guard = EpochGuard {
             issued_seq: 1,
@@ -828,33 +883,37 @@ mod tests {
         };
         let (swarm_tx, _swarm_rx) = mpsc::channel(1);
         let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
-        let builder = HostGraftBuilder::new(
+        let extra_runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
+        let builder = RootMembraneBuilder::new(
             NetworkState::from_peer_id(vec![1, 2, 3]),
             swarm_tx,
-            false,
             Some(Arc::new(gen_signing_key())),
             libp2p_stream::Behaviour::new().new_control(),
             Vec::new(),
             runtime,
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+        )
+        .with_extras(
+            NamedCapabilities::try_from_pairs([("application-extra", extra_runtime.client)])
+                .expect("dynamic extra"),
         );
         let mut message = capnp::message::Builder::new_default();
         let mut cap_table = Vec::new();
         {
             let mut results =
-                message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                message.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
             results.imbue_mut(&mut cap_table);
             builder
                 .build(&guard, results)
                 .expect("build external graft");
         }
         let mut results = message
-            .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
+            .get_root_as_reader::<system_capnp::membrane::graft_results::Reader<'_>>()
             .expect("read external graft");
         results.imbue(&cap_table);
         let names: Vec<_> = results
-            .get_caps()
-            .expect("external caps")
+            .get_extras()
+            .expect("application extras")
             .iter()
             .map(|entry| {
                 entry
@@ -865,18 +924,45 @@ mod tests {
                     .to_owned()
             })
             .collect();
-        assert_eq!(
-            names,
-            [
-                "identity",
-                "host",
-                "runtime",
-                "routing-finder",
-                "routing-announcer",
-                "authority",
-                "ipfs"
-            ]
-        );
+        assert_eq!(names, ["application-extra"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stat_snapshot_reports_mutable_counts_and_becomes_stale() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let state = NetworkState::from_peer_id(b"secret-peer-marker".to_vec());
+                state.add_listen_addr(vec![1, 2, 3]).await;
+                state.set_connected_peer_count(7).await;
+                let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1));
+                let stat: system_capnp::stat::Client = capnp_rpc::new_client(EpochGuardedStat {
+                    network_state: state,
+                    guard: EpochGuard {
+                        issued_seq: 1,
+                        receiver: epoch_rx,
+                    },
+                });
+
+                let response = stat
+                    .snapshot_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("current Stat snapshot");
+                let snapshot = response
+                    .get()
+                    .expect("snapshot results")
+                    .get_stat()
+                    .expect("NodeStat");
+                assert_eq!(snapshot.get_connected_peer_count(), 7);
+                let addrs = snapshot.get_listen_addrs().expect("listen addresses");
+                assert_eq!(addrs.len(), 1);
+                assert_eq!(addrs.get(0).expect("listen address"), &[1, 2, 3]);
+
+                epoch_tx.send_replace(test_epoch(2));
+                assert!(stat.snapshot_request().send().promise.await.is_err());
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -892,10 +978,9 @@ mod tests {
                 let (swarm_tx, _swarm_rx) = mpsc::channel(1);
                 let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
                 let root = KernelRootGraftBuilder {
-                    inner: HostGraftBuilder::new(
+                    inner: RootMembraneBuilder::new(
                         NetworkState::from_peer_id(vec![1, 2, 3]),
                         swarm_tx,
-                        false,
                         None,
                         libp2p_stream::Behaviour::new().new_control(),
                         Vec::new(),
@@ -908,7 +993,7 @@ mod tests {
                 let mut message = capnp::message::Builder::new_default();
                 let mut cap_table = Vec::new();
                 let mut results =
-                    message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                    message.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
                 results.imbue_mut(&mut cap_table);
                 root.build(&guard, results)
                     .expect("build intended PID0 root graft");
@@ -936,10 +1021,9 @@ mod tests {
                 let (swarm_tx, _swarm_rx) = mpsc::channel(1);
                 let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
                 let root = KernelRootGraftBuilder {
-                    inner: HostGraftBuilder::new(
+                    inner: RootMembraneBuilder::new(
                         NetworkState::from_peer_id(vec![1, 2, 3]),
                         swarm_tx,
-                        false,
                         None,
                         libp2p_stream::Behaviour::new().new_control(),
                         Vec::new(),
@@ -953,7 +1037,7 @@ mod tests {
                 let mut cap_table = Vec::new();
                 let error = {
                     let mut results =
-                        message.init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                        message.init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
                     results.imbue_mut(&mut cap_table);
                     root.build(&guard, results)
                         .expect_err("superseded PID0 root graft must fail")
@@ -1039,7 +1123,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn retained_issuing_host_cannot_keep_previous_registration_live() {
+    async fn retained_child_membrane_cannot_keep_previous_registration_live() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1057,10 +1141,9 @@ mod tests {
                 let registry = crate::dispatch::new_registry();
                 let (registration_scope, registration_scope_rx) = watch::channel(());
                 let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(RuntimeStub);
-                let builder = HostGraftBuilder::new(
+                let builder = RootMembraneBuilder::new(
                     NetworkState::from_peer_id(vec![1, 2, 3]),
                     swarm_tx,
-                    false,
                     None,
                     libp2p_stream::Behaviour::new().new_control(),
                     Vec::new(),
@@ -1074,47 +1157,27 @@ mod tests {
                 let mut first_cap_table = Vec::new();
                 {
                     let mut results = first_message
-                        .init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>();
+                        .init_root::<system_capnp::membrane::graft_results::Builder<'_>>();
                     results.imbue_mut(&mut first_cap_table);
                     builder.build(&guard, results).expect("build first graft");
                 }
                 let mut first_results = first_message
-                    .get_root_as_reader::<membrane_capnp::membrane::graft_results::Reader<'_>>()
+                    .get_root_as_reader::<system_capnp::membrane::graft_results::Reader<'_>>()
                     .expect("read first graft");
                 first_results.imbue(&first_cap_table);
-                let first_caps =
-                    crate::decode_exports(first_results.get_caps().expect("first graft caps"))
-                        .expect("decode first graft caps");
-                let host = first_caps
-                    .iter()
-                    .find(|entry| entry.name() == "host")
-                    .map(|entry| system_capnp::host::Client {
-                        client: entry.capability().clone(),
-                    })
-                    .expect("first graft host");
-
-                let network = host
-                    .network_request()
-                    .send()
-                    .promise
-                    .await
-                    .expect("network request")
-                    .get()
-                    .expect("network response")
-                    .get_http_listener()
+                let network = first_results
+                    .get_network()
+                    .expect("network")
+                    .get_http()
+                    .get_listener()
                     .expect("HTTP listener");
-                let retained_host =
-                    NamedCapabilities::try_from_pairs([("issuing-host", host.clone().client)])
-                        .expect("retained issuing host grant");
+                let child_membrane =
+                    authority::membrane_client(guard.receiver.clone(), b"test-peer");
                 let executor: system_capnp::executor::Client = capnp_rpc::new_client(ExecutorStub);
                 let mut listen = network.listen_request();
                 listen.get().set_executor(executor);
                 listen.get().set_prefix("/status");
-                crate::encode_exports(
-                    &retained_host,
-                    listen.get().init_caps(retained_host.len() as u32),
-                )
-                .expect("encode retained host");
+                listen.get().set_membrane(child_membrane);
                 listen
                     .send()
                     .promise
@@ -1136,7 +1199,7 @@ mod tests {
                 let mut replacement_cap_table = Vec::new();
                 {
                     let mut results = replacement_message
-                        .init_root::<membrane_capnp::membrane::graft_results::Builder<'_>>(
+                        .init_root::<system_capnp::membrane::graft_results::Builder<'_>>(
                     );
                     results.imbue_mut(&mut replacement_cap_table);
                     builder
@@ -1150,14 +1213,13 @@ mod tests {
                 );
 
                 // Failed init or pid0 exit drops the execution-generation
-                // owner. The route retains its issuing Host as a grant, but
-                // that back-reference owns only a receiver and therefore
-                // cannot prolong route liveness.
+                // owner. The route retains its child Membrane, but that
+                // capability cannot prolong route liveness.
                 drop(registration_scope);
                 assert_eq!(
                     crate::dispatch::live_route_count(&registry),
                     Ok(0),
-                    "a retained issuing Host must not keep the old session ready"
+                    "a retained child Membrane must not keep the old session ready"
                 );
 
                 tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -1195,7 +1257,6 @@ mod tests {
                     host_writer,
                     NetworkState::from_peer_id(vec![1, 2, 3]),
                     swarm_tx,
-                    false,
                     epoch_rx,
                     readiness_gate.clone(),
                     Some(Arc::new(gen_signing_key())),
@@ -1217,7 +1278,7 @@ mod tests {
                     Default::default(),
                 );
                 let mut guest_rpc = RpcSystem::new(Box::new(guest_network), None);
-                let membrane: GuestMembrane = guest_rpc.bootstrap(Side::Server);
+                let membrane: system_capnp::membrane::Client = guest_rpc.bootstrap(Side::Server);
                 tokio::task::spawn_local(guest_rpc.map(|_| ()));
 
                 let response = membrane
@@ -1226,37 +1287,18 @@ mod tests {
                     .promise
                     .await
                     .expect("process-local PID0 graft RPC");
-                let names: std::collections::HashSet<_> = response
-                    .get()
-                    .expect("pid0 graft results")
-                    .get_caps()
-                    .expect("pid0 RPC caps")
-                    .iter()
-                    .map(|entry| {
-                        entry
-                            .get_name()
-                            .expect("cap name")
-                            .to_str()
-                            .expect("UTF-8 cap name")
-                            .to_owned()
-                    })
-                    .collect();
-                for expected in [
-                    "identity",
-                    "host",
-                    "runtime",
-                    "routing-finder",
-                    "routing-announcer",
-                    "authority",
-                    "ipfs",
-                    "http-client",
-                ] {
-                    assert!(
-                        names.contains(expected),
-                        "pid0 RPC bootstrap lost {expected}: {names:?}"
-                    );
-                }
-                assert_eq!(names.len(), 8);
+                let graft = response.get().expect("pid0 graft results");
+                assert_eq!(graft.get_peer_id().expect("peer ID"), &[1, 2, 3]);
+                assert!(graft.has_stat());
+                assert!(graft.has_runtime());
+                assert!(graft.has_authority());
+                assert!(graft.has_identity());
+                assert!(graft.has_ipfs());
+                let network = graft.get_network().expect("network");
+                assert!(network.get_stream().has_listener());
+                assert!(network.get_vat().has_dialer());
+                assert!(network.get_http().has_dialer());
+                assert_eq!(graft.get_extras().expect("extras").len(), 0);
                 readiness_gate
                     .kernel_ready()
                     .expect("commit current pid0 generation");
@@ -1266,7 +1308,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn ordinary_child_rpc_serves_empty_grants_and_rejects_membrane_graft() {
+    async fn ordinary_child_rpc_serves_a_narrow_membrane() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1274,11 +1316,11 @@ mod tests {
                 let (host_reader, host_writer) = io::split(host_stream);
                 let (guest_reader, guest_writer) = io::split(guest_stream);
 
-                let (host_rpc, _guest_export) = build_initial_authority_rpc(
-                    host_reader,
-                    host_writer,
-                    InitialAuthorityRecord::default(),
-                );
+                let epoch = test_epoch(1);
+                let (_epoch_tx, epoch_rx) = watch::channel(epoch);
+                let child_membrane = authority::membrane_client(epoch_rx, b"test-peer");
+                let (host_rpc, _guest_export) =
+                    build_child_membrane_rpc(host_reader, host_writer, child_membrane);
                 tokio::task::spawn_local(host_rpc.map(|_| ()));
 
                 let guest_network = VatNetwork::new(
@@ -1288,40 +1330,111 @@ mod tests {
                     Default::default(),
                 );
                 let mut guest_rpc = RpcSystem::new(Box::new(guest_network), None);
-                let bootstrap: capnp::capability::Client = guest_rpc.bootstrap(Side::Server);
+                let membrane: system_capnp::membrane::Client = guest_rpc.bootstrap(Side::Server);
                 tokio::task::spawn_local(guest_rpc.map(|_| ()));
 
-                let grants = ChildInitialGrants {
-                    client: bootstrap.clone(),
-                };
-                let response = grants
-                    .get_request()
+                let response = membrane
+                    .graft_request()
                     .send()
                     .promise
                     .await
-                    .expect("InitialGrants.get RPC");
-                assert_eq!(
-                    response
-                        .get()
-                        .expect("initial grants results")
-                        .get_caps()
-                        .expect("initial grants")
-                        .len(),
-                    0
-                );
+                    .expect("child Membrane.graft RPC");
+                let graft = response.get().expect("child graft results");
+                assert_eq!(graft.get_peer_id().expect("required peerId"), b"test-peer");
+                assert!(!graft.has_stat());
+                assert!(!graft.has_runtime());
+                assert!(!graft.has_authority());
+                assert!(!graft.has_identity());
+                assert!(!graft.has_ipfs());
+                assert_eq!(graft.get_extras().expect("child extras").len(), 0);
+            })
+            .await;
+    }
 
-                let membrane = GuestMembrane { client: bootstrap };
-                let error = match membrane.graft_request().send().promise.await {
-                    Ok(_) => panic!("ordinary child bootstrap must reject Membrane.graft"),
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_rpc_forwards_the_stateful_supplied_membrane_without_eager_graft() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let grafts = Rc::new(Cell::new(0));
+                let supplied: system_capnp::membrane::Client =
+                    capnp_rpc::new_client(StatefulMembrane {
+                        grafts: grafts.clone(),
+                    });
+                let child = forward_child_membrane(supplied);
+
+                assert_eq!(grafts.get(), 0, "child bootstrap must not inspect Membrane");
+                for expected in 1_u32..=2 {
+                    let response = child
+                        .graft_request()
+                        .send()
+                        .promise
+                        .await
+                        .expect("forwarded graft");
+                    assert_eq!(
+                        response
+                            .get()
+                            .expect("forwarded graft results")
+                            .get_peer_id()
+                            .expect("stateful peerId"),
+                        &expected.to_be_bytes()
+                    );
+                }
+                assert_eq!(
+                    grafts.get(),
+                    2,
+                    "each child graft must reach the supplied Membrane server"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_rpc_keeps_a_supplied_membrane_pending_until_the_child_grafts() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let grafts = Rc::new(Cell::new(0));
+                let supplied: system_capnp::membrane::Client =
+                    capnp_rpc::new_client(PendingMembrane {
+                        grafts: grafts.clone(),
+                    });
+                let child = forward_child_membrane(supplied);
+
+                assert_eq!(grafts.get(), 0, "child bootstrap must not inspect Membrane");
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_millis(25),
+                    child.graft_request().send().promise,
+                )
+                .await;
+                assert!(
+                    result.is_err(),
+                    "supplied pending graft must remain pending"
+                );
+                assert_eq!(grafts.get(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_rpc_preserves_a_supplied_membrane_failure() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let grafts = Rc::new(Cell::new(0));
+                let supplied: system_capnp::membrane::Client =
+                    capnp_rpc::new_client(FailingMembrane {
+                        grafts: grafts.clone(),
+                    });
+                let child = forward_child_membrane(supplied);
+
+                assert_eq!(grafts.get(), 0, "child bootstrap must not inspect Membrane");
+                let error = match child.graft_request().send().promise.await {
+                    Ok(_) => panic!("supplied failing graft must fail"),
                     Err(error) => error,
                 };
-                assert!(
-                    error
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .contains("unimplemented"),
-                    "unexpected graft rejection: {error}"
-                );
+                assert!(error.to_string().contains("supplied-membrane-failure"));
+                assert_eq!(grafts.get(), 1);
             })
             .await;
     }

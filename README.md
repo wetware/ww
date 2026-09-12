@@ -31,13 +31,13 @@ curl http://localhost:2080/status
 ```
 
 The second command hit a WebAssembly cell running inside the daemon. The
-default Rust kernel installs this composition directly. The cell receives only
-the explicit `host` grant, which lets the cell report peer identity and peers.
+default Rust kernel installs this composition directly. The cell receives a
+narrow `Membrane` containing only `peerId` and `Stat`.
 
 ## Features
 
-- **Explicit child grants.** Each ordinary cell starts with a typed bundle of capabilities and nothing else. Parent cells choose which capabilities to hand down; method-level restrictions are enforced on the capability reference and on capabilities reached through it.
-- **Composable membranes.** Tool A calls tool B which calls tool C, each link carrying an explicit capability set. The membrane is the boundary at every hop. See [examples/oracle/](examples/oracle/) for the runnable version.
+- **Explicit child Membranes.** Each ordinary cell starts with one parent-selected `Membrane` and no ambient node authority. Its `graft()` exposes only the typed fields and application-defined `extras` that the parent chose. Method restrictions remain attached to each capability reference and to capabilities reached through it.
+- **Composable membranes.** Tool A calls tool B which calls tool C. Each process boundary carries one explicit `Membrane`. See [examples/oracle/](examples/oracle/) for the runnable version.
 - **Content-addressed code.** Cells are identified by CID. The binary that ran is the binary you pinned; no swap-under-the-rug between generation and execution.
 - **WASM cell scale.** ~10ms spawn, KB-scale binaries, language-agnostic via native `wasm32-wasip3` components. Per-call sandboxing is only feasible because cells are cheap; microVM cold-start is too slow for that.
 - **P2P capability sharing.** A cell can export a typed capability to a peer over libp2p. Service names locate a stream; they do not authorize its caller. A deployer can publish a `Terminal` that authenticates a login identity and issues only the method authority selected for that identity.
@@ -86,11 +86,12 @@ through `KernelSource`: `--kernel` takes precedence over `WW_KERNEL`, and the
 default is embedded `std/kernel`. `ww build` produces `boot/main.wasm` as the
 conventional application artifact; the Host does not use it as PID0 input.
 
-Pid0 calls `membrane.graft()` to obtain host capabilities. Ordinary children
-instead call `initial_grants.get()` and receive exactly the immutable
-`List(Export)` selected by their parent—no host graft or fallback. After an
-epoch transition, delegated host capabilities stay stale until an authorized
-ancestor explicitly re-delegates fresh references or respawns the child.
+PID0 and ordinary children both receive a `Membrane`. PID0 receives a broad
+root implementation. Each child receives the exact narrow implementation that
+its parent passes to `Executor.spawn()`. Repeated `graft()` calls cannot add
+authority because each server returns only its held references. After an epoch
+transition, delegated host capabilities stay stale until an authorized ancestor
+explicitly re-delegates fresh references or respawns the child.
 
 [doc/architecture.md](doc/architecture.md) is the canonical reference; [doc/capabilities.md](doc/capabilities.md) is the capability surface.
 

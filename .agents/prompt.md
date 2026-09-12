@@ -51,13 +51,13 @@ the guest which separate application plumbing the Host configured:
 ## Architecture (three layers)
 
 - **Host** (`ww` binary): libp2p swarm, loads kernel WASM, serves Membrane.
-- **Kernel** (pid0): the embedded Rust kernel calls `membrane.graft()`, receives named capabilities, and installs `/status`.
-- **Children**: spawned by pid0 with attenuated capabilities.
+- **Kernel** (pid0): the embedded Rust kernel calls `membrane.graft()`, receives typed authority, and installs `/status`.
+- **Children**: spawned with parent-selected narrow `Membrane` implementations.
 
 ## Capabilities after graft
 
-Host, Runtime, Routing, Identity, HttpClient, StreamListener,
-StreamDialer, VatListener, VatClient.
+peerId, Stat, grouped Network leaves, Routing fields, Runtime, Authority,
+Identity, IPFS, and application-defined extras.
 
 ## Mounts
 

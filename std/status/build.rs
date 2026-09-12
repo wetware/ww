@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 
 /// Build script for the status cell.
 ///
-/// Compiles the shared schemas so the WAGI cell can read its explicit `host`
-/// grant and call `host.id` / `host.addrs` / `host.peers`.
+/// Compiles the shared schemas so the WAGI cell can read its narrow Membrane.
 /// No status-local schema — the cell is HTTP-only and does not export
 /// a Cap'n Proto interface.
 fn main() {
@@ -25,13 +24,12 @@ fn main() {
         .file(capnp_dir.join("system.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("auth.capnp"))
-        .file(capnp_dir.join("membrane.capnp"))
         .file(capnp_dir.join("stem.capnp"))
         .file(capnp_dir.join("http.capnp"))
         .run()
         .expect("failed to compile shared capnp schemas");
 
-    for schema in &["system", "routing", "auth", "membrane", "stem", "http"] {
+    for schema in &["system", "routing", "auth", "stem", "http"] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()

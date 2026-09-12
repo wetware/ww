@@ -64,23 +64,21 @@ impl system_capnp::executor::Server for StubExecutor {
     }
 }
 
-/// GraftBuilder that populates graft results with a StubRuntime (Export list format).
+/// GraftBuilder that populates the typed runtime field.
 pub struct StubSessionBuilder;
 
 impl GraftBuilder for StubSessionBuilder {
     fn build(
         &self,
         guard: &EpochGuard,
-        mut builder: atom::membrane_capnp::membrane::graft_results::Builder<'_>,
+        mut builder: system_capnp::membrane::graft_results::Builder<'_>,
     ) -> std::result::Result<(), capnp::Error> {
+        builder.set_peer_id(b"typed-peer-id");
         let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(StubRuntime {
             guard: guard.clone(),
         });
 
-        let mut caps = builder.reborrow().init_caps(1);
-        let mut entry = caps.reborrow().get(0);
-        entry.set_name("runtime");
-        entry.init_cap().set_as_capability(runtime.client.hook);
+        builder.set_runtime(runtime);
         Ok(())
     }
 }
@@ -108,44 +106,6 @@ impl auth_capnp::identity::Server for StubIdentity {
         _results: auth_capnp::identity::VerifyResults,
     ) -> Promise<(), capnp::Error> {
         Promise::err(capnp::Error::unimplemented("stub identity".into()))
-    }
-}
-
-/// Stub Host: returns unimplemented for all methods.
-pub struct StubHost;
-
-#[allow(refining_impl_trait)]
-impl system_capnp::host::Server for StubHost {
-    fn id(
-        self: capnp::capability::Rc<Self>,
-        _params: system_capnp::host::IdParams,
-        _results: system_capnp::host::IdResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("stub host".into()))
-    }
-
-    fn addrs(
-        self: capnp::capability::Rc<Self>,
-        _params: system_capnp::host::AddrsParams,
-        _results: system_capnp::host::AddrsResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("stub host".into()))
-    }
-
-    fn peers(
-        self: capnp::capability::Rc<Self>,
-        _params: system_capnp::host::PeersParams,
-        _results: system_capnp::host::PeersResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("stub host".into()))
-    }
-
-    fn network(
-        self: capnp::capability::Rc<Self>,
-        _params: system_capnp::host::NetworkParams,
-        _results: system_capnp::host::NetworkResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("stub host".into()))
     }
 }
 
@@ -191,18 +151,16 @@ impl routing_capnp::announcer::Server for StubAnnouncer {
     }
 }
 
-/// GraftBuilder that populates all six graft capabilities with stubs.
-/// Used to verify that graft() returns every capability field.
+/// GraftBuilder that populates representative typed fields and one dynamic extra.
 pub struct FullStubSessionBuilder;
 
 impl GraftBuilder for FullStubSessionBuilder {
     fn build(
         &self,
         guard: &EpochGuard,
-        mut builder: atom::membrane_capnp::membrane::graft_results::Builder<'_>,
+        mut builder: system_capnp::membrane::graft_results::Builder<'_>,
     ) -> std::result::Result<(), capnp::Error> {
         let identity: auth_capnp::identity::Client = capnp_rpc::new_client(StubIdentity);
-        let host: system_capnp::host::Client = capnp_rpc::new_client(StubHost);
         let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(StubRuntime {
             guard: guard.clone(),
         });
@@ -210,31 +168,20 @@ impl GraftBuilder for FullStubSessionBuilder {
         let announcer: routing_capnp::announcer::Client = capnp_rpc::new_client(StubAnnouncer);
         let http_client: http_capnp::http_client::Client = capnp_rpc::new_client(StubHttpClient);
 
-        let mut caps = builder.reborrow().init_caps(6);
-
-        let mut e = caps.reborrow().get(0);
-        e.set_name("identity");
-        e.init_cap().set_as_capability(identity.client.hook);
-
-        let mut e = caps.reborrow().get(1);
-        e.set_name("host");
-        e.init_cap().set_as_capability(host.client.hook);
-
-        let mut e = caps.reborrow().get(2);
-        e.set_name("runtime");
-        e.init_cap().set_as_capability(runtime.client.hook);
-
-        let mut e = caps.reborrow().get(3);
-        e.set_name("routing-finder");
-        e.init_cap().set_as_capability(finder.client.hook);
-
-        let mut e = caps.reborrow().get(4);
-        e.set_name("routing-announcer");
-        e.init_cap().set_as_capability(announcer.client.hook);
-
-        let mut e = caps.reborrow().get(5);
-        e.set_name("http-client");
-        e.init_cap().set_as_capability(http_client.client.hook);
+        builder.set_peer_id(b"typed-peer-id");
+        builder.set_identity(identity);
+        builder.set_runtime(runtime.clone());
+        let mut routing = builder.reborrow().init_routing();
+        routing.set_finder(finder);
+        routing.set_announcer(announcer);
+        builder
+            .reborrow()
+            .init_network()
+            .init_http()
+            .set_dialer(http_client);
+        let mut extra = builder.reborrow().init_extras(1).get(0);
+        extra.set_name("application-extra");
+        extra.init_cap().set_as_capability(runtime.client.hook);
 
         Ok(())
     }

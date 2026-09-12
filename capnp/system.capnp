@@ -1,53 +1,77 @@
-# Wetware peer interfaces.
-#
-# Trusted pid0 obtains these capabilities through its Membrane. Ordinary
-# children can receive selected references only through explicit parent grants
-# delivered by InitialGrants (see membrane.capnp). Host-derived wrappers hold
-# an EpochGuard and fail with a stale-epoch error after an epoch advance.
+# Wetware transport and process interfaces.
 
 @0xbf5147b78c0e6a2f;
 
-using MembraneSchema = import "membrane.capnp";
 using AuthSchema = import "auth.capnp";
+using RoutingSchema = import "routing.capnp";
+using HttpSchema = import "http.capnp";
 
-struct PeerInfo {
-  peerId @0 :Data;       # libp2p peer ID, serialized.
-  addrs @1 :List(Data);  # Multiaddrs for this peer, each serialized.
+struct Export @0xbb8d5590cb2f3d2e {
+  name @0 :Text;
+  cap  @1 :Capability;
+  # An application-defined capability bound to a local name. Fixed Wetware
+  # platform authority uses typed fields.
 }
 
-interface Host {
-  id @0 () -> (peerId :Data);
-  # Return this node's libp2p peer ID.
+struct NodeStat @0xa00344c466fb1f93 {
+  listenAddrs         @0 :List(Data);
+  connectedPeerCount @1 :UInt32;
+}
 
-  addrs @1 () -> (addrs :List(Data));
-  # Return the multiaddrs this node is listening on.
+interface Stat @0xa7b9b759cc17f8ca {
+  snapshot @0 () -> (stat :NodeStat);
+  # Return one current observation without exposing peer identities or
+  # connected-peer endpoint addresses.
+}
 
-  peers @2 () -> (peers :List(PeerInfo));
-  # List currently connected peers.
+struct Network @0xebd3804c63534aaf {
+  stream :group {
+    listener @0 :StreamListener;
+    dialer   @1 :StreamDialer;
+  }
 
-  network @3 () -> (streamListener :StreamListener, streamDialer :StreamDialer,
-                    vatListener :VatListener, vatClient :VatClient,
-                    httpListener :HttpListener);
-  # Obtain StreamListener/StreamDialer (libp2p byte-stream mode),
-  # VatListener/VatClient (Cap'n Proto capability mode), and
-  # HttpListener (WAGI/CGI mode) for subprotocol I/O.
+  vat :group {
+    listener @2 :VatListener;
+    dialer   @3 :VatClient;
+  }
+
+  http :group {
+    listener @4 :HttpListener;
+    dialer   @5 :HttpSchema.HttpClient;
+  }
+}
+
+struct Routing @0xbd9034a6f00b9064 {
+  finder    @0 :RoutingSchema.Finder;
+  announcer @1 :RoutingSchema.Announcer;
+}
+
+interface Membrane @0xdb52c25106bc2c5e {
+  graft @0 () -> (
+    peerId :Data,
+
+    stat    :Stat,
+    network :Network,
+    routing :Routing,
+
+    runtime   :Runtime,
+    authority :AuthSchema.Authority,
+    identity  :AuthSchema.Identity,
+    ipfs      :Ipfs,
+
+    extras :List(Export)
+  );
+  # Having a Membrane reference is authorization. Every successful graft has
+  # a non-empty peerId. A withheld capability is a null capability pointer.
+  # Repeated graft calls expose only the authority held by this Membrane.
 }
 
 interface Runtime {
   load @0 (wasm :Data) -> (executor :Executor);
-  # Compile (or cache-hit) the WASM bytes and return an Executor bound
-  # to that binary.
-  #
-  # Cache policy is set at the Runtime level (--runtime-cache-policy),
-  # not per-call. Default is "shared": if the same bytes were loaded
-  # before, return a clone of the existing Executor client (same
-  # underlying server object, same spawn bookkeeping).
-  #
-  # "isolated" policy: always create a fresh Executor server, even for
-  # previously-loaded bytes.
+  # Compile or retrieve a cached executor bound to the supplied WASM bytes.
 
   shutdown @1 () -> ();
-  # Terminate all tasks spawned through this Runtime.
+  # Terminate tasks spawned through this Runtime.
 }
 
 interface Ipfs {
@@ -77,41 +101,33 @@ struct OneshotFuel {
 }
 
 interface Executor {
-  spawn @0 (args :List(Text), env :List(Text),
-            caps :List(MembraneSchema.Export),
-            fuelPolicy :FuelPolicy) -> (process :Process);
-  # Spawn a new instance of the bound WASM binary with the given
-  # args and env.  Late-binding args/env is required for WAGI, which
-  # injects per-request CGI env vars (REQUEST_METHOD, PATH_INFO, etc.).
-  #
-  # caps: the child's complete named initial grant set. Empty means the child
-  # receives zero application capabilities.
+  spawn @0 (
+    args :List(Text),
+    env :List(Text),
+    membrane :Membrane,
+    fuelPolicy :FuelPolicy
+  ) -> (process :Process);
+  # Spawn one child with the supplied Membrane as its bootstrap capability.
 
   cid @1 () -> (cid :Text);
-  # Return the CID of the bound WASM binary.
 }
 
 interface StreamListener {
-  listen @0 (executor :Executor, protocol :Text,
-             caps :List(MembraneSchema.Export)) -> ();
-  # Accept incoming libp2p streams on /ww/0.1.0/stream/{protocol}.
-  # For each stream, spawn a cell process via Executor
-  # and wire stdin/stdout to the stream.
-  #
-  # caps: immutable registration-time grant template copied exactly into each
-  # spawned child's InitialAuthorityRecord. Empty means zero grants.
+  listen @0 (
+    executor :Executor,
+    protocol :Text,
+    membrane :Membrane
+  ) -> ();
+  # Each accepted stream receives the registration-time Membrane.
 }
 
 interface HttpListener {
-  listen @0 (executor :Executor, prefix :Text,
-             caps :List(MembraneSchema.Export)) -> ();
-  # Accept HTTP requests matching the path prefix.
-  # For each request, spawn a cell process via Executor.
-  # CGI env vars are passed as environment, request body to stdin,
-  # CGI response read from stdout.
-  #
-  # caps: immutable registration-time grant template copied exactly into each
-  # spawned child's InitialAuthorityRecord. Empty means zero grants.
+  listen @0 (
+    executor :Executor,
+    prefix :Text,
+    membrane :Membrane
+  ) -> ();
+  # Each matching request receives the registration-time Membrane.
 }
 
 interface StreamDialer {

@@ -67,7 +67,7 @@ Layers stack with per-file union; later layers win.
 | `--identity <PATH>` | `~/.ww/identity` | Ed25519 identity file path. Also reads `WW_IDENTITY` env. |
 | `--insecure-ephemeral` | off | Allow ephemeral identity fallback if identity file is missing (insecure; for quick trial runs). |
 | `--http-listen <ADDR>` | none | Enable WAGI HTTP server (e.g. `127.0.0.1:2080`) |
-| `--http-dial <HOST>` | none | Allow outbound HTTP to host. Repeatable. Supports exact hosts, `*.example.com`, or `*`. Without this flag, no http-client capability is granted. |
+| `--http-dial <HOST>` | none | Allow outbound HTTP to host. Repeatable. Supports exact hosts, `*.example.com`, or `*`. Without this flag, `network.http.dialer` is null. |
 | `--with-http-admin <ADDR>` | `127.0.0.1:2026` | Local HTTP admin endpoint (`/healthz`, `/readyz`, `/version`, `/metrics`, `/host/id`, `/host/addrs`); set `off` to disable (case-insensitive). Also reads `WW_HTTP_ADMIN`. A non-loopback address exposes unauthenticated host diagnostics. |
 | `--wasm-debug` | off | Enable WASM debug info for guest processes |
 | `--executor-threads <N>` | `0` | Executor worker threads (0 = auto-detect, one per CPU core) |

@@ -84,16 +84,15 @@ kernel. It is deliberately absent from ordinary-cell linkers.
 | `kernel-ready` (`kernel_ready()` in generated Rust) | `() -> result<_, ready-error>` | Commit the generation bound by PID0's process-local graft. `ready-error` currently contains `stale-generation`. The guest supplies no generation or token. |
 
 This host function is not a Cap'n Proto capability. It cannot appear in a
-`Membrane` graft or `InitialGrants`, be delegated to a child, or cross a
+`Membrane` graft, be delegated to a child, or cross a
 network connection. A stale-generation result makes the PID0 initialization
 fail. The Host owns termination and replacement.
 
 ## Cap'n Proto RPC (over wetware:transport)
 
 Once the guest opens `wetware:transport`, it bootstraps a Cap'n Proto RPC
-session over the P3 streams. The host serves the full
-**Membrane** only to trusted pid0. Ordinary children receive the distinct
-**InitialGrants** closed-delivery capability.
+session over the P3 streams. PID0 and ordinary children both bootstrap a
+**Membrane**. The object reference determines the available authority.
 
 ### Connection Setup
 
@@ -101,9 +100,8 @@ session over the P3 streams. The host serves the full
 2. Guest calls `connection.open()` once and receives the incoming stream.
 3. Guest adapts both streams for `VatNetwork`.
 4. Guest creates `RpcSystem::new(network, bootstrap_export)`.
-5. Guest bootstraps the host-provided capability:
-   `rpc_system.bootstrap(Side::Server)` → `Membrane` for pid0 or
-   `InitialGrants` for an ordinary child
+5. Guest bootstraps the host-provided `Membrane` capability with
+   `rpc_system.bootstrap(Side::Server)`.
 6. Guest optionally exports its own bootstrap capability with `system::serve`.
 
 ### Guest Entry Points
@@ -116,56 +114,56 @@ connection setup automatically:
 | `system::run` | `(f: FnOnce(C) -> Future) -> Future<Result<(), Error>>` | Bootstrap the host and select `RpcSystem` with the application Future. |
 | `system::serve` | `(bootstrap: Client, f: FnOnce(C) -> Future) -> Future<Result<(), Error>>` | Run the session and export one guest bootstrap capability. |
 
-### Graft Exports and Child Initial Grants
+### Membrane graft
 
-`Membrane.graft()` returns a `List(Export)`. The current host graft uses the
-following canonical names. `identity` requires a configured signing key, and
-`http-client` appears only when the operator configures an `--http-dial`
-allowlist. Trusted PID0 can delegate any selected references to an ordinary
-child through `Executor.spawn` or a listener's registration-time grant list.
+`Membrane.graft()` returns multiple named fields directly. `peerId` is required
+and non-empty in every successful result. Capability fields are nullable.
+`Network` and `Routing` are structs of nullable capability references.
+`network.stream`, `network.vat`, and `network.http` are Cap'n Proto groups.
 
-| Export name | Interface | Description |
+| Field | Type | Description |
 |-------------|-----------|-------------|
-| `identity` | `auth_capnp::identity` | Host-side signing. |
-| `host` | `system_capnp::host` | Node identity and network interfaces. |
+| `peerId` | `Data` | Stable copied node identity metadata. |
+| `stat` | `system_capnp::stat` | Snapshot listen addresses and connected-peer count. |
+| `network` | `system_capnp::network` | Grouped stream, vat, and HTTP authority. |
+| `routing` | `system_capnp::routing` | Nullable Finder and Announcer references. |
 | `runtime` | `system_capnp::runtime` | Load WASM binaries and obtain Executors. |
-| `routing-finder` | `routing_capnp::finder` | Find a bounded number of unique DHT providers. |
-| `routing-announcer` | `routing_capnp::announcer` | Announce the Wetware host PeerID as a DHT provider. |
 | `authority` | `auth_capnp::authority` | Construct a policy-bound `Terminal` over an explicit capability. |
+| `identity` | `auth_capnp::identity` | Host-side signing. |
 | `ipfs` | `system_capnp::ipfs` | Read `/ipfs`, `/ipns`, or `/ipld` content through a `ByteStream`. |
-| `http-client` | `http_capnp::http_client` | Make outbound HTTP requests to the configured host allowlist. |
+| `extras` | `List(system_capnp::export)` | Application-defined named capabilities. |
 
-An ordinary child calls `InitialGrants.get()` to obtain exactly the immutable
-named references selected by its parent. `InitialGrants` does not add the
-canonical graft exports automatically.
+An ordinary child calls `graft()` on the `Membrane` selected by its parent.
+Repeated calls cannot add authority. A parent passes one `Membrane` to
+`Executor.spawn()`, `StreamListener.listen()`, or `HttpListener.listen()`.
 
 WASI filesystem access and the `ipfs` RPC capability are separate surfaces.
 When the host installs the content substrate, WASI guests can read IPFS-family
-paths through the virtual filesystem. The `ipfs` export provides
+paths through the virtual filesystem. The `ipfs` field provides
 `Ipfs.read(path)` for non-WASI clients and for explicit delegation. Neither
 surface provides enumeration, mutation, pin management, or publishing.
 
-Host-derived grants retain their **epoch guards** and become invalid when the
-host advances its epoch. Repeated `InitialGrants.get()` calls return the same
-recorded references; fresh authority requires explicit ancestor re-delegation
+Host-derived capabilities retain their **epoch guards** and become invalid when
+the host advances its epoch. Repeated graft calls return the same authority
+surface; fresh authority requires explicit ancestor re-delegation
 or child respawn. Non-host grants keep their own normal lifetime semantics.
 
-`routing-finder` and `routing-announcer` are independently delegable. The
+`routing.finder` and `routing.announcer` are independently delegable. The
 optional routing-key WIT import is not part of `Membrane.graft()` or
-`InitialGrants`.
+application-defined `extras` list.
 
 ## Cap'n Proto RPC (system.capnp)
 
 Full interface reference for the capabilities available to guests.
 
-### Host
+### Membrane, Stat, Network, and Routing
 
-| Method | Signature | Description |
+| Interface or value | Signature or shape | Description |
 |--------|-----------|-------------|
-| `id` | `() -> (peerId: Data)` | This node's libp2p peer ID. |
-| `addrs` | `() -> (addrs: List(Data))` | Multiaddrs this node listens on. |
-| `peers` | `() -> (peers: List(PeerInfo))` | Currently connected peers. |
-| `network` | `() -> (streamListener, streamDialer, vatListener, vatClient, httpListener)` | Get network interfaces (byte-stream + RPC + HTTP modes). |
+| `Membrane.graft` | `() -> (peerId, stat, network, routing, runtime, authority, identity, ipfs, extras)` | Return the authority held by one Membrane server. |
+| `Stat.snapshot` | `() -> (stat: NodeStat)` | Return current listen addresses and connected-peer count without peer records. |
+| `Network` | `stream`, `vat`, and `http` groups | Hold nullable listener and dialer references. |
+| `Routing` | `finder`, `announcer` | Hold independently nullable provider-routing references. |
 
 ### Provider routing (`routing.capnp`)
 
@@ -174,7 +172,7 @@ Full interface reference for the capabilities available to guests.
 | `Finder` | `findProviders` | `(key: Text, count: UInt32, sink: ProviderSink) -> ()` | Deliver at most `count` unique WAN/LAN provider PeerIDs through a single-slot handoff. The swarm selects and retains at most `min(count, 16)` results. `count == 0` starts no query. A per-request token stops remaining work after sink failure, epoch expiry, or the 30-second deadline. The deadline also includes command admission. |
 | `Announcer` | `provide` | `(key: Text) -> ()` | Announce the Wetware host PeerID on WAN and LAN. Local registration and republication stop after the final owner epoch ends. |
 
-The removed broad `Routing` interface is not available. Guests have no
+`Routing` is a struct, not a capability-vending interface. Guests have no
 provider-routing methods for IPNS resolution or publication, persistent
 UnixFS mutation, or CID derivation.
 
@@ -189,7 +187,7 @@ UnixFS mutation, or CID derivation.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `spawn` | `(args: List(Text), env: List(Text), caps: List(Export), fuelPolicy: FuelPolicy) -> (process: Process)` | Spawn a new instance of the bound WASM binary with args, env, explicit initial grants, and fuel policy. |
+| `spawn` | `(args: List(Text), env: List(Text), membrane: Membrane, fuelPolicy: FuelPolicy) -> (process: Process)` | Spawn a new instance with the supplied Membrane and fuel policy. |
 | `cid` | `() -> (cid: Text)` | Return the CID of the WASM binary bound to this Executor. |
 
 ### Process
@@ -215,7 +213,7 @@ UnixFS mutation, or CID derivation.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `listen` | `(executor: Executor, protocol: Text, caps: List(Export)) -> ()` | Accept streams on `/ww/0.1.0/stream/{protocol}`. Per-stream: spawn handler via Executor, wire stdin/stdout, and forward optional caps. |
+| `listen` | `(executor: Executor, protocol: Text, membrane: Membrane) -> ()` | Accept streams, spawn a handler, wire stdin/stdout, and forward the registration-time Membrane. |
 
 ### StreamDialer (byte-stream mode)
 
@@ -267,9 +265,9 @@ Rust ownership order. The guest does not leak resources with
 
 Host capabilities grafted by pid0 are wrapped in epoch guards. When the host
 advances its epoch (e.g., on-chain state change), delegated copies also become
-invalid and calls return `staleEpoch` errors. Ordinary children cannot
-re-graft. The Host terminates the old PID0 and starts a fresh PID0 for the new
-generation.
+invalid and calls return `staleEpoch` errors. Re-grafting an ordinary child's
+Membrane cannot add authority. The Host terminates the old PID0 and starts a
+fresh PID0 for the new generation.
 
 ### Host I/O buffering
 

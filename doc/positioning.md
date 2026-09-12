@@ -89,10 +89,10 @@ What none of them have:
   attenuation travels with a schema-bound reference and recursively
   confines capabilities returned through it. Argument- and
   resource-level policy are not implied by that guarantee.
-- **Composable trust graphs.** The membrane is the trust boundary,
-  and graft composes naturally: when tool A calls tool B which
-  calls tool C, each call carries a capability set the previous
-  layer chose, enforced by the runtime, not by trust.
+- **Composable trust graphs.** The membrane is the trust boundary.
+  When tool A calls tool B which calls tool C, each process boundary carries
+  one `Membrane` selected by the previous layer. Its typed graft fields and
+  application-defined `extras` define the available authority.
 - **Content-addressed code with provable provenance.** The thing
   that ran is the thing you signed off on; no swap-under-the-rug.
 - **WASM-cell scale.** ~10ms spawn, KB-scale binaries,
@@ -116,20 +116,19 @@ some are written by the LLM at runtime (definitely untrusted).
 
 On Wetware:
 
-- Trusted pid0 receives the host `Membrane` and explicitly grants the
-  orchestrator the references it needs: the user's tax document may arrive as
-  a CID (a copyable locator into the IPFS UnixFS DAG, not host-filesystem or
-  path-based authority); `http-client` for the IRS API (gated to `irs.gov`
-  via `--http-dial`); and `identity` for signing. Nothing else is acquired by
-  the child bootstrap.
+- Trusted pid0 receives the root `Membrane` and passes the orchestrator a
+  narrower `Membrane`. The user's tax document may arrive as a CID, which is a
+  copyable locator into the IPFS UnixFS DAG rather than host-filesystem
+  authority. The orchestrator's graft can contain `network.http.dialer`, gated
+  to `irs.gov` through `--http-dial`, and `identity` for signing. Other typed
+  fields remain null, and `extras` contains no additional capabilities.
 - Each tool the orchestrator calls runs as a child cell. The
-  orchestrator decides which explicit references to grant to the child. The
-  IRS API tool gets an `http-client` whose
-  dial allowlist is just `irs.gov`; it cannot reach any other
-  domain.
-- A third-party MCP server pulled from GitHub gets *zero*
-  `http-client`, *zero* fs / CID handles, *zero* environment,
-  and a single typed Cap'n Proto interface. If it tries to do
+  orchestrator decides which `Membrane` to pass to each child. The IRS API
+  tool receives only the required HTTP dialer in `network.http.dialer`. Its
+  allowlist contains only `irs.gov`.
+- A third-party MCP server pulled from GitHub gets a `Membrane` with a null
+  `network.http.dialer`, *zero* fs / CID handles, *zero* environment,
+  and a single typed Cap'n Proto interface in `extras`. If it tries to do
   anything outside its grant, the runtime fails the call. The
   host doesn't have to trust the server's good intentions.
 - A tool written by the LLM at runtime is content-addressed before
@@ -193,8 +192,8 @@ A few framings we've explicitly *not* chosen, and why:
 
 What we have today:
 
-- WASM cell runtime with a graft-capable trusted pid0 and explicit ordinary
-  child grants.
+- WASM cell runtime with a graft-capable trusted pid0 and explicit,
+  parent-selected child `Membrane` references.
 - Hook-level method attenuation for schema-bound capabilities, including
   returned capabilities, pipelines, re-attenuation intersection, and
   independent membrane-boundary lineage.

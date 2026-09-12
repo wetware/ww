@@ -26,6 +26,11 @@ fn setup_runtime() -> system_capnp::runtime::Client {
     )
 }
 
+fn minimal_membrane() -> system_capnp::membrane::Client {
+    let (_sender, receiver) = tokio::sync::watch::channel(authority::Epoch::zero());
+    authority::membrane_client(receiver, b"test-peer")
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Initialize tracing for visibility
@@ -43,6 +48,7 @@ async fn main() {
             println!("=====================\n");
 
             let runtime = setup_runtime();
+            let membrane = minimal_membrane();
 
             // Load echo WASM via runtime.load() → Executor
             let mut load_req = runtime.load_request();
@@ -53,7 +59,9 @@ async fn main() {
             // ─── Test 1: Executor.spawn() ───
             println!("--- Test 1: Executor.spawn() ---");
             {
-                let spawn_resp = executor.spawn_request().send().promise.await.unwrap();
+                let mut request = executor.spawn_request();
+                request.get().set_membrane(membrane.clone());
+                let spawn_resp = request.send().promise.await.unwrap();
                 let process = spawn_resp.get().unwrap().get_process().unwrap();
 
                 // Write to stdin
@@ -86,7 +94,9 @@ async fn main() {
             println!("\n--- Test 2: Executor (multiple spawns) ---");
             {
                 // Spawn first instance
-                let spawn_resp = executor.spawn_request().send().promise.await.unwrap();
+                let mut request = executor.spawn_request();
+                request.get().set_membrane(membrane.clone());
+                let spawn_resp = request.send().promise.await.unwrap();
                 let process = spawn_resp.get().unwrap().get_process().unwrap();
 
                 let stdin_resp = process.stdin_request().send().promise.await.unwrap();
@@ -111,7 +121,9 @@ async fn main() {
                 println!("  [OK] Exit code: 0");
 
                 // Spawn second instance (verifies Executor is reusable)
-                let spawn_resp2 = executor.spawn_request().send().promise.await.unwrap();
+                let mut request = executor.spawn_request();
+                request.get().set_membrane(membrane.clone());
+                let spawn_resp2 = request.send().promise.await.unwrap();
                 let process2 = spawn_resp2.get().unwrap().get_process().unwrap();
 
                 let stdin_resp2 = process2.stdin_request().send().promise.await.unwrap();

@@ -28,10 +28,10 @@ If they want to browse, show the menu:
 >
 > 1. **Guest and service transports** — host bootstrap, byte streams, HTTP,
 >    and Cap'n Proto vats (`doc/api/wasm-guest.md`, `capnp/system.capnp`)
-> 2. **System capabilities** — Host, Executor, Process, streams
+> 2. **System capabilities** — Membrane, Stat, Network, Executor, Process, streams
 >    (`capnp/system.capnp`)
-> 3. **Membrane & auth** — Terminal, Membrane, Epoch, Identity
->    (`capnp/stem.capnp`)
+> 3. **Membrane & auth** — `Membrane` (`capnp/system.capnp`), `Terminal` and
+>    `Identity` (`capnp/auth.capnp`), and `Epoch` (`capnp/stem.capnp`)
 > 4. **Routing / DHT** — provide, findProviders
 >    (`capnp/routing.capnp`, `doc/routing.md`)
 > 5. **CLI** — flags, subcommands, env vars (`doc/cli.md`)

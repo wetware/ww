@@ -12,13 +12,13 @@
 //! }
 //! ```
 //!
-//! `status` and `version` are always populated. `peer_id`, `listen_addrs`,
-//! and `peer_count` come from the `host` capability if it's in the cell's
-//! initial grants; if the cap is withheld they degrade to `null`.
+//! `status` and `version` are always populated. Required `peer_id` metadata
+//! comes from the narrow Membrane. `listen_addrs` and `peer_count` come from
+//! one `Stat` snapshot. A withheld or unavailable `Stat` degrades those two
+//! mutable fields to `null`.
 //!
 //! WAGI mode only. Runs once per HTTP request — fresh cell, no state.
 
-use capnp::capability::FromClientHook;
 use std::future::Future;
 use system::Guest;
 
@@ -51,11 +51,6 @@ mod auth_capnp {
 }
 
 #[allow(dead_code)]
-mod membrane_capnp {
-    include!(concat!(env!("OUT_DIR"), "/membrane_capnp.rs"));
-}
-
-#[allow(dead_code)]
 mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
 }
@@ -65,25 +60,9 @@ mod http_capnp {
     include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
 }
 
-type InitialGrants = membrane_capnp::initial_grants::Client;
+type Membrane = system_capnp::membrane::Client;
 
-const HOST_CALL_TIMEOUT_NS: u64 = 500_000_000; // 500ms
-
-/// Look up a typed capability by name in the initial grants list.
-/// Returns `None` if the cap is missing — used for graceful degradation.
-fn initial_grant_opt<T: FromClientHook>(
-    caps: &capnp::struct_list::Reader<'_, membrane_capnp::export::Owned>,
-    name: &str,
-) -> Option<T> {
-    for i in 0..caps.len() {
-        let entry = caps.get(i);
-        let n = entry.get_name().ok()?.to_str().ok()?;
-        if n == name {
-            return entry.get_cap().get_as_capability::<T>().ok();
-        }
-    }
-    None
-}
+const STAT_CALL_TIMEOUT_NS: u64 = 500_000_000; // 500ms
 
 /// Best-effort logger to WASI stderr.
 struct StderrLogger;
@@ -105,11 +84,29 @@ fn init_logging() {
     log::set_max_level(log::LevelFilter::Info);
 }
 
-/// Best-effort host introspection. Each call swallows errors and returns
-/// `None` so the JSON response can degrade per field instead of failing
-/// the whole request.
-async fn with_host_timeout<T>(future: impl Future<Output = Option<T>>) -> Option<T> {
-    timeout_future(future, HOST_CALL_TIMEOUT_NS).await.flatten()
+/// Call `Stat.snapshot()` once so both mutable fields come from one
+/// observation. Errors and timeouts degrade both fields to `null`.
+async fn stat_snapshot(stat: Option<system_capnp::stat::Client>) -> Option<(Vec<String>, usize)> {
+    let stat = stat?;
+    timeout_future(
+        async move {
+            let response = stat.snapshot_request().send().promise.await.ok()?;
+            let snapshot = response.get().ok()?.get_stat().ok()?;
+            let addrs = snapshot.get_listen_addrs().ok()?;
+            let listen_addrs = addrs
+                .iter()
+                .filter_map(|address| {
+                    let bytes = address.ok()?;
+                    let multiaddr = multiaddr::Multiaddr::try_from(bytes.to_vec()).ok()?;
+                    Some(multiaddr.to_string())
+                })
+                .collect();
+            Some((listen_addrs, snapshot.get_connected_peer_count() as usize))
+        },
+        STAT_CALL_TIMEOUT_NS,
+    )
+    .await
+    .flatten()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -134,52 +131,12 @@ where
     }
 }
 
-async fn host_id(host: &system_capnp::host::Client) -> Option<String> {
-    with_host_timeout(async {
-        let resp = host.id_request().send().promise.await.ok()?;
-        let bytes = resp.get().ok()?.get_peer_id().ok()?;
-        Some(bs58::encode(bytes).into_string())
-    })
-    .await
-}
-
-async fn host_addrs(host: &system_capnp::host::Client) -> Option<Vec<String>> {
-    with_host_timeout(async {
-        let resp = host.addrs_request().send().promise.await.ok()?;
-        let addrs = resp.get().ok()?.get_addrs().ok()?;
-        Some(
-            addrs
-                .iter()
-                .filter_map(|a| {
-                    let bytes = a.ok()?;
-                    let ma = multiaddr::Multiaddr::try_from(bytes.to_vec()).ok()?;
-                    Some(ma.to_string())
-                })
-                .collect(),
-        )
-    })
-    .await
-}
-
-async fn host_peer_count(host: &system_capnp::host::Client) -> Option<usize> {
-    with_host_timeout(async {
-        let resp = host.peers_request().send().promise.await.ok()?;
-        let peers = resp.get().ok()?.get_peers().ok()?;
-        Some(peers.len() as usize)
-    })
-    .await
-}
-
-/// Build the JSON body for `/status`. `host_cap` is `None` when the
-/// initial grants did not include it.
-async fn build_status_json(host_cap: Option<system_capnp::host::Client>) -> String {
-    let (peer_id, listen_addrs, peer_count) = match host_cap {
-        Some(h) => (
-            host_id(&h).await,
-            host_addrs(&h).await,
-            host_peer_count(&h).await,
-        ),
-        None => (None, None, None),
+async fn build_status_json(peer_id: Vec<u8>, stat: Option<system_capnp::stat::Client>) -> String {
+    let peer_id = bs58::encode(peer_id).into_string();
+    let snapshot = stat_snapshot(stat).await;
+    let (listen_addrs, peer_count) = match snapshot {
+        Some((listen_addrs, peer_count)) => (Some(listen_addrs), Some(peer_count)),
+        None => (None, None),
     };
 
     let body = serde_json::json!({
@@ -192,18 +149,30 @@ async fn build_status_json(host_cap: Option<system_capnp::host::Client>) -> Stri
     serde_json::to_string(&body).unwrap_or_else(|_| r#"{"status":"err","reason":"json"}"#.into())
 }
 
+async fn status_json_from_membrane(membrane: &Membrane) -> Result<String, capnp::Error> {
+    let graft_response = membrane.graft_request().send().promise.await?;
+    let graft = graft_response.get()?;
+    if !graft.has_peer_id() {
+        return Err(capnp::Error::failed(
+            "Membrane.graft result is missing required peerId".into(),
+        ));
+    }
+    let peer_id = graft.get_peer_id()?.to_vec();
+    if peer_id.is_empty() {
+        return Err(capnp::Error::failed(
+            "Membrane.graft result contains an empty peerId".into(),
+        ));
+    }
+    let stat = graft.has_stat().then(|| graft.get_stat()).transpose()?;
+
+    Ok(build_status_json(peer_id, stat).await)
+}
+
 async fn run_http() -> Result<(), ()> {
     use wagi_guest as wagi;
 
-    system::run(|initial_grants: InitialGrants| async move {
-        let grants_resp = initial_grants.get_request().send().promise.await?;
-        let caps = grants_resp.get()?.get_caps()?;
-        let host_cap: Option<system_capnp::host::Client> = initial_grant_opt(&caps, "host");
-        if host_cap.is_none() {
-            log::info!("host cap withheld — peer_id/listen_addrs/peer_count will be null");
-        }
-
-        let json = build_status_json(host_cap).await;
+    system::run(|membrane: Membrane| async move {
+        let json = status_json_from_membrane(&membrane).await?;
         wagi::respond_bytes_async(
             200,
             &[("Content-Type", "application/json")],
@@ -244,37 +213,40 @@ mod tests {
     use capnp::capability::Promise;
 
     const TEST_PEER_ID: &[u8] = b"status-test-peer";
+    const SECRET_CONNECTED_PEER_ID: &str = "secret-connected-peer-id";
+    const SECRET_CONNECTED_PEER_ADDR: &str = "/ip4/198.51.100.7/tcp/6553";
 
-    struct SlowPeersHost;
+    struct SnapshotStat {
+        connected_peers: Vec<(&'static str, &'static str)>,
+    }
 
     #[allow(refining_impl_trait)]
-    impl system_capnp::host::Server for SlowPeersHost {
-        fn id(
+    impl system_capnp::stat::Server for SnapshotStat {
+        fn snapshot(
             self: capnp::capability::Rc<Self>,
-            _params: system_capnp::host::IdParams,
-            mut results: system_capnp::host::IdResults,
+            _params: system_capnp::stat::SnapshotParams,
+            mut results: system_capnp::stat::SnapshotResults,
         ) -> Promise<(), capnp::Error> {
-            results.get().set_peer_id(TEST_PEER_ID);
-            Promise::ok(())
-        }
-
-        fn addrs(
-            self: capnp::capability::Rc<Self>,
-            _params: system_capnp::host::AddrsParams,
-            mut results: system_capnp::host::AddrsResults,
-        ) -> Promise<(), capnp::Error> {
-            let addr: multiaddr::Multiaddr = "/ip4/127.0.0.1/tcp/2025"
+            let address: multiaddr::Multiaddr = "/ip4/127.0.0.1/tcp/2025"
                 .parse()
                 .expect("valid test multiaddr");
-            let mut addrs = results.get().init_addrs(1);
-            addrs.set(0, &addr.to_vec());
+            let mut stat = results.get().init_stat();
+            stat.reborrow()
+                .init_listen_addrs(1)
+                .set(0, &address.to_vec());
+            stat.set_connected_peer_count(self.connected_peers.len() as u32);
             Promise::ok(())
         }
+    }
 
-        fn peers(
+    struct PendingStat;
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::stat::Server for PendingStat {
+        fn snapshot(
             self: capnp::capability::Rc<Self>,
-            _params: system_capnp::host::PeersParams,
-            _results: system_capnp::host::PeersResults,
+            _params: system_capnp::stat::SnapshotParams,
+            _results: system_capnp::stat::SnapshotResults,
         ) -> Promise<(), capnp::Error> {
             Promise::from_future(async {
                 std::future::pending::<()>().await;
@@ -282,66 +254,154 @@ mod tests {
                 Ok(())
             })
         }
+    }
 
-        fn network(
+    struct MissingPeerIdMembrane;
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::membrane::Server for MissingPeerIdMembrane {
+        fn graft(
             self: capnp::capability::Rc<Self>,
-            _params: system_capnp::host::NetworkParams,
-            _results: system_capnp::host::NetworkResults,
+            _params: system_capnp::membrane::GraftParams,
+            _results: system_capnp::membrane::GraftResults,
         ) -> Promise<(), capnp::Error> {
-            Promise::err(capnp::Error::unimplemented("test host network".into()))
+            Promise::ok(())
         }
     }
 
-    /// `build_status_json` with `None` host cap must return null for
-    /// host-derived fields and populate `status` + `version`. This is
-    /// the graceful-degradation contract the engagement starter kit
-    /// pitch depends on.
-    #[tokio::test(flavor = "current_thread")]
-    async fn build_status_json_null_host_returns_null_fields_and_populates_static() {
-        let json = build_status_json(None).await;
-        let v: serde_json::Value = serde_json::from_str(&json).expect("body should parse as JSON");
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
-        assert!(
-            v["peer_id"].is_null(),
-            "peer_id should be null when host cap is absent"
-        );
-        assert!(
-            v["listen_addrs"].is_null(),
-            "listen_addrs should be null when host cap is absent"
-        );
-        assert!(
-            v["peer_count"].is_null(),
-            "peer_count should be null when host cap is absent"
-        );
+    struct EmptyPeerIdMembrane;
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::membrane::Server for EmptyPeerIdMembrane {
+        fn graft(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::membrane::GraftParams,
+            mut results: system_capnp::membrane::GraftResults,
+        ) -> Promise<(), capnp::Error> {
+            results.get().set_peer_id(&[]);
+            Promise::ok(())
+        }
+    }
+
+    struct MinimalStatusMembrane {
+        stat: system_capnp::stat::Client,
+    }
+
+    #[allow(refining_impl_trait)]
+    impl system_capnp::membrane::Server for MinimalStatusMembrane {
+        fn graft(
+            self: capnp::capability::Rc<Self>,
+            _params: system_capnp::membrane::GraftParams,
+            mut results: system_capnp::membrane::GraftResults,
+        ) -> Promise<(), capnp::Error> {
+            let mut graft = results.get();
+            graft.set_peer_id(TEST_PEER_ID);
+            graft.set_stat(self.stat.clone());
+            Promise::ok(())
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn build_status_json_times_out_slow_peer_count_only() {
-        let host: system_capnp::host::Client = capnp_rpc::new_client(SlowPeersHost);
+    async fn production_status_decode_rejects_missing_peer_id() {
+        let membrane: Membrane = capnp_rpc::new_client(MissingPeerIdMembrane);
+
+        let error = match status_json_from_membrane(&membrane).await {
+            Ok(_) => panic!("missing peerId must fail status decoding"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("peerId"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_status_decode_rejects_empty_peer_id() {
+        let membrane: Membrane = capnp_rpc::new_client(EmptyPeerIdMembrane);
+
+        let error = match status_json_from_membrane(&membrane).await {
+            Ok(_) => panic!("empty peerId must fail status decoding"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("peerId"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn minimal_status_accepts_peer_id_and_stat_without_optional_authority() {
+        let stat: system_capnp::stat::Client = capnp_rpc::new_client(SnapshotStat {
+            connected_peers: vec![],
+        });
+        let membrane: Membrane = capnp_rpc::new_client(MinimalStatusMembrane { stat });
+
+        let response = membrane
+            .graft_request()
+            .send()
+            .promise
+            .await
+            .expect("minimal graft");
+        let graft = response.get().expect("minimal graft results");
+        assert!(graft.has_peer_id());
+        assert!(graft.has_stat());
+        assert!(!graft.has_network());
+        assert!(!graft.has_routing());
+        assert!(!graft.has_runtime());
+        assert!(!graft.has_authority());
+        assert!(!graft.has_identity());
+        assert!(!graft.has_ipfs());
+        assert!(!graft.has_extras());
+
+        let json = status_json_from_membrane(&membrane)
+            .await
+            .expect("minimal status");
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("body should parse as JSON");
+        assert_eq!(value["peer_id"], bs58::encode(TEST_PEER_ID).into_string());
+        assert_eq!(value["listen_addrs"][0], "/ip4/127.0.0.1/tcp/2025");
+        assert_eq!(value["peer_count"], 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn withheld_stat_returns_null_dynamic_values() {
+        let json = build_status_json(TEST_PEER_ID.to_vec(), None).await;
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("body should parse as JSON");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["peer_id"], bs58::encode(TEST_PEER_ID).into_string());
+        assert!(value["listen_addrs"].is_null());
+        assert!(value["peer_count"].is_null());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_snapshot_populates_both_mutable_fields() {
+        let stat: system_capnp::stat::Client = capnp_rpc::new_client(SnapshotStat {
+            connected_peers: vec![
+                (SECRET_CONNECTED_PEER_ID, SECRET_CONNECTED_PEER_ADDR),
+                ("second-secret-peer-id", "/ip4/203.0.113.9/tcp/6554"),
+                ("third-secret-peer-id", "/ip4/192.0.2.11/tcp/6555"),
+            ],
+        });
+        let json = build_status_json(TEST_PEER_ID.to_vec(), Some(stat)).await;
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("body should parse as JSON");
+
+        assert_eq!(value["peer_id"], bs58::encode(TEST_PEER_ID).into_string());
+        assert_eq!(value["listen_addrs"][0], "/ip4/127.0.0.1/tcp/2025");
+        assert_eq!(value["peer_count"], 3);
+        assert!(!json.contains(SECRET_CONNECTED_PEER_ID));
+        assert!(!json.contains(SECRET_CONNECTED_PEER_ADDR));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_timeout_degrades_both_mutable_fields() {
+        let stat: system_capnp::stat::Client = capnp_rpc::new_client(PendingStat);
         let started = tokio::time::Instant::now();
+        let json = build_status_json(TEST_PEER_ID.to_vec(), Some(stat)).await;
 
-        let json = build_status_json(Some(host)).await;
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "status host timeout should return promptly, took {elapsed:?}"
-        );
-
-        let v: serde_json::Value = serde_json::from_str(&json).expect("body should parse as JSON");
-        assert_eq!(v["status"], "ok");
-        assert_eq!(
-            v["peer_id"],
-            bs58::encode(TEST_PEER_ID).into_string(),
-            "fast host.id should still populate"
-        );
-        assert_eq!(
-            v["listen_addrs"][0], "/ip4/127.0.0.1/tcp/2025",
-            "fast host.addrs should still populate"
-        );
-        assert!(
-            v["peer_count"].is_null(),
-            "slow host.peers should degrade to null"
-        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("body should parse as JSON");
+        assert_eq!(value["peer_id"], bs58::encode(TEST_PEER_ID).into_string());
+        assert!(value["listen_addrs"].is_null());
+        assert!(value["peer_count"].is_null());
     }
 }
