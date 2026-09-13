@@ -21,6 +21,9 @@ const LAST_MOVE: Color = Color::new(0.28, 0.56, 0.87, 0.45);
 const MOVE_DELAY: f64 = 1.5;
 const END_DELAY: f64 = 3.0;
 
+type Square = (usize, usize);
+type LastMove = (Square, Square);
+
 fn window_conf() -> Conf {
     Conf {
         window_title: "Wetware Chess — PGN Replay".into(),
@@ -122,9 +125,7 @@ mod tests {
 /// Build all positions from the starting position through each SAN move.
 /// Returns (positions, last_moves) where positions[0] is the start and
 /// last_moves[i] is the (from, to) for the move that produced positions[i+1].
-fn build_positions(
-    san_moves: &[String],
-) -> Result<(Vec<Chess>, Vec<((usize, usize), (usize, usize))>), String> {
+fn build_positions(san_moves: &[String]) -> Result<(Vec<Chess>, Vec<LastMove>), String> {
     let mut positions = vec![Chess::default()];
     let mut last_moves = Vec::new();
 
@@ -228,7 +229,11 @@ impl ReplayState {
         }
         let idx = self.move_index - 1; // 0-based move index
         let full_move = (idx / 2 + 1) as u32;
-        let side = if idx % 2 == 0 { "White" } else { "Black" };
+        let side = if idx.is_multiple_of(2) {
+            "White"
+        } else {
+            "Black"
+        };
         Some((full_move, side))
     }
 }
@@ -525,7 +530,7 @@ fn draw_board(
 
     // FEN at bottom
     draw_text(
-        &format!("FEN: {fen}"),
+        format!("FEN: {fen}"),
         BOARD_PADDING,
         screen_height() - 16.0,
         14.0,

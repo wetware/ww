@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Chess demo with match play and PGN replay viewer.
+
 ### Changed
 - **Production Cells now use native WASI P3.** Wasmtime 48.0.1 invokes each
   asynchronous `wasi:cli/run@0.3.0` export with `Store::run_concurrent`.

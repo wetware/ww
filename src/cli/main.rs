@@ -3058,6 +3058,7 @@ mod tests {
             mounts: vec![".".to_string(), "~/.ww/identity:/etc/identity".to_string()],
             namespace_root: Vec::new(),
             listen: Vec::new(),
+            bootstrap: Vec::new(),
             wasm_debug: false,
             kernel: None,
             identity: None,
