@@ -89,15 +89,23 @@ struct FuelPolicy {
     # EWMA auto-adjusts. Runs indefinitely. Current behavior.
 
     oneshot @1 :OneshotFuel;
-    # Fixed budget. Trap at exhaustion (Trap::OutOfFuel).
+    # Cumulative guest-compute budget. Trap at exhaustion (Trap::OutOfFuel).
     # Auction-metered cells. "Prepaid card."
   }
 }
 
 struct OneshotFuel {
   totalBudget @0 :UInt64;
-  maxPerEpoch @1 :UInt64;   # 0 = use MAX_FUEL default
-  minPerEpoch @2 :UInt64;   # 0 = use MIN_FUEL default
+  # Total cumulative guest-compute authority. 0 grants no initial fuel; the
+  # Cell traps on its first fuel-consuming execution.
+
+  maxPerEpoch @1 :UInt64;
+  # Cumulative per-epoch authority cap. 0 selects MAX_FUEL; values above
+  # MAX_FUEL are clamped to MAX_FUEL. Exhaustion before the next epoch
+  # currently traps out of fuel. Issue #679 owns suspension until that tick.
+
+  minPerEpoch @2 :UInt64;
+  # EWMA quantum floor, not compute authority. 0 selects MIN_FUEL.
 }
 
 interface Executor {
