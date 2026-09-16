@@ -32,53 +32,74 @@ mod routing_key_runtime {
 // ---------------------------------------------------------------------------
 // Fuel metering
 //
-// Fuel is both the resource-metering unit and the cooperative preemption
-// primitive.  Every YIELD_INTERVAL instructions Wasmtime suspends the guest
-// and returns Poll::Pending to the Tokio LocalSet, giving other cells a turn.
+// Fuel is both the resource-metering unit and a cooperative preemption input.
+// `fuel_async_yield_interval` requests an async yield after YIELD_INTERVAL
+// consumed fuel. A grant can exhaust before Wasmtime reaches that yield.
 //
-// The fuel budget IS the scheduling quantum: larger budgets give cells higher
-// effective priority (more instructions per yield cycle).  The EWMA estimator
-// tracks consumed/budget ratio and sizes the budget inversely: I/O-bound
-// cells get large budgets, compute-heavy cells get small ones.
+// The EWMA quantum is the desired scheduling grant. Larger quanta give cells
+// more instructions between accounting boundaries. The estimator tracks the
+// consumed/installed ratio and sizes the next quantum inversely.
 //
-// Two refueling paths:
+// Two accounting paths:
 //   - call_hook (ReturningFromHost): fires on every host call, EWMA adapts.
-//   - epoch_deadline_callback: fires every EPOCH_TICK_MS, prevents
-//     Trap::OutOfFuel for cells that don't make host calls.
+//   - epoch_deadline_callback: fires every EPOCH_TICK_MS.
+//
+// One-shot Cells clamp every grant by cumulative total and per-epoch
+// authority. Scheduled-cell exhaustion and yielding remain separate concerns.
 // ---------------------------------------------------------------------------
 
 use crate::sched::{INITIAL_FUEL, MAX_FUEL, MIN_FUEL, RATIO_SCALE, YIELD_INTERVAL};
 
 /// Ratio-based EWMA fuel estimator for WASM cells.
 ///
-/// Tracks the consumed/budget ratio via an exponentially weighted moving
-/// average (α=0.3) and sizes the budget inversely: low ratio (I/O-bound)
-/// → large budget, high ratio (compute-bound) → small budget.
+/// Tracks the consumed/installed ratio via an exponentially weighted moving
+/// average (α=0.3) and sizes the quantum inversely: low ratio (I/O-bound)
+/// → large quantum, high ratio (compute-bound) → small quantum.
 ///
 /// Using the ratio instead of absolute consumed avoids a feedback loop
-/// where consumed depends on budget, which would spiral to MIN_FUEL under
+/// where consumed depends on the installed grant, which would spiral to
+/// MIN_FUEL under
 /// bursty workloads.
 ///
 /// Design doc: `doc/designs/fuel-scheduling.md`
 pub struct FuelEstimator {
-    budget: u64,
-    /// EWMA of consumed/budget ratio (fixed-point, 0..RATIO_SCALE).
+    /// Amount most recently installed in the Store with `set_fuel`.
+    installed: u64,
+    /// Desired EWMA grant quantum. Authority ledgers can reduce the actual grant.
+    quantum: u64,
+    /// EWMA of consumed/installed ratio (fixed-point, 0..RATIO_SCALE).
     avg_ratio: u64,
     /// False until the first on_host_return observation.
     initialized: bool,
-    /// Host calls observed since the last epoch tick. Cells that make linked
-    /// host calls are already handled by the call hook, so the epoch callback
-    /// refuels them without double-observing. An unmarked epoch still records
-    /// measured consumption because Component Model builtins do not mark
-    /// `HostCallFrames`.
+    /// Host calls observed since the last epoch tick. The call hook already
+    /// observes linked host calls, so the epoch callback settles subsequent
+    /// consumption without another EWMA observation. An unmarked epoch still
+    /// records measured consumption because Component Model builtins do not
+    /// mark `HostCallFrames`.
     host_calls_this_epoch: u32,
-    /// Per-cell ceiling for the EWMA budget (default: MAX_FUEL).
-    max_fuel: u64,
-    /// Per-cell floor for the EWMA budget (default: MIN_FUEL).
-    min_fuel: u64,
-    /// Total fuel budget from a oneshot quote.  `None` = unlimited (scheduled cell).
-    /// When this reaches 0 the epoch callback stops refueling and the cell traps.
-    remaining_budget: Option<u64>,
+    /// Per-cell ceiling for the EWMA quantum (default: MAX_FUEL).
+    max_quantum: u64,
+    /// Per-cell floor for the EWMA quantum (default: MIN_FUEL).
+    min_quantum: u64,
+    /// One-shot authority restored at each epoch transition.
+    epoch_limit: Option<u64>,
+    /// Cumulative fuel authority left for a oneshot cell.
+    /// `None` means that the cell is scheduled and has no cumulative limit.
+    total_remaining: Option<u64>,
+    /// Fuel authority left in the current epoch for a oneshot cell.
+    epoch_remaining: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum FuelBoundary {
+    HostReturn,
+    Epoch,
+}
+
+#[derive(Clone, Copy)]
+struct FuelUpdate {
+    consumed: u64,
+    grant: u64,
 }
 
 /// One observation from the production epoch fuel callback.
@@ -120,57 +141,68 @@ impl FuelObserver {
 
 impl FuelEstimator {
     #[must_use]
-    pub fn new(initial: u64) -> Self {
+    pub fn new(initial_quantum: u64) -> Self {
         Self {
-            budget: initial,
+            installed: initial_quantum,
+            quantum: initial_quantum,
             avg_ratio: RATIO_SCALE / 2,
             initialized: false,
             host_calls_this_epoch: 0,
-            max_fuel: MAX_FUEL,
-            min_fuel: MIN_FUEL,
-            remaining_budget: None,
+            max_quantum: MAX_FUEL,
+            min_quantum: MIN_FUEL,
+            epoch_limit: None,
+            total_remaining: None,
+            epoch_remaining: None,
         }
     }
 
     /// Create an estimator for a oneshot (budgeted) cell.
     ///
-    /// `max_fuel`/`min_fuel`: per-epoch bounds. 0 = use system defaults.
-    /// `total_budget`: total fuel credits. Cell traps when exhausted.
+    /// `max_per_epoch` is the cumulative authority available in each epoch and
+    /// also caps the EWMA quantum. `min_per_epoch` sets only the EWMA floor.
+    /// Zero values select the system defaults.
     #[must_use]
-    pub fn new_oneshot(total_budget: u64, max_fuel: u64, min_fuel: u64) -> Self {
-        let effective_max = if max_fuel > 0 {
-            max_fuel.min(MAX_FUEL)
+    pub fn new_oneshot(total_budget: u64, max_per_epoch: u64, min_per_epoch: u64) -> Self {
+        let effective_max = if max_per_epoch > 0 {
+            max_per_epoch.min(MAX_FUEL)
         } else {
             MAX_FUEL
         };
-        let effective_min = if min_fuel > 0 {
-            min_fuel.min(effective_max)
+        let effective_min = if min_per_epoch > 0 {
+            min_per_epoch.min(effective_max)
         } else {
-            MIN_FUEL
+            MIN_FUEL.min(effective_max)
         };
         Self {
-            budget: INITIAL_FUEL,
+            installed: 0,
+            quantum: INITIAL_FUEL,
             avg_ratio: RATIO_SCALE / 2,
             initialized: false,
             host_calls_this_epoch: 0,
-            max_fuel: effective_max,
-            min_fuel: effective_min,
-            remaining_budget: Some(total_budget),
+            max_quantum: effective_max,
+            min_quantum: effective_min,
+            epoch_limit: Some(effective_max),
+            total_remaining: Some(total_budget),
+            epoch_remaining: Some(effective_max),
         }
     }
 
-    /// Adjust the fuel budget at a `ReturningFromHost` boundary.
-    ///
-    /// `remaining` is the fuel left in the store at the moment the guest
-    /// re-enters WASM after a host call.  The estimator computes the
-    /// consumed/budget ratio, updates the EWMA, and returns a new budget
-    /// sized inversely to the ratio.
-    ///
-    /// Returns the new budget to install via `store.set_fuel(...)`.
-    pub fn on_host_return(&mut self, remaining: u64) -> u64 {
-        let consumed = self.budget.saturating_sub(remaining);
+    /// Return and record the first grant installed in a Store.
+    fn initial_grant(&mut self) -> u64 {
+        let grant = self.available_grant();
+        self.installed = grant;
+        grant
+    }
+
+    fn available_grant(&self) -> u64 {
+        self.quantum
+            .min(self.total_remaining.unwrap_or(u64::MAX))
+            .min(self.epoch_remaining.unwrap_or(u64::MAX))
+    }
+
+    fn observe(&mut self, installed: u64, consumed: u64) {
         let ratio = (consumed * RATIO_SCALE)
-            .checked_div(self.budget)
+            .checked_div(installed)
             .unwrap_or(RATIO_SCALE / 2);
 
         if !self.initialized {
@@ -182,31 +214,69 @@ impl FuelEstimator {
             self.avg_ratio = (self.avg_ratio * 7 + ratio * 3) / 10;
         }
 
-        // Budget inversely proportional to utilization ratio.
-        // ratio=0 (pure I/O) → budget=MAX_FUEL
-        // ratio=1000 (pure compute) → budget=0, clamped to MIN_FUEL
-        let new_budget = (self.max_fuel * (RATIO_SCALE - self.avg_ratio) / RATIO_SCALE)
-            .clamp(self.min_fuel, self.max_fuel);
-        self.budget = new_budget;
-        new_budget
+        // Quantum inversely proportional to utilization ratio.
+        // ratio=0 (pure I/O) → quantum=MAX_FUEL
+        // ratio=1000 (pure compute) → quantum=0, clamped to MIN_FUEL
+        self.quantum = (self.max_quantum * (RATIO_SCALE - self.avg_ratio) / RATIO_SCALE)
+            .clamp(self.min_quantum, self.max_quantum);
     }
 
-    /// Record one epoch boundary and return the next fuel budget.
+    /// Settle the installed fuel exactly once, update boundary state, and
+    /// record the next authority-bounded grant.
+    fn settle_and_grant(&mut self, current_fuel: u64, boundary: FuelBoundary) -> FuelUpdate {
+        let installed = self.installed;
+        let consumed = installed.saturating_sub(current_fuel);
+        if let Some(total_remaining) = self.total_remaining.as_mut() {
+            *total_remaining = total_remaining.saturating_sub(consumed);
+        }
+        if let Some(epoch_remaining) = self.epoch_remaining.as_mut() {
+            *epoch_remaining = epoch_remaining.saturating_sub(consumed);
+        }
+
+        match boundary {
+            FuelBoundary::HostReturn => {
+                self.host_calls_this_epoch += 1;
+                self.observe(installed, consumed);
+            }
+            FuelBoundary::Epoch => {
+                if self.host_calls_this_epoch == 0 {
+                    self.observe(installed, consumed);
+                }
+                self.host_calls_this_epoch = 0;
+                self.epoch_remaining = self.epoch_limit;
+            }
+        }
+
+        let grant = self.available_grant();
+        self.installed = grant;
+        FuelUpdate { consumed, grant }
+    }
+
+    /// Settle fuel at a `ReturningFromHost` boundary.
+    ///
+    /// `remaining` is the fuel left in the store at the moment the guest
+    /// re-enters WASM after a host call. The estimator computes the
+    /// consumed/installed ratio, updates the EWMA, and returns the next grant.
+    ///
+    /// The returned grant is bounded by one-shot authority when present.
+    pub fn on_host_return(&mut self, remaining: u64) -> u64 {
+        self.settle_and_grant(remaining, FuelBoundary::HostReturn)
+            .grant
+    }
+
+    /// Settle one epoch boundary and return the next fuel grant.
     ///
     /// Linked host calls already record their observation in the call hook.
     /// Otherwise, use the Store's actual remaining fuel. This distinguishes
     /// low-consumption Component Model I/O from genuinely compute-bound work.
+    #[cfg(test)]
     fn on_epoch_tick(&mut self, remaining: u64) -> u64 {
-        if self.host_calls_this_epoch == 0 {
-            self.on_host_return(remaining);
-        }
-        self.host_calls_this_epoch = 0;
-        self.budget
+        self.settle_and_grant(remaining, FuelBoundary::Epoch).grant
     }
 
-    /// Returns the current budget.
-    pub fn budget(&self) -> u64 {
-        self.budget
+    /// Returns the current desired EWMA quantum before authority clamps.
+    pub fn quantum(&self) -> u64 {
+        self.quantum
     }
 
     /// Returns the current EWMA ratio (0..RATIO_SCALE).
@@ -386,7 +456,7 @@ pub struct ComponentRunStates {
     /// The CidTree interceptor uses this execution-context state to delegate
     /// scratch operations to WASI without making the image root writable.
     pub(crate) writable_fs_descriptors: std::collections::HashSet<u32>,
-    /// EWMA fuel estimator, refuels at host call boundaries.
+    /// EWMA estimator and one-shot fuel authority ledgers.
     pub fuel_estimator: FuelEstimator,
     /// Opt-in production callback observations used by integration tests.
     fuel_observer: Option<FuelObserver>,
@@ -577,17 +647,54 @@ fn install_host_return_fuel_hook(store: &mut Store<ComponentRunStates>) {
     store.call_hook(|mut ctx, hook| {
         if ctx.data_mut().host_call_frames.on_call_hook(hook) {
             let remaining = ctx.get_fuel().unwrap_or(0);
-            ctx.data_mut().fuel_estimator.host_calls_this_epoch += 1;
-            let new_budget = ctx.data_mut().fuel_estimator.on_host_return(remaining);
-            ctx.set_fuel(new_budget)?;
+            let update = ctx
+                .data_mut()
+                .fuel_estimator
+                .settle_and_grant(remaining, FuelBoundary::HostReturn);
+            ctx.set_fuel(update.grant)?;
             tracing::debug!(
-                new_budget,
+                grant = update.grant,
+                consumed = update.consumed,
                 remaining,
                 avg_ratio = ctx.data().fuel_estimator.avg_ratio(),
                 "fuel.refuel"
             );
         }
         Ok(())
+    });
+}
+
+fn install_epoch_fuel_callback(store: &mut Store<ComponentRunStates>) {
+    store.epoch_deadline_callback(|mut ctx| {
+        // Charge work to the old epoch before opening the new epoch allowance.
+        let current_fuel = ctx.get_fuel().unwrap_or(0);
+        let est = &mut ctx.data_mut().fuel_estimator;
+        let host_calls_this_epoch = est.host_calls_this_epoch;
+        let update = est.settle_and_grant(current_fuel, FuelBoundary::Epoch);
+        let avg_ratio = est.avg_ratio();
+        let total_remaining = est.total_remaining;
+        let epoch_remaining = est.epoch_remaining;
+        ctx.set_fuel(update.grant)?;
+        if let Some(observer) = ctx.data().fuel_observer.as_ref() {
+            observer.record(FuelEpochObservation {
+                current_fuel,
+                measured_consumption: update.consumed,
+                host_calls_this_epoch,
+                budget: update.grant,
+                avg_ratio,
+            });
+        }
+        tracing::trace!(
+            grant = update.grant,
+            current_fuel,
+            measured_consumption = update.consumed,
+            host_calls_this_epoch,
+            avg_ratio,
+            ?total_remaining,
+            ?epoch_remaining,
+            "fuel.epoch_refuel"
+        );
+        Ok(wasmtime::UpdateDeadline::Continue(1))
     });
 }
 
@@ -751,8 +858,8 @@ impl Builder {
     /// Override the default fuel estimator.
     ///
     /// When set, this estimator replaces `FuelEstimator::new(INITIAL_FUEL)` in
-    /// the process store.  Used by `ExecutorImpl::spawn()` to inject oneshot
-    /// budget constraints from the `FuelPolicy` schema.
+    /// the process store. The Cap'n Proto `Executor.spawn` boundary uses this
+    /// override to apply one-shot authority from the `FuelPolicy` schema.
     pub fn with_fuel_estimator(mut self, est: FuelEstimator) -> Self {
         self.fuel_estimator = Some(est);
         self
@@ -829,10 +936,7 @@ impl Proc {
         //   consume_fuel       — enables instruction counting; without this,
         //                        fuel methods are no-ops and the estimator is
         //                        inert.
-        //   epoch_interruption — enables the epoch_deadline_callback that
-        //                        refuels compute-bound cells, preventing
-        //                        Trap::OutOfFuel for guests that don't make
-        //                        host calls frequently enough.
+        //   epoch_interruption — enables the epoch accounting callback.
         let engine = if let Some(engine) = engine {
             engine
         } else {
@@ -877,6 +981,8 @@ impl Proc {
 
         let wasi = wasi_builder.build();
 
+        let mut fuel_estimator = fuel_estimator.unwrap_or_else(|| FuelEstimator::new(INITIAL_FUEL));
+        let initial_fuel = fuel_estimator.initial_grant();
         let state = ComponentRunStates {
             wasi_ctx: wasi,
             resource_table: ResourceTable::new(),
@@ -886,7 +992,7 @@ impl Proc {
             cache_mode,
             cid_tree,
             writable_fs_descriptors: std::collections::HashSet::new(),
-            fuel_estimator: fuel_estimator.unwrap_or_else(|| FuelEstimator::new(INITIAL_FUEL)),
+            fuel_estimator,
             fuel_observer,
             host_call_frames: HostCallFrames::default(),
             kernel_ready_gate,
@@ -894,83 +1000,27 @@ impl Proc {
 
         let mut store = Store::new(&engine, state);
 
-        // Load the initial fuel budget.  fuel_async_yield_interval controls how
+        // Load the initial authority-bounded grant. fuel_async_yield_interval controls how
         // often Wasmtime suspends the guest to poll other Tokio tasks — this is
-        // independent of the EWMA budget ceiling.  A cell with MAX_FUEL still
+        // independent of the EWMA quantum ceiling. A Cell with MAX_FUEL still
         // yields every YIELD_INTERVAL instructions.
-        store.set_fuel(INITIAL_FUEL)?;
+        store.set_fuel(initial_fuel)?;
         store.fuel_async_yield_interval(Some(YIELD_INTERVAL))?;
-        tracing::trace!(budget = INITIAL_FUEL, "fuel.initial");
+        tracing::trace!(grant = initial_fuel, "fuel.initial");
 
-        // Epoch-based refueling: prevents Trap::OutOfFuel for compute-bound
-        // cells.  When Engine::increment_epoch() is called (by the epoch tick
-        // task in runtime.rs), this callback fires inside the Store context
-        // and refuels the cell with its current EWMA-estimated budget.
-        //
-        // For I/O-bound cells this is a no-op (they're already refueled by
-        // the call_hook below).  For compute-bound cells, this is the only
-        // refueling path — without it, fuel exhaustion causes Trap::OutOfFuel.
-        store.epoch_deadline_callback(|mut ctx| {
-            // Read fuel level before borrowing the estimator mutably.
-            let current_fuel = ctx.get_fuel().unwrap_or(0);
-            let est = &mut ctx.data_mut().fuel_estimator;
-
-            // Budget exhaustion check for oneshot cells.
-            // When remaining_budget hits 0, stop refueling.  The cell traps on
-            // the next instruction that would consume fuel.
-            if let Some(ref mut remaining) = est.remaining_budget {
-                let consumed = est.budget.saturating_sub(current_fuel);
-                *remaining = remaining.saturating_sub(consumed);
-                if *remaining == 0 {
-                    tracing::info!(remaining_budget = 0, "fuel.budget.exhausted");
-                    return Ok(wasmtime::UpdateDeadline::Continue(1));
-                }
-                let remaining_snap = *remaining;
-                let avg = est.avg_ratio();
-                tracing::debug!(
-                    remaining_budget = remaining_snap,
-                    consumed_this_epoch = consumed,
-                    avg_ratio = avg,
-                    "fuel.budget.epoch_tick"
-                );
-            }
-
-            let measured_consumption = est.budget.saturating_sub(current_fuel);
-            let host_calls_this_epoch = est.host_calls_this_epoch;
-            let budget = est.on_epoch_tick(current_fuel);
-            let avg_ratio = est.avg_ratio();
-            ctx.set_fuel(budget)?;
-            if let Some(observer) = ctx.data().fuel_observer.as_ref() {
-                observer.record(FuelEpochObservation {
-                    current_fuel,
-                    measured_consumption,
-                    host_calls_this_epoch,
-                    budget,
-                    avg_ratio,
-                });
-            }
-            tracing::trace!(
-                budget,
-                current_fuel,
-                measured_consumption,
-                host_calls_this_epoch,
-                avg_ratio,
-                "fuel.epoch_refuel"
-            );
-            Ok(wasmtime::UpdateDeadline::Continue(1))
-        });
+        // Epoch accounting settles the old epoch and installs the next grant.
+        // For one-shot Cells, settlement precedes the epoch allowance reset.
+        install_epoch_fuel_callback(&mut store);
         store.set_epoch_deadline(1);
 
-        // EWMA refueling hook: observes linked guest imports when they return.
+        // The EWMA accounting hook observes linked imports when they return.
         //
-        // The estimator tracks the consumed/budget ratio via EWMA and sizes
-        // the budget inversely.  set_fuel() reloads the tank so the guest can
-        // continue. Wasmtime 48 also emits these hooks for internal libcalls
+        // The estimator tracks the consumed/installed ratio via EWMA and sizes
+        // the next quantum inversely. Wasmtime 48 also emits these hooks for internal libcalls
         // and fuel/epoch yields. Linked imports mark the Store state from
         // their host implementation; the hook ignores unmarked transitions.
         //
-        // Compute-bound cells that don't make host calls are refueled by the
-        // epoch_deadline_callback above to prevent Trap::OutOfFuel.
+        // Compute-bound Cells that do not make host calls reach the epoch path.
         install_host_return_fuel_hook(&mut store);
 
         // Instantiate it as a normal component. The canonical engine has
@@ -1286,7 +1336,10 @@ mod tests {
         );
     }
 
-    fn component_test_state() -> ComponentRunStates {
+    fn component_test_state_with_fuel(
+        fuel_estimator: FuelEstimator,
+        fuel_observer: Option<FuelObserver>,
+    ) -> ComponentRunStates {
         let (_host, granted_transport) = crate::p3::HostTransport::bounded_pair();
         ComponentRunStates {
             wasi_ctx: WasiCtxBuilder::new().build(),
@@ -1297,15 +1350,21 @@ mod tests {
             cache_mode: None,
             cid_tree: None,
             writable_fs_descriptors: std::collections::HashSet::new(),
-            fuel_estimator: FuelEstimator::new(INITIAL_FUEL),
-            fuel_observer: None,
+            fuel_estimator,
+            fuel_observer,
             host_call_frames: HostCallFrames::default(),
             kernel_ready_gate: None,
         }
     }
 
-    async fn linked_routing_key_probe_bytes(
+    fn component_test_state() -> ComponentRunStates {
+        component_test_state_with_fuel(FuelEstimator::new(INITIAL_FUEL), None)
+    }
+
+    async fn linked_routing_key_probe_bytes_with_fuel(
         bytes: &[u8],
+        mut fuel_estimator: FuelEstimator,
+        fuel_observer: Option<FuelObserver>,
     ) -> (
         Store<ComponentRunStates>,
         wasmtime::component::TypedFunc<(), (String,)>,
@@ -1315,12 +1374,17 @@ mod tests {
         let mut linker = Linker::new(&engine);
         add_p3_wasi_to_linker(&mut linker).expect("install P3 WASI imports");
         add_routing_key_to_linker(&mut linker).expect("install routing-key import");
-        let mut store = Store::new(&engine, component_test_state());
-        store.set_fuel(INITIAL_FUEL).expect("routing-key test fuel");
+        let initial_fuel = fuel_estimator.initial_grant();
+        let mut store = Store::new(
+            &engine,
+            component_test_state_with_fuel(fuel_estimator, fuel_observer),
+        );
+        store.set_fuel(initial_fuel).expect("routing-key test fuel");
         store
             .fuel_async_yield_interval(Some(YIELD_INTERVAL))
             .expect("routing-key yield interval");
         store.set_epoch_deadline(1);
+        install_epoch_fuel_callback(&mut store);
         install_host_return_fuel_hook(&mut store);
         let instance = linker
             .instantiate_async(&mut store, &component)
@@ -1332,11 +1396,37 @@ mod tests {
         (store, probe)
     }
 
+    async fn linked_routing_key_probe_bytes(
+        bytes: &[u8],
+    ) -> (
+        Store<ComponentRunStates>,
+        wasmtime::component::TypedFunc<(), (String,)>,
+    ) {
+        linked_routing_key_probe_bytes_with_fuel(bytes, FuelEstimator::new(INITIAL_FUEL), None)
+            .await
+    }
+
     async fn linked_routing_key_probe() -> (
         Store<ComponentRunStates>,
         wasmtime::component::TypedFunc<(), (String,)>,
     ) {
         linked_routing_key_probe_bytes(ROUTING_KEY_PROBE_COMPONENT.as_bytes()).await
+    }
+
+    fn compiled_routing_key_probe_bytes() -> Vec<u8> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let artifact =
+            root.join("target/routing-key-probe/wasm32-wasip3/release/routing_key_probe.wasm");
+        if !artifact.is_file() {
+            let status = std::process::Command::new("make")
+                .current_dir(&root)
+                .arg("routing-key-probe")
+                .status()
+                .expect("launch routing-key-probe build");
+            assert!(status.success(), "routing-key-probe build failed");
+        }
+        std::fs::read(&artifact)
+            .unwrap_or_else(|error| panic!("read {}: {error}", artifact.display()))
     }
 
     #[tokio::test]
@@ -1357,19 +1447,7 @@ mod tests {
 
     #[tokio::test]
     async fn compiled_routing_key_guest_wrapper_matches_golden_vector() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let artifact =
-            root.join("target/routing-key-probe/wasm32-wasip3/release/routing_key_probe.wasm");
-        if !artifact.is_file() {
-            let status = std::process::Command::new("make")
-                .current_dir(&root)
-                .arg("routing-key-probe")
-                .status()
-                .expect("launch routing-key-probe build");
-            assert!(status.success(), "routing-key-probe build failed");
-        }
-        let bytes = std::fs::read(&artifact)
-            .unwrap_or_else(|error| panic!("read {}: {error}", artifact.display()));
+        let bytes = compiled_routing_key_probe_bytes();
         let (mut store, probe) = linked_routing_key_probe_bytes(&bytes).await;
 
         for _ in 0..2 {
@@ -1382,6 +1460,191 @@ mod tests {
                 "bafkr4ifcoue3f52zpzpz2xei7dqhs3gajm326llyljbwisxkwea7hbowyy"
             );
         }
+    }
+
+    fn charged_oneshot_fuel(store: &Store<ComponentRunStates>, total_budget: u64) -> u64 {
+        let est = &store.data().fuel_estimator;
+        let settled = total_budget - est.total_remaining.expect("one-shot total ledger");
+        let current = store.get_fuel().expect("read one-shot Store fuel");
+        settled + est.installed.saturating_sub(current)
+    }
+
+    #[tokio::test]
+    async fn oneshot_fuel_zero_tiny_and_small_epoch_p3_guests_exhaust() {
+        let bytecode = wat::parse_str(include_str!(
+            "../../../tests/fixtures/spinning-component.wat"
+        ))
+        .expect("parse P3 spinning component fixture");
+
+        for (total_budget, max_per_epoch, expected_initial) in [
+            (0, 10_000, 0),
+            (1_337, 10_000, 1_337),
+            (25_000, 5_000, 5_000),
+        ] {
+            let (builder, _handles) = Builder::ordinary(
+                Program::Bytes(bytecode.clone()),
+                tokio::io::empty(),
+                tokio::io::sink(),
+                tokio::io::sink(),
+            );
+            let proc = builder
+                .with_fuel_estimator(FuelEstimator::new_oneshot(total_budget, max_per_epoch, 0))
+                .build()
+                .await
+                .expect("build budgeted P3 spinning component");
+            assert_eq!(
+                proc.store.get_fuel().expect("read initial P3 fuel"),
+                expected_initial
+            );
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), proc.run())
+                .await
+                .expect("budgeted P3 spinning component timed out")
+                .expect_err("budgeted P3 spinning component must exhaust fuel");
+        }
+    }
+
+    #[tokio::test]
+    async fn oneshot_fuel_compiled_p3_host_calls_cannot_mint_total_authority() {
+        const TOTAL_BUDGET: u64 = 25_000;
+        let bytes = compiled_routing_key_probe_bytes();
+        let (mut store, probe) = linked_routing_key_probe_bytes_with_fuel(
+            &bytes,
+            FuelEstimator::new_oneshot(TOTAL_BUDGET, 100_000, 0),
+            None,
+        )
+        .await;
+
+        let mut completed = 0;
+        let failure = loop {
+            match probe.call_async(&mut store, ()).await {
+                Ok((key,)) => {
+                    assert_eq!(
+                        key,
+                        "bafkr4ifcoue3f52zpzpz2xei7dqhs3gajm326llyljbwisxkwea7hbowyy"
+                    );
+                    completed += 1;
+                    assert!(completed < 10_000, "one-shot guest did not exhaust");
+                }
+                Err(error) => break error,
+            }
+        };
+
+        assert!(completed > 1, "test did not exercise repeated host returns");
+        assert_eq!(charged_oneshot_fuel(&store, TOTAL_BUDGET), TOTAL_BUDGET);
+        assert_eq!(store.get_fuel().expect("read exhausted Store fuel"), 0);
+        assert!(
+            format!("{failure:#}").contains("fuel"),
+            "unexpected one-shot failure: {failure:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_fuel_compiled_p3_host_calls_share_one_epoch_limit() {
+        const TOTAL_BUDGET: u64 = 25_000;
+        const MAX_PER_EPOCH: u64 = 10_000;
+        let bytes = compiled_routing_key_probe_bytes();
+        let (mut store, probe) = linked_routing_key_probe_bytes_with_fuel(
+            &bytes,
+            FuelEstimator::new_oneshot(TOTAL_BUDGET, MAX_PER_EPOCH, 0),
+            None,
+        )
+        .await;
+
+        let mut completed = 0;
+        while probe.call_async(&mut store, ()).await.is_ok() {
+            completed += 1;
+            assert!(completed < 10_000, "one-epoch P3 guest did not exhaust");
+        }
+
+        assert!(completed > 1, "test did not exercise repeated host returns");
+        assert_eq!(charged_oneshot_fuel(&store, TOTAL_BUDGET), MAX_PER_EPOCH);
+        assert_eq!(store.get_fuel().expect("read exhausted Store fuel"), 0);
+    }
+
+    #[tokio::test]
+    async fn oneshot_fuel_compiled_p3_spans_epochs_without_resetting_total() {
+        const TOTAL_BUDGET: u64 = 25_000;
+        const MAX_PER_EPOCH: u64 = 10_000;
+        let bytes = compiled_routing_key_probe_bytes();
+        let observer = FuelObserver::default();
+        let (mut store, probe) = linked_routing_key_probe_bytes_with_fuel(
+            &bytes,
+            FuelEstimator::new_oneshot(TOTAL_BUDGET, MAX_PER_EPOCH, 0),
+            Some(observer.clone()),
+        )
+        .await;
+
+        let mut completed = 0;
+        loop {
+            store.engine().increment_epoch();
+            match probe.call_async(&mut store, ()).await {
+                Ok(_) => {
+                    completed += 1;
+                    assert!(
+                        completed < 10_000,
+                        "multi-epoch one-shot guest did not exhaust"
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+
+        let observations = observer.observations();
+        assert!(
+            observations.len() >= 2,
+            "guest did not cross multiple production epochs: {observations:?}"
+        );
+        assert!(observations.iter().all(|sample| {
+            sample.measured_consumption <= MAX_PER_EPOCH && sample.budget <= MAX_PER_EPOCH
+        }));
+        assert_eq!(charged_oneshot_fuel(&store, TOTAL_BUDGET), TOTAL_BUDGET);
+    }
+
+    #[tokio::test]
+    async fn oneshot_fuel_compiled_p3_consumes_a_final_partial_grant() {
+        const CALIBRATION_TOTAL: u64 = 100_000;
+        const FINAL_PARTIAL: u64 = 1_337;
+        let bytes = compiled_routing_key_probe_bytes();
+        let (mut calibration_store, calibration_probe) = linked_routing_key_probe_bytes_with_fuel(
+            &bytes,
+            FuelEstimator::new_oneshot(CALIBRATION_TOTAL, CALIBRATION_TOTAL, 0),
+            None,
+        )
+        .await;
+        calibration_probe
+            .call_async(&mut calibration_store, ())
+            .await
+            .expect("calibrate one compiled P3 probe call");
+        let first_call_fuel = charged_oneshot_fuel(&calibration_store, CALIBRATION_TOTAL);
+        assert!(first_call_fuel > 0);
+
+        let total_budget = first_call_fuel + FINAL_PARTIAL;
+        let observer = FuelObserver::default();
+        let (mut store, probe) = linked_routing_key_probe_bytes_with_fuel(
+            &bytes,
+            FuelEstimator::new_oneshot(total_budget, CALIBRATION_TOTAL, 0),
+            Some(observer.clone()),
+        )
+        .await;
+        probe
+            .call_async(&mut store, ())
+            .await
+            .expect("first budgeted compiled P3 probe call");
+        assert_eq!(charged_oneshot_fuel(&store, total_budget), first_call_fuel);
+
+        store.engine().increment_epoch();
+        probe
+            .call_async(&mut store, ())
+            .await
+            .expect_err("the second compiled P3 probe must exhaust the partial grant");
+
+        assert!(observer
+            .observations()
+            .iter()
+            .any(|sample| sample.budget == FINAL_PARTIAL));
+        assert_eq!(charged_oneshot_fuel(&store, total_budget), total_budget);
+        assert_eq!(store.get_fuel().expect("read exhausted Store fuel"), 0);
     }
 
     #[tokio::test]
@@ -1898,7 +2161,7 @@ mod tests {
         est.on_host_return(900_000);
         assert_eq!(est.avg_ratio(), 100);
         // Second call: same ratio. EWMA: (100*7 + 100*3) / 10 = 100
-        let budget = est.budget();
+        let budget = est.quantum();
         let remaining = budget - (budget * 100 / RATIO_SCALE);
         est.on_host_return(remaining);
         assert_eq!(est.avg_ratio(), 100);
@@ -1909,7 +2172,7 @@ mod tests {
         let mut est = FuelEstimator::new(1_000_000);
         // Repeatedly consume 0 fuel — pure I/O proxy
         for _ in 0..50 {
-            let budget = est.budget();
+            let budget = est.quantum();
             est.on_host_return(budget); // consumed = 0
         }
         // Ratio → 0, budget → MAX_FUEL
@@ -1918,7 +2181,7 @@ mod tests {
             "ratio should be near 0, got {}",
             est.avg_ratio()
         );
-        assert_eq!(est.budget(), MAX_FUEL);
+        assert_eq!(est.quantum(), MAX_FUEL);
     }
 
     #[test]
@@ -1934,7 +2197,7 @@ mod tests {
             "ratio should be near 1000, got {}",
             est.avg_ratio()
         );
-        assert_eq!(est.budget(), MIN_FUEL);
+        assert_eq!(est.quantum(), MIN_FUEL);
     }
 
     #[test]
@@ -1943,7 +2206,7 @@ mod tests {
         let mut trajectory = Vec::with_capacity(60);
 
         for _ in 0..60 {
-            let remaining = est.budget().saturating_sub(1_000);
+            let remaining = est.quantum().saturating_sub(1_000);
             trajectory.push(est.on_epoch_tick(remaining));
         }
 
@@ -1970,7 +2233,7 @@ mod tests {
         }
 
         assert!(est.avg_ratio() > 990);
-        assert_eq!(est.budget(), MIN_FUEL);
+        assert_eq!(est.quantum(), MIN_FUEL);
     }
 
     #[test]
@@ -1978,7 +2241,7 @@ mod tests {
         let mut est = FuelEstimator::new(1_000_000);
         // Alternate: I/O round (consumed=0) and compute round (consumed=budget)
         for _ in 0..100 {
-            let budget = est.budget();
+            let budget = est.quantum();
             est.on_host_return(budget); // I/O: consumed = 0
             est.on_host_return(0); // Compute: consumed = budget
         }
@@ -1991,9 +2254,9 @@ mod tests {
             ratio
         );
         assert!(
-            est.budget() > MIN_FUEL * 10,
+            est.quantum() > MIN_FUEL * 10,
             "budget should not spiral to MIN_FUEL, got {}",
-            est.budget()
+            est.quantum()
         );
     }
 
@@ -2002,7 +2265,7 @@ mod tests {
         let mut est = FuelEstimator::new(MIN_FUEL);
         // All fuel consumed → ratio = 1000 → budget clamped to MIN_FUEL
         est.on_host_return(0);
-        assert_eq!(est.budget(), MIN_FUEL);
+        assert_eq!(est.quantum(), MIN_FUEL);
     }
 
     #[test]
@@ -2010,7 +2273,7 @@ mod tests {
         let mut est = FuelEstimator::new(MAX_FUEL);
         // Zero consumed → ratio = 0 → budget = MAX_FUEL
         est.on_host_return(MAX_FUEL);
-        assert_eq!(est.budget(), MAX_FUEL);
+        assert_eq!(est.quantum(), MAX_FUEL);
     }
 
     #[test]
@@ -2026,7 +2289,7 @@ mod tests {
         let mut est = FuelEstimator::new(1_000_000);
         // Start as I/O-bound (ratio ~100)
         for _ in 0..20 {
-            let budget = est.budget();
+            let budget = est.quantum();
             let remaining = budget - (budget / 10); // 10% utilization
             est.on_host_return(remaining);
         }
@@ -2035,7 +2298,7 @@ mod tests {
 
         // Shift to compute-heavy (ratio ~900)
         for _ in 0..20 {
-            let budget = est.budget();
+            let budget = est.quantum();
             let remaining = budget / 10; // 90% utilization
             est.on_host_return(remaining);
         }
@@ -2051,35 +2314,164 @@ mod tests {
     // FuelEstimator oneshot / fuel-policy tests
     // =========================================================================
 
+    #[tokio::test]
+    async fn oneshot_fuel_initial_grant_is_bounded_by_total_and_epoch_authority() {
+        for (total_budget, max_per_epoch, expected_grant) in [
+            (0, 10_000, 0),
+            (1, 10_000, 1),
+            (9_999, 10_000, 9_999),
+            (10_000, 10_000, 10_000),
+            (25_000, 10_000, 10_000),
+        ] {
+            let bytecode = wat::parse_str(P3_NOOP_COMMAND).expect("parse P3 no-op component");
+            let (builder, _handles) = Builder::ordinary(
+                Program::Bytes(bytecode),
+                tokio::io::empty(),
+                tokio::io::sink(),
+                tokio::io::sink(),
+            );
+            let proc = builder
+                .with_fuel_estimator(FuelEstimator::new_oneshot(total_budget, max_per_epoch, 0))
+                .build()
+                .await
+                .expect("build one-shot P3 component");
+
+            assert_eq!(
+                proc.store.get_fuel().expect("read initial fuel"),
+                expected_grant,
+                "total_budget={total_budget}, max_per_epoch={max_per_epoch}"
+            );
+        }
+    }
+
+    #[test]
+    fn oneshot_fuel_small_epoch_limit_does_not_panic_or_overgrant() {
+        let mut est = FuelEstimator::new_oneshot(25_000, 5_000, 0);
+
+        assert!(est.on_host_return(0) <= 5_000);
+    }
+
+    #[test]
+    fn oneshot_fuel_marked_returns_share_the_total_ledger() {
+        let mut est = FuelEstimator::new_oneshot(25_000, 100_000, 0);
+        assert_eq!(est.initial_grant(), 25_000);
+
+        let mut charged = 0;
+        for consumed in [9_616, 9_616, 5_768] {
+            let current_fuel = est.installed - consumed;
+            charged += consumed;
+            let grant = est.on_host_return(current_fuel);
+
+            assert_eq!(est.total_remaining, Some(25_000 - charged));
+            assert_eq!(est.epoch_remaining, Some(100_000 - charged));
+            assert_eq!(est.installed, grant);
+            assert!(grant <= 25_000 - charged);
+        }
+
+        assert_eq!(charged, 25_000);
+        assert_eq!(est.installed, 0);
+        assert_eq!(est.on_host_return(0), 0);
+    }
+
+    #[test]
+    fn oneshot_fuel_epoch_limit_is_cumulative_and_resets_after_settlement() {
+        let mut est = FuelEstimator::new_oneshot(50_000, 10_000, 0);
+        assert_eq!(est.initial_grant(), 10_000);
+
+        let grant = est.on_host_return(6_000);
+        assert_eq!(est.total_remaining, Some(46_000));
+        assert_eq!(est.epoch_remaining, Some(6_000));
+        assert!(grant <= 6_000);
+
+        let grant = est.on_host_return(0);
+        assert_eq!(est.total_remaining, Some(40_000));
+        assert_eq!(est.epoch_remaining, Some(0));
+        assert_eq!(grant, 0);
+
+        let grant = est.on_epoch_tick(0);
+        assert_eq!(est.total_remaining, Some(40_000));
+        assert_eq!(est.epoch_remaining, Some(10_000));
+        assert_eq!(grant, 10_000);
+    }
+
+    #[test]
+    fn oneshot_fuel_epoch_settlement_honors_the_final_partial_grant() {
+        let mut est = FuelEstimator::new_oneshot(21_337, 10_000, 0);
+        assert_eq!(est.initial_grant(), 10_000);
+
+        assert_eq!(est.on_epoch_tick(0), 10_000);
+        assert_eq!(est.total_remaining, Some(11_337));
+        assert_eq!(est.on_epoch_tick(0), 1_337);
+        assert_eq!(est.total_remaining, Some(1_337));
+        assert_eq!(est.on_epoch_tick(0), 0);
+        assert_eq!(est.total_remaining, Some(0));
+    }
+
+    #[test]
+    fn oneshot_fuel_exact_quantum_boundary_grants_zero_next() {
+        let mut est = FuelEstimator::new_oneshot(20_000, 10_000, 0);
+        assert_eq!(est.initial_grant(), 10_000);
+        assert_eq!(est.on_epoch_tick(0), 10_000);
+        assert_eq!(est.on_epoch_tick(0), 0);
+        assert_eq!(est.total_remaining, Some(0));
+        assert_eq!(est.installed, 0);
+    }
+
+    #[test]
+    fn oneshot_fuel_epoch_tick_does_not_double_charge_a_host_return() {
+        let mut est = FuelEstimator::new_oneshot(50_000, 10_000, 0);
+        assert_eq!(est.initial_grant(), 10_000);
+
+        assert_eq!(est.on_host_return(6_000), 6_000);
+        assert_eq!(est.total_remaining, Some(46_000));
+        assert_eq!(est.on_epoch_tick(6_000), 10_000);
+        assert_eq!(est.total_remaining, Some(46_000));
+        assert_eq!(est.epoch_remaining, Some(10_000));
+    }
+
+    #[test]
+    fn oneshot_fuel_zero_work_host_return_after_epoch_tick_charges_nothing() {
+        let mut est = FuelEstimator::new_oneshot(50_000, 10_000, 0);
+        assert_eq!(est.initial_grant(), 10_000);
+
+        assert_eq!(est.on_epoch_tick(6_000), 10_000);
+        assert_eq!(est.total_remaining, Some(46_000));
+        assert_eq!(est.epoch_remaining, Some(10_000));
+
+        assert_eq!(est.on_host_return(10_000), 10_000);
+        assert_eq!(est.total_remaining, Some(46_000));
+        assert_eq!(est.epoch_remaining, Some(10_000));
+    }
+
     #[test]
     fn fuel_estimator_new_oneshot_basic() {
         let est = FuelEstimator::new_oneshot(5_000_000, 0, 0);
-        assert_eq!(est.remaining_budget, Some(5_000_000));
-        assert_eq!(est.max_fuel, MAX_FUEL);
-        assert_eq!(est.min_fuel, MIN_FUEL);
+        assert_eq!(est.total_remaining, Some(5_000_000));
+        assert_eq!(est.max_quantum, MAX_FUEL);
+        assert_eq!(est.min_quantum, MIN_FUEL);
     }
 
     #[test]
     fn fuel_estimator_new_oneshot_custom_bounds() {
         let est = FuelEstimator::new_oneshot(5_000_000, 5_000_000, 50_000);
-        assert_eq!(est.max_fuel, 5_000_000);
-        assert_eq!(est.min_fuel, 50_000);
+        assert_eq!(est.max_quantum, 5_000_000);
+        assert_eq!(est.min_quantum, 50_000);
     }
 
     #[test]
     fn fuel_estimator_new_oneshot_max_clamped() {
         // maxPerEpoch > MAX_FUEL should be clamped
         let est = FuelEstimator::new_oneshot(5_000_000, 100_000_000, 0);
-        assert_eq!(est.max_fuel, MAX_FUEL);
+        assert_eq!(est.max_quantum, MAX_FUEL);
     }
 
     #[test]
     fn fuel_estimator_default_unchanged() {
         // Verify new() still produces the same behavior
         let est = FuelEstimator::new(INITIAL_FUEL);
-        assert_eq!(est.remaining_budget, None);
-        assert_eq!(est.max_fuel, MAX_FUEL);
-        assert_eq!(est.min_fuel, MIN_FUEL);
+        assert_eq!(est.total_remaining, None);
+        assert_eq!(est.max_quantum, MAX_FUEL);
+        assert_eq!(est.min_quantum, MIN_FUEL);
     }
 
     #[test]
@@ -2090,14 +2482,14 @@ mod tests {
             est.on_host_return(0); // simulate 100% consumption
         }
         assert!(
-            est.budget() >= 50_000,
-            "should clamp to custom min_fuel, got {}",
-            est.budget()
+            est.quantum() >= 50_000,
+            "should clamp to custom min quantum, got {}",
+            est.quantum()
         );
         assert!(
-            est.budget() <= 5_000_000,
-            "should clamp to custom max_fuel, got {}",
-            est.budget()
+            est.quantum() <= 5_000_000,
+            "should clamp to custom max quantum, got {}",
+            est.quantum()
         );
     }
 }
