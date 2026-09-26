@@ -6,9 +6,11 @@ use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
-use wasmtime::{CallHook, Engine, Store};
+#[cfg(test)]
+use wasmtime::Engine;
+use wasmtime::{AsContextMut, CallHook, CallHookHandler, Store, StoreContextMut};
 use wasmtime_wasi::cli::{AsyncStdinStream, IsTerminal, StdoutStream};
-use wasmtime_wasi::p3::bindings::{Command as WasiCliCommand, CommandPre as WasiCliCommandPre};
+use wasmtime_wasi::p3::bindings::CommandPre as WasiCliCommandPre;
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxView, WasiView};
 
@@ -33,22 +35,22 @@ mod routing_key_runtime {
 // Fuel metering
 //
 // Fuel is both the resource-metering unit and a cooperative preemption input.
-// `fuel_async_yield_interval` requests an async yield after YIELD_INTERVAL
-// consumed fuel. A grant can exhaust before Wasmtime reaches that yield.
+// `fuel_async_yield_interval` requests periodic async yields. Intermediate
+// yields shorten the next interval to the grant's remaining authority.
 //
 // The EWMA quantum is the desired scheduling grant. Larger quanta give cells
 // more instructions between accounting boundaries. The estimator tracks the
 // consumed/installed ratio and sizes the next quantum inversely.
 //
-// Two accounting paths:
-//   - call_hook (ReturningFromHost): fires on every host call, EWMA adapts.
-//   - epoch_deadline_callback: fires every EPOCH_TICK_MS.
+// Fuel accounting runs only from call hooks where Cranelift has flushed its
+// function-local fuel counter. The epoch callback records a notification for
+// the next flushed hook.
 //
 // One-shot Cells clamp every grant by cumulative total and per-epoch
 // authority. Scheduled-cell exhaustion and yielding remain separate concerns.
 // ---------------------------------------------------------------------------
 
-use crate::sched::{INITIAL_FUEL, MAX_FUEL, MIN_FUEL, RATIO_SCALE, YIELD_INTERVAL};
+use crate::sched::{INITIAL_FUEL, MAX_FUEL, MIN_FUEL, RATIO_SCALE, YIELD_INTERVAL, YIELD_RESERVE};
 
 /// Ratio-based EWMA fuel estimator for WASM cells.
 ///
@@ -63,19 +65,19 @@ use crate::sched::{INITIAL_FUEL, MAX_FUEL, MIN_FUEL, RATIO_SCALE, YIELD_INTERVAL
 ///
 /// Design doc: `doc/designs/fuel-scheduling.md`
 pub struct FuelEstimator {
-    /// Amount most recently installed in the Store with `set_fuel`.
-    installed: u64,
+    /// Physical fuel most recently passed to `Store::set_fuel`.
+    physical_installed: u64,
+    /// Compute authority represented by the current physical fuel slice.
+    authority_grant: u64,
+    /// Store fuel expected at the next async out-of-gas return.
+    next_yield_remaining: u64,
     /// Desired EWMA grant quantum. Authority ledgers can reduce the actual grant.
     quantum: u64,
     /// EWMA of consumed/installed ratio (fixed-point, 0..RATIO_SCALE).
     avg_ratio: u64,
-    /// False until the first on_host_return observation.
+    /// False until the first measured fuel observation.
     initialized: bool,
-    /// Host calls observed since the last epoch tick. The call hook already
-    /// observes linked host calls, so the epoch callback settles subsequent
-    /// consumption without another EWMA observation. An unmarked epoch still
-    /// records measured consumption because Component Model builtins do not
-    /// mark `HostCallFrames`.
+    /// Host calls observed since the last opened epoch.
     host_calls_this_epoch: u32,
     /// Per-cell ceiling for the EWMA quantum (default: MAX_FUEL).
     max_quantum: u64,
@@ -93,16 +95,43 @@ pub struct FuelEstimator {
 #[derive(Clone, Copy)]
 enum FuelBoundary {
     HostReturn,
-    Epoch,
+    Slice,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FuelDecision {
+    Grant(u64),
+    Suspend,
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FuelUpdate {
     consumed: u64,
-    grant: u64,
+    decision: FuelDecision,
 }
 
-/// One observation from the production epoch fuel callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FuelSlice {
+    authority: u64,
+    physical: u64,
+    yield_interval: u64,
+}
+
+impl FuelSlice {
+    fn for_authority(authority: u64) -> Self {
+        debug_assert!(authority > 0);
+        Self {
+            authority,
+            physical: authority
+                .checked_add(YIELD_RESERVE)
+                .expect("bounded authority grant plus yield reserve must fit u64"),
+            yield_interval: authority.min(YIELD_INTERVAL),
+        }
+    }
+}
+
+/// One epoch opening observed at a fuel-flushed call hook.
 ///
 /// This type supports production-path integration tests. Recording is disabled
 /// unless a caller explicitly installs a [`FuelObserver`] on the process.
@@ -116,11 +145,28 @@ pub struct FuelEpochObservation {
     pub avg_ratio: u64,
 }
 
-/// Opt-in observer for production epoch fuel callbacks.
+/// Opt-in observer for production fuel decisions and epoch openings.
 #[doc(hidden)]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FuelObserver {
     observations: Arc<std::sync::Mutex<Vec<FuelEpochObservation>>>,
+    decisions: Arc<std::sync::Mutex<Vec<FuelDecision>>>,
+    updates: Arc<std::sync::Mutex<Vec<FuelUpdate>>>,
+    slice_boundaries: Arc<std::sync::atomic::AtomicUsize>,
+    decision_tx: tokio::sync::watch::Sender<usize>,
+}
+
+impl Default for FuelObserver {
+    fn default() -> Self {
+        let (decision_tx, _decision_rx) = tokio::sync::watch::channel(0);
+        Self {
+            observations: Arc::default(),
+            decisions: Arc::default(),
+            updates: Arc::default(),
+            slice_boundaries: Arc::default(),
+            decision_tx,
+        }
+    }
 }
 
 impl FuelObserver {
@@ -137,14 +183,107 @@ impl FuelObserver {
             .expect("fuel observer lock poisoned")
             .clone()
     }
+
+    fn record_decision(&self, update: FuelUpdate) {
+        let count = {
+            let mut decisions = self.decisions.lock().expect("fuel decision lock poisoned");
+            decisions.push(update.decision);
+            decisions.len()
+        };
+        self.updates
+            .lock()
+            .expect("fuel update lock poisoned")
+            .push(update);
+        self.decision_tx.send_replace(count);
+    }
+
+    #[cfg(test)]
+    fn updates(&self) -> Vec<FuelUpdate> {
+        self.updates
+            .lock()
+            .expect("fuel update lock poisoned")
+            .clone()
+    }
+
+    fn record_slice_boundary(&self) {
+        let count = self
+            .slice_boundaries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.decision_tx.send_replace(count);
+    }
+
+    async fn wait_for_decision(&self, expected: FuelDecision, occurrence: usize) {
+        let mut rx = self.decision_tx.subscribe();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let count = self
+                    .decisions
+                    .lock()
+                    .expect("fuel decision lock poisoned")
+                    .iter()
+                    .filter(|decision| **decision == expected)
+                    .count();
+                if count >= occurrence {
+                    return;
+                }
+                rx.changed().await.expect("fuel observer closed");
+            }
+        })
+        .await;
+        if result.is_err() {
+            let decisions = self.decisions.lock().expect("fuel decision lock poisoned");
+            panic!(
+                "timed out waiting for fuel decision {expected:?} occurrence {occurrence}; decisions={decisions:?}, slice_boundaries={}",
+                self.slice_boundaries
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+    }
+
+    /// Wait until the process has entered one-shot epoch suspension.
+    #[doc(hidden)]
+    pub async fn wait_for_suspension(&self, occurrence: usize) {
+        self.wait_for_decision(FuelDecision::Suspend, occurrence)
+            .await;
+    }
+
+    /// Return the number of observed one-shot epoch suspensions.
+    #[doc(hidden)]
+    pub fn suspension_count(&self) -> usize {
+        self.decisions
+            .lock()
+            .expect("fuel decision lock poisoned")
+            .iter()
+            .filter(|decision| **decision == FuelDecision::Suspend)
+            .count()
+    }
+
+    #[cfg(test)]
+    async fn wait_for_slice_boundaries(&self, expected: usize) {
+        let mut rx = self.decision_tx.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while self
+                .slice_boundaries
+                .load(std::sync::atomic::Ordering::Relaxed)
+                < expected
+            {
+                rx.changed().await.expect("fuel observer closed");
+            }
+        })
+        .await
+        .expect("timed out waiting for repeated fuel slice boundaries");
+    }
 }
 
 impl FuelEstimator {
     #[must_use]
     pub fn new(initial_quantum: u64) -> Self {
         Self {
-            installed: initial_quantum,
-            quantum: initial_quantum,
+            physical_installed: 0,
+            authority_grant: 0,
+            next_yield_remaining: 0,
+            quantum: initial_quantum.min(MAX_FUEL),
             avg_ratio: RATIO_SCALE / 2,
             initialized: false,
             host_calls_this_epoch: 0,
@@ -174,7 +313,9 @@ impl FuelEstimator {
             MIN_FUEL.min(effective_max)
         };
         Self {
-            installed: 0,
+            physical_installed: 0,
+            authority_grant: 0,
+            next_yield_remaining: 0,
             quantum: INITIAL_FUEL,
             avg_ratio: RATIO_SCALE / 2,
             initialized: false,
@@ -187,11 +328,20 @@ impl FuelEstimator {
         }
     }
 
-    /// Return and record the first grant installed in a Store.
+    #[cfg(test)]
+    fn initial_decision(&self) -> FuelDecision {
+        self.current_decision()
+    }
+
+    #[cfg(test)]
     fn initial_grant(&mut self) -> u64 {
-        let grant = self.available_grant();
-        self.installed = grant;
-        grant
+        match self.initial_decision() {
+            FuelDecision::Grant(grant) => {
+                self.install_authority_grant(grant);
+                grant
+            }
+            FuelDecision::Suspend | FuelDecision::Exhausted => 0,
+        }
     }
 
     fn available_grant(&self) -> u64 {
@@ -200,10 +350,49 @@ impl FuelEstimator {
             .min(self.epoch_remaining.unwrap_or(u64::MAX))
     }
 
+    fn current_decision(&self) -> FuelDecision {
+        match (self.total_remaining, self.epoch_remaining) {
+            (Some(0), _) => FuelDecision::Exhausted,
+            (Some(_), Some(0)) => FuelDecision::Suspend,
+            _ => FuelDecision::Grant(self.available_grant()),
+        }
+    }
+
+    fn install_authority_grant(&mut self, authority: u64) -> FuelSlice {
+        let slice = FuelSlice::for_authority(authority);
+        self.authority_grant = authority;
+        self.physical_installed = slice.physical;
+        self.next_yield_remaining = slice.physical.saturating_sub(slice.yield_interval);
+        slice
+    }
+
+    fn yield_boundary_reached(&self, current_fuel: u64) -> bool {
+        self.authority_grant > 0 && current_fuel <= self.next_yield_remaining
+    }
+
+    fn rearm_yield_boundary(&mut self, current_fuel: u64, interval: u64) {
+        self.next_yield_remaining = current_fuel.saturating_sub(interval);
+    }
+
+    fn authority_boundary_reached(&self, current_fuel: u64) -> bool {
+        self.authority_grant > 0
+            && self.physical_installed.saturating_sub(current_fuel) >= self.authority_grant
+    }
+
+    fn has_unsettled_consumption(&self, current_fuel: u64) -> bool {
+        self.authority_grant > 0 && self.physical_installed > current_fuel
+    }
+
+    fn remaining_authority(&self, current_fuel: u64) -> u64 {
+        self.authority_grant
+            .saturating_sub(self.physical_installed.saturating_sub(current_fuel))
+    }
+
     fn observe(&mut self, installed: u64, consumed: u64) {
-        let ratio = (consumed * RATIO_SCALE)
+        let ratio = (consumed.saturating_mul(RATIO_SCALE))
             .checked_div(installed)
-            .unwrap_or(RATIO_SCALE / 2);
+            .unwrap_or(RATIO_SCALE / 2)
+            .min(RATIO_SCALE);
 
         if !self.initialized {
             // Seed from first real observation — avoids cold-start bias.
@@ -221,11 +410,13 @@ impl FuelEstimator {
             .clamp(self.min_quantum, self.max_quantum);
     }
 
-    /// Settle the installed fuel exactly once, update boundary state, and
-    /// record the next authority-bounded grant.
-    fn settle_and_grant(&mut self, current_fuel: u64, boundary: FuelBoundary) -> FuelUpdate {
-        let installed = self.installed;
-        let consumed = installed.saturating_sub(current_fuel);
+    /// Settle physical fuel exactly once and choose the next authority action.
+    /// Reserve consumption caused by one inter-checkpoint overshoot is charged
+    /// to both one-shot ledgers, but installing reserve never debits a ledger.
+    fn settle_and_decide(&mut self, current_fuel: u64, boundary: FuelBoundary) -> FuelUpdate {
+        let physical_installed = self.physical_installed;
+        let authority_grant = self.authority_grant;
+        let consumed = physical_installed.saturating_sub(current_fuel);
         if let Some(total_remaining) = self.total_remaining.as_mut() {
             *total_remaining = total_remaining.saturating_sub(consumed);
         }
@@ -236,20 +427,25 @@ impl FuelEstimator {
         match boundary {
             FuelBoundary::HostReturn => {
                 self.host_calls_this_epoch += 1;
-                self.observe(installed, consumed);
+                self.observe(authority_grant, consumed);
             }
-            FuelBoundary::Epoch => {
-                if self.host_calls_this_epoch == 0 {
-                    self.observe(installed, consumed);
-                }
-                self.host_calls_this_epoch = 0;
-                self.epoch_remaining = self.epoch_limit;
+            FuelBoundary::Slice => {
+                self.observe(authority_grant, consumed);
             }
         }
 
-        let grant = self.available_grant();
-        self.installed = grant;
-        FuelUpdate { consumed, grant }
+        self.physical_installed = current_fuel;
+        self.authority_grant = 0;
+        self.next_yield_remaining = current_fuel;
+        FuelUpdate {
+            consumed,
+            decision: self.current_decision(),
+        }
+    }
+
+    fn open_epoch(&mut self) {
+        self.host_calls_this_epoch = 0;
+        self.epoch_remaining = self.epoch_limit;
     }
 
     /// Settle fuel at a `ReturningFromHost` boundary.
@@ -259,19 +455,48 @@ impl FuelEstimator {
     /// consumed/installed ratio, updates the EWMA, and returns the next grant.
     ///
     /// The returned grant is bounded by one-shot authority when present.
-    pub fn on_host_return(&mut self, remaining: u64) -> u64 {
-        self.settle_and_grant(remaining, FuelBoundary::HostReturn)
-            .grant
+    #[cfg(test)]
+    fn on_host_return(&mut self, remaining: u64) -> u64 {
+        if self.physical_installed == 0 {
+            let grant = self.available_grant();
+            if grant == 0 {
+                return 0;
+            }
+            self.install_authority_grant(grant);
+        }
+        let physical_remaining = remaining.saturating_add(YIELD_RESERVE);
+        match self
+            .settle_and_decide(physical_remaining, FuelBoundary::HostReturn)
+            .decision
+        {
+            FuelDecision::Grant(grant) => {
+                self.install_authority_grant(grant);
+                grant
+            }
+            FuelDecision::Suspend | FuelDecision::Exhausted => 0,
+        }
     }
 
-    /// Settle one epoch boundary and return the next fuel grant.
-    ///
-    /// Linked host calls already record their observation in the call hook.
-    /// Otherwise, use the Store's actual remaining fuel. This distinguishes
-    /// low-consumption Component Model I/O from genuinely compute-bound work.
+    /// Model a flushed hook followed by an epoch opening.
     #[cfg(test)]
-    fn on_epoch_tick(&mut self, remaining: u64) -> u64 {
-        self.settle_and_grant(remaining, FuelBoundary::Epoch).grant
+    fn on_flushed_epoch_boundary(&mut self, remaining: u64) -> u64 {
+        if self.physical_installed == 0 {
+            let grant = self.available_grant();
+            if grant == 0 {
+                return 0;
+            }
+            self.install_authority_grant(grant);
+        }
+        let physical_remaining = remaining.saturating_add(YIELD_RESERVE);
+        self.settle_and_decide(physical_remaining, FuelBoundary::Slice);
+        self.open_epoch();
+        match self.current_decision() {
+            FuelDecision::Grant(grant) => {
+                self.install_authority_grant(grant);
+                grant
+            }
+            FuelDecision::Suspend | FuelDecision::Exhausted => 0,
+        }
     }
 
     /// Returns the current desired EWMA quantum before authority clamps.
@@ -458,6 +683,14 @@ pub struct ComponentRunStates {
     pub(crate) writable_fs_descriptors: std::collections::HashSet<u32>,
     /// EWMA estimator and one-shot fuel authority ledgers.
     pub fuel_estimator: FuelEstimator,
+    /// Epoch subscription paired with this Store's Wasmtime Engine.
+    epoch_clock: crate::engine::EpochSubscription,
+    /// Latest epoch sequence whose one-shot allowance this Store opened.
+    opened_epoch: u64,
+    /// Latest epoch notification waiting for a fuel-flushed call hook.
+    pending_epoch: Option<u64>,
+    /// The next unmarked host return belongs to the unflushed epoch libcall.
+    returning_from_epoch_callback: bool,
     /// Opt-in production callback observations used by integration tests.
     fuel_observer: Option<FuelObserver>,
     /// Real-import markers paired with live `CallingHost` hook frames.
@@ -473,6 +706,50 @@ pub struct ComponentRunStates {
 impl ComponentRunStates {
     pub(crate) fn mark_host_call(&mut self) {
         self.host_call_frames.mark();
+    }
+
+    fn note_epoch_callback(&mut self, epoch: u64) {
+        if epoch > self.opened_epoch {
+            self.pending_epoch = Some(
+                self.pending_epoch
+                    .map_or(epoch, |pending| pending.max(epoch)),
+            );
+        }
+        self.returning_from_epoch_callback = true;
+    }
+
+    fn take_epoch_callback_return(&mut self, hook: CallHook) -> bool {
+        if matches!(hook, CallHook::ReturningFromHost) && self.returning_from_epoch_callback {
+            self.returning_from_epoch_callback = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn latest_unopened_epoch(&self) -> Option<u64> {
+        let latest = self
+            .pending_epoch
+            .unwrap_or(0)
+            .max(self.epoch_clock.current_epoch());
+        (latest > self.opened_epoch).then_some(latest)
+    }
+
+    fn open_epoch(&mut self, epoch: u64) -> bool {
+        if self.pending_epoch.is_some_and(|pending| pending <= epoch) {
+            self.pending_epoch = None;
+        }
+        if epoch <= self.opened_epoch {
+            return false;
+        }
+        self.opened_epoch = epoch;
+        self.fuel_estimator.open_epoch();
+        true
+    }
+
+    fn open_latest_epoch(&mut self) -> Option<u64> {
+        let epoch = self.latest_unopened_epoch()?;
+        self.open_epoch(epoch).then_some(epoch)
     }
 }
 
@@ -548,7 +825,7 @@ struct ProcInit {
     env: Vec<String>,
     args: Vec<String>,
     program: Program,
-    engine: Option<Arc<Engine>>,
+    runtime_engine: Option<crate::engine::RuntimeEngine>,
     stdin: BoxAsyncRead,
     stdout: BoxAsyncWrite,
     stderr: BoxAsyncWrite,
@@ -644,56 +921,163 @@ fn add_p3_wasi_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> 
 }
 
 fn install_host_return_fuel_hook(store: &mut Store<ComponentRunStates>) {
-    store.call_hook(|mut ctx, hook| {
-        if ctx.data_mut().host_call_frames.on_call_hook(hook) {
-            let remaining = ctx.get_fuel().unwrap_or(0);
-            let update = ctx
-                .data_mut()
-                .fuel_estimator
-                .settle_and_grant(remaining, FuelBoundary::HostReturn);
-            ctx.set_fuel(update.grant)?;
-            tracing::debug!(
-                grant = update.grant,
-                consumed = update.consumed,
-                remaining,
-                avg_ratio = ctx.data().fuel_estimator.avg_ratio(),
-                "fuel.refuel"
-            );
+    store.call_hook_async(FuelCallHook);
+}
+
+struct FuelCallHook;
+
+#[async_trait::async_trait]
+impl CallHookHandler<ComponentRunStates> for FuelCallHook {
+    async fn handle_call_event(
+        &self,
+        mut ctx: StoreContextMut<'_, ComponentRunStates>,
+        hook: CallHook,
+    ) -> wasmtime::Result<()> {
+        let marked_host_return = ctx.data_mut().host_call_frames.on_call_hook(hook);
+        if ctx.data_mut().take_epoch_callback_return(hook) {
+            return Ok(());
         }
-        Ok(())
-    });
+        if !matches!(hook, CallHook::ReturningFromHost) {
+            return Ok(());
+        }
+
+        let remaining = ctx.get_fuel().unwrap_or(0);
+        let slice_boundary =
+            !marked_host_return && ctx.data().fuel_estimator.yield_boundary_reached(remaining);
+        if slice_boundary {
+            if let Some(observer) = ctx.data().fuel_observer.as_ref() {
+                observer.record_slice_boundary();
+            }
+        }
+        let fuel_boundary = !marked_host_return
+            && ctx
+                .data()
+                .fuel_estimator
+                .authority_boundary_reached(remaining);
+        if !marked_host_return && !slice_boundary {
+            return Ok(());
+        }
+
+        let pending_epoch = ctx.data().latest_unopened_epoch();
+        if !marked_host_return && !fuel_boundary && pending_epoch.is_none() {
+            let remaining_authority = ctx.data().fuel_estimator.remaining_authority(remaining);
+            let interval = remaining_authority.min(YIELD_INTERVAL);
+            ctx.fuel_async_yield_interval(Some(interval))?;
+            ctx.data_mut()
+                .fuel_estimator
+                .rearm_yield_boundary(remaining, interval);
+            return Ok(());
+        }
+
+        let boundary = if marked_host_return {
+            FuelBoundary::HostReturn
+        } else {
+            FuelBoundary::Slice
+        };
+        settle_and_apply_fuel_boundary(&mut ctx, remaining, boundary).await
+    }
+}
+
+async fn settle_and_apply_fuel_boundary(
+    ctx: &mut StoreContextMut<'_, ComponentRunStates>,
+    remaining: u64,
+    boundary: FuelBoundary,
+) -> wasmtime::Result<()> {
+    let mut update = ctx
+        .data_mut()
+        .fuel_estimator
+        .settle_and_decide(remaining, boundary);
+    let host_calls_this_epoch = ctx.data().fuel_estimator.host_calls_this_epoch;
+    let opened_epoch = ctx.data_mut().open_latest_epoch();
+    if opened_epoch.is_some() {
+        ctx.set_epoch_deadline(1);
+        update.decision = ctx.data().fuel_estimator.current_decision();
+        if let Some(observer) = ctx.data().fuel_observer.as_ref() {
+            observer.record(FuelEpochObservation {
+                current_fuel: remaining,
+                measured_consumption: update.consumed,
+                host_calls_this_epoch,
+                budget: match update.decision {
+                    FuelDecision::Grant(grant) => grant,
+                    FuelDecision::Suspend | FuelDecision::Exhausted => 0,
+                },
+                avg_ratio: ctx.data().fuel_estimator.avg_ratio(),
+            });
+        }
+    }
+    if let Some(observer) = ctx.data().fuel_observer.as_ref() {
+        observer.record_decision(update);
+    }
+    apply_fuel_decision(ctx, update.decision).await?;
+    tracing::debug!(
+        consumed = update.consumed,
+        remaining,
+        avg_ratio = ctx.data().fuel_estimator.avg_ratio(),
+        "fuel.boundary"
+    );
+    Ok(())
+}
+
+async fn apply_fuel_decision(
+    ctx: &mut StoreContextMut<'_, ComponentRunStates>,
+    mut decision: FuelDecision,
+) -> wasmtime::Result<()> {
+    loop {
+        match decision {
+            FuelDecision::Grant(grant) => {
+                install_fuel_slice_in_context(ctx, grant)?;
+                return Ok(());
+            }
+            FuelDecision::Exhausted => {
+                return Err(wasmtime::Error::msg(
+                    "one-shot total fuel authority exhausted",
+                ));
+            }
+            FuelDecision::Suspend => {
+                if ctx.data_mut().open_latest_epoch().is_none() {
+                    ctx.data_mut().epoch_clock.changed().await.map_err(|_| {
+                        wasmtime::Error::msg("epoch clock closed while one-shot Cell was suspended")
+                    })?;
+                    continue;
+                }
+                ctx.set_epoch_deadline(1);
+                decision = ctx.data().fuel_estimator.current_decision();
+            }
+        }
+    }
+}
+
+fn install_fuel_slice_in_context(
+    ctx: &mut StoreContextMut<'_, ComponentRunStates>,
+    authority: u64,
+) -> wasmtime::Result<()> {
+    let slice = ctx
+        .data_mut()
+        .fuel_estimator
+        .install_authority_grant(authority);
+    ctx.fuel_async_yield_interval(Some(slice.yield_interval))?;
+    ctx.set_fuel(slice.physical)?;
+    Ok(())
+}
+
+fn install_fuel_slice_in_store(
+    store: &mut Store<ComponentRunStates>,
+    authority: u64,
+) -> wasmtime::Result<()> {
+    let slice = store
+        .data_mut()
+        .fuel_estimator
+        .install_authority_grant(authority);
+    store.fuel_async_yield_interval(Some(slice.yield_interval))?;
+    store.set_fuel(slice.physical)?;
+    Ok(())
 }
 
 fn install_epoch_fuel_callback(store: &mut Store<ComponentRunStates>) {
     store.epoch_deadline_callback(|mut ctx| {
-        // Charge work to the old epoch before opening the new epoch allowance.
-        let current_fuel = ctx.get_fuel().unwrap_or(0);
-        let est = &mut ctx.data_mut().fuel_estimator;
-        let host_calls_this_epoch = est.host_calls_this_epoch;
-        let update = est.settle_and_grant(current_fuel, FuelBoundary::Epoch);
-        let avg_ratio = est.avg_ratio();
-        let total_remaining = est.total_remaining;
-        let epoch_remaining = est.epoch_remaining;
-        ctx.set_fuel(update.grant)?;
-        if let Some(observer) = ctx.data().fuel_observer.as_ref() {
-            observer.record(FuelEpochObservation {
-                current_fuel,
-                measured_consumption: update.consumed,
-                host_calls_this_epoch,
-                budget: update.grant,
-                avg_ratio,
-            });
-        }
-        tracing::trace!(
-            grant = update.grant,
-            current_fuel,
-            measured_consumption = update.consumed,
-            host_calls_this_epoch,
-            avg_ratio,
-            ?total_remaining,
-            ?epoch_remaining,
-            "fuel.epoch_refuel"
-        );
+        let current_epoch = ctx.data().epoch_clock.engine_epoch();
+        ctx.data_mut().note_epoch_callback(current_epoch);
+        tracing::trace!(current_epoch, "fuel.epoch_pending");
         Ok(wasmtime::UpdateDeadline::Continue(1))
     });
 }
@@ -715,7 +1099,7 @@ pub struct Builder {
     args: Vec<String>,
     wasm_debug: bool,
     program: Program,
-    engine: Option<Arc<Engine>>,
+    runtime_engine: Option<crate::engine::RuntimeEngine>,
     stdin: BoxAsyncRead,
     stdout: BoxAsyncWrite,
     stderr: BoxAsyncWrite,
@@ -809,7 +1193,7 @@ impl Builder {
             args: Vec::new(),
             wasm_debug: false,
             program,
-            engine: None,
+            runtime_engine: None,
             stdin: Box::new(stdin),
             stdout: Box::new(stdout),
             stderr: Box::new(stderr),
@@ -840,9 +1224,9 @@ impl Builder {
         self
     }
 
-    /// Provide a shared Wasmtime engine to reuse across processes.
-    pub fn with_engine(mut self, engine: Arc<Engine>) -> Self {
-        self.engine = Some(engine);
+    /// Provide the paired Wasmtime engine and epoch clock for this process.
+    pub fn with_runtime_engine(mut self, runtime_engine: crate::engine::RuntimeEngine) -> Self {
+        self.runtime_engine = Some(runtime_engine);
         self
     }
 
@@ -865,7 +1249,7 @@ impl Builder {
         self
     }
 
-    /// Install opt-in observation of the production epoch fuel callback.
+    /// Install opt-in observation of production fuel decisions and epoch openings.
     #[doc(hidden)]
     pub fn with_fuel_observer(mut self, observer: FuelObserver) -> Self {
         self.fuel_observer = Some(observer);
@@ -878,7 +1262,7 @@ impl Builder {
             env: self.env,
             args: self.args,
             program: self.program,
-            engine: self.engine,
+            runtime_engine: self.runtime_engine,
             stdin: self.stdin,
             stdout: self.stdout,
             stderr: self.stderr,
@@ -892,13 +1276,15 @@ impl Builder {
     }
 }
 
-/// Cell process that encapsulates a WASM instance and its configuration.
+/// Prepared Cell process and its runtime configuration.
 ///
-/// Designed for per-stream instantiation - each incoming stream gets its own Proc instance.
-/// This enables concurrent execution of multiple services.
+/// `Builder::build` compiles, links, and validates the component without
+/// executable instantiation or physical fuel. `Proc::run` applies the initial
+/// fuel decision before `instantiate_async` can execute guest start functions.
+/// Start functions use the same hooks and settlement path as `wasi:cli/run`.
 pub struct Proc {
-    /// Typed handle to the guest command world
-    pub command: WasiCliCommand,
+    /// Validated command prepared for executable instantiation.
+    pre: WasiCliCommandPre<ComponentRunStates>,
     /// Cell runtime store
     pub store: Store<ComponentRunStates>,
 }
@@ -910,7 +1296,7 @@ impl Proc {
             env,
             args,
             program,
-            engine,
+            runtime_engine,
             stdin,
             stdout,
             stderr,
@@ -920,6 +1306,15 @@ impl Proc {
             fuel_estimator,
             fuel_observer,
         } = init;
+        if let Program::Bytes(bytes) = &program {
+            if bytes.len() > crate::sched::MAX_COMPONENT_BYTES {
+                return Err(anyhow!(
+                    "component exceeds the fuel segment size bound: {} bytes, maximum {}",
+                    bytes.len(),
+                    crate::sched::MAX_COMPONENT_BYTES
+                ));
+            }
+        }
         let cache_mode = cache_mode.map(Arc::new);
         let (cid_tree, kernel_ready_gate) = match mode {
             ConstructionMode::Ordinary => (None, None),
@@ -937,11 +1332,12 @@ impl Proc {
         //                        fuel methods are no-ops and the estimator is
         //                        inert.
         //   epoch_interruption — enables the epoch accounting callback.
-        let engine = if let Some(engine) = engine {
-            engine
-        } else {
-            Arc::new(crate::engine::wasm_engine()?)
-        };
+        let runtime_engine = runtime_engine.ok_or_else(|| {
+            anyhow!("Cell Builder requires a paired runtime Engine and epoch clock")
+        })?;
+        let engine = runtime_engine.engine();
+        let epoch_clock = runtime_engine.subscribe();
+        let opened_epoch = epoch_clock.current_epoch();
         let mut linker = Linker::new(&engine);
         add_p3_wasi_to_linker(&mut linker)?;
         crate::p3::add_transport_to_linker(&mut linker)?;
@@ -981,8 +1377,7 @@ impl Proc {
 
         let wasi = wasi_builder.build();
 
-        let mut fuel_estimator = fuel_estimator.unwrap_or_else(|| FuelEstimator::new(INITIAL_FUEL));
-        let initial_fuel = fuel_estimator.initial_grant();
+        let fuel_estimator = fuel_estimator.unwrap_or_else(|| FuelEstimator::new(INITIAL_FUEL));
         let state = ComponentRunStates {
             wasi_ctx: wasi,
             resource_table: ResourceTable::new(),
@@ -993,6 +1388,10 @@ impl Proc {
             cid_tree,
             writable_fs_descriptors: std::collections::HashSet::new(),
             fuel_estimator,
+            epoch_clock,
+            opened_epoch,
+            pending_epoch: None,
+            returning_from_epoch_callback: false,
             fuel_observer,
             host_call_frames: HostCallFrames::default(),
             kernel_ready_gate,
@@ -1000,16 +1399,8 @@ impl Proc {
 
         let mut store = Store::new(&engine, state);
 
-        // Load the initial authority-bounded grant. fuel_async_yield_interval controls how
-        // often Wasmtime suspends the guest to poll other Tokio tasks — this is
-        // independent of the EWMA quantum ceiling. A Cell with MAX_FUEL still
-        // yields every YIELD_INTERVAL instructions.
-        store.set_fuel(initial_fuel)?;
-        store.fuel_async_yield_interval(Some(YIELD_INTERVAL))?;
-        tracing::trace!(grant = initial_fuel, "fuel.initial");
-
-        // Epoch accounting settles the old epoch and installs the next grant.
-        // For one-shot Cells, settlement precedes the epoch allowance reset.
+        // The epoch callback records only the latest transition. A later
+        // fuel-flushed hook settles the old epoch before opening the new one.
         install_epoch_fuel_callback(&mut store);
         store.set_epoch_deadline(1);
 
@@ -1018,9 +1409,9 @@ impl Proc {
         // The estimator tracks the consumed/installed ratio via EWMA and sizes
         // the next quantum inversely. Wasmtime 48 also emits these hooks for internal libcalls
         // and fuel/epoch yields. Linked imports mark the Store state from
-        // their host implementation; the hook ignores unmarked transitions.
-        //
-        // Compute-bound Cells that do not make host calls reach the epoch path.
+        // their host implementation. Confirmed out-of-gas returns are the
+        // unmarked fuel boundaries. Intermediate returns re-arm the next yield
+        // to the remaining authority before execution resumes.
         install_host_return_fuel_hook(&mut store);
 
         // Instantiate it as a normal component. The canonical engine has
@@ -1062,10 +1453,31 @@ impl Proc {
             "Guest component pre-instantiated"
         );
 
+        Ok(Self { pre, store })
+    }
+
+    /// Instantiate the prepared guest and invoke `wasi:cli/run#run`.
+    pub async fn run(mut self) -> Result<()> {
+        match self.store.data().fuel_estimator.current_decision() {
+            FuelDecision::Grant(grant) => {
+                // Physical fuel includes a runtime reserve that is not Cell
+                // authority. The normal fuel and epoch hooks were installed
+                // during preparation, before executable instantiation.
+                install_fuel_slice_in_store(&mut self.store, grant)?;
+                tracing::trace!(grant, "fuel.initial");
+            }
+            FuelDecision::Exhausted => {
+                return Err(anyhow!("one-shot total fuel authority exhausted"));
+            }
+            FuelDecision::Suspend => {
+                unreachable!("a new one-shot epoch starts with authority")
+            }
+        }
+
         let start = std::time::Instant::now();
         let command = match tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            pre.instantiate_async(&mut store),
+            self.pre.instantiate_async(&mut self.store),
         )
         .await
         {
@@ -1080,18 +1492,23 @@ impl Proc {
             "Guest component instantiated"
         );
 
-        Ok(Self { command, store })
-    }
+        let remaining = self.store.get_fuel()?;
+        if self
+            .store
+            .data()
+            .fuel_estimator
+            .has_unsettled_consumption(remaining)
+        {
+            let mut ctx = self.store.as_context_mut();
+            settle_and_apply_fuel_boundary(&mut ctx, remaining, FuelBoundary::Slice).await?;
+        }
 
-    /// Invoke the guest's `wasi:cli/run#run` export and wait for completion.
-    pub async fn run(mut self) -> Result<()> {
-        let command = self.command;
         let result = self
             .store
             .run_concurrent(async move |access| command.wasi_cli_run().call_run(access).await)
             .await
-            .map_err(|error| anyhow!("P3 command event loop failed: {error}"))?
-            .map_err(|error| anyhow!("failed to call `wasi:cli/run`: {error}"))?;
+            .map_err(|error| anyhow!("P3 command event loop failed: {error:#}"))?
+            .map_err(|error| anyhow!("failed to call `wasi:cli/run`: {error:#}"))?;
         result.map_err(|()| anyhow!("guest returned non-zero exit status"))
     }
 }
@@ -1099,7 +1516,7 @@ impl Proc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::AsyncReadExt;
 
     struct PendingFlushWriter {
@@ -1124,6 +1541,20 @@ mod tests {
     }
 
     struct FailingTransportWriter;
+
+    struct PollCounter<F> {
+        future: Pin<Box<F>>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl<F: Future> Future for PollCounter<F> {
+        type Output = F::Output;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            self.future.as_mut().poll(cx)
+        }
+    }
 
     impl AsyncWrite for FailingTransportWriter {
         fn poll_write(
@@ -1262,6 +1693,56 @@ mod tests {
             (export "run" (func $run))))
     "#;
 
+    const P3_TRAPPING_START_COMMAND: &str = r#"
+        (component
+          (core func $task-return (canon task.return (result (result))))
+          (core module $command
+            (import "" "task-return" (func $task-return (param i32)))
+            (func $start
+              unreachable)
+            (start $start)
+            (func (export "run")
+              i32.const 0
+              call $task-return))
+          (core instance $instance
+            (instantiate $command
+              (with "" (instance
+                (export "task-return" (func $task-return))))))
+          (func $run async (result (result))
+            (canon lift (core func $instance "run") async))
+          (instance (export (interface "wasi:cli/run@0.3.0"))
+            (export "run" (func $run))))
+    "#;
+
+    const P3_COUNTED_START_COMMAND: &str = r#"
+        (component
+          (core func $task-return (canon task.return (result (result))))
+          (core module $command
+            (import "" "task-return" (func $task-return (param i32)))
+            (func $start
+              (local $remaining i32)
+              i32.const 3000
+              local.set $remaining
+              (loop $spin
+                local.get $remaining
+                i32.const 1
+                i32.sub
+                local.tee $remaining
+                br_if $spin))
+            (start $start)
+            (func (export "run")
+              i32.const 0
+              call $task-return))
+          (core instance $instance
+            (instantiate $command
+              (with "" (instance
+                (export "task-return" (func $task-return))))))
+          (func $run async (result (result))
+            (canon lift (core func $instance "run") async))
+          (instance (export (interface "wasi:cli/run@0.3.0"))
+            (export "run" (func $run))))
+    "#;
+
     struct EpochTicker {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -1340,7 +1821,19 @@ mod tests {
         fuel_estimator: FuelEstimator,
         fuel_observer: Option<FuelObserver>,
     ) -> ComponentRunStates {
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component test runtime engine");
+        component_test_state_with_runtime(fuel_estimator, fuel_observer, &runtime_engine)
+    }
+
+    fn component_test_state_with_runtime(
+        fuel_estimator: FuelEstimator,
+        fuel_observer: Option<FuelObserver>,
+        runtime_engine: &crate::engine::RuntimeEngine,
+    ) -> ComponentRunStates {
         let (_host, granted_transport) = crate::p3::HostTransport::bounded_pair();
+        let epoch_clock = runtime_engine.subscribe();
+        let opened_epoch = epoch_clock.current_epoch();
         ComponentRunStates {
             wasi_ctx: WasiCtxBuilder::new().build(),
             resource_table: ResourceTable::new(),
@@ -1351,6 +1844,10 @@ mod tests {
             cid_tree: None,
             writable_fs_descriptors: std::collections::HashSet::new(),
             fuel_estimator,
+            epoch_clock,
+            opened_epoch,
+            pending_epoch: None,
+            returning_from_epoch_callback: false,
             fuel_observer,
             host_call_frames: HostCallFrames::default(),
             kernel_ready_gate: None,
@@ -1363,26 +1860,39 @@ mod tests {
 
     async fn linked_routing_key_probe_bytes_with_fuel(
         bytes: &[u8],
-        mut fuel_estimator: FuelEstimator,
+        fuel_estimator: FuelEstimator,
         fuel_observer: Option<FuelObserver>,
     ) -> (
         Store<ComponentRunStates>,
         wasmtime::component::TypedFunc<(), (String,)>,
+        crate::engine::EpochPublisher,
     ) {
-        let engine = crate::engine::wasm_engine().expect("component engine");
+        let (runtime_engine, publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let engine = runtime_engine.engine();
         let component = Component::new(&engine, bytes).expect("routing-key probe component");
         let mut linker = Linker::new(&engine);
         add_p3_wasi_to_linker(&mut linker).expect("install P3 WASI imports");
         add_routing_key_to_linker(&mut linker).expect("install routing-key import");
-        let initial_fuel = fuel_estimator.initial_grant();
+        let initial_decision = fuel_estimator.initial_decision();
         let mut store = Store::new(
             &engine,
-            component_test_state_with_fuel(fuel_estimator, fuel_observer),
+            component_test_state_with_runtime(fuel_estimator, fuel_observer, &runtime_engine),
         );
-        store.set_fuel(initial_fuel).expect("routing-key test fuel");
-        store
-            .fuel_async_yield_interval(Some(YIELD_INTERVAL))
-            .expect("routing-key yield interval");
+        match initial_decision {
+            FuelDecision::Grant(grant) => {
+                install_fuel_slice_in_store(&mut store, grant).expect("routing-key test fuel")
+            }
+            FuelDecision::Exhausted => {
+                store
+                    .fuel_async_yield_interval(Some(YIELD_INTERVAL))
+                    .expect("routing-key yield interval");
+                store
+                    .set_fuel(YIELD_RESERVE)
+                    .expect("routing-key exhausted reserve");
+            }
+            FuelDecision::Suspend => unreachable!("new test epoch has authority"),
+        }
         store.set_epoch_deadline(1);
         install_epoch_fuel_callback(&mut store);
         install_host_return_fuel_hook(&mut store);
@@ -1393,7 +1903,7 @@ mod tests {
         let probe = instance
             .get_typed_func::<(), (String,)>(&mut store, "probe")
             .expect("typed routing-key probe export");
-        (store, probe)
+        (store, probe, publisher)
     }
 
     async fn linked_routing_key_probe_bytes(
@@ -1401,6 +1911,7 @@ mod tests {
     ) -> (
         Store<ComponentRunStates>,
         wasmtime::component::TypedFunc<(), (String,)>,
+        crate::engine::EpochPublisher,
     ) {
         linked_routing_key_probe_bytes_with_fuel(bytes, FuelEstimator::new(INITIAL_FUEL), None)
             .await
@@ -1409,29 +1920,35 @@ mod tests {
     async fn linked_routing_key_probe() -> (
         Store<ComponentRunStates>,
         wasmtime::component::TypedFunc<(), (String,)>,
+        crate::engine::EpochPublisher,
     ) {
         linked_routing_key_probe_bytes(ROUTING_KEY_PROBE_COMPONENT.as_bytes()).await
     }
 
     fn compiled_routing_key_probe_bytes() -> Vec<u8> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let artifact =
-            root.join("target/routing-key-probe/wasm32-wasip3/release/routing_key_probe.wasm");
-        if !artifact.is_file() {
-            let status = std::process::Command::new("make")
-                .current_dir(&root)
-                .arg("routing-key-probe")
-                .status()
-                .expect("launch routing-key-probe build");
-            assert!(status.success(), "routing-key-probe build failed");
-        }
-        std::fs::read(&artifact)
-            .unwrap_or_else(|error| panic!("read {}: {error}", artifact.display()))
+        static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        BYTES
+            .get_or_init(|| {
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+                let artifact = root
+                    .join("target/routing-key-probe/wasm32-wasip3/release/routing_key_probe.wasm");
+                if !artifact.is_file() {
+                    let status = std::process::Command::new("make")
+                        .current_dir(&root)
+                        .arg("routing-key-probe")
+                        .status()
+                        .expect("launch routing-key-probe build");
+                    assert!(status.success(), "routing-key-probe build failed");
+                }
+                std::fs::read(&artifact)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", artifact.display()))
+            })
+            .clone()
     }
 
     #[tokio::test]
     async fn routing_key_wit_call_matches_golden_vector_and_is_deterministic() {
-        let (mut store, probe) = linked_routing_key_probe().await;
+        let (mut store, probe, _publisher) = linked_routing_key_probe().await;
 
         for _ in 0..2 {
             let (key,) = probe
@@ -1448,7 +1965,7 @@ mod tests {
     #[tokio::test]
     async fn compiled_routing_key_guest_wrapper_matches_golden_vector() {
         let bytes = compiled_routing_key_probe_bytes();
-        let (mut store, probe) = linked_routing_key_probe_bytes(&bytes).await;
+        let (mut store, probe, _publisher) = linked_routing_key_probe_bytes(&bytes).await;
 
         for _ in 0..2 {
             let (key,) = probe
@@ -1466,21 +1983,60 @@ mod tests {
         let est = &store.data().fuel_estimator;
         let settled = total_budget - est.total_remaining.expect("one-shot total ledger");
         let current = store.get_fuel().expect("read one-shot Store fuel");
-        settled + est.installed.saturating_sub(current)
+        settled + est.physical_installed.saturating_sub(current)
     }
 
     #[tokio::test]
-    async fn oneshot_fuel_zero_tiny_and_small_epoch_p3_guests_exhaust() {
+    async fn oneshot_fuel_tiny_p3_guest_exhausts_explicitly() {
         let bytecode = wat::parse_str(include_str!(
             "../../../tests/fixtures/spinning-component.wat"
         ))
         .expect("parse P3 spinning component fixture");
 
-        for (total_budget, max_per_epoch, expected_initial) in [
-            (0, 10_000, 0),
-            (1_337, 10_000, 1_337),
-            (25_000, 5_000, 5_000),
-        ] {
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytecode),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let proc = builder
+            .with_runtime_engine(runtime_engine)
+            .with_fuel_estimator(FuelEstimator::new_oneshot(1_337, 10_000, 0))
+            .build()
+            .await
+            .expect("build budgeted P3 spinning component");
+        assert_eq!(
+            proc.store.get_fuel().expect("read prepared P3 fuel"),
+            0,
+            "construction installed executable fuel before Proc::run"
+        );
+        assert_eq!(
+            proc.store.data().fuel_estimator.current_decision(),
+            FuelDecision::Grant(1_337)
+        );
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), proc.run())
+            .await
+            .expect("budgeted P3 spinning component timed out")
+            .expect_err("budgeted P3 spinning component must exhaust fuel");
+        let message = format!("{error:#}");
+        assert!(message.contains("one-shot total fuel authority exhausted"));
+        assert!(!message.contains("all fuel consumed by WebAssembly"));
+    }
+
+    #[tokio::test]
+    async fn oneshot_fuel_rearms_the_final_partial_yield_interval() {
+        let bytecode = wat::parse_str(include_str!(
+            "../../../tests/fixtures/spinning-component.wat"
+        ))
+        .expect("parse P3 spinning component fixture");
+
+        for authority in [12_500, 15_000, 25_000, 100_001] {
+            let (runtime_engine, _publisher) =
+                crate::engine::runtime_engine().expect("component runtime engine");
+            let observer = FuelObserver::default();
             let (builder, _handles) = Builder::ordinary(
                 Program::Bytes(bytecode.clone()),
                 tokio::io::empty(),
@@ -1488,19 +2044,31 @@ mod tests {
                 tokio::io::sink(),
             );
             let proc = builder
-                .with_fuel_estimator(FuelEstimator::new_oneshot(total_budget, max_per_epoch, 0))
+                .with_runtime_engine(runtime_engine)
+                .with_fuel_estimator(FuelEstimator::new_oneshot(authority, authority, 0))
+                .with_fuel_observer(observer.clone())
                 .build()
                 .await
                 .expect("build budgeted P3 spinning component");
-            assert_eq!(
-                proc.store.get_fuel().expect("read initial P3 fuel"),
-                expected_initial
-            );
 
-            tokio::time::timeout(std::time::Duration::from_secs(5), proc.run())
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), proc.run())
                 .await
                 .expect("budgeted P3 spinning component timed out")
                 .expect_err("budgeted P3 spinning component must exhaust fuel");
+            let message = format!("{error:#}");
+            assert!(message.contains("one-shot total fuel authority exhausted"));
+            assert!(!message.contains("all fuel consumed by WebAssembly"));
+
+            let updates = observer.updates();
+            let consumed: u64 = updates.iter().map(|update| update.consumed).sum();
+            assert!(
+                consumed >= authority,
+                "authority {authority} settled only {consumed} fuel: {updates:?}"
+            );
+            assert!(
+                consumed <= authority + 4,
+                "authority {authority} crossed its final yield interval: {updates:?}"
+            );
         }
     }
 
@@ -1508,7 +2076,7 @@ mod tests {
     async fn oneshot_fuel_compiled_p3_host_calls_cannot_mint_total_authority() {
         const TOTAL_BUDGET: u64 = 25_000;
         let bytes = compiled_routing_key_probe_bytes();
-        let (mut store, probe) = linked_routing_key_probe_bytes_with_fuel(
+        let (mut store, probe, _publisher) = linked_routing_key_probe_bytes_with_fuel(
             &bytes,
             FuelEstimator::new_oneshot(TOTAL_BUDGET, 100_000, 0),
             None,
@@ -1532,9 +2100,8 @@ mod tests {
 
         assert!(completed > 1, "test did not exercise repeated host returns");
         assert_eq!(charged_oneshot_fuel(&store, TOTAL_BUDGET), TOTAL_BUDGET);
-        assert_eq!(store.get_fuel().expect("read exhausted Store fuel"), 0);
         assert!(
-            format!("{failure:#}").contains("fuel"),
+            format!("{failure:#}").contains("one-shot total fuel authority exhausted"),
             "unexpected one-shot failure: {failure:#}"
         );
     }
@@ -1544,31 +2111,8 @@ mod tests {
         const TOTAL_BUDGET: u64 = 25_000;
         const MAX_PER_EPOCH: u64 = 10_000;
         let bytes = compiled_routing_key_probe_bytes();
-        let (mut store, probe) = linked_routing_key_probe_bytes_with_fuel(
-            &bytes,
-            FuelEstimator::new_oneshot(TOTAL_BUDGET, MAX_PER_EPOCH, 0),
-            None,
-        )
-        .await;
-
-        let mut completed = 0;
-        while probe.call_async(&mut store, ()).await.is_ok() {
-            completed += 1;
-            assert!(completed < 10_000, "one-epoch P3 guest did not exhaust");
-        }
-
-        assert!(completed > 1, "test did not exercise repeated host returns");
-        assert_eq!(charged_oneshot_fuel(&store, TOTAL_BUDGET), MAX_PER_EPOCH);
-        assert_eq!(store.get_fuel().expect("read exhausted Store fuel"), 0);
-    }
-
-    #[tokio::test]
-    async fn oneshot_fuel_compiled_p3_spans_epochs_without_resetting_total() {
-        const TOTAL_BUDGET: u64 = 25_000;
-        const MAX_PER_EPOCH: u64 = 10_000;
-        let bytes = compiled_routing_key_probe_bytes();
         let observer = FuelObserver::default();
-        let (mut store, probe) = linked_routing_key_probe_bytes_with_fuel(
+        let (mut store, probe, mut publisher) = linked_routing_key_probe_bytes_with_fuel(
             &bytes,
             FuelEstimator::new_oneshot(TOTAL_BUDGET, MAX_PER_EPOCH, 0),
             Some(observer.clone()),
@@ -1577,7 +2121,49 @@ mod tests {
 
         let mut completed = 0;
         loop {
-            store.engine().increment_epoch();
+            let mut call = Box::pin(probe.call_async(&mut store, ()));
+            match tokio::time::timeout(std::time::Duration::from_millis(20), &mut call).await {
+                Ok(Ok(_)) => {
+                    completed += 1;
+                    assert!(completed < 10_000, "one-shot P3 guest did not suspend");
+                }
+                Ok(Err(error)) => {
+                    panic!("one-shot P3 guest terminated before epoch wake: {error:#}")
+                }
+                Err(_) => {
+                    publisher.tick();
+                    call.await
+                        .expect("host-call-heavy guest resumes after epoch wake");
+                    break;
+                }
+            }
+        }
+
+        assert!(completed > 1, "test did not exercise repeated host returns");
+        assert!(observer
+            .decisions
+            .lock()
+            .expect("fuel decision lock")
+            .contains(&FuelDecision::Suspend));
+        assert!(charged_oneshot_fuel(&store, TOTAL_BUDGET) > MAX_PER_EPOCH);
+    }
+
+    #[tokio::test]
+    async fn oneshot_fuel_compiled_p3_spans_epochs_without_resetting_total() {
+        const TOTAL_BUDGET: u64 = 25_000;
+        const MAX_PER_EPOCH: u64 = 10_000;
+        let bytes = compiled_routing_key_probe_bytes();
+        let observer = FuelObserver::default();
+        let (mut store, probe, mut publisher) = linked_routing_key_probe_bytes_with_fuel(
+            &bytes,
+            FuelEstimator::new_oneshot(TOTAL_BUDGET, MAX_PER_EPOCH, 0),
+            Some(observer.clone()),
+        )
+        .await;
+
+        let mut completed = 0;
+        loop {
+            publisher.tick();
             match probe.call_async(&mut store, ()).await {
                 Ok(_) => {
                     completed += 1;
@@ -1606,12 +2192,13 @@ mod tests {
         const CALIBRATION_TOTAL: u64 = 100_000;
         const FINAL_PARTIAL: u64 = 1_337;
         let bytes = compiled_routing_key_probe_bytes();
-        let (mut calibration_store, calibration_probe) = linked_routing_key_probe_bytes_with_fuel(
-            &bytes,
-            FuelEstimator::new_oneshot(CALIBRATION_TOTAL, CALIBRATION_TOTAL, 0),
-            None,
-        )
-        .await;
+        let (mut calibration_store, calibration_probe, _calibration_publisher) =
+            linked_routing_key_probe_bytes_with_fuel(
+                &bytes,
+                FuelEstimator::new_oneshot(CALIBRATION_TOTAL, CALIBRATION_TOTAL, 0),
+                None,
+            )
+            .await;
         calibration_probe
             .call_async(&mut calibration_store, ())
             .await
@@ -1621,7 +2208,7 @@ mod tests {
 
         let total_budget = first_call_fuel + FINAL_PARTIAL;
         let observer = FuelObserver::default();
-        let (mut store, probe) = linked_routing_key_probe_bytes_with_fuel(
+        let (mut store, probe, mut publisher) = linked_routing_key_probe_bytes_with_fuel(
             &bytes,
             FuelEstimator::new_oneshot(total_budget, CALIBRATION_TOTAL, 0),
             Some(observer.clone()),
@@ -1633,18 +2220,31 @@ mod tests {
             .expect("first budgeted compiled P3 probe call");
         assert_eq!(charged_oneshot_fuel(&store, total_budget), first_call_fuel);
 
-        store.engine().increment_epoch();
-        probe
+        publisher.tick();
+        let error = probe
             .call_async(&mut store, ())
             .await
             .expect_err("the second compiled P3 probe must exhaust the partial grant");
+        let message = format!("{error:#}");
+        assert!(message.contains("one-shot total fuel authority exhausted"));
+        assert!(!message.contains("all fuel consumed by WebAssembly"));
 
-        assert!(observer
-            .observations()
+        let observations = observer.observations();
+        let final_epoch = observations
             .iter()
-            .any(|sample| sample.budget == FINAL_PARTIAL));
+            .find(|sample| sample.budget > 0 && sample.budget <= FINAL_PARTIAL)
+            .unwrap_or_else(|| {
+                panic!("no final partial epoch grant was observed: {observations:?}")
+            });
+        assert!(
+            final_epoch.measured_consumption > 0,
+            "old-epoch work was not charged before the final epoch opened"
+        );
+        assert!(observer.updates().iter().any(|update| {
+            update.consumed == final_epoch.measured_consumption
+                && update.decision == FuelDecision::Grant(final_epoch.budget)
+        }));
         assert_eq!(charged_oneshot_fuel(&store, total_budget), total_budget);
-        assert_eq!(store.get_fuel().expect("read exhausted Store fuel"), 0);
     }
 
     #[tokio::test]
@@ -1659,7 +2259,9 @@ mod tests {
         );
         let bytes = std::fs::read(&artifact)
             .unwrap_or_else(|error| panic!("read {}: {error}", artifact.display()));
-        let engine = Arc::new(crate::engine::wasm_engine().expect("component engine"));
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let engine = runtime_engine.engine();
         let _ticker = EpochTicker::start(Arc::clone(&engine));
         let (stderr_read, stderr_write) = tokio::io::duplex(64 * 1024);
         let (mut builder, _handles) = Builder::ordinary(
@@ -1671,7 +2273,7 @@ mod tests {
         builder.granted_transport =
             crate::p3::GrantedTransport::from_parts(FailingTransportReader, FailingTransportWriter);
         let proc = builder
-            .with_engine(engine)
+            .with_runtime_engine(runtime_engine)
             .with_args(vec!["authority-probe".into(), "enumerate".into()])
             .build()
             .await
@@ -1704,7 +2306,7 @@ mod tests {
 
     #[tokio::test]
     async fn linked_production_host_import_marks_and_refuels_once() {
-        let (mut store, probe) = linked_routing_key_probe().await;
+        let (mut store, probe, _publisher) = linked_routing_key_probe().await;
 
         probe
             .call_async(&mut store, ())
@@ -1781,6 +2383,297 @@ mod tests {
             .expect_err("spinning core module must exhaust fuel");
         assert!(!store.data().fuel_estimator.initialized);
         assert_eq!(store.data().fuel_estimator.host_calls_this_epoch, 0);
+    }
+
+    #[tokio::test]
+    async fn epoch_callback_defers_accounting_until_a_flushed_hook() {
+        let (runtime_engine, mut publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let engine = runtime_engine.engine();
+        let module = wasmtime::Module::new(
+            &engine,
+            r#"
+                (module
+                    (import "host" "block" (func $block))
+                    (func (export "run")
+                        call $block))
+            "#,
+        )
+        .expect("blocking core module");
+        let mut linker = wasmtime::Linker::new(&engine);
+        linker
+            .func_wrap_async(
+                "host",
+                "block",
+                |_caller: wasmtime::Caller<'_, ComponentRunStates>, (): ()| {
+                    Box::new(std::future::pending::<()>())
+                },
+            )
+            .expect("link blocking host import");
+
+        let observer = FuelObserver::default();
+        let mut store = Store::new(
+            &engine,
+            component_test_state_with_runtime(
+                FuelEstimator::new_oneshot(25_000, 10_000, 0),
+                Some(observer.clone()),
+                &runtime_engine,
+            ),
+        );
+        install_fuel_slice_in_store(&mut store, 10_000).expect("initial callback test fuel");
+        install_epoch_fuel_callback(&mut store);
+        install_host_return_fuel_hook(&mut store);
+        store.set_epoch_deadline(1);
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate blocking core module");
+        let run = instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .expect("run export");
+
+        publisher.tick();
+        let mut call = Box::pin(run.call_async(&mut store, ()));
+        let first_poll = std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await;
+        assert!(first_poll.is_pending(), "blocking host import completed");
+        assert!(
+            observer.observations().is_empty(),
+            "epoch callback performed fuel accounting before a flushed hook"
+        );
+        assert!(
+            observer.updates().is_empty(),
+            "epoch callback produced a fuel decision before a flushed hook"
+        );
+        drop(call);
+        assert_eq!(
+            store.data().opened_epoch,
+            0,
+            "epoch allowance opened before a flushed hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_epoch_settles_once_at_the_next_marked_host_return() {
+        let (runtime_engine, mut publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let engine = runtime_engine.engine();
+        let module = wasmtime::Module::new(
+            &engine,
+            r#"
+                (module
+                    (import "host" "ping" (func $ping))
+                    (func (export "run")
+                        call $ping))
+            "#,
+        )
+        .expect("marked-return core module");
+        let mut linker = wasmtime::Linker::new(&engine);
+        linker
+            .func_wrap(
+                "host",
+                "ping",
+                |mut caller: wasmtime::Caller<'_, ComponentRunStates>| {
+                    caller.data_mut().mark_host_call();
+                },
+            )
+            .expect("link marked host import");
+
+        let observer = FuelObserver::default();
+        let mut store = Store::new(
+            &engine,
+            component_test_state_with_runtime(
+                FuelEstimator::new_oneshot(25_000, 10_000, 0),
+                Some(observer.clone()),
+                &runtime_engine,
+            ),
+        );
+        install_fuel_slice_in_store(&mut store, 10_000).expect("initial marked-return fuel");
+        install_epoch_fuel_callback(&mut store);
+        install_host_return_fuel_hook(&mut store);
+        store.set_epoch_deadline(1);
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate marked-return core module");
+        let run = instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .expect("run export");
+
+        publisher.tick();
+        run.call_async(&mut store, ())
+            .await
+            .expect("marked host return after epoch callback");
+
+        assert_eq!(store.data().opened_epoch, 1);
+        assert_eq!(store.data().pending_epoch, None);
+        assert!(!store.data().returning_from_epoch_callback);
+        let observations = observer.observations();
+        let updates = observer.updates();
+        assert_eq!(observations.len(), 1, "epoch opened more than once");
+        assert_eq!(updates.len(), 1, "old epoch settled more than once");
+        assert_eq!(observations[0].measured_consumption, updates[0].consumed);
+        assert_eq!(observations[0].host_calls_this_epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn pending_epoch_ticks_coalesce_at_the_next_out_of_gas_return() {
+        const TOTAL_BUDGET: u64 = 25_000;
+        let (runtime_engine, mut publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let engine = runtime_engine.engine();
+        let module = wasmtime::Module::new(
+            &engine,
+            r#"
+                (module
+                    (func (export "run")
+                        (loop $spin
+                            br $spin)))
+            "#,
+        )
+        .expect("spinning core module");
+        let observer = FuelObserver::default();
+        let mut store = Store::new(
+            &engine,
+            component_test_state_with_runtime(
+                FuelEstimator::new_oneshot(TOTAL_BUDGET, TOTAL_BUDGET, 0),
+                Some(observer.clone()),
+                &runtime_engine,
+            ),
+        );
+        install_fuel_slice_in_store(&mut store, TOTAL_BUDGET)
+            .expect("initial out-of-gas callback fuel");
+        install_epoch_fuel_callback(&mut store);
+        install_host_return_fuel_hook(&mut store);
+        store.set_epoch_deadline(1);
+        let instance = wasmtime::Linker::new(&engine)
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate spinning core module");
+        let run = instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .expect("run export");
+
+        assert_eq!(publisher.tick(), 1);
+        assert_eq!(publisher.tick(), 2);
+        assert_eq!(publisher.tick(), 3);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run.call_async(&mut store, ()),
+        )
+        .await
+        .expect("spinning core module timed out")
+        .expect_err("spinning core module must exhaust total authority");
+        assert!(format!("{error:#}").contains("one-shot total fuel authority exhausted"));
+
+        assert_eq!(store.data().opened_epoch, 3);
+        assert_eq!(store.data().pending_epoch, None);
+        assert_eq!(
+            observer.observations().len(),
+            1,
+            "coalesced ticks opened more than one allowance"
+        );
+        let updates = observer.updates();
+        let consumed: u64 = updates.iter().map(|update| update.consumed).sum();
+        assert!(consumed >= TOTAL_BUDGET, "under-counted fuel: {updates:?}");
+        assert!(
+            consumed <= TOTAL_BUDGET + 4,
+            "coalesced ticks minted fuel: {updates:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn epoch_callback_mid_chunk_installs_only_the_final_authority_at_a_flushed_hook() {
+        for final_authority in [1, 100, 1337, 9999] {
+            let total_budget = YIELD_INTERVAL + final_authority + 2;
+            let (runtime_engine, publisher) =
+                crate::engine::runtime_engine().expect("component runtime engine");
+            let engine = runtime_engine.engine();
+            let module = wasmtime::Module::new(
+                &engine,
+                r#"
+                    (module
+                        (import "host" "tighten-and-tick" (func $tighten-and-tick))
+                        (global $counter (mut i32) (i32.const 0))
+                        (func (export "run")
+                            call $tighten-and-tick
+                            (loop $spin
+                                global.get $counter
+                                i32.const 1
+                                i32.add
+                                global.set $counter
+                                br $spin)))
+                "#,
+            )
+            .expect("mid-chunk core module");
+            let publisher = Arc::new(std::sync::Mutex::new(publisher));
+            let callback_publisher = Arc::clone(&publisher);
+            let mut linker = wasmtime::Linker::new(&engine);
+            linker
+                .func_wrap(
+                    "host",
+                    "tighten-and-tick",
+                    move |mut caller: wasmtime::Caller<'_, ComponentRunStates>| {
+                        caller.data_mut().fuel_estimator.epoch_limit = Some(final_authority);
+                        callback_publisher
+                            .lock()
+                            .expect("epoch publisher lock")
+                            .tick();
+                    },
+                )
+                .expect("link epoch trigger");
+
+            let observer = FuelObserver::default();
+            let mut store = Store::new(
+                &engine,
+                component_test_state_with_runtime(
+                    FuelEstimator::new_oneshot(total_budget, total_budget, 0),
+                    Some(observer.clone()),
+                    &runtime_engine,
+                ),
+            );
+            install_fuel_slice_in_store(&mut store, total_budget).expect("initial mid-chunk fuel");
+            install_epoch_fuel_callback(&mut store);
+            install_host_return_fuel_hook(&mut store);
+            store.set_epoch_deadline(1);
+            let instance = linker
+                .instantiate_async(&mut store, &module)
+                .await
+                .expect("instantiate mid-chunk core module");
+            let run = instance
+                .get_typed_func::<(), ()>(&mut store, "run")
+                .expect("run export");
+
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                run.call_async(&mut store, ()),
+            )
+            .await
+            .expect("mid-chunk core module did not reach total exhaustion")
+            .expect_err("mid-chunk core module must exhaust total authority");
+            assert!(format!("{error:#}").contains("one-shot total fuel authority exhausted"));
+
+            let updates = observer.updates();
+            assert_eq!(updates.len(), 2, "unexpected settlement trace: {updates:?}");
+            assert!(
+                updates[0].consumed >= YIELD_INTERVAL,
+                "old epoch work was not settled at the flushed boundary: {updates:?}"
+            );
+            assert_eq!(updates[0].decision, FuelDecision::Grant(final_authority));
+            assert!(
+                updates[1].consumed >= final_authority,
+                "guest executed less than the final authority: {updates:?}"
+            );
+            // The fixture loop has five fixed-cost operators. Crossing after
+            // its first operator can execute at most four more fuel units.
+            assert!(
+                updates[1].consumed <= final_authority + 4,
+                "guest executed beyond one inter-checkpoint segment: {updates:?}"
+            );
+            assert_eq!(updates[1].decision, FuelDecision::Exhausted);
+            let measured_consumption: u64 = updates.iter().map(|update| update.consumed).sum();
+            assert!(measured_consumption >= total_budget);
+            assert!(measured_consumption <= total_budget + 4);
+        }
     }
 
     #[test]
@@ -1928,6 +2821,214 @@ mod tests {
         assert_eq!(builder.args.len(), 1);
     }
 
+    #[tokio::test]
+    async fn oversized_component_is_rejected_before_compilation() {
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(vec![0; crate::sched::MAX_COMPONENT_BYTES + 1]),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+
+        let error = match builder.with_runtime_engine(runtime_engine).build().await {
+            Ok(_) => panic!("oversized component unexpectedly compiled"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("component exceeds the fuel segment size bound"));
+    }
+
+    #[tokio::test]
+    async fn zero_budget_builds_without_executing_a_trapping_start_function() {
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let bytecode =
+            wat::parse_str(P3_TRAPPING_START_COMMAND).expect("parse P3 trapping-start component");
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytecode),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+
+        let proc = builder
+            .with_runtime_engine(runtime_engine)
+            .with_fuel_estimator(FuelEstimator::new_oneshot(0, 10_000, 0))
+            .build()
+            .await
+            .expect("zero-budget construction must not execute the start function");
+        assert_eq!(
+            proc.store.get_fuel().expect("read zero-budget fuel"),
+            0,
+            "zero-budget construction installed executable physical fuel"
+        );
+        let error = proc
+            .run()
+            .await
+            .expect_err("zero-budget process must reject guest execution");
+        assert!(format!("{error:#}").contains("one-shot total fuel authority exhausted"));
+    }
+
+    #[tokio::test]
+    async fn nonzero_start_trap_is_reported_by_run_after_preparation() {
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let bytecode =
+            wat::parse_str(P3_TRAPPING_START_COMMAND).expect("parse P3 trapping-start component");
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytecode),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+
+        let proc = builder
+            .with_runtime_engine(runtime_engine)
+            .with_fuel_estimator(FuelEstimator::new_oneshot(1_000, 1_000, 0))
+            .build()
+            .await
+            .expect("preparation must not execute the trapping start function");
+        assert_eq!(proc.store.get_fuel().expect("read prepared Store fuel"), 0);
+
+        let error = proc
+            .run()
+            .await
+            .expect_err("executable instantiation must report the start trap");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("command!start") && message.contains("`unreachable` instruction"),
+            "unexpected start-function error: {message}"
+        );
+        assert!(!message.contains("one-shot total fuel authority exhausted"));
+    }
+
+    #[tokio::test]
+    async fn start_function_uses_runtime_boundaries_and_settles_on_host_return() {
+        const TOTAL_BUDGET: u64 = 25_000;
+        const EPOCH_BUDGET: u64 = 12_500;
+
+        let (runtime_engine, mut publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let bytecode =
+            wat::parse_str(P3_COUNTED_START_COMMAND).expect("parse P3 counted-start component");
+        let observer = FuelObserver::default();
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytecode),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let proc = builder
+            .with_runtime_engine(runtime_engine)
+            .with_fuel_estimator(FuelEstimator::new_oneshot(TOTAL_BUDGET, EPOCH_BUDGET, 0))
+            .with_fuel_observer(observer.clone())
+            .build()
+            .await
+            .expect("build counted-start component");
+        assert_eq!(
+            proc.store.get_fuel().expect("read prepared Store fuel"),
+            0,
+            "construction installed executable fuel before Proc::run"
+        );
+
+        let mut run = Box::pin(proc.run());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut run => panic!(
+                    "start function completed before its first epoch boundary: {result:?}"
+                ),
+                () = async {
+                    loop {
+                        if !observer.updates().is_empty() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("start function did not reach its first epoch boundary");
+        let first_updates = observer.updates();
+        assert_eq!(
+            first_updates.len(),
+            1,
+            "start function did not use the normal fuel hook: {first_updates:?}"
+        );
+        assert_eq!(first_updates[0].decision, FuelDecision::Suspend);
+        assert!(first_updates[0].consumed >= EPOCH_BUDGET);
+        assert!(
+            observer.slice_boundaries.load(Ordering::Relaxed) >= 2,
+            "non-multiple startup authority did not use an intermediate F1 re-arm"
+        );
+
+        publisher.tick();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("counted start function timed out after the next epoch")
+            .expect("counted-start command failed");
+
+        let updates = observer.updates();
+        assert_eq!(
+            updates.len(),
+            2,
+            "successful instantiation did not settle remaining start work: {updates:?}"
+        );
+        assert!(updates[1].consumed > 0, "start tail was not charged");
+        let consumed: u64 = updates.iter().map(|update| update.consumed).sum();
+        assert!(consumed > EPOCH_BUDGET, "start work was under-counted");
+        assert!(
+            consumed < TOTAL_BUDGET,
+            "start work exhausted total authority"
+        );
+        let expected_total_remaining = TOTAL_BUDGET - consumed;
+        let expected_epoch_remaining = EPOCH_BUDGET - updates[1].consumed;
+        assert_eq!(
+            updates[1].decision,
+            FuelDecision::Grant(expected_total_remaining.min(expected_epoch_remaining)),
+            "start work did not reduce the next executable grant: {updates:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_function_can_exhaust_total_authority_during_instantiation() {
+        const TOTAL_BUDGET: u64 = 1_000;
+
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let bytecode =
+            wat::parse_str(P3_COUNTED_START_COMMAND).expect("parse P3 counted-start component");
+        let observer = FuelObserver::default();
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytecode),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let proc = builder
+            .with_runtime_engine(runtime_engine)
+            .with_fuel_estimator(FuelEstimator::new_oneshot(TOTAL_BUDGET, 10_000, 0))
+            .with_fuel_observer(observer.clone())
+            .build()
+            .await
+            .expect("build counted-start component");
+
+        let error = proc
+            .run()
+            .await
+            .expect_err("start function must exhaust its total authority");
+        let message = format!("{error:#}");
+        assert!(message.contains("one-shot total fuel authority exhausted"));
+        assert!(!message.contains("all fuel consumed by WebAssembly"));
+
+        let updates = observer.updates();
+        assert_eq!(updates.len(), 1, "unexpected startup trace: {updates:?}");
+        assert!(updates[0].consumed >= TOTAL_BUDGET);
+        assert!(updates[0].consumed <= TOTAL_BUDGET + 4);
+        assert_eq!(updates[0].decision, FuelDecision::Exhausted);
+    }
+
     #[test]
     fn byte_loaded_filesystem_uses_private_empty_root_and_cleans_scratch() {
         let mut wasi = WasiCtxBuilder::new();
@@ -2002,7 +3103,9 @@ mod tests {
             "../../../tests/fixtures/spinning-component.wat"
         ))
         .expect("parse P3 spinning component fixture");
-        let engine = Arc::new(crate::engine::wasm_engine().expect("component engine"));
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let engine = runtime_engine.engine();
         let (builder, _handles) = Builder::ordinary(
             Program::Bytes(bytecode),
             tokio::io::empty(),
@@ -2010,19 +3113,12 @@ mod tests {
             tokio::io::sink(),
         );
         let mut proc = builder
-            .with_engine(Arc::clone(&engine))
+            .with_runtime_engine(runtime_engine.clone())
             .build()
             .await
             .expect("build P3 spinning component");
 
-        // Remove fuel-based cooperative yields so task cancellation can only
-        // become observable after Wasmtime handles an engine epoch deadline.
-        proc.store
-            .fuel_async_yield_interval(None)
-            .expect("disable fuel-based yields");
-        proc.store
-            .set_fuel(u64::MAX)
-            .expect("set non-exhausting test fuel");
+        // Observe an engine epoch deadline before cancelling the running task.
         let epoch_observed = Arc::new(AtomicBool::new(false));
         let callback_observed = Arc::clone(&epoch_observed);
         proc.store.epoch_deadline_callback(move |_context| {
@@ -2062,7 +3158,7 @@ mod tests {
             tokio::io::sink(),
         );
         let healthy_proc = builder
-            .with_engine(Arc::clone(&engine))
+            .with_runtime_engine(runtime_engine)
             .build()
             .await
             .expect("build second P3 component on shared Engine");
@@ -2078,9 +3174,8 @@ mod tests {
             "../../../tests/fixtures/spinning-component.wat"
         ))
         .expect("parse P3 spinning component fixture");
-        let engine = Arc::new(crate::engine::wasm_engine().expect("component engine"));
-        // Production starts the shared Engine ticker before it admits Cells.
-        let _ticker = EpochTicker::start(Arc::clone(&engine));
+        let (runtime_engine, mut publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
         let fuel_observer = FuelObserver::default();
         let (builder, _handles) = Builder::ordinary(
             Program::Bytes(bytecode),
@@ -2089,23 +3184,30 @@ mod tests {
             tokio::io::sink(),
         );
         let proc = builder
-            .with_engine(Arc::clone(&engine))
+            .with_runtime_engine(runtime_engine.clone())
             .with_fuel_observer(fuel_observer.clone())
             .build()
             .await
             .expect("build production-config P3 spinning component");
 
         let mut proc_task = tokio::spawn(async move { proc.run().await });
-        // Epoch callbacks run only while the Store executes the export. Two
-        // observations prove that the non-terminating guest remained active
-        // across production Engine ticks and exercised `Continue(1)`.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while fuel_observer.observations().len() < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("production epoch callback did not observe the compute-bound guest");
+        fuel_observer.wait_for_slice_boundaries(20).await;
+        for expected_ticks in 1..=20 {
+            publisher.tick();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while fuel_observer.observations().len() < expected_ticks {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("production epoch callback did not observe tick {expected_ticks}")
+            });
+            assert!(
+                !proc_task.is_finished(),
+                "scheduled P3 guest terminated after epoch tick {expected_ticks}"
+            );
+        }
         if proc_task.is_finished() {
             let result = (&mut proc_task)
                 .await
@@ -2130,7 +3232,7 @@ mod tests {
             tokio::io::sink(),
         );
         let healthy_proc = builder
-            .with_engine(Arc::clone(&engine))
+            .with_runtime_engine(runtime_engine)
             .build()
             .await
             .expect("build healthy P3 component on shared Engine");
@@ -2138,6 +3240,249 @@ mod tests {
             .await
             .expect("healthy P3 component did not complete")
             .expect("healthy P3 component failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oneshot_compute_suspends_across_epochs_then_exhausts_explicitly() {
+        const TOTAL_BUDGET: u64 = 25_000;
+        const MAX_PER_EPOCH: u64 = 10_000;
+        let bytecode = wat::parse_str(include_str!(
+            "../../../tests/fixtures/spinning-component.wat"
+        ))
+        .expect("parse P3 spinning component fixture");
+        let (runtime_engine, mut publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let observer = FuelObserver::default();
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytecode),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let proc = builder
+            .with_runtime_engine(runtime_engine)
+            .with_fuel_estimator(FuelEstimator::new_oneshot(TOTAL_BUDGET, MAX_PER_EPOCH, 0))
+            .with_fuel_observer(observer.clone())
+            .build()
+            .await
+            .expect("build one-shot P3 spinning component");
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut task = tokio::spawn(PollCounter {
+            future: Box::pin(proc.run()),
+            polls: Arc::clone(&polls),
+        });
+        observer.wait_for_decision(FuelDecision::Suspend, 1).await;
+        assert!(
+            !task.is_finished(),
+            "one-shot Cell terminated at epoch limit"
+        );
+        tokio::task::yield_now().await;
+        let suspended_polls = polls.load(Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            suspended_polls,
+            "suspended Proc::run future was hot-polled"
+        );
+
+        publisher.tick();
+        observer.wait_for_decision(FuelDecision::Suspend, 2).await;
+        assert!(
+            !task.is_finished(),
+            "one-shot Cell terminated after one resume"
+        );
+
+        publisher.tick();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+            .await
+            .expect("one-shot Cell did not terminate at total exhaustion")
+            .expect("one-shot process task panicked")
+            .expect_err("one-shot Cell must terminate at total exhaustion");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("one-shot total fuel authority exhausted"),
+            "unexpected terminal error: {message}"
+        );
+        assert!(!message.contains("all fuel consumed by WebAssembly"));
+
+        let terminal_updates: Vec<_> = observer
+            .updates()
+            .into_iter()
+            .filter(|update| {
+                matches!(
+                    update.decision,
+                    FuelDecision::Suspend | FuelDecision::Exhausted
+                )
+            })
+            .collect();
+        assert_eq!(
+            terminal_updates
+                .iter()
+                .map(|update| update.decision)
+                .collect::<Vec<_>>(),
+            vec![
+                FuelDecision::Suspend,
+                FuelDecision::Suspend,
+                FuelDecision::Exhausted
+            ]
+        );
+        assert!(terminal_updates[0].consumed >= MAX_PER_EPOCH);
+        assert!(terminal_updates[0].consumed <= MAX_PER_EPOCH + 4);
+        assert!(terminal_updates[1].consumed >= MAX_PER_EPOCH);
+        assert!(terminal_updates[1].consumed <= MAX_PER_EPOCH + 4);
+        let cumulative_consumption: u64 =
+            terminal_updates.iter().map(|update| update.consumed).sum();
+        assert!(cumulative_consumption >= TOTAL_BUDGET);
+        assert!(cumulative_consumption <= TOTAL_BUDGET + 4);
+    }
+
+    #[tokio::test]
+    async fn host_call_heavy_oneshot_does_not_refill_before_epoch_wake() {
+        let (runtime_engine, mut publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let engine = runtime_engine.engine();
+        let module = wasmtime::Module::new(
+            &engine,
+            r#"
+                (module
+                    (import "host" "ping" (func $ping))
+                    (func (export "run")
+                        (loop $again
+                            call $ping
+                            br $again)))
+            "#,
+        )
+        .expect("host-call-heavy module");
+        let mut linker = wasmtime::Linker::new(&engine);
+        linker
+            .func_wrap(
+                "host",
+                "ping",
+                |mut caller: wasmtime::Caller<'_, ComponentRunStates>| {
+                    caller.data_mut().mark_host_call();
+                },
+            )
+            .expect("link marked host call");
+
+        let estimator = FuelEstimator::new_oneshot(25_000, 10_000, 0);
+        let observer = FuelObserver::default();
+        let mut store = Store::new(
+            &engine,
+            component_test_state_with_runtime(estimator, Some(observer.clone()), &runtime_engine),
+        );
+        install_fuel_slice_in_store(&mut store, 10_000).expect("initial host-call fuel");
+        install_epoch_fuel_callback(&mut store);
+        install_host_return_fuel_hook(&mut store);
+        store.set_epoch_deadline(1);
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate host-call-heavy module");
+        let run = instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .expect("run export");
+        let mut call = Box::pin(run.call_async(&mut store, ()));
+
+        for occurrence in 1..=2 {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut call)
+                    .await
+                    .is_err(),
+                "host-call-heavy one-shot did not suspend in epoch {occurrence}"
+            );
+            assert_eq!(
+                observer
+                    .decisions
+                    .lock()
+                    .expect("fuel decision lock")
+                    .iter()
+                    .filter(|decision| **decision == FuelDecision::Suspend)
+                    .count(),
+                occurrence,
+                "same-epoch host returns granted new authority"
+            );
+            publisher.tick();
+        }
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), &mut call)
+            .await
+            .expect("host-call-heavy one-shot did not reach total exhaustion")
+            .expect_err("host-call-heavy one-shot must exhaust total authority");
+        let message = format!("{error:#}");
+        assert!(message.contains("one-shot total fuel authority exhausted"));
+        assert!(!message.contains("all fuel consumed by WebAssembly"));
+        drop(call);
+        assert_eq!(store.data().fuel_estimator.total_remaining, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspended_oneshot_terminates_when_epoch_clock_closes() {
+        let bytecode = wat::parse_str(include_str!(
+            "../../../tests/fixtures/spinning-component.wat"
+        ))
+        .expect("parse P3 spinning component fixture");
+        let (runtime_engine, publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let observer = FuelObserver::default();
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytecode),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let proc = builder
+            .with_runtime_engine(runtime_engine)
+            .with_fuel_estimator(FuelEstimator::new_oneshot(25_000, 10_000, 0))
+            .with_fuel_observer(observer.clone())
+            .build()
+            .await
+            .expect("build one-shot P3 spinning component");
+
+        let mut task = tokio::spawn(async move { proc.run().await });
+        observer.wait_for_decision(FuelDecision::Suspend, 1).await;
+        drop(publisher);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+            .await
+            .expect("Cell remained suspended after epoch clock closed")
+            .expect("one-shot process task panicked")
+            .expect_err("closed epoch clock must terminate the Cell");
+        assert!(
+            format!("{error:#}").contains("epoch clock closed while one-shot Cell was suspended")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspended_oneshot_store_drops_on_task_cancellation() {
+        let bytecode = wat::parse_str(include_str!(
+            "../../../tests/fixtures/spinning-component.wat"
+        ))
+        .expect("parse P3 spinning component fixture");
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let observer = FuelObserver::default();
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytecode),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let proc = builder
+            .with_runtime_engine(runtime_engine)
+            .with_fuel_estimator(FuelEstimator::new_oneshot(25_000, 10_000, 0))
+            .with_fuel_observer(observer.clone())
+            .build()
+            .await
+            .expect("build one-shot P3 spinning component");
+
+        let mut task = tokio::spawn(async move { proc.run().await });
+        observer.wait_for_decision(FuelDecision::Suspend, 1).await;
+        task.abort();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+            .await
+            .expect("suspended Cell cancellation exceeded timeout")
+            .expect_err("aborted suspended Cell must return JoinError");
+        assert!(error.is_cancelled());
     }
 
     // =========================================================================
@@ -2207,7 +3552,7 @@ mod tests {
 
         for _ in 0..60 {
             let remaining = est.quantum().saturating_sub(1_000);
-            trajectory.push(est.on_epoch_tick(remaining));
+            trajectory.push(est.on_flushed_epoch_boundary(remaining));
         }
 
         assert!(
@@ -2229,7 +3574,7 @@ mod tests {
         let mut est = FuelEstimator::new(INITIAL_FUEL);
 
         for _ in 0..60 {
-            est.on_epoch_tick(0);
+            est.on_flushed_epoch_boundary(0);
         }
 
         assert!(est.avg_ratio() > 990);
@@ -2277,6 +3622,11 @@ mod tests {
     }
 
     #[test]
+    fn fuel_estimator_clamps_an_oversized_initial_quantum() {
+        assert_eq!(FuelEstimator::new(u64::MAX).quantum(), MAX_FUEL);
+    }
+
+    #[test]
     fn fuel_estimator_zero_budget_defaults_ratio() {
         let mut est = FuelEstimator::new(0);
         // Budget is 0 — ratio defaults to 500
@@ -2315,14 +3665,15 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn oneshot_fuel_initial_grant_is_bounded_by_total_and_epoch_authority() {
+    async fn oneshot_fuel_prepared_store_defers_bounded_grant_until_run() {
         for (total_budget, max_per_epoch, expected_grant) in [
-            (0, 10_000, 0),
-            (1, 10_000, 1),
+            (1, 10_000, 1_u64),
             (9_999, 10_000, 9_999),
             (10_000, 10_000, 10_000),
             (25_000, 10_000, 10_000),
         ] {
+            let (runtime_engine, _publisher) =
+                crate::engine::runtime_engine().expect("component runtime engine");
             let bytecode = wat::parse_str(P3_NOOP_COMMAND).expect("parse P3 no-op component");
             let (builder, _handles) = Builder::ordinary(
                 Program::Bytes(bytecode),
@@ -2331,16 +3682,25 @@ mod tests {
                 tokio::io::sink(),
             );
             let proc = builder
+                .with_runtime_engine(runtime_engine)
                 .with_fuel_estimator(FuelEstimator::new_oneshot(total_budget, max_per_epoch, 0))
                 .build()
                 .await
                 .expect("build one-shot P3 component");
 
             assert_eq!(
-                proc.store.get_fuel().expect("read initial fuel"),
-                expected_grant,
+                proc.store.get_fuel().expect("read prepared Store fuel"),
+                0,
+                "construction installed executable fuel: \
+                 total_budget={total_budget}, max_per_epoch={max_per_epoch}"
+            );
+            assert_eq!(
+                proc.store.data().fuel_estimator.current_decision(),
+                FuelDecision::Grant(expected_grant),
                 "total_budget={total_budget}, max_per_epoch={max_per_epoch}"
             );
+            assert_eq!(proc.store.data().fuel_estimator.authority_grant, 0);
+            assert_eq!(proc.store.data().fuel_estimator.physical_installed, 0);
         }
     }
 
@@ -2352,24 +3712,74 @@ mod tests {
     }
 
     #[test]
+    fn oneshot_fuel_decision_distinguishes_suspend_from_total_exhaustion() {
+        let mut est = FuelEstimator::new_oneshot(25_000, 10_000, 0);
+        assert_eq!(est.initial_decision(), FuelDecision::Grant(10_000));
+
+        est.install_authority_grant(10_000);
+        let update = est.settle_and_decide(YIELD_RESERVE, FuelBoundary::Slice);
+        assert_eq!(update.consumed, 10_000);
+        assert_eq!(update.decision, FuelDecision::Suspend);
+
+        est.open_epoch();
+        assert_eq!(est.current_decision(), FuelDecision::Grant(10_000));
+        est.install_authority_grant(10_000);
+        let update = est.settle_and_decide(YIELD_RESERVE, FuelBoundary::Slice);
+        assert_eq!(update.decision, FuelDecision::Suspend);
+
+        est.open_epoch();
+        assert_eq!(est.current_decision(), FuelDecision::Grant(5_000));
+        est.install_authority_grant(5_000);
+        let update = est.settle_and_decide(YIELD_RESERVE, FuelBoundary::Slice);
+        assert_eq!(update.decision, FuelDecision::Exhausted);
+    }
+
+    #[test]
+    fn physical_fuel_plan_keeps_reserve_out_of_authority_ledgers() {
+        let plan = FuelSlice::for_authority(1_337);
+        assert_eq!(plan.authority, 1_337);
+        assert_eq!(plan.physical, 1_337 + YIELD_RESERVE);
+        assert_eq!(plan.yield_interval, 1_337);
+
+        let mut est = FuelEstimator::new_oneshot(1_337, 10_000, 0);
+        est.install_authority_grant(plan.authority);
+        assert_eq!(est.total_remaining, Some(1_337));
+        assert_eq!(est.epoch_remaining, Some(10_000));
+    }
+
+    #[test]
+    fn inter_checkpoint_overshoot_is_charged_without_minting_authority() {
+        let mut est = FuelEstimator::new_oneshot(25_000, 10_000, 0);
+        est.install_authority_grant(10_000);
+
+        let update = est.settle_and_decide(YIELD_RESERVE - 500, FuelBoundary::Slice);
+        assert_eq!(update.consumed, 10_500);
+        assert_eq!(est.total_remaining, Some(14_500));
+        assert_eq!(est.epoch_remaining, Some(0));
+        assert_eq!(update.decision, FuelDecision::Suspend);
+    }
+
+    #[test]
     fn oneshot_fuel_marked_returns_share_the_total_ledger() {
         let mut est = FuelEstimator::new_oneshot(25_000, 100_000, 0);
         assert_eq!(est.initial_grant(), 25_000);
 
         let mut charged = 0;
         for consumed in [9_616, 9_616, 5_768] {
-            let current_fuel = est.installed - consumed;
+            let current_fuel = est.physical_installed - YIELD_RESERVE - consumed;
             charged += consumed;
             let grant = est.on_host_return(current_fuel);
 
             assert_eq!(est.total_remaining, Some(25_000 - charged));
             assert_eq!(est.epoch_remaining, Some(100_000 - charged));
-            assert_eq!(est.installed, grant);
+            if grant > 0 {
+                assert_eq!(est.physical_installed, grant + YIELD_RESERVE);
+            }
             assert!(grant <= 25_000 - charged);
         }
 
         assert_eq!(charged, 25_000);
-        assert_eq!(est.installed, 0);
+        assert_eq!(est.authority_grant, 0);
         assert_eq!(est.on_host_return(0), 0);
     }
 
@@ -2388,7 +3798,7 @@ mod tests {
         assert_eq!(est.epoch_remaining, Some(0));
         assert_eq!(grant, 0);
 
-        let grant = est.on_epoch_tick(0);
+        let grant = est.on_flushed_epoch_boundary(0);
         assert_eq!(est.total_remaining, Some(40_000));
         assert_eq!(est.epoch_remaining, Some(10_000));
         assert_eq!(grant, 10_000);
@@ -2399,11 +3809,11 @@ mod tests {
         let mut est = FuelEstimator::new_oneshot(21_337, 10_000, 0);
         assert_eq!(est.initial_grant(), 10_000);
 
-        assert_eq!(est.on_epoch_tick(0), 10_000);
+        assert_eq!(est.on_flushed_epoch_boundary(0), 10_000);
         assert_eq!(est.total_remaining, Some(11_337));
-        assert_eq!(est.on_epoch_tick(0), 1_337);
+        assert_eq!(est.on_flushed_epoch_boundary(0), 1_337);
         assert_eq!(est.total_remaining, Some(1_337));
-        assert_eq!(est.on_epoch_tick(0), 0);
+        assert_eq!(est.on_flushed_epoch_boundary(0), 0);
         assert_eq!(est.total_remaining, Some(0));
     }
 
@@ -2411,10 +3821,10 @@ mod tests {
     fn oneshot_fuel_exact_quantum_boundary_grants_zero_next() {
         let mut est = FuelEstimator::new_oneshot(20_000, 10_000, 0);
         assert_eq!(est.initial_grant(), 10_000);
-        assert_eq!(est.on_epoch_tick(0), 10_000);
-        assert_eq!(est.on_epoch_tick(0), 0);
+        assert_eq!(est.on_flushed_epoch_boundary(0), 10_000);
+        assert_eq!(est.on_flushed_epoch_boundary(0), 0);
         assert_eq!(est.total_remaining, Some(0));
-        assert_eq!(est.installed, 0);
+        assert_eq!(est.authority_grant, 0);
     }
 
     #[test]
@@ -2424,7 +3834,7 @@ mod tests {
 
         assert_eq!(est.on_host_return(6_000), 6_000);
         assert_eq!(est.total_remaining, Some(46_000));
-        assert_eq!(est.on_epoch_tick(6_000), 10_000);
+        assert_eq!(est.on_flushed_epoch_boundary(6_000), 10_000);
         assert_eq!(est.total_remaining, Some(46_000));
         assert_eq!(est.epoch_remaining, Some(10_000));
     }
@@ -2434,7 +3844,7 @@ mod tests {
         let mut est = FuelEstimator::new_oneshot(50_000, 10_000, 0);
         assert_eq!(est.initial_grant(), 10_000);
 
-        assert_eq!(est.on_epoch_tick(6_000), 10_000);
+        assert_eq!(est.on_flushed_epoch_boundary(6_000), 10_000);
         assert_eq!(est.total_remaining, Some(46_000));
         assert_eq!(est.epoch_remaining, Some(10_000));
 

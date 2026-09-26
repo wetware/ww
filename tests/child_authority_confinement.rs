@@ -248,7 +248,7 @@ async fn harness(wasm: &[u8]) -> Harness {
     let runtime = create_runtime_client(
         false,
         guard,
-        Some(ticked.engine()),
+        ticked.runtime_engine(),
         None,
         CachePolicy::Shared,
     );
@@ -269,7 +269,7 @@ async fn fixed_epoch_zero_executor(
     let runtime = create_runtime_client(
         false,
         fixed_epoch_zero_guard(),
-        Some(ticked.engine()),
+        ticked.runtime_engine(),
         None,
         CachePolicy::Isolated,
     );
@@ -1335,10 +1335,12 @@ fn typed_runtime_and_executor_extra_remain_distinct() {
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
         let harness = harness(&wasm).await;
+        let (runtime_engine, _publisher) =
+            ww::cell::engine::runtime_engine().expect("test runtime engine");
         let runtime = create_runtime_client(
             false,
             fixed_epoch_zero_guard(),
-            None,
+            runtime_engine,
             None,
             CachePolicy::Isolated,
         );
@@ -1441,6 +1443,8 @@ fn runtime_is_available_only_when_explicitly_granted() {
             "withheld typed runtime must be a clear guest-level failure: {absent}"
         );
 
+        let (runtime_engine, _publisher) =
+            ww::cell::engine::runtime_engine().expect("test runtime engine");
         let present = probe_report_with_authority(
             &harness.executor,
             "invoke",
@@ -1449,7 +1453,7 @@ fn runtime_is_available_only_when_explicitly_granted() {
                 runtime: Some(create_runtime_client(
                     false,
                     fixed_epoch_zero_guard(),
-                    None,
+                    runtime_engine,
                     None,
                     CachePolicy::Isolated,
                 )),
@@ -1929,7 +1933,7 @@ fn explicitly_wired_known_cid_read_has_path_only_authority_and_node_effects() {
         let runtime = create_runtime_client_with_pinset(
             false,
             fixed_epoch_zero_guard(),
-            Some(ticked.engine()),
+            ticked.runtime_engine(),
             None,
             CachePolicy::Isolated,
             Some(cache.clone()),

@@ -353,7 +353,7 @@ impl Bootstrap {
 #[derive(Clone)]
 pub struct RuntimeInputs {
     wasm_debug: bool,
-    engine: Arc<wasmtime::Engine>,
+    runtime_engine: cell::engine::RuntimeEngine,
     compile_tx: mpsc::Sender<CompileRequest>,
     cache_policy: rpc::CachePolicy,
     pinset_cache: Arc<cache::PinsetCache>,
@@ -362,14 +362,14 @@ pub struct RuntimeInputs {
 impl RuntimeInputs {
     pub fn new(
         wasm_debug: bool,
-        engine: Arc<wasmtime::Engine>,
+        runtime_engine: cell::engine::RuntimeEngine,
         compile_tx: mpsc::Sender<CompileRequest>,
         cache_policy: rpc::CachePolicy,
         pinset_cache: Arc<cache::PinsetCache>,
     ) -> Self {
         Self {
             wasm_debug,
-            engine,
+            runtime_engine,
             compile_tx,
             cache_policy,
             pinset_cache,
@@ -491,7 +491,7 @@ impl Generation {
             readiness_gate.clone(),
         );
         builder = builder
-            .with_engine(runtime_inputs.engine.clone())
+            .with_runtime_engine(runtime_inputs.runtime_engine.clone())
             .with_wasm_debug(runtime_inputs.wasm_debug)
             .with_env(guest_env)
             .with_cache(cache::CacheMode::Shared(
@@ -506,7 +506,7 @@ impl Generation {
         let runtime_client = crate::launcher::create_runtime_client_with_pinset(
             runtime_inputs.wasm_debug,
             guard.clone(),
-            Some(runtime_inputs.engine),
+            runtime_inputs.runtime_engine,
             Some(runtime_inputs.compile_tx),
             runtime_inputs.cache_policy,
             Some(runtime_inputs.pinset_cache),

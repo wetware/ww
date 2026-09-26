@@ -122,7 +122,7 @@ async fn status_cell_serves_json_with_required_peer_id() {
             let runtime = create_runtime_client(
                 false,
                 guard.clone(),
-                Some(ticked.engine()),
+                ticked.runtime_engine(),
                 None,
                 CachePolicy::Shared,
             );

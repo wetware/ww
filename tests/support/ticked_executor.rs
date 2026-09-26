@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use tokio::sync::watch;
 
 /// Owns the production shared Engine and its 10 ms epoch ticker.
@@ -17,7 +15,7 @@ impl TickedExecutor {
         }
     }
 
-    pub fn engine(&self) -> Arc<wasmtime::Engine> {
-        self.pool.engine()
+    pub fn runtime_engine(&self) -> ww::cell::engine::RuntimeEngine {
+        self.pool.runtime_engine()
     }
 }
