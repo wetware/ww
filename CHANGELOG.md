@@ -347,10 +347,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - **One-shot Cells now enforce cumulative fuel authority across every grant.**
-  Initial, host-return, and epoch grants share total and per-epoch ledgers, so
-  repeated host calls cannot mint compute and `maxPerEpoch` is cumulative.
-  Zero and tiny budgets receive bounded grants without a clamp panic, and a
-  final remainder remains usable as a partial grant.
+  Initial, startup, host-return, and fuel-slice work share total and per-epoch
+  ledgers, so repeated host calls cannot mint compute and `maxPerEpoch` is
+  cumulative. Temporary epoch exhaustion suspends the Store until the next
+  paired epoch publication; scheduled slice exhaustion yields and continues.
+  Epoch callbacks only record notifications, while fuel-flushed async call
+  hooks settle work and install reserve-aware grants. Adaptive re-arming bounds
+  partial grants. Executable instantiation now occurs behind the authority
+  gate, so zero-budget Cells execute no guest code and only total one-shot
+  exhaustion is terminal.
 - **CidTree rejects untrusted CID spellings before host-path or Kubo use.**
   Directory walking now parses and canonicalizes intermediate directory CIDs
   before cache lookup, persisted-listing access, or Kubo lookup. File

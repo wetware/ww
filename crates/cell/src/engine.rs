@@ -6,8 +6,9 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use tokio::sync::watch;
 use wasmtime::component::Component;
 use wasmtime::{Cache, CacheConfig, Config, Engine, OperatorCost, VariableOperatorCost};
 
@@ -52,6 +53,87 @@ pub struct WasmtimeCacheSnapshot {
 #[derive(Clone)]
 pub struct WasmtimeCacheMetrics {
     factory: Arc<EngineFactory>,
+}
+
+/// A Wasmtime engine paired with its host-published epoch clock.
+#[derive(Clone)]
+pub struct RuntimeEngine {
+    engine: Arc<Engine>,
+    epoch_rx: watch::Receiver<u64>,
+    epoch_sequence: Arc<Mutex<u64>>,
+}
+
+/// The sole publisher for one [`RuntimeEngine`]'s epoch clock.
+pub struct EpochPublisher {
+    engine: Arc<Engine>,
+    epoch_tx: watch::Sender<u64>,
+    epoch_sequence: Arc<Mutex<u64>>,
+}
+
+/// One Cell's independently observed view of the runtime epoch clock.
+pub struct EpochSubscription {
+    epoch_rx: watch::Receiver<u64>,
+    epoch_sequence: Arc<Mutex<u64>>,
+}
+
+impl RuntimeEngine {
+    /// Return the raw Wasmtime engine used for compilation and Store creation.
+    pub fn engine(&self) -> Arc<Engine> {
+        Arc::clone(&self.engine)
+    }
+
+    /// Return the latest epoch sequence published after its engine increment.
+    pub fn current_epoch(&self) -> u64 {
+        *self.epoch_rx.borrow()
+    }
+
+    /// Subscribe to future epochs, treating the current publication as seen.
+    pub fn subscribe(&self) -> EpochSubscription {
+        let mut epoch_rx = self.epoch_rx.clone();
+        epoch_rx.borrow_and_update();
+        EpochSubscription {
+            epoch_rx,
+            epoch_sequence: Arc::clone(&self.epoch_sequence),
+        }
+    }
+}
+
+impl EpochPublisher {
+    /// Advance Wasmtime's epoch and then publish the paired epoch sequence.
+    pub fn tick(&mut self) -> u64 {
+        let mut sequence = self
+            .epoch_sequence
+            .lock()
+            .expect("runtime epoch sequence lock poisoned");
+        let next = sequence
+            .checked_add(1)
+            .expect("runtime epoch sequence overflow");
+        self.engine.increment_epoch();
+        *sequence = next;
+        self.epoch_tx.send_replace(next);
+        next
+    }
+}
+
+impl EpochSubscription {
+    /// Return the latest epoch sequence published after its engine increment.
+    pub fn current_epoch(&self) -> u64 {
+        *self.epoch_rx.borrow()
+    }
+
+    /// Return the sequence paired with the latest Wasmtime epoch increment.
+    pub(crate) fn engine_epoch(&self) -> u64 {
+        *self
+            .epoch_sequence
+            .lock()
+            .expect("runtime epoch sequence lock poisoned")
+    }
+
+    /// Wait for the next published epoch and return its sequence.
+    pub async fn changed(&mut self) -> Result<u64, watch::error::RecvError> {
+        self.epoch_rx.changed().await?;
+        Ok(*self.epoch_rx.borrow_and_update())
+    }
 }
 
 impl WasmtimeCacheMetrics {
@@ -248,6 +330,25 @@ pub fn wasm_engine() -> wasmtime::Result<Engine> {
     engine_factory().engine()
 }
 
+/// Build a canonical Wasmtime engine together with its epoch publisher.
+pub fn runtime_engine() -> wasmtime::Result<(RuntimeEngine, EpochPublisher)> {
+    let engine = Arc::new(wasm_engine()?);
+    let (epoch_tx, epoch_rx) = watch::channel(0);
+    let epoch_sequence = Arc::new(Mutex::new(0));
+    Ok((
+        RuntimeEngine {
+            engine: Arc::clone(&engine),
+            epoch_rx,
+            epoch_sequence: Arc::clone(&epoch_sequence),
+        },
+        EpochPublisher {
+            engine,
+            epoch_tx,
+            epoch_sequence,
+        },
+    ))
+}
+
 /// Return the live Wasmtime cache state and counters.
 pub fn wasmtime_cache_metrics() -> WasmtimeCacheMetrics {
     WasmtimeCacheMetrics {
@@ -302,6 +403,44 @@ mod tests {
         assert_eq!(
             memory_fill_fuel(&factory, 0),
             memory_fill_fuel(&factory, 4096)
+        );
+    }
+
+    #[test]
+    fn size_dependent_segment_can_exceed_the_runtime_yield_reserve() {
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config).expect("default-cost engine");
+        let fill_length = crate::sched::YIELD_RESERVE + 1;
+        let memory_pages = fill_length.div_ceil(65_536);
+        let module = wasmtime::Module::new(
+            &engine,
+            format!(
+                r#"
+                (module
+                    (memory {memory_pages})
+                    (func (export "fill")
+                        i32.const 0
+                        i32.const 0
+                        i32.const {fill_length}
+                        memory.fill))
+            "#
+            ),
+        )
+        .expect("memory.fill module");
+        let mut store = wasmtime::Store::new(&engine, ());
+        store
+            .set_fuel(crate::sched::YIELD_RESERVE)
+            .expect("runtime reserve fuel");
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instance");
+        let error = instance
+            .get_typed_func::<(), ()>(&mut store, "fill")
+            .expect("fill export")
+            .call(&mut store, ())
+            .expect_err("size-dependent segment must exceed the runtime reserve");
+        assert!(
+            format!("{error:#}").contains("all fuel consumed by WebAssembly"),
+            "unexpected segment failure: {error:#}"
         );
     }
 
@@ -394,5 +533,116 @@ mod tests {
                 .files_total_size_soft_limit(),
             max_bytes
         );
+    }
+
+    #[test]
+    fn runtime_engine_clones_share_the_same_wasmtime_engine() {
+        let (runtime_engine, _publisher) = runtime_engine().expect("runtime engine");
+        let cloned = runtime_engine.clone();
+
+        assert!(Arc::ptr_eq(&runtime_engine.engine(), &cloned.engine()));
+    }
+
+    #[test]
+    fn publisher_tick_advances_the_shared_epoch_sequence() {
+        let (runtime_engine, mut publisher) = runtime_engine().expect("runtime engine");
+
+        assert_eq!(runtime_engine.current_epoch(), 0);
+        assert_eq!(publisher.tick(), 1);
+        assert_eq!(runtime_engine.current_epoch(), 1);
+        assert_eq!(publisher.tick(), 2);
+        assert_eq!(runtime_engine.current_epoch(), 2);
+    }
+
+    #[test]
+    fn callback_epoch_observation_is_serialized_with_tick() {
+        let (runtime_engine, publisher) = runtime_engine().expect("runtime engine");
+        let subscription = runtime_engine.subscribe();
+        let sequence = Arc::clone(&publisher.epoch_sequence);
+        let sequence_guard = sequence.lock().expect("epoch sequence lock");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce epoch reader");
+            observed_tx
+                .send(subscription.engine_epoch())
+                .expect("publish callback epoch");
+        });
+
+        started_rx.recv().expect("epoch reader started");
+        assert!(
+            observed_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "callback epoch observation escaped the tick critical section"
+        );
+        drop(sequence_guard);
+        assert_eq!(observed_rx.recv().expect("callback epoch"), 0);
+        reader.join().expect("epoch reader thread");
+    }
+
+    #[tokio::test]
+    async fn new_subscription_marks_the_current_epoch_as_its_baseline() {
+        let (runtime_engine, mut publisher) = runtime_engine().expect("runtime engine");
+        assert_eq!(publisher.tick(), 1);
+
+        let mut subscription = runtime_engine.subscribe();
+        assert_eq!(subscription.current_epoch(), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), subscription.changed())
+                .await
+                .is_err(),
+            "a fresh subscription must not observe ticks from before subscription"
+        );
+
+        assert_eq!(publisher.tick(), 2);
+        assert_eq!(subscription.changed().await.expect("second epoch"), 2);
+    }
+
+    #[tokio::test]
+    async fn tick_before_changed_is_not_lost() {
+        let (runtime_engine, mut publisher) = runtime_engine().expect("runtime engine");
+        let mut subscription = runtime_engine.subscribe();
+
+        assert_eq!(publisher.tick(), 1);
+        assert_eq!(subscription.changed().await.expect("published epoch"), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_publisher_closes_subscriptions() {
+        let (runtime_engine, publisher) = runtime_engine().expect("runtime engine");
+        let mut subscription = runtime_engine.subscribe();
+
+        drop(publisher);
+
+        assert!(subscription.changed().await.is_err());
+    }
+
+    #[test]
+    fn published_tick_also_advances_the_paired_wasmtime_engine() {
+        use std::sync::atomic::AtomicBool;
+
+        let (runtime_engine, mut publisher) = runtime_engine().expect("runtime engine");
+        let engine = runtime_engine.engine();
+        let module = wasmtime::Module::new(&engine, "(module (func (export \"run\")))")
+            .expect("epoch probe module");
+        let mut store = wasmtime::Store::new(&engine, ());
+        store.set_fuel(u64::MAX).expect("probe fuel");
+        let epoch_observed = Arc::new(AtomicBool::new(false));
+        let callback_observed = Arc::clone(&epoch_observed);
+        store.epoch_deadline_callback(move |_context| {
+            callback_observed.store(true, Ordering::SeqCst);
+            Ok(wasmtime::UpdateDeadline::Continue(1))
+        });
+        store.set_epoch_deadline(1);
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("probe instance");
+        let run = instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .expect("probe export");
+
+        assert_eq!(publisher.tick(), 1);
+        run.call(&mut store, ()).expect("run epoch probe");
+
+        assert!(epoch_observed.load(Ordering::SeqCst));
     }
 }

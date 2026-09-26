@@ -45,7 +45,7 @@ async fn spawn_greeter_on_pool(
     wasm: Vec<u8>,
 ) -> (greeter_capnp::greeter::Client, FuelObserver) {
     let (test_end, cell_end) = tokio::io::duplex(64 * 1024);
-    let engine = pool.engine();
+    let runtime_engine = pool.runtime_engine();
     let fuel_observer = FuelObserver::default();
     let worker_fuel_observer = fuel_observer.clone();
 
@@ -67,7 +67,7 @@ async fn spawn_greeter_on_pool(
                 let runtime = ww::launcher::create_runtime_client_with_fuel_observer(
                     false,
                     guard,
-                    Some(engine),
+                    runtime_engine,
                     None,
                     CachePolicy::Shared,
                     worker_fuel_observer,
@@ -148,6 +148,206 @@ async fn spawn_greeter_on_pool(
     tokio::task::yield_now().await;
 
     (greeter, fuel_observer)
+}
+
+async fn drive_with_manual_epochs<F: std::future::Future>(
+    future: F,
+    publisher: &mut cell::engine::EpochPublisher,
+) -> F::Output {
+    let mut future = Box::pin(future);
+    for _ in 0..1_000 {
+        match tokio::time::timeout(std::time::Duration::from_millis(10), &mut future).await {
+            Ok(output) => return output,
+            Err(_) => {
+                publisher.tick();
+            }
+        }
+    }
+    panic!("manual epoch driver exceeded 1,000 ticks")
+}
+
+async fn spawn_manual_oneshot_greeter(
+    wasm: Vec<u8>,
+) -> (
+    greeter_capnp::greeter::Client,
+    ww::system_capnp::process::Client,
+    cell::engine::EpochPublisher,
+    FuelObserver,
+    watch::Sender<authority::Epoch>,
+) {
+    let (runtime_engine, mut publisher) =
+        cell::engine::runtime_engine().expect("manual runtime engine");
+    let epoch = authority::Epoch {
+        seq: 1,
+        head: vec![],
+        root: None,
+    };
+    let (epoch_tx, epoch_rx) = watch::channel(epoch);
+    let guard = authority::EpochGuard {
+        issued_seq: 1,
+        receiver: epoch_rx.clone(),
+    };
+    let fuel_observer = FuelObserver::default();
+    let runtime = ww::launcher::create_runtime_client_with_fuel_observer(
+        false,
+        guard,
+        runtime_engine,
+        None,
+        CachePolicy::Isolated,
+        fuel_observer.clone(),
+    );
+
+    let mut load = runtime.load_request();
+    load.get().set_wasm(&wasm);
+    let executor = load
+        .send()
+        .promise
+        .await
+        .expect("load one-shot discovery guest")
+        .get()
+        .expect("load results")
+        .get_executor()
+        .expect("one-shot Executor");
+
+    let mut spawn = executor.spawn_request();
+    spawn
+        .get()
+        .set_membrane(authority::membrane_client(epoch_rx, b"test-peer"));
+    {
+        let mut env = spawn.get().init_env(1);
+        env.set(0, "WW_PEER_ID=deadbeefcafebabe");
+    }
+    {
+        let mut policy = spawn.get().init_fuel_policy().init_oneshot();
+        policy.set_total_budget(10_000_000);
+        policy.set_max_per_epoch(10_000);
+        policy.set_min_per_epoch(0);
+    }
+    let process = spawn
+        .send()
+        .promise
+        .await
+        .expect("spawn one-shot discovery guest")
+        .get()
+        .expect("spawn results")
+        .get_process()
+        .expect("one-shot Process");
+
+    let bootstrap =
+        drive_with_manual_epochs(process.bootstrap_request().send().promise, &mut publisher)
+            .await
+            .expect("bootstrap one-shot discovery guest");
+    let generic = bootstrap
+        .get()
+        .expect("bootstrap results")
+        .get_cap()
+        .get_as_capability::<capnp::capability::Client>()
+        .expect("bootstrap capability");
+    let greeter = greeter_capnp::greeter::Client { client: generic };
+    (greeter, process, publisher, fuel_observer, epoch_tx)
+}
+
+#[tokio::test]
+async fn guest_rpc_queues_while_oneshot_store_is_suspended_and_resumes_on_tick() {
+    let wasm = load_discovery_wasm();
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let (greeter, _process, mut publisher, fuel_observer, _epoch_tx) =
+                spawn_manual_oneshot_greeter(wasm).await;
+            // Bootstrap can consume its epoch and resume only far enough to
+            // return the capability. Start the request under test in a fresh
+            // published epoch so its suspension is independently observable.
+            publisher.tick();
+            let next_suspension = fuel_observer.suspension_count() + 1;
+            let large_name = "suspended-request-".repeat(16 * 1024);
+            let mut first_request = greeter.greet_request();
+            first_request.get().set_name(&large_name);
+            let mut first = Box::pin(first_request.send().promise);
+            tokio::select! {
+                () = fuel_observer.wait_for_suspension(next_suspension) => {}
+                result = &mut first => match result {
+                    Ok(_) => panic!("large guest RPC completed before suspension"),
+                    Err(error) => panic!("large guest RPC failed before suspension: {error}"),
+                },
+            }
+
+            let mut second_request = greeter.greet_request();
+            second_request.get().set_name("queued-while-suspended");
+            let mut second = Box::pin(second_request.send().promise);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+                    .await
+                    .is_err(),
+                "queued guest RPC completed while the Store was suspended"
+            );
+
+            let ticker = tokio::task::spawn_local(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
+                loop {
+                    interval.tick().await;
+                    publisher.tick();
+                }
+            });
+            let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                tokio::join!(first, second)
+            })
+            .await
+            .expect("queued guest RPCs did not resume");
+            ticker.abort();
+            first.expect("large guest RPC failed after resume");
+            second.expect("queued guest RPC failed after resume");
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn epoch_replacement_kill_drops_a_suspended_store_with_pending_guest_rpc() {
+    let wasm = load_discovery_wasm();
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let (greeter, process, mut publisher, fuel_observer, epoch_tx) =
+                spawn_manual_oneshot_greeter(wasm).await;
+            publisher.tick();
+            let next_suspension = fuel_observer.suspension_count() + 1;
+            let mut request = greeter.greet_request();
+            request.get().set_name("kill-suspended-".repeat(16 * 1024));
+            let mut pending = Box::pin(request.send().promise);
+            tokio::select! {
+                () = fuel_observer.wait_for_suspension(next_suspension) => {}
+                result = &mut pending => match result {
+                    Ok(_) => panic!("guest RPC completed before suspension"),
+                    Err(error) => panic!("guest RPC failed before suspension: {error}"),
+                },
+            }
+
+            epoch_tx.send_replace(authority::Epoch {
+                seq: 2,
+                head: b"replacement-root".to_vec(),
+                root: None,
+            });
+
+            process
+                .kill_request()
+                .send()
+                .promise
+                .await
+                .expect("kill suspended one-shot Process");
+            let wait = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                process.wait_request().send().promise,
+            )
+            .await
+            .expect("suspended Process teardown exceeded timeout")
+            .expect("wait for suspended Process");
+            assert_eq!(wait.get().expect("wait results").get_exit_code(), 137);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), &mut pending)
+                    .await
+                    .expect("pending guest RPC survived Store teardown")
+                    .is_err()
+            );
+        })
+        .await;
 }
 
 #[tokio::test]

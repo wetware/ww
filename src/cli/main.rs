@@ -2005,7 +2005,7 @@ system::export!({iface_name}Guest);
             kernel_bootstrap,
             ww::kernel::RuntimeInputs::new(
                 wasm_debug,
-                executor_pool.engine(),
+                executor_pool.runtime_engine(),
                 compile_tx,
                 cache_policy,
                 pinset_cache,

@@ -26,12 +26,6 @@ use cell::proc::{FuelEstimator, FuelObserver};
 use cell::{Builder, Proc, Program};
 use rpc::{graft, ByteStreamImpl, CachePolicy, ProcessBootstrapControl, ProcessImpl, StreamMode};
 
-/// Maximum WASM binary size accepted by the Executor.
-///
-/// Rejects oversized binaries before compilation to bound memory and
-/// CPU spent on untrusted guest code while still accommodating larger
-/// practical WASM guests.
-const MAX_WASM_BYTES: usize = 8 * 1024 * 1024;
 const RPC_EOF_GRACE: Duration = Duration::from_secs(1);
 
 static RPC_EOF_FALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -66,7 +60,7 @@ pub struct RuntimeImpl {
     /// single-threaded LocalSet.
     executor_cache: RefCell<HashMap<[u8; 32], system_capnp::executor::Client>>,
     /// Shared Wasmtime engine for this runtime and all executors it creates.
-    engine: Arc<wasmtime::Engine>,
+    runtime_engine: cell::engine::RuntimeEngine,
     /// Optional compilation service channel.
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     /// Optional host-managed cache for the accepted known-CID read substrate.
@@ -94,17 +88,13 @@ impl RuntimeImpl {
         capnp_rpc::new_client(ExecutorImpl {
             bytecode,
             component,
-            engine: self.engine.clone(),
+            runtime_engine: self.runtime_engine.clone(),
             wasm_debug: self.wasm_debug,
             guard: self.guard.clone(),
             pinset_cache: self.pinset_cache.clone(),
             fuel_observer: self.fuel_observer.clone(),
         })
     }
-}
-
-fn build_wasmtime_engine() -> Arc<wasmtime::Engine> {
-    Arc::new(cell::engine::wasm_engine().expect("failed to create wasmtime engine"))
 }
 
 async fn compile_with_service(
@@ -141,14 +131,14 @@ async fn compile_with_service(
 pub fn create_runtime_client(
     wasm_debug: bool,
     guard: EpochGuard,
-    engine: Option<Arc<wasmtime::Engine>>,
+    runtime_engine: cell::engine::RuntimeEngine,
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
 ) -> system_capnp::runtime::Client {
     create_runtime_client_with_options(
         wasm_debug,
         guard,
-        engine,
+        runtime_engine,
         compile_tx,
         cache_policy,
         None,
@@ -164,7 +154,7 @@ pub fn create_runtime_client(
 pub fn create_runtime_client_with_pinset(
     wasm_debug: bool,
     guard: EpochGuard,
-    engine: Option<Arc<wasmtime::Engine>>,
+    runtime_engine: cell::engine::RuntimeEngine,
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
     pinset_cache: Option<Arc<cache::PinsetCache>>,
@@ -172,7 +162,7 @@ pub fn create_runtime_client_with_pinset(
     create_runtime_client_with_options(
         wasm_debug,
         guard,
-        engine,
+        runtime_engine,
         compile_tx,
         cache_policy,
         pinset_cache,
@@ -185,7 +175,7 @@ pub fn create_runtime_client_with_pinset(
 pub fn create_runtime_client_with_fuel_observer(
     wasm_debug: bool,
     guard: EpochGuard,
-    engine: Option<Arc<wasmtime::Engine>>,
+    runtime_engine: cell::engine::RuntimeEngine,
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
     fuel_observer: FuelObserver,
@@ -193,7 +183,7 @@ pub fn create_runtime_client_with_fuel_observer(
     create_runtime_client_with_options(
         wasm_debug,
         guard,
-        engine,
+        runtime_engine,
         compile_tx,
         cache_policy,
         None,
@@ -204,7 +194,7 @@ pub fn create_runtime_client_with_fuel_observer(
 fn create_runtime_client_with_options(
     wasm_debug: bool,
     guard: EpochGuard,
-    engine: Option<Arc<wasmtime::Engine>>,
+    runtime_engine: cell::engine::RuntimeEngine,
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
     pinset_cache: Option<Arc<cache::PinsetCache>>,
@@ -215,7 +205,7 @@ fn create_runtime_client_with_options(
         guard,
         cache_policy,
         executor_cache: RefCell::new(HashMap::new()),
-        engine: engine.unwrap_or_else(build_wasmtime_engine),
+        runtime_engine,
         compile_tx,
         pinset_cache,
         fuel_observer,
@@ -259,18 +249,18 @@ impl system_capnp::runtime::Server for RuntimeImpl {
         pry!(self.check_epoch());
         let wasm = read_data_result(pry!(params.get()).get_wasm());
 
-        if wasm.len() > MAX_WASM_BYTES {
+        if wasm.len() > cell::sched::MAX_COMPONENT_BYTES {
             return Promise::err(capnp::Error::failed(format!(
                 "WASM binary too large ({} bytes, max {})",
                 wasm.len(),
-                MAX_WASM_BYTES
+                cell::sched::MAX_COMPONENT_BYTES
             )));
         }
 
         let key = *blake3::hash(&wasm).as_bytes();
         let bytecode = Arc::new(wasm);
         let compile_tx = self.compile_tx.clone();
-        let engine = self.engine.clone();
+        let engine = self.runtime_engine.engine();
         let server = self.clone();
 
         Promise::from_future(async move {
@@ -335,7 +325,7 @@ impl system_capnp::runtime::Server for RuntimeImpl {
 pub struct ExecutorImpl {
     bytecode: Arc<Vec<u8>>,
     component: Option<Arc<wasmtime::component::Component>>,
-    engine: Arc<wasmtime::Engine>,
+    runtime_engine: cell::engine::RuntimeEngine,
     wasm_debug: bool,
     guard: EpochGuard,
     pinset_cache: Option<Arc<cache::PinsetCache>>,
@@ -542,7 +532,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
 
         let bytecode = self.bytecode.clone();
         let component = self.component.clone();
-        let engine = self.engine.clone();
+        let runtime_engine = self.runtime_engine.clone();
         let wasm_debug = self.wasm_debug;
         let pinset_cache = self.pinset_cache.clone();
         let fuel_observer = self.fuel_observer.clone();
@@ -564,7 +554,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
             let (mut builder, mut handles) =
                 Builder::ordinary(program, guest_stdin, guest_stdout, guest_stderr);
             builder = builder
-                .with_engine(engine)
+                .with_runtime_engine(runtime_engine)
                 .with_env(env)
                 .with_args(args)
                 .with_wasm_debug(wasm_debug);
@@ -740,8 +730,15 @@ mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (epoch_tx, guard) = live_guard(1);
-                let runtime =
-                    create_runtime_client(false, guard, None, None, CachePolicy::Isolated);
+                let (runtime_engine, _publisher) =
+                    cell::engine::runtime_engine().expect("test runtime engine");
+                let runtime = create_runtime_client(
+                    false,
+                    guard,
+                    runtime_engine,
+                    None,
+                    CachePolicy::Isolated,
+                );
 
                 let mut load = runtime.load_request();
                 load.get().set_wasm(b"executor identity bytes");
@@ -785,10 +782,12 @@ mod tests {
     async fn fixed_epoch_zero_runtime_remains_valid() {
         tokio::task::LocalSet::new()
             .run_until(async {
+                let (runtime_engine, _publisher) =
+                    cell::engine::runtime_engine().expect("test runtime engine");
                 let runtime = create_runtime_client(
                     false,
                     authority::EpochGuard::fixed(authority::Epoch::zero()),
-                    None,
+                    runtime_engine,
                     None,
                     CachePolicy::Isolated,
                 );

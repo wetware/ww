@@ -7,7 +7,7 @@
 //!
 //! Executor threads use `current_thread` + `LocalSet` because `wasmtime::Store`
 //! is `!Send`.  M:N cell scheduling comes from the EWMA fuel estimator
-//! (`src/cell/proc.rs`), not tokio work stealing.
+//! (`crates/cell/src/proc.rs`), not tokio work stealing.
 //!
 //! `SwarmService` is the one exception: it uses a `multi_thread` runtime so
 //! the per-connection upgrade tasks that libp2p-swarm spawns (each containing
@@ -23,10 +23,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::sync::{mpsc, watch};
-use wasmtime::Engine;
-
 use cell::sched::EPOCH_TICK_MS;
+use tokio::sync::{mpsc, watch};
 
 // ---------------------------------------------------------------------------
 // Service trait
@@ -211,7 +209,7 @@ pub struct ExecutorPool {
     next: AtomicUsize,
     /// Shared engine for all cells. Callers pass this to `cell::Builder` so
     /// all cells on a worker respond to `increment_epoch()` on the same engine.
-    engine: Arc<Engine>,
+    runtime_engine: cell::engine::RuntimeEngine,
 }
 
 impl ExecutorPool {
@@ -228,13 +226,11 @@ impl ExecutorPool {
             n
         };
 
-        // Create a shared Engine with fuel + epoch support.  All cells on
-        // all workers share this Engine so Engine::increment_epoch() reaches
-        // every Store's epoch_deadline_callback.
-        let engine = Arc::new(
-            cell::engine::wasm_engine()
-                .map_err(|e| anyhow::anyhow!("failed to create shared wasmtime engine: {e}"))?,
-        );
+        // Create one Engine and one published epoch clock for the pool. Every
+        // Store callback records transitions from this paired clock.
+        let (runtime_engine, epoch_publisher) = cell::engine::runtime_engine()
+            .map_err(|e| anyhow::anyhow!("failed to create shared wasmtime engine: {e}"))?;
+        let mut epoch_publisher = Some(epoch_publisher);
 
         let mut senders = Vec::with_capacity(n);
         let mut threads = Vec::with_capacity(n);
@@ -245,10 +241,14 @@ impl ExecutorPool {
             let (tx, rx) = mpsc::channel(SPAWN_CHANNEL_DEPTH);
             let shutdown = shutdown.clone();
             let counts = cell_counts.clone();
-            let engine = engine.clone();
+            let worker_epoch_publisher = (i == 0).then(|| {
+                epoch_publisher
+                    .take()
+                    .expect("worker 0 owns the sole epoch publisher")
+            });
             let handle = std::thread::Builder::new()
                 .name(format!("executor-{}", i))
-                .spawn(move || worker_loop(i, rx, shutdown, counts, engine))
+                .spawn(move || worker_loop(i, rx, shutdown, counts, worker_epoch_publisher))
                 .with_context(|| format!("failed to spawn executor worker thread {i}"))?;
             senders.push(tx);
             threads.push(Some(handle));
@@ -261,7 +261,7 @@ impl ExecutorPool {
             threads,
             cell_counts,
             next: AtomicUsize::new(0),
-            engine,
+            runtime_engine,
         })
     }
 
@@ -317,10 +317,10 @@ impl ExecutorPool {
 
     /// Shared Wasmtime engine for all cells in this pool.
     ///
-    /// Pass this to `cell::Builder::with_engine()` so all cells share the same
+    /// Pass this to `cell::Builder::with_runtime_engine()` so all cells share the same
     /// Engine and respond to `Engine::increment_epoch()`.
-    pub fn engine(&self) -> Arc<Engine> {
-        Arc::clone(&self.engine)
+    pub fn runtime_engine(&self) -> cell::engine::RuntimeEngine {
+        self.runtime_engine.clone()
     }
 }
 
@@ -371,15 +371,15 @@ impl Drop for CellCountGuard {
 /// `SpawnRequest` factories over the channel, spawns them as local tasks.
 /// Each cell cooperatively yields via the EWMA fuel estimator.
 ///
-/// An epoch tick task calls `Engine::increment_epoch()` every EPOCH_TICK_MS,
-/// triggering each Store's `epoch_deadline_callback` to refuel compute-bound
-/// cells that don't make host calls frequently enough.
+/// An epoch tick task publishes a paired Wasmtime epoch every EPOCH_TICK_MS.
+/// Store callbacks record the latest transition. Fuel-flushed hooks settle
+/// old-epoch work before they open the new allowance.
 fn worker_loop(
     id: usize,
     rx: mpsc::Receiver<SpawnRequest>,
     shutdown: watch::Receiver<()>,
     cell_counts: Arc<Vec<AtomicUsize>>,
-    engine: Arc<Engine>,
+    epoch_publisher: Option<cell::engine::EpochPublisher>,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -390,21 +390,16 @@ fn worker_loop(
     let _span = tracing::info_span!("executor", worker = id).entered();
 
     rt.block_on(local.run_until(async move {
-        // Epoch tick task: bumps the Engine epoch counter every EPOCH_TICK_MS.
-        // This triggers epoch_deadline_callback in every Store on this Engine,
-        // refueling compute-bound cells that would otherwise Trap::OutOfFuel.
-        //
-        // Only worker 0 runs the tick task because all workers share the same
-        // Arc<Engine>.  increment_epoch() is a global atomic bump, so running
-        // it on N workers would advance the epoch N times per tick.
-        if id == 0 {
-            let tick_engine = engine.clone();
+        // The sole publisher advances the shared Engine and then publishes the
+        // paired sequence. Store callbacks only record the transition. A
+        // fuel-flushed hook performs settlement and installs the next grant.
+        if let Some(mut epoch_publisher) = epoch_publisher {
             tokio::task::spawn_local(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(EPOCH_TICK_MS));
                 interval.tick().await; // skip immediate first tick
                 loop {
                     interval.tick().await;
-                    tick_engine.increment_epoch();
+                    epoch_publisher.tick();
                 }
             });
         }
@@ -1107,6 +1102,33 @@ mod tests {
         // Drop should close channels and join threads without hanging.
         drop(shutdown_tx);
         drop(pool); // should not hang
+    }
+
+    #[test]
+    fn executor_pool_publishes_epochs_and_closes_the_clock_on_drop() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        let pool = ExecutorPool::new(1, shutdown_rx);
+        let mut subscription = pool.runtime_engine().subscribe();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), subscription.changed())
+                .await
+                .expect("executor pool did not publish an epoch")
+                .expect("executor pool epoch clock closed early");
+        });
+
+        drop(pool);
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while subscription.changed().await.is_ok() {}
+            })
+            .await
+            .expect("executor pool epoch clock remained open after pool drop");
+        });
     }
 
     #[test]

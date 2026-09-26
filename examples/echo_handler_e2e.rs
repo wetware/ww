@@ -17,10 +17,22 @@ use ww::system_capnp;
 
 /// Create a Runtime client for testing with a fixed epoch-zero guard.
 fn setup_runtime() -> system_capnp::runtime::Client {
+    let (runtime_engine, mut publisher) =
+        ww::cell::engine::runtime_engine().expect("example runtime engine");
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+            ww::cell::sched::EPOCH_TICK_MS,
+        ));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            publisher.tick();
+        }
+    });
     create_runtime_client(
         false,
         authority::EpochGuard::fixed(authority::Epoch::zero()),
-        None,
+        runtime_engine,
         None,
         CachePolicy::Shared,
     )

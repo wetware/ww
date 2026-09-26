@@ -27,12 +27,15 @@ on-chain attestation.
 
 The scheduler and one-shot accounting use separate state:
 
-- `installed` is the amount passed to the most recent `set_fuel()` call.
+- `authority_grant` is the guest compute that the ledger permits in the current slice.
+- `physical_installed` is `authority_grant + YIELD_RESERVE`, as passed to `set_fuel()`.
 - `total_remaining` is a one-shot Cell's cumulative compute authority.
 - `epoch_remaining` is its compute authority in the current epoch.
 - `quantum` is the EWMA estimator's desired grant size.
 
-The authority ledgers can reduce any grant below the desired quantum.
+The authority ledgers can reduce any grant below the desired quantum. The
+physical reserve is runtime machinery. Installing the reserve does not debit or
+increase either authority ledger.
 
 ## EWMA ratio estimator
 
@@ -46,8 +49,8 @@ and the next quantum is sized *inversely* to the smoothed ratio.
 At each `ReturningFromHost` boundary (a WASI import completing):
 
 ```
-consumed = installed - get_fuel()
-ratio    = consumed * RATIO_SCALE / installed  // 0..1000
+consumed = physical_installed - get_fuel()
+ratio    = min(consumed * RATIO_SCALE / authority_grant, RATIO_SCALE)
 ```
 
 Wasmtime also emits call hooks for internal libcalls and fuel or epoch yields.
@@ -106,52 +109,62 @@ direction to converge.  We use a continuous inverse mapping rather than
 AIMD's step function because the fuel ratio is a smooth signal (not a
 binary loss/no-loss event).
 
-## Two accounting paths
+## Fuel accounting and epoch notification
 
-### Path 1 — call_hook (I/O-bound cells)
+### Fuel-flushed call hooks
 
-Fires at each marked `ReturningFromHost` transition. The accounting path
-settles the installed grant, updates the EWMA, and installs an
-authority-bounded grant. Host calls are accounting boundaries. They do not
-restore one-shot authority.
+The async call hook handles marked `ReturningFromHost` transitions and
+confirmed out-of-gas returns. Cranelift flushes its function-local fuel counter
+before both boundaries. The hook can therefore read precise Store fuel.
+
+A marked return settles actual consumption and updates the EWMA. The hook
+tracks the Store fuel expected at the next out-of-gas return. Other unmarked
+Wasmtime and libcall returns are ignored.
+
+At an intermediate out-of-gas return, the hook computes the authority left in
+the current grant. The hook re-arms `fuel_async_yield_interval` to the smaller
+of that remainder and `YIELD_INTERVAL`. Wasmtime preserves and repartitions the
+remaining physical fuel. The next yield therefore lands at the authority
+boundary, subject only to one inter-checkpoint segment.
+
+The hook makes one explicit decision after settlement:
+
+- `Grant(g)` installs a new authority grant plus the physical reserve.
+- `Suspend` waits on the paired epoch clock before opening a new epoch.
+- `Exhausted` returns the explicit `one-shot total fuel authority exhausted` error.
+
+Scheduled Cells always choose `Grant`. Scheduled Cells never wait for an epoch
+because they consumed a quantum.
 
 Guest Wasm executed during host-call machinery remains charged. This includes
 guest realloc callbacks used by Component Model lowering and lifting.
 
-Each marked return increments `host_calls_this_epoch`. The epoch callback then
-knows that the call hook already observed the Cell during this epoch.
+Each marked return increments `host_calls_this_epoch`. Opening an epoch resets
+that count after the old epoch has been settled.
 
-### Path 2 — epoch_deadline_callback (compute-bound cells)
+### Epoch callback
 
-Fires every `EPOCH_TICK_MS` (10 ms) when the epoch tick task calls
-`Engine::increment_epoch()` and opens a new one-shot epoch allowance.
+The epoch callback is notification-only. Cranelift does not flush or reload its
+function-local fuel counter around the `new_epoch` libcall. Store fuel is not
+authoritative inside this callback.
 
-The callback checks `host_calls_this_epoch` only to decide whether to update the
-EWMA:
+The callback coalesces the latest published sequence into `pending_epoch` and
+returns `UpdateDeadline::Continue(1)`. The callback does not read fuel, settle
+ledgers, open an allowance, install fuel, or report authority exhaustion. The
+hook ignores the callback's immediate unflushed `ReturningFromHost` event.
 
-- **Zero** — observe the Store's actual remaining fuel at the epoch boundary.
-  Component Model I/O with low consumption stays near `MAX_FUEL`. Work that
-  consumes most of its installed grant converges toward `MIN_FUEL`.
-- **Non-zero** — the Cell made host calls; the call hook already updated the
-  EWMA. Install a new grant without another EWMA observation.
+At the next marked return or confirmed out-of-gas return, the hook performs the
+authoritative order:
 
-The callback always settles consumption since the last accounting boundary. It
-then resets the counter, resets `epoch_remaining`, and installs the next grant.
-Consumption immediately before the epoch tick belongs to the old epoch.
+1. Read precise Store fuel and settle work against the old epoch.
+2. Debit `total_remaining` and `epoch_remaining`.
+3. Open the latest pending or published epoch once.
+4. Reset `epoch_remaining` and compute `FuelDecision`.
+5. Update the Store deadline and install physical fuel.
 
-### Why two paths?
-
-A single path can't cover both workloads efficiently:
-
-- call_hook alone misses compute-bound cells (no host calls to trigger it).
-- epoch_deadline_callback alone observes at fixed intervals regardless of
-  host call frequency, losing the fine-grained signal that makes EWMA
-  responsive.
-
-The combination gives frequent observations for I/O Cells and periodic
-observations for compute Cells. The `host_calls_this_epoch` guard prevents a
-duplicate EWMA observation. The shared settlement path prevents duplicate fuel
-charges.
+Multiple ticks before that hook coalesce to one current-epoch allowance. The
+suspend path uses the same `open_epoch` operation after its watch receiver
+wakes.
 
 ## Yield interval vs quantum
 
@@ -159,17 +172,25 @@ Two independent knobs control cooperative scheduling:
 
 | Knob | Value | Controls |
 |---|---|---|
-| `fuel_async_yield_interval` | YIELD_INTERVAL (10K) | Requested fuel interval between async yields; smaller grants can exhaust first |
+| `fuel_async_yield_interval` | min(remaining authority, YIELD_INTERVAL) | Re-arms each slice toward the authority boundary |
 | EWMA quantum | MIN_FUEL..MAX_FUEL | Desired grant before one-shot authority clamps |
+| YIELD_RESERVE | 10M | Physical fuel retained for runtime boundary machinery |
 
 A scheduled Cell with a MAX_FUEL (10M) grant can yield every 10K
 instructions. Each yield returns `Poll::Pending` to the LocalSet. The quantum
 determines the desired work between accounting boundaries.
 
-Scheduled-cell cooperative-yield and fuel-exhaustion behavior is outside the
-one-shot accounting model. Issue #679 owns that behavior. In particular, this
-design does not change `MIN_FUEL`, `YIELD_INTERVAL`, or the scheduled epoch
-callback's `UpdateDeadline::Continue(1)` result.
+After each intermediate yield, the hook re-arms the interval to
+`min(YIELD_INTERVAL, remaining_authority)`. A final partial grant therefore
+reaches the async hook while physical reserve remains.
+
+Wetware accepts encoded components up to `MAX_COMPONENT_BYTES` (8 MiB).
+Production charges at most one fixed fuel unit per encoded operator and zero
+variable bulk-operation cost. Every operator occupies at least one encoded
+byte. `YIELD_RESERVE` is 10M, so one production straight-line segment costs
+less than the reserve. A guard test documents how Wasmtime's default variable
+bulk-operation cost can exceed the same reserve when this production
+assumption is absent. The reserve is runtime machinery, not authority.
 
 ## One-shot authority exhaustion
 
@@ -178,50 +199,67 @@ Cells spawned with `FuelPolicy::Oneshot` use two cumulative ledgers:
 - `totalBudget` is the total guest-compute authority for the Cell.
 - `maxPerEpoch` is the cumulative guest-compute authority cap for one epoch.
 
-Initialization, marked host returns, and epoch callbacks use one accounting
+Marked host returns and confirmed out-of-gas returns use one accounting
 operation:
 
 ```
-consumed        = installed.saturating_sub(get_fuel())
+consumed        = physical_installed.saturating_sub(get_fuel())
 total_remaining = total_remaining.saturating_sub(consumed)
 epoch_remaining = epoch_remaining.saturating_sub(consumed)
 grant            = min(quantum, total_remaining, epoch_remaining)
-installed        = grant
-set_fuel(grant)
+physical         = grant + YIELD_RESERVE
+set_fuel(physical)
 ```
 
-Initialization skips settlement and applies the same grant clamp. A zero total
-installs zero fuel. A final remainder smaller than `MIN_FUEL` remains usable as
-a partial grant.
+`Builder::build` compiles, links, validates, and prepares the component. It does
+not install physical fuel or call executable instantiation. `Proc::run` first
+evaluates `FuelDecision`. A zero total returns explicit authority exhaustion
+before `instantiate_async`, so no guest start function or guest entry point can
+execute.
 
-At an epoch boundary, the callback first settles consumption against the old
-epoch. The callback then resets `epoch_remaining` to `maxPerEpoch`. An epoch
-transition never resets `total_remaining`.
+For a nonzero grant, `Proc::run` installs the first reserve-aware slice before
+`instantiate_async`. The normal async fuel hook, `HostCallFrames`, epoch
+callback, pending-epoch state, suspension path, and exhaustion path are already
+installed. Start functions therefore use the same runtime accounting as
+`wasi:cli/run`. After successful instantiation returns to host code, any
+unsettled start-function consumption uses the same settlement and decision
+operation shown above. A final remainder smaller than `MIN_FUEL` remains usable
+as a partial grant.
+
+An epoch callback records `pending_epoch`. The next fuel-flushed hook first
+settles old-epoch consumption. The hook then resets `epoch_remaining` to
+`maxPerEpoch`. An epoch transition never resets `total_remaining`.
 
 `minPerEpoch` is the EWMA quantum floor. `minPerEpoch` does not force a grant
 above either authority ledger. The runtime normalizes the floor at or below the
 effective quantum ceiling, including when `maxPerEpoch < MIN_FUEL`.
 
-When `total_remaining` reaches zero, the runtime installs zero fuel. Wasmtime
-traps on the next instruction that consumes fuel. Total-authority exhaustion is
-terminal.
+When `total_remaining` reaches zero, `FuelDecision::Exhausted` returns a
+deliberate runtime error. Wetware does not use `Trap::OutOfFuel` as the semantic
+terminal signal.
 
 When `epoch_remaining` reaches zero while `total_remaining` is still positive,
-the runtime also installs zero fuel. Current Wasmtime behavior traps if the Cell
-consumes fuel before the next epoch tick. The Cell can therefore terminate with
-unused total authority after it exhausts `maxPerEpoch`.
+`FuelDecision::Suspend` parks the whole Store in the async call hook. The hook
+waits on `watch::Receiver::changed()`. The next epoch signal opens exactly one
+new allowance, installs a bounded grant, moves the Store deadline forward, and
+resumes guest execution.
 
-That per-epoch trap is current behavior, not the desired end-state. Issue #679
-owns suspending or yielding the Cell until the next epoch opens new per-epoch
-authority. Issue #672 does not change that behavior. The epoch callback
-continues to return `UpdateDeadline::Continue(1)`.
+Actual execution can cross an authority boundary by one Wasmtime
+inter-checkpoint segment. Settlement charges the complete segment to both
+ledgers. The runtime does not mint later authority to compensate for overshoot.
 
 ## Epoch tick placement
 
-All executor workers share a single `Arc<Engine>`.
-`Engine::increment_epoch()` is a global atomic bump — calling it on N
-workers would advance the epoch N times per tick, multiplying the
-callback frequency.  The tick task runs on worker 0 only.
+`RuntimeEngine` pairs the shared `Arc<Engine>` with a versioned epoch
+subscription. `ExecutorPool` owns the sole `EpochPublisher` on worker 0. Each
+tick holds the shared epoch-sequence lock while it calls
+`Engine::increment_epoch()`, records the paired sequence, and publishes the
+sequence. A synchronous epoch callback records the paired sequence through the
+same lock. A fuel-flushed hook opens the latest published sequence. This
+ordering does not expose a new allowance before the engine increment completes.
+
+Dropping worker 0 closes the only watch sender. A suspended Cell then returns a
+runtime error instead of waiting forever.
 
 ## Constants
 
@@ -230,9 +268,11 @@ callback frequency.  The tick task runs on worker 0 only.
 | INITIAL_FUEL | 1,000,000 | Initial desired quantum; one-shot ledgers can reduce the first grant |
 | MAX_FUEL | 10,000,000 | I/O-bound convergence ceiling |
 | MIN_FUEL | 10,000 | Default EWMA quantum floor; not a minimum authority grant |
-| YIELD_INTERVAL | 10,000 | Configured async-yield interval; #679 owns scheduled exhaustion before a yield |
+| YIELD_INTERVAL | 10,000 | Normal async-yield interval |
+| MAX_COMPONENT_BYTES | 8,388,608 | Bounds fixed-cost production segments below the reserve |
+| YIELD_RESERVE | 10,000,000 | Physical runtime reserve; never one-shot authority |
 | RATIO_SCALE | 1,000 | Fixed-point precision; 3 decimal digits |
-| EPOCH_TICK_MS | 10 | 100 Hz accounting cadence; scheduled-cell liveness remains tracked by #679 |
+| EPOCH_TICK_MS | 10 | 100 Hz accounting and one-shot resume cadence |
 
 ## References
 

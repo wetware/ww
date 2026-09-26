@@ -123,7 +123,7 @@ async fn status_cell_via_http_listener_with_narrow_membrane_returns_status() {
             let runtime = create_runtime_client(
                 false,
                 guard.clone(),
-                Some(ticked.engine()),
+                ticked.runtime_engine(),
                 None,
                 CachePolicy::Shared,
             );

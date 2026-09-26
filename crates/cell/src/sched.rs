@@ -23,11 +23,28 @@ pub const MIN_FUEL: u64 = 10_000;
 /// EWMA budget — a guest with a large budget still yields frequently.
 pub const YIELD_INTERVAL: u64 = 10_000;
 
+/// Maximum encoded component size accepted by a runnable Cell.
+///
+/// Production assigns at most one fuel unit per encoded operator and assigns
+/// zero variable bulk-operation cost. Because every operator occupies at
+/// least one byte, this limit also bounds one straight-line fuel segment.
+pub const MAX_COMPONENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Physical Wasmtime fuel retained after an authority grant ends so the
+/// runtime can reach an async call-hook boundary and make a fuel decision.
+/// This fuel is runtime machinery. It is never authority granted to a Cell.
+///
+/// `MAX_COMPONENT_BYTES` bounds fixed operator cost below this reserve. The
+/// production engine assigns zero variable bulk-operation cost.
+pub const YIELD_RESERVE: u64 = MAX_FUEL;
+
+const _: () = assert!(YIELD_RESERVE > MAX_COMPONENT_BYTES as u64);
+
 /// Fixed-point scaling for the consumed/budget ratio.
 /// 0 = pure I/O (consumed nothing), 1000 = pure compute (consumed everything).
 pub const RATIO_SCALE: u64 = 1000;
 
 /// Epoch tick interval in milliseconds.  The epoch tick task calls
-/// `Engine::increment_epoch()` at this rate, triggering the
-/// `epoch_deadline_callback` in every Store to refuel compute-bound cells.
+/// `Engine::increment_epoch()` at this rate. Each Store callback records the
+/// transition for its next fuel-flushed call-hook boundary.
 pub const EPOCH_TICK_MS: u64 = 10;
