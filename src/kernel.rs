@@ -316,7 +316,6 @@ pub struct Bootstrap {
     signing_key: Arc<SigningKey>,
     stream_control: libp2p_stream::Control,
     route_registry: Option<crate::dispatcher::server::RouteRegistry>,
-    ipfs_client: crate::ipfs::HttpClient,
     http_dial: Vec<String>,
 }
 
@@ -326,7 +325,6 @@ impl Bootstrap {
         swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
         signing_key: Arc<SigningKey>,
         stream_control: libp2p_stream::Control,
-        ipfs_client: crate::ipfs::HttpClient,
         http_dial: Vec<String>,
     ) -> Self {
         Self {
@@ -335,7 +333,6 @@ impl Bootstrap {
             signing_key,
             stream_control,
             route_registry: None,
-            ipfs_client,
             http_dial,
         }
     }
@@ -524,7 +521,6 @@ impl Generation {
             bootstrap.route_registry,
             runtime_client,
             rpc::NamedCapabilities::default(),
-            bootstrap.ipfs_client,
             bootstrap.http_dial,
             guard.issued_seq,
             registration_scope.receiver(),

@@ -346,7 +346,6 @@ mod tests {
         assert!(!graft.has_runtime());
         assert!(!graft.has_authority());
         assert!(!graft.has_identity());
-        assert!(!graft.has_ipfs());
         assert!(!graft.has_extras());
 
         let json = status_json_from_membrane(&membrane)

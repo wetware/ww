@@ -169,7 +169,6 @@ fn prebuilt_probe_mode_rejects_missing_and_empty_artifacts() {
 #[derive(Default)]
 struct BackendCounts {
     http: Cell<u32>,
-    ipfs: Cell<u32>,
 }
 
 struct Harness {
@@ -212,9 +211,7 @@ async fn probe_backend() -> (String, Rc<BackendCounts>) {
                 }
                 let first_line = String::from_utf8_lossy(&request);
                 let first_line = first_line.lines().next().unwrap_or_default();
-                if first_line.contains("/api/v0/") {
-                    counts.ipfs.set(counts.ipfs.get() + 1);
-                } else if first_line.contains("/authority-probe") {
+                if first_line.contains("/authority-probe") {
                     counts.http.set(counts.http.get() + 1);
                 }
                 stream
@@ -314,7 +311,6 @@ struct FixedAuthority {
     runtime: Option<system_capnp::runtime::Client>,
     authority: Option<ww::auth_capnp::authority::Client>,
     identity: Option<ww::auth_capnp::identity::Client>,
-    ipfs: Option<system_capnp::ipfs::Client>,
 }
 
 impl Default for FixedAuthority {
@@ -333,7 +329,6 @@ impl Default for FixedAuthority {
             runtime: None,
             authority: None,
             identity: None,
-            ipfs: None,
         }
     }
 }
@@ -415,9 +410,6 @@ impl authority::GraftBuilder for TestGraftBuilder {
         }
         if let Some(identity) = &fixed.identity {
             builder.set_identity(identity.clone());
-        }
-        if let Some(ipfs) = &fixed.ipfs {
-            builder.set_ipfs(ipfs.clone());
         }
         let extras = builder.reborrow().init_extras(self.extras.len() as u32);
         ww::rpc::encode_exports(&self.extras, extras)
@@ -964,7 +956,6 @@ fn present_authority_pointers(report: &Value) -> Vec<&'static str> {
         ("runtime", &detail["runtime"]),
         ("authority", &detail["authority"]),
         ("identity", &detail["identity"]),
-        ("ipfs", &detail["ipfs"]),
     ]
     .into_iter()
     .filter_map(|(path, value)| {
@@ -2093,11 +2084,6 @@ fn minimal_membrane_child_receives_only_required_peer_metadata() {
             harness.backend_counts.http.get(),
             0,
             "minimal authority must not reach the test-local HTTP backend"
-        );
-        assert_eq!(
-            harness.backend_counts.ipfs.get(),
-            0,
-            "minimal authority must not reach the test-local IPFS backend"
         );
     });
 }

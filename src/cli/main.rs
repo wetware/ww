@@ -1992,7 +1992,6 @@ system::export!({iface_name}Guest);
             swarm_cmd_tx.clone(),
             signing_key,
             stream_control,
-            ipfs_client.clone(),
             http_dial,
         );
         if let Some(ref registry) = route_registry {

@@ -49,12 +49,16 @@ The response reports `status: "ok"` and a non-null `peer_id`.
 1. Started a **libp2p swarm** on the configured port
 2. Loaded embedded `std/kernel/bin/main.wasm` — the Rust kernel Cell (pid0)
 3. Spawned it with a **Membrane** whose `graft()` returns typed `peerId`,
-   `stat`, `network`, `routing`, `runtime`, `authority`, `identity`, and `ipfs`
-   fields. `extras` contains only application-defined capabilities.
+   `stat`, `network`, `routing`, `runtime`, `authority`, and `identity` fields.
+   `extras` contains only application-defined capabilities.
 
 The kernel grafted onto the Membrane, received epoch-scoped
 capabilities, and installed `/status` with a narrow `Membrane` containing only
 `peerId` and `Stat`.
+
+Cells read content through WASI filesystem paths. Image paths resolve through
+the active `CidTree`; `/ipfs/<cid>/...` also requires applicable root or cache
+wiring. The guest VFS does not resolve `/ipns/...` or `/ipld/...` namespaces.
 
 ## Next
 

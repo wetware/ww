@@ -19,11 +19,11 @@ use capnp_rpc::RpcSystem;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use libp2p::identity::Keypair;
 use libp2p_core::SignedEnvelope;
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::{ByteStreamImpl, NamedCapabilities, StreamMode, SwarmCommand};
+use crate::{NamedCapabilities, SwarmCommand};
 use auth::SigningDomain;
 use authority::http_capnp;
 use authority::routing_capnp;
@@ -159,61 +159,6 @@ struct EpochGuardedDomainSigner {
     guard: EpochGuard,
 }
 
-// ---------------------------------------------------------------------------
-// EpochGuardedIpfs — daemon-side IPFS read proxy for non-WASI clients
-// ---------------------------------------------------------------------------
-
-struct EpochGuardedIpfs {
-    guard: EpochGuard,
-    ipfs_client: ipfs::HttpClient,
-}
-
-const IPFS_STREAM_BRIDGE_BUFFER_BYTES: usize = 64 * 1024;
-
-fn validate_ipfs_path(path: &str) -> Result<(), capnp::Error> {
-    if ipfs::is_ipfs_path(path) {
-        return Ok(());
-    }
-    Err(capnp::Error::failed(format!(
-        "ipfs.read: expected /ipfs/, /ipns/, or /ipld/ path; got {path}"
-    )))
-}
-
-#[allow(refining_impl_trait)]
-impl system_capnp::ipfs::Server for EpochGuardedIpfs {
-    fn read(
-        self: capnp::capability::Rc<Self>,
-        params: system_capnp::ipfs::ReadParams,
-        mut results: system_capnp::ipfs::ReadResults,
-    ) -> Promise<(), capnp::Error> {
-        pry!(self.guard.check());
-        let p = pry!(params.get());
-        let path = pry!(p
-            .get_path()
-            .and_then(|t| t.to_str().map_err(|e| capnp::Error::failed(e.to_string()))))
-        .to_string();
-
-        if let Err(err) = validate_ipfs_path(&path) {
-            return Promise::err(err);
-        }
-
-        let (mut writer, reader) = io::duplex(IPFS_STREAM_BRIDGE_BUFFER_BYTES);
-        let stream_client: system_capnp::byte_stream::Client =
-            capnp_rpc::new_client(ByteStreamImpl::new(reader, StreamMode::ReadOnly));
-        results.get().set_stream(stream_client);
-
-        let client = self.ipfs_client.clone();
-        tokio::spawn(async move {
-            if let Err(err) = client.cat_to_writer(&path, &mut writer).await {
-                tracing::warn!(path = %path, error = %err, "ipfs.read bridge failed");
-            }
-            let _ = writer.shutdown().await;
-        });
-
-        Promise::ok(())
-    }
-}
-
 #[allow(refining_impl_trait)]
 impl auth_capnp::signer::Server for EpochGuardedDomainSigner {
     fn sign(
@@ -298,8 +243,6 @@ pub struct RootMembraneBuilder {
     runtime_client: system_capnp::runtime::Client,
     /// Application-defined named capabilities configured for `extras`.
     extras: NamedCapabilities,
-    /// IPFS HTTP client for Kubo API calls (e.g. IPNS resolution).
-    ipfs_client: ipfs::HttpClient,
     /// Host-internal view of the pid0 execution-generation lifetime. Every
     /// graft for that generation shares this receiver; unrelated graft calls
     /// therefore cannot invalidate pid0 registrations.
@@ -315,7 +258,6 @@ impl RootMembraneBuilder {
         stream_control: libp2p_stream::Control,
         allowed_hosts: Vec<String>,
         runtime_client: system_capnp::runtime::Client,
-        ipfs_client: ipfs::HttpClient,
     ) -> Self {
         Self {
             network_state,
@@ -326,7 +268,6 @@ impl RootMembraneBuilder {
             route_registry: None,
             runtime_client,
             extras: NamedCapabilities::default(),
-            ipfs_client,
             registration_scope: None,
         }
     }
@@ -443,12 +384,6 @@ impl RootMembraneBuilder {
             builder.set_identity(identity);
         }
 
-        let ipfs: system_capnp::ipfs::Client = capnp_rpc::new_client(EpochGuardedIpfs {
-            guard: guard.clone(),
-            ipfs_client: self.ipfs_client.clone(),
-        });
-        builder.set_ipfs(ipfs);
-
         let extras = builder.reborrow().init_extras(self.extras.len() as u32);
         crate::encode_exports(&self.extras, extras)
     }
@@ -465,7 +400,7 @@ impl GraftBuilder for RootMembraneBuilder {
 }
 
 // IPFS content access goes through the WASI virtual filesystem (CidTree).
-// See src/vfs.rs and src/fs_intercept.rs.
+// See crates/cell/src/vfs.rs and crates/cell/src/fs_intercept.rs.
 
 // ---------------------------------------------------------------------------
 // RPC bootstrap constructors
@@ -561,7 +496,6 @@ pub fn build_kernel_membrane_rpc<R, W>(
     route_registry: Option<crate::dispatch::RouteRegistry>,
     runtime_client: system_capnp::runtime::Client,
     extras: NamedCapabilities,
-    ipfs_client: ipfs::HttpClient,
     http_dial: Vec<String>,
     intended_seq: u64,
     registration_scope: watch::Receiver<()>,
@@ -577,7 +511,6 @@ where
         stream_control,
         http_dial,
         runtime_client,
-        ipfs_client,
     )
     .with_registration_scope(registration_scope);
     if !extras.is_empty() {
@@ -616,6 +549,7 @@ mod tests {
     use futures::FutureExt;
     use std::cell::Cell;
     use std::rc::Rc;
+    use tokio::io;
 
     struct RuntimeStub;
     impl system_capnp::runtime::Server for RuntimeStub {}
@@ -841,7 +775,6 @@ mod tests {
             libp2p_stream::Behaviour::new().new_control(),
             vec!["example.com".into()],
             runtime,
-            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
         );
 
         let mut message = capnp::message::Builder::new_default();
@@ -861,7 +794,6 @@ mod tests {
         assert!(results.has_runtime());
         assert!(results.has_authority());
         assert!(results.has_identity());
-        assert!(results.has_ipfs());
         let network = results.get_network().expect("network");
         assert!(network.get_stream().has_listener());
         assert!(network.get_stream().has_dialer());
@@ -891,7 +823,6 @@ mod tests {
             libp2p_stream::Behaviour::new().new_control(),
             Vec::new(),
             runtime,
-            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
         )
         .with_extras(
             NamedCapabilities::try_from_pairs([("application-extra", extra_runtime.client)])
@@ -985,7 +916,6 @@ mod tests {
                         libp2p_stream::Behaviour::new().new_control(),
                         Vec::new(),
                         runtime,
-                        ipfs::HttpClient::new("http://127.0.0.1:1".into()),
                     ),
                     readiness_gate: readiness_gate.clone(),
                     intended_seq: 1,
@@ -1028,7 +958,6 @@ mod tests {
                         libp2p_stream::Behaviour::new().new_control(),
                         Vec::new(),
                         runtime,
-                        ipfs::HttpClient::new("http://127.0.0.1:1".into()),
                     ),
                     readiness_gate: readiness_gate.clone(),
                     intended_seq: 1,
@@ -1148,7 +1077,6 @@ mod tests {
                     libp2p_stream::Behaviour::new().new_control(),
                     Vec::new(),
                     runtime,
-                    ipfs::HttpClient::new("http://127.0.0.1:1".into()),
                 )
                 .with_route_registry(registry.clone())
                 .with_registration_scope(registration_scope_rx);
@@ -1264,7 +1192,6 @@ mod tests {
                     None,
                     runtime,
                     NamedCapabilities::default(),
-                    ipfs::HttpClient::new("http://127.0.0.1:1".into()),
                     vec!["example.com".into()],
                     1,
                     registration_scope_rx,
@@ -1293,7 +1220,6 @@ mod tests {
                 assert!(graft.has_runtime());
                 assert!(graft.has_authority());
                 assert!(graft.has_identity());
-                assert!(graft.has_ipfs());
                 let network = graft.get_network().expect("network");
                 assert!(network.get_stream().has_listener());
                 assert!(network.get_vat().has_dialer());
@@ -1345,7 +1271,6 @@ mod tests {
                 assert!(!graft.has_runtime());
                 assert!(!graft.has_authority());
                 assert!(!graft.has_identity());
-                assert!(!graft.has_ipfs());
                 assert_eq!(graft.get_extras().expect("child extras").len(), 0);
             })
             .await;

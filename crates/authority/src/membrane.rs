@@ -34,8 +34,8 @@ pub fn get_extra<T: FromClientHook>(
 /// Callback trait for populating the graft response with capabilities.
 ///
 /// Implementors receive the EpochGuard and a builder for the graft results,
-/// allowing platform-specific capabilities such as network, runtime, and IPFS
-/// access to be injected into the response fields.
+/// allowing platform-specific capability references to be injected into the
+/// response fields.
 pub trait GraftBuilder: 'static {
     fn build(
         &self,
@@ -299,7 +299,6 @@ mod tests {
         assert!(!graft.has_runtime());
         assert!(!graft.has_authority());
         assert!(!graft.has_identity());
-        assert!(!graft.has_ipfs());
         assert!(!graft.has_extras());
     }
 }

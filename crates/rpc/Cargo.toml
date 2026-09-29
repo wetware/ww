@@ -27,7 +27,6 @@ tracing = { workspace = true }
 
 # Workspace crates
 auth = { path = "../guest/auth" }
-ipfs = { path = "../ipfs" }
 authority = { package = "wetware-authority", path = "../authority" }
 
 [dev-dependencies]

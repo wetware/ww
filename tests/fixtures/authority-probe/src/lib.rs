@@ -203,7 +203,6 @@ fn authority_presence(
         "runtime": graft.has_runtime(),
         "authority": graft.has_authority(),
         "identity": graft.has_identity(),
-        "ipfs": graft.has_ipfs(),
     }))
 }
 
@@ -399,26 +398,6 @@ async fn invoke_named(membrane: Membrane, requested: String) -> Value {
                 Ok(json!({
                     "guard_callable": true,
                     "terminal_obtained": true,
-                }))
-            }
-            "ipfs" => {
-                if !graft.has_ipfs() {
-                    return Err(capnp::Error::failed("ipfs is withheld".into()));
-                }
-                let ipfs = graft.get_ipfs()?;
-                let mut request = ipfs.read_request();
-                request
-                    .get()
-                    .set_path("/ipfs/bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye");
-                let response = request.send().promise.await?;
-                let stream = response.get()?.get_stream()?;
-                let mut read = stream.read_request();
-                read.get().set_max_bytes(1);
-                let bytes = read.send().promise.await?.get()?.get_data()?.to_vec();
-                Ok(json!({
-                    "rpc_reached": true,
-                    "stream_obtained": true,
-                    "read_bytes": bytes.len(),
                 }))
             }
             "stream-listener" => {
@@ -865,7 +844,6 @@ async fn run_invoke_all() -> Result<(), capnp::Error> {
             "routing-announcer",
             "authority",
             "identity",
-            "ipfs",
         ] {
             let result = invoke_named(membrane.clone(), name.to_owned()).await;
             if result["ok"] == true {
@@ -1333,7 +1311,6 @@ mod tests {
                 "runtime": false,
                 "authority": false,
                 "identity": false,
-                "ipfs": false,
             })
         );
     }
