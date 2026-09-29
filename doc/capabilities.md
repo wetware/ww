@@ -95,7 +95,6 @@ requires a configured signing key. The HTTP dialer requires a non-empty
 | **runtime** | Load WASM binaries and obtain scoped Executors |
 | **authority** | Construct a policy-bound `Terminal` over one explicit capability |
 | **identity** | Host-side Ed25519 signing; the private key never enters WASM |
-| **ipfs** | Read `/ipfs`, `/ipns`, or `/ipld` content through a `ByteStream` |
 | **extras** | Dynamically named application-defined capability references |
 
 `routing.finder` and `routing.announcer` are separate references. Delegating
@@ -122,19 +121,19 @@ Filesystem substrate is fixed by the trusted execution context:
 - an image-backed cell retains its actual `CidTree`-rooted read-only image;
 - each process has a separate writable `/tmp`, removed with that process and
   inaccessible through sibling filesystem namespaces;
-- `/ipfs/<cid>` materializes only when the host explicitly supplies the
-  pinset/cache wiring. Without it, the path fails instead of falling back to
-  global host services.
+- `/ipfs/<cid>/...` materializes only when the active image root or explicit
+  pinset/cache wiring supplies that CID. Without applicable wiring, the path
+  fails instead of falling back to global host services.
 
 Use regular WASI-aware guest file I/O against paths under the image root or
 explicit `/ipfs/<cid>/...` paths. The WASI virtual filesystem and its reachable
-CID tree govern guest path I/O. The membrane governs RPC capability authority.
+CID tree govern guest path I/O. The guest VFS has no namespace resolver for
+`/ipns/...` or `/ipld/...`. The membrane governs RPC capability authority.
 
 Known-CID cache wiring is execution-context state, not a child-visible control
-capability. A child cannot replace or widen it. The typed `ipfs` graft field
-can be delegated explicitly and provides `Ipfs.read()` through a
-`ByteStream`; it does not expose cache controls, mutation, pin management,
-publishing, routing, or arbitrary dialing.
+capability. A child cannot replace or widen it. Host-internal Kubo operations
+can resolve image layers, populate caches, manage pins, and publish content.
+Those operations are not a guest content-read surface.
 
 This does not mean a CAS read has no node effect. A read can fetch over the
 node's network, pin and materialize blocks on disk, occupy cache budget, affect
@@ -147,7 +146,8 @@ intentional substrate effects, not node-control authority.
 authorizes provider assertions under the Wetware host PeerID. Announcer
 registrations remain local only while at least one owner lease is active. The
 final owner release stops WAN and LAN registration and future republication;
-records already distributed to other peers expire naturally.
+records already distributed to other peers expire naturally. Provider routing
+exchanges provider records; it does not read content bytes.
 
 No current guest capability provides persistent content mutation or IPNS
 publication. The removed broad `Routing` interface formerly contained

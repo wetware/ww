@@ -43,7 +43,7 @@ HOST PROCESS
 
 The PID0 graft contains `peerId`, `Stat`, grouped network capability
 references, grouped routing references, runtime, authority, optional identity,
-IPFS, and application-defined extras. Local PID0 grafting has no `AuthPolicy`.
+and application-defined extras. Local PID0 grafting has no `AuthPolicy`.
 Authenticated vat publication remains separate: each inbound stream receives
 a fresh `Terminal` that verifies login before returning policy-selected service
 authority.
@@ -249,15 +249,22 @@ Every child has local computation, args and environment selected at spawn,
 stdio, clocks, randomness, and process lifecycle. These are substrate
 facilities, not application grants.
 
-An image-backed cell retains an image-rooted read-only filesystem. A
+An image-backed Cell reads its read-only image root through its `CidTree`. A
 byte-loaded `Executor` gets a private empty read-only root. Every child has a
 private writable `/tmp`, cleaned up with its lifecycle.
 
-Optional host CAS wiring can make known-CID content readable. It does not
-provide enumeration, mutation, MFS/IPNS, pin management, publishing, provider
-discovery, provider announcement, or arbitrary dialing. A read may nevertheless
-use node network, disk, cache, and eviction resources. Known CIDs are copyable
-bearer locators, not confidential object references.
+An explicit `/ipfs/<cid>/...` path resolves through the image `CidTree` when
+the CID is the active root. Other known CIDs require optional host cache and
+pinset wiring. Without applicable wiring, the path fails instead of falling
+back to a global host service. The guest VFS has no namespace resolver for
+`/ipns/...` or `/ipld/...`.
+
+Host-internal Kubo operations can resolve image layers, populate caches, manage
+pins, and publish content. Guest provider routing is separate: `Finder` and
+`Announcer` exchange provider records, not content bytes. Neither facility adds
+a guest RPC content-read surface. A read may nevertheless use node network,
+disk, cache, and eviction resources. Known CIDs are copyable bearer locators,
+not confidential object references.
 
 ## Security claim and boundary
 

@@ -37,9 +37,11 @@ The host supplies explicit stdin, stdout, and stderr streams. PID0 can receive
 terminal-backed stdin. Byte and HTTP handlers use stdin and stdout for their
 application protocol. The process-local RPC session does not use stdio.
 
-The image and `/ipfs` filesystem is read-only. Each process receives a private
-ephemeral writable `/tmp`. The P3 filesystem interceptor preserves CidTree lazy
-materialization and path confinement.
+An image-backed Cell reads its `CidTree`-backed image root through WASI. An
+explicit `/ipfs/<cid>/...` path is readable only when the execution context
+supplies the applicable root or cache wiring. Each process receives a private
+ephemeral writable `/tmp`. The guest VFS has no `/ipns` or `/ipld` namespace
+resolver.
 
 ## Custom Interfaces
 
@@ -130,18 +132,19 @@ and non-empty in every successful result. Capability fields are nullable.
 | `runtime` | `system_capnp::runtime` | Load WASM binaries and obtain Executors. |
 | `authority` | `auth_capnp::authority` | Construct a policy-bound `Terminal` over an explicit capability. |
 | `identity` | `auth_capnp::identity` | Host-side signing. |
-| `ipfs` | `system_capnp::ipfs` | Read `/ipfs`, `/ipns`, or `/ipld` content through a `ByteStream`. |
 | `extras` | `List(system_capnp::export)` | Application-defined named capabilities. |
 
 An ordinary child calls `graft()` on the `Membrane` selected by its parent.
 Repeated calls cannot add authority. A parent passes one `Membrane` to
 `Executor.spawn()`, `StreamListener.listen()`, or `HttpListener.listen()`.
 
-WASI filesystem access and the `ipfs` RPC capability are separate surfaces.
-When the host installs the content substrate, WASI guests can read IPFS-family
-paths through the virtual filesystem. The `ipfs` field provides
-`Ipfs.read(path)` for non-WASI clients and for explicit delegation. Neither
-surface provides enumeration, mutation, pin management, or publishing.
+Cells perform supported content reads through WASI filesystem path I/O. The
+image root resolves through its `CidTree`. An explicit `/ipfs/<cid>/...` path
+resolves only when the execution context supplies the applicable root or cache
+wiring. The guest VFS does not resolve `/ipns/...` or `/ipld/...` namespaces.
+Host-internal Kubo operations and provider routing remain separate from guest
+content reads. `routing.finder` and `routing.announcer` exchange provider
+records; they do not read content bytes.
 
 Host-derived capabilities retain their **epoch guards** and become invalid when
 the host advances its epoch. Repeated graft calls return the same authority
@@ -160,7 +163,7 @@ Full interface reference for the capabilities available to guests.
 
 | Interface or value | Signature or shape | Description |
 |--------|-----------|-------------|
-| `Membrane.graft` | `() -> (peerId, stat, network, routing, runtime, authority, identity, ipfs, extras)` | Return the authority held by one Membrane server. |
+| `Membrane.graft` | `() -> (peerId, stat, network, routing, runtime, authority, identity, extras)` | Return the authority held by one Membrane server. |
 | `Stat.snapshot` | `() -> (stat: NodeStat)` | Return current listen addresses and connected-peer count without peer records. |
 | `Network` | `stream`, `vat`, and `http` groups | Hold nullable listener and dialer references. |
 | `Routing` | `finder`, `announcer` | Hold independently nullable provider-routing references. |

@@ -138,8 +138,8 @@ rejects `wasi:sockets` imports.
 
 The host serves a process-local `Membrane` to PID0. `Membrane.graft()` returns
 typed `peerId`, `stat`, `network`, `routing`, `runtime`, `authority`,
-`identity`, and `ipfs` fields. `extras` contains only application-defined
-named capabilities.
+and `identity` fields. `extras` contains only application-defined named
+capabilities.
 
 Graft-issued host capabilities retain PID0's `EpochGuard`.
 
