@@ -358,10 +358,9 @@ struct CellCountGuard {
 impl Drop for CellCountGuard {
     fn drop(&mut self) {
         // Saturating subtract prevents underflow to usize::MAX (finding #4).
-        let _ =
-            self.counts[self.worker_id].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                Some(c.saturating_sub(1))
-            });
+        let _ = self.counts[self.worker_id].try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+            Some(c.saturating_sub(1))
+        });
     }
 }
 
