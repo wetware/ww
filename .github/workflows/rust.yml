@@ -287,7 +287,14 @@ jobs:
     - name: Install IPFS (Kubo)
       run: |
         KUBO_VERSION="v0.33.0"
-        wget -qO- "https://dist.ipfs.tech/kubo/${KUBO_VERSION}/kubo_${KUBO_VERSION}_linux-amd64.tar.gz" | tar xz
+        KUBO_ARCHIVE="kubo_${KUBO_VERSION}_linux-amd64.tar.gz"
+        KUBO_ARCHIVE_PATH="$RUNNER_TEMP/$KUBO_ARCHIVE"
+        curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
+          "https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}/${KUBO_ARCHIVE}" \
+          --output "$KUBO_ARCHIVE_PATH"
+        echo "6551acf9be99f98bb4c853a0b22004f2703f0cb13f34111e863d77aa10032ead2c89eb9a8d6fccb4da11011e8d29a8cb251bd3e6651fdbaa3209e3b1bfb5e4f4  $KUBO_ARCHIVE_PATH" \
+          | sha512sum --check --strict
+        tar -xzf "$KUBO_ARCHIVE_PATH"
         sudo mv kubo/ipfs /usr/local/bin/
         rm -rf kubo
 

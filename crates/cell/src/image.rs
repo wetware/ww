@@ -19,7 +19,6 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
-use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -43,6 +42,61 @@ const MFS_REAPABLE_MARKER_PREFIX: &str = ".wetware-ww-reapable-v1-";
 const MFS_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const MFS_SWEEP_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const MFS_CLEANUP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Parse a bare CID, without the path-prefix and trailing-byte tolerance of
+/// `Cid::from_str`. Only the canonical rendering may enter an IPFS source path.
+fn parse_dag_cid(value: &str) -> Result<Cid> {
+    let bytes = if value.starts_with("Qm") {
+        cid::multibase::Base::Base58Btc.decode(value)
+    } else {
+        cid::multibase::decode(value).map(|(_, bytes)| bytes)
+    }
+    .context("invalid bare CID encoding")?;
+    let mut remaining = bytes.as_slice();
+    let cid = Cid::read_bytes(&mut remaining).context("invalid CID")?;
+    if !remaining.is_empty() {
+        bail!("invalid CID: trailing bytes");
+    }
+    // Parsing can accept overflowing varints. Require canonical binary bytes,
+    // while allowing alternate textual multibase representations.
+    if cid.to_bytes() != bytes {
+        bail!("invalid CID: noncanonical binary encoding");
+    }
+    Ok(cid)
+}
+
+/// An overlay entry whose metadata can be used by the MFS composer.
+struct MergeEntry {
+    name: String,
+    cid: Cid,
+    is_directory: bool,
+}
+
+impl TryFrom<ipfs::LsEntry> for MergeEntry {
+    type Error = anyhow::Error;
+
+    fn try_from(entry: ipfs::LsEntry) -> Result<Self> {
+        // Kubo MFS uses Go's slash-separated `path` domain, independent of
+        // the host OS. Do not normalize names or reject literal backslashes,
+        // Unicode, or query punctuation: structured query encoding preserves
+        // those bytes. Reject controls at this metadata boundary as well.
+        if entry.name.is_empty()
+            || entry.name == "."
+            || entry.name == ".."
+            || entry.name.contains('/')
+            || entry.name.bytes().any(|byte| byte.is_ascii_control())
+        {
+            bail!("invalid MFS entry name: {:?}", entry.name);
+        }
+        let cid = parse_dag_cid(&entry.hash)
+            .with_context(|| format!("invalid CID for overlay entry {:?}", entry.name))?;
+        Ok(Self {
+            name: entry.name,
+            cid,
+            is_directory: entry.entry_type == 1,
+        })
+    }
+}
 
 fn mfs_namespace_name(created_at_secs: u64, token: u128) -> String {
     format!("{created_at_secs:016x}-{token:032x}")
@@ -299,12 +353,19 @@ pub async fn dag_merge(
     if cids.is_empty() {
         bail!("No CIDs to merge");
     }
+    // Callers include Kubo add/resolve results and deployment layer metadata.
+    // Validate every layer before creating or mutating a merge namespace.
+    let cids = cids
+        .iter()
+        .map(|value| parse_dag_cid(value).context("invalid merge layer CID"))
+        .collect::<Result<Vec<_>>>()?;
     if cids.len() == 1 {
+        let root = cids[0].to_string();
         client
-            .pin_add_once(&cids[0])
+            .pin_add_once(&root)
             .await
             .context("pinning effective root")?;
-        return Ok(cids[0].clone());
+        return Ok(root);
     }
 
     // The caller owns retries. A new attempt receives a new namespace, which
@@ -312,7 +373,7 @@ pub async fn dag_merge(
     let mut guard = MfsNamespaceGuard::new(client);
     let result = async {
         guard.prepare().await?;
-        let root = dag_merge_attempt(cids, client, cancel, guard.path()).await?;
+        let root = dag_merge_attempt(&cids, client, cancel, guard.path()).await?;
         client
             .pin_add_once(&root)
             .await
@@ -325,7 +386,7 @@ pub async fn dag_merge(
 }
 
 async fn dag_merge_attempt(
-    cids: &[String],
+    cids: &[Cid],
     client: &ipfs::BootClient,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
     mfs_path: &str,
@@ -355,7 +416,9 @@ async fn dag_merge_attempt(
             .files_stat(mfs_path, true)
             .await
             .context("Failed to stat merged MFS namespace")?;
-        Ok(stat.hash)
+        parse_dag_cid(&stat.hash)
+            .context("invalid merged root CID")
+            .map(|cid| cid.to_string())
     };
     await_or_cancel(cancel, merge).await
 }
@@ -390,6 +453,12 @@ async fn merge_overlay_recursive_inner(
         .ls(overlay_path)
         .await
         .with_context(|| format!("ls overlay {overlay_path}"))?;
+    // Validate the entire listing before constructing child paths or removing
+    // any existing entry. Recursive listings cross the same boundary.
+    let overlay_entries = overlay_entries
+        .into_iter()
+        .map(MergeEntry::try_from)
+        .collect::<Result<Vec<_>>>()?;
 
     // Recursion only descends into directories already copied into MFS, so a
     // listing error is an operation failure rather than evidence of an empty dir.
@@ -399,7 +468,7 @@ async fn merge_overlay_recursive_inner(
     for entry in &overlay_entries {
         let child_mfs = format!("{}/{}", mfs_path, entry.name);
         let child_overlay = format!("{}/{}", overlay_path, entry.name);
-        let is_overlay_dir = entry.entry_type == 1;
+        let is_overlay_dir = entry.is_directory;
 
         if mfs_names.contains(entry.name.as_str()) {
             // Entry exists in base. Check if both are directories.
@@ -417,13 +486,13 @@ async fn merge_overlay_recursive_inner(
                 mfs.files_rm(&child_mfs, true)
                     .await
                     .with_context(|| format!("rm {child_mfs}"))?;
-                mfs.files_cp(&format!("/ipfs/{}", entry.hash), &child_mfs)
+                mfs.files_cp(&format!("/ipfs/{}", entry.cid), &child_mfs)
                     .await
                     .with_context(|| format!("cp overlay entry {}", entry.name))?;
             }
         } else {
             // New entry → cp.
-            mfs.files_cp(&format!("/ipfs/{}", entry.hash), &child_mfs)
+            mfs.files_cp(&format!("/ipfs/{}", entry.cid), &child_mfs)
                 .await
                 .with_context(|| format!("cp new entry {}", entry.name))?;
         }
@@ -548,7 +617,7 @@ async fn resolve_bare_cid(
     } else {
         cid_with_subpath.to_owned()
     };
-    Cid::from_str(&candidate)
+    parse_dag_cid(&candidate)
         .with_context(|| format!("invalid resolved CID {candidate}"))
         .map(|cid| cid.to_string())
 }
@@ -598,6 +667,10 @@ pub fn cid_bytes_to_ipfs_path(cid_bytes: &[u8]) -> Result<String> {
     let cid = Cid::read_bytes(cid_bytes).context("Failed to parse CID from bytes")?;
     Ok(format!("/ipfs/{cid}"))
 }
+
+#[cfg(test)]
+#[path = "image/tests.rs"]
+mod security_tests;
 
 #[cfg(test)]
 mod tests {
@@ -711,6 +784,8 @@ mod tests {
                 let mut request = [0u8; 4096];
                 let bytes = stream.read(&mut request).await.unwrap();
                 let request = String::from_utf8_lossy(&request[..bytes]).into_owned();
+                let (endpoint, query) = expected.split_once('?').unwrap();
+                let expected = format!("{endpoint}?{}", query.replace('/', "%2F"));
                 assert!(request.contains(&expected), "unexpected request: {request}");
                 server_requests.lock().unwrap().push(request);
                 stream.write_all(&response).await.unwrap();
@@ -739,12 +814,7 @@ mod tests {
     //
     // Two pure-validation cases live here (no IPFS roundtrip needed).
     //
-    // Merge correctness (`dag_merge` over multiple layers) is NOT unit-tested
-    // here: those paths require Kubo to `add_dir` local layers, and CI's
-    // daemon does not reliably accept ephemeral `tempfile::TempDir` paths
-    // inside the test runner. The previous `apply_mounts` / `merge_layers`
-    // tests only worked because the deleted code had an all-local
-    // `copy_merge` fast path that never hit IPFS — now gone.
+    // Fake-Kubo merge boundary and layer semantics tests live in image/tests.rs.
 
     #[tokio::test]
     async fn test_virtual_empty_mounts_errors() {
@@ -764,6 +834,19 @@ mod tests {
 
     #[tokio::test]
     async fn dag_merge_pins_before_namespace_teardown() {
+        let merged = Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x00, b"merged").unwrap(),
+        )
+        .to_string();
+        let stat_body = serde_json::json!({
+            "Hash": merged, "Size": 0, "Type": "directory"
+        })
+        .to_string();
+        let stat_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{stat_body}",
+            stat_body.len()
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -774,12 +857,12 @@ mod tests {
                 let mut request = [0u8; 4096];
                 let bytes = stream.read(&mut request).await.unwrap();
                 let request = String::from_utf8_lossy(&request[..bytes]).into_owned();
-                let response = if request.contains("/api/v0/ls?arg=/ipfs/") {
+                let response = if request.contains("/api/v0/ls?arg=") {
                     b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"Objects\":[{\"Links\":[]}]}".as_slice()
                 } else if request.contains("/api/v0/files/ls") {
                     b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"Entries\":[]}".as_slice()
                 } else if request.contains("/api/v0/files/stat") {
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 45\r\nConnection: close\r\n\r\n{\"Hash\":\"merged\",\"Size\":0,\"Type\":\"directory\"}".as_slice()
+                    stat_response.as_bytes()
                 } else {
                     b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
                 };
@@ -804,7 +887,7 @@ mod tests {
             &client,
         )
         .await;
-        assert_eq!(result.unwrap().0, "merged");
+        assert_eq!(result.unwrap().0, merged);
         tokio::time::timeout(Duration::from_secs(1), server)
             .await
             .expect("fake Kubo must receive every expected request")
@@ -813,7 +896,7 @@ mod tests {
         let requests = requests.lock().unwrap();
         let pin = requests
             .iter()
-            .position(|request| request.contains("/api/v0/pin/add?arg=merged"))
+            .position(|request| request.contains(&format!("/api/v0/pin/add?arg={merged}")))
             .expect("effective-root pin request");
         let cleanup = requests
             .iter()
