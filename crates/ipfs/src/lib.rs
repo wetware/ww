@@ -608,13 +608,11 @@ impl HttpClient {
     ///
     /// Returns the resolved path (e.g., "/ipfs/QmHash...").
     pub async fn name_resolve(&self, name: &str) -> anyhow::Result<String> {
-        let url = format!(
-            "{}/api/v0/name/resolve?arg={}&nocache=true",
-            self.base_url, name
-        );
+        let url = format!("{}/api/v0/name/resolve", self.base_url);
         let response = self
             .http_client
             .post(&url)
+            .query(&[("arg", name), ("nocache", "true")])
             .send()
             .await
             .context("IPNS name resolve request failed")?;
@@ -635,10 +633,11 @@ impl HttpClient {
 
     /// Resolve an IPFS path, including a subpath, to its canonical CID path.
     pub async fn resolve(&self, path: &str) -> anyhow::Result<String> {
-        let url = format!("{}/api/v0/resolve?arg={}", self.base_url, path);
+        let url = format!("{}/api/v0/resolve", self.base_url);
         let response = self
             .http_client
             .post(&url)
+            .query(&[("arg", path)])
             .send()
             .await
             .with_context(|| format!("Failed to resolve IPFS path {path}"))?;
@@ -670,16 +669,98 @@ mod tests {
 
     use super::{is_retryable_kubo_error, BootClient, HttpClient};
 
-    async fn read_request(stream: &mut tokio::net::TcpStream) {
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
         let mut request = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
             let read = stream.read(&mut chunk).await.unwrap();
             request.extend_from_slice(&chunk[..read]);
             if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
-                return;
+                return String::from_utf8(request).unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn image_merge_requests_preserve_arguments_and_flags() {
+        // These values must remain data after Kubo decodes the HTTP query.
+        let paths = [
+            "/workspace/name?arg=/escape&parents=false&recursive=false&hash=false#fragment",
+            "/workspace/space + percent%2F equals= ampersand&",
+            "/workspace/café-e\u{301}-日本語",
+            "/workspace/control\0\r\n\t",
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..paths.len() * 12 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let target = request.split_whitespace().nth(1).unwrap();
+                let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+                requests.push((
+                    url.path().to_string(),
+                    url.query_pairs().into_owned().collect::<Vec<_>>(),
+                ));
+                let body = r#"{"Path":"/ipfs/resolved","Objects":[{"Links":[]}],"Entries":[],"Hash":"hash","Size":0,"Type":"directory"}"#;
+                stream
+                    .write_all(
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+
+        let client = HttpClient::new(format!("http://{address}"));
+        let mfs = client.mfs();
+        let mut expected = Vec::new();
+        for path in paths {
+            let arg = ("arg".to_string(), path.to_string());
+            for flag in [false, true] {
+                mfs.files_mkdir(path, flag).await.unwrap();
+                expected.push((
+                    "/api/v0/files/mkdir".to_string(),
+                    vec![arg.clone(), ("parents".to_string(), flag.to_string())],
+                ));
+                mfs.files_stat(path, flag).await.unwrap();
+                expected.push((
+                    "/api/v0/files/stat".to_string(),
+                    vec![arg.clone(), ("hash".to_string(), flag.to_string())],
+                ));
+                mfs.files_rm(path, flag).await.unwrap();
+                expected.push((
+                    "/api/v0/files/rm".to_string(),
+                    vec![arg.clone(), ("recursive".to_string(), flag.to_string())],
+                ));
+            }
+            let destination = format!("{path}-destination&arg=/injected");
+            mfs.files_cp(path, &destination).await.unwrap();
+            expected.push((
+                "/api/v0/files/cp".to_string(),
+                vec![arg.clone(), ("arg".to_string(), destination)],
+            ));
+            mfs.files_ls(path).await.unwrap();
+            expected.push((
+                "/api/v0/files/ls".to_string(),
+                vec![arg.clone(), ("long".to_string(), "true".to_string())],
+            ));
+            client.ls(path).await.unwrap();
+            expected.push(("/api/v0/ls".to_string(), vec![arg.clone()]));
+            client.resolve(path).await.unwrap();
+            expected.push(("/api/v0/resolve".to_string(), vec![arg.clone()]));
+            client.name_resolve(path).await.unwrap();
+            expected.push((
+                "/api/v0/name/resolve".to_string(),
+                vec![arg.clone(), ("nocache".to_string(), "true".to_string())],
+            ));
+            client.pin_add(path).await.unwrap();
+            expected.push(("/api/v0/pin/add".to_string(), vec![arg]));
+        }
+        assert_eq!(server.await.unwrap(), expected);
     }
 
     #[tokio::test]
@@ -887,10 +968,11 @@ impl HttpClient {
     ///
     /// Calls Kubo's `/api/v0/ls?arg=<path>` and parses the JSON response.
     pub async fn ls(&self, path: &str) -> Result<Vec<LsEntry>> {
-        let url = format!("{}/api/v0/ls?arg={}", self.base_url, path);
+        let url = format!("{}/api/v0/ls", self.base_url);
         let response = self
             .http_client
             .post(&url)
+            .query(&[("arg", path)])
             .send()
             .await
             .with_context(|| format!("Failed to ls IPFS path {path}"))?;
@@ -932,10 +1014,11 @@ impl HttpClient {
     ///
     /// Calls Kubo's `/api/v0/pin/add?arg=<cid>`.
     pub async fn pin_add(&self, cid: &str) -> Result<()> {
-        let url = format!("{}/api/v0/pin/add?arg={}", self.base_url, cid);
+        let url = format!("{}/api/v0/pin/add", self.base_url);
         let response = self
             .http_client
             .post(&url)
+            .query(&[("arg", cid)])
             .send()
             .await
             .with_context(|| format!("Failed to pin {cid}"))?;
@@ -1374,14 +1457,13 @@ impl HttpClient {
 impl MFS<'_> {
     /// Create a directory in MFS.
     pub async fn files_mkdir(&self, path: &str, parents: bool) -> Result<()> {
-        let url = format!(
-            "{}/api/v0/files/mkdir?arg={}&parents={}",
-            self.client.base_url, path, parents
-        );
+        let url = format!("{}/api/v0/files/mkdir", self.client.base_url);
         let response = self
             .client
             .http_client
             .post(&url)
+            .query(&[("arg", path)])
+            .query(&[("parents", parents)])
             .send()
             .await
             .with_context(|| format!("MFS mkdir failed for {path}"))?;
@@ -1398,14 +1480,12 @@ impl MFS<'_> {
 
     /// Copy a file or directory in MFS. Source can be `/ipfs/<cid>`.
     pub async fn files_cp(&self, src: &str, dst: &str) -> Result<()> {
-        let url = format!(
-            "{}/api/v0/files/cp?arg={}&arg={}",
-            self.client.base_url, src, dst
-        );
+        let url = format!("{}/api/v0/files/cp", self.client.base_url);
         let response = self
             .client
             .http_client
             .post(&url)
+            .query(&[("arg", src), ("arg", dst)])
             .send()
             .await
             .with_context(|| format!("MFS cp failed: {src} -> {dst}"))?;
@@ -1423,14 +1503,12 @@ impl MFS<'_> {
 
     /// List entries in an MFS directory.
     pub async fn files_ls(&self, path: &str) -> Result<Vec<MfsEntry>> {
-        let url = format!(
-            "{}/api/v0/files/ls?arg={}&long=true",
-            self.client.base_url, path
-        );
+        let url = format!("{}/api/v0/files/ls", self.client.base_url);
         let response = self
             .client
             .http_client
             .post(&url)
+            .query(&[("arg", path), ("long", "true")])
             .send()
             .await
             .with_context(|| format!("MFS ls failed for {path}"))?;
@@ -1463,14 +1541,13 @@ impl MFS<'_> {
 
     /// Stat an MFS path, optionally computing its hash.
     pub async fn files_stat(&self, path: &str, hash: bool) -> Result<MfsStat> {
-        let url = format!(
-            "{}/api/v0/files/stat?arg={}&hash={}",
-            self.client.base_url, path, hash
-        );
+        let url = format!("{}/api/v0/files/stat", self.client.base_url);
         let response = self
             .client
             .http_client
             .post(&url)
+            .query(&[("arg", path)])
+            .query(&[("hash", hash)])
             .send()
             .await
             .with_context(|| format!("MFS stat failed for {path}"))?;
@@ -1491,14 +1568,13 @@ impl MFS<'_> {
 
     /// Remove an MFS path.
     pub async fn files_rm(&self, path: &str, recursive: bool) -> Result<()> {
-        let url = format!(
-            "{}/api/v0/files/rm?arg={}&recursive={}",
-            self.client.base_url, path, recursive
-        );
+        let url = format!("{}/api/v0/files/rm", self.client.base_url);
         let response = self
             .client
             .http_client
             .post(&url)
+            .query(&[("arg", path)])
+            .query(&[("recursive", recursive)])
             .send()
             .await
             .with_context(|| format!("MFS rm failed for {path}"))?;
