@@ -422,3 +422,7 @@ impl<S: BlockSource> Composer<'_, S> {
 #[cfg(test)]
 #[path = "composer_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "composer_property_tests.rs"]
+mod property_tests;

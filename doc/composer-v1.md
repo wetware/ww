@@ -169,8 +169,15 @@ does not implement Unicode normalization, alter `CidTree`, or replace Kubo.
 
 `image::codec` and `image::composer` tests run without HTTP. They cover overlay
 semantics, metadata, CID reuse, fixed v1 root CIDs, malformed input, bounds,
-and cancellation. HTTP tests cover read/import failures and strict
-acknowledgements.
+and cancellation. A separate semantic model checks 64 deterministic tree sequences
+without using the production merge algorithm.
+
+The richer identity vector composes three layers with nested directories,
+non-ASCII names, mode and fractional mtime replacement, CIDv0 and CIDv1 inputs,
+an unchanged CIDv0 subtree, a replaced subtree, files, raw nodes, and symlinks.
+Its Composer v1 root is
+`bafybeihsp2xyejzajvqbbuwz2kep2bgbzho2waqi6pp4dfdlaf7jsqqkaq`.
+HTTP tests cover read/import failures and strict acknowledgements.
 
 Run real Kubo fixtures with the repository's pinned Kubo 0.33.0 executable on PATH:
 

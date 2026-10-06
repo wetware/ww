@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   directories. Kubo imports and recursively pins generated blocks. Ordinary
   directories are supported, HAMT shards are rejected, and the former
   composition-specific temporary MFS workspace machinery is removed.
+- **Composer v1 has deterministic model-based verification.** An independent
+  semantic model checks 64 generated layer sequences, insertion-order
+  invariance, CID reuse, metadata precedence, and a richer fixed identity
+  vector without calling the production merge algorithm.
 - **Breaking: every Cell now bootstraps through one typed `Membrane`.**
   `Membrane.graft()` returns direct `peerId`, `Stat`, grouped `Network`,
   `Routing`, runtime, authority, identity, IPFS, and application-only `extras`
