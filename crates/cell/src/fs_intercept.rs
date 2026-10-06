@@ -267,26 +267,28 @@ pub(crate) async fn materialize_cid_tree_descriptor(
             let canonical_cid = parsed.to_string();
             let staging_dir = cid_tree.staging_dir().join(format!("dir-{canonical_cid}"));
             if !staging_dir.exists() {
+                let entries = cid_tree.ls_dir(&canonical_cid).await.map_err(|error| {
+                    tracing::warn!(%canonical_cid, %error, "CidTree directory listing failed");
+                    MaterializeError::Io
+                })?;
                 std::fs::create_dir_all(&staging_dir).map_err(|_| MaterializeError::Io)?;
-                if let Ok(entries) = cid_tree.ls_dir(&canonical_cid).await {
-                    for entry in entries {
-                        if !is_confined_relative_path(&entry.name)
-                            || std::path::Path::new(&entry.name).components().count() != 1
-                        {
-                            tracing::warn!(name = %entry.name, "rejected unconfined CidTree entry");
-                            return Err(MaterializeError::Invalid);
+                for entry in entries {
+                    if !is_confined_relative_path(&entry.name)
+                        || std::path::Path::new(&entry.name).components().count() != 1
+                    {
+                        tracing::warn!(name = %entry.name, "rejected unconfined CidTree entry");
+                        return Err(MaterializeError::Invalid);
+                    }
+                    let entry_path = staging_dir.join(&entry.name);
+                    match entry.entry_type {
+                        crate::vfs::EntryType::Dir => {
+                            std::fs::create_dir_all(entry_path)
+                                .map_err(|_| MaterializeError::Io)?;
                         }
-                        let entry_path = staging_dir.join(&entry.name);
-                        match entry.entry_type {
-                            crate::vfs::EntryType::Dir => {
-                                std::fs::create_dir_all(entry_path)
-                                    .map_err(|_| MaterializeError::Io)?;
-                            }
-                            _ => {
-                                let file = std::fs::File::create(entry_path)
-                                    .map_err(|_| MaterializeError::Io)?;
-                                file.set_len(entry.size).map_err(|_| MaterializeError::Io)?;
-                            }
+                        _ => {
+                            let file = std::fs::File::create(entry_path)
+                                .map_err(|_| MaterializeError::Io)?;
+                            file.set_len(entry.size).map_err(|_| MaterializeError::Io)?;
                         }
                     }
                 }
@@ -798,6 +800,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     // ── CID path parsing tests ─────────────────────────────────────
 
@@ -868,6 +872,34 @@ mod tests {
         let result = materialize_cid_tree_descriptor(None, &tree, "", false).await;
         assert!(matches!(result, Err(MaterializeError::Invalid)));
         assert!(!staging.path().join("escaped").exists());
+    }
+
+    #[tokio::test]
+    async fn cid_tree_materialization_propagates_malformed_directory_listing() {
+        let cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+        let staging = tempfile::TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+        let tree = CidTree::new(
+            cid.to_string(),
+            ipfs::HttpClient::new(format!("http://{address}")),
+            staging.path().to_path_buf(),
+        );
+
+        let result = materialize_cid_tree_descriptor(None, &tree, "", false).await;
+        server.await.unwrap();
+
+        assert!(matches!(result, Err(MaterializeError::Io)));
+        assert!(!staging.path().join(format!("dir-{cid}")).exists());
     }
 
     #[tokio::test]
