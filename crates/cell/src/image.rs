@@ -29,6 +29,8 @@ use ipfs;
 
 #[cfg(test)]
 mod codec;
+#[cfg(test)]
+mod composer;
 
 // ── DAG merge via IPFS MFS ─────────────────────────────────────────
 
