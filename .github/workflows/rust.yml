@@ -141,10 +141,15 @@ jobs:
     - name: Install cargo-fuzz
       run: cargo install cargo-fuzz --version 0.13.2 --locked
 
+    - uses: ./.github/actions/setup-capnp
+
     - name: Build fuzz targets
       run: |
         cargo fuzz build fuzz_kubo_ls_response
         cargo fuzz build fuzz_kubo_mfs_ls_response
+        cargo fuzz build fuzz_composer_dagpb_decode
+        cargo fuzz build fuzz_composer_unixfs_metadata
+        cargo fuzz build fuzz_kubo_dag_import_response
 
     # Checked-in corpus replay is deterministic regression testing. Mutation
     # fuzzing remains a manual, bounded campaign.
@@ -153,7 +158,13 @@ jobs:
       run: |
         set -euo pipefail
 
-        for target in fuzz_kubo_ls_response fuzz_kubo_mfs_ls_response; do
+        for target in \
+          fuzz_kubo_ls_response \
+          fuzz_kubo_mfs_ls_response \
+          fuzz_composer_dagpb_decode \
+          fuzz_composer_unixfs_metadata \
+          fuzz_kubo_dag_import_response
+        do
           seeds=()
           while IFS= read -r -d '' seed; do
             seeds+=("$seed")
@@ -165,7 +176,7 @@ jobs:
           fi
 
           echo "Replaying ${#seeds[@]} checked-in seeds for ${target}"
-          cargo fuzz run "$target" "${seeds[@]}"
+          WW_FUZZ_SEMANTIC_REPLAY=1 cargo fuzz run "$target" "${seeds[@]}"
         done
 
   clippy:

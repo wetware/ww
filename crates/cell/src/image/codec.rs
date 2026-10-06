@@ -168,6 +168,10 @@ fn validated_metadata(data: &[u8]) -> Result<(UnixFs, MetadataKind)> {
     Ok((metadata, kind))
 }
 
+pub(super) fn validate_metadata(data: &[u8]) -> Result<()> {
+    validated_metadata(data).map(|_| ())
+}
+
 fn validate_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."

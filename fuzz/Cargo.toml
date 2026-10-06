@@ -10,10 +10,16 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
+capnp = "=0.25.4"
+cell = { path = "../crates/cell" }
+cid = "0.11"
 ipfs = { path = "../crates/ipfs" }
 libfuzzer-sys = "0.4"
 serde = "=1.0.228"
 serde_json = "=1.0.150"
+
+[patch.crates-io]
+capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", branch = "ww/import-fix-0.25-consume" }
 
 [[bin]]
 name = "fuzz_kubo_ls_response"
@@ -25,6 +31,27 @@ bench = false
 [[bin]]
 name = "fuzz_kubo_mfs_ls_response"
 path = "fuzz_targets/fuzz_kubo_mfs_ls_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_composer_dagpb_decode"
+path = "fuzz_targets/fuzz_composer_dagpb_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_composer_unixfs_metadata"
+path = "fuzz_targets/fuzz_composer_unixfs_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_kubo_dag_import_response"
+path = "fuzz_targets/fuzz_kubo_dag_import_response.rs"
 test = false
 doc = false
 bench = false
