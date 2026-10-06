@@ -1761,40 +1761,134 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    const ROOT: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+    const ROOT: &str = "bafybeiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf354";
 
-    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
-        let mut request = vec![0_u8; 8192];
-        let read = stream.read(&mut request).await.unwrap();
-        String::from_utf8_lossy(&request[..read]).into_owned()
+    // Empty UnixFS directories with absent mtime, mtime=1, and mtime=2.
+    // Each literal CID is SHA-256 over its corresponding DAG-PB block.
+    const DIRECTORY_BLOCKS: [(&str, &[u8]); 3] = [
+        (ROOT, &[10, 2, 8, 1]),
+        (
+            "bafybeic4h4hllpsarpi4d625bbnaotinfzn7j632pyt7snfgfnhgnn7che",
+            &[10, 6, 8, 1, 66, 2, 8, 1],
+        ),
+        (
+            "bafybeifq3dpjepjc33voodbyxlw3ckwcu3ijoypxwjpieuab6wysui5pxa",
+            &[10, 6, 8, 1, 66, 2, 8, 2],
+        ),
+    ];
+
+    struct KuboRequest {
+        text: String,
+        bytes: Vec<u8>,
     }
 
-    async fn respond(stream: &mut tokio::net::TcpStream, body: serde_json::Value) {
-        let body = body.to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+    impl std::ops::Deref for KuboRequest {
+        type Target = str;
+        fn deref(&self) -> &str {
+            &self.text
+        }
+    }
+
+    impl std::fmt::Display for KuboRequest {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.text)
+        }
+    }
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> KuboRequest {
+        let mut request = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert_ne!(read, 0, "request ended before complete headers/body");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&request[..end]);
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        KuboRequest {
+            text: String::from_utf8_lossy(&request).into_owned(),
+            bytes: request,
+        }
+    }
+
+    async fn respond(stream: &mut tokio::net::TcpStream, request: &KuboRequest) {
+        let path = request
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap();
+        let body = if path.starts_with("/api/v0/block/get") {
+            DIRECTORY_BLOCKS
+                .iter()
+                .find(|(cid, _)| path.contains(cid))
+                .expect("known fixture block")
+                .1
+                .to_vec()
+        } else if path.starts_with("/api/v0/dag/import") {
+            let root = DIRECTORY_BLOCKS
+                .iter()
+                .find_map(|(root, _)| {
+                    let cid = root.parse::<cid::Cid>().unwrap().to_bytes();
+                    request
+                        .bytes
+                        .windows(cid.len())
+                        .any(|part| part == cid)
+                        .then_some(*root)
+                })
+                .expect("CAR header must contain a known fixture root");
+            serde_json::json!({"Root":{"Cid":{"/":root},"PinErrorMsg":""}})
+                .to_string()
+                .into_bytes()
+        } else if path.starts_with("/api/v0/ls") {
+            serde_json::json!({"Objects":[{"Links":[]}]})
+                .to_string()
+                .into_bytes()
+        } else {
+            assert!(
+                path.starts_with("/api/v0/pin/"),
+                "unexpected endpoint {path}"
+            );
+            b"{}".to_vec()
+        };
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
-        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
     }
 
     async fn single_root_kubo() -> (crate::ipfs::HttpClient, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+            for expected in [
+                "/api/v0/pin/add",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+            ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 assert!(
                     request.lines().next().unwrap().contains(expected),
                     "{request}"
                 );
-                let body = if expected.ends_with("/ls") {
-                    serde_json::json!({"Objects": [{"Links": []}]})
-                } else {
-                    serde_json::json!({})
-                };
-                respond(&mut stream, body).await;
+                respond(&mut stream, &request).await;
             }
         });
         (
@@ -1832,12 +1926,7 @@ mod tests {
                     .to_owned();
                 server_calls.fetch_add(1, Ordering::SeqCst);
                 request_tx.send(path.clone()).unwrap();
-                let body = if path.starts_with("/api/v0/ls") {
-                    serde_json::json!({"Objects": [{"Links": []}]})
-                } else {
-                    serde_json::json!({})
-                };
-                respond(&mut stream, body).await;
+                respond(&mut stream, &request).await;
             }
         });
         (
@@ -1935,19 +2024,19 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+            for expected in [
+                "/api/v0/pin/add",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+            ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 assert!(
                     request.lines().next().unwrap().contains(expected),
                     "{request}"
                 );
-                let body = if expected.ends_with("/ls") {
-                    serde_json::json!({"Objects": [{"Links": []}]})
-                } else {
-                    serde_json::json!({})
-                };
-                respond(&mut stream, body).await;
+                respond(&mut stream, &request).await;
             }
         });
         let (epoch_tx, epoch_rx) = watch::channel(Epoch::zero());
@@ -2190,7 +2279,12 @@ mod tests {
             deployment.speculation.as_ref(),
             Some(Speculation::Ready { .. })
         ));
-        for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+        for expected in [
+            "/api/v0/pin/add",
+            "/api/v0/block/get",
+            "/api/v0/dag/import",
+            "/api/v0/ls",
+        ] {
             let request = next_request(&mut requests).await;
             assert!(request.starts_with(expected), "{request}");
         }
@@ -2218,7 +2312,7 @@ mod tests {
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
         assert_eq!(tree.root_cid().as_ref(), ROOT);
         assert_eq!(deployment.current_epoch().root.as_deref(), Some(ROOT));
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
     }
@@ -2252,7 +2346,12 @@ mod tests {
             deployment.speculation.as_ref(),
             Some(Speculation::Ready { .. })
         ));
-        for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+        for expected in [
+            "/api/v0/pin/add",
+            "/api/v0/block/get",
+            "/api/v0/dag/import",
+            "/api/v0/ls",
+        ] {
             let request = next_request(&mut requests).await;
             assert!(request.starts_with(expected), "{request}");
         }
@@ -2289,7 +2388,7 @@ mod tests {
         };
 
         assert!(matches!(outcome, Outcome::Authoritative { epoch: 0, .. }));
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
 
         let (running, _result_tx, _terminate_rx) = test_running_generation();
         {
@@ -2302,7 +2401,7 @@ mod tests {
             }
         }
         assert!(deployment.speculation.is_none());
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
 
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
@@ -2318,7 +2417,7 @@ mod tests {
         let (release_first_tx, release_first_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let mut release_first_rx = Some(release_first_rx);
-            for index in 1..=3 {
+            for index in 1..=4 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 let path = request
@@ -2332,12 +2431,7 @@ mod tests {
                 if index == 1 {
                     release_first_rx.take().unwrap().await.unwrap();
                 }
-                let body = if path.starts_with("/api/v0/ls") {
-                    serde_json::json!({"Objects": [{"Links": []}]})
-                } else {
-                    serde_json::json!({})
-                };
-                respond(&mut stream, body).await;
+                respond(&mut stream, &request).await;
             }
         });
         let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
@@ -2374,7 +2468,7 @@ mod tests {
             assert!(terminate_rx.has_changed().unwrap());
 
             release_first_tx.send(()).unwrap();
-            for expected in ["/api/v0/pin/add", "/api/v0/ls"] {
+            for expected in ["/api/v0/block/get", "/api/v0/dag/import", "/api/v0/ls"] {
                 let request = tokio::select! {
                     _ = &mut transition => panic!("replacement activated before teardown"),
                     request = next_request(&mut requests) => request,
@@ -2388,7 +2482,7 @@ mod tests {
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
         assert_eq!(tree.root_cid().as_ref(), ROOT);
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
         server.await.unwrap();
     }
 
@@ -2428,7 +2522,12 @@ mod tests {
                 .send(SourceMessage::Update(Update::Head(head)))
                 .await
                 .unwrap();
-            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+            for expected in [
+                "/api/v0/pin/add",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+            ] {
                 let request = tokio::select! {
                     _ = &mut transition => panic!("replacement activated before teardown"),
                     request = next_request(&mut requests) => request,
@@ -2455,7 +2554,7 @@ mod tests {
             test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
         let (running, result_tx, terminate_rx) = test_running_generation();
         let speculative = Head {
-            cid: "bafkreibm6jg3ux5qugqkmfqt5uj5rxszb4sa4e3u7jj4c5ukv5s4xvcc7a"
+            cid: "bafybeic4h4hllpsarpi4d625bbnaotinfzn7j632pyt7snfgfnhgnn7che"
                 .parse()
                 .unwrap(),
         };
@@ -2467,7 +2566,7 @@ mod tests {
             let transition = deployment.await_generation(running);
             tokio::pin!(transition);
             candidate_tx.send_replace(Some(speculative.bytes()));
-            for _ in 0..3 {
+            for _ in 0..4 {
                 tokio::select! {
                     _ = &mut transition => panic!("speculation changed kernel outcome"),
                     _ = next_request(&mut requests) => {}
@@ -2496,13 +2595,20 @@ mod tests {
             };
             assert!(unpin.starts_with("/api/v0/pin/rm"), "{unpin}");
             assert!(unpin.contains(&speculative.cid.to_string()), "{unpin}");
-            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+            for expected in [
+                "/api/v0/pin/add",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+            ] {
                 let request = tokio::select! {
                     _ = &mut transition => panic!("replacement activated before teardown"),
                     request = next_request(&mut requests) => request,
                 };
                 assert!(request.starts_with(expected), "{request}");
-                assert!(request.contains(ROOT), "{request}");
+                if expected != "/api/v0/dag/import" {
+                    assert!(request.contains(ROOT), "{request}");
+                }
             }
             result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
             transition.await.unwrap()
@@ -2510,7 +2616,7 @@ mod tests {
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
         assert_eq!(tree.root_cid().as_ref(), ROOT);
-        assert_eq!(calls.load(Ordering::SeqCst), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 9);
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
     }
@@ -2523,7 +2629,7 @@ mod tests {
         let server_calls = calls.clone();
         let (request_tx, mut requests) = mpsc::unbounded_channel();
         let server = tokio::spawn(async move {
-            for index in 1..=6 {
+            for index in 1..=7 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 let path = request
@@ -2540,12 +2646,7 @@ mod tests {
                         .await
                         .unwrap();
                 } else {
-                    let body = if path.starts_with("/api/v0/ls") {
-                        serde_json::json!({"Objects": [{"Links": []}]})
-                    } else {
-                        serde_json::json!({})
-                    };
-                    respond(&mut stream, body).await;
+                    respond(&mut stream, &request).await;
                 }
             }
         });
@@ -2564,7 +2665,7 @@ mod tests {
             let transition = deployment.await_generation(running);
             tokio::pin!(transition);
             candidate_tx.send_replace(Some(head.bytes()));
-            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/pin/rm"] {
+            for expected in ["/api/v0/pin/add", "/api/v0/block/get", "/api/v0/pin/rm"] {
                 let request = tokio::select! {
                     _ = &mut transition => panic!("speculative failure changed kernel outcome"),
                     request = next_request(&mut requests) => request,
@@ -2580,7 +2681,12 @@ mod tests {
                 .send(SourceMessage::Update(Update::Head(head)))
                 .await
                 .unwrap();
-            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+            for expected in [
+                "/api/v0/pin/add",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+            ] {
                 let request = tokio::select! {
                     _ = &mut transition => panic!("replacement activated before teardown"),
                     request = next_request(&mut requests) => request,
@@ -2593,7 +2699,7 @@ mod tests {
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
         assert_eq!(tree.root_cid().as_ref(), ROOT);
-        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
         server.await.unwrap();
     }
 
@@ -2607,7 +2713,7 @@ mod tests {
         let (release_first_tx, release_first_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let mut release_first_rx = Some(release_first_rx);
-            for index in 1..=6 {
+            for index in 1..=7 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 let path = request
@@ -2621,12 +2727,7 @@ mod tests {
                 if index == 1 {
                     release_first_rx.take().unwrap().await.unwrap();
                 }
-                let body = if path.starts_with("/api/v0/ls") {
-                    serde_json::json!({"Objects": [{"Links": []}]})
-                } else {
-                    serde_json::json!({})
-                };
-                respond(&mut stream, body).await;
+                respond(&mut stream, &request).await;
             }
         });
         let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
@@ -2637,12 +2738,12 @@ mod tests {
             test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
         let (running, result_tx, terminate_rx) = test_running_generation();
         let first = Head {
-            cid: "bafkreibm6jg3ux5qugqkmfqt5uj5rxszb4sa4e3u7jj4c5ukv5s4xvcc7a"
+            cid: "bafybeic4h4hllpsarpi4d625bbnaotinfzn7j632pyt7snfgfnhgnn7che"
                 .parse()
                 .unwrap(),
         };
         let intermediate = Head {
-            cid: "bafkreif2pall7dybz7vecqka3zo24nq2j4tztjwc5c3f4vmrf6sz4d3asa"
+            cid: "bafybeifq3dpjepjc33voodbyxlw3ckwcu3ijoypxwjpieuab6wysui5pxa"
                 .parse()
                 .unwrap(),
         };
@@ -2670,13 +2771,20 @@ mod tests {
             };
             assert!(old_unpin.starts_with("/api/v0/pin/rm"), "{old_unpin}");
             assert!(old_unpin.contains(&first.cid.to_string()), "{old_unpin}");
-            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+            for expected in [
+                "/api/v0/pin/add",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+            ] {
                 let request = tokio::select! {
                     _ = &mut transition => panic!("candidate changed kernel outcome"),
                     request = next_request(&mut requests) => request,
                 };
                 assert!(request.starts_with(expected), "{request}");
-                assert!(request.contains(ROOT), "{request}");
+                if expected != "/api/v0/dag/import" {
+                    assert!(request.contains(ROOT), "{request}");
+                }
             }
             tokio::select! {
                 _ = &mut transition => panic!("candidate changed kernel outcome"),
@@ -2695,7 +2803,7 @@ mod tests {
         let newest_unpin = next_request(&mut requests).await;
         assert!(newest_unpin.starts_with("/api/v0/pin/rm"), "{newest_unpin}");
         assert!(newest_unpin.contains(ROOT), "{newest_unpin}");
-        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
         server.await.unwrap();
     }
 
@@ -2705,19 +2813,19 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (prepared_tx, prepared_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
-            for expected in ["/api/v0/pin/add", "/api/v0/pin/add", "/api/v0/ls"] {
+            for expected in [
+                "/api/v0/pin/add",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+            ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 assert!(
                     request.lines().next().unwrap().contains(expected),
                     "{request}"
                 );
-                let body = if expected.ends_with("/ls") {
-                    serde_json::json!({"Objects": [{"Links": []}]})
-                } else {
-                    serde_json::json!({})
-                };
-                respond(&mut stream, body).await;
+                respond(&mut stream, &request).await;
             }
             prepared_tx.send(()).unwrap();
         });

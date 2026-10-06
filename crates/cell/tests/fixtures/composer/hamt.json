@@ -1,0 +1,14 @@
+{
+  "kubo": "0.33.0",
+  "boxo": "0.27.2",
+  "cid": "bafybeifps2wlz34pnqttgabqpewmol6nnfirqktdxkxmtyxa4h3p6bxrhu",
+  "entries": 4000,
+  "filename": "entry-{index:04}-abcdefghijklmnopqrstuvwxyz0123456789",
+  "content": "x",
+  "add_arguments": [
+    "-Qr",
+    "--cid-version=1",
+    "--raw-leaves=true"
+  ],
+  "root_block_sha256": "af96acbcef8f6c27330030792cc72fcd6951182a63baaec9e2e0e1f6ff06f13d"
+}

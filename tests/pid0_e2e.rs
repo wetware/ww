@@ -526,7 +526,10 @@ async fn forward_controlled_kubo(
     if uri.contains(&proxy.path_fragment) {
         match &mut proxy.control {
             ProxyControl::Delay => tokio::time::sleep(Duration::from_secs(2)).await,
-            ProxyControl::Gate { reached, release } => {
+            // Composition reads DAG-PB file headers through block/get before
+            // PID0 starts. Gate the later content read to preserve this test's
+            // PID0-result race boundary.
+            ProxyControl::Gate { reached, release } if uri.contains("/api/v0/cat") => {
                 let _ = reached.send(()).await;
                 while !*release.borrow() {
                     if release.changed().await.is_err() {
@@ -534,8 +537,9 @@ async fn forward_controlled_kubo(
                     }
                 }
             }
+            ProxyControl::Gate { .. } => {}
             ProxyControl::FailMergeUntil { attempts, release }
-                if uri.contains("/api/v0/files/cp") && !*release.borrow() =>
+                if uri.contains("/api/v0/block/get") && !*release.borrow() =>
             {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 return Response::builder()
