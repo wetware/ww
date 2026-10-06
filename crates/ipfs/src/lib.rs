@@ -15,6 +15,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+mod composed;
+
+pub use composed::parse_kubo_dag_import_response;
+
 // A failed TCP connection must not hold an IPFS operation indefinitely.
 const KUBO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // `/api/v0/id` is the readiness probe: it should be small and local. Bound
