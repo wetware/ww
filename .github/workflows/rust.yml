@@ -125,6 +125,49 @@ jobs:
           shellcheck scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh
         fi
 
+  fuzz-corpus:
+    name: Fuzz corpus regressions
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-30
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install pinned Rust nightly
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        toolchain: nightly-2026-08-30
+
+    - name: Install cargo-fuzz
+      run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+    - name: Build fuzz targets
+      run: |
+        cargo fuzz build fuzz_kubo_ls_response
+        cargo fuzz build fuzz_kubo_mfs_ls_response
+
+    # Checked-in corpus replay is deterministic regression testing. Mutation
+    # fuzzing remains a manual, bounded campaign.
+    - name: Replay checked-in fuzz corpus
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        for target in fuzz_kubo_ls_response fuzz_kubo_mfs_ls_response; do
+          seeds=()
+          while IFS= read -r -d '' seed; do
+            seeds+=("$seed")
+          done < <(git ls-files -z -- "fuzz/corpus/${target}")
+
+          if (( ${#seeds[@]} == 0 )); then
+            echo "No checked-in seeds found for ${target}" >&2
+            exit 1
+          fi
+
+          echo "Replaying ${#seeds[@]} checked-in seeds for ${target}"
+          cargo fuzz run "$target" "${seeds[@]}"
+        done
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
