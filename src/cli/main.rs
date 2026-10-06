@@ -1608,16 +1608,6 @@ system::export!({iface_name}Guest);
             "Kernel source resolved"
         );
         kernel_identity.publish(resolved_identity)?;
-        // Cleanup is deliberately detached: it may use at most a short,
-        // internal deadline, but boot must not wait for best-effort hygiene.
-        let sweep_ipfs_client = boot_ipfs_client.clone();
-        tokio::spawn(async move {
-            match image::sweep_stale_mfs_namespaces(&sweep_ipfs_client).await {
-                Ok(0) => {}
-                Ok(removed) => tracing::info!(removed, "Stale MFS merge namespace sweep complete"),
-                Err(error) => tracing::warn!("Stale MFS merge namespace sweep skipped: {error}"),
-            }
-        });
         runtime_status.set_phase("resolving-configuration");
 
         let mut all_mounts: Vec<ww::cell::mount::Mount> = Vec::new();

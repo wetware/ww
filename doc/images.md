@@ -33,6 +33,10 @@ as layers (later mounts override earlier ones):
 | IPNS path | `/ipns/k51qzi5uqu5...` |
 | Layered | `ww run /ipfs/QmBase my-overlay` |
 
+[Wetware Composer v1](composer-v1.md) merges ordinary UnixFS directory DAGs.
+It preserves unchanged subtree CIDs and exact UTF-8 names. HAMT directories and
+inputs outside the documented profile limits fail explicitly.
+
 Targeted mounts (`source:/guest/path`) are not accepted by backend virtual mode.
 An `/ipns/...` mount is an image layer that Kubo resolves during composition.
 It is distinct from `--ipns-stem`, which follows signed changes and replaces

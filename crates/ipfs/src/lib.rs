@@ -232,9 +232,8 @@ impl BootClient {
         self.retry_deadline
     }
 
-    /// Bound one non-idempotent request by the stricter of its watchdog and
-    /// finite retry budget. The caller may retry a larger idempotent unit in a
-    /// fresh namespace, but must never leave the individual request unbounded.
+    /// Bound one request by the stricter of its watchdog and finite retry
+    /// budget. The caller can retry a larger composition operation.
     fn bounded_timeout(&self) -> Option<Duration> {
         match (self.operation_timeout, self.retry_deadline) {
             (Some(watchdog), Some(budget)) => Some(watchdog.min(budget)),
@@ -361,89 +360,6 @@ impl BootClient {
     pub async fn ls(&self, path: &str) -> Result<Vec<LsEntry>> {
         self.retry("IPFS directory listing", || self.client.ls(path))
             .await
-    }
-
-    pub fn mfs(&self) -> BootMfs<'_> {
-        BootMfs { client: self }
-    }
-}
-
-/// Boot-only, individually retried MFS calls. These are deliberately separate
-/// from [`MFS`], whose ordinary runtime callers retain their existing timing.
-pub struct BootMfs<'a> {
-    client: &'a BootClient,
-}
-
-impl BootMfs<'_> {
-    pub async fn files_mkdir(&self, path: &str, parents: bool) -> Result<()> {
-        // Namespace creation is non-idempotent: Kubo may have created the
-        // directory even if a client-side watchdog expires. Let the enclosing
-        // DAG merge retry in a fresh random namespace instead of replaying
-        // this request against an ambiguous path.
-        let timeout = self.client.bounded_timeout();
-        let mfs = self.client.client.mfs();
-        let mkdir = mfs.files_mkdir(path, parents);
-        match timeout {
-            Some(timeout) => tokio::time::timeout(timeout, mkdir)
-                .await
-                .map_err(|_| KuboOperationTimeout::new("MFS mkdir", timeout))?,
-            None => mkdir.await,
-        }
-    }
-
-    pub async fn files_cp(&self, source: &str, destination: &str) -> Result<()> {
-        // Kubo can complete a copy after the caller's watchdog fires. Reusing
-        // the destination would then fail with "already has entry", so do not
-        // blindly retry this non-idempotent request. The caller retries the
-        // enclosing merge with a fresh namespace when this attempt is transient.
-        let timeout = self.client.bounded_timeout();
-        let mfs = self.client.client.mfs();
-        let copy = mfs.files_cp(source, destination);
-        match timeout {
-            Some(timeout) => tokio::time::timeout(timeout, copy)
-                .await
-                .map_err(|_| KuboOperationTimeout::new("MFS copy", timeout))?,
-            None => copy.await,
-        }
-    }
-
-    pub async fn files_ls(&self, path: &str) -> Result<Vec<MfsEntry>> {
-        let client = self.client.client.clone();
-        let path = path.to_owned();
-        self.client
-            .retry("MFS listing", move || {
-                let client = client.clone();
-                let path = path.clone();
-                async move { client.mfs().files_ls(&path).await }
-            })
-            .await
-    }
-
-    pub async fn files_stat(&self, path: &str, hash: bool) -> Result<MfsStat> {
-        let client = self.client.client.clone();
-        let path = path.to_owned();
-        self.client
-            .retry("MFS stat", || {
-                let client = client.clone();
-                let path = path.clone();
-                async move { client.mfs().files_stat(&path, hash).await }
-            })
-            .await
-    }
-
-    pub async fn files_rm(&self, path: &str, recursive: bool) -> Result<()> {
-        // As with copy, a timed-out remove may complete server-side. Repeating
-        // it can turn a successful first removal into Kubo's terminal
-        // "not found" response, so keep this single-attempt and bounded.
-        let timeout = self.client.bounded_timeout();
-        let mfs = self.client.client.mfs();
-        let remove = mfs.files_rm(path, recursive);
-        match timeout {
-            Some(timeout) => tokio::time::timeout(timeout, remove)
-                .await
-                .map_err(|_| KuboOperationTimeout::new("MFS removal", timeout))?,
-            None => remove.await,
-        }
     }
 }
 

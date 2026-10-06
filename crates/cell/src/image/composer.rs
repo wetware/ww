@@ -38,6 +38,13 @@ pub(super) trait BlockSource: Sync {
     async fn get(&self, cid: &Cid) -> Result<Vec<u8>>;
 }
 
+#[async_trait]
+impl BlockSource for ipfs::BootClient {
+    async fn get(&self, cid: &Cid) -> Result<Vec<u8>> {
+        self.block_get(cid, codec::MAX_BLOCK_BYTES).await
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Composition {
     pub root: Cid,
