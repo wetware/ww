@@ -667,7 +667,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::{is_retryable_kubo_error, BootClient, HttpClient};
+    use super::{
+        is_retryable_kubo_error, parse_kubo_ls_response, parse_kubo_mfs_ls_response, BootClient,
+        HttpClient,
+    };
 
     async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
         let mut request = Vec::new();
@@ -678,6 +681,285 @@ mod tests {
             if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
                 return String::from_utf8(request).unwrap();
             }
+        }
+    }
+
+    async fn client_with_json_response(
+        body: impl Into<String>,
+    ) -> (HttpClient, tokio::task::JoinHandle<()>) {
+        let body = body.into();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        (HttpClient::new(format!("http://{address}")), server)
+    }
+
+    #[test]
+    fn parse_kubo_ls_response_decodes_all_raw_entries() {
+        let entries = parse_kubo_ls_response(
+            br#"{"Objects":[{"Links":[{"Name":"first","Hash":"bafy-first","Size":1,"Type":2},{"Name":"second","Hash":"bafy-second","Size":2,"Type":1}]}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "first");
+        assert_eq!(entries[0].hash, "bafy-first");
+        assert_eq!(entries[0].size, 1);
+        assert_eq!(entries[0].entry_type, 2);
+        assert_eq!(entries[1].name, "second");
+        assert_eq!(entries[1].hash, "bafy-second");
+        assert_eq!(entries[1].size, 2);
+        assert_eq!(entries[1].entry_type, 1);
+    }
+
+    #[test]
+    fn parse_kubo_ls_response_rejects_malformed_raw_entry_atomically() {
+        let body = br#"{"Objects":[{"Links":[{"Name":"valid","Hash":"bafy-valid","Size":1,"Type":2},{"Name":"invalid","Hash":false,"Size":2,"Type":2}]}]}"#;
+
+        assert!(parse_kubo_ls_response(body).is_err());
+    }
+
+    #[test]
+    fn parse_kubo_mfs_ls_response_decodes_all_raw_entries() {
+        let entries = parse_kubo_mfs_ls_response(
+            br#"{"Entries":[{"Name":"first","Hash":"bafy-first","Size":1,"Type":0},{"Name":"second","Hash":"bafy-second","Size":2,"Type":1}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "first");
+        assert_eq!(entries[0].hash, "bafy-first");
+        assert_eq!(entries[0].size, 1);
+        assert_eq!(entries[0].entry_type, 0);
+        assert_eq!(entries[1].name, "second");
+        assert_eq!(entries[1].hash, "bafy-second");
+        assert_eq!(entries[1].size, 2);
+        assert_eq!(entries[1].entry_type, 1);
+    }
+
+    #[test]
+    fn parse_kubo_mfs_ls_response_rejects_malformed_raw_entry_atomically() {
+        let body = br#"{"Entries":[{"Name":"valid","Hash":"bafy-valid","Size":1,"Type":0},{"Name":"invalid","Hash":false,"Size":2,"Type":0}]}"#;
+
+        assert!(parse_kubo_mfs_ls_response(body).is_err());
+    }
+
+    #[tokio::test]
+    async fn ls_accepts_valid_populated_and_empty_listings() {
+        let (client, server) = client_with_json_response(
+            r#"{"Objects":[{"Hash":"bafy-dir","Links":[{"Name":"bin","Hash":"bafy-child","Size":42,"Type":1}]}]}"#,
+        )
+        .await;
+        let entries = client.ls("/ipfs/bafy-dir").await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "bin");
+        assert_eq!(entries[0].hash, "bafy-child");
+        assert_eq!(entries[0].size, 42);
+        assert_eq!(entries[0].entry_type, 1);
+
+        let (client, server) =
+            client_with_json_response(r#"{"Objects":[{"Hash":"bafy-empty","Links":[]}]}"#).await;
+        assert!(client.ls("/ipfs/bafy-empty").await.unwrap().is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ls_rejects_malformed_envelopes() {
+        for body in [
+            r#"[]"#,
+            r#"{}"#,
+            r#"{"Objects":"not-an-array"}"#,
+            r#"{"Objects":[]}"#,
+            r#"{"Objects":[42]}"#,
+            r#"{"Objects":[{}]}"#,
+            r#"{"Objects":[{"Links":"not-an-array"}]}"#,
+        ] {
+            let (client, server) = client_with_json_response(body).await;
+            let error = client.ls("/ipfs/bafy-dir").await.unwrap_err();
+            server.await.unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Malformed IPFS ls response for /ipfs/bafy-dir"),
+                "unexpected error for {body}: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ls_rejects_a_malformed_link_entry() {
+        let body = r#"{"Objects":[{"Hash":"bafy-dir","Links":[{"Name":"valid","Hash":"bafy-valid","Size":1,"Type":2},{"Name":42,"Hash":"bafy-invalid","Size":2,"Type":2}]}]}"#;
+        let (client, server) = client_with_json_response(body).await;
+        let error = client.ls("/ipfs/bafy-dir").await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Malformed IPFS ls directory entry at Objects[0].Links[1]"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ls_rejects_positional_object_representations() {
+        for body in [
+            r#"[[{"Links":[]}]]"#,
+            r#"{"Objects":[[[]]]}"#,
+            r#"{"Objects":[{"Links":[["file","bafy-file",1,2]]}]}"#,
+        ] {
+            let (client, server) = client_with_json_response(body).await;
+            let error = client.ls("/ipfs/bafy-dir").await.unwrap_err();
+            server.await.unwrap();
+            assert!(
+                error.to_string().contains("Malformed IPFS ls"),
+                "unexpected error for {body}: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ls_rejects_duplicate_recognized_entry_fields() {
+        for (body, expected_error) in [
+            (
+                r#"{"Objects":[{"Links":[{"Name":"file","Hash":false,"Hash":"bafy-file","Size":1,"Type":2}]}]}"#,
+                "Malformed IPFS ls directory entry at Objects[0].Links[0]",
+            ),
+            (
+                r#"{"Objects":[{"Links":[{"Name":"file","Hash":"bafy-first","Hash":"bafy-second","Size":1,"Type":2}]}]}"#,
+                "duplicate field `Hash`",
+            ),
+        ] {
+            let (client, server) = client_with_json_response(body).await;
+            let error = client.ls("/ipfs/bafy-dir").await.unwrap_err();
+            server.await.unwrap();
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn files_ls_accepts_valid_populated_and_empty_listings() {
+        let (client, server) = client_with_json_response(
+            r#"{"Entries":[{"Name":"file","Hash":"bafy-file","Size":7,"Type":0}]}"#,
+        )
+        .await;
+        let entries = client.mfs().files_ls("/workspace").await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "file");
+        assert_eq!(entries[0].hash, "bafy-file");
+        assert_eq!(entries[0].size, 7);
+        assert_eq!(entries[0].entry_type, 0);
+
+        for body in [r#"{"Entries":[]}"#, r#"{"Entries":null}"#] {
+            let (client, server) = client_with_json_response(body).await;
+            assert!(client
+                .mfs()
+                .files_ls("/workspace")
+                .await
+                .unwrap()
+                .is_empty());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn files_ls_rejects_malformed_envelopes() {
+        for body in [r#"[]"#, r#"{}"#, r#"{"Entries":"not-an-array"}"#] {
+            let (client, server) = client_with_json_response(body).await;
+            let error = client.mfs().files_ls("/workspace").await.unwrap_err();
+            server.await.unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Malformed MFS ls response for /workspace"),
+                "unexpected error for {body}: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn files_ls_rejects_malformed_entries_atomically() {
+        for (body, expected_index) in [
+            (
+                r#"{"Entries":[{"Name":"invalid","Hash":false,"Size":2,"Type":0}]}"#,
+                0,
+            ),
+            (
+                r#"{"Entries":[{"Name":"valid","Hash":"bafy-valid","Size":1,"Type":0},{"Name":"invalid","Hash":false,"Size":2,"Type":0}]}"#,
+                1,
+            ),
+        ] {
+            let (client, server) = client_with_json_response(body).await;
+            let error = client.mfs().files_ls("/workspace").await.unwrap_err();
+            server.await.unwrap();
+
+            assert!(
+                error.to_string().contains(&format!(
+                    "Malformed MFS directory entry at Entries[{expected_index}]"
+                )),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn files_ls_rejects_positional_object_representations_atomically() {
+        for body in [
+            r#"[null]"#,
+            r#"{"Entries":[["file","bafy-file",1,0]]}"#,
+            r#"{"Entries":[{"Name":"valid","Hash":"bafy-valid","Size":1,"Type":0},["invalid","bafy-invalid",2,0]]}"#,
+        ] {
+            let (client, server) = client_with_json_response(body).await;
+            let error = client.mfs().files_ls("/workspace").await.unwrap_err();
+            server.await.unwrap();
+            assert!(
+                error.to_string().contains("Malformed MFS"),
+                "unexpected error for {body}: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn files_ls_rejects_duplicate_recognized_entry_fields() {
+        for (body, expected_error) in [
+            (
+                r#"{"Entries":[{"Name":"file","Hash":false,"Hash":"bafy-file","Size":1,"Type":0}]}"#,
+                "Malformed MFS directory entry at Entries[0]",
+            ),
+            (
+                r#"{"Entries":[{"Name":"file","Hash":"bafy-first","Hash":"bafy-second","Size":1,"Type":0}]}"#,
+                "duplicate field `Hash`",
+            ),
+        ] {
+            let (client, server) = client_with_json_response(body).await;
+            let error = client.mfs().files_ls("/workspace").await.unwrap_err();
+            server.await.unwrap();
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error: {error:#}"
+            );
         }
     }
 
@@ -955,12 +1237,150 @@ mod tests {
 }
 
 /// Directory listing entry from Kubo's `/api/v0/ls` endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct LsEntry {
+    #[serde(rename = "Name")]
     pub name: String,
+    #[serde(rename = "Hash")]
     pub hash: String,
+    #[serde(rename = "Size")]
     pub size: u64,
+    #[serde(rename = "Type")]
     pub entry_type: u32, // 1 = directory, 2 = file
+}
+
+struct ObjectOnly<T>(T);
+
+impl<'de, T> serde::Deserialize<'de> for ObjectOnly<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ObjectOnlyVisitor<T>(std::marker::PhantomData<fn() -> T>);
+
+        impl<'de, T> serde::de::Visitor<'de> for ObjectOnlyVisitor<T>
+        where
+            T: serde::Deserialize<'de>,
+        {
+            type Value = ObjectOnly<T>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A>(self, map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(ObjectOnly)
+            }
+        }
+
+        deserializer.deserialize_map(ObjectOnlyVisitor(std::marker::PhantomData))
+    }
+}
+
+fn deserialize_object_array<'de, D, T>(
+    deserializer: D,
+    context: &'static str,
+) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct ObjectArrayVisitor<T> {
+        context: &'static str,
+        marker: std::marker::PhantomData<fn() -> T>,
+    }
+
+    impl<'de, T> serde::de::Visitor<'de> for ObjectArrayVisitor<T>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array of JSON objects")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+            let mut index = 0;
+            loop {
+                match sequence.next_element::<ObjectOnly<T>>() {
+                    Ok(Some(ObjectOnly(value))) => values.push(value),
+                    Ok(None) => return Ok(values),
+                    Err(error) => {
+                        return Err(<A::Error as serde::de::Error>::custom(format!(
+                            "{}[{index}]: {error}",
+                            self.context
+                        )));
+                    }
+                }
+                index += 1;
+            }
+        }
+    }
+
+    deserializer.deserialize_seq(ObjectArrayVisitor {
+        context,
+        marker: std::marker::PhantomData,
+    })
+}
+
+fn deserialize_ls_objects<'de, D>(deserializer: D) -> std::result::Result<Vec<LsObject>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_object_array(deserializer, "Malformed IPFS ls object at Objects")
+}
+
+fn deserialize_ls_links<'de, D>(deserializer: D) -> std::result::Result<Vec<LsEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_object_array(
+        deserializer,
+        "Malformed IPFS ls directory entry at Objects[0].Links",
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct LsResponse {
+    #[serde(rename = "Objects", deserialize_with = "deserialize_ls_objects")]
+    objects: Vec<LsObject>,
+}
+
+#[derive(serde::Deserialize)]
+struct LsObject {
+    #[serde(rename = "Links", deserialize_with = "deserialize_ls_links")]
+    links: Vec<LsEntry>,
+}
+
+/// Parses a raw Kubo `/api/v0/ls` response body.
+///
+/// This function is public so external fuzz targets can exercise the same
+/// JSON boundary as the production HTTP client.
+#[doc(hidden)]
+pub fn parse_kubo_ls_response(response_body: &[u8]) -> Result<Vec<LsEntry>> {
+    let ObjectOnly(body): ObjectOnly<LsResponse> = serde_json::from_slice(response_body)?;
+
+    if body.objects.len() != 1 {
+        anyhow::bail!("expected one Objects entry, found {}", body.objects.len());
+    }
+
+    Ok(body
+        .objects
+        .into_iter()
+        .next()
+        .expect("length checked above")
+        .links)
 }
 
 impl HttpClient {
@@ -985,29 +1405,12 @@ impl HttpClient {
             );
         }
 
-        let body: serde_json::Value = response
-            .json()
+        let response_body = response
+            .bytes()
             .await
-            .with_context(|| format!("Failed to parse IPFS ls response for {path}"))?;
-
-        let links = body["Objects"]
-            .as_array()
-            .and_then(|objs| objs.first())
-            .and_then(|obj| obj["Links"].as_array())
-            .unwrap_or(&Vec::new())
-            .clone();
-
-        let entries = links
-            .iter()
-            .map(|link| LsEntry {
-                name: link["Name"].as_str().unwrap_or("").to_string(),
-                hash: link["Hash"].as_str().unwrap_or("").to_string(),
-                size: link["Size"].as_u64().unwrap_or(0),
-                entry_type: link["Type"].as_u64().unwrap_or(0) as u32,
-            })
-            .collect();
-
-        Ok(entries)
+            .with_context(|| format!("Failed to read IPFS ls response for {path}"))?;
+        parse_kubo_ls_response(&response_body)
+            .map_err(|error| anyhow::anyhow!("Malformed IPFS ls response for {path}: {error}"))
     }
 
     /// Pin a CID on the IPFS node.
@@ -1431,6 +1834,58 @@ pub struct MfsEntry {
     pub entry_type: u32,
 }
 
+#[derive(serde::Deserialize)]
+struct MfsLsResponse {
+    #[serde(
+        rename = "Entries",
+        deserialize_with = "deserialize_nullable_mfs_entries"
+    )]
+    entries: Vec<MfsEntry>,
+}
+
+fn deserialize_nullable_mfs_entries<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<MfsEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct NullableEntriesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for NullableEntriesVisitor {
+        type Value = Vec<MfsEntry>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("null or an array of MFS entry objects")
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_object_array(deserializer, "Malformed MFS directory entry at Entries")
+        }
+    }
+
+    deserializer.deserialize_option(NullableEntriesVisitor)
+}
+
+/// Parses a raw Kubo `/api/v0/files/ls` response body.
+///
+/// This function is public so external fuzz targets can exercise the same
+/// JSON boundary as the production HTTP client.
+#[doc(hidden)]
+pub fn parse_kubo_mfs_ls_response(response_body: &[u8]) -> Result<Vec<MfsEntry>> {
+    let ObjectOnly(body): ObjectOnly<MfsLsResponse> = serde_json::from_slice(response_body)?;
+    Ok(body.entries)
+}
+
 /// MFS stat result from `/api/v0/files/stat`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct MfsStat {
@@ -1521,22 +1976,12 @@ impl MFS<'_> {
             );
         }
 
-        let body: serde_json::Value = response
-            .json()
+        let response_body = response
+            .bytes()
             .await
-            .with_context(|| format!("Failed to parse MFS ls response for {path}"))?;
-
-        let entries: Vec<MfsEntry> = body
-            .get("Entries")
-            .and_then(|e| e.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(entries)
+            .with_context(|| format!("Failed to read MFS ls response for {path}"))?;
+        parse_kubo_mfs_ls_response(&response_body)
+            .map_err(|error| anyhow::anyhow!("Malformed MFS ls response for {path}: {error}"))
     }
 
     /// Stat an MFS path, optionally computing its hash.
