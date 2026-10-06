@@ -16,6 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   semantic model checks 64 generated layer sequences, insertion-order
   invariance, CID reuse, metadata precedence, and a richer fixed identity
   vector without calling the production merge algorithm.
+- **Composer v1 fuzz regressions now replay in CI.** Three targets exercise
+  strict DAG-PB decoding, UnixFS metadata validation, and Kubo import
+  acknowledgements against checked-in deterministic corpora.
 - **Breaking: every Cell now bootstraps through one typed `Membrane`.**
   `Membrane.graft()` returns direct `peerId`, `Stat`, grouped `Network`,
   `Routing`, runtime, authority, identity, IPFS, and application-only `extras`

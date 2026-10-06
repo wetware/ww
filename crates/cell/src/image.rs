@@ -9,6 +9,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use cid::Cid;
+use ipld_dagpb::PbNode;
+use sha2::{Digest, Sha256};
 
 use crate::mount::Mount;
 
@@ -17,6 +19,86 @@ mod composer;
 
 /// Versioned identity profile for structural image composition.
 pub const COMPOSER_PROFILE: &str = composer::PROFILE;
+
+/// Exercises the exact Composer v1 DAG-PB decoder from an external fuzz target.
+#[doc(hidden)]
+pub fn fuzz_composer_dagpb_decode(data: &[u8]) -> Result<()> {
+    let digest = Sha256::digest(data);
+    let hash = cid::multihash::Multihash::wrap(0x12, &digest)
+        .context("invalid fuzz-input SHA-256 digest")?;
+    let cid = Cid::new_v1(0x70, hash);
+    let decoded = codec::decode(&cid, data.to_vec())?;
+
+    let wire = PbNode::from_bytes(bytes::Bytes::copy_from_slice(data))
+        .expect("production DAG-PB decode accepted bytes the wire decoder rejected");
+    let cumulative_size = wire.links.iter().fold(data.len() as u64, |size, link| {
+        size.checked_add(
+            link.size
+                .expect("production DAG-PB decode accepted a link without Tsize"),
+        )
+        .expect("production DAG-PB decode accepted cumulative-size overflow")
+    });
+
+    match decoded {
+        codec::Node::Directory(directory) => {
+            assert_eq!(wire.data.as_deref(), Some(directory.data.as_ref()));
+            assert_eq!(wire.links.len(), directory.entries.len());
+            for link in &wire.links {
+                let name = link
+                    .name
+                    .as_ref()
+                    .expect("production directory decode accepted a nameless link");
+                let entry = directory
+                    .entries
+                    .get(name)
+                    .expect("decoded directory omitted a wire link");
+                assert_eq!(entry.cid, link.cid);
+                assert_eq!(entry.size, link.size.unwrap());
+            }
+
+            let encoded = codec::encode(&directory)
+                .expect("production directory decode produced an unencodable directory");
+            assert_eq!(encoded.2, cumulative_size);
+            let redecoded = codec::decode(&encoded.0, encoded.1.clone())
+                .expect("production directory encoding did not decode");
+            assert_eq!(redecoded, codec::Node::Directory(directory));
+            let codec::Node::Directory(redecoded_directory) = redecoded else {
+                unreachable!("directory equality checked above")
+            };
+            assert_eq!(
+                codec::encode(&redecoded_directory)
+                    .expect("redecoded production directory was not encodable"),
+                encoded
+            );
+        }
+        codec::Node::File { file, size } => {
+            assert_eq!(size, cumulative_size);
+            assert_eq!(file.links.len(), wire.links.len());
+            assert_eq!(
+                file.logical_size,
+                file.links.iter().fold(file.inline_size, |size, link| {
+                    size.checked_add(link.logical_size)
+                        .expect("production file decode accepted logical-size overflow")
+                })
+            );
+            for (decoded_link, wire_link) in file.links.iter().zip(&wire.links) {
+                assert_eq!(decoded_link.cid, wire_link.cid);
+                assert_eq!(decoded_link.size, wire_link.size.unwrap());
+            }
+        }
+        codec::Node::Raw { size, .. } | codec::Node::Symlink { size } => {
+            assert_eq!(size, cumulative_size);
+            assert!(wire.links.is_empty());
+        }
+    }
+    Ok(())
+}
+
+/// Exercises the exact Composer v1 UnixFS metadata decoder from a fuzz target.
+#[doc(hidden)]
+pub fn fuzz_composer_unixfs_metadata(data: &[u8]) -> Result<()> {
+    codec::validate_metadata(data)
+}
 
 /// Parse a bare CID, without the path-prefix and trailing-byte tolerance of
 /// `Cid::from_str`. Only the canonical rendering may enter an IPFS source path.
@@ -281,6 +363,50 @@ mod tests {
         Mount {
             source: path.to_string(),
             target: PathBuf::from("/"),
+        }
+    }
+
+    #[test]
+    fn composer_dagpb_fuzz_seam_reaches_the_production_decoder() {
+        let empty_directory = [0x0a, 0x02, 0x08, 0x01];
+        assert!(fuzz_composer_dagpb_decode(&empty_directory).is_ok());
+
+        let unsupported_flat_file = [0x0a, 0x02, 0x08, 0x03];
+        assert!(fuzz_composer_dagpb_decode(&unsupported_flat_file).is_err());
+    }
+
+    #[test]
+    fn composer_unixfs_metadata_fuzz_seam_accepts_supported_local_shapes() {
+        for metadata in [
+            &[0x08, 0x01][..],
+            &[0x08, 0x02, 0x12, 0x01, b'x', 0x18, 0x01],
+            &[0x08, 0x00, 0x12, 0x01, b'x', 0x18, 0x01],
+            &[0x08, 0x04, 0x12, 0x01, b'x'],
+        ] {
+            assert!(
+                fuzz_composer_unixfs_metadata(metadata).is_ok(),
+                "rejected supported metadata {metadata:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_unixfs_metadata_fuzz_seam_rejects_invalid_local_shapes() {
+        for metadata in [
+            &[0x08, 0x01, 0x08, 0x01][..],
+            &[0x08, 0x01, 0x38, 0x80, 0x20],
+            &[0x08, 0x01, 0x42, 0x00],
+            &[0x08, 0x05, 0x28, 0x22, 0x30, 0x80, 0x02],
+            &[0x08, 0x01, 0x12, 0x00],
+            &[0x08, 0x02, 0x28, 0x00],
+            &[0x08, 0x02, 0x12, 0x01, b'x', 0x18, 0x02],
+            &[0x08, 0x00, 0x12, 0x01, b'x'],
+            &[0x08, 0x04, 0x12, 0x01, 0xff],
+        ] {
+            assert!(
+                fuzz_composer_unixfs_metadata(metadata).is_err(),
+                "accepted invalid metadata {metadata:?}"
+            );
         }
     }
 
