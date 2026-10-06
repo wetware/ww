@@ -27,6 +27,9 @@ use cid::Cid;
 use crate::mount::Mount;
 use ipfs;
 
+#[cfg(test)]
+mod codec;
+
 // ── DAG merge via IPFS MFS ─────────────────────────────────────────
 
 // Merge workspaces live below a versioned, private-to-ww MFS root. Older

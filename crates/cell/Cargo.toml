@@ -22,6 +22,9 @@ cap-std = "4.0"
 wasmtime = { workspace = true, features = ["call-hook"] }
 wasmtime-wasi = { version = "=48.0.1", default-features = false, features = ["p3"] }
 tempfile = { workspace = true }
+ipld-dagpb = "=0.2.2"
+prost = "0.14"
+sha2 = "0.10"
 
 # Workspace crates
 authority = { package = "wetware-authority", path = "../authority" }
