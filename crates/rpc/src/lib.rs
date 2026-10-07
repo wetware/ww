@@ -1813,17 +1813,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_byte_stream_close_cancels_pending_read() {
+    async fn test_byte_stream_close_releases_transport_with_retained_read_pipeline() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (client, _host) = setup_byte_stream_rpc(StreamMode::Bidirectional);
+                let (mut host, guest) = io::duplex(4096);
+                let stream_impl = ByteStreamImpl::new(guest, StreamMode::Bidirectional);
+                let state = stream_impl.state.clone();
+                let client: system_capnp::byte_stream::Client = capnp_rpc::new_client(stream_impl);
 
                 let mut read_request = client.read_request();
                 read_request.get().set_max_bytes(1);
-                let read = read_request.send().promise;
-                tokio::pin!(read);
-                assert!(futures::poll!(read.as_mut()).is_pending());
+                let remote_read = read_request.send();
+                let retained_pipeline = remote_read.pipeline;
+                {
+                    let read = remote_read.promise;
+                    tokio::pin!(read);
+                    assert!(futures::poll!(read.as_mut()).is_pending());
+                }
+                assert!(
+                    state.read_gate.try_lock().is_err(),
+                    "retained response pipeline must keep the pending read alive"
+                );
 
                 let close = client.close_request().send().promise;
                 tokio::pin!(close);
@@ -1832,11 +1843,11 @@ mod tests {
                     Poll::Pending => panic!("close waited behind a pending read"),
                 };
 
-                let response = match futures::poll!(read.as_mut()) {
-                    Poll::Ready(result) => result.expect("local close must resolve read as EOF"),
-                    Poll::Pending => panic!("pending read was not woken by close"),
-                };
-                assert!(response.get().unwrap().get_data().unwrap().is_empty());
+                let mut received = Vec::new();
+                host.read_to_end(&mut received).await.unwrap();
+                assert!(received.is_empty());
+
+                drop(retained_pipeline);
             })
             .await;
     }
@@ -2020,6 +2031,116 @@ mod tests {
                 };
                 assert_ne!(error.extra, STREAM_CLOSED);
                 assert!(error.extra.to_lowercase().contains("broken pipe"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_twoparty_write_progress_and_close_cancellation() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (host, guest) = io::duplex(4096);
+                let stream_impl = ByteStreamImpl::new(guest, StreamMode::Bidirectional);
+                let state = stream_impl.state.clone();
+                let stream_cap: system_capnp::byte_stream::Client =
+                    capnp_rpc::new_client(stream_impl);
+
+                let (client_transport, server_transport) = io::duplex(8 * 1024);
+                let (client_read, client_write) = io::split(client_transport);
+                let (server_read, server_write) = io::split(server_transport);
+
+                let server_network = VatNetwork::new(
+                    server_read.compat(),
+                    server_write.compat_write(),
+                    Side::Server,
+                    Default::default(),
+                );
+                let server_rpc =
+                    RpcSystem::new(Box::new(server_network), Some(stream_cap.client.clone()));
+                tokio::pin!(server_rpc);
+
+                let client_network = VatNetwork::new(
+                    client_read.compat(),
+                    client_write.compat_write(),
+                    Side::Client,
+                    Default::default(),
+                );
+                let mut client_rpc = RpcSystem::new(Box::new(client_network), None);
+                let client: system_capnp::byte_stream::Client = client_rpc.bootstrap(Side::Server);
+                tokio::pin!(client_rpc);
+
+                let mut read_request = client.read_request();
+                read_request.get().set_max_bytes(1);
+                let read = read_request.send().promise;
+                tokio::pin!(read);
+
+                let mut read_dispatched = false;
+                for _ in 0..16 {
+                    let _ = futures::poll!(client_rpc.as_mut());
+                    let _ = futures::poll!(server_rpc.as_mut());
+                    assert!(futures::poll!(read.as_mut()).is_pending());
+                    if state.read_gate.try_lock().is_err() {
+                        read_dispatched = true;
+                        break;
+                    }
+                }
+                assert!(
+                    read_dispatched,
+                    "RPC server did not dispatch the pending read"
+                );
+
+                let mut write_request = client.write_request();
+                write_request.get().set_data(b"x");
+                let write = write_request.send().promise;
+                tokio::pin!(write);
+                let mut write_result = None;
+                for _ in 0..16 {
+                    let _ = futures::poll!(client_rpc.as_mut());
+                    let _ = futures::poll!(server_rpc.as_mut());
+                    if let Poll::Ready(result) = futures::poll!(write.as_mut()) {
+                        write_result = Some(result);
+                        break;
+                    }
+                }
+                write_result
+                    .expect("two-party write remained pending behind read")
+                    .expect("two-party write failed");
+                assert!(futures::poll!(read.as_mut()).is_pending());
+
+                let close = client.close_request().send().promise;
+                tokio::pin!(close);
+                let mut close_result = None;
+                for _ in 0..16 {
+                    let _ = futures::poll!(client_rpc.as_mut());
+                    let _ = futures::poll!(server_rpc.as_mut());
+                    if let Poll::Ready(result) = futures::poll!(close.as_mut()) {
+                        close_result = Some(result);
+                        break;
+                    }
+                }
+                close_result
+                    .expect("two-party close remained pending behind read")
+                    .expect("two-party close failed");
+
+                let mut read_result = None;
+                for _ in 0..16 {
+                    let _ = futures::poll!(client_rpc.as_mut());
+                    let _ = futures::poll!(server_rpc.as_mut());
+                    if let Poll::Ready(result) = futures::poll!(read.as_mut()) {
+                        read_result = Some(result);
+                        break;
+                    }
+                }
+                let response = read_result
+                    .expect("two-party close did not wake pending read")
+                    .expect("two-party read failed after close");
+                assert!(response.get().unwrap().get_data().unwrap().is_empty());
+
+                let mut host = host;
+                let mut received = Vec::new();
+                host.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, b"x");
             })
             .await;
     }
