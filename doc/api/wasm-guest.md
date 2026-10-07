@@ -208,9 +208,18 @@ UnixFS mutation, or CID derivation.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `read` | `(maxBytes: UInt32) -> (data: Data)` | Read up to `maxBytes`. Empty data = EOF. |
-| `write` | `(data: Data) -> ()` | Write data to stream. |
-| `close` | `() -> ()` | Close stream. Further reads return EOF, writes fail. |
+| `read` | `(maxBytes: UInt32) -> (data: Data)` | Read up to `maxBytes`. Empty data reports peer EOF or local close. |
+| `write` | `(data: Data) -> ()` | Write data with bounded transport backpressure. Success reports local acceptance, not remote delivery. |
+| `close` | `() -> ()` | Cancel pending I/O and close the stream. Repeated calls succeed. |
+
+Reads and writes can progress concurrently. Calls in the same direction remain
+serialized. Local close resolves pending and future permitted reads with empty
+data. Local close fails pending and future permitted writes, including empty
+writes, with `stream is closed`.
+
+A write cancelled by local close may have delivered a prefix. Process stdin
+uses a separate `ByteStream`; its accepted buffer remains readable before EOF
+after write-then-close.
 
 ### StreamListener (byte-stream mode)
 
