@@ -1813,6 +1813,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_byte_stream_overlapping_reads_serialize_through_completion() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, mut host) = setup_byte_stream_rpc(StreamMode::Bidirectional);
+
+                let mut first_request = client.read_request();
+                first_request.get().set_max_bytes(1);
+                let remote_first = first_request.send();
+                let _first_pipeline = remote_first.pipeline;
+                let first = remote_first.promise;
+                tokio::pin!(first);
+                assert!(futures::poll!(first.as_mut()).is_pending());
+
+                let mut second_request = client.read_request();
+                second_request.get().set_max_bytes(1);
+                let remote_second = second_request.send();
+                let _second_pipeline = remote_second.pipeline;
+                let second = remote_second.promise;
+                tokio::pin!(second);
+                assert!(futures::poll!(second.as_mut()).is_pending());
+
+                host.write_all(b"a").await.unwrap();
+                assert!(
+                    futures::poll!(second.as_mut()).is_pending(),
+                    "queued read consumed data reserved for the active read"
+                );
+
+                let response = match futures::poll!(first.as_mut()) {
+                    Poll::Ready(result) => result.expect("active read failed"),
+                    Poll::Pending => panic!("active read did not complete after data arrived"),
+                };
+                assert_eq!(response.get().unwrap().get_data().unwrap(), b"a");
+
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                host.write_all(b"b").await.unwrap();
+                let response = match futures::poll!(second.as_mut()) {
+                    Poll::Ready(result) => result.expect("queued read failed"),
+                    Poll::Pending => panic!("queued read did not complete after data arrived"),
+                };
+                assert_eq!(response.get().unwrap().get_data().unwrap(), b"b");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_overlapping_writes_serialize_through_completion() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, mut host) =
+                    setup_byte_stream_rpc_with_capacity(StreamMode::Bidirectional, 1);
+
+                let mut first_request = client.write_request();
+                first_request.get().set_data(b"ab");
+                let first = first_request.send().promise;
+                tokio::pin!(first);
+                assert!(futures::poll!(first.as_mut()).is_pending());
+
+                let mut second_request = client.write_request();
+                second_request.get().set_data(b"cd");
+                let second = second_request.send().promise;
+                tokio::pin!(second);
+                assert!(futures::poll!(second.as_mut()).is_pending());
+
+                let mut byte = [0u8; 1];
+                {
+                    let next_byte = host.read_exact(&mut byte);
+                    tokio::pin!(next_byte);
+                    match futures::poll!(next_byte.as_mut()) {
+                        Poll::Ready(result) => {
+                            result.expect("active write did not expose its first byte");
+                        }
+                        Poll::Pending => panic!("active write made no controlled progress"),
+                    }
+                }
+                assert_eq!(&byte, b"a");
+
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                {
+                    let next_byte = host.read_exact(&mut byte);
+                    tokio::pin!(next_byte);
+                    assert!(
+                        futures::poll!(next_byte.as_mut()).is_pending(),
+                        "queued write contributed bytes before the active write completed"
+                    );
+
+                    match futures::poll!(first.as_mut()) {
+                        Poll::Ready(result) => {
+                            result.expect("active write failed");
+                        }
+                        Poll::Pending => {
+                            panic!("active write did not complete after capacity became available")
+                        }
+                    }
+
+                    match futures::poll!(next_byte.as_mut()) {
+                        Poll::Ready(result) => {
+                            result.expect("failed to read the active write's final byte")
+                        }
+                        Poll::Pending => panic!("active write's final byte was not observable"),
+                    };
+                }
+                assert_eq!(&byte, b"b");
+
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                {
+                    let next_byte = host.read_exact(&mut byte);
+                    tokio::pin!(next_byte);
+                    match futures::poll!(next_byte.as_mut()) {
+                        Poll::Ready(result) => {
+                            result.expect("queued write did not expose its first byte");
+                        }
+                        Poll::Pending => panic!("queued write made no controlled progress"),
+                    }
+                }
+                assert_eq!(&byte, b"c");
+
+                match futures::poll!(second.as_mut()) {
+                    Poll::Ready(result) => {
+                        result.expect("queued write failed");
+                    }
+                    Poll::Pending => {
+                        panic!("queued write did not complete after capacity became available")
+                    }
+                }
+                {
+                    let next_byte = host.read_exact(&mut byte);
+                    tokio::pin!(next_byte);
+                    match futures::poll!(next_byte.as_mut()) {
+                        Poll::Ready(result) => {
+                            result.expect("queued write did not expose its final byte");
+                        }
+                        Poll::Pending => panic!("queued write's final byte was not observable"),
+                    }
+                }
+                assert_eq!(&byte, b"d");
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn test_byte_stream_close_releases_transport_with_retained_read_pipeline() {
         let local = tokio::task::LocalSet::new();
         local
