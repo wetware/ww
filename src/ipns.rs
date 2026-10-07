@@ -488,11 +488,7 @@ fn parse_value(value: &[u8]) -> Result<Cid> {
     let cid = value
         .strip_prefix("/ipfs/")
         .context("IPNS value is not an /ipfs/<cid> deployment binding")?;
-    if cid.is_empty() || cid.contains('/') {
-        bail!("IPNS deployment binding must contain one CID and no subpath");
-    }
-    cid.parse::<Cid>()
-        .context("IPNS value contains an invalid CID")
+    crate::ipfs::cid_identity::parse_cid(cid).context("IPNS value contains an invalid CID")
 }
 
 /// Apply the Wetware single-writer publisher policy to durable local state.
@@ -896,6 +892,49 @@ mod tests {
         assert_eq!(decoded.deployment_cid(), Some(cid));
         assert_eq!(decoded.sequence(), 7);
         assert_eq!(decoded.ttl(), RECORD_TTL);
+    }
+
+    #[test]
+    fn signed_deployment_alias_keeps_original_value_and_record_bytes() {
+        let keypair = Keypair::generate_ed25519();
+        let name = keypair.public().to_peer_id();
+        let cid = Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x12, &[0xff; 32]).unwrap(),
+        );
+        let alias = cid.to_string_of_base(cid::multibase::Base::Base64).unwrap();
+        assert!(alias.contains('/'));
+        let value = format!("/ipfs/{alias}");
+        let raw = Record::new(
+            &keypair,
+            &value,
+            Utc::now() + chrono::Duration::hours(1),
+            7,
+            RECORD_TTL,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let decoded = SignedRecord::decode(name, raw.clone()).unwrap();
+        assert_eq!(decoded.deployment_cid(), Some(cid));
+        assert_eq!(decoded.value(), value.as_bytes());
+        assert_eq!(decoded.raw(), raw);
+        let directory = tempfile::tempdir().unwrap();
+        let store = RecordStore::publisher(directory.path(), name);
+        store.persist(decoded.raw()).unwrap();
+        assert_eq!(store.load().unwrap().unwrap(), raw);
+        assert!(parse_value(format!("/ipfs/{alias}/child").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn deployment_binding_rejects_noncanonical_binary_aliases() {
+        for bytes in [
+            vec![1, 0x55, 0, 1, b'x', 0],
+            vec![0x81, 0, 0x55, 0, 1, b'x'],
+        ] {
+            let alias = cid::multibase::encode(cid::multibase::Base::Base32Lower, bytes);
+            assert!(parse_value(format!("/ipfs/{alias}").as_bytes()).is_err());
+        }
     }
 
     #[test]

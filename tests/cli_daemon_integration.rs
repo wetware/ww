@@ -350,7 +350,7 @@ async fn default_daemon_import_excludes_private_host_state() {
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept add request");
         let request = read_http_request(&mut stream).await;
-        let body = b"{\"Name\":\"\",\"Hash\":\"test-root\",\"Size\":\"0\"}\n";
+        let body = b"{\"Name\":\"\",\"Hash\":\"bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye\",\"Size\":\"0\"}\n";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -368,7 +368,10 @@ async fn default_daemon_import_excludes_private_host_state() {
         .add_dir(Path::new(images[0]))
         .await
         .expect("import daemon FHS root");
-    assert_eq!(root, "test-root");
+    assert_eq!(
+        root,
+        "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye"
+    );
     let request = server.await.expect("fake Kubo task");
     let request = String::from_utf8_lossy(&request);
     assert!(

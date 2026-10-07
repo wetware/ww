@@ -18,7 +18,6 @@
 //! Lines starting with `#` are comments. Unknown keys are ignored (forward compat).
 
 use anyhow::{bail, Context, Result};
-use cid::Cid;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -89,15 +88,7 @@ impl NamespaceConfig {
         if value.is_empty() {
             bail!("Namespace '{}' has an empty bootstrap CID", self.name);
         }
-        if value.contains('/') {
-            bail!(
-                "Namespace '{}' bootstrap must be a CID, not an IPFS subpath: {}",
-                self.name,
-                self.bootstrap
-            );
-        }
-        let cid = value
-            .parse::<Cid>()
+        let cid = crate::ipfs::cid_identity::parse_cid(value)
             .with_context(|| format!("Namespace '{}' has an invalid bootstrap CID", self.name))?;
         Ok(Some(format!("/ipfs/{cid}")))
     }
@@ -201,6 +192,19 @@ pub async fn resolve_namespaces(
                 };
             match result {
                 Ok(resolved_path) => {
+                    let value = resolved_path.strip_prefix("/ipfs/").with_context(|| {
+                        format!(
+                            "Namespace '{}' IPNS resolution must return an /ipfs/ CID",
+                            config.name
+                        )
+                    })?;
+                    let cid = crate::ipfs::cid_identity::parse_cid(value).with_context(|| {
+                        format!(
+                            "Namespace '{}' IPNS resolution returned an invalid root CID",
+                            config.name
+                        )
+                    })?;
+                    let resolved_path = format!("/ipfs/{cid}");
                     tracing::info!(
                         ns = %config.name,
                         ipns = %config.ipns,
@@ -295,6 +299,7 @@ pub fn list_configs(ns_dir: &Path) -> Result<Vec<NamespaceConfig>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cid::Cid;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -317,6 +322,83 @@ mod tests {
         let (mut stream, _) = listener.accept().await.unwrap();
         read_request(&mut stream).await;
         std::future::pending::<()>().await;
+    }
+
+    async fn resolve_successful_kubo_path(path: String) -> Result<Vec<(String, String)>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let body = serde_json::json!({ "Path": path }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let config = NamespaceConfig {
+            name: "ww".into(),
+            ipns: "k51-test".into(),
+            bootstrap: format!("/ipfs/{}", test_cid()),
+        };
+        let runtime_status = crate::metrics::RuntimeStatus::starting();
+        let client = crate::ipfs::BootClient::new(
+            crate::ipfs::HttpClient::new(format!("http://{address}")),
+            1,
+            1,
+        );
+        let result = resolve_namespaces(&[config], &client, &runtime_status).await;
+        server.await.unwrap();
+        assert!(!runtime_status.is_degraded());
+        result
+    }
+
+    #[tokio::test]
+    async fn successful_ipns_resolution_rejects_malformed_root_paths() {
+        let cid = crate::ipfs::cid_identity::parse_cid(&test_cid()).unwrap();
+        let mut bytes = cid.to_bytes();
+        bytes.push(0);
+        let malformed = cid::multibase::encode(cid::multibase::Base::Base32Lower, bytes);
+        for path in [
+            format!("/ipfs/{malformed}"),
+            "/ipfs/not-a-cid".into(),
+            "/ipfs/".into(),
+            cid.to_string(),
+            format!("https://gateway.example/ipfs/{cid}"),
+            format!("/ipfs//ipfs/{cid}"),
+            format!("/ipfs/{cid}/child"),
+            format!("/ipfs/{cid}/"),
+        ] {
+            assert!(
+                resolve_successful_kubo_path(path.clone()).await.is_err(),
+                "malformed resolved root must not become a namespace path or select bootstrap: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_ipns_resolution_canonicalizes_alternate_cid_spellings() {
+        let cid = Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x12, &[255; 32]).unwrap(),
+        );
+        for base in [
+            cid::multibase::Base::Base58Btc,
+            cid::multibase::Base::Base64,
+        ] {
+            let alias = cid.to_string_of_base(base).unwrap();
+            assert_ne!(alias, cid.to_string());
+            if base == cid::multibase::Base::Base64 {
+                assert!(alias.contains('/'));
+            }
+            assert_eq!(
+                resolve_successful_kubo_path(format!("/ipfs/{alias}"))
+                    .await
+                    .unwrap(),
+                vec![("ww".into(), format!("/ipfs/{cid}"))]
+            );
+        }
     }
 
     #[tokio::test]
@@ -352,6 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn transient_ipns_failure_retries_without_degrading() {
+        const RECOVERED_CID: &str = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -364,12 +447,12 @@ mod tests {
 
             let (mut second, _) = listener.accept().await.unwrap();
             read_request(&mut second).await;
-            second
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"Path\":\"/ipfs/recovered\"}",
-                )
-                .await
-                .unwrap();
+            let body = format!(r#"{{"Path":"/ipfs/{RECOVERED_CID}"}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            second.write_all(response.as_bytes()).await.unwrap();
         });
         let config = NamespaceConfig {
             name: "ww".into(),
@@ -387,7 +470,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resolved, vec![("ww".into(), "/ipfs/recovered".into())]);
+        assert_eq!(
+            resolved,
+            vec![("ww".into(), format!("/ipfs/{RECOVERED_CID}"))]
+        );
         assert!(!runtime_status.is_degraded());
         server.await.unwrap();
     }
@@ -580,16 +666,53 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_rejects_trailing_cid_bytes() {
+        let cid = crate::ipfs::cid_identity::parse_cid(&test_cid()).unwrap();
+        let mut bytes = cid.to_bytes();
+        bytes.push(0);
+        let alias = cid::multibase::encode(cid::multibase::Base::Base32Lower, bytes);
+        for prefix in ["", "/ipfs/"] {
+            let config = NamespaceConfig {
+                name: "ww".into(),
+                ipns: String::new(),
+                bootstrap: format!("{prefix}{alias}"),
+            };
+            assert!(config.bootstrap_ipfs_path().is_err(), "{prefix}{alias}");
+        }
+    }
+
+    #[test]
+    fn bootstrap_accepts_slash_bearing_base64_alias() {
+        let cid = Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x12, &[255; 32]).unwrap(),
+        );
+        let alias = cid.to_string_of_base(cid::multibase::Base::Base64).unwrap();
+        assert!(alias.contains('/'));
+        for prefix in ["", "/ipfs/"] {
+            let config = NamespaceConfig {
+                name: "ww".into(),
+                ipns: String::new(),
+                bootstrap: format!("{prefix}{alias}"),
+            };
+            assert_eq!(
+                config.bootstrap_ipfs_path().unwrap(),
+                Some(format!("/ipfs/{cid}"))
+            );
+        }
+    }
+
+    #[test]
     fn bootstrap_rejects_ipfs_subpath() {
-        let config = NamespaceConfig {
-            name: "ww".into(),
-            ipns: String::new(),
-            bootstrap: format!("/ipfs/{}/etc/ns", test_cid()),
-        };
-        let err = config.validate().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("must be a CID, not an IPFS subpath"));
+        for prefix in ["", "/ipfs/"] {
+            let config = NamespaceConfig {
+                name: "ww".into(),
+                ipns: String::new(),
+                bootstrap: format!("{prefix}{}/etc/ns", test_cid()),
+            };
+            let err = config.validate().unwrap_err();
+            assert!(err.to_string().contains("invalid bootstrap CID"));
+        }
     }
 
     #[test]

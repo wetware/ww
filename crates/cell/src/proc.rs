@@ -3063,7 +3063,7 @@ mod tests {
         let staging = tempfile::tempdir().expect("image staging");
         let root_cid = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
         let tree = Arc::new(crate::vfs::CidTree::new(
-            root_cid.to_string(),
+            ipfs::cid_identity::parse_cid(root_cid).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.path().to_path_buf(),
         ));
@@ -3075,7 +3075,10 @@ mod tests {
             filesystem.image_root.is_none(),
             "image-backed cells must not be replaced by the byte-loaded empty root"
         );
-        assert_eq!(tree.root_cid().as_str(), root_cid);
+        assert_eq!(
+            *tree.root_cid(),
+            ipfs::cid_identity::parse_cid(root_cid).unwrap()
+        );
         assert_eq!(tree.staging_dir(), staging.path());
         assert_ne!(filesystem.scratch.path(), tree.staging_dir());
     }

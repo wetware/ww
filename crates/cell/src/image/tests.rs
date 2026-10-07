@@ -245,6 +245,46 @@ async fn merge(kubo: &FakeKubo, layers: &[String]) -> Result<String> {
 }
 
 #[tokio::test]
+async fn typed_merge_preserves_cid_version_and_returns_identity() {
+    let (v1, block) = directory(&[]);
+    let v0 = Cid::new_v0(*v1.hash()).unwrap();
+    for root in [v0, v1] {
+        let kubo = FakeKubo::new(
+            HashMap::from([(root, block.clone())]),
+            root,
+            ResponseMode::Success,
+        )
+        .await;
+        let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            dag_merge_cids(&[root], &kubo.client, &mut cancel)
+                .await
+                .unwrap(),
+            root
+        );
+    }
+}
+
+#[tokio::test]
+async fn slash_bearing_root_mount_alias_needs_no_path_resolution() {
+    let root = Cid::new_v1(
+        0x55,
+        cid::multihash::Multihash::<64>::wrap(0x12, &[0xff; 32]).unwrap(),
+    );
+    let alias = multibase(Base::Base64, root.to_bytes());
+    assert!(alias.contains('/'));
+    let kubo = FakeKubo::new(HashMap::new(), root, ResponseMode::Success).await;
+    let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+    assert_eq!(
+        resolve_bare_cid(&format!("/ipfs/{alias}"), &kubo.client, &mut cancel)
+            .await
+            .unwrap(),
+        root.to_string()
+    );
+    assert!(kubo.requests().is_empty());
+}
+
+#[tokio::test]
 async fn invalid_root_cids_fail_before_any_backend_request() {
     let (root, _) = directory(&[]);
     let valid = root.to_string();

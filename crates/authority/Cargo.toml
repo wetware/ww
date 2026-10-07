@@ -13,6 +13,7 @@ capnpc = { workspace = true }
 [dependencies]
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
+cid = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 hex = { workspace = true }
 libp2p-core = { workspace = true }

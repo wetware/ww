@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use cid::Cid;
 
 use super::{Head, InvalidHead, Source as SourceContract, Update};
 
@@ -134,7 +133,7 @@ impl Source {
             .context("Atom source eth_call result was not hex")?;
         let head = ::atom::abi::decode_head_return(&encoded)
             .context("Atom source could not decode Atom.head()")?;
-        let update = match Cid::read_bytes(head.cid.as_slice()) {
+        let update = match crate::ipfs::cid_identity::decode_cid(&head.cid) {
             Ok(cid) => Update::Head(Head { cid }),
             Err(error) => Update::InvalidHead(InvalidHead {
                 selected: head.cid,
@@ -193,6 +192,7 @@ fn parse_hex_u64(value: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cid::Cid;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn encode_head(revision: u64, cid: &[u8]) -> String {
@@ -279,6 +279,48 @@ mod tests {
             Update::Head(Head { cid: new })
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn noncanonical_authoritative_cid_bytes_preserve_invalid_evidence() {
+        let valid: Cid = "bafkreibm6jg3ux5qugqkmfqt5uj5rxszb4sa4e3u7jj4c5ukv5s4xvcc7a"
+            .parse()
+            .unwrap();
+        let canonical = valid.to_bytes();
+        let mut trailing = canonical.clone();
+        trailing.push(0);
+        let mut nonminimal = vec![0x81, 0];
+        nonminimal.extend_from_slice(&canonical[1..]);
+        let mut overflow = vec![0xff; 11];
+        overflow.extend_from_slice(&canonical[1..]);
+        for bytes in [
+            trailing,
+            nonminimal,
+            canonical[..canonical.len() - 1].to_vec(),
+            overflow,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let selected = bytes.clone();
+            let server = tokio::spawn(async move {
+                for result in [
+                    serde_json::json!("0x6"),
+                    serde_json::json!(encode_head(1, &selected)),
+                ] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    request(&mut stream).await;
+                    respond(&mut stream, result).await;
+                }
+            });
+            let mut source =
+                Source::new(Config::new(format!("http://{address}"), [0; 20], 6)).unwrap();
+            let update = source.current().await.unwrap();
+            match update {
+                Update::InvalidHead(invalid) => assert_eq!(invalid.selected, bytes),
+                other => panic!("accepted malformed authoritative bytes {bytes:?}: {other:?}"),
+            }
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
