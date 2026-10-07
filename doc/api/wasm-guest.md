@@ -208,7 +208,7 @@ UnixFS mutation, or CID derivation.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `read` | `(maxBytes: UInt32) -> (data: Data)` | Read up to `maxBytes`. Empty data reports peer EOF or local close. |
+| `read` | `(maxBytes: UInt32) -> (data: Data)` | Read up to `maxBytes`. Empty data reports a zero-byte request, peer EOF, or local close. |
 | `write` | `(data: Data) -> ()` | Write data with bounded transport backpressure. Success reports local acceptance, not remote delivery. |
 | `close` | `() -> ()` | Cancel pending I/O and close the stream. Repeated calls succeed. |
 

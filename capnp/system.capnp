@@ -185,8 +185,9 @@ interface VatClient {
 interface ByteStream {
   read @0 (maxBytes :UInt32) -> (data :Data);
   # Read up to maxBytes from the stream. Reads are serialized with reads but
-  # may progress concurrently with writes. Empty data reports peer EOF or
-  # local close. Local close resolves a pending permitted read as empty data.
+  # may progress concurrently with writes. Empty data reports a zero-byte
+  # request, peer EOF, or local close. Local close resolves a pending permitted
+  # read as empty data.
 
   write @1 (data :Data) -> ();
   # Write data to the stream. Writes are serialized with writes but may
