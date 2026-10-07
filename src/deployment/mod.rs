@@ -206,18 +206,15 @@ async fn prepare_root(
         Prewarm::Existing(tree) => tree,
         Prewarm::Bootstrap { tree, staging_dir } => tree.get_or_insert_with(|| {
             Arc::new(CidTree::new(
-                effective.to_string(),
+                effective,
                 ipfs_client.clone(),
                 staging_dir.to_owned(),
             ))
         }),
     };
-    bounded(
-        "effective-root prewarm",
-        tree.pre_warm(&effective.to_string()),
-    )
-    .await
-    .context("pre-warming effective deployment root")?;
+    bounded("effective-root prewarm", tree.pre_warm(&effective))
+        .await
+        .context("pre-warming effective deployment root")?;
     Ok(PreparedRoot {
         head,
         effective,
@@ -1451,7 +1448,7 @@ impl Deployment {
             effective,
             pins,
         } = prepared;
-        self.cid_tree.swap_root(effective.to_string());
+        self.cid_tree.swap_root(effective);
         self.epoch_tx.send_replace(Epoch {
             seq: self.epoch_seq,
             head: head.as_ref().map_or_else(Vec::new, Head::bytes),
@@ -1618,7 +1615,7 @@ impl BootstrapState {
                         continue;
                     }
                     let tree = tree.expect("successful preparation initializes a valid CidTree");
-                    tree.swap_root(prepared.effective.to_string());
+                    tree.swap_root(prepared.effective);
                     self.epoch_tx.send_replace(Epoch {
                         seq: self.epoch_seq,
                         head: prepared.head_bytes(),
@@ -1875,7 +1872,7 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 0);
         }
         assert_eq!(observer.borrow().seq, 0);
-        assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+        assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
         shutdown.send(()).unwrap();
         server.await.unwrap();
     }
@@ -1919,7 +1916,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(tree.unwrap().root_cid().as_ref(), ROOT);
+        assert_eq!(
+            tree.unwrap().root_cid().as_ref(),
+            &ROOT.parse::<Cid>().unwrap()
+        );
         assert_eq!(*prepared.effective(), ROOT.parse::<cid::Cid>().unwrap());
         assert_eq!(prepared.pins.cids, [ROOT.parse::<cid::Cid>().unwrap()]);
         assert!(pins.is_empty());
@@ -1982,7 +1982,10 @@ mod tests {
         .unwrap_err();
         assert_eq!(classify_failure(&error), FailureClass::Transient);
         assert_eq!(pins.cids, [head.cid]);
-        assert_eq!(tree.as_ref().unwrap().root_cid().as_ref(), ROOT);
+        assert_eq!(
+            tree.as_ref().unwrap().root_cid().as_ref(),
+            &ROOT.parse::<Cid>().unwrap()
+        );
         let prepared = prepare_root(
             Some(head.clone()),
             &[],
@@ -2098,7 +2101,10 @@ mod tests {
             .unwrap();
         assert_eq!(deployment.current_epoch().seq, 1);
         assert_eq!(deployment.current_epoch().root, Some(next.cid));
-        assert_eq!(deployment.cid_tree.root_cid().as_ref(), next_root);
+        assert_eq!(
+            deployment.cid_tree.root_cid().as_ref(),
+            &next_root.parse::<Cid>().unwrap()
+        );
         assert_eq!(deployment.active_pins.cids, [next.cid]);
         server.await.unwrap();
     }
@@ -2285,7 +2291,7 @@ mod tests {
         candidate_rx: watch::Receiver<Option<Vec<u8>>>,
     ) -> (Deployment, Arc<CidTree>, watch::Receiver<Epoch>) {
         let tree = Arc::new(CidTree::new(
-            OLD_ROOT.to_owned(),
+            OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging_dir,
         ));
@@ -2400,7 +2406,10 @@ mod tests {
         assert!(epoch.head.is_empty());
         assert_eq!(epoch.root, Some(ROOT.parse().unwrap()));
         assert!(deployment.source_rx.is_none());
-        assert_eq!(deployment.cid_tree.root_cid().as_ref(), ROOT);
+        assert_eq!(
+            deployment.cid_tree.root_cid().as_ref(),
+            &ROOT.parse::<Cid>().unwrap()
+        );
         server.await.unwrap();
     }
 
@@ -2480,7 +2489,7 @@ mod tests {
         let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            OLD_ROOT.to_owned(),
+            OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
         ));
@@ -2526,7 +2535,7 @@ mod tests {
         let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            OLD_ROOT.to_owned(),
+            OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
         ));
@@ -2560,7 +2569,7 @@ mod tests {
         let result = deployment.activate(2, None, prepared, GenerationStopped(()));
 
         assert!(result.is_err());
-        assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+        assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
         assert_eq!(deployment.current_epoch().root, None);
     }
 
@@ -2569,7 +2578,7 @@ mod tests {
         let (client, server) = single_root_kubo().await;
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            OLD_ROOT.to_owned(),
+            OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
         ));
@@ -2590,7 +2599,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(*prepared.effective(), ROOT.parse::<Cid>().unwrap());
-        assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+        assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
         server.await.unwrap();
     }
 
@@ -2633,7 +2642,7 @@ mod tests {
             epoch_observer.borrow().root,
             Some(OLD_ROOT.parse().unwrap())
         );
-        assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+        assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
         assert!(!terminate_rx.has_changed().unwrap());
 
         let outcome = {
@@ -2645,7 +2654,7 @@ mod tests {
             }
             assert_eq!(epoch_observer.borrow().seq, 1);
             assert_eq!(epoch_observer.borrow().root, None);
-            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+            assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
             assert!(terminate_rx.has_changed().unwrap());
 
             result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
@@ -2653,7 +2662,7 @@ mod tests {
         };
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
-        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
         assert_eq!(deployment.current_epoch().root, Some(ROOT.parse().unwrap()));
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         shutdown_tx.send(()).unwrap();
@@ -2725,7 +2734,7 @@ mod tests {
                 epoch_observer.borrow().root,
                 Some(OLD_ROOT.parse().unwrap())
             );
-            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+            assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
             assert!(!terminate_rx.has_changed().unwrap());
             assert!(ready_gate.is_ready());
 
@@ -2810,7 +2819,7 @@ mod tests {
                 changed = epoch_observer.changed() => changed.unwrap(),
             }
             assert_eq!(epoch_observer.borrow().root, None);
-            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+            assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
             assert!(terminate_rx.has_changed().unwrap());
 
             release_first_tx.send(()).unwrap();
@@ -2821,13 +2830,13 @@ mod tests {
                 };
                 assert!(request.starts_with(expected), "{request}");
             }
-            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+            assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
             result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
             transition.await.unwrap()
         };
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
-        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         server.await.unwrap();
     }
@@ -2863,7 +2872,7 @@ mod tests {
                 epoch_observer.borrow().root,
                 Some(OLD_ROOT.parse().unwrap())
             );
-            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+            assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
             assert!(!terminate_rx.has_changed().unwrap());
             assert_eq!(calls.load(Ordering::SeqCst), 0);
 
@@ -2888,7 +2897,7 @@ mod tests {
         };
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
-        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
     }
@@ -2935,7 +2944,7 @@ mod tests {
                 changed = epoch_observer.changed() => changed.unwrap(),
             }
             assert_eq!(epoch_observer.borrow().root, None);
-            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+            assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
             assert!(terminate_rx.has_changed().unwrap());
 
             let unpin = tokio::select! {
@@ -2964,7 +2973,7 @@ mod tests {
         };
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
-        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
         assert_eq!(calls.load(Ordering::SeqCst), 9);
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
@@ -3026,7 +3035,7 @@ mod tests {
                 epoch_observer.borrow().root,
                 Some(OLD_ROOT.parse().unwrap())
             );
-            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+            assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
             assert!(!terminate_rx.has_changed().unwrap());
 
             source_tx
@@ -3050,7 +3059,7 @@ mod tests {
         };
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
-        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
         assert_eq!(calls.load(Ordering::SeqCst), 7);
         server.await.unwrap();
     }
@@ -3147,7 +3156,7 @@ mod tests {
                 epoch_observer.borrow().root,
                 Some(OLD_ROOT.parse().unwrap())
             );
-            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+            assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
             assert!(!terminate_rx.has_changed().unwrap());
 
             result_tx.send(Ok(kernel::Outcome::Exited(0))).unwrap();
@@ -3187,7 +3196,7 @@ mod tests {
         let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            OLD_ROOT.to_owned(),
+            OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
         ));
@@ -3232,7 +3241,7 @@ mod tests {
                 prepared = prepared_rx => prepared.unwrap(),
             }
             assert!(terminate_rx.has_changed().unwrap());
-            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+            assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
 
             result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
             replacement.await.unwrap()
@@ -3245,7 +3254,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
         assert_eq!(deployment.current_epoch().root, Some(ROOT.parse().unwrap()));
         server.await.unwrap();
     }
@@ -3255,7 +3264,7 @@ mod tests {
         let (client, server) = single_root_kubo().await;
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            OLD_ROOT.to_owned(),
+            OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
         ));
@@ -3306,7 +3315,7 @@ mod tests {
             }
             assert_eq!(epoch_observer.borrow().seq, 1);
             assert_eq!(epoch_observer.borrow().root, None);
-            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+            assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
             assert!(terminate_rx.has_changed().unwrap());
 
             let valid = Head {
@@ -3328,7 +3337,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(tree.root_cid().as_ref(), ROOT);
+        assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
         assert_eq!(deployment.current_epoch().root, Some(ROOT.parse().unwrap()));
         server.await.unwrap();
     }
@@ -3456,7 +3465,7 @@ mod tests {
         let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            OLD_ROOT.to_owned(),
+            OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
         ));
@@ -3564,7 +3573,7 @@ mod tests {
         let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            OLD_ROOT.to_owned(),
+            OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
         ));
@@ -3614,7 +3623,7 @@ mod tests {
         let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            OLD_ROOT.to_owned(),
+            OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
         ));

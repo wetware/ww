@@ -125,7 +125,7 @@ pub(crate) fn parse_ipfs_path(path: &str) -> Option<IpfsCidPath> {
         return None;
     }
 
-    let cid = cid_str.parse::<cid::Cid>().ok()?;
+    let cid = ipfs::cid_identity::parse_cid(cid_str).ok()?;
     Some(IpfsCidPath {
         cid,
         subpath: subpath.to_string(),
@@ -136,7 +136,7 @@ pub(crate) fn parse_ipfs_path(path: &str) -> Option<IpfsCidPath> {
 #[derive(Clone)]
 pub(crate) struct CidDirectoryContext {
     tree: Arc<CidTree>,
-    root: Arc<String>,
+    root: Arc<cid::Cid>,
     path: String,
 }
 
@@ -184,7 +184,7 @@ impl IpfsFilesystemView<'_> {
         if let Some(context) = self.descriptors.directories.get(&id) {
             if root {
                 if let Some(parsed) = parse_ipfs_path(path) {
-                    if parsed.cid.to_string() != *context.root {
+                    if parsed.cid != *context.root {
                         return Ok(OpenRoute::Ipfs(parsed));
                     }
                     return Ok(OpenRoute::CidTree(context.clone(), parsed.subpath));
@@ -277,7 +277,7 @@ pub(crate) async fn materialize_cid_tree_descriptor(
 
     let resolved = cid_tree.resolve_path(path).await.map_err(|error| {
         tracing::debug!(path, %error, "CidTree path resolution failed");
-        MaterializeError::NoEntry
+        resolution_error(error)
     })?;
 
     materialize_resolved_descriptor(cache, cid_tree, resolved).await
@@ -287,7 +287,7 @@ fn resolution_error(error: anyhow::Error) -> MaterializeError {
     match error.downcast_ref::<ResolveError>() {
         Some(ResolveError::NoEntry) => MaterializeError::NoEntry,
         Some(ResolveError::NotDirectory) => MaterializeError::NotDirectory,
-        Some(ResolveError::InvalidPath) => MaterializeError::Invalid,
+        Some(ResolveError::InvalidPath | ResolveError::InvalidCid) => MaterializeError::Invalid,
         None => MaterializeError::Io,
     }
 }
@@ -300,16 +300,15 @@ async fn materialize_resolved_descriptor(
     match resolved {
         ResolvedNode::CidFile { cid, .. } => {
             let cache = cache.ok_or(MaterializeError::Io)?;
-            let parsed = cid.parse::<cid::Cid>().map_err(|_| MaterializeError::Io)?;
-            let canonical_cid = parsed.to_string();
-            cache.ensure(&parsed).await.map_err(|error| {
+            let canonical_cid = cid.to_string();
+            cache.ensure(&cid).await.map_err(|error| {
                 tracing::warn!(%canonical_cid, %error, "CidTree cache ensure failed");
                 MaterializeError::Io
             })?;
             let staging_path = cache.staging_dir().join(&canonical_cid);
             if !staging_path.exists() {
                 cache
-                    .fetch_to_path(&parsed, &staging_path)
+                    .fetch_to_path(&cid, &staging_path)
                     .await
                     .map_err(|error| {
                         tracing::warn!(%canonical_cid, %error, "CidTree stream fetch failed");
@@ -322,14 +321,10 @@ async fn materialize_resolved_descriptor(
             open_read_only_path(&staging_path)
         }
         ResolvedNode::CidDir { cid } => {
-            let parsed = cid.parse::<cid::Cid>().map_err(|error| {
-                tracing::warn!(%cid, %error, "CidTree directory has an invalid CID");
-                MaterializeError::Invalid
-            })?;
-            let canonical_cid = parsed.to_string();
+            let canonical_cid = cid.to_string();
             let staging_dir = cid_tree.staging_dir().join(format!("dir-{canonical_cid}"));
             if !staging_dir.exists() {
-                let entries = cid_tree.ls_dir(&canonical_cid).await.map_err(|error| {
+                let entries = cid_tree.ls_dir(&cid).await.map_err(|error| {
                     tracing::warn!(%canonical_cid, %error, "CidTree directory listing failed");
                     MaterializeError::Io
                 })?;
@@ -994,6 +989,15 @@ mod tests {
     }
 
     #[test]
+    fn root_route_rejects_noncanonical_binary_cid_aliases() {
+        let cid: cid::Cid = DIRECTORY_CID.parse().unwrap();
+        let mut bytes = cid.to_bytes();
+        bytes.push(0);
+        let alias = cid::multibase::encode(cid::multibase::Base::Base32Lower, bytes);
+        assert!(parse_ipfs_path(&format!("ipfs/{alias}/child")).is_none());
+    }
+
+    #[test]
     fn test_parse_ipfs_path_rejects_traversal() {
         let cid_str = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
         // Direct traversal
@@ -1023,7 +1027,7 @@ mod tests {
         )
         .unwrap();
         let tree = CidTree::new(
-            cid.to_string(),
+            ipfs::cid_identity::parse_cid(cid).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.path().to_path_buf(),
         );
@@ -1057,7 +1061,7 @@ mod tests {
         )
         .unwrap();
         let tree = CidTree::new(
-            cid.to_string(),
+            ipfs::cid_identity::parse_cid(cid).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.path().to_path_buf(),
         );
@@ -1095,7 +1099,7 @@ mod tests {
                 .unwrap();
         });
         let tree = CidTree::new(
-            cid.to_string(),
+            ipfs::cid_identity::parse_cid(cid).unwrap(),
             ipfs::HttpClient::new(format!("http://{address}")),
             staging.path().to_path_buf(),
         );
@@ -1125,7 +1129,7 @@ mod tests {
         )
         .unwrap();
         let tree = CidTree::new(
-            root_cid.to_string(),
+            ipfs::cid_identity::parse_cid(root_cid).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.clone(),
         );
@@ -1137,7 +1141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cid_tree_file_materialization_uses_canonical_cid_path() {
+    async fn cid_tree_rejects_path_bearing_child_before_cache_effects() {
         let content = b"confined file content";
         let (cid, pinner) = test_cid_and_pinner(content);
         let escape_root = tempfile::TempDir::new().unwrap();
@@ -1158,20 +1162,22 @@ mod tests {
         )
         .unwrap();
         let tree = CidTree::new(
-            cid.to_string(),
+            cid,
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             tree_staging.path().to_path_buf(),
         );
         let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
         let canonical_path = cache.staging_dir().join(cid.to_string());
 
-        let descriptor =
-            materialize_cid_tree_descriptor(Some(&cache), &tree, "hostile-file", false)
-                .await
-                .unwrap();
-        drop(descriptor);
+        let result =
+            materialize_cid_tree_descriptor(Some(&cache), &tree, "hostile-file", false).await;
 
-        assert_eq!(std::fs::read(&canonical_path).unwrap(), content);
+        assert!(
+            matches!(result, Err(MaterializeError::Invalid)),
+            "path-bearing child metadata must be rejected"
+        );
+        assert!(!canonical_path.exists());
+        assert_eq!(std::fs::read_dir(cache.staging_dir()).unwrap().count(), 0);
         assert!(
             !escaped_path.exists(),
             "a parseable CID string must not escape the cache staging directory"
@@ -1179,6 +1185,47 @@ mod tests {
     }
 
     const DIRECTORY_CID: &str = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+
+    #[tokio::test]
+    async fn valid_alternate_child_cid_stages_canonical_file() {
+        let content = b"alias file";
+        let cid = cid::Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x12, &[255; 32]).unwrap(),
+        );
+        let alias = cid.to_string_of_base(cid::multibase::Base::Base64).unwrap();
+        assert!(alias.contains('/'));
+        let staging = tempfile::tempdir().unwrap();
+        let entries = [crate::vfs::DirEntry {
+            name: "child".into(),
+            cid: alias,
+            entry_type: crate::vfs::EntryType::File,
+            size: content.len() as u64,
+        }];
+        std::fs::write(
+            staging.path().join(format!("{cid}.dirlist.json")),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let tree = CidTree::new(
+            cid,
+            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            staging.path().into(),
+        );
+        let pinner = Arc::new(MockPinner {
+            data: HashMap::from([(cid, content.to_vec())]),
+            path_data: HashMap::new(),
+        });
+        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        materialize_cid_tree_descriptor(Some(&cache), &tree, "child", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(cache.staging_dir().join(cid.to_string())).unwrap(),
+            content
+        );
+        assert_eq!(std::fs::read_dir(cache.staging_dir()).unwrap().count(), 1);
+    }
 
     struct BuildHookGuard;
 
@@ -1227,7 +1274,7 @@ mod tests {
         )
         .unwrap();
         CidTree::new(
-            DIRECTORY_CID.into(),
+            ipfs::cid_identity::parse_cid(DIRECTORY_CID).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.to_path_buf(),
         )
@@ -1298,7 +1345,7 @@ mod tests {
         let entries = if empty { vec![] } else { directory_entries() };
         let first_tree = cached_directory_tree(staging.path(), &entries);
         let second_tree = CidTree::new(
-            DIRECTORY_CID.into(),
+            ipfs::cid_identity::parse_cid(DIRECTORY_CID).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.path().to_path_buf(),
         );
@@ -1408,7 +1455,7 @@ mod tests {
         // A new tree has no LRU; its backend is unavailable. Final reuse must
         // not require listing or touch any published entry.
         let tree = CidTree::new(
-            DIRECTORY_CID.into(),
+            ipfs::cid_identity::parse_cid(DIRECTORY_CID).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.path().into(),
         );
@@ -1469,7 +1516,7 @@ mod tests {
         )
         .unwrap();
         let tree = CidTree::new(
-            alternate.clone(),
+            ipfs::cid_identity::parse_cid(&alternate).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.path().into(),
         );
@@ -1478,6 +1525,25 @@ mod tests {
             .unwrap();
         assert!(staging.path().join(format!("dir-{canonical}")).is_dir());
         assert!(!staging.path().join(format!("dir-{alternate}")).exists());
+        use std::os::unix::fs::MetadataExt;
+        let inode = std::fs::metadata(staging.path().join(format!("dir-{canonical}")))
+            .unwrap()
+            .ino();
+        std::fs::remove_file(staging.path().join(format!("{canonical}.dirlist.json"))).unwrap();
+        let tree = CidTree::new(
+            ipfs::cid_identity::parse_cid(canonical).unwrap(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            staging.path().into(),
+        );
+        let _hook = BuildHookGuard::install(|_, _| panic!("alias caused duplicate publication"));
+        let descriptor = materialize_cid_tree_descriptor(None, &tree, "", false)
+            .await
+            .unwrap();
+        let wasmtime_wasi::filesystem::Descriptor::Dir(dir) = descriptor else {
+            panic!("expected directory")
+        };
+        assert_eq!(dir.dir.metadata().unwrap().ino(), inode);
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]
@@ -1506,7 +1572,7 @@ mod tests {
             }
         });
         let tree = CidTree::new(
-            DIRECTORY_CID.into(),
+            ipfs::cid_identity::parse_cid(DIRECTORY_CID).unwrap(),
             ipfs::HttpClient::new(format!("http://{address}")),
             staging.path().into(),
         );
