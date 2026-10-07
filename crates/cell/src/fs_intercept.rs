@@ -271,7 +271,14 @@ pub(crate) async fn materialize_cid_tree_descriptor(
                     tracing::warn!(%canonical_cid, %error, "CidTree directory listing failed");
                     MaterializeError::Io
                 })?;
-                std::fs::create_dir_all(&staging_dir).map_err(|_| MaterializeError::Io)?;
+                // The reusable path must never be the construction path. A unique
+                // sibling keeps rename on one filesystem and isolates other builders.
+                std::fs::create_dir_all(cid_tree.staging_dir())
+                    .map_err(|_| MaterializeError::Io)?;
+                let temporary = tempfile::Builder::new()
+                    .prefix(".cid-dir-")
+                    .tempdir_in(cid_tree.staging_dir())
+                    .map_err(|_| MaterializeError::Io)?;
                 for entry in entries {
                     if !is_confined_relative_path(&entry.name)
                         || std::path::Path::new(&entry.name).components().count() != 1
@@ -279,7 +286,7 @@ pub(crate) async fn materialize_cid_tree_descriptor(
                         tracing::warn!(name = %entry.name, "rejected unconfined CidTree entry");
                         return Err(MaterializeError::Invalid);
                     }
-                    let entry_path = staging_dir.join(&entry.name);
+                    let entry_path = temporary.path().join(&entry.name);
                     match entry.entry_type {
                         crate::vfs::EntryType::Dir => {
                             std::fs::create_dir_all(entry_path)
@@ -291,7 +298,37 @@ pub(crate) async fn materialize_cid_tree_descriptor(
                             file.set_len(entry.size).map_err(|_| MaterializeError::Io)?;
                         }
                     }
+                    #[cfg(test)]
+                    tests::directory_build_hook(temporary.path(), tests::BuildStage::Entry)?;
                 }
+                #[cfg(test)]
+                tests::directory_build_hook(temporary.path(), tests::BuildStage::BeforePublish)?;
+
+                // Linux RENAME_NOREPLACE / macOS RENAME_EXCL preserve the first
+                // completed directory, including an empty one. `exists()` above
+                // is only a fast path; the filesystem arbitrates publication
+                // across CidTree instances and processes. Unsupported filesystems
+                // fail closed rather than fall back to a replacing rename.
+                use rustix::fs::{renameat_with, RenameFlags, CWD};
+                match renameat_with(
+                    CWD,
+                    temporary.path(),
+                    CWD,
+                    &staging_dir,
+                    RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => {
+                        // Rename freed the old name. Disarm cleanup before another
+                        // builder can reuse it; this builder no longer owns it.
+                        let _former_path = temporary.keep();
+                        #[cfg(test)]
+                        tests::directory_build_hook(&_former_path, tests::BuildStage::Published)?;
+                    }
+                    Err(rustix::io::Errno::EXIST) if staging_dir.is_dir() => {}
+                    Err(_) => return Err(MaterializeError::Io),
+                }
+                // On failure or a lost race, TempDir removes only this builder's
+                // unpublished state. Success disarms cleanup of the freed name.
             }
             open_read_only_path(&staging_dir)
         }
@@ -803,6 +840,32 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BuildStage {
+        Entry,
+        BeforePublish,
+        Published,
+    }
+
+    type DirectoryBuildHook =
+        Box<dyn FnMut(&std::path::Path, BuildStage) -> Result<(), MaterializeError>>;
+    thread_local! {
+        static DIRECTORY_BUILD_HOOK: std::cell::RefCell<Option<DirectoryBuildHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // Materialization performs no awaits between tempdir creation and publish.
+    // Tests install hooks only on dedicated threads or current-thread runtimes.
+    pub(super) fn directory_build_hook(
+        path: &std::path::Path,
+        stage: BuildStage,
+    ) -> Result<(), MaterializeError> {
+        DIRECTORY_BUILD_HOOK.with_borrow_mut(|hook| match hook {
+            Some(hook) => hook(path, stage),
+            None => Ok(()),
+        })
+    }
+
     // ── CID path parsing tests ─────────────────────────────────────
 
     #[test]
@@ -872,6 +935,52 @@ mod tests {
         let result = materialize_cid_tree_descriptor(None, &tree, "", false).await;
         assert!(matches!(result, Err(MaterializeError::Invalid)));
         assert!(!staging.path().join("escaped").exists());
+    }
+
+    #[tokio::test]
+    async fn cid_tree_later_invalid_entry_leaves_no_published_directory() {
+        let cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+        let staging = tempfile::TempDir::new().unwrap();
+        let entries = vec![
+            crate::vfs::DirEntry {
+                name: "first".to_string(),
+                cid: cid.to_string(),
+                entry_type: crate::vfs::EntryType::File,
+                size: 7,
+            },
+            crate::vfs::DirEntry {
+                name: "../escaped".to_string(),
+                cid: cid.to_string(),
+                entry_type: crate::vfs::EntryType::File,
+                size: 1,
+            },
+        ];
+        std::fs::write(
+            staging.path().join(format!("{cid}.dirlist.json")),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let tree = CidTree::new(
+            cid.to_string(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
+            staging.path().to_path_buf(),
+        );
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed_in_hook = observed.clone();
+        let final_path = staging.path().join(format!("dir-{cid}"));
+        let hook = BuildHookGuard::install(move |temporary, stage| {
+            assert!(stage == BuildStage::Entry);
+            assert_eq!(std::fs::metadata(temporary.join("first")).unwrap().len(), 7);
+            assert!(!final_path.exists());
+            observed_in_hook.set(true);
+            Ok(())
+        });
+        let result = materialize_cid_tree_descriptor(None, &tree, "", false).await;
+        drop(hook);
+        assert!(observed.get(), "the earlier valid entry must be populated");
+        assert!(matches!(result, Err(MaterializeError::Invalid)));
+        assert!(!staging.path().join(format!("dir-{cid}")).exists());
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]
@@ -971,6 +1080,348 @@ mod tests {
             !escaped_path.exists(),
             "a parseable CID string must not escape the cache staging directory"
         );
+    }
+
+    const DIRECTORY_CID: &str = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+
+    struct BuildHookGuard;
+
+    impl BuildHookGuard {
+        fn install(
+            hook: impl FnMut(&std::path::Path, BuildStage) -> Result<(), MaterializeError> + 'static,
+        ) -> Self {
+            DIRECTORY_BUILD_HOOK.with_borrow_mut(|slot| {
+                assert!(slot.is_none());
+                *slot = Some(Box::new(hook));
+            });
+            Self
+        }
+    }
+
+    impl Drop for BuildHookGuard {
+        fn drop(&mut self) {
+            DIRECTORY_BUILD_HOOK.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
+    fn directory_entries() -> Vec<crate::vfs::DirEntry> {
+        vec![
+            crate::vfs::DirEntry {
+                name: "first".into(),
+                cid: DIRECTORY_CID.into(),
+                entry_type: crate::vfs::EntryType::File,
+                size: 7,
+            },
+            crate::vfs::DirEntry {
+                name: "nested".into(),
+                cid: DIRECTORY_CID.into(),
+                entry_type: crate::vfs::EntryType::Dir,
+                size: 0,
+            },
+        ]
+    }
+
+    fn cached_directory_tree(
+        staging: &std::path::Path,
+        entries: &[crate::vfs::DirEntry],
+    ) -> CidTree {
+        std::fs::write(
+            staging.join(format!("{DIRECTORY_CID}.dirlist.json")),
+            serde_json::to_vec(entries).unwrap(),
+        )
+        .unwrap();
+        CidTree::new(
+            DIRECTORY_CID.into(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            staging.to_path_buf(),
+        )
+    }
+
+    fn assert_complete_directory(path: &std::path::Path, empty: bool) {
+        if empty {
+            assert_eq!(std::fs::read_dir(path).unwrap().count(), 0);
+        } else {
+            assert_eq!(std::fs::read_dir(path).unwrap().count(), 2);
+            assert_eq!(std::fs::metadata(path.join("first")).unwrap().len(), 7);
+            assert!(path.join("nested").is_dir());
+        }
+    }
+
+    #[tokio::test]
+    async fn cid_tree_population_failure_is_unpublished_and_retryable() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let tree = cached_directory_tree(staging.path(), &directory_entries());
+        let final_path = staging.path().join(format!("dir-{DIRECTORY_CID}"));
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed_in_hook = observed.clone();
+        let final_in_hook = final_path.clone();
+        let hook = BuildHookGuard::install(move |temporary, stage| {
+            assert!(stage == BuildStage::Entry);
+            // A real stub has been populated. Obstruct the next mkdir to cause
+            // a real filesystem error, without corrupting the cached listing.
+            assert_eq!(std::fs::metadata(temporary.join("first")).unwrap().len(), 7);
+            assert!(!final_in_hook.exists());
+            std::fs::write(temporary.join("nested"), b"obstruction").unwrap();
+            observed_in_hook.set(true);
+            Ok(())
+        });
+        let result = materialize_cid_tree_descriptor(None, &tree, "", false).await;
+        drop(hook);
+        assert!(observed.get());
+        assert!(matches!(result, Err(MaterializeError::Io)));
+        assert!(!final_path.exists());
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 1);
+
+        // The same tree retries from its valid cached listing, in new state.
+        let final_in_hook = final_path.clone();
+        let hook = BuildHookGuard::install(move |_, stage| {
+            assert_eq!(final_in_hook.exists(), stage == BuildStage::Published);
+            Ok(())
+        });
+        let descriptor = materialize_cid_tree_descriptor(None, &tree, "", false)
+            .await
+            .unwrap();
+        drop(hook);
+        let wasmtime_wasi::filesystem::Descriptor::Dir(dir) = descriptor else {
+            panic!("expected directory descriptor");
+        };
+        assert_eq!(dir.perms, wasmtime_wasi::FsPerms::ReadOnly);
+        assert_eq!(dir.open_mode, wasmtime_wasi::OpenMode::READ);
+        assert_complete_directory(&final_path, false);
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 2);
+    }
+
+    // Both independent trees reach partial construction and completed private
+    // construction before either may publish. Channels then select a winner.
+    fn concurrent_directory_publication(empty: bool) {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let staging = tempfile::TempDir::new().unwrap();
+        let entries = if empty { vec![] } else { directory_entries() };
+        let first_tree = cached_directory_tree(staging.path(), &entries);
+        let second_tree = CidTree::new(
+            DIRECTORY_CID.into(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            staging.path().to_path_buf(),
+        );
+        let final_path = staging.path().join(format!("dir-{DIRECTORY_CID}"));
+        let (events_tx, events_rx) = mpsc::channel();
+        let mut gates = Vec::new();
+        let mut workers = Vec::new();
+        for (id, tree) in [first_tree, second_tree].into_iter().enumerate() {
+            let (gate_tx, gate_rx) = mpsc::channel();
+            gates.push(gate_tx);
+            let events_tx = events_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut first_entry = true;
+                let _hook = BuildHookGuard::install(move |temporary, stage| {
+                    if stage == BuildStage::Published {
+                        return Ok(());
+                    }
+                    let before_publish = stage == BuildStage::BeforePublish;
+                    if first_entry || before_publish {
+                        first_entry = false;
+                        events_tx
+                            .send((id, temporary.to_path_buf(), before_publish))
+                            .unwrap();
+                        // Timeout only bounds a broken test; channels establish ordering.
+                        gate_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }
+                    Ok(())
+                });
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let descriptor = runtime
+                    .block_on(materialize_cid_tree_descriptor(None, &tree, "", false))
+                    .unwrap();
+                let wasmtime_wasi::filesystem::Descriptor::Dir(dir) = descriptor else {
+                    panic!("expected directory descriptor");
+                };
+                dir.dir.metadata().unwrap().ino()
+            }));
+        }
+        drop(events_tx);
+        let mut temporary_paths = Vec::new();
+        for _ in 0..2 {
+            let (_, temporary, before_publish) =
+                events_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(before_publish, empty);
+            assert!(!final_path.exists());
+            if !empty {
+                assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 1);
+                assert_eq!(std::fs::metadata(temporary.join("first")).unwrap().len(), 7);
+            }
+            temporary_paths.push(temporary);
+        }
+        assert_ne!(temporary_paths[0], temporary_paths[1]);
+        if !empty {
+            for gate in &gates {
+                gate.send(()).unwrap();
+            }
+            for _ in 0..2 {
+                let (_, temporary, before_publish) =
+                    events_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(before_publish);
+                assert!(!final_path.exists());
+                assert_complete_directory(&temporary, false);
+            }
+        }
+        gates[0].send(()).unwrap();
+        let winner_inode = workers.remove(0).join().unwrap();
+        assert_complete_directory(&final_path, empty);
+        assert_eq!(std::fs::metadata(&final_path).unwrap().ino(), winner_inode);
+        gates[1].send(()).unwrap();
+        let loser_inode = workers.remove(0).join().unwrap();
+        assert_eq!(
+            winner_inode, loser_inode,
+            "loser must open the winner, even for an empty directory"
+        );
+        assert_eq!(std::fs::metadata(&final_path).unwrap().ino(), winner_inode);
+        assert_complete_directory(&final_path, empty);
+        for temporary in temporary_paths {
+            assert!(!temporary.exists());
+        }
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn cid_tree_concurrent_builders_publish_one_complete_directory() {
+        concurrent_directory_publication(false);
+    }
+
+    #[test]
+    fn cid_tree_concurrent_builders_preserve_empty_winner() {
+        concurrent_directory_publication(true);
+    }
+
+    #[tokio::test]
+    async fn cid_tree_reuses_published_directory_without_population() {
+        use std::os::unix::fs::MetadataExt;
+        let staging = tempfile::TempDir::new().unwrap();
+        let tree = cached_directory_tree(staging.path(), &directory_entries());
+        materialize_cid_tree_descriptor(None, &tree, "", false)
+            .await
+            .unwrap();
+        let final_path = staging.path().join(format!("dir-{DIRECTORY_CID}"));
+        let inode = std::fs::metadata(&final_path).unwrap().ino();
+        std::fs::remove_file(staging.path().join(format!("{DIRECTORY_CID}.dirlist.json"))).unwrap();
+        // A new tree has no LRU; its backend is unavailable. Final reuse must
+        // not require listing or touch any published entry.
+        let tree = CidTree::new(
+            DIRECTORY_CID.into(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            staging.path().into(),
+        );
+        let _hook = BuildHookGuard::install(|_, _| panic!("published directory was reconstructed"));
+        let descriptor = materialize_cid_tree_descriptor(None, &tree, "", false)
+            .await
+            .unwrap();
+        let wasmtime_wasi::filesystem::Descriptor::Dir(dir) = descriptor else {
+            panic!("expected directory");
+        };
+        assert_eq!(dir.dir.metadata().unwrap().ino(), inode);
+        assert_complete_directory(&final_path, false);
+        assert!(matches!(
+            materialize_cid_tree_descriptor(None, &tree, "", true).await,
+            Err(MaterializeError::NotPermitted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cid_tree_success_does_not_clean_reused_temporary_name() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let tree = cached_directory_tree(staging.path(), &directory_entries());
+        let reused_path = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let reused_in_hook = reused_path.clone();
+        let _hook = BuildHookGuard::install(move |temporary, stage| {
+            if stage == BuildStage::Published {
+                // Publication frees this pathname. Simulate another builder
+                // acquiring it before the successful publisher drops TempDir.
+                std::fs::create_dir(temporary).unwrap();
+                std::fs::write(temporary.join("other-builder"), b"in progress").unwrap();
+                *reused_in_hook.borrow_mut() = Some(temporary.to_path_buf());
+            }
+            Ok(())
+        });
+        materialize_cid_tree_descriptor(None, &tree, "", false)
+            .await
+            .unwrap();
+        let reused = reused_path.borrow().clone().expect("publication hook ran");
+        assert_eq!(
+            std::fs::read(reused.join("other-builder")).unwrap(),
+            b"in progress"
+        );
+        assert_complete_directory(&staging.path().join(format!("dir-{DIRECTORY_CID}")), false);
+    }
+
+    #[tokio::test]
+    async fn cid_tree_directory_materialization_uses_canonical_cid_path() {
+        let canonical = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
+        let alternate = canonical
+            .parse::<cid::Cid>()
+            .unwrap()
+            .to_string_of_base(cid::multibase::Base::Base58Btc)
+            .unwrap();
+        let staging = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            staging.path().join(format!("{canonical}.dirlist.json")),
+            b"[]",
+        )
+        .unwrap();
+        let tree = CidTree::new(
+            alternate.clone(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            staging.path().into(),
+        );
+        materialize_cid_tree_descriptor(None, &tree, "", false)
+            .await
+            .unwrap();
+        assert!(staging.path().join(format!("dir-{canonical}")).is_dir());
+        assert!(!staging.path().join(format!("dir-{alternate}")).exists());
+    }
+
+    #[tokio::test]
+    async fn cid_tree_listing_http_failure_can_retry() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                ("500 Internal Server Error", "failure".to_string()),
+                (
+                    "200 OK",
+                    format!(
+                        r#"{{"Objects":[{{"Links":[{{"Name":"first","Hash":"{DIRECTORY_CID}","Size":7,"Type":2}},{{"Name":"nested","Hash":"{DIRECTORY_CID}","Size":0,"Type":1}}]}}]}}"#
+                    ),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let tree = CidTree::new(
+            DIRECTORY_CID.into(),
+            ipfs::HttpClient::new(format!("http://{address}")),
+            staging.path().into(),
+        );
+        let result = materialize_cid_tree_descriptor(None, &tree, "", false).await;
+        assert!(matches!(result, Err(MaterializeError::Io)));
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
+        materialize_cid_tree_descriptor(None, &tree, "", false)
+            .await
+            .unwrap();
+        assert_complete_directory(&staging.path().join(format!("dir-{DIRECTORY_CID}")), false);
+        server.await.unwrap();
     }
 
     // ── Mock pinner for integration tests ──────────────────────────
