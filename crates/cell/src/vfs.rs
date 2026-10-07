@@ -109,7 +109,9 @@ impl CidTree {
 
     /// Remove readdir stubs after a completed generation transition.
     ///
-    /// Stub directories are root-relative and must not survive a root change.
+    /// Callers must stop all users of this staging directory before cleanup,
+    /// including users of other CidTree instances sharing the same directory.
+    /// Published CID-keyed stubs are immutable until this quiescent cleanup.
     /// Content-addressed staged files remain under `PinsetCache` ownership.
     pub fn cleanup_stubs(&self) {
         if let Ok(entries) = std::fs::read_dir(&self.staging_dir) {

@@ -1342,6 +1342,7 @@ dependencies = [
  "lru",
  "prost",
  "rand 0.9.4",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
