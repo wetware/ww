@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+pub mod cid_identity;
 mod composed;
 
 pub use composed::parse_kubo_dag_import_response;
