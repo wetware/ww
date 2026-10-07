@@ -7,18 +7,20 @@
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use authority::{Epoch, EpochGuard};
+use cid::Cid;
 use rand::Rng;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
-use crate::cell::image::dag_merge;
+use crate::cell::image::dag_merge_cids;
 use crate::cell::vfs::CidTree;
+use crate::ipfs::cid_identity::{decode_cid, parse_cid};
 use crate::kernel;
 use crate::services::{ExecutorPool, SpawnRequest};
 use crate::stem::{Head, InvalidHead, Source, Update};
@@ -108,18 +110,18 @@ fn retry_delay(current: &mut Duration) -> Duration {
 
 #[derive(Debug, Default)]
 struct PinSet {
-    cids: Vec<String>,
+    cids: Vec<Cid>,
 }
 
 impl PinSet {
-    fn insert(&mut self, cid: String) {
+    fn insert(&mut self, cid: Cid) {
         if !self.cids.contains(&cid) {
             self.cids.push(cid);
         }
     }
 
-    fn contains(&self, cid: &str) -> bool {
-        self.cids.iter().any(|owned| owned == cid)
+    fn contains(&self, cid: &Cid) -> bool {
+        self.cids.contains(cid)
     }
 
     fn is_empty(&self) -> bool {
@@ -131,12 +133,12 @@ impl PinSet {
 #[derive(Debug)]
 pub struct PreparedRoot {
     head: Option<Head>,
-    effective: String,
+    effective: Cid,
     pins: PinSet,
 }
 
 impl PreparedRoot {
-    pub fn effective(&self) -> &str {
+    pub fn effective(&self) -> &Cid {
         &self.effective
     }
 
@@ -145,11 +147,20 @@ impl PreparedRoot {
     }
 }
 
+/// Bootstrap keeps the cache tree absent until composition yields a valid root.
+enum Prewarm<'a> {
+    Existing(&'a Arc<CidTree>),
+    Bootstrap {
+        tree: &'a mut Option<Arc<CidTree>>,
+        staging_dir: &'a Path,
+    },
+}
+
 async fn prepare_root(
     head: Option<Head>,
-    frozen_layers: &[String],
+    frozen_layers: &[Cid],
     ipfs_client: &crate::ipfs::HttpClient,
-    cid_tree: Option<&Arc<CidTree>>,
+    prewarm: Prewarm<'_>,
     pins: &mut PinSet,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<PreparedRoot> {
@@ -158,12 +169,12 @@ async fn prepare_root(
     }
     let mut layers = Vec::with_capacity(frozen_layers.len() + usize::from(head.is_some()));
     if let Some(head) = &head {
-        let cid = head.cid.to_string();
+        let cid = head.cid;
         if !pins.contains(&cid) {
-            bounded("head pin", ipfs_client.pin_add(&cid))
+            bounded("head pin", ipfs_client.pin_add(&cid.to_string()))
                 .await
                 .context("pinning deployment head")?;
-            pins.insert(cid.clone());
+            pins.insert(cid);
         }
         layers.push(cid);
     }
@@ -181,21 +192,32 @@ async fn prepare_root(
     let boot_client = crate::ipfs::BootClient::one_attempt(ipfs_client.clone(), OPERATION_TIMEOUT);
     let effective = bounded(
         "effective-root merge",
-        dag_merge(&layers, &boot_client, cancel),
+        dag_merge_cids(&layers, &boot_client, cancel),
     )
     .await
     .context("composing effective deployment root")?;
-    pins.insert(effective.clone());
+    pins.insert(effective);
 
     if *cancel.borrow() {
         anyhow::bail!("deployment preparation cancelled");
     }
 
-    if let Some(tree) = cid_tree {
-        bounded("effective-root prewarm", tree.pre_warm(&effective))
-            .await
-            .context("pre-warming effective deployment root")?;
-    }
+    let tree = match prewarm {
+        Prewarm::Existing(tree) => tree,
+        Prewarm::Bootstrap { tree, staging_dir } => tree.get_or_insert_with(|| {
+            Arc::new(CidTree::new(
+                effective.to_string(),
+                ipfs_client.clone(),
+                staging_dir.to_owned(),
+            ))
+        }),
+    };
+    bounded(
+        "effective-root prewarm",
+        tree.pre_warm(&effective.to_string()),
+    )
+    .await
+    .context("pre-warming effective deployment root")?;
     Ok(PreparedRoot {
         head,
         effective,
@@ -210,7 +232,7 @@ struct PreparationOutput {
 
 async fn prepare_root_owned(
     head: Head,
-    frozen_layers: Vec<String>,
+    frozen_layers: Vec<Cid>,
     ipfs_client: crate::ipfs::HttpClient,
     cid_tree: Arc<CidTree>,
     mut pins: PinSet,
@@ -220,7 +242,7 @@ async fn prepare_root_owned(
         Some(head),
         &frozen_layers,
         &ipfs_client,
-        Some(&cid_tree),
+        Prewarm::Existing(&cid_tree),
         &mut pins,
         &mut cancel,
     )
@@ -468,7 +490,7 @@ pub struct Deployment {
     epoch_tx: watch::Sender<Epoch>,
     epoch_rx: watch::Receiver<Epoch>,
     epoch_seq: u64,
-    frozen_layers: Vec<String>,
+    frozen_layers: Vec<Cid>,
     frozen_pins: PinSet,
     active_pins: PinSet,
     retained_pins: Vec<PinSet>,
@@ -488,21 +510,30 @@ impl Deployment {
         epoch_tx: watch::Sender<Epoch>,
         epoch_rx: watch::Receiver<Epoch>,
     ) -> Result<Self> {
-        for layer in &config.frozen_layers {
-            layer.parse::<cid::Cid>().map_err(|error| {
-                PermanentPreparationError(format!(
-                    "malformed configured deployment layer {layer}: {error}"
-                ))
-            })?;
-        }
+        let frozen_layers = config
+            .frozen_layers
+            .iter()
+            .map(|layer| {
+                parse_cid(layer).map_err(|error| {
+                    PermanentPreparationError(format!(
+                        "malformed configured deployment layer {layer}: {error}"
+                    ))
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut frozen_pins = PinSet::default();
         let mut pin_delay = RETRY_BASE_DELAY;
-        for layer in &config.frozen_layers {
+        for layer in &frozen_layers {
             loop {
-                match bounded("frozen-layer pin", config.ipfs_client.pin_add(layer)).await {
+                match bounded(
+                    "frozen-layer pin",
+                    config.ipfs_client.pin_add(&layer.to_string()),
+                )
+                .await
+                {
                     Ok(()) => {
-                        frozen_pins.insert(layer.clone());
+                        frozen_pins.insert(*layer);
                         pin_delay = RETRY_BASE_DELAY;
                         break;
                     }
@@ -535,7 +566,7 @@ impl Deployment {
             epoch_rx,
             epoch_seq: 0,
             target,
-            frozen_layers: config.frozen_layers,
+            frozen_layers,
             frozen_pins,
             retained_pins: Vec::new(),
             ipfs_client: config.ipfs_client,
@@ -659,7 +690,7 @@ impl Deployment {
     }
 
     fn observe_candidate(&mut self, bytes: Option<Vec<u8>>) {
-        let candidate = bytes.and_then(|bytes| match cid::Cid::read_bytes(bytes.as_slice()) {
+        let candidate = bytes.and_then(|bytes| match decode_cid(&bytes) {
             Ok(cid) => Some(Candidate {
                 head: Head { cid },
                 expires_at: tokio::time::Instant::now() + SPECULATIVE_RETENTION,
@@ -1246,7 +1277,7 @@ impl Deployment {
                     head,
                     &frozen_layers,
                     &ipfs_client,
-                    Some(&cid_tree),
+                    Prewarm::Existing(&cid_tree),
                     &mut attempt,
                     &mut cancel_rx,
                 );
@@ -1420,7 +1451,7 @@ impl Deployment {
             effective,
             pins,
         } = prepared;
-        self.cid_tree.swap_root(effective.clone());
+        self.cid_tree.swap_root(effective.to_string());
         self.epoch_tx.send_replace(Epoch {
             seq: self.epoch_seq,
             head: head.as_ref().map_or_else(Vec::new, Head::bytes),
@@ -1440,7 +1471,7 @@ impl Deployment {
         self.release_retained().await;
     }
 
-    fn protected_cids(&self, extra: Option<&PinSet>) -> HashSet<String> {
+    fn protected_cids(&self, extra: Option<&PinSet>) -> HashSet<Cid> {
         self.frozen_pins
             .cids
             .iter()
@@ -1485,7 +1516,7 @@ struct BootstrapState {
     epoch_rx: watch::Receiver<Epoch>,
     epoch_seq: u64,
     target: Target,
-    frozen_layers: Vec<String>,
+    frozen_layers: Vec<Cid>,
     frozen_pins: PinSet,
     retained_pins: Vec<PinSet>,
     ipfs_client: crate::ipfs::HttpClient,
@@ -1497,11 +1528,7 @@ struct BootstrapState {
 
 impl BootstrapState {
     async fn prepare(mut self) -> Result<Deployment> {
-        let tree = Arc::new(CidTree::new(
-            String::new(),
-            self.ipfs_client.clone(),
-            self.staging_dir.clone(),
-        ));
+        let mut tree = None;
         let mut attempt = PinSet::default();
         let mut retry = RETRY_BASE_DELAY;
         loop {
@@ -1528,7 +1555,10 @@ impl BootstrapState {
                     head,
                     &self.frozen_layers,
                     &self.ipfs_client,
-                    Some(&tree),
+                    Prewarm::Bootstrap {
+                        tree: &mut tree,
+                        staging_dir: &self.staging_dir,
+                    },
                     &mut attempt,
                     &mut cancel_rx,
                 );
@@ -1587,11 +1617,12 @@ impl BootstrapState {
                         retry = RETRY_BASE_DELAY;
                         continue;
                     }
-                    tree.swap_root(prepared.effective.clone());
+                    let tree = tree.expect("successful preparation initializes a valid CidTree");
+                    tree.swap_root(prepared.effective.to_string());
                     self.epoch_tx.send_replace(Epoch {
                         seq: self.epoch_seq,
                         head: prepared.head_bytes(),
-                        root: Some(prepared.effective.clone()),
+                        root: Some(prepared.effective),
                     });
                     info!(seq = self.epoch_seq, root = %prepared.effective, "Boot deployment root activated");
                     return Ok(Deployment {
@@ -1668,7 +1699,7 @@ impl BootstrapState {
     }
 
     async fn release_attempt(&mut self, attempt: &mut PinSet) {
-        let protected: HashSet<String> = self
+        let protected: HashSet<Cid> = self
             .frozen_pins
             .cids
             .iter()
@@ -1685,15 +1716,15 @@ impl BootstrapState {
 async fn release_pin_set(
     pins: &mut PinSet,
     ipfs_client: &crate::ipfs::HttpClient,
-    protected: &HashSet<String>,
-    handled: &mut HashSet<String>,
+    protected: &HashSet<Cid>,
+    handled: &mut HashSet<Cid>,
 ) {
     let mut retained = Vec::new();
     for cid in pins.cids.drain(..) {
-        if protected.contains(&cid) || !handled.insert(cid.clone()) {
+        if protected.contains(&cid) || !handled.insert(cid) {
             continue;
         }
-        match bounded("pin removal", ipfs_client.pin_rm(&cid)).await {
+        match bounded("pin removal", ipfs_client.pin_rm(&cid.to_string())).await {
             Ok(()) => info!(%cid, "Released deployment pin"),
             Err(error) => {
                 warn!(%cid, "Deployment pin release deferred: {error:#}");
@@ -1762,6 +1793,315 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const ROOT: &str = "bafybeiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf354";
+
+    #[tokio::test]
+    async fn pin_aliases_share_ownership_and_protection() {
+        let root = crate::ipfs::cid_identity::parse_cid(ROOT).unwrap();
+        let alias = root
+            .to_string_of_base(cid::multibase::Base::Base58Btc)
+            .unwrap();
+        let mut pins = PinSet::default();
+        pins.insert(root);
+        pins.insert(crate::ipfs::cid_identity::parse_cid(&alias).unwrap());
+        assert_eq!(pins.cids, [root]);
+        let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
+        release_pin_set(
+            &mut pins,
+            &client,
+            &HashSet::from([root]),
+            &mut HashSet::new(),
+        )
+        .await;
+        assert!(
+            pins.is_empty(),
+            "an alias owner must be protected without attempting an unpin"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_frozen_layer_vector_fails_before_any_pin() {
+        let (client, calls, _requests, shutdown, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        for invalid in [
+            "not-a-cid".to_owned(),
+            cid::multibase::encode(cid::multibase::Base::Base32Lower, [1, 0x55, 0, 1, b'x', 0]),
+        ] {
+            let (epoch_tx, epoch_rx) = watch::channel(Epoch::zero());
+            let observer = epoch_rx.clone();
+            let result = Deployment::bootstrap(
+                Config {
+                    source: None,
+                    candidates: None,
+                    frozen_layers: vec![ROOT.to_owned(), invalid],
+                    ipfs_client: client.clone(),
+                    staging_dir: staging.path().to_owned(),
+                },
+                epoch_tx,
+                epoch_rx,
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(observer.borrow().root, None);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_advisory_bytes_never_start_preparation() {
+        let (client, calls, _requests, shutdown, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let (_source_tx, source_rx) = mpsc::channel(2);
+        let (_candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, tree, observer) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        let canonical = ROOT.parse::<cid::Cid>().unwrap().to_bytes();
+        let mut trailing = canonical.clone();
+        trailing.push(0);
+        let mut nonminimal = vec![0x81, 0];
+        nonminimal.extend_from_slice(&canonical[1..]);
+        for bytes in [
+            trailing,
+            nonminimal,
+            canonical[..canonical.len() - 1].to_vec(),
+            vec![0xff; 11],
+        ] {
+            deployment.observe_candidate(Some(bytes));
+            assert!(
+                deployment.speculation.is_none(),
+                "malformed bytes started speculative preparation"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(observer.borrow().seq, 0);
+        assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_tree_is_absent_until_valid_composition() {
+        let staging = tempfile::tempdir().unwrap();
+        let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
+        let mut tree = None;
+        let mut pins = PinSet::default();
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let result = prepare_root(
+            None,
+            &[],
+            &client,
+            Prewarm::Bootstrap {
+                tree: &mut tree,
+                staging_dir: staging.path(),
+            },
+            &mut pins,
+            &mut cancel,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(tree.is_none());
+        assert!(pins.is_empty());
+
+        let (client, server) = single_root_kubo().await;
+        let prepared = prepare_root(
+            Some(Head {
+                cid: ROOT.parse().unwrap(),
+            }),
+            &[],
+            &client,
+            Prewarm::Bootstrap {
+                tree: &mut tree,
+                staging_dir: staging.path(),
+            },
+            &mut pins,
+            &mut cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tree.unwrap().root_cid().as_ref(), ROOT);
+        assert_eq!(*prepared.effective(), ROOT.parse::<cid::Cid>().unwrap());
+        assert_eq!(prepared.pins.cids, [ROOT.parse::<cid::Cid>().unwrap()]);
+        assert!(pins.is_empty());
+        server.await.unwrap();
+    }
+
+    const OLD_ROOT: &str = "bafkreibm6jg3ux5qugqkmfqt5uj5rxszb4sa4e3u7jj4c5ukv5s4xvcc7a";
+    const SHARED_ROOT: &str = "bafkreif2pall7dybz7vecqka3zo24nq2j4tztjwc5c3f4vmrf6sz4d3asa";
+
+    #[tokio::test]
+    async fn bootstrap_prewarm_failure_keeps_attempt_pins_for_retry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (index, expected) in [
+                "/api/v0/pin/add",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                assert!(
+                    request.lines().next().unwrap().contains(expected),
+                    "{request}"
+                );
+                if index == 3 {
+                    stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy").await.unwrap();
+                } else {
+                    respond(&mut stream, &request).await;
+                }
+            }
+        });
+        let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
+        let staging = tempfile::tempdir().unwrap();
+        let mut tree = None;
+        let mut pins = PinSet::default();
+        let (_cancel, mut cancel) = watch::channel(false);
+        let head = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+        let error = prepare_root(
+            Some(head.clone()),
+            &[],
+            &client,
+            Prewarm::Bootstrap {
+                tree: &mut tree,
+                staging_dir: staging.path(),
+            },
+            &mut pins,
+            &mut cancel,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(classify_failure(&error), FailureClass::Transient);
+        assert_eq!(pins.cids, [head.cid]);
+        assert_eq!(tree.as_ref().unwrap().root_cid().as_ref(), ROOT);
+        let prepared = prepare_root(
+            Some(head.clone()),
+            &[],
+            &client,
+            Prewarm::Bootstrap {
+                tree: &mut tree,
+                staging_dir: staging.path(),
+            },
+            &mut pins,
+            &mut cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.pins.cids, [head.cid]);
+        assert!(pins.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_source_update_during_prewarm_releases_old_pins_before_new_root() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut requests) = mpsc::unbounded_channel();
+        let next_root = DIRECTORY_BLOCKS[1].0;
+        let server = tokio::spawn(async move {
+            let mut stalled = None;
+            for (index, expected) in [
+                "/api/v0/pin/add",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+                "/api/v0/pin/rm",
+                "/api/v0/pin/add",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_owned();
+                assert!(path.starts_with(expected), "{path}");
+                if index == 3 {
+                    stalled = Some(stream);
+                    request_tx.send(path).unwrap();
+                    continue;
+                }
+                let root = if index < 5 { ROOT } else { next_root };
+                if expected != "/api/v0/dag/import" {
+                    assert!(path.contains(root), "wrong root for {path}");
+                }
+                respond(&mut stream, &request).await;
+                request_tx.send(path).unwrap();
+            }
+            drop(stalled);
+        });
+        let initial = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+        let (epoch_tx, epoch_rx) = watch::channel(Epoch {
+            seq: 0,
+            head: initial.bytes(),
+            root: None,
+        });
+        let observer = epoch_rx.clone();
+        let (source_tx, source_rx) = mpsc::channel(2);
+        let staging = tempfile::tempdir().unwrap();
+        let state = BootstrapState {
+            epoch_tx,
+            epoch_rx,
+            epoch_seq: 0,
+            target: Target::Head(initial),
+            frozen_layers: Vec::new(),
+            frozen_pins: PinSet::default(),
+            retained_pins: Vec::new(),
+            ipfs_client: crate::ipfs::HttpClient::new(format!("http://{address}")),
+            staging_dir: staging.path().to_owned(),
+            source_rx: Some(source_rx),
+            source_task: None,
+            candidate_rx: None,
+        };
+        let bootstrap = tokio::spawn(state.prepare());
+        for _ in 0..4 {
+            next_request(&mut requests).await;
+        }
+        assert_eq!(
+            observer.borrow().root,
+            None,
+            "prewarm must precede rooted epoch publication"
+        );
+        let next = Head {
+            cid: next_root.parse().unwrap(),
+        };
+        source_tx
+            .send(SourceMessage::Update(Update::Head(next.clone())))
+            .await
+            .unwrap();
+        let removed = next_request(&mut requests).await;
+        assert!(removed.starts_with("/api/v0/pin/rm") && removed.contains(ROOT));
+        let deployment = tokio::time::timeout(Duration::from_secs(2), bootstrap)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(deployment.current_epoch().seq, 1);
+        assert_eq!(deployment.current_epoch().root, Some(next.cid));
+        assert_eq!(deployment.cid_tree.root_cid().as_ref(), next_root);
+        assert_eq!(deployment.active_pins.cids, [next.cid]);
+        server.await.unwrap();
+    }
 
     // Empty UnixFS directories with absent mtime, mtime=1, and mtime=2.
     // Each literal CID is SHA-256 over its corresponding DAG-PB block.
@@ -1945,14 +2285,14 @@ mod tests {
         candidate_rx: watch::Receiver<Option<Vec<u8>>>,
     ) -> (Deployment, Arc<CidTree>, watch::Receiver<Epoch>) {
         let tree = Arc::new(CidTree::new(
-            "old-root".to_owned(),
+            OLD_ROOT.to_owned(),
             client.clone(),
             staging_dir,
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
             head: Vec::new(),
-            root: Some("old-root".to_owned()),
+            root: Some(OLD_ROOT.parse().unwrap()),
         });
         let deployment = Deployment {
             epoch_tx,
@@ -2058,7 +2398,7 @@ mod tests {
         let epoch = deployment.current_epoch();
         assert_eq!(epoch.seq, 0);
         assert!(epoch.head.is_empty());
-        assert_eq!(epoch.root.as_deref(), Some(ROOT));
+        assert_eq!(epoch.root, Some(ROOT.parse().unwrap()));
         assert!(deployment.source_rx.is_none());
         assert_eq!(deployment.cid_tree.root_cid().as_ref(), ROOT);
         server.await.unwrap();
@@ -2094,7 +2434,7 @@ mod tests {
         let epoch = deployment.current_epoch();
         assert_eq!(epoch.seq, 0);
         assert_eq!(epoch.head, head.bytes());
-        assert_eq!(epoch.root.as_deref(), Some(ROOT));
+        assert_eq!(epoch.root, Some(ROOT.parse().unwrap()));
         server.await.unwrap();
     }
 
@@ -2131,7 +2471,7 @@ mod tests {
         let epoch = deployment.current_epoch();
         assert_eq!(epoch.seq, 1);
         assert_eq!(epoch.head, valid.bytes());
-        assert_eq!(epoch.root.as_deref(), Some(ROOT));
+        assert_eq!(epoch.root, Some(ROOT.parse().unwrap()));
         server.await.unwrap();
     }
 
@@ -2140,14 +2480,14 @@ mod tests {
         let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            "old-root".to_owned(),
+            OLD_ROOT.to_owned(),
             client.clone(),
             staging.path().to_owned(),
         ));
         let initial = Epoch {
             seq: u64::MAX,
             head: Vec::new(),
-            root: Some("old-root".to_owned()),
+            root: Some(OLD_ROOT.parse().unwrap()),
         };
         let (epoch_tx, epoch_rx) = watch::channel(initial.clone());
         let mut deployment = Deployment {
@@ -2186,7 +2526,7 @@ mod tests {
         let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            "old-root".to_owned(),
+            OLD_ROOT.to_owned(),
             client.clone(),
             staging.path().to_owned(),
         ));
@@ -2213,14 +2553,14 @@ mod tests {
         };
         let prepared = PreparedRoot {
             head: None,
-            effective: "superseded-root".to_owned(),
+            effective: DIRECTORY_BLOCKS[2].0.parse().unwrap(),
             pins: PinSet::default(),
         };
 
         let result = deployment.activate(2, None, prepared, GenerationStopped(()));
 
         assert!(result.is_err());
-        assert_eq!(tree.root_cid().as_ref(), "old-root");
+        assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
         assert_eq!(deployment.current_epoch().root, None);
     }
 
@@ -2229,7 +2569,7 @@ mod tests {
         let (client, server) = single_root_kubo().await;
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            "old-root".to_owned(),
+            OLD_ROOT.to_owned(),
             client.clone(),
             staging.path().to_owned(),
         ));
@@ -2242,15 +2582,15 @@ mod tests {
             }),
             &[],
             &client,
-            Some(&tree),
+            Prewarm::Existing(&tree),
             &mut pins,
             &mut cancel_rx,
         )
         .await
         .unwrap();
 
-        assert_eq!(prepared.effective(), ROOT);
-        assert_eq!(tree.root_cid().as_ref(), "old-root");
+        assert_eq!(*prepared.effective(), ROOT.parse::<Cid>().unwrap());
+        assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
         server.await.unwrap();
     }
 
@@ -2289,8 +2629,11 @@ mod tests {
             assert!(request.starts_with(expected), "{request}");
         }
         assert_eq!(epoch_observer.borrow().seq, 0);
-        assert_eq!(epoch_observer.borrow().root.as_deref(), Some("old-root"));
-        assert_eq!(tree.root_cid().as_ref(), "old-root");
+        assert_eq!(
+            epoch_observer.borrow().root,
+            Some(OLD_ROOT.parse().unwrap())
+        );
+        assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
         assert!(!terminate_rx.has_changed().unwrap());
 
         let outcome = {
@@ -2302,7 +2645,7 @@ mod tests {
             }
             assert_eq!(epoch_observer.borrow().seq, 1);
             assert_eq!(epoch_observer.borrow().root, None);
-            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
             assert!(terminate_rx.has_changed().unwrap());
 
             result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
@@ -2311,7 +2654,7 @@ mod tests {
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
         assert_eq!(tree.root_cid().as_ref(), ROOT);
-        assert_eq!(deployment.current_epoch().root.as_deref(), Some(ROOT));
+        assert_eq!(deployment.current_epoch().root, Some(ROOT.parse().unwrap()));
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
@@ -2378,8 +2721,11 @@ mod tests {
             assert!(unpin.starts_with("/api/v0/pin/rm"), "{unpin}");
             assert!(unpin.contains(ROOT), "{unpin}");
             assert_eq!(epoch_observer.borrow().seq, 0);
-            assert_eq!(epoch_observer.borrow().root.as_deref(), Some("old-root"));
-            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert_eq!(
+                epoch_observer.borrow().root,
+                Some(OLD_ROOT.parse().unwrap())
+            );
+            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
             assert!(!terminate_rx.has_changed().unwrap());
             assert!(ready_gate.is_ready());
 
@@ -2464,7 +2810,7 @@ mod tests {
                 changed = epoch_observer.changed() => changed.unwrap(),
             }
             assert_eq!(epoch_observer.borrow().root, None);
-            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
             assert!(terminate_rx.has_changed().unwrap());
 
             release_first_tx.send(()).unwrap();
@@ -2475,7 +2821,7 @@ mod tests {
                 };
                 assert!(request.starts_with(expected), "{request}");
             }
-            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
             result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
             transition.await.unwrap()
         };
@@ -2513,8 +2859,11 @@ mod tests {
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
             assert_eq!(epoch_observer.borrow().seq, 0);
-            assert_eq!(epoch_observer.borrow().root.as_deref(), Some("old-root"));
-            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert_eq!(
+                epoch_observer.borrow().root,
+                Some(OLD_ROOT.parse().unwrap())
+            );
+            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
             assert!(!terminate_rx.has_changed().unwrap());
             assert_eq!(calls.load(Ordering::SeqCst), 0);
 
@@ -2586,7 +2935,7 @@ mod tests {
                 changed = epoch_observer.changed() => changed.unwrap(),
             }
             assert_eq!(epoch_observer.borrow().root, None);
-            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
             assert!(terminate_rx.has_changed().unwrap());
 
             let unpin = tokio::select! {
@@ -2673,8 +3022,11 @@ mod tests {
                 assert!(request.starts_with(expected), "{request}");
             }
             assert_eq!(epoch_observer.borrow().seq, 0);
-            assert_eq!(epoch_observer.borrow().root.as_deref(), Some("old-root"));
-            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert_eq!(
+                epoch_observer.borrow().root,
+                Some(OLD_ROOT.parse().unwrap())
+            );
+            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
             assert!(!terminate_rx.has_changed().unwrap());
 
             source_tx
@@ -2791,8 +3143,11 @@ mod tests {
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
             assert_eq!(epoch_observer.borrow().seq, 0);
-            assert_eq!(epoch_observer.borrow().root.as_deref(), Some("old-root"));
-            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert_eq!(
+                epoch_observer.borrow().root,
+                Some(OLD_ROOT.parse().unwrap())
+            );
+            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
             assert!(!terminate_rx.has_changed().unwrap());
 
             result_tx.send(Ok(kernel::Outcome::Exited(0))).unwrap();
@@ -2832,14 +3187,14 @@ mod tests {
         let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            "old-root".to_owned(),
+            OLD_ROOT.to_owned(),
             client.clone(),
             staging.path().to_owned(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
             head: Vec::new(),
-            root: Some("old-root".to_owned()),
+            root: Some(OLD_ROOT.parse().unwrap()),
         });
         let (_source_tx, source_rx) = mpsc::channel(1);
         let mut deployment = Deployment {
@@ -2877,7 +3232,7 @@ mod tests {
                 prepared = prepared_rx => prepared.unwrap(),
             }
             assert!(terminate_rx.has_changed().unwrap());
-            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
 
             result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
             replacement.await.unwrap()
@@ -2891,7 +3246,7 @@ mod tests {
             }
         ));
         assert_eq!(tree.root_cid().as_ref(), ROOT);
-        assert_eq!(deployment.current_epoch().root.as_deref(), Some(ROOT));
+        assert_eq!(deployment.current_epoch().root, Some(ROOT.parse().unwrap()));
         server.await.unwrap();
     }
 
@@ -2900,14 +3255,14 @@ mod tests {
         let (client, server) = single_root_kubo().await;
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            "old-root".to_owned(),
+            OLD_ROOT.to_owned(),
             client.clone(),
             staging.path().to_owned(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
             head: Vec::new(),
-            root: Some("old-root".to_owned()),
+            root: Some(OLD_ROOT.parse().unwrap()),
         });
         let mut epoch_observer = epoch_rx.clone();
         let (source_tx, source_rx) = mpsc::channel(2);
@@ -2951,7 +3306,7 @@ mod tests {
             }
             assert_eq!(epoch_observer.borrow().seq, 1);
             assert_eq!(epoch_observer.borrow().root, None);
-            assert_eq!(tree.root_cid().as_ref(), "old-root");
+            assert_eq!(tree.root_cid().as_ref(), OLD_ROOT);
             assert!(terminate_rx.has_changed().unwrap());
 
             let valid = Head {
@@ -2974,7 +3329,7 @@ mod tests {
             }
         ));
         assert_eq!(tree.root_cid().as_ref(), ROOT);
-        assert_eq!(deployment.current_epoch().root.as_deref(), Some(ROOT));
+        assert_eq!(deployment.current_epoch().root, Some(ROOT.parse().unwrap()));
         server.await.unwrap();
     }
 
@@ -3053,7 +3408,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(deployment.current_epoch().root.as_deref(), Some(ROOT));
+        assert_eq!(deployment.current_epoch().root, Some(ROOT.parse().unwrap()));
         let mut epoch_observer = deployment.epoch_rx.clone();
         epoch_observer.borrow_and_update();
 
@@ -3086,7 +3441,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(deployment.current_epoch().root.as_deref(), Some(ROOT));
+        assert_eq!(deployment.current_epoch().root, Some(ROOT.parse().unwrap()));
         assert!(
             deployment.source_task.is_some(),
             "host follower must remain alive"
@@ -3101,14 +3456,14 @@ mod tests {
         let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            "old-root".to_owned(),
+            OLD_ROOT.to_owned(),
             client.clone(),
             staging.path().to_owned(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
             head: Vec::new(),
-            root: Some("old-root".to_owned()),
+            root: Some(OLD_ROOT.parse().unwrap()),
         });
         let (source_tx, source_rx) = mpsc::channel(1);
         let mut deployment = Deployment {
@@ -3167,10 +3522,10 @@ mod tests {
         let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
         let mut retained = vec![
             PinSet {
-                cids: vec!["shared".to_owned()],
+                cids: vec![SHARED_ROOT.parse().unwrap()],
             },
             PinSet {
-                cids: vec!["shared".to_owned()],
+                cids: vec![SHARED_ROOT.parse().unwrap()],
             },
         ];
         let mut handled = HashSet::new();
@@ -3180,13 +3535,13 @@ mod tests {
         retained.retain(|pins| !pins.is_empty());
 
         assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].cids, ["shared"]);
+        assert_eq!(retained[0].cids, [SHARED_ROOT.parse().unwrap()]);
         server.await.unwrap();
 
         release_pin_set(
             &mut retained[0],
             &client,
-            &HashSet::from(["shared".to_owned()]),
+            &HashSet::from([SHARED_ROOT.parse().unwrap()]),
             &mut HashSet::new(),
         )
         .await;
@@ -3209,14 +3564,14 @@ mod tests {
         let client = crate::ipfs::HttpClient::new(format!("http://{address}"));
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            "old-root".to_owned(),
+            OLD_ROOT.to_owned(),
             client.clone(),
             staging.path().to_owned(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
             head: Vec::new(),
-            root: Some("old-root".to_owned()),
+            root: Some(OLD_ROOT.parse().unwrap()),
         });
         let mut deployment = Deployment {
             epoch_tx,
@@ -3237,9 +3592,9 @@ mod tests {
                     head: Some(Head {
                         cid: ROOT.parse().unwrap(),
                     }),
-                    effective: ROOT.to_owned(),
+                    effective: ROOT.parse().unwrap(),
                     pins: PinSet {
-                        cids: vec![ROOT.to_owned()],
+                        cids: vec![ROOT.parse().unwrap()],
                     },
                 },
                 expires_at: tokio::time::Instant::now() + SPECULATIVE_RETENTION,
@@ -3250,7 +3605,7 @@ mod tests {
 
         assert!(deployment.speculation.is_none());
         assert_eq!(deployment.retained_pins.len(), 1);
-        assert_eq!(deployment.retained_pins[0].cids, [ROOT]);
+        assert_eq!(deployment.retained_pins[0].cids, [ROOT.parse().unwrap()]);
         server.await.unwrap();
     }
 
@@ -3259,7 +3614,7 @@ mod tests {
         let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
         let staging = tempfile::tempdir().unwrap();
         let tree = Arc::new(CidTree::new(
-            "old-root".to_owned(),
+            OLD_ROOT.to_owned(),
             client.clone(),
             staging.path().to_owned(),
         ));
@@ -3272,7 +3627,7 @@ mod tests {
             frozen_pins: PinSet::default(),
             active_pins: PinSet::default(),
             retained_pins: vec![PinSet {
-                cids: vec!["shared".to_owned()],
+                cids: vec![SHARED_ROOT.parse().unwrap()],
             }],
             ipfs_client: client,
             cid_tree: tree,
@@ -3283,12 +3638,15 @@ mod tests {
             speculation: None,
         };
         let mut attempt = PinSet {
-            cids: vec!["shared".to_owned()],
+            cids: vec![SHARED_ROOT.parse().unwrap()],
         };
 
         deployment.release_attempt(&mut attempt).await;
 
         assert!(attempt.is_empty());
-        assert_eq!(deployment.retained_pins[0].cids, ["shared"]);
+        assert_eq!(
+            deployment.retained_pins[0].cids,
+            [SHARED_ROOT.parse().unwrap()]
+        );
     }
 }

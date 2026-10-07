@@ -1069,6 +1069,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_dir_rejects_malformed_root_acknowledgement() {
+        for hash in [
+            "not-a-cid".to_owned(),
+            cid::multibase::encode(cid::multibase::Base::Base32Lower, [1, 0x55, 0, 1, b'x', 0]),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                assert!(request.contains("/api/v0/add?"));
+                let body = serde_json::json!({"Name":"", "Hash":hash, "Size":"0"}).to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let client = HttpClient::new(format!("http://{address}"));
+            let result = client.add_dir(directory.path()).await;
+            assert!(
+                result.is_err(),
+                "accepted malformed upload root: {result:?}"
+            );
+            assert!(!is_retryable_kubo_error(&result.unwrap_err()));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn missing_local_directory_is_not_retryable() {
         let directory = tempfile::TempDir::new().unwrap();
         let missing = directory.path().join("does-not-exist");
@@ -1476,7 +1503,9 @@ impl HttpClient {
         for line in body.lines().rev() {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
                 if let Some(hash) = json.get("Hash").and_then(|h| h.as_str()) {
-                    return Ok(hash.to_string());
+                    return cid_identity::parse_cid(hash)
+                        .context("IPFS add directory returned an invalid root CID")
+                        .map(|cid| cid.to_string());
                 }
             }
         }

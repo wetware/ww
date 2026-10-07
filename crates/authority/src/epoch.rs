@@ -2,6 +2,7 @@
 
 use call_guard::{stale_epoch_error, CallGuard};
 use capnp::Error;
+use cid::Cid;
 use tokio::sync::watch;
 
 /// Epoch value used by the membrane (matches capnp struct Epoch).
@@ -14,7 +15,7 @@ pub struct Epoch {
     pub head: Vec<u8>,
     /// The Host-composed root. `None` means that the epoch is authoritative
     /// but its replacement generation is not ready to start.
-    pub root: Option<String>,
+    pub root: Option<Cid>,
 }
 
 impl Epoch {
@@ -77,6 +78,25 @@ mod tests {
             head: head.to_vec(),
             root: None,
         }
+    }
+
+    #[test]
+    fn rooted_epoch_carries_cid_identity_without_revoking_same_sequence() {
+        let root: cid::Cid = "bafybeiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf354"
+            .parse()
+            .unwrap();
+        let (tx, rx) = watch::channel(Epoch::zero());
+        let guard = EpochGuard {
+            issued_seq: 0,
+            receiver: rx,
+        };
+        tx.send_replace(Epoch {
+            seq: 0,
+            head: Vec::new(),
+            root: Some(root),
+        });
+        assert_eq!(guard.receiver.borrow().root, Some(root));
+        assert!(guard.check().is_ok());
     }
 
     #[test]

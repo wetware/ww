@@ -135,20 +135,33 @@ pub async fn dag_merge(
     client: &ipfs::BootClient,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<String> {
-    if cids.is_empty() {
-        bail!("No CIDs to merge");
-    }
     let cids = cids
         .iter()
         .map(|value| parse_cid(value).context("invalid merge layer CID"))
         .collect::<Result<Vec<_>>>()?;
+    dag_merge_cids(&cids, client, cancel)
+        .await
+        .map(|cid| cid.to_string())
+}
+
+/// Compose validated layer identities and return the pinned effective root.
+///
+/// Retains CID version, codec, and multihash throughout composition and import.
+pub async fn dag_merge_cids(
+    cids: &[Cid],
+    client: &ipfs::BootClient,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<Cid> {
+    if cids.is_empty() {
+        bail!("No CIDs to merge");
+    }
     await_or_cancel(cancel, async {
-        let composition = composer::compose(client, &cids).await?;
+        let composition = composer::compose(client, cids).await?;
         client
             .import_composed(&composition.root, &composition.blocks)
             .await
             .context("storing and pinning composed root")?;
-        Ok(composition.root.to_string())
+        Ok(composition.root)
     })
     .await
 }
@@ -263,6 +276,11 @@ async fn resolve_bare_cid(
     let cid_with_subpath = ipfs_path
         .strip_prefix("/ipfs/")
         .with_context(|| format!("expected resolved /ipfs/ path, got {ipfs_path}"))?;
+    // Decode the complete root before interpreting slashes as path separators:
+    // a valid Base64 CID can contain slashes in its multibase spelling.
+    if let Ok(cid) = parse_cid(cid_with_subpath) {
+        return Ok(cid.to_string());
+    }
     let candidate = if cid_with_subpath.contains('/') {
         let resolved = await_or_cancel(cancel, ipfs_client.resolve(ipfs_path)).await?;
         resolved
