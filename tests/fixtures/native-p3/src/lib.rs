@@ -268,7 +268,20 @@ async fn raw_filesystem_policy() {
     }
     assert_eq!(read_file(&child).await, b"nested child");
 
-    let writable = scratch
+    scratch
+        .create_directory_at("nested".into())
+        .await
+        .expect("create nested scratch directory");
+    let nested_scratch = scratch
+        .open_at(
+            PathFlags::empty(),
+            "nested".into(),
+            OpenFlags::DIRECTORY,
+            DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+        )
+        .await
+        .expect("open nested scratch directory");
+    let writable = nested_scratch
         .open_at(
             PathFlags::empty(),
             "raw-probe.txt".into(),
@@ -278,8 +291,10 @@ async fn raw_filesystem_policy() {
         .await
         .unwrap();
     write_file(&writable, b"discarded contents", false).await;
+    write_file(&writable, b" appended", true).await;
+    assert_eq!(read_file(&writable).await, b"discarded contents appended");
     drop(writable);
-    let writable = scratch
+    let writable = nested_scratch
         .open_at(
             PathFlags::empty(),
             "raw-probe.txt".into(),
@@ -289,9 +304,9 @@ async fn raw_filesystem_policy() {
         .await
         .unwrap();
     assert!(read_file(&writable).await.is_empty());
-    write_file(&writable, b"raw scratch", false).await;
+    write_file(&writable, b"nested raw scratch", false).await;
     write_file(&writable, b" appended", true).await;
-    assert_eq!(read_file(&writable).await, b"raw scratch appended");
+    assert_eq!(read_file(&writable).await, b"nested raw scratch appended");
 
     // Drop both descriptor classes, then open replacements while siblings live.
     drop(deeper);

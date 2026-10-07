@@ -297,8 +297,33 @@ fn read_contents(store: &Store<Harness>, fd: &Fd) -> String {
     (&*file.file).read_to_string(&mut contents).unwrap();
     contents
 }
+fn write_contents(store: &Store<Harness>, fd: &Fd, contents: &[u8], append: bool) {
+    use std::io::{Seek, SeekFrom, Write};
+    let Descriptor::File(file) = store.data().table.get(fd).unwrap() else {
+        panic!("expected file")
+    };
+    if append {
+        (&*file.file).seek(SeekFrom::End(0)).unwrap();
+    }
+    (&*file.file).write_all(contents).unwrap();
+}
 fn drop_descriptor(store: &mut Store<Harness>, fd: Fd) {
     p3_types::HostDescriptor::drop(&mut store.data_mut().intercepted_filesystem(), fd).unwrap();
+}
+async fn create_directory(store: &mut Store<Harness>, base: u32, path: &str) {
+    store
+        .run_concurrent(async |access| {
+            let access = access.with_getter::<IpfsFilesystem>(Harness::intercepted_filesystem);
+            <IpfsFilesystem as p3_types::HostDescriptorWithStore<Harness>>::create_directory_at(
+                &access,
+                Resource::new_borrow(base),
+                path.into(),
+            )
+            .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -463,6 +488,59 @@ async fn writable_tmp_delegates_and_does_not_inherit_cidtree_context() {
         .await
         .unwrap();
     assert_eq!(read_contents(&store, &file), "");
+}
+
+#[tokio::test]
+async fn nested_writable_tmp_descriptor_preserves_writable_semantics() {
+    use p3_types::{DescriptorFlags as D, OpenFlags as O};
+    let (mut store, _, tmp) = harness();
+
+    create_directory(&mut store, tmp, "nested").await;
+    let nested = open(
+        &mut store,
+        tmp,
+        "nested",
+        O::DIRECTORY,
+        D::READ | D::MUTATE_DIRECTORY,
+    )
+    .await
+    .unwrap();
+    assert!(store.data().descriptors.writable.contains(&nested.rep()));
+
+    let file = open(
+        &mut store,
+        nested.rep(),
+        "probe.txt",
+        O::CREATE | O::EXCLUSIVE,
+        D::READ | D::WRITE,
+    )
+    .await
+    .unwrap();
+    write_contents(&store, &file, b"nested scratch", false);
+    write_contents(&store, &file, b" appended", true);
+    drop_descriptor(&mut store, file);
+    assert_eq!(
+        std::fs::read(store.data().scratch.path().join("nested/probe.txt")).unwrap(),
+        b"nested scratch appended"
+    );
+
+    let file = open(
+        &mut store,
+        nested.rep(),
+        "probe.txt",
+        O::TRUNCATE,
+        D::READ | D::WRITE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read_contents(&store, &file), "");
+    write_contents(&store, &file, b"after truncate", false);
+    drop_descriptor(&mut store, file);
+
+    let file = read_open(&mut store, nested.rep(), "probe.txt")
+        .await
+        .unwrap();
+    assert_eq!(read_contents(&store, &file), "after truncate");
 }
 
 #[tokio::test]

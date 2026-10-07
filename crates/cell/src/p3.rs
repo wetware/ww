@@ -1254,8 +1254,8 @@ mod tests {
             );
         }
         assert_eq!(
-            std::fs::read(paths.scratch.join("raw-probe.txt"))?,
-            b"raw scratch appended"
+            std::fs::read(paths.scratch.join("nested/raw-probe.txt"))?,
+            b"nested raw scratch appended"
         );
         assert_eq!(std::fs::read(&paths.materialized)?, b"lazy image bytes");
         assert_eq!(
