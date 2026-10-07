@@ -47,6 +47,15 @@ The command also rejects WASI socket imports and interfaces outside the
 fixture-specific allowlist. It then runs the ignored host artifact tests with
 `WW_NATIVE_P3_FIXTURE` set to the validated component.
 
+The filesystem export uses raw P3 descriptors for nested and chained opens,
+retained sibling descriptors, path confinement, literal encoded path names,
+and nested `ipfs/` entries. It checks all nonempty mutation-flag combinations
+against files, missing paths, and directories, with exact errors. It also
+checks file/directory mismatches and awaits the completion futures for rejected
+immutable writes/appends and writable `/tmp` create, truncate, write, append,
+and read operations. The host asserts one fetch per unique file and verifies
+staging and scratch cleanup when the Store drops.
+
 The fixture uses real P3 streams, futures, clocks, and filesystem calls. It
 isolates the host adapters from the production Cap'n Proto guest session.
 Production RPC concurrency, transport-failure propagation, and cancellation
