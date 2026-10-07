@@ -2005,23 +2005,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_source_update_during_prewarm_releases_old_pins_before_new_root() {
+    async fn bootstrap_supersession_releases_distinct_head_and_effective_pins() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (request_tx, mut requests) = mpsc::unbounded_channel();
         let next_root = DIRECTORY_BLOCKS[1].0;
+        let old_head = COMPOSED_DIRECTORY_BLOCKS[0].0;
+        let frozen = COMPOSED_DIRECTORY_BLOCKS[1].0;
+        let old_effective = COMPOSED_DIRECTORY_BLOCKS[2].0;
+        assert_ne!(old_head, old_effective);
+        assert_ne!(old_head, frozen);
+        assert_ne!(old_effective, frozen);
         let server = tokio::spawn(async move {
             let mut stalled = None;
-            for (index, expected) in [
-                "/api/v0/pin/add",
-                "/api/v0/block/get",
-                "/api/v0/dag/import",
-                "/api/v0/ls",
-                "/api/v0/pin/rm",
-                "/api/v0/pin/add",
-                "/api/v0/block/get",
-                "/api/v0/dag/import",
-                "/api/v0/ls",
+            for (index, (expected, expected_cid)) in [
+                ("/api/v0/pin/add", Some(old_head)),
+                ("/api/v0/block/get", Some(old_head)),
+                ("/api/v0/block/get", Some(frozen)),
+                ("/api/v0/dag/import", None),
+                ("/api/v0/ls", Some(old_effective)),
+                ("/api/v0/pin/rm", Some(old_head)),
+                ("/api/v0/pin/rm", Some(old_effective)),
+                ("/api/v0/pin/add", Some(next_root)),
+                ("/api/v0/block/get", Some(next_root)),
+                ("/api/v0/block/get", Some(frozen)),
+                ("/api/v0/dag/import", None),
+                ("/api/v0/ls", Some(frozen)),
             ]
             .into_iter()
             .enumerate()
@@ -2037,14 +2046,13 @@ mod tests {
                     .unwrap()
                     .to_owned();
                 assert!(path.starts_with(expected), "{path}");
-                if index == 3 {
+                if let Some(expected_cid) = expected_cid {
+                    assert!(path.contains(expected_cid), "wrong CID for {path}");
+                }
+                if index == 4 {
                     stalled = Some(stream);
                     request_tx.send(path).unwrap();
                     continue;
-                }
-                let root = if index < 5 { ROOT } else { next_root };
-                if expected != "/api/v0/dag/import" {
-                    assert!(path.contains(root), "wrong root for {path}");
                 }
                 respond(&mut stream, &request).await;
                 request_tx.send(path).unwrap();
@@ -2052,7 +2060,7 @@ mod tests {
             drop(stalled);
         });
         let initial = Head {
-            cid: ROOT.parse().unwrap(),
+            cid: old_head.parse().unwrap(),
         };
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
@@ -2067,8 +2075,10 @@ mod tests {
             epoch_rx,
             epoch_seq: 0,
             target: Target::Head(initial),
-            frozen_layers: Vec::new(),
-            frozen_pins: PinSet::default(),
+            frozen_layers: vec![frozen.parse().unwrap()],
+            frozen_pins: PinSet {
+                cids: vec![frozen.parse().unwrap()],
+            },
             retained_pins: Vec::new(),
             ipfs_client: crate::ipfs::HttpClient::new(format!("http://{address}")),
             staging_dir: staging.path().to_owned(),
@@ -2077,7 +2087,7 @@ mod tests {
             candidate_rx: None,
         };
         let bootstrap = tokio::spawn(state.prepare());
-        for _ in 0..4 {
+        for _ in 0..5 {
             next_request(&mut requests).await;
         }
         assert_eq!(
@@ -2092,20 +2102,35 @@ mod tests {
             .send(SourceMessage::Update(Update::Head(next.clone())))
             .await
             .unwrap();
-        let removed = next_request(&mut requests).await;
-        assert!(removed.starts_with("/api/v0/pin/rm") && removed.contains(ROOT));
+        let removed_head = next_request(&mut requests).await;
+        assert!(removed_head.contains(old_head), "{removed_head}");
+        let removed_effective = next_request(&mut requests).await;
+        assert!(
+            removed_effective.contains(old_effective),
+            "{removed_effective}"
+        );
+        assert!(!removed_head.contains(frozen), "{removed_head}");
+        assert!(!removed_effective.contains(frozen), "{removed_effective}");
         let deployment = tokio::time::timeout(Duration::from_secs(2), bootstrap)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         assert_eq!(deployment.current_epoch().seq, 1);
-        assert_eq!(deployment.current_epoch().root, Some(next.cid));
+        assert_eq!(deployment.current_epoch().head, next.bytes());
+        assert_eq!(
+            deployment.current_epoch().root,
+            Some(frozen.parse().unwrap())
+        );
         assert_eq!(
             deployment.cid_tree.root_cid().as_ref(),
-            &next_root.parse::<Cid>().unwrap()
+            &frozen.parse::<Cid>().unwrap()
         );
-        assert_eq!(deployment.active_pins.cids, [next.cid]);
+        assert_eq!(
+            deployment.active_pins.cids,
+            [next.cid, frozen.parse().unwrap()]
+        );
+        assert_eq!(deployment.frozen_pins.cids, [frozen.parse().unwrap()]);
         server.await.unwrap();
     }
 
@@ -2120,6 +2145,40 @@ mod tests {
         (
             "bafybeifq3dpjepjc33voodbyxlw3ckwcu3ijoypxwjpieuab6wysui5pxa",
             &[10, 6, 8, 1, 66, 2, 8, 2],
+        ),
+    ];
+
+    // `base` plus `overlay` composes to `root`; all three CIDs are distinct.
+    const COMPOSED_DIRECTORY_BLOCKS: [(&str, &[u8]); 3] = [
+        (
+            "bafybeigwirijl6q5hdcjccnta3lcdqsdr2ekbyxcymmjpyfte3fbqixtzm",
+            &[
+                18, 46, 10, 36, 1, 85, 18, 32, 202, 230, 98, 23, 47, 212, 80, 187, 12, 215, 16,
+                167, 105, 7, 156, 5, 191, 197, 216, 227, 94, 250, 101, 118, 237, 199, 208, 55, 122,
+                253, 212, 162, 18, 4, 107, 101, 101, 112, 24, 4, 18, 48, 10, 36, 1, 85, 18, 32,
+                203, 160, 107, 87, 54, 250, 246, 126, 84, 176, 123, 86, 30, 174, 148, 57, 94, 119,
+                76, 81, 122, 125, 145, 10, 84, 54, 158, 18, 99, 204, 251, 212, 18, 6, 116, 97, 114,
+                103, 101, 116, 24, 3, 10, 2, 8, 1,
+            ],
+        ),
+        (
+            "bafybeif3tic4aa357o2xytajngtd2gpqd5zzhkwucqqdii5kvinktiocdq",
+            &[
+                18, 48, 10, 36, 1, 85, 18, 32, 17, 80, 122, 14, 47, 94, 105, 213, 223, 164, 10, 98,
+                161, 189, 123, 110, 229, 126, 107, 205, 133, 198, 124, 155, 132, 49, 179, 111, 255,
+                33, 196, 55, 18, 6, 116, 97, 114, 103, 101, 116, 24, 3, 10, 2, 8, 1,
+            ],
+        ),
+        (
+            "bafybeie3kszxzyrguzhcirx6ytd6akzq6o5l6hbxrjobikiefnoim2n6wi",
+            &[
+                18, 46, 10, 36, 1, 85, 18, 32, 202, 230, 98, 23, 47, 212, 80, 187, 12, 215, 16,
+                167, 105, 7, 156, 5, 191, 197, 216, 227, 94, 250, 101, 118, 237, 199, 208, 55, 122,
+                253, 212, 162, 18, 4, 107, 101, 101, 112, 24, 4, 18, 48, 10, 36, 1, 85, 18, 32, 17,
+                80, 122, 14, 47, 94, 105, 213, 223, 164, 10, 98, 161, 189, 123, 110, 229, 126, 107,
+                205, 133, 198, 124, 155, 132, 49, 179, 111, 255, 33, 196, 55, 18, 6, 116, 97, 114,
+                103, 101, 116, 24, 3, 10, 2, 8, 1,
+            ],
         ),
     ];
 
@@ -2180,6 +2239,7 @@ mod tests {
         let body = if path.starts_with("/api/v0/block/get") {
             DIRECTORY_BLOCKS
                 .iter()
+                .chain(COMPOSED_DIRECTORY_BLOCKS.iter())
                 .find(|(cid, _)| path.contains(cid))
                 .expect("known fixture block")
                 .1
@@ -2187,6 +2247,7 @@ mod tests {
         } else if path.starts_with("/api/v0/dag/import") {
             let root = DIRECTORY_BLOCKS
                 .iter()
+                .chain(COMPOSED_DIRECTORY_BLOCKS.iter())
                 .find_map(|(root, _)| {
                     let cid = root.parse::<cid::Cid>().unwrap().to_bytes();
                     request
