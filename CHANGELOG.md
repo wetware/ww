@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed
+- **ByteStream reads and writes now make independent progress.** Close promptly
+  cancels pending I/O, repeated close succeeds, and post-close reads and writes
+  have deterministic results. Dialed streams release both transport pumps on
+  close and server teardown.
 - **Image composition now merges immutable UnixFS/DAG-PB structures directly.**
   Composer v1 deterministically reuses unchanged CIDs and encodes only changed
   directories. Kubo imports and recursively pins generated blocks. Ordinary

@@ -23,7 +23,7 @@ Don't follow a fixed order.  Ask:
 > 2. **Capabilities** — why no ambient authority, and what replaces it
 > 3. **Architecture** — the three layers (host, kernel, children)
 > 4. **The Membrane** — how capabilities flow and get attenuated
-> 5. **Concurrency** — how race conditions disappear (E-ordering)
+> 5. **Concurrency** — how implementations coordinate overlapping RPC calls
 > 6. **Epochs** — on-chain coordination and capability lifecycle
 > 7. **Images** — how code is packaged and layered
 >
@@ -92,7 +92,7 @@ Present one row at a time, explain each, check in.
 | signals | epoch lifecycle | Unix signals are fire-and-forget. An epoch advance makes host-issued capabilities stale. The Host terminates the old PID0 and starts a fresh PID0 for the new generation. |
 | pipe | `ByteStream` (`capnp/system.capnp`) | Both connect two processes via read/write.  But ByteStream is a capability — it can be passed to third parties, attenuated, or revoked. |
 | `bind()`/`listen()` | `StreamListener.listen()` / `VatListener.serveAuthenticated()` | Unix: any process can bind any port. Wetware requires an explicit listener capability. Vat publication serves an existing capability and does not spawn a process. |
-| semaphore / mutex | E-ordering (capnp objects) | No explicit locks.  Each capnp object serializes its own method calls — the object IS the lock.  Cross-object calls are concurrent; use pipelining to express ordering. |
+| semaphore / mutex | Direction gates and state locks | Async capnp calls can overlap. Each implementation protects shared state for its contract. `ByteStream` uses separate read and write gates so opposite directions can progress concurrently. |
 | ring 0 / ring 3 boundary | Membrane | The Membrane is the ring transition.  In x86 the `syscall` instruction crosses from ring 3 to ring 0.  In Wetware, `graft()` crosses from Cell to host.  The Membrane controls what's on the other side — like the IDT controls which kernel handlers userspace can invoke. |
 | init (pid 1) | pid0 (kernel Cell) | Both are the first process that sets up everything else. pid0 receives the root `Membrane`, decides policy, and passes parent-selected `Membrane` references to children. The kernel IS a Cell. |
 
@@ -159,22 +159,24 @@ references passed across process or vat boundaries.
 
 Key files: `doc/rpc-transport.md`, `doc/architecture.md`
 
-**Lead with the question:** "How do you prevent race conditions
-in a distributed system without locks?"
+**Lead with the question:** "How do you coordinate overlapping calls
+in a distributed system?"
 
 **E-ordering** (from the E programming language, Cap'n Proto's
 intellectual ancestor):
 
-- Method calls on a **single** Cap'n Proto object are serialized.
-  One at a time, in order.  No races within an object.
-- Method calls **across** objects are independent and concurrent.
-  This is where you *could* have races — but pipelining usually
-  eliminates the need for coordination.
+- Cap'n Proto preserves message order, but async method calls on a
+  **single** object can remain in flight concurrently. The implementation
+  defines synchronization for shared state.
+- `ByteStream` serializes calls per direction and permits one read and one
+  write to progress concurrently.
+- Calls **across** objects are independent and concurrent. Pipelining usually
+  eliminates the need for explicit coordination.
 
 Draw the analogy: this is like goroutines communicating over
-channels, or Erlang actors with mailboxes.  Each object IS the
-lock.  You don't need semaphores because the concurrency boundary
-is the object boundary.
+channels, or Erlang actors with mailboxes. Message order helps define
+causality. Each object still protects mutable state according to its
+own concurrency contract.
 
 **Pipelining** is the key trick: instead of waiting for a result
 before making the next call, you can chain calls on *promises*.
@@ -182,11 +184,10 @@ Pipelining `Executor.spawn()` on `Runtime.load(wasm)` avoids waiting for the
 load response before sending the spawn call. This expresses ordering without
 an intermediate blocking wait.
 
-If the user has blockchain background: "This is like how each
-smart contract serializes its own state transitions, but without
-a global block ordering.  There's no block builder because
-there's no global state to sequence — just objects with local
-ordering."
+If the user has blockchain background: "Unlike a smart contract, a
+capability object can have overlapping async calls. There is no global
+block ordering. Each implementation protects its own state, while
+E-ordering constrains message causality."
 
 ### Epochs
 
