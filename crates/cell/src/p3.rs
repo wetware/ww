@@ -448,7 +448,7 @@ mod tests {
         peak_host_call_depth: Arc<AtomicUsize>,
         cache_mode: Option<Arc<CacheMode>>,
         cid_tree: Option<Arc<CidTree>>,
-        writable_descriptors: std::collections::HashSet<u32>,
+        fs_descriptors: crate::fs_intercept::DescriptorContexts,
         _image_root: Option<TempDir>,
         _tree_staging: Option<TempDir>,
         _scratch: TempDir,
@@ -487,7 +487,7 @@ mod tests {
                 table: &mut self.table,
                 cache_mode: &self.cache_mode,
                 cid_tree: &self.cid_tree,
-                writable_descriptors: &mut self.writable_descriptors,
+                descriptors: &mut self.fs_descriptors,
             }
         }
 
@@ -521,7 +521,7 @@ mod tests {
             peak_host_call_depth: Arc::new(AtomicUsize::new(0)),
             cache_mode: None,
             cid_tree: None,
-            writable_descriptors: std::collections::HashSet::new(),
+            fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
             _image_root: Some(image_root),
             _tree_staging: None,
             _scratch: scratch,
@@ -1144,7 +1144,7 @@ mod tests {
                 peak_host_call_depth: Arc::new(AtomicUsize::new(0)),
                 cache_mode: Some(cache),
                 cid_tree: Some(tree),
-                writable_descriptors: std::collections::HashSet::new(),
+                fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
                 _image_root: None,
                 _tree_staging: Some(tree_staging),
                 _scratch: scratch,

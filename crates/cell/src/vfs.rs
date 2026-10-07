@@ -8,7 +8,8 @@
 //!
 //! The root CID can be atomically swapped (via `arc_swap::ArcSwap`) for
 //! epoch updates. Open file descriptors are unaffected because they hold
-//! real staging-dir FDs. New opens after a swap see the new tree.
+//! real staging-dir FDs. Directory descriptors retain a root snapshot and
+//! canonical virtual path for subsequent descriptor-relative opens.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -58,6 +59,33 @@ pub enum ResolvedNode {
     /// Directory backed by a CID. Listing via `ls_dir()`.
     CidDir { cid: String },
 }
+
+/// A resolved node and its canonical path within the captured root.
+#[derive(Debug)]
+pub struct ResolvedPath {
+    pub node: ResolvedNode,
+    pub path: String,
+}
+
+/// Path failures that filesystem interception maps to distinct WASI errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveError {
+    NoEntry,
+    NotDirectory,
+    InvalidPath,
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoEntry => "path entry not found",
+            Self::NotDirectory => "path component is not a directory",
+            Self::InvalidPath => "invalid descriptor-relative path",
+        })
+    }
+}
+
+impl std::error::Error for ResolveError {}
 
 // ── CidTree ───────────────────────────────────────────────────────
 
@@ -208,128 +236,124 @@ impl CidTree {
         Ok(entries)
     }
 
-    /// Resolve a guest path to a `ResolvedNode`.
+    /// Resolve a guest path from a snapshot of the current root.
     ///
-    /// Walks the CID tree from the current root. Symlinks are followed up to
-    /// `MAX_SYMLINK_DEPTH`.
+    /// This compatibility entry point accepts leading slashes. Descriptor-relative
+    /// callers use `resolve_at`, which rejects absolute guest paths.
     pub async fn resolve_path(&self, path: &str) -> Result<ResolvedNode> {
-        self.resolve_path_inner(path, 0).await
+        let root = self.root_cid();
+        Ok(self
+            .resolve_path_inner(&root, path, path.ends_with('/'), 0)
+            .await?
+            .node)
+    }
+
+    /// Resolve `path` relative to a directory in a captured root snapshot.
+    ///
+    /// `base_path` is the canonical root-relative path returned by a prior
+    /// resolution. Empty paths denote the base directory. Repeated separators
+    /// are ignored; dot, percent escapes, and backslashes remain literal names.
+    /// Absolute paths and parent traversal are rejected before any lookup.
+    pub async fn resolve_at(
+        &self,
+        root_cid: &str,
+        base_path: &str,
+        path: &str,
+    ) -> Result<ResolvedPath> {
+        for relative in [base_path, path] {
+            if relative.starts_with('/') || relative.split('/').any(|part| part == "..") {
+                return Err(ResolveError::InvalidPath.into());
+            }
+        }
+        let full_path = if base_path.is_empty() {
+            path.to_string()
+        } else {
+            // Retaining this separator also requires a directory when path is empty.
+            format!("{base_path}/{path}")
+        };
+        self.resolve_path_inner(root_cid, &full_path, full_path.ends_with('/'), 0)
+            .await
     }
 
     fn resolve_path_inner<'a>(
         &'a self,
+        root_cid: &'a str,
         path: &'a str,
+        require_directory: bool,
         symlink_depth: usize,
-    ) -> futures::future::BoxFuture<'a, Result<ResolvedNode>> {
-        Box::pin(self.resolve_path_inner_impl(path, symlink_depth))
+    ) -> futures::future::BoxFuture<'a, Result<ResolvedPath>> {
+        Box::pin(self.resolve_path_inner_impl(root_cid, path, require_directory, symlink_depth))
     }
 
     async fn resolve_path_inner_impl(
         &self,
+        root_cid: &str,
         path: &str,
+        require_directory: bool,
         symlink_depth: usize,
-    ) -> Result<ResolvedNode> {
+    ) -> Result<ResolvedPath> {
         if symlink_depth > MAX_SYMLINK_DEPTH {
             bail!("symlink depth exceeded (max {MAX_SYMLINK_DEPTH})");
         }
-
-        // Normalize: strip leading /
-        let path = path.strip_prefix('/').unwrap_or(path);
-        if path.is_empty() {
-            // Root directory
-            let root = self.root.load_full();
-            return Ok(ResolvedNode::CidDir {
-                cid: (*root).clone(),
-            });
+        if path.split('/').any(|part| part == "..") {
+            return Err(ResolveError::InvalidPath.into());
         }
 
-        // Reject path traversal
-        if path.split('/').any(|seg| seg == "..") {
-            bail!("path traversal (..) not allowed: {path}");
-        }
-
-        // Walk the CID tree from root
-        let root = self.root.load_full();
-        let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-        let mut current_cid = (*root).clone();
+        let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        let mut current_cid = root_cid.to_string();
 
         for (i, component) in components.iter().enumerate() {
             let entries = self.ls_dir(&current_cid).await?;
             let entry = entries
                 .iter()
-                .find(|e| e.name == *component)
+                .find(|entry| entry.name == *component)
+                .ok_or(ResolveError::NoEntry)
                 .with_context(|| {
-                    format!(
-                        "path component '{}' not found in CID {} (full path: {})",
-                        component, current_cid, path
-                    )
+                    format!("path component '{component}' not found in CID {current_cid} (full path: {path})")
                 })?;
-
             let is_last = i == components.len() - 1;
 
             match &entry.entry_type {
-                EntryType::Dir => {
-                    if is_last {
-                        return Ok(ResolvedNode::CidDir {
-                            cid: entry.cid.clone(),
-                        });
-                    }
-                    // Continue walking
-                    current_cid = entry.cid.clone();
-                }
+                EntryType::Dir => current_cid = entry.cid.clone(),
                 EntryType::File => {
-                    if is_last {
-                        return Ok(ResolvedNode::CidFile {
+                    if !is_last || require_directory {
+                        return Err(ResolveError::NotDirectory.into());
+                    }
+                    return Ok(ResolvedPath {
+                        node: ResolvedNode::CidFile {
                             cid: entry.cid.clone(),
                             size: entry.size,
-                        });
-                    }
-                    bail!(
-                        "path component '{}' is a file, not a directory (full path: {})",
-                        component,
-                        path
-                    );
+                        },
+                        path: components.join("/"),
+                    });
                 }
                 EntryType::Symlink { target } => {
-                    // Resolve symlink target. If absolute, resolve from root.
-                    // If relative, resolve from current directory.
-                    let remaining: String = if is_last {
-                        String::new()
+                    let parent = components[..i].join("/");
+                    let mut resolved_target = if target.starts_with('/') || parent.is_empty() {
+                        target.clone()
                     } else {
-                        components[i + 1..].join("/")
+                        format!("{parent}/{target}")
                     };
-
-                    let resolved_target = if target.starts_with('/') {
-                        if remaining.is_empty() {
-                            target.clone()
-                        } else {
-                            format!("{}/{}", target.trim_end_matches('/'), remaining)
-                        }
-                    } else {
-                        // Relative symlink: reconstruct parent path
-                        let parent: String = components[..i].join("/");
-                        let base = if parent.is_empty() {
-                            target.clone()
-                        } else {
-                            format!("{parent}/{target}")
-                        };
-                        if remaining.is_empty() {
-                            base
-                        } else {
-                            format!("{}/{}", base.trim_end_matches('/'), remaining)
-                        }
-                    };
-
+                    if !is_last {
+                        resolved_target.push('/');
+                        resolved_target.push_str(&components[i + 1..].join("/"));
+                    }
                     return self
-                        .resolve_path_inner(&resolved_target, symlink_depth + 1)
+                        .resolve_path_inner(
+                            root_cid,
+                            &resolved_target,
+                            require_directory || resolved_target.ends_with('/'),
+                            symlink_depth + 1,
+                        )
                         .await;
                 }
             }
         }
 
-        // Should not reach here — the loop handles all cases
-        bail!("unexpected end of path resolution: {path}");
+        Ok(ResolvedPath {
+            node: ResolvedNode::CidDir { cid: current_cid },
+            path: components.join("/"),
+        })
     }
 
     /// Reference to the IPFS client (for callers that need file content).
@@ -376,12 +400,217 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    #[test]
-    fn test_path_traversal_rejected() {
-        // Can't test async resolve_path easily without a mock IPFS client,
-        // but we can verify the traversal check logic inline.
-        let path = "etc/../../shadow";
-        assert!(path.split('/').any(|seg| seg == ".."));
+    fn fixture_cid(tag: u8) -> String {
+        cid::Cid::new_v1(
+            0x70,
+            cid::multihash::Multihash::<64>::wrap(0x12, &[tag; 32]).unwrap(),
+        )
+        .to_string()
+    }
+
+    fn fixture_entry(name: &str, tag: u8, entry_type: EntryType) -> DirEntry {
+        DirEntry {
+            name: name.to_string(),
+            cid: fixture_cid(tag),
+            entry_type,
+            size: 7,
+        }
+    }
+
+    fn fixture_listing(staging: &Path, tag: u8, entries: &[DirEntry]) {
+        std::fs::write(
+            staging.join(format!("{}{DIRLIST_SUFFIX}", fixture_cid(tag))),
+            serde_json::to_vec(entries).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn fixture_tree(staging: &Path) -> CidTree {
+        fixture_listing(
+            staging,
+            1,
+            &[
+                fixture_entry("child", 10, EntryType::File),
+                fixture_entry("nested", 2, EntryType::Dir),
+            ],
+        );
+        fixture_listing(
+            staging,
+            2,
+            &[
+                fixture_entry("child", 11, EntryType::File),
+                fixture_entry("deeper", 3, EntryType::Dir),
+            ],
+        );
+        fixture_listing(staging, 3, &[fixture_entry("child", 12, EntryType::File)]);
+        CidTree::new(
+            fixture_cid(1),
+            ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
+            staging.to_path_buf(),
+        )
+    }
+
+    #[tokio::test]
+    async fn resolve_path_rejects_trailing_slash_on_file() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let tree = fixture_tree(staging.path());
+        tree.resolve_path("child/")
+            .await
+            .expect_err("a trailing slash requires a directory");
+    }
+
+    #[tokio::test]
+    async fn resolve_at_keeps_each_base_and_canonical_chained_path() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let tree = fixture_tree(staging.path());
+        let root = tree.root_cid();
+        let nested = tree.resolve_at(&root, "", "nested//").await.unwrap();
+        assert_eq!(nested.path, "nested");
+        let deeper = tree
+            .resolve_at(&root, &nested.path, "deeper")
+            .await
+            .unwrap();
+        assert_eq!(deeper.path, "nested/deeper");
+
+        for (base, expected_path, expected_tag) in [
+            ("", "child", 10),
+            (nested.path.as_str(), "nested/child", 11),
+            (deeper.path.as_str(), "nested/deeper/child", 12),
+        ] {
+            let resolved = tree.resolve_at(&root, base, "child").await.unwrap();
+            assert_eq!(resolved.path, expected_path);
+            assert!(
+                matches!(resolved.node, ResolvedNode::CidFile { cid, .. } if cid == fixture_cid(expected_tag))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_at_preserves_snapshot_and_canonical_symlink_targets() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let tree = fixture_tree(staging.path());
+        fixture_listing(
+            staging.path(),
+            1,
+            &[
+                fixture_entry("nested", 2, EntryType::Dir),
+                fixture_entry(
+                    "relative",
+                    20,
+                    EntryType::Symlink {
+                        target: "nested//deeper".to_string(),
+                    },
+                ),
+                fixture_entry(
+                    "absolute",
+                    21,
+                    EntryType::Symlink {
+                        target: "/nested/deeper".to_string(),
+                    },
+                ),
+            ],
+        );
+        fixture_listing(staging.path(), 4, &[]);
+        fixture_listing(
+            staging.path(),
+            2,
+            &[
+                fixture_entry("child", 11, EntryType::File),
+                fixture_entry("deeper", 3, EntryType::Dir),
+                fixture_entry(
+                    "alias",
+                    22,
+                    EntryType::Symlink {
+                        target: "deeper".to_string(),
+                    },
+                ),
+            ],
+        );
+        let root = tree.root_cid();
+        let nested = tree.resolve_at(&root, "", "nested").await.unwrap();
+        tree.swap_root(fixture_cid(4));
+
+        for path in ["relative", "absolute", "nested/alias"] {
+            let directory = tree.resolve_at(&root, "", path).await.unwrap();
+            assert_eq!(directory.path, "nested/deeper");
+            let child = tree
+                .resolve_at(&root, &directory.path, "child")
+                .await
+                .unwrap();
+            assert_eq!(child.path, "nested/deeper/child");
+            assert!(
+                matches!(child.node, ResolvedNode::CidFile { cid, .. } if cid == fixture_cid(12))
+            );
+        }
+        let child = tree.resolve_at(&root, &nested.path, "child").await.unwrap();
+        assert!(matches!(child.node, ResolvedNode::CidFile { cid, .. } if cid == fixture_cid(11)));
+        assert!(tree.resolve_path("nested/child").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_at_rejects_escape_before_lookup_and_preserves_literal_names() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let tree = fixture_tree(staging.path());
+        let root = tree.root_cid();
+        for path in ["..", "../sibling", "a/../../b", "/child", "//child", "/"] {
+            let error = tree.resolve_at(&root, "missing", path).await.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ResolveError>(),
+                Some(&ResolveError::InvalidPath),
+                "{path}: {error:#}"
+            );
+        }
+        fixture_listing(
+            staging.path(),
+            2,
+            &[
+                fixture_entry("%2e%2e", 30, EntryType::File),
+                fixture_entry("%2f", 31, EntryType::File),
+                fixture_entry("..\\child", 32, EntryType::File),
+                fixture_entry("ipfs", 3, EntryType::Dir),
+            ],
+        );
+        for (path, tag) in [
+            ("%2e%2e", 30),
+            ("%2f", 31),
+            ("..\\child", 32),
+            ("ipfs//child", 12),
+        ] {
+            let resolved = tree.resolve_at(&root, "nested", path).await.unwrap();
+            assert!(
+                matches!(resolved.node, ResolvedNode::CidFile { cid, .. } if cid == fixture_cid(tag))
+            );
+        }
+        let error = tree.resolve_at(&root, "nested", ".").await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ResolveError>(),
+            Some(&ResolveError::NoEntry)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_at_distinguishes_missing_entries_and_non_directories() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let tree = fixture_tree(staging.path());
+        let root = tree.root_cid();
+        for (base, path, expected) in [
+            ("", "missing", ResolveError::NoEntry),
+            ("nested", "missing", ResolveError::NoEntry),
+            ("", "child/", ResolveError::NotDirectory),
+            ("", "child/other", ResolveError::NotDirectory),
+            ("child", "", ResolveError::NotDirectory),
+            ("child", "other", ResolveError::NotDirectory),
+        ] {
+            let error = tree.resolve_at(&root, base, path).await.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ResolveError>(),
+                Some(&expected),
+                "{base}/{path}: {error:#}"
+            );
+        }
+        let directory = tree.resolve_at(&root, "nested", "").await.unwrap();
+        assert_eq!(directory.path, "nested");
+        assert!(matches!(directory.node, ResolvedNode::CidDir { cid } if cid == fixture_cid(2)));
     }
 
     #[test]
