@@ -110,6 +110,10 @@ pub(crate) struct IpfsCidPath {
 }
 
 /// Parse a relative path like `ipfs/QmHash/sub/file` into CID + subpath.
+///
+/// The CID spelling occupies one path segment. Bare-CID boundaries can accept
+/// multibase spellings that contain `/`, but this path grammar does not add
+/// escaping, percent decoding, or longest-prefix framing for those spellings.
 /// Returns None if the path doesn't start with `ipfs/` or contains path
 /// traversal components (`..`).
 pub(crate) fn parse_ipfs_path(path: &str) -> Option<IpfsCidPath> {

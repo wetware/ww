@@ -209,6 +209,41 @@ async fn alias_root_routes_through_own_tree() {
 }
 
 #[tokio::test]
+async fn slash_bearing_bare_alias_does_not_change_single_segment_path_grammar() {
+    let (mut store, _, _) = harness();
+    let cid = cid::Cid::new_v1(
+        0x55,
+        cid::multihash::Multihash::<64>::wrap(0x12, &[255; 32]).unwrap(),
+    );
+    let alias = cid.to_string_of_base(cid::multibase::Base::Base64).unwrap();
+    assert!(alias.contains('/'));
+    assert_eq!(ipfs::cid_identity::parse_cid(&alias).unwrap(), cid);
+
+    store.data_mut().tree = Some(Arc::new(CidTree::new(
+        cid,
+        ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+        store.data().staging.path().into(),
+    )));
+    let dirs =
+        p3_preopens::Host::get_directories(&mut store.data_mut().intercepted_filesystem()).unwrap();
+    let root = dirs.iter().find(|(_, path)| path == "/").unwrap().0.rep();
+    let path = format!("ipfs/{alias}/child");
+
+    assert!(parse_ipfs_path(&path).is_none());
+    match store
+        .data_mut()
+        .intercepted_filesystem()
+        .route_open(&Resource::new_borrow(root), &path)
+        .unwrap()
+    {
+        OpenRoute::CidTree(_, relative) => assert_eq!(relative, path),
+        OpenRoute::Ipfs(_) | OpenRoute::Wasi { .. } => {
+            panic!("slash-bearing CID text must not select a path-form IPFS route")
+        }
+    }
+}
+
+#[tokio::test]
 async fn chained_directory_opens_keep_base_context() {
     let (mut store, root, _) = harness();
     let nested = read_open(&mut store, root, "nested").await.unwrap();
