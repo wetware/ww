@@ -448,7 +448,7 @@ mod tests {
         peak_host_call_depth: Arc<AtomicUsize>,
         cache_mode: Option<Arc<CacheMode>>,
         cid_tree: Option<Arc<CidTree>>,
-        writable_descriptors: std::collections::HashSet<u32>,
+        fs_descriptors: crate::fs_intercept::DescriptorContexts,
         _image_root: Option<TempDir>,
         _tree_staging: Option<TempDir>,
         _scratch: TempDir,
@@ -487,7 +487,7 @@ mod tests {
                 table: &mut self.table,
                 cache_mode: &self.cache_mode,
                 cid_tree: &self.cid_tree,
-                writable_descriptors: &mut self.writable_descriptors,
+                descriptors: &mut self.fs_descriptors,
             }
         }
 
@@ -521,7 +521,7 @@ mod tests {
             peak_host_call_depth: Arc::new(AtomicUsize::new(0)),
             cache_mode: None,
             cid_tree: None,
-            writable_descriptors: std::collections::HashSet::new(),
+            fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
             _image_root: Some(image_root),
             _tree_staging: None,
             _scratch: scratch,
@@ -1068,8 +1068,35 @@ mod tests {
     }
 
     struct CountingPinner {
-        bytes: Vec<u8>,
+        contents: std::collections::HashMap<Cid, Vec<u8>>,
         fetches: AtomicUsize,
+    }
+
+    fn fixture_cid(seed: u8) -> Cid {
+        Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::wrap(0x12, &[seed; 32]).unwrap(),
+        )
+    }
+
+    fn filesystem_contents() -> std::collections::HashMap<Cid, Vec<u8>> {
+        let mut contents = std::collections::HashMap::from([(
+            TEST_CID.parse().unwrap(),
+            b"lazy image bytes".to_vec(),
+        )]);
+        for (seed, bytes) in [
+            (10, b"root child".as_slice()),
+            (11, b"nested child".as_slice()),
+            (12, b"deep child".as_slice()),
+            (13, b"sibling child".as_slice()),
+            (14, b"nested ipfs child".as_slice()),
+            (15, b"literal dot escape".as_slice()),
+            (16, b"literal slash escape".as_slice()),
+            (17, b"literal backslash".as_slice()),
+        ] {
+            contents.insert(fixture_cid(seed), bytes.to_vec());
+        }
+        contents
     }
 
     #[async_trait]
@@ -1082,13 +1109,16 @@ mod tests {
             Ok(())
         }
 
-        async fn fetch(&self, _cid: &Cid) -> Result<Vec<u8>> {
+        async fn fetch(&self, cid: &Cid) -> Result<Vec<u8>> {
             self.fetches.fetch_add(1, Ordering::AcqRel);
-            Ok(self.bytes.clone())
+            self.contents
+                .get(cid)
+                .cloned()
+                .context("unknown fixture CID")
         }
 
-        async fn size(&self, _cid: &Cid) -> Result<u64> {
-            Ok(self.bytes.len() as u64)
+        async fn size(&self, cid: &Cid) -> Result<u64> {
+            Ok(self.contents.get(cid).context("unknown fixture CID")?.len() as u64)
         }
     }
 
@@ -1106,18 +1136,52 @@ mod tests {
         let tree_staging = TempDir::new()?;
         let scratch = TempDir::new()?;
         let cid: Cid = TEST_CID.parse()?;
-        let entries = vec![DirEntry {
-            name: "known.txt".to_string(),
+        let entry = |name: &str, cid: Cid, entry_type: EntryType| DirEntry {
+            name: name.to_string(),
             cid: cid.to_string(),
-            entry_type: EntryType::File,
-            size: pinner.bytes.len() as u64,
-        }];
-        std::fs::write(
-            tree_staging.path().join(format!("{cid}.dirlist.json")),
-            serde_json::to_vec(&entries)?,
-        )?;
+            size: pinner
+                .contents
+                .get(&cid)
+                .map_or(0, |bytes| bytes.len() as u64),
+            entry_type,
+        };
+        let file = |name: &str, seed| entry(name, fixture_cid(seed), EntryType::File);
+        let dir = |name: &str, seed| entry(name, fixture_cid(seed), EntryType::Dir);
+        for (seed, entries) in [
+            (
+                1,
+                vec![
+                    entry("known.txt", cid, EntryType::File),
+                    file("child", 10),
+                    dir("nested", 2),
+                    dir("sibling", 4),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    file("child", 11),
+                    dir("deeper", 3),
+                    dir("ipfs", 5),
+                    file("%2e%2e", 15),
+                    file("%2f", 16),
+                    file(r"back\slash", 17),
+                ],
+            ),
+            (3, vec![file("child", 12)]),
+            (4, vec![file("child", 13)]),
+            (5, vec![dir(TEST_CID, 6)]),
+            (6, vec![file("child", 14)]),
+        ] {
+            std::fs::write(
+                tree_staging
+                    .path()
+                    .join(format!("{}.dirlist.json", fixture_cid(seed))),
+                serde_json::to_vec(&entries)?,
+            )?;
+        }
         let tree = Arc::new(CidTree::new(
-            cid.to_string(),
+            fixture_cid(1).to_string(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             tree_staging.path().to_path_buf(),
         ));
@@ -1144,7 +1208,7 @@ mod tests {
                 peak_host_call_depth: Arc::new(AtomicUsize::new(0)),
                 cache_mode: Some(cache),
                 cid_tree: Some(tree),
-                writable_descriptors: std::collections::HashSet::new(),
+                fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
                 _image_root: None,
                 _tree_staging: Some(tree_staging),
                 _scratch: scratch,
@@ -1158,7 +1222,7 @@ mod tests {
     async fn p3_filesystem_matches_cid_tree_policy_and_cleans_up() -> Result<()> {
         let (_host, grant) = HostTransport::bounded_pair();
         let pinner = Arc::new(CountingPinner {
-            bytes: b"lazy image bytes".to_vec(),
+            contents: filesystem_contents(),
             fetches: AtomicUsize::new(0),
         });
         let (state, paths) = filesystem_state(grant, Arc::clone(&pinner))?;
@@ -1178,7 +1242,21 @@ mod tests {
         assert!(observed.traversal_rejected);
         assert!(observed.image_write_rejected);
         assert_eq!(observed.scratch, b"scratch-data");
-        assert_eq!(pinner.fetches.load(Ordering::Acquire), 1);
+        // Every unique file is fetched once despite repeated descriptor opens.
+        assert_eq!(
+            pinner.fetches.load(Ordering::Acquire),
+            pinner.contents.len()
+        );
+        for (cid, expected) in &pinner.contents {
+            assert_eq!(
+                &std::fs::read(paths.cache_staging.join(cid.to_string()))?,
+                expected
+            );
+        }
+        assert_eq!(
+            std::fs::read(paths.scratch.join("nested/raw-probe.txt"))?,
+            b"nested raw scratch appended"
+        );
         assert_eq!(std::fs::read(&paths.materialized)?, b"lazy image bytes");
         assert_eq!(
             std::fs::read(paths.scratch.join("probe.txt"))?,

@@ -1,5 +1,6 @@
 use futures::future::join3;
 use std::fs;
+use wasip3::filesystem::types::{Descriptor, DescriptorFlags, ErrorCode, OpenFlags, PathFlags};
 use wit_bindgen::{StreamResult, StreamWriter};
 
 wit_bindgen::generate!({
@@ -43,6 +44,283 @@ fn open() -> (
     let (outgoing, outgoing_reader) = wit_stream::new();
     let (incoming, completion) = wetware::transport::connection::open(outgoing_reader);
     (outgoing, incoming, completion)
+}
+
+async fn open_file(base: &Descriptor, path: &str) -> Descriptor {
+    base.open_at(
+        PathFlags::empty(),
+        path.to_string(),
+        OpenFlags::empty(),
+        DescriptorFlags::READ,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("open {path}: {error:?}"))
+}
+
+async fn read_file(file: &Descriptor) -> Vec<u8> {
+    let (reader, completion) = file.read_via_stream(0);
+    let (bytes, result) = futures::join!(read_to_end(reader), async { completion.await });
+    result.expect("file read completion");
+    bytes
+}
+
+async fn assert_open_error(
+    base: &Descriptor,
+    path: &str,
+    open_flags: OpenFlags,
+    flags: DescriptorFlags,
+    expected: ErrorCode,
+) {
+    match base
+        .open_at(PathFlags::empty(), path.to_string(), open_flags, flags)
+        .await
+    {
+        Ok(_) => panic!("open {path} with {open_flags:?}/{flags:?} unexpectedly succeeded"),
+        Err(error) => assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected),
+            "open {path} with {open_flags:?}/{flags:?}: expected {expected:?}, got {error:?}"
+        ),
+    }
+}
+
+async fn write_file(file: &Descriptor, bytes: &[u8], append: bool) {
+    let (writer, reader) = wasip3::wit_stream::new();
+    let completion = if append {
+        file.append_via_stream(reader)
+    } else {
+        file.write_via_stream(reader, 0)
+    };
+    let ((), result) = futures::join!(write_and_close(writer, bytes.to_vec()), async {
+        completion.await
+    });
+    result.expect("file write completion");
+}
+
+async fn assert_mutation_flags(base: &Descriptor, directory_name: &str) {
+    // Reject every nonempty combination before any file contents are requested.
+    for mask in 1..32 {
+        let mut open_flags = OpenFlags::empty();
+        let mut flags = DescriptorFlags::READ;
+        if mask & 1 != 0 {
+            flags |= DescriptorFlags::WRITE;
+        }
+        if mask & 2 != 0 {
+            flags |= DescriptorFlags::MUTATE_DIRECTORY;
+        }
+        if mask & 4 != 0 {
+            open_flags |= OpenFlags::CREATE;
+        }
+        if mask & 8 != 0 {
+            open_flags |= OpenFlags::EXCLUSIVE;
+        }
+        if mask & 16 != 0 {
+            open_flags |= OpenFlags::TRUNCATE;
+        }
+        for directory in [OpenFlags::empty(), OpenFlags::DIRECTORY] {
+            for target in ["child", "missing", directory_name] {
+                assert_open_error(
+                    base,
+                    target,
+                    open_flags | directory,
+                    flags,
+                    ErrorCode::NotPermitted,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn raw_filesystem_policy() {
+    let preopens = wasip3::filesystem::preopens::get_directories();
+    let root = &preopens.iter().find(|(_, path)| path == "/").unwrap().0;
+    let scratch = &preopens.iter().find(|(_, path)| path == "/tmp").unwrap().0;
+
+    assert_mutation_flags(root, "nested").await;
+
+    // A directory remains a valid open result without DIRECTORY intent.
+    let nested = open_file(root, "nested").await;
+    assert_mutation_flags(&nested, "deeper").await;
+    let sibling = open_file(root, "sibling").await;
+    let deeper = nested
+        .open_at(
+            PathFlags::empty(),
+            "deeper".into(),
+            OpenFlags::DIRECTORY,
+            DescriptorFlags::READ,
+        )
+        .await
+        .unwrap();
+    for (base, expected) in [
+        (root, b"root child".as_slice()),
+        (&nested, b"nested child".as_slice()),
+        (&deeper, b"deep child".as_slice()),
+        (&sibling, b"sibling child".as_slice()),
+        (&nested, b"nested child".as_slice()),
+    ] {
+        assert_eq!(read_file(&open_file(base, "child").await).await, expected);
+    }
+
+    for path in [
+        "..",
+        "../sibling",
+        "a/../../b",
+        "/child",
+        "//child",
+        "/nested/child",
+    ] {
+        assert_open_error(
+            &nested,
+            path,
+            OpenFlags::empty(),
+            DescriptorFlags::READ,
+            ErrorCode::Invalid,
+        )
+        .await;
+    }
+    for path in [".", "missing"] {
+        assert_open_error(
+            &nested,
+            path,
+            OpenFlags::empty(),
+            DescriptorFlags::READ,
+            ErrorCode::NoEntry,
+        )
+        .await;
+    }
+    assert_eq!(
+        read_file(&open_file(&nested, "deeper//child").await).await,
+        b"deep child"
+    );
+    for (path, expected) in [
+        ("%2e%2e", b"literal dot escape".as_slice()),
+        ("%2f", b"literal slash escape".as_slice()),
+        (r"back\slash", b"literal backslash".as_slice()),
+        (
+            "ipfs/QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG/child",
+            b"nested ipfs child".as_slice(),
+        ),
+    ] {
+        assert_eq!(read_file(&open_file(&nested, path).await).await, expected);
+    }
+
+    let child = open_file(&nested, "child").await;
+    assert_open_error(
+        &child,
+        "child",
+        OpenFlags::empty(),
+        DescriptorFlags::READ,
+        ErrorCode::NotDirectory,
+    )
+    .await;
+    assert_open_error(
+        &child,
+        "missing",
+        OpenFlags::CREATE,
+        DescriptorFlags::WRITE,
+        ErrorCode::NotDirectory,
+    )
+    .await;
+    assert_open_error(
+        &nested,
+        "child",
+        OpenFlags::DIRECTORY,
+        DescriptorFlags::READ,
+        ErrorCode::NotDirectory,
+    )
+    .await;
+    for path in ["child/", "child/other"] {
+        assert_open_error(
+            &nested,
+            path,
+            OpenFlags::empty(),
+            DescriptorFlags::READ,
+            ErrorCode::NotDirectory,
+        )
+        .await;
+    }
+    let (reader, completion) = nested.read_via_stream(0);
+    let (bytes, result) = futures::join!(read_to_end(reader), async { completion.await });
+    assert!(bytes.is_empty());
+    assert!(
+        matches!(result, Err(ErrorCode::IsDirectory)),
+        "directory read: {result:?}"
+    );
+
+    // Observe each terminal future, including early host rejection of input.
+    for append in [false, true] {
+        let (mut writer, reader) = wasip3::wit_stream::new();
+        let completion = if append {
+            child.append_via_stream(reader)
+        } else {
+            child.write_via_stream(reader, 0)
+        };
+        let send = async move {
+            let _ = writer.write_all(b"mutated".to_vec()).await;
+            drop(writer);
+        };
+        let ((), result) = futures::join!(send, async { completion.await });
+        assert!(
+            matches!(result, Err(ErrorCode::NotPermitted)),
+            "immutable write: {result:?}"
+        );
+    }
+    assert_eq!(read_file(&child).await, b"nested child");
+
+    scratch
+        .create_directory_at("nested".into())
+        .await
+        .expect("create nested scratch directory");
+    let nested_scratch = scratch
+        .open_at(
+            PathFlags::empty(),
+            "nested".into(),
+            OpenFlags::DIRECTORY,
+            DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+        )
+        .await
+        .expect("open nested scratch directory");
+    let writable = nested_scratch
+        .open_at(
+            PathFlags::empty(),
+            "raw-probe.txt".into(),
+            OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+            DescriptorFlags::READ | DescriptorFlags::WRITE,
+        )
+        .await
+        .unwrap();
+    write_file(&writable, b"discarded contents", false).await;
+    write_file(&writable, b" appended", true).await;
+    assert_eq!(read_file(&writable).await, b"discarded contents appended");
+    drop(writable);
+    let writable = nested_scratch
+        .open_at(
+            PathFlags::empty(),
+            "raw-probe.txt".into(),
+            OpenFlags::TRUNCATE,
+            DescriptorFlags::READ | DescriptorFlags::WRITE,
+        )
+        .await
+        .unwrap();
+    assert!(read_file(&writable).await.is_empty());
+    write_file(&writable, b"nested raw scratch", false).await;
+    write_file(&writable, b" appended", true).await;
+    assert_eq!(read_file(&writable).await, b"nested raw scratch appended");
+
+    // Drop both descriptor classes, then open replacements while siblings live.
+    drop(deeper);
+    drop(writable);
+    let replacement = open_file(&sibling, "child").await;
+    assert_eq!(read_file(&replacement).await, b"sibling child");
+    assert_open_error(
+        &nested,
+        "child",
+        OpenFlags::TRUNCATE,
+        DescriptorFlags::WRITE,
+        ErrorCode::NotPermitted,
+    )
+    .await;
 }
 
 impl exports::wetware::transport::fixture::Guest for Fixture {
@@ -113,6 +391,7 @@ impl exports::wetware::transport::fixture::Guest for Fixture {
     }
 
     async fn filesystem() -> exports::wetware::transport::fixture::FilesystemObservation {
+        raw_filesystem_policy().await;
         let image = fs::read("/known.txt").expect("read image-backed file");
         let missing_rejected = fs::read("/missing.txt").is_err();
         let traversal_rejected = fs::read("/../ambient-secret").is_err();

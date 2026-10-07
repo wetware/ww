@@ -8,10 +8,11 @@
 //! When no CidTree is present, falls back to the original behavior: intercepts
 //! only explicit `/ipfs/<CID>/…` paths via the pinset cache.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::proc::ComponentRunStates;
-use crate::vfs::{CidTree, ResolvedNode};
+use crate::vfs::{CidTree, ResolveError, ResolvedNode};
 use anyhow::Result;
 use wasmtime::component::{HasData, Linker, Resource};
 use wasmtime_wasi::filesystem::{WasiFilesystemCtx, WasiFilesystemCtxView};
@@ -31,7 +32,7 @@ pub(crate) struct IpfsFilesystemView<'a> {
     pub table: &'a mut wasmtime::component::ResourceTable,
     pub cache_mode: &'a Option<Arc<cache::CacheMode>>,
     pub cid_tree: &'a Option<Arc<CidTree>>,
-    pub writable_descriptors: &'a mut std::collections::HashSet<u32>,
+    pub descriptors: &'a mut DescriptorContexts,
 }
 
 impl IpfsFilesystemView<'_> {
@@ -54,7 +55,7 @@ fn ipfs_filesystem(state: &mut ComponentRunStates) -> IpfsFilesystemView<'_> {
         table: &mut state.resource_table,
         cache_mode: &state.cache_mode,
         cid_tree: &state.cid_tree,
-        writable_descriptors: &mut state.writable_fs_descriptors,
+        descriptors: &mut state.fs_descriptors,
     }
 }
 
@@ -131,31 +132,72 @@ pub(crate) fn parse_ipfs_path(path: &str) -> Option<IpfsCidPath> {
     })
 }
 
-enum OpenRoute {
-    CidTree(Arc<CidTree>, String),
-    Ipfs(IpfsCidPath),
-    Wasi,
+/// Virtual identity is independent of host materialization paths and current roots.
+#[derive(Clone)]
+pub(crate) struct CidDirectoryContext {
+    tree: Arc<CidTree>,
+    root: Arc<String>,
+    path: String,
 }
 
-fn route_open(cid_tree: Option<&Arc<CidTree>>, path: &str) -> OpenRoute {
-    if let Some(cid_tree) = cid_tree {
-        let rooted_subpath = parse_ipfs_path(path)
-            .filter(|parsed| parsed.cid.to_string() == *cid_tree.root_cid())
-            .map(|parsed| parsed.subpath);
-        let is_other_ipfs = parse_ipfs_path(path)
-            .map(|parsed| parsed.cid.to_string() != *cid_tree.root_cid())
-            .unwrap_or(false);
-        if !is_other_ipfs {
-            return OpenRoute::CidTree(
-                Arc::clone(cid_tree),
-                rooted_subpath.unwrap_or_else(|| path.to_string()),
-            );
-        }
-    }
+/// Metadata follows resource-table ownership. Only preopened `/` descriptors
+/// can select the global IPFS route; returned directories stay in their namespace.
+#[derive(Default)]
+pub(crate) struct DescriptorContexts {
+    directories: HashMap<u32, CidDirectoryContext>,
+    roots: HashSet<u32>,
+    writable: HashSet<u32>,
+}
 
-    match parse_ipfs_path(path) {
-        Some(path) => OpenRoute::Ipfs(path),
-        None => OpenRoute::Wasi,
+impl DescriptorContexts {
+    fn remove(&mut self, id: u32) {
+        self.directories.remove(&id);
+        self.roots.remove(&id);
+        self.writable.remove(&id);
+    }
+}
+
+enum OpenRoute {
+    CidTree(CidDirectoryContext, String),
+    Ipfs(IpfsCidPath),
+    Wasi { writable: bool },
+}
+
+impl IpfsFilesystemView<'_> {
+    fn route_open(
+        &self,
+        descriptor: &Resource<wasmtime_wasi::filesystem::Descriptor>,
+        path: &str,
+    ) -> P3FilesystemResult<OpenRoute> {
+        // Validate the actual resource before consulting metadata or flags.
+        if !matches!(
+            self.table.get(descriptor)?,
+            wasmtime_wasi::filesystem::Descriptor::Dir(_)
+        ) {
+            return Err(p3_types::ErrorCode::NotDirectory.into());
+        }
+        let id = descriptor.rep();
+        if self.descriptors.writable.contains(&id) {
+            return Ok(OpenRoute::Wasi { writable: true });
+        }
+        let root = self.descriptors.roots.contains(&id);
+        if let Some(context) = self.descriptors.directories.get(&id) {
+            if root {
+                if let Some(parsed) = parse_ipfs_path(path) {
+                    if parsed.cid.to_string() != *context.root {
+                        return Ok(OpenRoute::Ipfs(parsed));
+                    }
+                    return Ok(OpenRoute::CidTree(context.clone(), parsed.subpath));
+                }
+            }
+            return Ok(OpenRoute::CidTree(context.clone(), path.to_string()));
+        }
+        if root {
+            if let Some(parsed) = parse_ipfs_path(path) {
+                return Ok(OpenRoute::Ipfs(parsed));
+            }
+        }
+        Ok(OpenRoute::Wasi { writable: false })
     }
 }
 
@@ -207,6 +249,7 @@ pub(crate) enum MaterializeError {
     Io,
     NoEntry,
     NotPermitted,
+    NotDirectory,
 }
 
 impl From<MaterializeError> for p3_types::ErrorCode {
@@ -216,10 +259,12 @@ impl From<MaterializeError> for p3_types::ErrorCode {
             MaterializeError::Io => Self::Io,
             MaterializeError::NoEntry => Self::NoEntry,
             MaterializeError::NotPermitted => Self::NotPermitted,
+            MaterializeError::NotDirectory => Self::NotDirectory,
         }
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn materialize_cid_tree_descriptor(
     cache: Option<&cache::CacheMode>,
     cid_tree: &CidTree,
@@ -235,6 +280,23 @@ pub(crate) async fn materialize_cid_tree_descriptor(
         MaterializeError::NoEntry
     })?;
 
+    materialize_resolved_descriptor(cache, cid_tree, resolved).await
+}
+
+fn resolution_error(error: anyhow::Error) -> MaterializeError {
+    match error.downcast_ref::<ResolveError>() {
+        Some(ResolveError::NoEntry) => MaterializeError::NoEntry,
+        Some(ResolveError::NotDirectory) => MaterializeError::NotDirectory,
+        Some(ResolveError::InvalidPath) => MaterializeError::Invalid,
+        None => MaterializeError::Io,
+    }
+}
+
+async fn materialize_resolved_descriptor(
+    cache: Option<&cache::CacheMode>,
+    cid_tree: &CidTree,
+    resolved: ResolvedNode,
+) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
     match resolved {
         ResolvedNode::CidFile { cid, .. } => {
             let cache = cache.ok_or(MaterializeError::Io)?;
@@ -405,8 +467,10 @@ impl p3_types::HostDescriptor for IpfsFilesystemView<'_> {
         &mut self,
         descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
     ) -> wasmtime::Result<()> {
-        self.writable_descriptors.remove(&descriptor.rep());
-        p3_types::HostDescriptor::drop(&mut self.as_wasi_view(), descriptor)
+        let id = descriptor.rep();
+        p3_types::HostDescriptor::drop(&mut self.as_wasi_view(), descriptor)?;
+        self.descriptors.remove(id);
+        Ok(())
     }
 }
 
@@ -416,8 +480,22 @@ impl p3_preopens::Host for IpfsFilesystemView<'_> {
     ) -> wasmtime::Result<Vec<(Resource<wasmtime_wasi::filesystem::Descriptor>, String)>> {
         let directories = p3_preopens::Host::get_directories(&mut self.as_wasi_view())?;
         for (descriptor, path) in &directories {
+            let id = descriptor.rep();
+            self.descriptors.remove(id);
             if path == "/tmp" {
-                self.writable_descriptors.insert(descriptor.rep());
+                self.descriptors.writable.insert(id);
+            } else if path == "/" {
+                self.descriptors.roots.insert(id);
+                if let Some(tree) = self.cid_tree {
+                    self.descriptors.directories.insert(
+                        id,
+                        CidDirectoryContext {
+                            tree: Arc::clone(tree),
+                            root: tree.root_cid(),
+                            path: String::new(),
+                        },
+                    );
+                }
             }
         }
         Ok(directories)
@@ -647,13 +725,14 @@ impl<T: FilesystemHostState> p3_types::HostDescriptorWithStore<T> for IpfsFilesy
         open_flags: p3_types::OpenFlags,
         flags: p3_types::DescriptorFlags,
     ) -> P3FilesystemResult<Resource<wasmtime_wasi::filesystem::Descriptor>> {
-        let writable = store.with(|mut access| {
-            access
-                .get()
-                .writable_descriptors
-                .contains(&descriptor.rep())
-        });
-        if writable {
+        let (cache, route) = store.with(|mut access| {
+            let view = access.get();
+            Ok::<_, P3FilesystemError>((
+                view.cache_mode.clone(),
+                view.route_open(&descriptor, &path)?,
+            ))
+        })?;
+        if let OpenRoute::Wasi { writable } = route {
             let opened = <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::open_at(
                 &p3_wasi_accessor(store),
                 descriptor,
@@ -664,49 +743,66 @@ impl<T: FilesystemHostState> p3_types::HostDescriptorWithStore<T> for IpfsFilesy
             )
             .await?;
             store.with(|mut access| {
-                access.get().writable_descriptors.insert(opened.rep());
+                let view = access.get();
+                view.descriptors.remove(opened.rep());
+                if writable {
+                    view.descriptors.writable.insert(opened.rep());
+                }
             });
             return Ok(opened);
         }
 
-        let (cache, route) = store.with(|mut access| {
-            let view = access.get();
-            (
-                view.cache_mode.clone(),
-                route_open(view.cid_tree.as_ref(), &path),
-            )
-        });
-        let write_requested = flags.contains(p3_types::DescriptorFlags::WRITE);
-        let descriptor = match route {
-            OpenRoute::CidTree(cid_tree, target) => {
-                materialize_cid_tree_descriptor(
-                    cache.as_deref(),
-                    &cid_tree,
-                    &target,
-                    write_requested,
-                )
-                .await
+        // Immutable intent is rejected before resolving any target or changing staging.
+        if flags.intersects(
+            p3_types::DescriptorFlags::WRITE | p3_types::DescriptorFlags::MUTATE_DIRECTORY,
+        ) || open_flags.intersects(
+            p3_types::OpenFlags::CREATE
+                | p3_types::OpenFlags::EXCLUSIVE
+                | p3_types::OpenFlags::TRUNCATE,
+        ) {
+            return Err(p3_types::ErrorCode::NotPermitted.into());
+        }
+        let (opened, context) = match route {
+            OpenRoute::CidTree(mut context, target) => {
+                let resolved = context
+                    .tree
+                    .resolve_at(&context.root, &context.path, &target)
+                    .await
+                    .map_err(resolution_error)
+                    .map_err(p3_types::ErrorCode::from)?;
+                let directory = matches!(resolved.node, ResolvedNode::CidDir { .. });
+                if !directory && open_flags.contains(p3_types::OpenFlags::DIRECTORY) {
+                    return Err(p3_types::ErrorCode::NotDirectory.into());
+                }
+                let opened =
+                    materialize_resolved_descriptor(cache.as_deref(), &context.tree, resolved.node)
+                        .await
+                        .map_err(p3_types::ErrorCode::from)?;
+                context.path = resolved.path;
+                (opened, directory.then_some(context))
             }
             OpenRoute::Ipfs(ipfs_path) => {
-                materialize_ipfs_descriptor(cache.as_deref(), &ipfs_path, write_requested).await
+                let opened = materialize_ipfs_descriptor(cache.as_deref(), &ipfs_path, false)
+                    .await
+                    .map_err(p3_types::ErrorCode::from)?;
+                if (open_flags.contains(p3_types::OpenFlags::DIRECTORY) || path.ends_with('/'))
+                    && !matches!(opened, wasmtime_wasi::filesystem::Descriptor::Dir(_))
+                {
+                    return Err(p3_types::ErrorCode::NotDirectory.into());
+                }
+                (opened, None)
             }
-            OpenRoute::Wasi => {
-                return <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::open_at(
-                    &p3_wasi_accessor(store),
-                    descriptor,
-                    path_flags,
-                    path,
-                    open_flags,
-                    flags,
-                )
-                .await;
+            OpenRoute::Wasi { .. } => unreachable!(),
+        };
+        store.with(|mut access| {
+            let view = access.get();
+            let opened = view.table.push(opened)?;
+            view.descriptors.remove(opened.rep());
+            if let Some(context) = context {
+                view.descriptors.directories.insert(opened.rep(), context);
             }
-        }
-        .map_err(|error| P3FilesystemError::from(p3_types::ErrorCode::from(error)))?;
-
-        store
-            .with(|mut access| access.get().table.push(descriptor))
-            .map_err(P3FilesystemError::from)
+            Ok(opened)
+        })
     }
 
     async fn readlink_at(
@@ -1560,3 +1656,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "fs_intercept_tests.rs"]
+mod descriptor_tests;

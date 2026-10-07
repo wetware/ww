@@ -676,11 +676,11 @@ pub struct ComponentRunStates {
     /// When `Some`, the guest filesystem is backed by a CidTree
     /// instead of a preopened host directory.
     pub cid_tree: Option<std::sync::Arc<crate::vfs::CidTree>>,
-    /// Descriptor identities rooted at the private writable `/tmp` preopen.
+    /// CidTree directory contexts, root routing entries, and private `/tmp` identities.
     ///
     /// The CidTree interceptor uses this execution-context state to delegate
     /// scratch operations to WASI without making the image root writable.
-    pub(crate) writable_fs_descriptors: std::collections::HashSet<u32>,
+    pub(crate) fs_descriptors: crate::fs_intercept::DescriptorContexts,
     /// EWMA estimator and one-shot fuel authority ledgers.
     pub fuel_estimator: FuelEstimator,
     /// Epoch subscription paired with this Store's Wasmtime Engine.
@@ -1386,7 +1386,7 @@ impl Proc {
             granted_transport,
             cache_mode,
             cid_tree,
-            writable_fs_descriptors: std::collections::HashSet::new(),
+            fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
             fuel_estimator,
             epoch_clock,
             opened_epoch,
@@ -1842,7 +1842,7 @@ mod tests {
             granted_transport,
             cache_mode: None,
             cid_tree: None,
-            writable_fs_descriptors: std::collections::HashSet::new(),
+            fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
             fuel_estimator,
             epoch_clock,
             opened_epoch,
