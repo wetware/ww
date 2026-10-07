@@ -138,6 +138,11 @@ jobs:
       with:
         toolchain: nightly-2026-08-30
 
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: fuzz-corpus
+        workspaces: fuzz -> target
+
     - name: Install cargo-fuzz
       run: cargo install cargo-fuzz --version 0.13.2 --locked
 
@@ -247,19 +252,23 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
       with:
-        key: build-test
+        # `key` is job-specific; share dependency artifacts with the test job.
+        shared-key: build-test
 
     - name: Build host workspace test binaries
       run: cargo build --workspace --tests
 
   build-wasm:
     name: Build native wasm32-wasip3 components
-    needs: [build]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
       with:
         submodules: recursive
+
+    # The native fixture's host tests use stable via rust-toolchain.toml.
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
 
     - name: Install pinned Rust nightly
       uses: dtolnay/rust-toolchain@nightly
@@ -294,12 +303,13 @@ jobs:
         echo "WASI_SDK_PATH=$tool_dir/wasi-sdk-34.0-x86_64-linux" >> "$GITHUB_ENV"
         echo "WASM_TOOLS=$tool_dir/wasm-tools-1.258.0-x86_64-linux/wasm-tools" >> "$GITHUB_ENV"
 
-    - name: Build and validate native P3 fixture
-      run: make test-p3-fixture
-
     - uses: Swatinem/rust-cache@v2
       with:
         key: wasm-p3
+
+    # The fixture also compiles host-side cell tests, so restore before it runs.
+    - name: Build and validate native P3 fixture
+      run: make test-p3-fixture
 
     - name: Build and validate first-party P3 components
       run: make test-wasm
@@ -381,7 +391,7 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
       with:
-        key: build-test
+        shared-key: build-test
 
     - name: Download validated P3 components
       uses: actions/download-artifact@v8
@@ -396,11 +406,13 @@ jobs:
         test -s examples/discovery/bin/discovery.wasm
         test -s target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
 
-    - name: Run host workspace tests (hot cache from build job)
+    - name: Run host workspace tests
       run: cargo test --workspace -- --test-threads=2
       env:
         WW_TEST_REQUIRE_KUBO: "1"
         WW_USE_PREBUILT_AUTHORITY_PROBE: "1"
+        # Reuse compiled WASM across fresh engines within this job.
+        WW_CWASM_DIR: ${{ runner.temp }}/ww-cwasm
 
     - name: Smoke-test Chess authority proof command
       run: |
