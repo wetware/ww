@@ -221,6 +221,9 @@ A write cancelled by local close may have delivered a prefix. Process stdin
 uses a separate `ByteStream`; its accepted buffer remains readable before EOF
 after write-then-close.
 
+Closing a stream returned by `StreamDialer.dial` cancels both network pumps.
+This close is abortive for buffered bytes that the network has not accepted.
+
 ### StreamListener (byte-stream mode)
 
 | Method | Signature | Description |

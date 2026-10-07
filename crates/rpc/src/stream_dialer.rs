@@ -8,7 +8,7 @@
 use authority::EpochGuard;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
-use futures::io::AsyncReadExt;
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use libp2p::PeerId;
 use std::time::Duration;
 use tokio::io;
@@ -20,6 +20,35 @@ use super::{ByteStreamImpl, StreamMode};
 
 /// Timeout for establishing the libp2p stream to a remote peer.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+const DIAL_BUFFER_BYTES: usize = 64 * 1024;
+
+fn dialed_byte_stream<R, W>(stream_read: R, stream_write: W) -> ByteStreamImpl
+where
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
+{
+    let (host_side, guest_side) = io::duplex(DIAL_BUFFER_BYTES);
+    let (mut host_read, mut host_write) = io::split(host_side);
+
+    let inbound = tokio::task::spawn_local(async move {
+        if let Err(error) = io::copy(&mut stream_read.compat(), &mut host_write).await {
+            tracing::debug!("stream→host pump error: {error}");
+        }
+    });
+
+    let outbound = tokio::task::spawn_local(async move {
+        let mut compat_write = stream_write.compat_write();
+        if let Err(error) = io::copy(&mut host_read, &mut compat_write).await {
+            tracing::debug!("host→stream pump error: {error}");
+        }
+    });
+
+    ByteStreamImpl::new_with_pump_abort_handles(
+        guest_side,
+        StreamMode::Bidirectional,
+        [inbound.abort_handle(), outbound.abort_handle()],
+    )
+}
 
 pub struct StreamDialerImpl {
     stream_control: libp2p_stream::Control,
@@ -80,37 +109,155 @@ impl system_capnp::stream_dialer::Server for StreamDialerImpl {
                 ))
             })?;
 
-            // Create a duplex pair: guest_side ↔ host_side.
-            // The guest reads/writes via ByteStream RPC on guest_side.
-            // The host pumps host_side ↔ libp2p stream.
-            // 64 KiB matches the RPC pipe buffer and the listener pump size.
-            let (host_side, guest_side) = io::duplex(64 * 1024);
-
-            // Split both sides for bidirectional pumping.
+            // Split the libp2p stream for bidirectional pumping. The returned
+            // ByteStream owns abort handles for both pump tasks.
             let (stream_read, stream_write) = Box::pin(stream).split();
-            let (mut host_read, mut host_write) = io::split(host_side);
-
-            // Pump: libp2p stream → host_side (remote writes → guest reads)
-            tokio::task::spawn_local(async move {
-                if let Err(e) = io::copy(&mut stream_read.compat(), &mut host_write).await {
-                    tracing::debug!("stream→host pump error: {e}");
-                }
-            });
-
-            // Pump: host_side → libp2p stream (guest writes → remote reads)
-            tokio::task::spawn_local(async move {
-                let mut compat_write = stream_write.compat_write();
-                if let Err(e) = io::copy(&mut host_read, &mut compat_write).await {
-                    tracing::debug!("host→stream pump error: {e}");
-                }
-            });
-
-            // Wrap guest_side as a bidirectional ByteStream capability.
             let stream_cap: system_capnp::byte_stream::Client =
-                capnp_rpc::new_client(ByteStreamImpl::new(guest_side, StreamMode::Bidirectional));
+                capnp_rpc::new_client(dialed_byte_stream(stream_read, stream_write));
             results.get().set_stream(stream_cap);
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::io::{AsyncRead, AsyncWrite};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncReadExt as _;
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    struct DropTracked<T> {
+        inner: T,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl<T> DropTracked<T> {
+        fn new(inner: T, dropped: Arc<AtomicBool>) -> Self {
+            Self { inner, dropped }
+        }
+    }
+
+    impl<T> Drop for DropTracked<T> {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for DropTracked<T> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_read(cx, buffer)
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for DropTracked<T> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buffer)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_close(cx)
+        }
+    }
+
+    fn tracked_dialer_stream(
+        capacity: usize,
+    ) -> (
+        system_capnp::byte_stream::Client,
+        io::DuplexStream,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    ) {
+        let (network_side, network_peer) = io::duplex(capacity);
+        let (network_read, network_write) = io::split(network_side);
+        let read_dropped = Arc::new(AtomicBool::new(false));
+        let write_dropped = Arc::new(AtomicBool::new(false));
+        let stream = dialed_byte_stream(
+            DropTracked::new(network_read.compat(), read_dropped.clone()),
+            DropTracked::new(network_write.compat_write(), write_dropped.clone()),
+        );
+        (
+            capnp_rpc::new_client(stream),
+            network_peer,
+            read_dropped,
+            write_dropped,
+        )
+    }
+
+    #[tokio::test]
+    async fn close_cancels_pumps_blocked_on_network_input() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (client, _network_peer, read_dropped, write_dropped) = tracked_dialer_stream(1);
+                tokio::task::yield_now().await;
+                assert!(!read_dropped.load(Ordering::SeqCst));
+                assert!(!write_dropped.load(Ordering::SeqCst));
+
+                client.close_request().send().promise.await.unwrap();
+                tokio::task::yield_now().await;
+
+                assert!(read_dropped.load(Ordering::SeqCst));
+                assert!(write_dropped.load(Ordering::SeqCst));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn close_cancels_pump_blocked_on_network_output() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (client, mut network_peer, read_dropped, write_dropped) =
+                    tracked_dialer_stream(1);
+                let mut request = client.write_request();
+                let payload = vec![b'x'; DIAL_BUFFER_BYTES];
+                request.get().set_data(&payload);
+                request.send().promise.await.unwrap();
+
+                let mut accepted = [0u8; 1];
+                network_peer.read_exact(&mut accepted).await.unwrap();
+                tokio::task::yield_now().await;
+                assert_eq!(accepted, [b'x']);
+                assert!(!write_dropped.load(Ordering::SeqCst));
+
+                client.close_request().send().promise.await.unwrap();
+                tokio::task::yield_now().await;
+
+                assert!(read_dropped.load(Ordering::SeqCst));
+                assert!(write_dropped.load(Ordering::SeqCst));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn dropping_byte_stream_server_cancels_both_pumps() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (client, _network_peer, read_dropped, write_dropped) = tracked_dialer_stream(1);
+                tokio::task::yield_now().await;
+
+                drop(client);
+                tokio::task::yield_now().await;
+
+                assert!(read_dropped.load(Ordering::SeqCst));
+                assert!(write_dropped.load(Ordering::SeqCst));
+            })
+            .await;
     }
 }

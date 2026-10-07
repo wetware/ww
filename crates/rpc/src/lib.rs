@@ -275,15 +275,20 @@ struct ByteStreamState {
     read_gate: Mutex<()>,
     write_gate: Mutex<()>,
     closed: CancellationToken,
+    pump_abort_handles: StdMutex<Option<[tokio::task::AbortHandle; 2]>>,
 }
 
 impl ByteStreamState {
-    fn new(stream: io::DuplexStream) -> Self {
+    fn new(
+        stream: io::DuplexStream,
+        pump_abort_handles: Option<[tokio::task::AbortHandle; 2]>,
+    ) -> Self {
         Self {
             transport: StdMutex::new(Some(stream)),
             read_gate: Mutex::new(()),
             write_gate: Mutex::new(()),
             closed: CancellationToken::new(),
+            pump_abort_handles: StdMutex::new(pump_abort_handles),
         }
     }
 
@@ -295,6 +300,16 @@ impl ByteStreamState {
             .take();
         drop(stream);
         self.closed.cancel();
+        let pump_abort_handles = self
+            .pump_abort_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handles) = pump_abort_handles {
+            for handle in handles {
+                handle.abort();
+            }
+        }
     }
 
     fn is_open(&self) -> bool {
@@ -391,7 +406,18 @@ pub struct ByteStreamImpl {
 impl ByteStreamImpl {
     pub fn new(stream: io::DuplexStream, mode: StreamMode) -> Self {
         Self {
-            state: Arc::new(ByteStreamState::new(stream)),
+            state: Arc::new(ByteStreamState::new(stream, None)),
+            mode,
+        }
+    }
+
+    pub(crate) fn new_with_pump_abort_handles(
+        stream: io::DuplexStream,
+        mode: StreamMode,
+        pump_abort_handles: [tokio::task::AbortHandle; 2],
+    ) -> Self {
+        Self {
+            state: Arc::new(ByteStreamState::new(stream, Some(pump_abort_handles))),
             mode,
         }
     }
