@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- **Finite WAGI completion regressions now cover every terminal write state.**
+  Tests directly exercise zero-byte progress, dropped and cancelled output,
+  early clean-session completion, and request-local completion guards.
 - **ByteStream reads and writes now make independent progress.** Close promptly
   cancels pending I/O, repeated close succeeds, and post-close reads and writes
   have deterministic results. Dialed streams release both transport pumps on

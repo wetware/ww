@@ -491,6 +491,7 @@ where
 mod graft_tests {
     use capnp::traits::{Imbue, ImbueMut};
     use std::cell::Cell;
+    use std::rc::Rc;
     use std::task::Poll;
 
     use super::*;
@@ -509,6 +510,14 @@ mod graft_tests {
                 Poll::Ready(Ok(()))
             }
         })
+    }
+
+    struct DropMarker(Rc<Cell<bool>>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
     }
 
     #[test]
@@ -579,17 +588,79 @@ mod graft_tests {
     #[test]
     fn clean_session_completion_does_not_satisfy_an_incomplete_guard() {
         let completion = CompletionGuard::new();
-        let result = futures::executor::block_on(select_session(
-            pending_once_then_ok(),
-            std::future::ready(Ok(())),
-            std::future::pending(),
-        ));
+        let output_started = Rc::new(Cell::new(false));
+        let output_dropped = Rc::new(Cell::new(false));
+        let rpc_completed = Rc::new(Cell::new(false));
+        let transport_completed = Rc::new(Cell::new(false));
 
-        assert!(result.is_ok());
-        let error = completion
-            .require("finite response output")
-            .expect_err("an incomplete response must fail");
+        let application = {
+            let output_started = output_started.clone();
+            let output_dropped = output_dropped.clone();
+            async move {
+                let _drop_marker = DropMarker(output_dropped);
+                output_started.set(true);
+                std::future::pending::<Result<(), capnp::Error>>().await
+            }
+        };
+        let rpc = {
+            let output_started = output_started.clone();
+            let rpc_completed = rpc_completed.clone();
+            futures::future::poll_fn(move |cx| {
+                if output_started.get() {
+                    rpc_completed.set(true);
+                    Poll::Ready(Ok(()))
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+        };
+        let transport = {
+            let rpc_completed = rpc_completed.clone();
+            let transport_completed = transport_completed.clone();
+            futures::future::poll_fn(move |cx| {
+                if rpc_completed.get() {
+                    transport_completed.set(true);
+                    Poll::Ready(Ok(()))
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+        };
+
+        let result = futures::executor::block_on(select_session(transport, rpc, application))
+            .and_then(|()| completion.require("finite response output"));
+
+        assert!(output_started.get(), "finite output did not start");
+        assert!(
+            output_dropped.get(),
+            "pending finite output was not dropped"
+        );
+        assert!(rpc_completed.get(), "RPC did not close cleanly");
+        assert!(
+            transport_completed.get(),
+            "transport did not complete after the clean RPC close"
+        );
+        let error = result.expect_err("an incomplete response must fail");
         assert!(error.to_string().contains("finite response output"));
+    }
+
+    #[test]
+    fn completion_guards_are_request_local() {
+        let first_request = CompletionGuard::new();
+        let first_application = first_request.clone();
+        let second_request = CompletionGuard::new();
+
+        first_application.complete();
+
+        first_request
+            .require("first finite response output")
+            .expect("the first request completed");
+        let error = second_request
+            .require("second finite response output")
+            .expect_err("the second request must remain incomplete");
+        assert!(error.to_string().contains("second finite response output"));
     }
 
     #[test]

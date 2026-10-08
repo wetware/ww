@@ -171,7 +171,6 @@ pub async fn respond_bytes_async(
     body: &[u8],
 ) -> Result<(), String> {
     use std::io::Write;
-    use wit_bindgen::StreamResult;
 
     let mut response = Vec::new();
     write!(response, "Status: {status} {}\r\n", reason_phrase(status))
@@ -187,19 +186,23 @@ pub async fn respond_bytes_async(
     while !response.is_empty() {
         let (status, remaining) = writer.write(response).await;
         response = remaining.into_vec();
-        match status {
-            StreamResult::Complete(count) if count > 0 => {}
-            StreamResult::Complete(_) => {
-                return Err("P3 stdout accepted no response bytes".to_string());
-            }
-            StreamResult::Dropped => return Err("P3 stdout was dropped".to_string()),
-            StreamResult::Cancelled => return Err("P3 stdout write was cancelled".to_string()),
-        }
+        require_write_progress(status)?;
     }
     drop(writer);
     completion
         .await
         .map_err(|error| format!("P3 stdout failed: {error:?}"))
+}
+
+fn require_write_progress(status: wit_bindgen::StreamResult) -> Result<(), String> {
+    use wit_bindgen::StreamResult;
+
+    match status {
+        StreamResult::Complete(count) if count > 0 => Ok(()),
+        StreamResult::Complete(_) => Err("P3 stdout accepted no response bytes".to_string()),
+        StreamResult::Dropped => Err("P3 stdout was dropped".to_string()),
+        StreamResult::Cancelled => Err("P3 stdout write was cancelled".to_string()),
+    }
 }
 
 fn reason_phrase(status: u16) -> &'static str {
@@ -226,7 +229,8 @@ fn reason_phrase(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::AsyncGuest;
+    use super::{require_write_progress, AsyncGuest};
+    use wit_bindgen::StreamResult;
 
     struct TestGuest;
 
@@ -242,5 +246,34 @@ mod tests {
 
         assert_guest::<TestGuest>();
         assert!(futures::executor::block_on(TestGuest::run()).is_ok());
+    }
+
+    #[test]
+    fn positive_write_progress_is_accepted() {
+        assert_eq!(require_write_progress(StreamResult::Complete(1)), Ok(()));
+    }
+
+    #[test]
+    fn zero_byte_write_is_rejected() {
+        assert_eq!(
+            require_write_progress(StreamResult::Complete(0)),
+            Err("P3 stdout accepted no response bytes".to_string())
+        );
+    }
+
+    #[test]
+    fn dropped_write_is_rejected() {
+        assert_eq!(
+            require_write_progress(StreamResult::Dropped),
+            Err("P3 stdout was dropped".to_string())
+        );
+    }
+
+    #[test]
+    fn cancelled_write_is_rejected() {
+        assert_eq!(
+            require_write_progress(StreamResult::Cancelled),
+            Err("P3 stdout write was cancelled".to_string())
+        );
     }
 }
