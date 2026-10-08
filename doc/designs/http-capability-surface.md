@@ -44,19 +44,28 @@ and argv, pipes body to stdin. Fresh cell per request. Stateless.
 - `stdin` = request body only
 - `stdout` = CGI response (`Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nHello`)
 
-Guest code is a boring CLI program using the `wagi-guest` crate:
+Guest code is a finite CLI program using the `wagi-guest` crate:
 
 ```rust
 use wagi_guest as wagi;
 
-fn handle() {
+struct Counter;
+
+impl wagi::AsyncGuest for Counter {
+  async fn run() -> Result<(), ()> {
     let ct = ("Content-Type", "text/plain");
-    match wagi::method().as_str() {
-        "GET"  => wagi::respond(200, &[ct], "0"),
-        "POST" => wagi::respond(200, &[ct], "1"),
-        _      => wagi::respond(405, &[ct], "Method Not Allowed"),
-    }
+    let (status, body) = match wagi::method().as_str() {
+        "GET"  => (200, "0"),
+        "POST" => (200, "1"),
+        _      => (405, "Method Not Allowed"),
+    };
+    wagi::respond_bytes_async(status, &[ct], body.as_bytes())
+      .await
+      .map_err(|_| ())
+  }
 }
+
+wagi::export_async!(Counter);
 ```
 
 That's ~8 lines. Down from the 306-line FastCGI implementation.
@@ -103,7 +112,13 @@ Thin wrapper (~100 lines, zero deps beyond std):
 
 - `wagi::method()`, `wagi::path()`, `wagi::query()`, `wagi::header(name)`
 - `wagi::body()`, `wagi::body_string()`
-- `wagi::respond(status, headers, body)`
+- `wagi::respond_bytes_async(status, headers, body)` for finite P3 handlers
+- `wagi::respond` and `wagi::respond_bytes` as unacknowledged compatibility helpers
+
+`respond_bytes_async` builds one contiguous CGI response. Success means that P3
+stdout accepted all bytes and the host writer flush completed. The boundary
+does not cover network or HTTP client consumption. A failure can leave an
+accepted prefix in stdout.
 
 ### Spawn Path
 

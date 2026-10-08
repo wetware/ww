@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Finite WAGI responses now complete at the P3 stdout flush boundary.**
+  Counter, snap, oracle HTTP, and status handlers await acknowledged output.
+  Closed writers, final flush failures, and partial writes now fail the guest
+  root instead of reporting success with truncated CGI output.
+
 ### Changed
 - **ByteStream reads and writes now make independent progress.** Close promptly
   cancels pending I/O, repeated close succeeds, and post-close reads and writes

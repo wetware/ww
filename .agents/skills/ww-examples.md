@@ -22,7 +22,7 @@ Don't just present a list — ask what they're after:
 >
 > 1. **Echo** — simplest possible guest. Good if you want to see
 >    the bare minimum.  *(~5 min walkthrough)*
-> 2. **Counter** — WAGI guest with FastCGI. Good if you're building
+> 2. **Counter** — finite WAGI guest with CGI over WASI. Good if you're building
 >    a web service.  *(~10 min walkthrough)*
 > 3. **Chess** — Cap'n Proto vat guest over libp2p. Good if you want
 >    to see a real multi-node app.  *(~15 min walkthrough)*
@@ -65,7 +65,7 @@ with more moving parts?"
 
 ---
 
-## 2. Counter (HTTP/FastCGI guest) — ~10 min
+## 2. Counter (HTTP/WAGI guest) — ~10 min
 
 Read files from `examples/counter/`.
 
@@ -79,17 +79,19 @@ Walk through together:
 
 1. **What it does**: serves `GET /counter` (returns count) and
    `POST /counter` (increments).  405 for everything else.
-2. **The key difference**: this guest speaks FastCGI over stdin/stdout. Run
+2. **The key difference**: this guest reads CGI environment variables and
+   writes a CGI response to stdout. Run
    `make -C examples/counter` yourself and show the output. The repository
    does not currently ship an `HttpListener.listen()` composition for the
    counter.
-3. **FastCGI protocol**: the cell speaks binary FastCGI over stdio.
-   The host translates HTTP ↔ FastCGI.  Simpler than parsing HTTP/1.1.
+3. **Finite output completion**: the cell implements `AsyncGuest`, exports
+   with `export_async!`, and awaits `respond_bytes_async`. Success means that
+   P3 stdout accepted the response and the host writer flushed it.
 4. **Per-request spawn**: each request gets a fresh instance.  Counter
    resets — that's expected for the demo.
 
 ⚗️ **Name the win**: "You've seen the guest side of WAGI: compile a native
-WASI P3 component that speaks FastCGI. An `HttpListener.listen()` registration
+WASI P3 component that writes CGI. An `HttpListener.listen()` registration
 supplies the route and per-request process plumbing."
 
 Check in: "Ready for the big one (Chess), or want to dig into

@@ -70,7 +70,10 @@ Based on discovery, produce a concrete design.  Cover:
   Reference `doc/images.md`.
 - **Build pipeline**: source → native `wasm32-wasip3` component. Select the
   async `guest` world for a Cap'n Proto session or the runtime-free
-  `sync-command` world for finite stdio work. Reference
+  `sync-command` world for finite stdio work. A runtime-free finite WAGI
+  handler implements `wagi_guest::AsyncGuest` and exports with `export_async!`.
+  A WAGI handler that uses `system::run` retains `system::Guest`. Both forms
+  await `respond_bytes_async` before root completion. Reference
   `examples/counter/Makefile` and `scripts/build_wasip3_component.sh`. Declare
   the artifact's exact import allowlist; the build rejects WASI 0.2, socket,
   and out-of-allowlist imports.

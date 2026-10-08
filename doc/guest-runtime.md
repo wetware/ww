@@ -76,6 +76,17 @@ P3 transport completion participates in the outer session result.
 The guest does not drain RPC for an arbitrary interval. A completed P3 stream
 write already waits for the underlying host flush.
 
+Finite WAGI handlers use `wagi_guest::respond_bytes_async`. The returned Future
+completes after P3 stdout accepts all CGI bytes and the host writer flushes.
+The boundary does not cover network delivery or downstream consumption. The
+helper allocates one contiguous response, and a failed write can leave an
+observable prefix in stdout.
+
+Finite handlers that also use `system::run` keep a request-local
+`system::CompletionGuard`. The handler marks the guard only after the awaited
+response succeeds. An orderly RPC or transport result cannot turn an
+incomplete response into application success.
+
 ## Supported suspension sources
 
 First-party async guests suspend on host-visible P3 operations:
