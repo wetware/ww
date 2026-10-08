@@ -453,6 +453,7 @@ jobs:
     - name: Run standalone standard-library tests
       if: ${{ always() }}
       run: |
+        cargo test --manifest-path crates/wagi-guest/Cargo.toml
         cargo test --manifest-path std/kernel/Cargo.toml
         cargo test --manifest-path std/status/Cargo.toml
 
