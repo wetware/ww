@@ -88,7 +88,7 @@ fn harness() -> (Store<Harness>, u32, u32) {
     listing(staging.path(), DEEPER, &[("child", DEEPER, false)]);
     listing(staging.path(), SIBLING, &[("child", SIBLING, false)]);
     let tree = Arc::new(CidTree::new(
-        ROOT.into(),
+        ipfs::cid_identity::parse_cid(ROOT).unwrap(),
         ipfs::HttpClient::new("http://127.0.0.1:1".into()),
         staging.path().into(),
     ));
@@ -162,6 +162,85 @@ async fn read_open(
         p3_types::DescriptorFlags::READ,
     )
     .await
+}
+
+#[tokio::test]
+async fn alias_root_routes_through_own_tree() {
+    let (mut store, _, _) = harness();
+    let cid: cid::Cid = NESTED.parse().unwrap();
+    let alias = cid
+        .to_string_of_base(cid::multibase::Base::Base58Btc)
+        .unwrap();
+    store.data_mut().tree = Some(Arc::new(CidTree::new(
+        ipfs::cid_identity::parse_cid(&alias).unwrap(),
+        ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+        store.data().staging.path().into(),
+    )));
+    let dirs =
+        p3_preopens::Host::get_directories(&mut store.data_mut().intercepted_filesystem()).unwrap();
+    let root = dirs.iter().find(|(_, path)| path == "/").unwrap().0.rep();
+    for spelling in [cid.to_string(), alias] {
+        let path = format!("ipfs/{spelling}/deeper");
+        assert!(matches!(
+            store
+                .data_mut()
+                .intercepted_filesystem()
+                .route_open(&Resource::new_borrow(root), &path)
+                .unwrap(),
+            OpenRoute::CidTree(_, _)
+        ));
+        let directory = read_open(&mut store, root, &path).await.unwrap();
+        assert_eq!(
+            store.data().descriptors.directories[&directory.rep()].path,
+            "deeper"
+        );
+    }
+    assert!(matches!(
+        store
+            .data_mut()
+            .intercepted_filesystem()
+            .route_open(
+                &Resource::new_borrow(root),
+                &format!("ipfs/{SIBLING}/child")
+            )
+            .unwrap(),
+        OpenRoute::Ipfs(_)
+    ));
+}
+
+#[tokio::test]
+async fn slash_bearing_bare_alias_does_not_change_single_segment_path_grammar() {
+    let (mut store, _, _) = harness();
+    let cid = cid::Cid::new_v1(
+        0x55,
+        cid::multihash::Multihash::<64>::wrap(0x12, &[255; 32]).unwrap(),
+    );
+    let alias = cid.to_string_of_base(cid::multibase::Base::Base64).unwrap();
+    assert!(alias.contains('/'));
+    assert_eq!(ipfs::cid_identity::parse_cid(&alias).unwrap(), cid);
+
+    store.data_mut().tree = Some(Arc::new(CidTree::new(
+        cid,
+        ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+        store.data().staging.path().into(),
+    )));
+    let dirs =
+        p3_preopens::Host::get_directories(&mut store.data_mut().intercepted_filesystem()).unwrap();
+    let root = dirs.iter().find(|(_, path)| path == "/").unwrap().0.rep();
+    let path = format!("ipfs/{alias}/child");
+
+    assert!(parse_ipfs_path(&path).is_none());
+    match store
+        .data_mut()
+        .intercepted_filesystem()
+        .route_open(&Resource::new_borrow(root), &path)
+        .unwrap()
+    {
+        OpenRoute::CidTree(_, relative) => assert_eq!(relative, path),
+        OpenRoute::Ipfs(_) | OpenRoute::Wasi { .. } => {
+            panic!("slash-bearing CID text must not select a path-form IPFS route")
+        }
+    }
 }
 
 #[tokio::test]
@@ -353,7 +432,7 @@ async fn descriptors_retain_root_snapshot_and_namespace_after_swap() {
         .tree
         .as_ref()
         .unwrap()
-        .swap_root(SIBLING.into());
+        .swap_root(ipfs::cid_identity::parse_cid(SIBLING).unwrap());
     let file = read_open(&mut store, nested.rep(), "child").await.unwrap();
     assert_eq!(read_contents(&store, &file), "nested");
     let file = read_open(&mut store, root, "child").await.unwrap();
@@ -364,7 +443,7 @@ async fn descriptors_retain_root_snapshot_and_namespace_after_swap() {
     let file = read_open(&mut store, new_root, "child").await.unwrap();
     assert_eq!(read_contents(&store, &file), "sibling");
     store.data_mut().tree = Some(Arc::new(CidTree::new(
-        DEEPER.into(),
+        ipfs::cid_identity::parse_cid(DEEPER).unwrap(),
         ipfs::HttpClient::new("http://127.0.0.1:1".into()),
         store.data().staging.path().into(),
     )));
@@ -551,7 +630,7 @@ async fn mutation_on_uncached_root_does_not_request_a_listing() {
     listener.set_nonblocking(true).unwrap();
     let staging = tempfile::tempdir().unwrap();
     let tree = Arc::new(CidTree::new(
-        ROOT.into(),
+        ipfs::cid_identity::parse_cid(ROOT).unwrap(),
         ipfs::HttpClient::new(format!("http://{}", listener.local_addr().unwrap())),
         staging.path().into(),
     ));

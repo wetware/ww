@@ -95,7 +95,7 @@ one real `RpcSystem` with the application Future. Wetware has no guest
 scheduler, polling timer, spawn API, or channel runtime.
 
 Cap'n Proto concurrency model (E-ordering):
-Method calls on a single Cap'n Proto object are serialized -- no
-races within an object.  Calls across objects are independent and
-concurrent.  Pipelining lets you chain calls on promises.  No locks,
-no semaphores -- the object IS the synchronization boundary.
+Cap'n Proto preserves message order, but async method calls can remain in
+flight concurrently. Implementations define synchronization for shared state.
+`ByteStream` serializes calls per direction and permits one read and one write
+to progress concurrently. Pipelining lets you chain calls on promises.

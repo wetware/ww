@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
+use cid::Cid;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
@@ -55,9 +56,9 @@ pub struct DirEntry {
 #[derive(Debug)]
 pub enum ResolvedNode {
     /// File backed by a CID. Content must be fetched via PinsetCache.
-    CidFile { cid: String, size: u64 },
+    CidFile { cid: Cid, size: u64 },
     /// Directory backed by a CID. Listing via `ls_dir()`.
-    CidDir { cid: String },
+    CidDir { cid: Cid },
 }
 
 /// A resolved node and its canonical path within the captured root.
@@ -73,6 +74,7 @@ pub enum ResolveError {
     NoEntry,
     NotDirectory,
     InvalidPath,
+    InvalidCid,
 }
 
 impl std::fmt::Display for ResolveError {
@@ -81,6 +83,7 @@ impl std::fmt::Display for ResolveError {
             Self::NoEntry => "path entry not found",
             Self::NotDirectory => "path component is not a directory",
             Self::InvalidPath => "invalid descriptor-relative path",
+            Self::InvalidCid => "invalid selected entry CID",
         })
     }
 }
@@ -96,18 +99,18 @@ impl std::error::Error for ResolveError {}
 /// in a 3-tier stack (memory → disk → network).
 pub struct CidTree {
     /// The current root CID, swapped atomically on epoch updates.
-    root: ArcSwap<String>,
+    root: ArcSwap<Cid>,
     /// IPFS HTTP client for `ls()` calls (directory metadata).
     ipfs: ipfs::HttpClient,
-    /// In-memory LRU cache for directory listings, keyed by CID string.
-    dir_cache: Mutex<LruCache<String, Vec<DirEntry>>>,
+    /// In-memory LRU cache for directory listings, keyed by versioned CID.
+    dir_cache: Mutex<LruCache<Cid, Vec<DirEntry>>>,
     /// Staging directory for persisted directory listings.
     staging_dir: PathBuf,
 }
 
 impl CidTree {
     /// Create a new CidTree with the given root CID.
-    pub fn new(root_cid: String, ipfs: ipfs::HttpClient, staging_dir: PathBuf) -> Self {
+    pub fn new(root_cid: Cid, ipfs: ipfs::HttpClient, staging_dir: PathBuf) -> Self {
         Self {
             root: ArcSwap::from_pointee(root_cid),
             ipfs,
@@ -119,7 +122,7 @@ impl CidTree {
     }
 
     /// The current root CID.
-    pub fn root_cid(&self) -> Arc<String> {
+    pub fn root_cid(&self) -> Arc<Cid> {
         self.root.load_full()
     }
 
@@ -127,7 +130,7 @@ impl CidTree {
     ///
     /// Clears the in-memory directory listing cache. This activation operation
     /// does not perform staging-directory cleanup.
-    pub fn swap_root(&self, new_cid: String) {
+    pub fn swap_root(&self, new_cid: Cid) {
         self.root.store(Arc::new(new_cid));
 
         if let Ok(mut cache) = self.dir_cache.lock() {
@@ -156,7 +159,7 @@ impl CidTree {
     /// Pre-warm the directory listing cache for the root of a CID.
     ///
     /// Call this before `swap_root()` so the first post-swap access is fast.
-    pub async fn pre_warm(&self, cid: &str) -> Result<()> {
+    pub async fn pre_warm(&self, cid: &Cid) -> Result<()> {
         let _ = self.ls_dir(cid).await?;
         Ok(())
     }
@@ -166,32 +169,25 @@ impl CidTree {
     /// 1. In-memory LRU cache (hit → return immediately)
     /// 2. Staging disk (hit → populate LRU, return)
     /// 3. IPFS daemon `ls()` (populate both caches, return)
-    pub async fn ls_dir(&self, cid: &str) -> Result<Vec<DirEntry>> {
-        let canonical = cid
-            .parse::<cid::Cid>()
-            .with_context(|| format!("invalid directory CID: {cid}"))?
-            .to_string();
-
+    pub async fn ls_dir(&self, cid: &Cid) -> Result<Vec<DirEntry>> {
         // Tier 1: in-memory LRU
         if let Some(entries) = self
             .dir_cache
             .lock()
             .ok()
-            .and_then(|mut c| c.get(&canonical).cloned())
+            .and_then(|mut c| c.get(cid).cloned())
         {
             return Ok(entries);
         }
 
         // Tier 2: staging disk
-        let disk_path = self
-            .staging_dir
-            .join(format!("{canonical}{DIRLIST_SUFFIX}"));
+        let disk_path = self.staging_dir.join(format!("{cid}{DIRLIST_SUFFIX}"));
         if disk_path.exists() {
             if let Ok(data) = std::fs::read_to_string(&disk_path) {
                 if let Ok(entries) = serde_json::from_str::<Vec<DirEntry>>(&data) {
                     // Populate LRU from disk
                     if let Ok(mut cache) = self.dir_cache.lock() {
-                        cache.put(canonical.clone(), entries.clone());
+                        cache.put(*cid, entries.clone());
                     }
                     return Ok(entries);
                 }
@@ -199,12 +195,12 @@ impl CidTree {
         }
 
         // Tier 3: IPFS daemon
-        let ipfs_path = format!("/ipfs/{canonical}");
+        let ipfs_path = format!("/ipfs/{cid}");
         let raw_entries = self
             .ipfs
             .ls(&ipfs_path)
             .await
-            .with_context(|| format!("ls failed for CID {canonical}"))?;
+            .with_context(|| format!("ls failed for CID {cid}"))?;
 
         let entries: Vec<DirEntry> = raw_entries
             .into_iter()
@@ -230,7 +226,7 @@ impl CidTree {
 
         // Populate LRU
         if let Ok(mut cache) = self.dir_cache.lock() {
-            cache.put(canonical, entries.clone());
+            cache.put(*cid, entries.clone());
         }
 
         Ok(entries)
@@ -256,7 +252,7 @@ impl CidTree {
     /// Absolute paths and parent traversal are rejected before any lookup.
     pub async fn resolve_at(
         &self,
-        root_cid: &str,
+        root_cid: &Cid,
         base_path: &str,
         path: &str,
     ) -> Result<ResolvedPath> {
@@ -277,7 +273,7 @@ impl CidTree {
 
     fn resolve_path_inner<'a>(
         &'a self,
-        root_cid: &'a str,
+        root_cid: &'a Cid,
         path: &'a str,
         require_directory: bool,
         symlink_depth: usize,
@@ -287,7 +283,7 @@ impl CidTree {
 
     async fn resolve_path_inner_impl(
         &self,
-        root_cid: &str,
+        root_cid: &Cid,
         path: &str,
         require_directory: bool,
         symlink_depth: usize,
@@ -300,7 +296,7 @@ impl CidTree {
         }
 
         let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-        let mut current_cid = root_cid.to_string();
+        let mut current_cid = *root_cid;
 
         for (i, component) in components.iter().enumerate() {
             let entries = self.ls_dir(&current_cid).await?;
@@ -314,14 +310,18 @@ impl CidTree {
             let is_last = i == components.len() - 1;
 
             match &entry.entry_type {
-                EntryType::Dir => current_cid = entry.cid.clone(),
+                EntryType::Dir => {
+                    current_cid = ipfs::cid_identity::parse_cid(&entry.cid)
+                        .context(ResolveError::InvalidCid)?;
+                }
                 EntryType::File => {
                     if !is_last || require_directory {
                         return Err(ResolveError::NotDirectory.into());
                     }
                     return Ok(ResolvedPath {
                         node: ResolvedNode::CidFile {
-                            cid: entry.cid.clone(),
+                            cid: ipfs::cid_identity::parse_cid(&entry.cid)
+                                .context(ResolveError::InvalidCid)?,
                             size: entry.size,
                         },
                         path: components.join("/"),
@@ -400,18 +400,17 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    fn fixture_cid(tag: u8) -> String {
+    fn fixture_cid(tag: u8) -> Cid {
         cid::Cid::new_v1(
             0x70,
             cid::multihash::Multihash::<64>::wrap(0x12, &[tag; 32]).unwrap(),
         )
-        .to_string()
     }
 
     fn fixture_entry(name: &str, tag: u8, entry_type: EntryType) -> DirEntry {
         DirEntry {
             name: name.to_string(),
-            cid: fixture_cid(tag),
+            cid: fixture_cid(tag).to_string(),
             entry_type,
             size: 7,
         }
@@ -448,6 +447,37 @@ mod tests {
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.to_path_buf(),
         )
+    }
+
+    #[test]
+    fn typed_root_replacement_preserves_snapshot_on_invalid_ingress() {
+        use ipfs::cid_identity::parse_cid;
+        let staging = tempfile::TempDir::new().unwrap();
+        let original = fixture_cid(1);
+        let alias = original
+            .to_string_of_base(cid::multibase::Base::Base58Btc)
+            .unwrap();
+        let tree = CidTree::new(
+            parse_cid(&alias).unwrap(),
+            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            staging.path().into(),
+        );
+        let snapshot: Arc<cid::Cid> = tree.root_cid();
+        assert_eq!(*snapshot, original);
+        for malformed in [
+            String::new(),
+            "not-a-cid".into(),
+            format!("/ipfs/{original}"),
+        ] {
+            let replacement = parse_cid(&malformed).map(|cid| tree.swap_root(cid));
+            assert!(replacement.is_err());
+            assert_eq!(*tree.root_cid(), original);
+        }
+        let next = fixture_cid(2);
+        tree.swap_root(next);
+        assert_eq!(*tree.root_cid(), next);
+        assert_eq!(*snapshot, original);
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -674,7 +704,7 @@ mod tests {
                 .unwrap();
         });
         let tree = CidTree::new(
-            root_cid.to_string(),
+            ipfs::cid_identity::parse_cid(root_cid).unwrap(),
             ipfs::HttpClient::new(format!("http://{address}")),
             staging.clone(),
         );
@@ -685,7 +715,7 @@ mod tests {
             .expect_err("an invalid intermediate directory CID must fail resolution");
 
         assert!(
-            error.to_string().contains("invalid directory CID"),
+            error.downcast_ref::<ResolveError>() == Some(&ResolveError::InvalidCid),
             "unexpected resolution error: {error:#}"
         );
         assert_eq!(
@@ -729,7 +759,7 @@ mod tests {
         let disk_path = staging.path().join(format!("{canonical}{DIRLIST_SUFFIX}"));
         std::fs::write(&disk_path, serde_json::to_vec(&entries).unwrap()).unwrap();
         let tree = CidTree::new(
-            alternate,
+            ipfs::cid_identity::parse_cid(&alternate).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.path().to_path_buf(),
         );
@@ -737,12 +767,14 @@ mod tests {
         let resolved = tree.resolve_path("child").await.unwrap();
         assert!(matches!(
             resolved,
-            ResolvedNode::CidFile { cid, size: 7 } if cid == canonical
+            ResolvedNode::CidFile { cid, size: 7 } if cid == parsed
         ));
 
         std::fs::remove_file(disk_path).unwrap();
-        let cached = tree.ls_dir(canonical).await.unwrap();
+        let cached = tree.ls_dir(&parsed).await.unwrap();
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].name, "child");
+        assert_eq!(tree.dir_cache.lock().unwrap().len(), 1);
+        assert!(tree.dir_cache.lock().unwrap().contains(&parsed));
     }
 }

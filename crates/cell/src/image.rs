@@ -9,6 +9,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use cid::Cid;
+use ipfs::cid_identity::{decode_cid, parse_cid};
 use ipld_dagpb::PbNode;
 use sha2::{Digest, Sha256};
 
@@ -100,28 +101,6 @@ pub fn fuzz_composer_unixfs_metadata(data: &[u8]) -> Result<()> {
     codec::validate_metadata(data)
 }
 
-/// Parse a bare CID, without the path-prefix and trailing-byte tolerance of
-/// `Cid::from_str`. Only the canonical rendering may enter an IPFS source path.
-fn parse_dag_cid(value: &str) -> Result<Cid> {
-    let bytes = if value.starts_with("Qm") {
-        cid::multibase::Base::Base58Btc.decode(value)
-    } else {
-        cid::multibase::decode(value).map(|(_, bytes)| bytes)
-    }
-    .context("invalid bare CID encoding")?;
-    let mut remaining = bytes.as_slice();
-    let cid = Cid::read_bytes(&mut remaining).context("invalid CID")?;
-    if !remaining.is_empty() {
-        bail!("invalid CID: trailing bytes");
-    }
-    // Parsing can accept overflowing varints. Require canonical binary bytes,
-    // while allowing alternate textual multibase representations.
-    if cid.to_bytes() != bytes {
-        bail!("invalid CID: noncanonical binary encoding");
-    }
-    Ok(cid)
-}
-
 async fn await_or_cancel<T, F>(
     cancel: &mut tokio::sync::watch::Receiver<bool>,
     operation: F,
@@ -156,20 +135,33 @@ pub async fn dag_merge(
     client: &ipfs::BootClient,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<String> {
+    let cids = cids
+        .iter()
+        .map(|value| parse_cid(value).context("invalid merge layer CID"))
+        .collect::<Result<Vec<_>>>()?;
+    dag_merge_cids(&cids, client, cancel)
+        .await
+        .map(|cid| cid.to_string())
+}
+
+/// Compose validated layer identities and return the pinned effective root.
+///
+/// Retains CID version, codec, and multihash throughout composition and import.
+pub async fn dag_merge_cids(
+    cids: &[Cid],
+    client: &ipfs::BootClient,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<Cid> {
     if cids.is_empty() {
         bail!("No CIDs to merge");
     }
-    let cids = cids
-        .iter()
-        .map(|value| parse_dag_cid(value).context("invalid merge layer CID"))
-        .collect::<Result<Vec<_>>>()?;
     await_or_cancel(cancel, async {
-        let composition = composer::compose(client, &cids).await?;
+        let composition = composer::compose(client, cids).await?;
         client
             .import_composed(&composition.root, &composition.blocks)
             .await
             .context("storing and pinning composed root")?;
-        Ok(composition.root.to_string())
+        Ok(composition.root)
     })
     .await
 }
@@ -284,6 +276,11 @@ async fn resolve_bare_cid(
     let cid_with_subpath = ipfs_path
         .strip_prefix("/ipfs/")
         .with_context(|| format!("expected resolved /ipfs/ path, got {ipfs_path}"))?;
+    // Decode the complete root before interpreting slashes as path separators:
+    // a valid Base64 CID can contain slashes in its multibase spelling.
+    if let Ok(cid) = parse_cid(cid_with_subpath) {
+        return Ok(cid.to_string());
+    }
     let candidate = if cid_with_subpath.contains('/') {
         let resolved = await_or_cancel(cancel, ipfs_client.resolve(ipfs_path)).await?;
         resolved
@@ -293,7 +290,7 @@ async fn resolve_bare_cid(
     } else {
         cid_with_subpath.to_owned()
     };
-    parse_dag_cid(&candidate)
+    parse_cid(&candidate)
         .with_context(|| format!("invalid resolved CID {candidate}"))
         .map(|cid| cid.to_string())
 }
@@ -340,7 +337,7 @@ pub fn cid_bytes_to_ipfs_path(cid_bytes: &[u8]) -> Result<String> {
     if cid_bytes.is_empty() {
         bail!("Empty CID bytes");
     }
-    let cid = Cid::read_bytes(cid_bytes).context("Failed to parse CID from bytes")?;
+    let cid = decode_cid(cid_bytes).context("Failed to parse CID from bytes")?;
     Ok(format!("/ipfs/{cid}"))
 }
 
@@ -577,5 +574,32 @@ mod tests {
         let result = cid_bytes_to_ipfs_path(&[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Empty CID bytes"));
+    }
+
+    #[test]
+    fn test_cid_bytes_to_ipfs_path_rejects_binary_aliases() {
+        let canonical = [0x01, 0x55, 0x00, 0x01, b'x'];
+        let mut trailing = canonical.to_vec();
+        trailing.push(0);
+        let mut concatenated = canonical.to_vec();
+        concatenated.extend_from_slice(&canonical);
+        let mut nonminimal = vec![0x81, 0x00];
+        nonminimal.extend_from_slice(&canonical[1..]);
+        for bytes in [
+            trailing,
+            concatenated,
+            nonminimal,
+            cid::multibase::decode("f8180808080808080800255000178")
+                .unwrap()
+                .1,
+            cid::multibase::decode("f0155008180808080808080800278")
+                .unwrap()
+                .1,
+        ] {
+            assert!(
+                cid_bytes_to_ipfs_path(&bytes).is_err(),
+                "accepted invalid CID bytes: {bytes:02x?}"
+            );
+        }
     }
 }

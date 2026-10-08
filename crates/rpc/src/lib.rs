@@ -26,8 +26,10 @@ pub mod wagi;
 pub use named_capability::{decode_exports, encode_exports, NamedCapabilities, NamedCapability};
 
 use std::cell::RefCell;
+use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll};
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
@@ -37,8 +39,9 @@ use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 #[cfg(test)]
 use capnp_rpc::RpcSystem;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use tokio::sync::oneshot;
@@ -265,23 +268,164 @@ pub enum StreamMode {
     Bidirectional,
 }
 
+const STREAM_CLOSED: &str = "stream is closed";
+
+struct ByteStreamState {
+    transport: StdMutex<Option<io::DuplexStream>>,
+    read_gate: Mutex<()>,
+    write_gate: Mutex<()>,
+    closed: CancellationToken,
+    pump_abort_handles: StdMutex<Option<[tokio::task::AbortHandle; 2]>>,
+}
+
+impl ByteStreamState {
+    fn new(
+        stream: io::DuplexStream,
+        pump_abort_handles: Option<[tokio::task::AbortHandle; 2]>,
+    ) -> Self {
+        Self {
+            transport: StdMutex::new(Some(stream)),
+            read_gate: Mutex::new(()),
+            write_gate: Mutex::new(()),
+            closed: CancellationToken::new(),
+            pump_abort_handles: StdMutex::new(pump_abort_handles),
+        }
+    }
+
+    fn close(&self) {
+        let stream = self
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(stream);
+        self.closed.cancel();
+        let pump_abort_handles = self
+            .pump_abort_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handles) = pump_abort_handles {
+            for handle in handles {
+                handle.abort();
+            }
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+}
+
+struct SharedTransport {
+    state: Arc<ByteStreamState>,
+}
+
+impl SharedTransport {
+    fn new(state: Arc<ByteStreamState>) -> Self {
+        Self { state }
+    }
+
+    fn closed_error() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::NotConnected, STREAM_CLOSED)
+    }
+
+    fn is_closed_error(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::NotConnected && error.to_string() == STREAM_CLOSED
+    }
+}
+
+impl AsyncRead for SharedTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut transport = self
+            .state
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match transport.as_mut() {
+            Some(stream) => Pin::new(stream).poll_read(cx, buffer),
+            None => Poll::Ready(Err(Self::closed_error())),
+        }
+    }
+}
+
+impl AsyncWrite for SharedTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut transport = self
+            .state
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match transport.as_mut() {
+            Some(stream) => Pin::new(stream).poll_write(cx, buffer),
+            None => Poll::Ready(Err(Self::closed_error())),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut transport = self
+            .state
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match transport.as_mut() {
+            Some(stream) => Pin::new(stream).poll_flush(cx),
+            None => Poll::Ready(Err(Self::closed_error())),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut transport = self
+            .state
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match transport.as_mut() {
+            Some(stream) => Pin::new(stream).poll_shutdown(cx),
+            None => Poll::Ready(Err(Self::closed_error())),
+        }
+    }
+}
+
 pub struct ByteStreamImpl {
-    stream: Arc<Mutex<io::DuplexStream>>,
+    state: Arc<ByteStreamState>,
     mode: StreamMode,
 }
 
 impl ByteStreamImpl {
     pub fn new(stream: io::DuplexStream, mode: StreamMode) -> Self {
         Self {
-            stream: Arc::new(Mutex::new(stream)),
+            state: Arc::new(ByteStreamState::new(stream, None)),
             mode,
         }
     }
 
-    async fn with_stream<'a>(
-        stream: &'a Arc<Mutex<io::DuplexStream>>,
-    ) -> tokio::sync::MutexGuard<'a, io::DuplexStream> {
-        stream.lock().await
+    pub(crate) fn new_with_pump_abort_handles(
+        stream: io::DuplexStream,
+        mode: StreamMode,
+        pump_abort_handles: [tokio::task::AbortHandle; 2],
+    ) -> Self {
+        Self {
+            state: Arc::new(ByteStreamState::new(stream, Some(pump_abort_handles))),
+            mode,
+        }
+    }
+}
+
+impl Drop for ByteStreamImpl {
+    fn drop(&mut self) {
+        self.state.close();
     }
 }
 
@@ -299,21 +443,44 @@ impl system_capnp::byte_stream::Server for ByteStreamImpl {
         // ReadOnly and Bidirectional both allow read
 
         let max_bytes = (pry!(params.get()).get_max_bytes() as usize).min(MAX_READ_BYTES);
-        let stream = self.stream.clone();
+        let state = self.state.clone();
         Promise::from_future(async move {
+            let _read_guard = tokio::select! {
+                guard = state.read_gate.lock() => guard,
+                _ = state.closed.cancelled() => {
+                    results.get().set_data(&[]);
+                    return Ok(());
+                }
+            };
             if max_bytes == 0 {
                 results.get().set_data(&[]);
                 return Ok(());
             }
             let mut buffer = vec![0u8; max_bytes];
-            let mut locked = ByteStreamImpl::with_stream(&stream).await;
-            let read = locked
-                .read(&mut buffer)
-                .await
-                .map_err(|err| capnp::Error::failed(err.to_string()))?;
-            buffer.truncate(read);
-            results.get().set_data(&buffer);
-            Ok(())
+            let mut transport = SharedTransport::new(state.clone());
+            let read = transport.read(&mut buffer);
+            tokio::pin!(read);
+            let outcome = tokio::select! {
+                biased;
+                result = &mut read => Some(result),
+                _ = state.closed.cancelled() => None,
+            };
+            match outcome {
+                Some(Ok(read)) => {
+                    buffer.truncate(read);
+                    results.get().set_data(&buffer);
+                    Ok(())
+                }
+                Some(Err(error)) if SharedTransport::is_closed_error(&error) => {
+                    results.get().set_data(&[]);
+                    Ok(())
+                }
+                Some(Err(error)) => Err(capnp::Error::failed(error.to_string())),
+                None => {
+                    results.get().set_data(&[]);
+                    Ok(())
+                }
+            }
         })
     }
 
@@ -330,20 +497,41 @@ impl system_capnp::byte_stream::Server for ByteStreamImpl {
         // WriteOnly and Bidirectional both allow write
 
         let data = pry!(params.get()).get_data().unwrap_or(&[]).to_vec();
-        let stream = self.stream.clone();
+        let state = self.state.clone();
         Promise::from_future(async move {
-            let mut locked = ByteStreamImpl::with_stream(&stream).await;
-            if !data.is_empty() {
-                locked
-                    .write_all(&data)
-                    .await
-                    .map_err(|err| capnp::Error::failed(err.to_string()))?;
-                locked
-                    .flush()
-                    .await
-                    .map_err(|err| capnp::Error::failed(err.to_string()))?;
+            let _write_guard = tokio::select! {
+                guard = state.write_gate.lock() => guard,
+                _ = state.closed.cancelled() => {
+                    return Err(capnp::Error::failed(STREAM_CLOSED.into()));
+                }
+            };
+            if data.is_empty() {
+                return if state.is_open() {
+                    Ok(())
+                } else {
+                    Err(capnp::Error::failed(STREAM_CLOSED.into()))
+                };
             }
-            Ok(())
+
+            let mut transport = SharedTransport::new(state.clone());
+            let write = async {
+                transport.write_all(&data).await?;
+                transport.flush().await
+            };
+            tokio::pin!(write);
+            let outcome = tokio::select! {
+                biased;
+                result = &mut write => Some(result),
+                _ = state.closed.cancelled() => None,
+            };
+            match outcome {
+                Some(Ok(())) => Ok(()),
+                Some(Err(error)) if SharedTransport::is_closed_error(&error) => {
+                    Err(capnp::Error::failed(STREAM_CLOSED.into()))
+                }
+                Some(Err(error)) => Err(capnp::Error::failed(error.to_string())),
+                None => Err(capnp::Error::failed(STREAM_CLOSED.into())),
+            }
         })
     }
 
@@ -352,12 +540,8 @@ impl system_capnp::byte_stream::Server for ByteStreamImpl {
         _params: system_capnp::byte_stream::CloseParams,
         _results: system_capnp::byte_stream::CloseResults,
     ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
-        let stream = self.stream.clone();
-        Promise::from_future(async move {
-            let mut locked = ByteStreamImpl::with_stream(&stream).await;
-            let _ = locked.shutdown().await;
-            Ok(())
-        })
+        self.state.close();
+        Promise::ok(())
     }
 }
 
@@ -531,6 +715,7 @@ pub enum CachePolicy {
 mod tests {
     use super::*;
     use authority::EpochGuard;
+    use std::task::Poll;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     /// A throwaway capability for tests that exercise protocol/validation logic
@@ -1467,7 +1652,14 @@ mod tests {
     fn setup_byte_stream_rpc(
         mode: StreamMode,
     ) -> (system_capnp::byte_stream::Client, io::DuplexStream) {
-        let (host_side, guest_side) = io::duplex(4096);
+        setup_byte_stream_rpc_with_capacity(mode, 4096)
+    }
+
+    fn setup_byte_stream_rpc_with_capacity(
+        mode: StreamMode,
+        capacity: usize,
+    ) -> (system_capnp::byte_stream::Client, io::DuplexStream) {
+        let (host_side, guest_side) = io::duplex(capacity);
         let stream_impl = ByteStreamImpl::new(guest_side, mode);
         let client: system_capnp::byte_stream::Client = capnp_rpc::new_client(stream_impl);
         (client, host_side)
@@ -1551,6 +1743,589 @@ mod tests {
                 let (client, _host) = setup_byte_stream_rpc(StreamMode::Bidirectional);
                 let result = client.close_request().send().promise.await;
                 assert!(result.is_ok(), "close should succeed");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_pending_read_does_not_block_write() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, mut host) = setup_byte_stream_rpc(StreamMode::Bidirectional);
+
+                let mut read_request = client.read_request();
+                read_request.get().set_max_bytes(1);
+                let remote_read = read_request.send();
+                let _retained_pipeline = remote_read.pipeline;
+                let read = remote_read.promise;
+                tokio::pin!(read);
+                assert!(futures::poll!(read.as_mut()).is_pending());
+
+                let mut write_request = client.write_request();
+                write_request.get().set_data(b"x");
+                let write = write_request.send().promise;
+                tokio::pin!(write);
+                match futures::poll!(write.as_mut()) {
+                    Poll::Ready(result) => {
+                        result.expect("write must complete while read is pending")
+                    }
+                    Poll::Pending => panic!("pending read blocked an independent write"),
+                };
+                assert!(futures::poll!(read.as_mut()).is_pending());
+
+                let mut byte = [0u8; 1];
+                host.read_exact(&mut byte).await.unwrap();
+                assert_eq!(&byte, b"x");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_pending_write_does_not_block_read() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, mut host) =
+                    setup_byte_stream_rpc_with_capacity(StreamMode::Bidirectional, 1);
+
+                let mut write_request = client.write_request();
+                write_request.get().set_data(b"ab");
+                let write = write_request.send().promise;
+                tokio::pin!(write);
+                assert!(futures::poll!(write.as_mut()).is_pending());
+
+                host.write_all(b"z").await.unwrap();
+                let mut read_request = client.read_request();
+                read_request.get().set_max_bytes(1);
+                let read = read_request.send().promise;
+                tokio::pin!(read);
+                let response = match futures::poll!(read.as_mut()) {
+                    Poll::Ready(result) => {
+                        result.expect("read must complete while write is pending")
+                    }
+                    Poll::Pending => panic!("pending write blocked an independent read"),
+                };
+                assert_eq!(response.get().unwrap().get_data().unwrap(), b"z");
+                assert!(futures::poll!(write.as_mut()).is_pending());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_overlapping_reads_serialize_through_completion() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, mut host) = setup_byte_stream_rpc(StreamMode::Bidirectional);
+
+                let mut first_request = client.read_request();
+                first_request.get().set_max_bytes(1);
+                let remote_first = first_request.send();
+                let _first_pipeline = remote_first.pipeline;
+                let first = remote_first.promise;
+                tokio::pin!(first);
+                assert!(futures::poll!(first.as_mut()).is_pending());
+
+                let mut second_request = client.read_request();
+                second_request.get().set_max_bytes(1);
+                let remote_second = second_request.send();
+                let _second_pipeline = remote_second.pipeline;
+                let second = remote_second.promise;
+                tokio::pin!(second);
+                assert!(futures::poll!(second.as_mut()).is_pending());
+
+                host.write_all(b"a").await.unwrap();
+                assert!(
+                    futures::poll!(second.as_mut()).is_pending(),
+                    "queued read consumed data reserved for the active read"
+                );
+
+                let response = match futures::poll!(first.as_mut()) {
+                    Poll::Ready(result) => result.expect("active read failed"),
+                    Poll::Pending => panic!("active read did not complete after data arrived"),
+                };
+                assert_eq!(response.get().unwrap().get_data().unwrap(), b"a");
+
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                host.write_all(b"b").await.unwrap();
+                let response = match futures::poll!(second.as_mut()) {
+                    Poll::Ready(result) => result.expect("queued read failed"),
+                    Poll::Pending => panic!("queued read did not complete after data arrived"),
+                };
+                assert_eq!(response.get().unwrap().get_data().unwrap(), b"b");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_overlapping_writes_serialize_through_completion() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, mut host) =
+                    setup_byte_stream_rpc_with_capacity(StreamMode::Bidirectional, 1);
+
+                let mut first_request = client.write_request();
+                first_request.get().set_data(b"ab");
+                let first = first_request.send().promise;
+                tokio::pin!(first);
+                assert!(futures::poll!(first.as_mut()).is_pending());
+
+                let mut second_request = client.write_request();
+                second_request.get().set_data(b"cd");
+                let second = second_request.send().promise;
+                tokio::pin!(second);
+                assert!(futures::poll!(second.as_mut()).is_pending());
+
+                let mut byte = [0u8; 1];
+                {
+                    let next_byte = host.read_exact(&mut byte);
+                    tokio::pin!(next_byte);
+                    match futures::poll!(next_byte.as_mut()) {
+                        Poll::Ready(result) => {
+                            result.expect("active write did not expose its first byte");
+                        }
+                        Poll::Pending => panic!("active write made no controlled progress"),
+                    }
+                }
+                assert_eq!(&byte, b"a");
+
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                {
+                    let next_byte = host.read_exact(&mut byte);
+                    tokio::pin!(next_byte);
+                    assert!(
+                        futures::poll!(next_byte.as_mut()).is_pending(),
+                        "queued write contributed bytes before the active write completed"
+                    );
+
+                    match futures::poll!(first.as_mut()) {
+                        Poll::Ready(result) => {
+                            result.expect("active write failed");
+                        }
+                        Poll::Pending => {
+                            panic!("active write did not complete after capacity became available")
+                        }
+                    }
+
+                    match futures::poll!(next_byte.as_mut()) {
+                        Poll::Ready(result) => {
+                            result.expect("failed to read the active write's final byte")
+                        }
+                        Poll::Pending => panic!("active write's final byte was not observable"),
+                    };
+                }
+                assert_eq!(&byte, b"b");
+
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                {
+                    let next_byte = host.read_exact(&mut byte);
+                    tokio::pin!(next_byte);
+                    match futures::poll!(next_byte.as_mut()) {
+                        Poll::Ready(result) => {
+                            result.expect("queued write did not expose its first byte");
+                        }
+                        Poll::Pending => panic!("queued write made no controlled progress"),
+                    }
+                }
+                assert_eq!(&byte, b"c");
+
+                match futures::poll!(second.as_mut()) {
+                    Poll::Ready(result) => {
+                        result.expect("queued write failed");
+                    }
+                    Poll::Pending => {
+                        panic!("queued write did not complete after capacity became available")
+                    }
+                }
+                {
+                    let next_byte = host.read_exact(&mut byte);
+                    tokio::pin!(next_byte);
+                    match futures::poll!(next_byte.as_mut()) {
+                        Poll::Ready(result) => {
+                            result.expect("queued write did not expose its final byte");
+                        }
+                        Poll::Pending => panic!("queued write's final byte was not observable"),
+                    }
+                }
+                assert_eq!(&byte, b"d");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_close_releases_transport_with_retained_read_pipeline() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut host, guest) = io::duplex(4096);
+                let stream_impl = ByteStreamImpl::new(guest, StreamMode::Bidirectional);
+                let state = stream_impl.state.clone();
+                let client: system_capnp::byte_stream::Client = capnp_rpc::new_client(stream_impl);
+
+                let mut read_request = client.read_request();
+                read_request.get().set_max_bytes(1);
+                let remote_read = read_request.send();
+                let retained_pipeline = remote_read.pipeline;
+                {
+                    let read = remote_read.promise;
+                    tokio::pin!(read);
+                    assert!(futures::poll!(read.as_mut()).is_pending());
+                }
+                assert!(
+                    state.read_gate.try_lock().is_err(),
+                    "retained response pipeline must keep the pending read alive"
+                );
+
+                let close = client.close_request().send().promise;
+                tokio::pin!(close);
+                match futures::poll!(close.as_mut()) {
+                    Poll::Ready(result) => result.expect("close must not wait for a pending read"),
+                    Poll::Pending => panic!("close waited behind a pending read"),
+                };
+
+                let mut received = Vec::new();
+                host.read_to_end(&mut received).await.unwrap();
+                assert!(received.is_empty());
+
+                drop(retained_pipeline);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_close_cancels_blocked_and_queued_writes() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, mut host) =
+                    setup_byte_stream_rpc_with_capacity(StreamMode::Bidirectional, 1);
+
+                let mut first_request = client.write_request();
+                first_request.get().set_data(b"ab");
+                let first = first_request.send().promise;
+                tokio::pin!(first);
+                assert!(futures::poll!(first.as_mut()).is_pending());
+
+                let mut second_request = client.write_request();
+                second_request.get().set_data(b"c");
+                let second = second_request.send().promise;
+                tokio::pin!(second);
+                assert!(futures::poll!(second.as_mut()).is_pending());
+
+                let close = client.close_request().send().promise;
+                tokio::pin!(close);
+                match futures::poll!(close.as_mut()) {
+                    Poll::Ready(result) => result.expect("close must not wait for pending writes"),
+                    Poll::Pending => panic!("close waited behind a pending write"),
+                };
+
+                for mut write in [first.as_mut(), second.as_mut()] {
+                    let error = match futures::poll!(write.as_mut()) {
+                        Poll::Ready(Err(error)) => error,
+                        Poll::Ready(Ok(_)) => panic!("write succeeded after close won"),
+                        Poll::Pending => panic!("pending write was not woken by close"),
+                    };
+                    assert_eq!(error.extra, "stream is closed");
+                }
+
+                let mut accepted = Vec::new();
+                host.read_to_end(&mut accepted).await.unwrap();
+                assert_eq!(accepted, b"a");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_close_cancels_queued_reads() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, _host) = setup_byte_stream_rpc(StreamMode::Bidirectional);
+
+                let mut first_request = client.read_request();
+                first_request.get().set_max_bytes(1);
+                let first = first_request.send().promise;
+                tokio::pin!(first);
+                assert!(futures::poll!(first.as_mut()).is_pending());
+
+                let mut second_request = client.read_request();
+                second_request.get().set_max_bytes(1);
+                let second = second_request.send().promise;
+                tokio::pin!(second);
+                assert!(futures::poll!(second.as_mut()).is_pending());
+
+                let close = client.close_request().send().promise;
+                tokio::pin!(close);
+                match futures::poll!(close.as_mut()) {
+                    Poll::Ready(result) => result.expect("close must not wait for queued reads"),
+                    Poll::Pending => panic!("close waited behind a pending read"),
+                };
+
+                for mut read in [first.as_mut(), second.as_mut()] {
+                    let response = match futures::poll!(read.as_mut()) {
+                        Poll::Ready(result) => {
+                            result.expect("close must resolve queued read as EOF")
+                        }
+                        Poll::Pending => panic!("queued read was not woken by close"),
+                    };
+                    assert!(response.get().unwrap().get_data().unwrap().is_empty());
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_post_close_contract() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, _host) = setup_byte_stream_rpc(StreamMode::Bidirectional);
+                client.close_request().send().promise.await.unwrap();
+                client.close_request().send().promise.await.unwrap();
+
+                for max_bytes in [0, 1] {
+                    let mut request = client.read_request();
+                    request.get().set_max_bytes(max_bytes);
+                    let read = request.send().promise;
+                    tokio::pin!(read);
+                    let response = match futures::poll!(read.as_mut()) {
+                        Poll::Ready(result) => result.expect("read after close must return EOF"),
+                        Poll::Pending => panic!("read after close remained pending"),
+                    };
+                    assert!(response.get().unwrap().get_data().unwrap().is_empty());
+                }
+
+                for data in [&[][..], &b"x"[..]] {
+                    let mut request = client.write_request();
+                    request.get().set_data(data);
+                    let error = match request.send().promise.await {
+                        Ok(_) => panic!("write succeeded after close"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(error.extra, "stream is closed");
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_close_before_first_poll_wins_over_ready_io() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, mut host) = setup_byte_stream_rpc(StreamMode::Bidirectional);
+                host.write_all(b"ready").await.unwrap();
+
+                let mut read_request = client.read_request();
+                read_request.get().set_max_bytes(5);
+                let read = read_request.send().promise;
+
+                client.close_request().send().promise.await.unwrap();
+
+                let response = read.await.unwrap();
+                assert!(response.get().unwrap().get_data().unwrap().is_empty());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_io_completed_before_close_preserves_result() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (read_client, mut read_host) = setup_byte_stream_rpc(StreamMode::Bidirectional);
+                read_host.write_all(b"ready").await.unwrap();
+                let mut read_request = read_client.read_request();
+                read_request.get().set_max_bytes(5);
+                let read_response = read_request.send().promise.await.unwrap();
+                read_client.close_request().send().promise.await.unwrap();
+                assert_eq!(read_response.get().unwrap().get_data().unwrap(), b"ready");
+
+                let (write_client, mut write_host) =
+                    setup_byte_stream_rpc(StreamMode::Bidirectional);
+                let mut write_request = write_client.write_request();
+                write_request.get().set_data(b"accepted");
+                let write_response = write_request.send().promise.await.unwrap();
+                write_client.close_request().send().promise.await.unwrap();
+                drop(write_response);
+                let mut received = Vec::new();
+                write_host.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, b"accepted");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_transport_error_without_local_close_is_preserved() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, host) = setup_byte_stream_rpc(StreamMode::Bidirectional);
+                drop(host);
+
+                let mut request = client.write_request();
+                request.get().set_data(b"x");
+                let error = match request.send().promise.await {
+                    Ok(_) => panic!("write unexpectedly succeeded after peer transport closed"),
+                    Err(error) => error,
+                };
+                assert_ne!(error.extra, STREAM_CLOSED);
+                assert!(error.extra.to_lowercase().contains("broken pipe"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_twoparty_write_progress_and_close_cancellation() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (host, guest) = io::duplex(4096);
+                let stream_impl = ByteStreamImpl::new(guest, StreamMode::Bidirectional);
+                let state = stream_impl.state.clone();
+                let stream_cap: system_capnp::byte_stream::Client =
+                    capnp_rpc::new_client(stream_impl);
+
+                let (client_transport, server_transport) = io::duplex(8 * 1024);
+                let (client_read, client_write) = io::split(client_transport);
+                let (server_read, server_write) = io::split(server_transport);
+
+                let server_network = VatNetwork::new(
+                    server_read.compat(),
+                    server_write.compat_write(),
+                    Side::Server,
+                    Default::default(),
+                );
+                let server_rpc =
+                    RpcSystem::new(Box::new(server_network), Some(stream_cap.client.clone()));
+                tokio::pin!(server_rpc);
+
+                let client_network = VatNetwork::new(
+                    client_read.compat(),
+                    client_write.compat_write(),
+                    Side::Client,
+                    Default::default(),
+                );
+                let mut client_rpc = RpcSystem::new(Box::new(client_network), None);
+                let client: system_capnp::byte_stream::Client = client_rpc.bootstrap(Side::Server);
+                tokio::pin!(client_rpc);
+
+                let mut read_request = client.read_request();
+                read_request.get().set_max_bytes(1);
+                let read = read_request.send().promise;
+                tokio::pin!(read);
+
+                let mut read_dispatched = false;
+                for _ in 0..16 {
+                    let _ = futures::poll!(client_rpc.as_mut());
+                    let _ = futures::poll!(server_rpc.as_mut());
+                    assert!(futures::poll!(read.as_mut()).is_pending());
+                    if state.read_gate.try_lock().is_err() {
+                        read_dispatched = true;
+                        break;
+                    }
+                }
+                assert!(
+                    read_dispatched,
+                    "RPC server did not dispatch the pending read"
+                );
+
+                let mut write_request = client.write_request();
+                write_request.get().set_data(b"x");
+                let write = write_request.send().promise;
+                tokio::pin!(write);
+                let mut write_result = None;
+                for _ in 0..16 {
+                    let _ = futures::poll!(client_rpc.as_mut());
+                    let _ = futures::poll!(server_rpc.as_mut());
+                    if let Poll::Ready(result) = futures::poll!(write.as_mut()) {
+                        write_result = Some(result);
+                        break;
+                    }
+                }
+                write_result
+                    .expect("two-party write remained pending behind read")
+                    .expect("two-party write failed");
+                assert!(futures::poll!(read.as_mut()).is_pending());
+
+                let close = client.close_request().send().promise;
+                tokio::pin!(close);
+                let mut close_result = None;
+                for _ in 0..16 {
+                    let _ = futures::poll!(client_rpc.as_mut());
+                    let _ = futures::poll!(server_rpc.as_mut());
+                    if let Poll::Ready(result) = futures::poll!(close.as_mut()) {
+                        close_result = Some(result);
+                        break;
+                    }
+                }
+                close_result
+                    .expect("two-party close remained pending behind read")
+                    .expect("two-party close failed");
+
+                let mut read_result = None;
+                for _ in 0..16 {
+                    let _ = futures::poll!(client_rpc.as_mut());
+                    let _ = futures::poll!(server_rpc.as_mut());
+                    if let Poll::Ready(result) = futures::poll!(read.as_mut()) {
+                        read_result = Some(result);
+                        break;
+                    }
+                }
+                let response = read_result
+                    .expect("two-party close did not wake pending read")
+                    .expect("two-party read failed after close");
+                assert!(response.get().unwrap().get_data().unwrap().is_empty());
+
+                let mut host = host;
+                let mut received = Vec::new();
+                host.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, b"x");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_peer_eof_keeps_write_direction_usable() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, mut host) = setup_byte_stream_rpc(StreamMode::Bidirectional);
+                host.shutdown().await.unwrap();
+
+                let mut read_request = client.read_request();
+                read_request.get().set_max_bytes(1);
+                let response = read_request.send().promise.await.unwrap();
+                assert!(response.get().unwrap().get_data().unwrap().is_empty());
+
+                let mut write_request = client.write_request();
+                write_request.get().set_data(b"x");
+                write_request.send().promise.await.unwrap();
+                let mut byte = [0u8; 1];
+                host.read_exact(&mut byte).await.unwrap();
+                assert_eq!(&byte, b"x");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_byte_stream_close_preserves_buffered_process_stdin() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, mut process_stdin) =
+                    setup_byte_stream_rpc_with_capacity(StreamMode::WriteOnly, 64);
+
+                let mut write_request = client.write_request();
+                write_request.get().set_data(b"request body");
+                write_request.send().promise.await.unwrap();
+                client.close_request().send().promise.await.unwrap();
+
+                let mut received = Vec::new();
+                process_stdin.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, b"request body");
             })
             .await;
     }

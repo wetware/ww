@@ -6271,6 +6271,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -7230,6 +7231,7 @@ dependencies = [
  "capnp",
  "capnp-rpc",
  "capnpc",
+ "cid",
  "ed25519-dalek",
  "hex",
  "libp2p-core",
