@@ -5,18 +5,26 @@
 //! body to stdin. The guest reads env vars, reads stdin, and writes a
 //! CGI-formatted response to stdout.
 //!
-//! This crate wraps the boring parts so your handler is ~8 lines:
+//! This crate formats request metadata and finite CGI responses:
 //!
 //! ```ignore
 //! use wagi_guest as wagi;
 //!
-//! fn handle() {
-//!     match wagi::method().as_str() {
-//!         "GET"  => wagi::respond(200, &[("Content-Type", "text/plain")], "hello"),
-//!         "POST" => wagi::respond(200, &[("Content-Type", "text/plain")], "created"),
-//!         _      => wagi::respond(405, &[], "Method Not Allowed"),
+//! struct Handler;
+//!
+//! impl wagi::AsyncGuest for Handler {
+//!     async fn run() -> Result<(), ()> {
+//!         wagi::respond_bytes_async(
+//!             200,
+//!             &[("Content-Type", "text/plain")],
+//!             b"hello",
+//!         )
+//!         .await
+//!         .map_err(|error| eprintln!("response failed: {error}"))
 //!     }
 //! }
+//!
+//! wagi::export_async!(Handler);
 //! ```
 
 use std::io::Read;
@@ -33,6 +41,7 @@ pub mod bindings {
 }
 
 pub use bindings::__export_wagi_guest;
+pub use bindings::exports::wasi::cli::run::Guest as AsyncGuest;
 
 /// Synchronous WAGI entry point.
 pub trait Guest {
@@ -48,6 +57,14 @@ macro_rules! export {
                 <$ty as $crate::Guest>::run()
             }
         }
+        $crate::__export_wagi_guest!($ty with_types_in $crate::bindings);
+    };
+}
+
+/// Export a handler that implements the asynchronous P3 CLI entry point.
+#[macro_export]
+macro_rules! export_async {
+    ($ty:ident) => {
         $crate::__export_wagi_guest!($ty with_types_in $crate::bindings);
     };
 }
@@ -104,9 +121,11 @@ pub fn body_string() -> String {
     String::from_utf8(body()).unwrap_or_default()
 }
 
-/// Write a CGI response to stdout.
+/// Write a CGI response to buffered stdout without completion acknowledgement.
 ///
 /// Formats the Status line, headers, and body per RFC 3875.
+/// This compatibility helper does not report write or flush failures. A finite
+/// WASI P3 handler must use [`respond_bytes_async`] and await its result.
 /// ```ignore
 /// wagi::respond(200, &[("Content-Type", "text/plain")], "hello");
 /// ```
@@ -118,7 +137,10 @@ pub fn respond(status: u16, headers: &[(&str, &str)], body: &str) {
     print!("\r\n{body}");
 }
 
-/// Write a CGI response with a byte body.
+/// Write a CGI response with a byte body without completion acknowledgement.
+///
+/// This compatibility helper does not report write or flush failures. A finite
+/// WASI P3 handler must use [`respond_bytes_async`] and await its result.
 pub fn respond_bytes(status: u16, headers: &[(&str, &str)], body: &[u8]) {
     use std::io::Write;
     let mut out = std::io::stdout();
@@ -133,9 +155,16 @@ pub fn respond_bytes(status: u16, headers: &[(&str, &str)], body: &[u8]) {
 
 /// Write a CGI response and await P3 stdout completion.
 ///
-/// WASIp3's raw file-descriptor flush is a no-op. Finite async cells must use
-/// `write-via-stream` so their final buffered bytes reach the host before the
-/// exported root future completes.
+/// Success means that P3 stdout accepted every response byte and the configured
+/// host writer completed its flush. Success does not mean that an HTTP client,
+/// network peer, or downstream proxy consumed the response.
+///
+/// The helper builds one contiguous CGI response before it writes. Peak guest
+/// memory therefore includes the headers, body, and response allocation. An
+/// error can occur after the host writer accepted a response prefix.
+///
+/// WASI P3 raw file-descriptor flush does not provide this completion boundary.
+/// Finite handlers must await this helper before their exported root completes.
 pub async fn respond_bytes_async(
     status: u16,
     headers: &[(&str, &str)],
@@ -192,5 +221,26 @@ fn reason_phrase(status: u16) -> &'static str {
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AsyncGuest;
+
+    struct TestGuest;
+
+    impl AsyncGuest for TestGuest {
+        async fn run() -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn async_guest_entry_returns_a_future() {
+        fn assert_guest<T: AsyncGuest>() {}
+
+        assert_guest::<TestGuest>();
+        assert!(futures::executor::block_on(TestGuest::run()).is_ok());
     }
 }

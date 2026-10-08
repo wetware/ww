@@ -294,6 +294,17 @@ fresh PID0 for the new generation.
 P3 stdout and stderr completion waits for the underlying host flush. A finite
 command can therefore complete without losing its final output bytes.
 
+Runtime-free finite WAGI commands implement `wagi_guest::AsyncGuest` and export
+with `wagi_guest::export_async!`. Finite WAGI commands that use `system::run`
+retain `system::Guest`. Both forms must await `respond_bytes_async`. Its success
+covers P3 stream acceptance and the configured host writer flush. It does not
+cover HTTP client or network consumption. The helper constructs one contiguous
+CGI response. A failure can occur after the writer accepts a prefix.
+
+`respond` and `respond_bytes` remain compatibility helpers. They do not return
+stdout completion or flush errors and are unsuitable as a finite P3 command's
+completion boundary.
+
 ### Forward-progress limits
 
 RPC can progress while the application awaits a supported P3 clock, transport,

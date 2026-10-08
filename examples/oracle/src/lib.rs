@@ -499,7 +499,9 @@ async fn run_consumer(membrane: Membrane) -> Result<(), capnp::Error> {
 async fn run_http() -> Result<(), ()> {
     use wagi_guest as wagi;
 
-    system::run(|membrane: Membrane| async move {
+    let completion = system::CompletionGuard::new();
+    let application_completion = completion.clone();
+    let result = system::run(|membrane: Membrane| async move {
         let graft_response = membrane.graft_request().send().promise.await?;
         let graft = graft_response.get()?;
         let http = graft.get_network()?.get_http().get_dialer()?;
@@ -507,21 +509,29 @@ async fn run_http() -> Result<(), ()> {
         let cache = init_cache();
         if let Err(e) = fetch_prices(&http, &cache).await {
             log::warn!("http: price fetch failed: {e}");
-            wagi::respond(
-                502,
-                &[("Content-Type", "text/plain")],
-                &format!("price fetch failed: {e}"),
-            );
+            let body = format!("price fetch failed: {e}");
+            wagi::respond_bytes_async(502, &[("Content-Type", "text/plain")], body.as_bytes())
+                .await
+                .map_err(capnp::Error::failed)?;
+            application_completion.complete();
             return Ok(());
         }
 
         let query = wagi::query();
         let json = build_json_response(&cache, &query);
-        wagi::respond(200, &[("Content-Type", "application/json")], &json);
+        wagi::respond_bytes_async(
+            200,
+            &[("Content-Type", "application/json")],
+            json.as_bytes(),
+        )
+        .await
+        .map_err(capnp::Error::failed)?;
+        application_completion.complete();
         Ok(())
     })
-    .await
-    .map_err(|error| {
+    .await;
+    let result = result.and_then(|()| completion.require("finite WAGI response output"));
+    result.map_err(|error| {
         log::error!("oracle HTTP RPC failed: {error}");
     })
 }

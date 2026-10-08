@@ -104,6 +104,9 @@ async fn status_cell_serves_json_with_required_peer_id() {
             // ── Set up an in-process runtime with a known peer ID ───────
             //
             let peer_id_bytes = synth_peer_id_bytes();
+            let expected_peer_id = libp2p::PeerId::from_bytes(&peer_id_bytes)
+                .expect("synthetic peer ID")
+                .to_base58();
             let network_state = NetworkState::from_peer_id(peer_id_bytes.clone());
 
             let epoch = authority::Epoch {
@@ -230,6 +233,13 @@ async fn status_cell_serves_json_with_required_peer_id() {
                 .expect("wait failed");
             let exit_code = wait_resp.get().expect("wait response").get_exit_code();
             assert_eq!(exit_code, 0, "status cell should exit cleanly");
+
+            let expected = format!(
+                "Status: 200 OK\r\nContent-Type: application/json\r\n\r\n\
+                 {{\"listen_addrs\":[],\"peer_count\":0,\"peer_id\":\"{expected_peer_id}\",\
+                 \"status\":\"ok\",\"version\":\"0.1.0\"}}"
+            );
+            assert_eq!(response, expected.as_bytes());
 
             // ── Parse the CGI response ─────────────────────────────────
             let cgi = wagi::parse_cgi_response(&response)

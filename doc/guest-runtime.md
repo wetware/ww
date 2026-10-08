@@ -76,6 +76,17 @@ P3 transport completion participates in the outer session result.
 The guest does not drain RPC for an arbitrary interval. A completed P3 stream
 write already waits for the underlying host flush.
 
+Finite WAGI handlers use `wagi_guest::respond_bytes_async`. The returned Future
+completes after P3 stdout accepts all CGI bytes and the host writer flushes.
+The boundary does not cover network delivery or downstream consumption. The
+helper allocates one contiguous response, and a failed write can leave an
+observable prefix in stdout.
+
+Finite handlers that also use `system::run` keep a request-local
+`system::CompletionGuard`. The handler marks the guard only after the awaited
+response succeeds. An orderly RPC or transport result cannot turn an
+incomplete response into application success.
+
 ## Supported suspension sources
 
 First-party async guests suspend on host-visible P3 operations:
@@ -117,14 +128,15 @@ PID0 alone imports
 on the trusted PID0 linker. The function commits the generation already bound
 to PID0's process-local graft.
 
-## Synchronous Cells
+## Runtime-free Cells
 
-Synchronous Cells use a P3 CLI export but do not link `std/system` or construct
-an `RpcSystem`. Echo, counter, snap-hello-rs, and the routing-key probe remain
-runtime-free unless their own behavior needs RPC.
+Runtime-free Cells use a P3 CLI export but do not link `std/system` or construct
+an `RpcSystem`. Echo and the routing-key probe use the synchronous guest entry.
+Counter and snap-hello-rs use `AsyncGuest` only to await P3 stdout completion.
+All four remain runtime-free unless their own behavior needs RPC.
 
 The `wasm32-wasip3` target does not imply that every guest uses async RPC. It
-defines the common Component Model ABI and lets synchronous guests use only
+defines the common Component Model ABI and lets runtime-free guests use only
 their declared interfaces.
 
 ## Architecture guardrails
