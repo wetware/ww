@@ -179,19 +179,15 @@ fn snap_text_for_greeting(method: &str, greeting: &str) -> String {
 
 struct SnapCell;
 
-impl wagi::Guest for SnapCell {
-    fn run() -> Result<(), ()> {
+impl wagi::AsyncGuest for SnapCell {
+    async fn run() -> Result<(), ()> {
         let accept = wagi::header("Accept").unwrap_or_default();
         let method = wagi::method();
         let is_post = method == "POST";
 
-        // `respond_bytes` flushes explicitly; plain `respond` uses
-        // `print!` and can lose buffered bytes on cell teardown
-        // (the body sits in stdout while only the headers ship).
-        // Same fix the std/status cell uses (std/status/src/lib.rs:151-153).
         if wants_snap(&accept) || is_post {
             let body = snap_response_json(&snap_text(&method), &compute_target_url());
-            wagi::respond_bytes(
+            wagi::respond_bytes_async(
                 200,
                 &[
                     ("Content-Type", SNAP_TYPE),
@@ -207,14 +203,16 @@ impl wagi::Guest for SnapCell {
                     ("Access-Control-Allow-Origin", "*"),
                 ],
                 body.as_bytes(),
-            );
+            )
+            .await
+            .map_err(|error| eprintln!("snap JSON response failed: {error}"))?;
         } else {
             // `Link: <>; rel="alternate"; type="..."` — empty `<>` is
             // an RFC 3986 same-document reference; clients re-fetch
             // the current URL with `Accept` set. Avoids hardcoding an
             // absolute URL into the cell.
             let body = html_body(&viewer_greeting());
-            wagi::respond_bytes(
+            wagi::respond_bytes_async(
                 200,
                 &[
                     ("Content-Type", "text/html; charset=utf-8"),
@@ -227,14 +225,16 @@ impl wagi::Guest for SnapCell {
                     ),
                 ],
                 body.as_bytes(),
-            );
+            )
+            .await
+            .map_err(|error| eprintln!("snap HTML response failed: {error}"))?;
         }
 
         Ok(())
     }
 }
 
-wagi::export!(SnapCell);
+wagi::export_async!(SnapCell);
 
 #[cfg(test)]
 mod tests {

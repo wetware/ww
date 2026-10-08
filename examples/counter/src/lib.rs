@@ -13,19 +13,20 @@ use wagi_guest as wagi;
 
 struct CounterCell;
 
-impl wagi::Guest for CounterCell {
-    fn run() -> Result<(), ()> {
+impl wagi::AsyncGuest for CounterCell {
+    async fn run() -> Result<(), ()> {
         let count: u64 = 0;
         let ct = ("Content-Type", "text/plain");
 
-        match wagi::method().as_str() {
-            "GET" => wagi::respond(200, &[ct], &count.to_string()),
-            "POST" => wagi::respond(200, &[ct], &(count + 1).to_string()),
-            _ => wagi::respond(405, &[ct], "Method Not Allowed"),
-        }
-
-        Ok(())
+        let (status, body) = match wagi::method().as_str() {
+            "GET" => (200, count.to_string()),
+            "POST" => (200, (count + 1).to_string()),
+            _ => (405, "Method Not Allowed".to_string()),
+        };
+        wagi::respond_bytes_async(status, &[ct], body.as_bytes())
+            .await
+            .map_err(|error| eprintln!("counter response failed: {error}"))
     }
 }
 
-wagi::export!(CounterCell);
+wagi::export_async!(CounterCell);

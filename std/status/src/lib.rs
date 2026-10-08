@@ -171,7 +171,9 @@ async fn status_json_from_membrane(membrane: &Membrane) -> Result<String, capnp:
 async fn run_http() -> Result<(), ()> {
     use wagi_guest as wagi;
 
-    system::run(|membrane: Membrane| async move {
+    let completion = system::CompletionGuard::new();
+    let application_completion = completion.clone();
+    let result = system::run(|membrane: Membrane| async move {
         let json = status_json_from_membrane(&membrane).await?;
         wagi::respond_bytes_async(
             200,
@@ -180,10 +182,12 @@ async fn run_http() -> Result<(), ()> {
         )
         .await
         .map_err(capnp::Error::failed)?;
+        application_completion.complete();
         Ok(())
     })
-    .await
-    .map_err(|error| {
+    .await;
+    let result = result.and_then(|()| completion.require("finite WAGI response output"));
+    result.map_err(|error| {
         log::error!("status RPC failed: {error}");
     })
 }
