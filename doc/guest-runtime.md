@@ -128,14 +128,15 @@ PID0 alone imports
 on the trusted PID0 linker. The function commits the generation already bound
 to PID0's process-local graft.
 
-## Synchronous Cells
+## Runtime-free Cells
 
-Synchronous Cells use a P3 CLI export but do not link `std/system` or construct
-an `RpcSystem`. Echo, counter, snap-hello-rs, and the routing-key probe remain
-runtime-free unless their own behavior needs RPC.
+Runtime-free Cells use a P3 CLI export but do not link `std/system` or construct
+an `RpcSystem`. Echo and the routing-key probe use the synchronous guest entry.
+Counter and snap-hello-rs use `AsyncGuest` only to await P3 stdout completion.
+All four remain runtime-free unless their own behavior needs RPC.
 
 The `wasm32-wasip3` target does not imply that every guest uses async RPC. It
-defines the common Component Model ABI and lets synchronous guests use only
+defines the common Component Model ABI and lets runtime-free guests use only
 their declared interfaces.
 
 ## Architecture guardrails
