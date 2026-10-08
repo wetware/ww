@@ -33,6 +33,7 @@ pub mod bindings {
 }
 
 pub use bindings::__export_wagi_guest;
+pub use bindings::exports::wasi::cli::run::Guest as AsyncGuest;
 
 /// Synchronous WAGI entry point.
 pub trait Guest {
@@ -48,6 +49,14 @@ macro_rules! export {
                 <$ty as $crate::Guest>::run()
             }
         }
+        $crate::__export_wagi_guest!($ty with_types_in $crate::bindings);
+    };
+}
+
+/// Export a handler that implements the asynchronous P3 CLI entry point.
+#[macro_export]
+macro_rules! export_async {
+    ($ty:ident) => {
         $crate::__export_wagi_guest!($ty with_types_in $crate::bindings);
     };
 }
@@ -192,5 +201,26 @@ fn reason_phrase(status: u16) -> &'static str {
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AsyncGuest;
+
+    struct TestGuest;
+
+    impl AsyncGuest for TestGuest {
+        async fn run() -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn async_guest_entry_returns_a_future() {
+        fn assert_guest<T: AsyncGuest>() {}
+
+        assert_guest::<TestGuest>();
+        assert!(futures::executor::block_on(TestGuest::run()).is_ok());
     }
 }

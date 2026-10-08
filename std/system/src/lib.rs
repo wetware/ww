@@ -8,8 +8,10 @@ use capnp::capability::FromClientHook;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
+use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 use wit_bindgen::{
     StreamReader as WasiStreamReader, StreamResult, StreamWriter as WasiStreamWriter,
@@ -133,6 +135,36 @@ pub mod bindings {
 
 pub use bindings::__export_system_guest;
 pub use bindings::exports::wasi::cli::run::Guest;
+
+/// Request-local state for work that must complete before a finite root succeeds.
+///
+/// Clone the guard into the application future. Call [`Self::complete`] only
+/// after the required work succeeds, then call [`Self::require`] if the session
+/// returns success. The guard does not change the shared RPC session selector.
+#[derive(Clone, Default)]
+pub struct CompletionGuard {
+    complete: Rc<Cell<bool>>,
+}
+
+impl CompletionGuard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn complete(&self) {
+        self.complete.set(true);
+    }
+
+    pub fn require(&self, operation: &str) -> Result<(), capnp::Error> {
+        if self.complete.get() {
+            Ok(())
+        } else {
+            Err(capnp::Error::failed(format!(
+                "{operation} did not complete before the session ended"
+            )))
+        }
+    }
+}
 
 /// Export a type that implements the selective P3 [`Guest`] entry point.
 #[macro_export]
@@ -458,11 +490,25 @@ where
 #[cfg(test)]
 mod graft_tests {
     use capnp::traits::{Imbue, ImbueMut};
+    use std::cell::Cell;
+    use std::task::Poll;
 
     use super::*;
 
     fn failed(message: &str) -> capnp::Error {
         capnp::Error::failed(message.to_string())
+    }
+
+    fn pending_once_then_ok() -> impl Future<Output = Result<(), capnp::Error>> {
+        let first_poll = Cell::new(true);
+        futures::future::poll_fn(move |cx| {
+            if first_poll.replace(false) {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        })
     }
 
     #[test]
@@ -528,6 +574,41 @@ mod graft_tests {
             std::future::pending(),
         ));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn clean_session_completion_does_not_satisfy_an_incomplete_guard() {
+        let completion = CompletionGuard::new();
+        let result = futures::executor::block_on(select_session(
+            pending_once_then_ok(),
+            std::future::ready(Ok(())),
+            std::future::pending(),
+        ));
+
+        assert!(result.is_ok());
+        let error = completion
+            .require("finite response output")
+            .expect_err("an incomplete response must fail");
+        assert!(error.to_string().contains("finite response output"));
+    }
+
+    #[test]
+    fn completed_guard_accepts_clean_session_completion() {
+        let completion = CompletionGuard::new();
+        let application = completion.clone();
+        let result = futures::executor::block_on(select_session(
+            pending_once_then_ok(),
+            std::future::pending(),
+            async move {
+                application.complete();
+                Ok(())
+            },
+        ));
+
+        assert!(result.is_ok());
+        completion
+            .require("finite response output")
+            .expect("completed response");
     }
 
     #[test]
