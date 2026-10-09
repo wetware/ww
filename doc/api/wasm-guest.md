@@ -254,6 +254,26 @@ This close is abortive for buffered bytes that the network has not accepted.
 |--------|-----------|-------------|
 | `listen` | `(executor: Executor, protocol: Text, membrane: Membrane) -> ()` | Accept streams, spawn a handler, wire stdin/stdout, and forward the registration-time Membrane. |
 
+Peer input EOF closes the accepted child's stdin without closing its output
+direction, so delayed output can still reach the peer. One supervisor retains
+Process ownership and both transport directions. A single non-renewable
+30-second completion grace starts at the earlier observed input EOF or child
+completion with pending output. It covers remaining handler work, output drain,
+flush, and close without restarting between phases.
+
+On timeout, cancellation, or transport/executor failure, the supervisor stops
+gateway work, makes a bounded best-effort kill request, and releases its Process
+and outstanding ownership-bearing RPC objects. The connection permit returns
+when gateway-owned connection state ends; it does not certify remote child
+cleanup. Backend teardown proceeds independently. This also works with opaque
+wrapped or remote Executors and does not disconnect a shared executor to stop
+one child.
+
+The authoritative registration epoch check runs immediately before
+`Executor.spawn()` dispatch after scheduling, without an intervening yield.
+Stale admission returns the permit without spawning. Later epoch transitions
+do not retroactively invalidate a dispatched spawn.
+
 ### StreamDialer (byte-stream mode)
 
 | Method | Signature | Description |

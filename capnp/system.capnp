@@ -122,6 +122,10 @@ interface StreamListener {
     membrane :Membrane
   ) -> ();
   # Each accepted stream receives the registration-time Membrane.
+  # Peer input EOF closes only child stdin; delayed output remains deliverable.
+  # One fixed 30-second completion grace bounds remaining gateway work after
+  # input EOF or child completion with pending output. Admission permits account
+  # for gateway connection lifetime, not remote child cleanup acknowledgement.
 }
 
 interface HttpListener {

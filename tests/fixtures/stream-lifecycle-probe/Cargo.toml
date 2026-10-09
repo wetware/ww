@@ -1,0 +1,19 @@
+[package]
+name = "stream-lifecycle-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+capnp = "0.25.3"
+futures = "0.3"
+system = { path = "../../../std/system" }
+wit-bindgen = { version = "=0.62.0", git = "https://github.com/wetware/wit-bindgen", rev = "025f95c294373c73e12eaee335577c81477d5a20" }
+
+[patch.crates-io]
+capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a" }

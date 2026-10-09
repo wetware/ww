@@ -173,9 +173,9 @@
       "group": "THE CELL AND NETWORK",
       "title": "Cap’n Proto RPC",
       "subtitle": "Carries typed capability calls.",
-      "files": ["crates/rpc/src/lib.rs", "crates/rpc/src/routing.rs"],
+      "files": ["crates/rpc/src/lib.rs", "crates/rpc/src/routing.rs", "crates/rpc/src/stream_listener.rs"],
       "what": "RPC connects cells to host-provided capabilities through in-memory duplex streams. It also carries vat service calls over libp2p streams between peers.",
-      "built": "`crates/rpc` implements root graft construction, application-defined `extras`, independent provider discovery and announcement, Membrane-forwarding listeners, WAGI, and connection budgets. Process capabilities own execution lifetime; wait is replayable and managed RPC disconnect releases exported ownership."
+      "built": "`crates/rpc` implements root graft construction, application-defined `extras`, independent provider discovery and announcement, Membrane-forwarding listeners, WAGI, and connection budgets. Process capabilities own execution lifetime; wait is replayable and managed RPC disconnect releases exported ownership. Each accepted byte stream preserves directional EOF within one fixed completion grace. Admission accounts only for gateway connection lifetime, independently of backend cleanup."
     },
     {
       "key": "swarm",
