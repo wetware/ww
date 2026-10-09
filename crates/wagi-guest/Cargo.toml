@@ -7,7 +7,7 @@ description = "Thin helper for writing WAGI (CGI-over-WASI) guest cells"
 [workspace]  # standalone — not part of the host workspace (targets native wasm32-wasip3)
 
 [dependencies]
-wit-bindgen = "=0.61.1"
+wit-bindgen = { version = "=0.62.0", git = "https://github.com/wetware/wit-bindgen", rev = "025f95c294373c73e12eaee335577c81477d5a20" }
 
 [dev-dependencies]
 futures = "0.3"

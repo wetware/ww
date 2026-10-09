@@ -1045,7 +1045,7 @@ crate-type = ["cdylib"]
 capnpc    = "0.25.3"
 
 [patch.crates-io]
-capnp-rpc = {{ git = "https://github.com/wetware/capnproto-rust", branch = "ww/import-fix-0.25-consume" }}
+capnp-rpc = {{ git = "https://github.com/wetware/capnproto-rust", rev = "b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a" }}
 "#
         );
         std::fs::write(target_dir.join("Cargo.toml"), cargo_toml)?;

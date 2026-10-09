@@ -9,7 +9,7 @@ edition = "2021"
 capnp = "0.25.3"
 capnp-rpc = "0.25.0"
 log = "0.4.29"
-wit-bindgen = "=0.61.1"
+wit-bindgen = { version = "=0.62.0", git = "https://github.com/wetware/wit-bindgen", rev = "025f95c294373c73e12eaee335577c81477d5a20" }
 system = { path = "../system" }
 
 [lib]
@@ -21,4 +21,4 @@ capnpc = "0.25.3"
 # capnp-rpc 0.25.1 + import-wrapper-reuse fix (wetware/ww#586). Keep the
 # kernel component on the same transport implementation as the host.
 [patch.crates-io]
-capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", branch = "ww/import-fix-0.25-consume" }
+capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a" }

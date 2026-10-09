@@ -27,7 +27,7 @@ use ww::system_capnp;
 
 use ticked_executor::TickedExecutor;
 
-const CAPNP_FORK_REVISION: &str = "c6eecf42da63296e5bf628251935cf5af09d80be";
+const CAPNP_FORK_REVISION: &str = "b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a";
 const USE_PREBUILT_AUTHORITY_PROBE_ENV: &str = "WW_USE_PREBUILT_AUTHORITY_PROBE";
 const KNOWN_CID: &str = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
 
@@ -35,14 +35,38 @@ fn fixed_epoch_zero_guard() -> authority::EpochGuard {
     authority::EpochGuard::fixed(authority::Epoch::zero())
 }
 
-fn assert_capnp_rpc_revision(lock: &str, label: &str) {
+fn assert_capnp_rpc_revision(manifest_dir: &Path, label: &str) {
+    let lock = std::fs::read_to_string(manifest_dir.join("Cargo.lock"))
+        .unwrap_or_else(|error| panic!("{label} Cargo.lock: {error}"));
     let stanza = lock
         .split("[[package]]")
         .find(|stanza| stanza.contains("name = \"capnp-rpc\""))
         .unwrap_or_else(|| panic!("{label} has no capnp-rpc package"));
     assert!(
-        stanza.contains(&format!("#{CAPNP_FORK_REVISION}\"")),
+        stanza.contains("version = \"0.25.1\"")
+            && stanza.contains(&format!(
+                "source = \"git+https://github.com/wetware/capnproto-rust?rev={CAPNP_FORK_REVISION}#{CAPNP_FORK_REVISION}\""
+            )),
         "{label} must resolve capnp-rpc at {CAPNP_FORK_REVISION}: {stanza}"
+    );
+
+    let manifest = std::fs::read_to_string(manifest_dir.join("Cargo.toml"))
+        .unwrap_or_else(|error| panic!("{label} Cargo.toml: {error}"));
+    let patch = manifest
+        .split("[patch.crates-io]")
+        .nth(1)
+        .expect("capnp-rpc Git patch")
+        .lines()
+        .skip_while(|line| line.trim().is_empty())
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .find(|line| line.trim_start().starts_with("capnp-rpc ="))
+        .unwrap_or_else(|| panic!("{label} must patch capnp-rpc to its exact Git revision"));
+    assert_eq!(
+        patch.trim(),
+        format!(
+            "capnp-rpc = {{ git = \"https://github.com/wetware/capnproto-rust\", rev = \"{CAPNP_FORK_REVISION}\" }}"
+        ),
+        "{label} must use the same exact capnp-rpc revision as the host"
     );
 }
 
@@ -982,16 +1006,19 @@ fn assert_no_active_authority_pointers(report: &Value, context: &str) {
     }
 }
 
+fn assert_host_and_probe_capnp_provenance() {
+    assert_capnp_rpc_revision(Path::new(env!("CARGO_MANIFEST_DIR")), "host");
+    assert_capnp_rpc_revision(&fixture_dir(), "probe");
+}
+
+#[test]
+fn capnp_fork_gate_records_exact_revision() {
+    assert_host_and_probe_capnp_provenance();
+}
+
 #[test]
 fn capnp_fork_gate_same_cap_two_names_survives_redelivery() {
-    let root_lock =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))
-            .expect("root Cargo.lock");
-    let fixture_lock =
-        std::fs::read_to_string(fixture_dir().join("Cargo.lock")).expect("probe Cargo.lock");
-    assert_capnp_rpc_revision(&root_lock, "host Cargo.lock");
-    assert_capnp_rpc_revision(&fixture_lock, "probe Cargo.lock");
-
+    assert_host_and_probe_capnp_provenance();
     let wasm = probe_bytes();
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {

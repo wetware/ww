@@ -11,10 +11,14 @@ crate-type = ["cdylib"]
 
 [dependencies]
 futures = "=0.3.31"
-wasip3 = "=0.8.0"
-wit-bindgen = "=0.61.1"
+wasip3 = "=0.9.0"
+wit-bindgen = { version = "=0.62.0", git = "https://github.com/wetware/wit-bindgen", rev = "025f95c294373c73e12eaee335577c81477d5a20" }
 
 [profile.release]
 opt-level = "z"
 lto = true
 strip = true
+
+# Keep the pre-generated WASI bindings on the same fixed runtime as the fixture.
+[patch.crates-io]
+wit-bindgen = { version = "=0.62.0", git = "https://github.com/wetware/wit-bindgen", rev = "025f95c294373c73e12eaee335577c81477d5a20" }

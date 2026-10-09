@@ -10,7 +10,7 @@ capnp = "0.25.3"
 capnp-rpc = "0.25.0"
 futures   = "0.3"
 log       = "0.4"
-wit-bindgen = "=0.61.1"
+wit-bindgen = { version = "=0.62.0", git = "https://github.com/wetware/wit-bindgen", rev = "025f95c294373c73e12eaee335577c81477d5a20" }
 hex       = "0.4"
 routing-key = { path = "../../crates/guest/routing-key" }
 serde     = { version = "1", features = ["derive"] }
@@ -31,11 +31,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 [build-dependencies]
 capnpc = "0.25.3"
 
-# capnp-rpc 0.25.1 + import-wrapper-reuse fix (wetware/ww#586): re-importing an
-# already-held capability created a duplicate wrapper Client whose later drop
-# poisoned the RPC downcast map, panicking the event loop on the next send of
-# that cap. Drop this patch once the fix is released upstream (PR pending on
-# capnproto/capnproto-rust; the ww/ branch resolves capnp from crates.io so the
-# git patch does not drag in a second capnp).
+# Exact capnp-rpc import-wrapper and terminalization patches.
+# Provenance and removal gates: ../../doc/dependencies/capnp-rpc.md.
 [patch.crates-io]
-capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", branch = "ww/import-fix-0.25-consume" }
+capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a" }

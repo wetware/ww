@@ -240,7 +240,7 @@ dependencies = [
 [[package]]
 name = "capnp-rpc"
 version = "0.25.1"
-source = "git+https://github.com/wetware/capnproto-rust?branch=ww%2Fimport-fix-0.25-consume#c6eecf42da63296e5bf628251935cf5af09d80be"
+source = "git+https://github.com/wetware/capnproto-rust?rev=b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a#b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a"
 dependencies = [
  "capnp",
  "capnp-futures",
@@ -295,6 +295,7 @@ dependencies = [
  "lru",
  "prost",
  "rand 0.9.5",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -3371,6 +3372,7 @@ dependencies = [
  "capnp",
  "capnp-rpc",
  "capnpc",
+ "cid",
  "ed25519-dalek",
  "hex",
  "libp2p-core",
