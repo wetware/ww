@@ -75,10 +75,19 @@ Runtime ──load(WASM bytes)──> Executor ──spawn(args, env, Membrane)�
 ```
 
 `Runtime` authorizes selecting and loading arbitrary code. `Executor` is
-image-bound spawn authority. `Process` is authority over one running child
+image-bound spawn authority. `Process` owns the lifetime of one child
 (stdio, lifecycle, and optionally its guest export through
 `Process.bootstrap()`). A child receives `Runtime`, an `Executor`, or neither
 only through an explicit grant.
+
+Process clones and remote references share execution ownership. Final backend
+ownership loss requests termination; holding only stdio or bootstrap references
+does not keep the child alive. `wait()` is repeatable cleanup observation and
+`kill()` only requests termination. Managed RPC disconnect releases exported
+ownership and cuts runtime-created transport cycles. See
+[RPC transport](rpc-transport.md#process-ownership-and-cleanup) for the lifetime
+contract. Intentional daemon ownership is
+deferred; PID0 retains its separate host ownership root.
 
 Each `Membrane` server owns only its delegated references. Repeated `graft()`
 calls return the same authority surface and cannot recover omitted authority.

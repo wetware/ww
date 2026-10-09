@@ -502,11 +502,8 @@ impl Runner {
         for remote in self.remotes.drain(..) {
             let ww::rpc::vat_dial::VatDial { bootstrap, driver } = remote;
             drop(bootstrap);
-            driver.abort();
+            driver.shutdown();
             match tokio::time::timeout(CLEANUP_DEADLINE, driver).await {
-                Ok(Err(error)) if error.is_cancelled() => {
-                    report.evidence.remote_rpc_systems_awaited += 1;
-                }
                 Ok(Ok(Ok(()))) => {
                     report.evidence.remote_rpc_systems_awaited += 1;
                 }

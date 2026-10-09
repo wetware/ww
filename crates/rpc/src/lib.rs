@@ -8,6 +8,8 @@ pub mod graft;
 pub mod http_client;
 pub mod http_listener;
 pub mod keys;
+pub mod local_tasks;
+pub mod managed_rpc;
 pub mod named_capability;
 pub mod routing;
 pub mod stream_dialer;
@@ -545,13 +547,116 @@ impl system_capnp::byte_stream::Server for ByteStreamImpl {
     }
 }
 
+/// Small retained lifecycle result, independent of execution and RPC resources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupState {
+    Running,
+    Cleaned(i32),
+    Lost(LostReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LostReason {
+    OwnerDropped,
+}
+
+impl std::fmt::Display for LostReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OwnerDropped => {
+                f.write_str("execution lifecycle owner lost before cleanup completed")
+            }
+        }
+    }
+}
+
+/// The sole teardown owner's publication authority. Losing it never proves exit.
+pub struct CleanupPublisher {
+    sender: watch::Sender<CleanupState>,
+}
+
+/// Cloneable, non-owning observation of cleanup; retains only the small result.
+#[derive(Clone)]
+pub struct CleanupObserver {
+    receiver: watch::Receiver<CleanupState>,
+}
+
+pub fn cleanup_channel() -> (CleanupPublisher, CleanupObserver) {
+    let (sender, receiver) = watch::channel(CleanupState::Running);
+    (CleanupPublisher { sender }, CleanupObserver { receiver })
+}
+
+impl CleanupPublisher {
+    /// Publish only after all resources owned by the backend have been released.
+    pub fn cleaned(self, exit_code: i32) {
+        self.sender.send_replace(CleanupState::Cleaned(exit_code));
+    }
+}
+
+impl Drop for CleanupPublisher {
+    fn drop(&mut self) {
+        self.sender.send_if_modified(|state| {
+            if *state == CleanupState::Running {
+                *state = CleanupState::Lost(LostReason::OwnerDropped);
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+impl CleanupObserver {
+    pub fn state(&self) -> CleanupState {
+        *self.receiver.borrow()
+    }
+
+    pub async fn wait(&self) -> Result<i32, LostReason> {
+        let mut receiver = self.receiver.clone();
+        let state = receiver
+            .wait_for(|state| *state != CleanupState::Running)
+            .await
+            .map(|state| *state)
+            .unwrap_or(CleanupState::Lost(LostReason::OwnerDropped));
+        match state {
+            CleanupState::Cleaned(exit_code) => Ok(exit_code),
+            CleanupState::Lost(reason) => Err(reason),
+            CleanupState::Running => unreachable!("wait_for returns only terminal state"),
+        }
+    }
+}
+
+/// Idempotent termination request, independent of ownership and cleanup truth.
+#[derive(Clone)]
+pub struct TerminationHandle {
+    sender: watch::Sender<bool>,
+}
+
+impl TerminationHandle {
+    pub fn new(sender: watch::Sender<bool>) -> Self {
+        Self { sender }
+    }
+
+    pub fn request(&self) {
+        self.sender.send_if_modified(|requested| {
+            if !*requested {
+                *requested = true;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+/// One owning facade per execution, shared by Cap'n Proto client references.
 pub struct ProcessImpl {
     stdin: system_capnp::byte_stream::Client,
     stdout: system_capnp::byte_stream::Client,
     stderr: system_capnp::byte_stream::Client,
-    exit_rx: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<i32>>>>,
+    cleanup: CleanupObserver,
     bootstrap_cap: Rc<RefCell<Option<capnp::capability::Client>>>,
-    kill_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    terminate: TerminationHandle,
 }
 
 #[derive(Clone)]
@@ -561,7 +666,8 @@ pub struct ProcessBootstrapControl {
 
 impl ProcessBootstrapControl {
     pub fn clear(&self) {
-        self.bootstrap_cap.borrow_mut().take();
+        let bootstrap_cap = self.bootstrap_cap.borrow_mut().take();
+        drop(bootstrap_cap);
     }
 }
 
@@ -570,16 +676,16 @@ impl ProcessImpl {
         stdin: system_capnp::byte_stream::Client,
         stdout: system_capnp::byte_stream::Client,
         stderr: system_capnp::byte_stream::Client,
-        exit_rx: tokio::sync::oneshot::Receiver<i32>,
-        kill_tx: tokio::sync::watch::Sender<bool>,
+        cleanup: CleanupObserver,
+        terminate: TerminationHandle,
     ) -> Self {
         Self {
             stdin,
             stdout,
             stderr,
-            exit_rx: Arc::new(Mutex::new(Some(exit_rx))),
+            cleanup,
             bootstrap_cap: Rc::new(RefCell::new(None)),
-            kill_tx: Arc::new(kill_tx),
+            terminate,
         }
     }
 
@@ -587,20 +693,20 @@ impl ProcessImpl {
         stdin: system_capnp::byte_stream::Client,
         stdout: system_capnp::byte_stream::Client,
         stderr: system_capnp::byte_stream::Client,
-        exit_rx: tokio::sync::oneshot::Receiver<i32>,
+        cleanup: CleanupObserver,
         bootstrap_cap: capnp::capability::Client,
-        kill_tx: tokio::sync::watch::Sender<bool>,
+        terminate: TerminationHandle,
     ) -> Self {
-        Self::with_controlled_bootstrap(stdin, stdout, stderr, exit_rx, bootstrap_cap, kill_tx).0
+        Self::with_controlled_bootstrap(stdin, stdout, stderr, cleanup, bootstrap_cap, terminate).0
     }
 
     pub fn with_controlled_bootstrap(
         stdin: system_capnp::byte_stream::Client,
         stdout: system_capnp::byte_stream::Client,
         stderr: system_capnp::byte_stream::Client,
-        exit_rx: tokio::sync::oneshot::Receiver<i32>,
+        cleanup: CleanupObserver,
         bootstrap_cap: capnp::capability::Client,
-        kill_tx: tokio::sync::watch::Sender<bool>,
+        terminate: TerminationHandle,
     ) -> (Self, ProcessBootstrapControl) {
         let bootstrap_cap = Rc::new(RefCell::new(Some(bootstrap_cap)));
         let control = ProcessBootstrapControl {
@@ -611,12 +717,18 @@ impl ProcessImpl {
                 stdin,
                 stdout,
                 stderr,
-                exit_rx: Arc::new(Mutex::new(Some(exit_rx))),
+                cleanup,
                 bootstrap_cap,
-                kill_tx: Arc::new(kill_tx),
+                terminate,
             },
             control,
         )
+    }
+}
+
+impl Drop for ProcessImpl {
+    fn drop(&mut self) {
+        self.terminate.request();
     }
 }
 
@@ -653,13 +765,12 @@ impl system_capnp::process::Server for ProcessImpl {
         _params: system_capnp::process::WaitParams,
         mut results: system_capnp::process::WaitResults,
     ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
-        let exit_rx = Arc::clone(&self.exit_rx);
+        let cleanup = self.cleanup.clone();
         Promise::from_future(async move {
-            let mut guard = exit_rx.lock().await;
-            let rx = guard.take().ok_or_else(|| {
-                capnp::Error::failed("wait() already called for this process".into())
-            })?;
-            let code = rx.await.unwrap_or(1);
+            let code = cleanup
+                .wait()
+                .await
+                .map_err(|reason| capnp::Error::failed(reason.to_string()))?;
             results.get().set_exit_code(code);
             Ok(())
         })
@@ -688,8 +799,8 @@ impl system_capnp::process::Server for ProcessImpl {
         _params: system_capnp::process::KillParams,
         _results: system_capnp::process::KillResults,
     ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
-        let _ = self.kill_tx.send(true);
-        tracing::info!("process.kill: kill signal sent");
+        self.terminate.request();
+        tracing::info!("process.kill: termination requested");
         Promise::ok(())
     }
 }
@@ -942,8 +1053,8 @@ mod tests {
         system_capnp::byte_stream::Client,
         system_capnp::byte_stream::Client,
         system_capnp::byte_stream::Client,
-        tokio::sync::oneshot::Receiver<i32>,
-        tokio::sync::watch::Sender<bool>,
+        CleanupObserver,
+        TerminationHandle,
     ) {
         let (dummy_in, _) = io::duplex(1);
         let (dummy_out, _) = io::duplex(1);
@@ -951,9 +1062,9 @@ mod tests {
         let stdin = capnp_rpc::new_client(ByteStreamImpl::new(dummy_in, StreamMode::WriteOnly));
         let stdout = capnp_rpc::new_client(ByteStreamImpl::new(dummy_out, StreamMode::ReadOnly));
         let stderr = capnp_rpc::new_client(ByteStreamImpl::new(dummy_err, StreamMode::ReadOnly));
-        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let (_tx, rx) = cleanup_channel();
         let (kill_tx, _kill_rx) = tokio::sync::watch::channel(false);
-        (stdin, stdout, stderr, rx, kill_tx)
+        (stdin, stdout, stderr, rx, TerminationHandle::new(kill_tx))
     }
 
     #[tokio::test]
@@ -1125,12 +1236,12 @@ mod tests {
             .run_until(async {
                 let (stdin, stdout, stderr, _, kill_tx) = dummy_process_parts();
                 // Create our own channel so we control the sender.
-                let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+                let (exit_tx, exit_rx) = cleanup_channel();
                 let process_impl = ProcessImpl::new(stdin, stdout, stderr, exit_rx, kill_tx);
                 let process = setup_process_rpc(process_impl);
 
                 // Send exit code from the "cell" side.
-                exit_tx.send(42).unwrap();
+                exit_tx.cleaned(42);
 
                 let resp = process.wait_request().send().promise.await.unwrap();
                 let exit_code = resp.get().unwrap().get_exit_code();
@@ -1140,26 +1251,194 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_wait_double_call_errors() {
+    async fn test_process_wait_replays_completed_exit() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let (stdin, stdout, stderr, _, kill_tx) = dummy_process_parts();
-                let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+                let (exit_tx, exit_rx) = cleanup_channel();
                 let process_impl = ProcessImpl::new(stdin, stdout, stderr, exit_rx, kill_tx);
                 let process = setup_process_rpc(process_impl);
 
-                exit_tx.send(0).unwrap();
+                exit_tx.cleaned(0);
 
                 // First call succeeds.
                 let resp = process.wait_request().send().promise.await.unwrap();
                 assert_eq!(resp.get().unwrap().get_exit_code(), 0);
 
-                // Second call should error (receiver already consumed).
-                let result = process.wait_request().send().promise.await;
-                assert!(result.is_err(), "wait() called twice should fail");
+                let second = process.wait_request().send().promise.await.unwrap();
+                assert_eq!(second.get().unwrap().get_exit_code(), 0);
             })
             .await;
+    }
+
+    fn controlled_local_process() -> (
+        system_capnp::process::Client,
+        CleanupPublisher,
+        CleanupObserver,
+        watch::Receiver<bool>,
+    ) {
+        let (stdin, stdout, stderr, _, _) = dummy_process_parts();
+        let (exit_tx, exit_rx) = cleanup_channel();
+        let (kill_tx, kill_rx) = watch::channel(false);
+        (
+            capnp_rpc::new_client(ProcessImpl::with_bootstrap(
+                stdin,
+                stdout,
+                stderr,
+                exit_rx.clone(),
+                placeholder_cap(),
+                TerminationHandle::new(kill_tx),
+            )),
+            exit_tx,
+            exit_rx,
+            kill_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_process_concurrent_waits_share_terminal_result() {
+        use futures::FutureExt;
+        let (process, exit_tx, _, _) = controlled_local_process();
+        let mut first = Box::pin(process.wait_request().send().promise);
+        let mut second = Box::pin(process.wait_request().send().promise);
+        assert!(first.as_mut().now_or_never().is_none());
+        assert!(second.as_mut().now_or_never().is_none());
+        exit_tx.cleaned(42);
+        assert_eq!(first.await.unwrap().get().unwrap().get_exit_code(), 42);
+        assert_eq!(second.await.unwrap().get().unwrap().get_exit_code(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_process_cancelled_wait_preserves_late_wait() {
+        use futures::FutureExt;
+        let (process, exit_tx, observer, _) = controlled_local_process();
+        drop(observer.clone());
+        let mut first = Box::pin(process.wait_request().send().promise);
+        assert!(first.as_mut().now_or_never().is_none());
+        drop(first);
+        exit_tx.cleaned(42);
+        let late = process.wait_request().send().promise.await.unwrap();
+        assert_eq!(late.get().unwrap().get_exit_code(), 42);
+        assert_eq!(observer.clone().wait().await, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn test_process_owner_loss_is_an_error_not_exit_one() {
+        let (process, exit_tx, observer, _) = controlled_local_process();
+        drop(exit_tx);
+        assert!(
+            process.wait_request().send().promise.await.is_err(),
+            "lifecycle owner disappearance does not prove an exit status"
+        );
+        assert_eq!(observer.wait().await, Err(LostReason::OwnerDropped));
+        assert_eq!(observer.clone().wait().await, Err(LostReason::OwnerDropped));
+    }
+
+    #[tokio::test]
+    async fn test_process_local_clones_terminate_only_after_final_release() {
+        let (process, _exit_tx, _, kill_rx) = controlled_local_process();
+        let _stdin = process
+            .stdin_request()
+            .send()
+            .promise
+            .await
+            .unwrap()
+            .get()
+            .unwrap()
+            .get_stream()
+            .unwrap();
+        let _stdout = process
+            .stdout_request()
+            .send()
+            .promise
+            .await
+            .unwrap()
+            .get()
+            .unwrap()
+            .get_stream()
+            .unwrap();
+        let _stderr = process
+            .stderr_request()
+            .send()
+            .promise
+            .await
+            .unwrap()
+            .get()
+            .unwrap()
+            .get_stream()
+            .unwrap();
+        let _bootstrap = process
+            .bootstrap_request()
+            .send()
+            .promise
+            .await
+            .unwrap()
+            .get()
+            .unwrap()
+            .get_cap()
+            .get_as_capability::<capnp::capability::Client>()
+            .unwrap();
+        let sibling_ref = process.clone();
+        drop(process);
+        assert!(
+            !*kill_rx.borrow(),
+            "another Process owner keeps execution alive"
+        );
+        drop(sibling_ref);
+        assert!(
+            *kill_rx.borrow(),
+            "final Process release requests termination"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_pending_wait_does_not_retain_facade() {
+        use futures::FutureExt;
+        let (process, exit_tx, observer, kill_rx) = controlled_local_process();
+        let mut wait = Box::pin(process.wait_request().send().promise);
+        assert!(wait.as_mut().now_or_never().is_none());
+        drop(process);
+        assert!(
+            *kill_rx.borrow(),
+            "a dispatched wait observes without owning the facade"
+        );
+        exit_tx.cleaned(137);
+        assert_eq!(wait.await.unwrap().get().unwrap().get_exit_code(), 137);
+        assert_eq!(observer.clone().wait().await, Ok(137));
+    }
+
+    #[tokio::test]
+    async fn test_process_final_release_leaves_sibling_alive() {
+        let (first, _first_exit_tx, _, first_kill_rx) = controlled_local_process();
+        let (second, _second_exit_tx, _, second_kill_rx) = controlled_local_process();
+        drop(first);
+        assert!(*first_kill_rx.borrow());
+        assert!(!*second_kill_rx.borrow(), "termination is per execution");
+        drop(second);
+        assert!(*second_kill_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn test_process_kill_and_final_release_notify_once() {
+        use futures::FutureExt;
+        let (process, _exit_tx, observer, mut kill_rx) = controlled_local_process();
+        process.kill_request().send().promise.await.unwrap();
+        assert!(*kill_rx.borrow_and_update());
+        assert!(
+            observer.wait().now_or_never().is_none(),
+            "kill only requests termination"
+        );
+        process.kill_request().send().promise.await.unwrap();
+        assert!(
+            !kill_rx.has_changed().unwrap(),
+            "duplicate kill is idempotent"
+        );
+        drop(process);
+        assert!(
+            kill_rx.changed().await.is_err(),
+            "final release shares the same request"
+        );
     }
 
     // =========================================================================

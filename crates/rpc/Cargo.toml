@@ -26,8 +26,10 @@ tokio-util = { workspace = true, features = ["codec", "compat", "rt"] }
 tracing = { workspace = true }
 
 # Workspace crates
+membrane = { package = "wetware-membrane", path = "../membrane" }
 auth = { path = "../guest/auth" }
 authority = { package = "wetware-authority", path = "../authority" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

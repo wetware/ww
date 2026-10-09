@@ -9,7 +9,6 @@ use anyhow::{bail, Context, Result};
 use authority::EpochGuard;
 use cid::Cid;
 use ed25519_dalek::SigningKey;
-use futures::FutureExt;
 use tokio::io::{stderr, stdout, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
@@ -412,7 +411,7 @@ pub struct Generation {
 
 struct GenerationCleanup {
     proc_abort: tokio::task::AbortHandle,
-    rpc_abort: tokio::task::AbortHandle,
+    rpc: rpc::managed_rpc::ManagedRpc,
     readiness_gate: Arc<authority::KernelReadyGate>,
 }
 
@@ -420,7 +419,7 @@ impl Drop for GenerationCleanup {
     fn drop(&mut self) {
         self.readiness_gate.clear();
         self.proc_abort.abort();
-        self.rpc_abort.abort();
+        self.rpc.shutdown();
     }
 }
 
@@ -527,10 +526,9 @@ impl Generation {
         );
 
         let mut proc_task = tokio::spawn(async move { proc.run().await });
-        let rpc_task = tokio::task::spawn_local(rpc_system.map(|_| ()));
-        let _cleanup = GenerationCleanup {
+        let mut cleanup = GenerationCleanup {
             proc_abort: proc_task.abort_handle(),
-            rpc_abort: rpc_task.abort_handle(),
+            rpc: rpc_system,
             readiness_gate: readiness_gate.clone(),
         };
         let outcome = tokio::select! {
@@ -548,8 +546,7 @@ impl Generation {
 
         readiness_gate.clear();
         drop(registration_scope);
-        rpc_task.abort();
-        let _ = rpc_task.await;
+        let _ = cleanup.rpc.shutdown_and_join().await;
         tracing::debug!(?outcome, "Kernel generation exited");
         Ok(outcome)
     }
@@ -626,6 +623,64 @@ mod tests {
     use super::*;
 
     const TEST_CID: &str = "bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a";
+
+    struct KernelBootstrap {
+        _dropped: tokio::sync::oneshot::Sender<()>,
+    }
+    impl authority::system_capnp::membrane::Server for KernelBootstrap {}
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn generation_owner_loss_cancels_host_process_and_disconnects_rpc() {
+        use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty::VatNetwork};
+        use rpc::managed_rpc::{ManagedRpc, ManagedRpcSystem};
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (_epoch_tx, epoch_rx) = watch::channel(authority::Epoch {
+                    seq: 1,
+                    head: vec![],
+                    root: None,
+                });
+                let ready = Arc::new(authority::KernelReadyGate::new(epoch_rx));
+                ready.bind_generation(1);
+                ready.kernel_ready().unwrap();
+                let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+                let bootstrap: authority::system_capnp::membrane::Client =
+                    capnp_rpc::new_client(KernelBootstrap {
+                        _dropped: dropped_tx,
+                    });
+                let (stream, _peer) = tokio::io::duplex(8192);
+                let (reader, writer) = tokio::io::split(stream);
+                let mut rpc = ManagedRpcSystem::new(
+                    Box::new(VatNetwork::new(
+                        reader.compat(),
+                        writer.compat_write(),
+                        Side::Server,
+                        Default::default(),
+                    )),
+                    Some(bootstrap.client),
+                );
+                let retained: authority::system_capnp::membrane::Client =
+                    rpc.bootstrap(Side::Client);
+                let proc = tokio::spawn(std::future::pending::<()>());
+                let owner = GenerationCleanup {
+                    proc_abort: proc.abort_handle(),
+                    rpc: ManagedRpc::spawn(rpc),
+                    readiness_gate: ready.clone(),
+                };
+                drop(owner);
+                assert!(!ready.is_ready());
+                assert!(proc.await.unwrap_err().is_cancelled());
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
+                        .await
+                        .unwrap()
+                        .is_err()
+                );
+                assert!(retained.graft_request().send().promise.await.is_err());
+            })
+            .await;
+    }
 
     #[test]
     fn selector_precedence_is_cli_then_env_then_embedded() {

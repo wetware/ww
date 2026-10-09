@@ -386,6 +386,7 @@ fn worker_loop(
         .with_context(|| format!("executor-{id}: failed to build runtime"))?;
 
     let local = tokio::task::LocalSet::new();
+    let tasks = rpc::local_tasks::LocalTaskScope::enter();
     let _span = tracing::info_span!("executor", worker = id).entered();
 
     rt.block_on(local.run_until(async move {
@@ -405,8 +406,10 @@ fn worker_loop(
 
         let mut rx = rx;
         let mut shutdown = shutdown;
+        let mut cells = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                _ = cells.join_next(), if !cells.is_empty() => {},
                 req = rx.recv() => match req {
                     Some(spawn_req) => {
                         let cell_name = spawn_req.name;
@@ -418,18 +421,28 @@ fn worker_loop(
                             worker_id: id,
                         };
                         let span = tracing::info_span!("cell", name = %cell_name);
+                        let cancelled = rpc::local_tasks::shutdown_token();
                         let handle = tokio::task::spawn_local(async move {
                             let _guard = guard;
                             let _span = span.entered();
-                            (factory)(cell_shutdown).await;
+                            tokio::select! {
+                                biased;
+                                _ = cancelled.cancelled() => false,
+                                _ = (factory)(cell_shutdown) => true,
+                            }
                         });
                         // Monitor the cell task for panics and send exit code.
                         let cell_name_log = cell_name.clone();
-                        tokio::task::spawn_local(async move {
+                        cells.spawn_local(async move {
                             match handle.await {
-                                Ok(()) => {
+                                Ok(true) => {
                                     if let Some(tx) = result_tx {
                                         let _ = tx.send(Ok(0));
+                                    }
+                                }
+                                Ok(false) => {
+                                    if let Some(tx) = result_tx {
+                                        let _ = tx.send(Err(anyhow::anyhow!("executor shutting down")));
                                     }
                                 }
                                 Err(e) if e.is_panic() => {
@@ -460,6 +473,14 @@ fn worker_loop(
                 _ = shutdown.changed() => break,
             }
         }
+        // Stop admission, then release and join the root cell owners. Their
+        // nested RPC workers and OwnedChildLifecycle tasks remain scheduled on
+        // this LocalSet until managed disconnection and backend teardown finish.
+        rx.close();
+        drop(rx);
+        tasks.shutdown();
+        while cells.join_next().await.is_some() {}
+        tasks.wait().await;
         tracing::info!("executor worker shutting down");
     }));
 
@@ -1101,6 +1122,117 @@ mod tests {
         // Drop should close channels and join threads without hanging.
         drop(shutdown_tx);
         drop(pool); // should not hang
+    }
+
+    #[test]
+    fn executor_pool_shutdown_disconnects_detached_rpc_owners() {
+        use crate::system_capnp::{byte_stream, membrane, process};
+        use capnp::capability::Promise;
+        use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty::VatNetwork};
+        use rpc::managed_rpc::{ManagedRpc, ManagedRpcSystem};
+        use std::{cell::RefCell, rc::Rc};
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+        struct Export(Rc<RefCell<Option<process::Client>>>);
+        impl membrane::Server for Export {
+            fn graft(
+                self: capnp::capability::Rc<Self>,
+                _: membrane::GraftParams,
+                mut results: membrane::GraftResults,
+            ) -> impl Future<Output = capnp::Result<()>> + 'static {
+                let process = self.0.borrow_mut().take().unwrap();
+                results
+                    .get()
+                    .init_extras(1)
+                    .get(0)
+                    .init_cap()
+                    .set_as_capability(process.client.hook);
+                Promise::ok(())
+            }
+        }
+
+        for close_spawn_channel in [false, true] {
+            let (shutdown_tx, shutdown_rx) = watch::channel(());
+            let pool = ExecutorPool::new(1, shutdown_rx);
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            assert!(pool
+                .spawn(SpawnRequest {
+                    name: "detached-vat".into(),
+                    factory: Box::new(move |_| Box::pin(async move {
+                        let exported = Rc::new(RefCell::new(None));
+                        let bootstrap: membrane::Client =
+                            capnp_rpc::new_client(Export(exported.clone()));
+                        let (a, b) = tokio::io::duplex(8192);
+                        let (ar, aw) = tokio::io::split(a);
+                        let (br, bw) = tokio::io::split(b);
+                        let mut server = ManagedRpcSystem::new(
+                            Box::new(VatNetwork::new(
+                                ar.compat(),
+                                aw.compat_write(),
+                                Side::Server,
+                                Default::default(),
+                            )),
+                            Some(bootstrap.client),
+                        );
+                        let retained: membrane::Client = server.bootstrap(Side::Client);
+                        let mut client = ManagedRpcSystem::new(
+                            Box::new(VatNetwork::new(
+                                br.compat(),
+                                bw.compat_write(),
+                                Side::Client,
+                                Default::default(),
+                            )),
+                            None,
+                        );
+                        let remote: membrane::Client = client.bootstrap(Side::Server);
+                        let (cleanup, observer) = rpc::cleanup_channel();
+                        let (kill_tx, kill_rx) = watch::channel(false);
+                        let (stream, _) = tokio::io::duplex(16);
+                        let stream: byte_stream::Client = capnp_rpc::new_client(
+                            rpc::ByteStreamImpl::new(stream, rpc::StreamMode::ReadOnly),
+                        );
+                        // The exported Process's bootstrap retains this same local
+                        // connection. Dropping the LocalSet alone leaves the cycle.
+                        *exported.borrow_mut() =
+                            Some(capnp_rpc::new_client(rpc::ProcessImpl::with_bootstrap(
+                                stream.clone(),
+                                stream.clone(),
+                                stream,
+                                observer,
+                                retained.client,
+                                rpc::TerminationHandle::new(kill_tx),
+                            )));
+                        let server = ManagedRpc::spawn(server);
+                        let client = ManagedRpc::spawn(client);
+                        let response = remote.graft_request().send().promise.await.unwrap();
+                        let process: process::Client = response
+                            .get()
+                            .unwrap()
+                            .get_extras()
+                            .unwrap()
+                            .get(0)
+                            .get_cap()
+                            .get_as()
+                            .unwrap();
+                        drop(response);
+                        process.stdout_request().send().promise.await.unwrap();
+                        tokio::task::spawn_local(async move {
+                            let _retained = (server, client, process, remote, cleanup);
+                            std::future::pending::<()>().await;
+                        });
+                        ready_tx.send(kill_rx).unwrap();
+                    })),
+                    result_tx: None,
+                })
+                .is_ok());
+            let kill = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(!*kill.borrow());
+            if !close_spawn_channel {
+                drop(shutdown_tx);
+            }
+            drop(pool);
+            assert!(*kill.borrow(), "worker shutdown must disconnect detached RPC exports (channel close: {close_spawn_channel})");
+        }
     }
 
     #[test]

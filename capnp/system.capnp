@@ -109,6 +109,8 @@ interface Executor {
     fuelPolicy :FuelPolicy
   ) -> (process :Process);
   # Spawn one child with the supplied Membrane as its bootstrap capability.
+  # Retain the returned owning Process capability for continued execution.
+  # There is no detach or daemon mode.
 
   cid @1 () -> (cid :Text);
 }
@@ -139,6 +141,18 @@ interface StreamDialer {
 }
 
 interface Process {
+  # Owning execution capability. Cloning or transmitting it shares ownership.
+  # Releasing one reference leaves execution owned by any remaining Process
+  # references. Final ownership loss at the backend requests termination.
+  # Requests, responses, pipelines, and wrappers can retain owning references.
+  # Final release and kill() do not await asynchronous backend cleanup.
+  # Holding only stdin/stdout/stderr/bootstrap capabilities does not own execution;
+  # retain a Process when continued execution is required.
+  # Detected RPC disconnection releases ownership exported on that connection;
+  # failure detection is not instantaneous. Application-created capability cycles
+  # can extend execution lifetime. Runtime-created transport cycles have an
+  # explicit RPC teardown operation that releases their exported ownership.
+
   stdin @0 () -> (stream :ByteStream);
   # Writable stream connected to the guest's standard input.
 
@@ -149,14 +163,20 @@ interface Process {
   # Readable stream connected to the guest's standard error.
 
   wait @3 () -> (exitCode :Int32);
-  # Block until the process exits and return its exit code.
+  # Observe completed backend cleanup and return the exit code. Calls are
+  # repeatable and may coexist; cancelling a wait does not consume its result.
+  # Losing the backend lifecycle owner before proven cleanup returns an error.
+  # A pending dispatched wait observes cleanup without retaining Process ownership.
+  # Observation is available while this capability remains usable; it does not
+  # promise persistence, stable identity, reconnection, or recovery.
 
   bootstrap @4 () -> (cap :Capability);
   # Return the capability exported by the guest via system::serve().
   # Errors if the guest didn't export a capability.
 
   kill @5 () -> ();
-  # Terminate the process immediately. Fuel is revoked and the cell traps.
+  # Request process termination before final ownership loss. The response means
+  # the request was accepted; it does not acknowledge completed backend cleanup.
 }
 
 interface VatListener {

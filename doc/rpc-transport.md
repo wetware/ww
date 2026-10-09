@@ -143,9 +143,55 @@ owner terminalizes RPC state during that destruction. Wetware pins upstream
 destructor-driven wakes before retiring the cancelled task's wake stream. The
 pin contains no later generator changes from upstream main.
 
-After Store teardown, Wetware gives the child host `RpcSystem` a one-second
-`RPC_EOF_GRACE` to observe transport EOF. If the `RpcSystem` does not finish in
-that interval, the process lifecycle aborts it as a malformed-peer fallback.
+Wetware-owned RPC drivers use managed disconnect. Normal completion, transport
+failure, explicit shutdown, and owner cancellation explicitly disconnect Cap'n
+Proto before abandoning its driver. This releases exported capabilities even
+when local code retains imported clients or pending calls. Merely aborting a
+bare `RpcSystem` is insufficient for that ownership guarantee. Teardown also
+covers cancellation before the driver's first poll and already-disconnected
+connections; disconnect requests are idempotent.
+
+After Store teardown, the child lifecycle requests managed shutdown and joins
+its host RPC driver. Disconnect releases exported ownership before the
+one-second `DISCONNECT_GRACE` bounds flushing the close. The LocalSet remains
+driven until tracked lifecycle and RPC workers finish during host shutdown.
+PID0 retains its separate deployment-owned lifetime root; its driver also uses
+managed teardown.
+
+## Process ownership and cleanup
+
+`Process` is an owning execution capability. Cloning or transmitting it shares
+execution ownership. Releasing one reference does not request termination while
+another Process owner remains. When the backend loses its final owning
+reference, it requests termination. Requests, responses, pipelines, and membrane
+wrappers can retain ownership. Holding only stdin, stdout, stderr, or a guest
+bootstrap capability does not; retain the Process for continued execution.
+
+Explicit `kill()` requests termination before final ownership loss. Neither its
+response nor final reference release acknowledges asynchronous cleanup. Both
+use the same idempotent termination control. The backend `OwnedChildLifecycle`
+remains the sole teardown owner: it drops the Store and joins auxiliary work
+before publishing `Cleaned(exit)`. Lifecycle-owner loss before proven teardown
+is `Lost`, an error rather than a fabricated exit code.
+
+`wait()` is repeatable observation while the Process remains usable. Concurrent
+waits coexist, cancelling one does not consume the result, and later waits see
+the retained terminal result. A dispatched pending wait does not independently
+own execution. The small retained cleanup state contains no Store, guest memory,
+stdio buffers, Membrane, RPC task, or Process façade.
+
+Detected RPC disconnect releases ownership exported through that connection;
+failure detection is not instantaneous. Application-created capability cycles
+can extend execution lifetime. Runtime-created transport cycles have a guaranteed
+managed-disconnect operation that releases their exports. For example, a caller
+may own a Process whose child imports that caller's Membrane; disconnect cuts the
+transport cycle without weakening ordinary capability composition.
+
+This contract supplies no stable process identity, persistence, reconnection,
+recovery, detach, or daemon API. A future daemon design would require independent
+backend ownership and application responsibility for its lifetime. Fuel bounds
+computation, not elapsed retention: blocked async work can remain alive without
+consuming guest fuel. Forced wall-clock retirement is separate future work.
 
 ## WASI authority
 
