@@ -427,6 +427,7 @@ dependencies = [
  "capnp-rpc",
  "capnpc",
  "futures",
+ "wetware-membrane",
  "wit-bindgen 0.62.0",
 ]
 
@@ -477,6 +478,16 @@ dependencies = [
  "hashbrown",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "wetware-membrane"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnp-rpc",
+ "capnpc",
+ "futures",
 ]
 
 [[package]]

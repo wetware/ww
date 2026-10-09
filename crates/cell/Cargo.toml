@@ -33,6 +33,9 @@ cache = { package = "ww-cache", path = "../cache" }
 ipfs = { path = "../ipfs" }
 
 [dev-dependencies]
+capnp = { workspace = true }
+capnp-rpc = { workspace = true }
+tokio-util = { workspace = true, features = ["compat"] }
 wat = "1"
 wit-component = { version = "0.244", features = ["dummy-module"] }
 wit-parser = "0.244"

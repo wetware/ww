@@ -23,7 +23,7 @@ P3_ROUTING := --allow-import wetware:routing/key@0.1.0
 P3_READINESS := --allow-import wetware:kernel-runtime/readiness@1.0.0
 
 .PHONY: all host std kernel status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
-.PHONY: publish-std try-publish-std publish test-deps test test-wasm test-p3-fixture authority-probe routing-key-probe
+.PHONY: publish-std try-publish-std publish test-deps test test-wasm test-p3-fixture test-guest-session-cancel guest-session-cancel-probe authority-probe routing-key-probe
 .PHONY: p3-chess p3-counter p3-discovery p3-echo p3-oracle p3-snap-hello-rs
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
@@ -43,6 +43,12 @@ test: test-deps
 
 test-p3-fixture:
 	bash scripts/check_native_p3_fixture.sh
+
+guest-session-cancel-probe:
+	bash scripts/check_guest_session_cancel.sh --build-only
+
+test-guest-session-cancel:
+	bash scripts/check_guest_session_cancel.sh
 
 # Build the disposable real-WASM adversarial guest used by the T1 confinement
 # harness. The integration test also builds it on demand in a separate target

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+membrane = { package = "wetware-membrane", path = "../../crates/membrane" }
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 futures = { workspace = true }
