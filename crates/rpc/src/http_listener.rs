@@ -953,9 +953,15 @@ mod tests {
             capnp_rpc::new_client(ByteStreamImpl::new(stdout_stream, StreamMode::ReadOnly));
         let stderr =
             capnp_rpc::new_client(ByteStreamImpl::new(stderr_stream, StreamMode::ReadOnly));
-        let (exit_tx, exit_rx) = oneshot::channel();
-        let _ = exit_tx.send(0);
-        capnp_rpc::new_client(ProcessImpl::new(stdin, stdout, stderr, exit_rx, kill_tx))
+        let (cleanup, observer) = crate::cleanup_channel();
+        cleanup.cleaned(0);
+        capnp_rpc::new_client(ProcessImpl::new(
+            stdin,
+            stdout,
+            stderr,
+            observer,
+            crate::TerminationHandle::new(kill_tx),
+        ))
     }
 
     struct HangingKillProcess {
@@ -1050,6 +1056,7 @@ mod tests {
                 let (stdout_stream, mut stdout_writer) = io::duplex(64 * 1024);
                 let (kill_tx, kill_rx) = watch::channel(false);
                 let process = process_with_stdout(stdout_stream, kill_tx);
+                let retained_owner = process.clone();
                 tokio::task::spawn_local(async move {
                     stdout_writer
                         .write_all(b"Status: 201 Created\r\nContent-Type: text/plain\r\n\r\nok")
@@ -1063,6 +1070,11 @@ mod tests {
                 assert_eq!(response.status, 201);
                 assert_eq!(response.body, b"ok");
                 assert!(!*kill_rx.borrow(), "normal request should not be killed");
+                drop(retained_owner);
+                assert!(
+                    *kill_rx.borrow(),
+                    "final owner release requests termination"
+                );
             })
             .await;
     }

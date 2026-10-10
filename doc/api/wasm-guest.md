@@ -200,9 +200,33 @@ UnixFS mutation, or CID derivation.
 | `stdin` | `() -> (stream: ByteStream)` | Writable stream to guest's stdin. |
 | `stdout` | `() -> (stream: ByteStream)` | Readable stream from guest's stdout. |
 | `stderr` | `() -> (stream: ByteStream)` | Readable stream from guest's stderr. |
-| `wait` | `() -> (exitCode: Int32)` | Block until process exits. |
+| `wait` | `() -> (exitCode: Int32)` | Repeatable observation of completed backend cleanup and exit status. Lifecycle-owner loss before proven cleanup returns an error. |
 | `bootstrap` | `() -> (cap: Capability)` | Get the capability exported by the guest via `system::serve()`. |
-| `kill` | `() -> ()` | Terminate the process by revoking its fuel. |
+| `kill` | `() -> ()` | Request termination; the response does not acknowledge asynchronous cleanup. |
+
+`Process` owns execution lifetime. Cloning or passing it to another vat shares
+ownership. Releasing one reference does not request termination while another
+Process owner remains; final ownership loss at the backend requests termination.
+Requests, responses, pipelines, and membrane wrappers can retain owning
+references. Holding only stdin, stdout, stderr, or bootstrap capabilities does
+not retain execution ownership.
+
+Concurrent `wait()` calls may coexist. Cancelling one does not consume the
+terminal result, and late calls can observe it while the Process capability
+remains usable. A dispatched pending wait does not independently own execution.
+Explicit `kill()` and final release use the same idempotent termination request;
+the backend lifecycle continues asynchronous teardown independently.
+
+Detected RPC disconnection releases ownership exported over that connection.
+Failure detection is not instantaneous. Application-created capability cycles
+can extend lifetime; Wetware-created transport cycles have a managed RPC
+disconnect path that releases their exports.
+
+There is no detach or daemon API, stable process identity, persistence, or
+reconnection guarantee. PID0 has its own deployment-owned lifetime root.
+Intentional orphaning is deferred: it would need independent backend ownership
+and application-managed retirement. Fuel limits computation, not wall-clock
+retention; blocked async work may consume no guest fuel.
 
 ### ByteStream
 

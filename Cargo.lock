@@ -5319,6 +5319,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "wetware-authority",
+ "wetware-membrane",
 ]
 
 [[package]]

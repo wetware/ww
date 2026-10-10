@@ -10,13 +10,13 @@
 
 use std::time::Duration;
 
+use crate::managed_rpc::ManagedRpcSystem as RpcSystem;
 use auth::SigningDomain;
 use authority::{auth_capnp, EpochGuard, KeyMethodAuthorization, TerminalServer};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
-use capnp_rpc::RpcSystem;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use futures::StreamExt;
 
@@ -290,26 +290,28 @@ async fn handle_authenticated_vat_connection(
     let (reader, writer) = Box::pin(stream).split();
     let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
     let rpc_system = RpcSystem::new(Box::new(network), Some(bootstrap_cap));
-    tokio::pin!(rpc_system);
+    let mut rpc_system = crate::managed_rpc::ManagedRpc::spawn(rpc_system);
     let deadline = tokio::time::sleep(login_timeout);
     tokio::pin!(deadline);
 
-    tokio::select! {
+    let outcome = tokio::select! {
         biased;
         result = granted_rx => {
             if result.is_ok() {
-                let _ = rpc_system.await;
-                AuthenticatedConnectionOutcome::Authenticated
+                let _ = (&mut rpc_system).await;
+                return AuthenticatedConnectionOutcome::Authenticated;
             } else {
                 AuthenticatedConnectionOutcome::ConnectionClosed
             }
         }
         _ = &mut deadline => AuthenticatedConnectionOutcome::LoginTimedOut,
-        _ = rpc_system.as_mut() => {
+        _ = &mut rpc_system => {
             tracing::debug!(protocol, "authenticated vat peer disconnected before login");
-            AuthenticatedConnectionOutcome::ConnectionClosed
+            return AuthenticatedConnectionOutcome::ConnectionClosed;
         }
-    }
+    };
+    let _ = rpc_system.shutdown_and_join().await;
+    outcome
 }
 
 /// Bootstrap one remote peer with a persistent capability.
@@ -324,7 +326,7 @@ pub async fn handle_vat_connection_serve(
     let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
     let peer_rpc = RpcSystem::new(Box::new(network), Some(bootstrap_cap));
 
-    let _ = peer_rpc.await;
+    let _ = crate::managed_rpc::ManagedRpc::spawn(peer_rpc).await;
     tracing::debug!(protocol, "vat peer disconnected");
 
     Ok(())

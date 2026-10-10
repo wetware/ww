@@ -93,10 +93,9 @@ impl system_capnp::vat_client::Server for VatClientImpl {
             let super::vat_dial::VatDial { bootstrap, driver } =
                 super::vat_dial::connect::<_, capnp::capability::Client>(stream);
 
-            // The driver runs detached. Cap'n Proto refcounting handles
-            // shutdown: when the guest drops all capabilities obtained from
-            // this connection, the RpcSystem drains and the task completes.
-            // We log the eventual RpcSystem outcome for observability.
+            // The task below owns the managed driver and logs its outcome.
+            // Owner cancellation or detected transport failure explicitly
+            // disconnects before connection exports are abandoned.
             let driver_peer = peer_id;
             let driver_protocol = stream_protocol.clone();
             let driver_service = protocol_name.clone();
@@ -118,7 +117,7 @@ impl system_capnp::vat_client::Server for VatClientImpl {
                         peer = %driver_peer,
                         protocol = %driver_protocol,
                         service = %driver_service,
-                        "vat dial driver task aborted: {e}"
+                        "vat dial driver task failed: {e}"
                     ),
                 }
             });

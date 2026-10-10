@@ -1,7 +1,7 @@
 //! Paved-path helper for opening a Cap'n Proto vat connection as a client.
 //!
 //! Wraps an `AsyncRead + AsyncWrite` stream as a Cap'n Proto RPC client vat,
-//! drives the `RpcSystem` in a detached background task, and returns the
+//! drives the `RpcSystem` in a managed background task, and returns the
 //! remote's bootstrap capability typed as `C`.
 //!
 //! # Why this exists
@@ -59,8 +59,9 @@
 //! pipelines on the bootstrap, so its response promise IS the handshake
 //! observable.  We follow that pattern: callers that want an explicit
 //! liveness check should make a lightweight typed call (e.g. shell.eval("")).
-//! Callers that just hold the cap pay no penalty — the connection idles
-//! cleanly until the cap is dropped.
+//! The `ManagedRpc` owner controls connection lifetime. Dropping the owner
+//! requests connection shutdown. Retained imported capabilities may still
+//! exist as values, but they do not override that shutdown.
 //!
 //! # Trade-offs
 //!
@@ -84,8 +85,8 @@
 //! - **Connection drops mid-session.** No change vs. the prior code:
 //!   in-flight promises fail with `Disconnected`.
 //! - **Caller never invokes a method.** No 30s connect penalty for
-//!   dials that don't end up using the cap; connection idles cleanly
-//!   until the cap is dropped.  Pure improvement.
+//!   dials that don't end up using the cap. Dropping the `ManagedRpc` owner
+//!   requests connection shutdown even if the cap is retained.
 //! - **libp2p-level dial failure** (host unreachable, no subprotocol
 //!   negotiated).  No change: `vat_dial::connect` is never reached.
 //!
@@ -99,45 +100,38 @@
 //!
 //! [capnproto-rust hello-world client]: https://github.com/capnproto/capnproto-rust/blob/master/capnp-rpc/examples/hello-world/client.rs
 
+use crate::managed_rpc::ManagedRpcSystem as RpcSystem;
 use capnp::capability::FromClientHook;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
-use capnp_rpc::RpcSystem;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 /// A bootstrapped Cap'n Proto vat connection.
 ///
-/// Holds the typed bootstrap capability plus a `JoinHandle` to the
-/// detached `RpcSystem` driver task.  Dropping a `VatDial` detaches the
-/// driver — the underlying connection closes naturally when all derived
-/// clients are dropped or the transport fails.  Call [`Self::abort`] to
-/// actively cancel the driver.
-///
-/// The driver `JoinHandle` carries the eventual `RpcSystem` result: `Ok(())`
-/// means the remote disconnected cleanly, `Err(e)` means the connection ended
-/// with a transport- or protocol-level error.  Callers wanting that signal can
-/// `.await` `driver` and match on the inner result.
+/// Owns a typed bootstrap capability and its managed RPC driver.
+/// Dropping the driver or calling [`Self::abort`] requests disconnection;
+/// awaiting it joins bounded teardown. Retained clients then become unusable.
 pub struct VatDial<C> {
     /// The remote's bootstrap capability, ready for use.  The first method
     /// call on this client triggers the Bootstrap roundtrip (pipelined).
     pub bootstrap: C,
-    /// JoinHandle for the spawned `RpcSystem` driver task.  The inner result
+    /// Managed owner of the `RpcSystem` driver task. The inner result
     /// is the `RpcSystem` outcome (`Ok` = clean close, `Err` = RPC error).
-    pub driver: tokio::task::JoinHandle<Result<(), capnp::Error>>,
+    pub driver: crate::managed_rpc::ManagedRpc,
 }
 
 impl<C> VatDial<C> {
-    /// Actively cancel the driver task.  After calling this, the bootstrap
+    /// Request managed disconnection.  After calling this, the bootstrap
     /// capability and any pipelined references become unusable.
     pub fn abort(&self) {
-        self.driver.abort();
+        self.driver.shutdown();
     }
 }
 
 /// Open a Cap'n Proto vat as a client over the given stream and return its
 /// bootstrap capability typed as `C`.
 ///
-/// The `RpcSystem` is spawned as a detached `tokio::task::spawn_local` task
+/// The `RpcSystem` is spawned as a managed `tokio::task::spawn_local` task
 /// **before** returning; once that task is polled (which happens as soon as
 /// control yields), it flushes the Bootstrap message and receives the remote
 /// Return.  Must be called from within a [`tokio::task::LocalSet`]
@@ -168,7 +162,7 @@ where
     // CRITICAL ORDERING: spawn the driver BEFORE returning. Derived promises
     // (method calls, when_resolved, etc.) only make progress while the
     // RpcSystem is being polled.
-    let driver = tokio::task::spawn_local(rpc_system);
+    let driver = crate::managed_rpc::ManagedRpc::spawn(rpc_system);
 
     let typed: C = FromClientHook::new(bootstrap_cap.hook);
     VatDial {

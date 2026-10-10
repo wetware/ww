@@ -10,12 +10,12 @@
 
 use std::sync::Arc;
 
+use crate::managed_rpc::ManagedRpcSystem as RpcSystem;
 use authority::{auth_capnp, Epoch, EpochGuard, GraftBuilder, MembraneServer};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
-use capnp_rpc::RpcSystem;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use libp2p::identity::Keypair;
 use libp2p_core::SignedEnvelope;
@@ -413,13 +413,13 @@ pub type GuestMembrane = system_capnp::membrane::Client;
 /// parent-held `Process.bootstrap()` operation.
 pub type GuestExport = capnp::capability::Client;
 
-/// Build the ordinary-child RPC path around the exact delegated authority.
+/// Start the managed ordinary-child RPC path around the exact delegated authority.
 #[doc(hidden)]
 pub fn build_child_membrane_rpc<R, W>(
     reader: R,
     writer: W,
     membrane: GuestMembrane,
-) -> (RpcSystem<Side>, GuestExport)
+) -> (crate::managed_rpc::ManagedRpc, GuestExport)
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
@@ -432,10 +432,13 @@ where
     );
     let mut rpc_system = RpcSystem::new(Box::new(rpc_network), Some(membrane.client));
     let guest_export: GuestExport = rpc_system.bootstrap(Side::Client);
-    (rpc_system, guest_export)
+    (
+        crate::managed_rpc::ManagedRpc::spawn(rpc_system),
+        guest_export,
+    )
 }
 
-/// Build the trusted pid0 RPC system with its full graft-capable `Membrane`.
+/// Start the managed pid0 RPC system with its full graft-capable `Membrane`.
 ///
 /// The membrane provides epoch-scoped typed authority and, when configured, a
 /// host-side node identity signer.
@@ -499,7 +502,7 @@ pub fn build_kernel_membrane_rpc<R, W>(
     http_dial: Vec<String>,
     intended_seq: u64,
     registration_scope: watch::Receiver<()>,
-) -> RpcSystem<Side>
+) -> crate::managed_rpc::ManagedRpc
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
@@ -535,7 +538,10 @@ where
         Side::Server,
         Default::default(),
     );
-    RpcSystem::new(Box::new(rpc_network), Some(root_membrane.client))
+    crate::managed_rpc::ManagedRpc::spawn(RpcSystem::new(
+        Box::new(rpc_network),
+        Some(root_membrane.client),
+    ))
 }
 
 // IPFS content access is tested in fs_intercept::tests and vfs::tests.
@@ -624,7 +630,7 @@ mod tests {
         );
         let mut guest_rpc = RpcSystem::new(Box::new(guest_network), None);
         let membrane = guest_rpc.bootstrap(Side::Server);
-        tokio::task::spawn_local(guest_rpc.map(|_| ()));
+        tokio::task::spawn_local(crate::managed_rpc::ManagedRpc::spawn(guest_rpc).map(|_| ()));
         membrane
     }
 
@@ -1206,7 +1212,9 @@ mod tests {
                 );
                 let mut guest_rpc = RpcSystem::new(Box::new(guest_network), None);
                 let membrane: system_capnp::membrane::Client = guest_rpc.bootstrap(Side::Server);
-                tokio::task::spawn_local(guest_rpc.map(|_| ()));
+                tokio::task::spawn_local(
+                    crate::managed_rpc::ManagedRpc::spawn(guest_rpc).map(|_| ()),
+                );
 
                 let response = membrane
                     .graft_request()
@@ -1257,7 +1265,9 @@ mod tests {
                 );
                 let mut guest_rpc = RpcSystem::new(Box::new(guest_network), None);
                 let membrane: system_capnp::membrane::Client = guest_rpc.bootstrap(Side::Server);
-                tokio::task::spawn_local(guest_rpc.map(|_| ()));
+                tokio::task::spawn_local(
+                    crate::managed_rpc::ManagedRpc::spawn(guest_rpc).map(|_| ()),
+                );
 
                 let response = membrane
                     .graft_request()

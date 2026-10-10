@@ -23,6 +23,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Guest RPC sessions terminalize synchronously on cancellation.**
   Retained calls become terminal before cancellation returns, including
   cancellation before the first driver poll and extracted session fields.
+- **Process capabilities now own execution lifetime.** Cloning or transmitting
+  a Process shares ownership; final owner release requests termination.
+  `wait()` is replayable, concurrent, and non-consuming; `kill()` acknowledges
+  only a termination request. Managed RPC disconnect releases exported
+  ownership on detected teardown, including cancellation and runtime-created
+  transport cycles. Detach and daemon semantics remain deferred.
 - **ByteStream reads and writes now make independent progress.** Close promptly
   cancels pending I/O, repeated close succeeds, and post-close reads and writes
   have deterministic results. Dialed streams release both transport pumps on

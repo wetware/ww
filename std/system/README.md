@@ -53,6 +53,13 @@ Discarding a Store or trapping with Wasm `panic=abort` does not promise guest
 destructor execution. The host child lifecycle retains responsibility for
 host-side cleanup at those boundaries.
 
+The parent must retain the owning `Process` while it needs the child to execute.
+Keeping only the exported bootstrap capability does not retain execution
+ownership. Cloning or transmitting the Process shares ownership; final owner
+release at the backend requests termination. See the
+[Process contract](../../doc/api/wasm-guest.md#process) for repeatable `wait()`
+and request-only `kill()` semantics.
+
 ## Relationship to the kernel
 
 The trusted PID0 kernel receives a process-local root `Membrane`. PID0 calls
