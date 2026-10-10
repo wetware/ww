@@ -28,6 +28,7 @@ use ww::launcher::create_runtime_client;
 use ww::rpc::managed_rpc::{ManagedRpc, ManagedRpcSystem};
 use ww::rpc::stream_listener::StreamListenerImpl;
 use ww::rpc::{CachePolicy, ConnectionBudget, NetworkState, SwarmCommand};
+use ww::services::{CompilationService, Service};
 use ww::system_capnp;
 
 struct LocalSwarms {
@@ -355,6 +356,54 @@ impl Drop for ControlledClock {
     }
 }
 
+/// Finish cold compilation before starting network or lifecycle watchdogs.
+/// The compiled component stays in Executor, so spawn does not depend on a
+/// disk-cache hit or block the thread driving libp2p negotiation.
+struct PreparedExecutor {
+    engine: TickedExecutor,
+    runtime: system_capnp::runtime::Client,
+    executor: system_capnp::executor::Client,
+}
+
+impl PreparedExecutor {
+    async fn new(wasm: &[u8]) -> Self {
+        admission_trace();
+        let engine = TickedExecutor::new();
+        let (compile_tx, request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        // A blocking task also inhibits automatic advancement in paused-time
+        // tests while the real compilation workers prepare the component.
+        let compiler =
+            tokio::task::spawn_blocking(move || CompilationService { request_rx }.run(shutdown_rx));
+        let runtime = create_runtime_client(
+            false,
+            authority::EpochGuard::fixed(authority::Epoch::zero()),
+            engine.runtime_engine(),
+            Some(compile_tx),
+            CachePolicy::Isolated,
+        );
+        let mut request = runtime.load_request();
+        request.get().set_wasm(wasm);
+        let loaded = request.send().promise.await;
+        drop(shutdown_tx);
+        compiler
+            .await
+            .expect("join fixture compiler")
+            .expect("fixture compiler shutdown");
+        let executor = loaded
+            .expect("Runtime.load P3 fixture")
+            .get()
+            .expect("load results")
+            .get_executor()
+            .expect("compiled Executor");
+        Self {
+            engine,
+            runtime,
+            executor,
+        }
+    }
+}
+
 struct Harness {
     swarms: LocalSwarms,
     epoch: watch::Sender<authority::Epoch>,
@@ -371,8 +420,7 @@ struct Harness {
 }
 
 impl Harness {
-    async fn new(wasm: &[u8], fail_spawn: bool) -> Self {
-        admission_trace();
+    async fn new(prepared: PreparedExecutor, fail_spawn: bool) -> Self {
         let swarms = local_swarms().await;
         let (epoch, epoch_rx) = watch::channel(authority::Epoch {
             seq: 1,
@@ -383,23 +431,11 @@ impl Harness {
             issued_seq: 1,
             receiver: epoch_rx,
         };
-        let engine = TickedExecutor::new();
-        let runtime = create_runtime_client(
-            false,
-            authority::EpochGuard::fixed(authority::Epoch::zero()),
-            engine.runtime_engine(),
-            None,
-            CachePolicy::Isolated,
-        );
-        let mut request = runtime.load_request();
-        request.get().set_wasm(wasm);
-        let executor = bounded(request.send().promise)
-            .await
-            .expect("Runtime.load P3 fixture")
-            .get()
-            .expect("load results")
-            .get_executor()
-            .expect("compiled Executor");
+        let PreparedExecutor {
+            engine,
+            runtime,
+            executor,
+        } = prepared;
         let (spawned, children) = mpsc::unbounded_channel();
         let calls = Arc::new(AtomicUsize::new(0));
         let executor: system_capnp::executor::Client = capnp_rpc::new_client(ObservedExecutor {
@@ -507,7 +543,8 @@ async fn real_p3_delayed_output_uses_supplied_membrane_and_completes() {
     };
     tokio::task::LocalSet::new()
         .run_until(async {
-            let mut h = Harness::new(&wasm, false).await;
+            let prepared = PreparedExecutor::new(&wasm).await;
+            let mut h = Harness::new(prepared, false).await;
             let mut stream = h.open().await;
             stream.write_all(b"request").await.expect("peer input");
             stream.close().await.expect("peer input EOF");
@@ -555,8 +592,9 @@ async fn real_p3_completion_timeout_releases_permit_and_execution() {
     };
     tokio::task::LocalSet::new()
         .run_until(async {
+            let prepared = PreparedExecutor::new(&wasm).await;
             let clock = ControlledClock::hold();
-            let mut h = Harness::new(&wasm, false).await;
+            let mut h = Harness::new(prepared, false).await;
             let mut stream = h.open().await;
             let child = h.child().await;
             let started = tokio::time::Instant::now();
@@ -599,7 +637,8 @@ async fn real_p3_host_cancellation_releases_permit_and_execution() {
     };
     tokio::task::LocalSet::new()
         .run_until(async {
-            let mut h = Harness::new(&wasm, false).await;
+            let prepared = PreparedExecutor::new(&wasm).await;
+            let mut h = Harness::new(prepared, false).await;
             let mut stream = h.open().await;
             stream.close().await.expect("input EOF");
             let child = h.child().await;
@@ -623,7 +662,8 @@ async fn real_p3_peer_reset_releases_permit_and_execution() {
     };
     tokio::task::LocalSet::new()
         .run_until(async {
-            let mut h = Harness::new(&wasm, false).await;
+            let prepared = PreparedExecutor::new(&wasm).await;
+            let mut h = Harness::new(prepared, false).await;
             let mut stream = h.open().await;
             stream.close().await.expect("input EOF");
             let child = h.child().await;
@@ -651,8 +691,9 @@ async fn real_p3_timing_out_one_sibling_preserves_the_other() {
     };
     tokio::task::LocalSet::new()
         .run_until(async {
+            let prepared = PreparedExecutor::new(&wasm).await;
             let clock = ControlledClock::hold();
-            let mut h = Harness::new(&wasm, false).await;
+            let mut h = Harness::new(prepared, false).await;
             let executor_cid = h.executor_cid().await;
             assert!(!executor_cid.is_empty());
             let mut a = h.open().await;
@@ -777,7 +818,8 @@ async fn real_p3_stale_final_admission_never_dispatches_executor() {
     };
     tokio::task::LocalSet::new()
         .run_until(async {
-            let h = Harness::new(&wasm, false).await;
+            let prepared = PreparedExecutor::new(&wasm).await;
+            let h = Harness::new(prepared, false).await;
             let (admitted_tx, admitted) = oneshot::channel();
             *admission_trace().lock().unwrap() = Some(AdmissionTrigger {
                 thread: std::thread::current().id(),
@@ -809,7 +851,8 @@ async fn real_p3_executor_path_failure_returns_gateway_permit() {
     };
     tokio::task::LocalSet::new()
         .run_until(async {
-            let h = Harness::new(&wasm, true).await;
+            let prepared = PreparedExecutor::new(&wasm).await;
+            let h = Harness::new(prepared, true).await;
             let mut stream = h.open().await;
             let _ = bounded(stream.read_to_end(&mut Vec::new())).await;
             budget_released(&h.budget, 0).await;
