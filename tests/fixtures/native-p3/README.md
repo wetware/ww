@@ -13,7 +13,8 @@ The build lane pins this tuple:
 - Rust target `wasm32-wasip3`;
 - WASI SDK 34.0;
 - `wasm-component-ld` 0.5.30 with LLD 23.1.0;
-- `wit-bindgen` 0.61.1;
+- `wit-bindgen` 0.62.0 with the exact Wetware cancellation-wake fix
+  `025f95c294373c73e12eaee335577c81477d5a20`;
 - `wasm-tools` 1.258.0;
 - Wasmtime 48.0.1 in the host workspace.
 

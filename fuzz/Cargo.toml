@@ -19,7 +19,7 @@ serde = "=1.0.228"
 serde_json = "=1.0.150"
 
 [patch.crates-io]
-capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", branch = "ww/import-fix-0.25-consume" }
+capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a" }
 
 [[bin]]
 name = "fuzz_kubo_ls_response"
