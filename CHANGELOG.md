@@ -29,6 +29,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   only a termination request. Managed RPC disconnect releases exported
   ownership on detected teardown, including cancellation and runtime-created
   transport cycles. Detach and daemon semantics remain deferred.
+- **Accepted byte streams preserve delayed output after input EOF.** EOF closes
+  only child stdin. One non-renewable 30-second completion grace bounds remaining
+  handler work, output drain, flush, and close. Timeout and failure release
+  gateway connection permits when local connection state ends, independently of
+  remote backend cleanup. A final epoch check rejects stale registrations before
+  spawn dispatch; one child's failure does not terminate its siblings.
 - **ByteStream reads and writes now make independent progress.** Close promptly
   cancels pending I/O, repeated close succeeds, and post-close reads and writes
   have deterministic results. Dialed streams release both transport pumps on

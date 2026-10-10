@@ -250,6 +250,34 @@ for a result. The first typed response reports bootstrap or transport failure.
 registration-time `Membrane`, and pumps bytes through process stdin and stdout.
 `StreamDialer.dial` returns a bidirectional `ByteStream` capability.
 
+Each accepted stream has one supervisor. The supervisor retains an owning
+Process reference, a replayable wait observation, both transport directions,
+one cancellation token, and one connection permit. Clean peer input EOF closes
+child stdin only. Child stdout and the network output direction remain usable,
+so a response produced after input EOF can still reach the peer.
+
+The supervisor starts one non-renewable 30-second completion deadline when it
+first observes peer input EOF or child completion with unfinished output. The
+deadline covers stdin EOF propagation, remaining handler work, stdout drain,
+and network write, flush, and close. It never restarts between phases. Normal
+completion observes child exit and final output EOF. Expiry, cancellation, or
+transport/executor failure stops normal gateway work, makes a bounded
+best-effort kill request when useful, and drops Process and ownership-bearing
+requests, responses, and pipelines.
+
+`ConnectionPermit` accounts only for gateway-owned accepted connection state.
+It returns once that local state and transport end, without requiring a remote
+cleanup acknowledgement. Backend lifecycle cleanup proceeds independently after
+termination or final ownership loss. The same algorithm accepts local, wrapped,
+forwarded, or remote Executors; a single-child timeout never disconnects a shared
+executor connection or kills a sibling.
+
+A final registration epoch check occurs after scheduling and immediately before
+`Executor.spawn()` dispatch, with no intervening yield. Stale admission drops
+the accepted transport and returns its permit without spawning. A later epoch
+transition does not retroactively invalidate an already-dispatched spawn; the
+listener's host cancellation path still ends its accepted supervisors.
+
 `HttpListener.listen` creates an HTTP route, spawns one process per request,
 supplies CGI environment variables and request bytes, and reads the CGI
 response from stdout. The host never selects these modes from a WASM custom

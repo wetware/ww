@@ -86,7 +86,7 @@ does not keep the child alive. `wait()` is repeatable cleanup observation and
 `kill()` only requests termination. Managed RPC disconnect releases exported
 ownership and cuts runtime-created transport cycles. See
 [RPC transport](rpc-transport.md#process-ownership-and-cleanup) for the lifetime
-contract. Intentional daemon ownership is
+contract and gateway admission accounting. Intentional daemon ownership is
 deferred; PID0 retains its separate host ownership root.
 
 Each `Membrane` server owns only its delegated references. Repeated `graft()`

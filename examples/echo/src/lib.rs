@@ -2,7 +2,7 @@
 //!
 //! The cell copies stdin to stdout and exits. It has no RPC runtime.
 
-use std::io::Write;
+use std::io::{Read, Write};
 
 mod bindings {
     wit_bindgen::generate!({
@@ -18,7 +18,9 @@ impl bindings::exports::wasi::cli::run::Guest for EchoCell {
     async fn run() -> Result<(), ()> {
         let mut input = std::io::stdin().lock();
         let mut output = std::io::stdout().lock();
-        std::io::copy(&mut input, &mut output).map_err(|_| ())?;
+        let mut request = Vec::new();
+        input.read_to_end(&mut request).map_err(|_| ())?;
+        output.write_all(&request).map_err(|_| ())?;
         output.flush().map_err(|_| ())
     }
 }

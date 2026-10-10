@@ -49,6 +49,7 @@ jobs:
             - 'scripts/build_wasip3_component.sh'
             - 'scripts/check_first_party_wasip3.sh'
             - 'scripts/check_native_p3_fixture.sh'
+            - 'tests/fixtures/stream-lifecycle-probe/**'
             - 'rust-toolchain.toml'
           host:
             - 'src/**'
@@ -111,6 +112,7 @@ jobs:
         cargo fmt --all -- --check
         cargo fmt --manifest-path std/kernel/Cargo.toml -- --check
         cargo fmt --manifest-path tests/fixtures/native-p3/Cargo.toml -- --check
+        cargo fmt --manifest-path tests/fixtures/stream-lifecycle-probe/Cargo.toml -- --check
 
     - name: Check IPFS release publish scripts
       run: |
@@ -326,6 +328,7 @@ jobs:
           examples/*/bin/
           target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
           target/routing-key-probe/wasm32-wasip3/release/routing_key_probe.wasm
+          target/stream-lifecycle-probe/wasm32-wasip3/release/stream_lifecycle_probe.wasm
         retention-days: 1
 
   test:
@@ -408,11 +411,13 @@ jobs:
         test -s examples/echo/bin/echo.wasm
         test -s examples/discovery/bin/discovery.wasm
         test -s target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
+        test -s target/stream-lifecycle-probe/wasm32-wasip3/release/stream_lifecycle_probe.wasm
 
     - name: Run host workspace tests
       run: cargo test --workspace -- --test-threads=2
       env:
         WW_TEST_REQUIRE_KUBO: "1"
+        WW_REQUIRE_P3_FIXTURES: "1"
         WW_USE_PREBUILT_AUTHORITY_PROBE: "1"
         # Reuse compiled WASM across fresh engines within this job.
         WW_CWASM_DIR: ${{ runner.temp }}/ww-cwasm
