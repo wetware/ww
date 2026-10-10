@@ -1,0 +1,27 @@
+package wetware:session-cancel@0.1.0;
+
+interface observer {
+    event: func(code: u32);
+    wait-event: func(code: u32) -> future;
+}
+
+interface child {
+    victim: async func(mode: u32, gate: future) -> u32;
+    sibling: async func(gate: future) -> u32;
+    reenter: async func() -> u32;
+    certify: func(mode: u32) -> u32;
+}
+
+world child-world {
+    import observer;
+    import wetware:transport/connection@0.2.0;
+    export child;
+}
+
+world parent-world {
+    import observer;
+    import child;
+    export run: async func(mode: u32, cancel: bool) -> u32;
+    export sibling: async func(gate: future) -> u32;
+    export reenter: async func() -> u32;
+}

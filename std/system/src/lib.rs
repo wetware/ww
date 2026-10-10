@@ -8,8 +8,11 @@ use capnp::capability::FromClientHook;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
+use futures::FutureExt;
 use std::cell::Cell;
 use std::future::Future;
+use std::io::Write;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -360,7 +363,13 @@ impl futures::io::AsyncWrite for StreamWriter {
     }
 }
 
+/// Owns one guest RPC connection, including its synchronous terminalization.
+///
+/// Extracting `rpc_system` or `client` does not detach the connection: dropping
+/// the remaining session owner terminalizes their connection as well.
 pub struct RpcSession<C> {
+    // Fields drop in declaration order, including after a partial move.
+    cleanup: SessionCleanup,
     pub rpc_system: RpcSystem<Side>,
     pub client: C,
     completion: wit_bindgen::FutureReader<
@@ -383,9 +392,15 @@ impl<C: FromClientHook> RpcSession<C> {
             pending: None,
         };
         let network = VatNetwork::new(reader, writer, Side::Client, Default::default());
-        let mut rpc_system = RpcSystem::new(Box::new(network), bootstrap);
+        let bootstrap_owner = bootstrap.map(membrane::RpcBootstrap::new);
+        let mut rpc_system = membrane::rpc_system(
+            Box::new(network),
+            bootstrap_owner.as_ref().map(membrane::RpcBootstrap::client),
+        );
         let client = rpc_system.bootstrap(Side::Server);
+        let cleanup = SessionCleanup::new(rpc_system.get_disconnector(), bootstrap_owner);
         Self {
+            cleanup,
             rpc_system,
             client,
             completion,
@@ -423,13 +438,13 @@ where
     Fut: Future<Output = Result<(), capnp::Error>>,
 {
     let RpcSession {
+        cleanup,
         rpc_system,
         client,
         completion,
     } = session;
-    let application = f(client);
     let transport = async move { transport_completion_result(completion.await) };
-    select_session(transport, rpc_system, application).await
+    select_session_with_cleanup(transport, rpc_system, || f(client), cleanup).await
 }
 
 fn transport_completion_result(
@@ -443,36 +458,249 @@ fn transport_completion_result(
     }
 }
 
+// Task 3 makes one supported disconnector poll settle connection-owned work.
+// This owner requires no RpcSystem poll, including during component cancellation.
+struct SessionCleanup {
+    disconnect: Option<capnp_rpc::Disconnector<Side>>,
+    bootstrap: Option<membrane::RpcBootstrap>,
+}
+
+impl SessionCleanup {
+    fn new(
+        disconnect: capnp_rpc::Disconnector<Side>,
+        bootstrap: Option<membrane::RpcBootstrap>,
+    ) -> Self {
+        Self {
+            disconnect: Some(disconnect),
+            bootstrap,
+        }
+    }
+
+    fn finish(&mut self) -> capnp::Result<()> {
+        let mut first = None;
+        if let Some(disconnect) = self.disconnect.take() {
+            cleanup_step(&mut first, "RPC disconnect", || {
+                membrane::initiate_disconnect(disconnect)
+                    .now_or_never()
+                    .unwrap_or_else(|| {
+                        Err(capnp::Error::failed(
+                            "RPC terminalization did not complete synchronously".into(),
+                        ))
+                    })
+            });
+        }
+        // Terminal state must exist before bootstrap destruction can reenter.
+        cleanup_step(&mut first, "RPC bootstrap release", || {
+            drop(self.bootstrap.take());
+            Ok(())
+        });
+        first.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            let _ = writeln!(std::io::stderr(), "RPC session cleanup failed: {error}");
+        }
+    }
+}
+
+// Keep every selected future owned until disconnect and bootstrap release end.
+// Explicit finish and Drop use the same consuming path. Separate unwind
+// boundaries let one user destructor fail without skipping the other owners.
+struct SessionScope<Transport, Rpc, App, MakeApp> {
+    cleanup: SessionCleanup,
+    application: Option<Pin<Box<App>>>,
+    make_application: Option<MakeApp>,
+    rpc: Option<Pin<Box<Rpc>>>,
+    transport: Option<Pin<Box<Transport>>>,
+}
+
+impl<Transport, Rpc, App, MakeApp> SessionScope<Transport, Rpc, App, MakeApp> {
+    fn finish(&mut self, keep_transport: bool) -> capnp::Result<()> {
+        let mut first = self.cleanup.finish().err();
+        cleanup_step(&mut first, "application future release", || {
+            drop(self.application.take());
+            Ok(())
+        });
+        cleanup_step(&mut first, "application factory release", || {
+            drop(self.make_application.take());
+            Ok(())
+        });
+        cleanup_step(&mut first, "RPC driver release", || {
+            drop(self.rpc.take());
+            Ok(())
+        });
+        if !keep_transport || first.is_some() {
+            cleanup_step(&mut first, "transport future release", || {
+                drop(self.transport.take());
+                Ok(())
+            });
+        }
+        first.map_or(Ok(()), Err)
+    }
+}
+
+impl<Transport, Rpc, App, MakeApp> Drop for SessionScope<Transport, Rpc, App, MakeApp> {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish(false) {
+            let _ = writeln!(std::io::stderr(), "RPC session cleanup failed: {error}");
+        }
+    }
+}
+
+fn cleanup_step(
+    first: &mut Option<capnp::Error>,
+    stage: &str,
+    f: impl FnOnce() -> capnp::Result<()>,
+) {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|panic| {
+        let detail = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic payload");
+        let error = capnp::Error::failed(format!("{stage} panicked: {detail}"));
+        if let Err(secondary) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(panic))) {
+            // A recursively panicking payload cannot replace the first cause.
+            std::mem::forget(secondary);
+        }
+        Err(error)
+    });
+    if let Err(error) = result {
+        if let Some(cause) = first.as_ref() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "secondary RPC session cleanup failure after {cause}: {error}"
+            );
+        } else {
+            *first = Some(error);
+        }
+    }
+}
+
+fn select_session_with_cleanup<Transport, Rpc, App, MakeApp>(
+    transport: Transport,
+    rpc: Rpc,
+    make_application: MakeApp,
+    cleanup: SessionCleanup,
+) -> impl Future<Output = capnp::Result<()>>
+where
+    Transport: Future<Output = capnp::Result<()>>,
+    Rpc: Future<Output = capnp::Result<()>>,
+    App: Future<Output = capnp::Result<()>>,
+    MakeApp: FnOnce() -> App,
+{
+    // Construct synchronously: even dropping this future before its first poll
+    // must terminalize the connection without starting RPC or application work.
+    let mut scope = SessionScope {
+        cleanup,
+        application: None::<Pin<Box<App>>>,
+        make_application: Some(make_application),
+        rpc: Some(Box::pin(rpc)),
+        transport: Some(Box::pin(transport)),
+    };
+    async move {
+        let selected = AssertUnwindSafe(async {
+            // The cleanup owner is installed before invoking application code.
+            scope.application = Some(Box::pin(scope.make_application.take().unwrap()()));
+            let root = futures::future::select(
+                scope.rpc.as_mut().unwrap().as_mut(),
+                scope.application.as_mut().unwrap().as_mut(),
+            );
+            match futures::future::select(
+                scope.transport.as_mut().unwrap().as_mut(),
+                Box::pin(root),
+            )
+            .await
+            {
+                futures::future::Either::Left((result, _)) => (result, true),
+                futures::future::Either::Right((root, _)) => match root {
+                    futures::future::Either::Left((result, _))
+                    | futures::future::Either::Right((result, _)) => (result, false),
+                },
+            }
+        })
+        .catch_unwind()
+        .await;
+        let keep_transport = matches!(&selected, Ok((Ok(()), false)));
+        let cleanup = scope.finish(keep_transport);
+        let transport = scope.transport.take();
+        drop(scope);
+
+        match selected {
+            Err(panic) => {
+                if let Err(error) = cleanup {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "secondary RPC session cleanup failure during unwind: {error}"
+                    );
+                }
+                std::panic::resume_unwind(panic);
+            }
+            Ok((Err(error), _)) => {
+                if let Err(secondary) = cleanup {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "secondary RPC session cleanup failure after {error}: {secondary}"
+                    );
+                }
+                Err(error)
+            }
+            Ok((Ok(()), _)) => {
+                cleanup?;
+                match transport {
+                    Some(transport) => transport.await,
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn select_session_with_disconnect<Transport, Rpc, App>(
+    transport: Transport,
+    rpc: Rpc,
+    application: App,
+    disconnect: capnp_rpc::Disconnector<Side>,
+    bootstrap: Option<membrane::RpcBootstrap>,
+) -> impl Future<Output = capnp::Result<()>>
+where
+    Transport: Future<Output = capnp::Result<()>>,
+    Rpc: Future<Output = capnp::Result<()>>,
+    App: Future<Output = capnp::Result<()>>,
+{
+    select_session_with_cleanup(
+        transport,
+        rpc,
+        || application,
+        SessionCleanup::new(disconnect, bootstrap),
+    )
+}
+
+#[cfg(test)]
 async fn select_session<Transport, Rpc, App>(
     transport: Transport,
     rpc: Rpc,
     application: App,
-) -> Result<(), capnp::Error>
+) -> capnp::Result<()>
 where
-    Transport: Future<Output = Result<(), capnp::Error>>,
-    Rpc: Future<Output = Result<(), capnp::Error>>,
-    App: Future<Output = Result<(), capnp::Error>>,
+    Transport: Future<Output = capnp::Result<()>>,
+    Rpc: Future<Output = capnp::Result<()>>,
+    App: Future<Output = capnp::Result<()>>,
 {
-    let root = futures::future::select(Box::pin(rpc), Box::pin(application));
-    match futures::future::select(Box::pin(transport), Box::pin(root)).await {
-        futures::future::Either::Left((transport_result, _)) => transport_result,
-        futures::future::Either::Right((root_result, transport)) => {
-            let root_result = match root_result {
-                futures::future::Either::Left((result, application)) => {
-                    drop(application);
-                    result
-                }
-                futures::future::Either::Right((result, rpc)) => {
-                    drop(rpc);
-                    result
-                }
-            };
-            match root_result {
-                Err(error) => Err(error),
-                Ok(()) => transport.await,
-            }
-        }
-    }
+    select_session_with_cleanup(
+        transport,
+        rpc,
+        || application,
+        SessionCleanup {
+            disconnect: None,
+            bootstrap: None,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -486,6 +714,9 @@ where
         futures::future::Either::Right((result, _)) => result,
     }
 }
+
+#[cfg(test)]
+mod session_tests;
 
 #[cfg(test)]
 mod graft_tests {
@@ -693,6 +924,205 @@ mod graft_tests {
             .expect_err("transport failure")
             .to_string()
             .contains("transport failed"));
+    }
+
+    struct PendingRead;
+    impl futures::io::AsyncRead for PendingRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+    }
+
+    struct OwnedExport(Rc<Cell<bool>>);
+    impl Drop for OwnedExport {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    impl system_capnp::membrane::Server for OwnedExport {}
+
+    struct PanickingBootstrap;
+    impl system_capnp::membrane::Server for PanickingBootstrap {}
+    impl Drop for PanickingBootstrap {
+        fn drop(&mut self) {
+            panic!("injected guest bootstrap destructor panic");
+        }
+    }
+
+    #[test]
+    fn bootstrap_panic_preserves_application_error_and_releases_guest_exports() {
+        let released = Rc::new(Cell::new(false));
+        let owned: system_capnp::membrane::Client =
+            capnp_rpc::new_client(OwnedExport(released.clone()));
+        let bootstrap: system_capnp::membrane::Client = capnp_rpc::new_client(PanickingBootstrap);
+        let bootstrap = membrane::RpcBootstrap::new(bootstrap.client);
+        let network = VatNetwork::new(
+            PendingRead,
+            futures::io::sink(),
+            Side::Client,
+            Default::default(),
+        );
+        let mut rpc = membrane::rpc_system(Box::new(network), Some(bootstrap.client()));
+        let remote: system_capnp::executor::Client = rpc.bootstrap(Side::Server);
+        let mut request = remote.spawn_request();
+        request.get().set_membrane(owned);
+        let pending = request.send();
+        let disconnect = rpc.get_disconnector();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            futures::executor::block_on(select_session_with_disconnect(
+                std::future::pending(),
+                rpc,
+                std::future::ready(Err(failed("application failed"))),
+                disconnect,
+                Some(bootstrap),
+            ))
+        }));
+        let error = result
+            .expect("secondary bootstrap panic must not replace the selected error")
+            .expect_err("preserve the application failure");
+        assert!(error.extra.contains("application failed"));
+        assert!(
+            released.get(),
+            "bootstrap panic must not strand other guest exports"
+        );
+        use futures::FutureExt;
+        assert!(pending
+            .promise
+            .now_or_never()
+            .is_some_and(|result| result.is_err()));
+        drop(pending.pipeline);
+    }
+
+    #[test]
+    fn terminal_rpc_rejects_guest_response_with_retained_pipeline() {
+        use capnp::capability::Promise;
+        use capnp_rpc::Connection;
+        use futures::FutureExt;
+
+        struct TerminalNetwork(VatNetwork<PendingRead>);
+        impl capnp_rpc::VatNetwork<Side> for TerminalNetwork {
+            fn connect(&mut self, vat: Side) -> Option<Box<dyn Connection<Side>>> {
+                self.0.connect(vat)
+            }
+            fn accept(&mut self) -> Promise<Box<dyn Connection<Side>>, capnp::Error> {
+                self.0.accept()
+            }
+            fn drive_until_shutdown(&mut self) -> Promise<(), capnp::Error> {
+                Promise::err(failed("injected terminal network failure"))
+            }
+        }
+
+        let network = TerminalNetwork(VatNetwork::new(
+            PendingRead,
+            futures::io::sink(),
+            Side::Client,
+            Default::default(),
+        ));
+        let mut rpc = membrane::rpc_system(Box::new(network), None);
+        let remote: system_capnp::executor::Client = rpc.bootstrap(Side::Server);
+        let pending = remote.cid_request().send();
+        let disconnect = rpc.get_disconnector();
+        let result = futures::executor::block_on(select_session_with_disconnect(
+            std::future::pending(),
+            rpc,
+            std::future::pending(),
+            disconnect,
+            None,
+        ));
+        assert!(result.is_err());
+        assert!(
+            pending
+                .promise
+                .now_or_never()
+                .is_some_and(|result| result.is_err()),
+            "finished guest RPC driver must not strand a retained pipeline's response"
+        );
+        drop(pending.pipeline);
+    }
+
+    #[test]
+    fn application_error_releases_exports_despite_retained_import() {
+        let released = Rc::new(Cell::new(false));
+        let owned: system_capnp::membrane::Client =
+            capnp_rpc::new_client(OwnedExport(released.clone()));
+        let network = VatNetwork::new(
+            PendingRead,
+            futures::io::sink(),
+            Side::Client,
+            Default::default(),
+        );
+        let mut rpc = RpcSystem::new(Box::new(network), None);
+        let remote: system_capnp::executor::Client = rpc.bootstrap(Side::Server);
+        let mut request = remote.spawn_request();
+        request.get().set_membrane(owned);
+        let pending = request.send();
+        let disconnect = rpc.get_disconnector();
+        let result = futures::executor::block_on(select_session_with_disconnect(
+            std::future::pending(),
+            rpc,
+            std::future::ready(Err(failed("application failed"))),
+            disconnect,
+            None,
+        ));
+        assert!(result.is_err());
+        assert!(
+            released.get(),
+            "guest session termination must release its queued export"
+        );
+        use futures::FutureExt;
+        assert!(
+            pending
+                .promise
+                .now_or_never()
+                .is_some_and(|result| result.is_err()),
+            "pending call must be rejected before the guest driver is dropped"
+        );
+        assert!(remote
+            .cid_request()
+            .send()
+            .promise
+            .now_or_never()
+            .is_some_and(|result| result.is_err()));
+    }
+
+    #[test]
+    fn application_error_clears_bootstrap_despite_retained_import() {
+        let released = Rc::new(Cell::new(false));
+        let owned: system_capnp::membrane::Client =
+            capnp_rpc::new_client(OwnedExport(released.clone()));
+        let bootstrap = membrane::RpcBootstrap::new(owned.client);
+        let network = VatNetwork::new(
+            PendingRead,
+            futures::io::sink(),
+            Side::Client,
+            Default::default(),
+        );
+        let mut rpc = RpcSystem::new(Box::new(network), Some(bootstrap.client()));
+        let remote: system_capnp::executor::Client = rpc.bootstrap(Side::Server);
+        let disconnect = rpc.get_disconnector();
+        let result = futures::executor::block_on(select_session_with_disconnect(
+            std::future::pending(),
+            rpc,
+            std::future::ready(Err(failed("application failed"))),
+            disconnect,
+            Some(bootstrap),
+        ));
+        assert!(result.is_err());
+        assert!(
+            released.get(),
+            "connection-state bootstrap ownership must be cleared"
+        );
+        use futures::FutureExt;
+        assert!(remote
+            .cid_request()
+            .send()
+            .promise
+            .now_or_never()
+            .is_some_and(|result| result.is_err()));
     }
 
     struct TestMembrane;

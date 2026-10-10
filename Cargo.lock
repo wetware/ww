@@ -1334,6 +1334,8 @@ dependencies = [
  "blake3",
  "bytes",
  "cap-std",
+ "capnp",
+ "capnp-rpc",
  "cid",
  "dirs",
  "futures",
@@ -1348,6 +1350,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
@@ -5980,6 +5983,7 @@ dependencies = [
  "capnp-rpc",
  "capnpc",
  "futures",
+ "wetware-membrane",
  "wit-bindgen 0.62.0",
 ]
 

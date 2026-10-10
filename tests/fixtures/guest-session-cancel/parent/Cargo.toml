@@ -1,0 +1,16 @@
+[package]
+name = "guest-session-cancel-parent"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "=0.62.0", git = "https://github.com/wetware/wit-bindgen", rev = "025f95c294373c73e12eaee335577c81477d5a20" }
+
+[profile.release]
+panic = "abort"

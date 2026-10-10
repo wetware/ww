@@ -412,6 +412,9 @@ pub(crate) fn add_transport_to_linker<T: TransportHostState>(
 }
 
 #[cfg(test)]
+mod session_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::fs_intercept::{

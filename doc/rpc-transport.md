@@ -60,6 +60,29 @@ application Future. `TransportError::Failed` fails the root. Orderly transport
 closure remains successful. Wasmtime P3 drives all waits. The guest does not
 poll `wasi:io/poll`, run a timer-based pump, or own an event loop.
 
+Within one selector observation, transport completion precedes RPC completion,
+which precedes application completion. All three futures remain inline. A
+private synchronous cleanup owner exists before the application factory runs
+and also belongs to direct `RpcSession` values.
+
+Normal completion stops result selection, consumes cleanup ownership once,
+terminalizes the RPC connection, releases the local bootstrap, then drops the
+application, uncalled application factory, and RPC driver. An error or unwind
+also drops the remaining transport future before propagation. Successful
+application or RPC completion waits for transport completion after local cleanup.
+Cleanup never polls `RpcSystem`, including after a completed or unwound poll.
+Dropping an unpolled session performs zero RPC and application polls.
+
+Cleanup rejects retained calls, response pipelines, and promised capabilities
+through the Task-3 connection terminalization contract. Each cleanup stage runs
+even if another stage reports a native destructor panic. A selected primary
+failure or original unwind remains primary; otherwise cleanup failure fails the
+session. Repeated cleanup is harmless because each owner is consumed once.
+
+The public `RpcSession.rpc_system` and `RpcSession.client` fields remain
+extractable. The remaining session owner still controls their connection and
+terminalizes it when that owner leaves scope. Extraction is not a detach API.
+
 `Process.bootstrap()` returns the guest capability supplied to `system::serve`.
 That capability differs from the host bootstrap received by the guest.
 
@@ -108,12 +131,17 @@ implementation type names, secrets, or debug output.
 
 Wasmtime 48 hard-cancels a concurrent component task when its owning Store is
 dropped. `Proc` owns the Store and the `Store::run_concurrent` Future together.
-Process abort therefore drops the generated root Future, guest `RpcSystem`,
-pending request Futures, P3 resources, and both transport adapters.
+Process abort therefore discards guest state and drops host-side P3 resources
+and transport adapters. Store destruction does not certify execution of guest
+Rust destructors. Neither does a Wasm `panic=abort` trap.
 
-Wetware does not use Cap'n Proto `Disconnector` as a graceful-shutdown driver.
-Structured drop is the process shutdown policy. The host-side driver remains
-owned by the process lifecycle and closes when that lifecycle ends.
+Generated P3 subtask cancellation is a separate path: it destroys the guest
+session while the Store and sibling tasks can continue. The synchronous session
+owner terminalizes RPC state during that destruction. Wetware pins upstream
+`wit-bindgen` v0.62.0 plus the cancellation-wake fix at fork revision
+`025f95c294373c73e12eaee335577c81477d5a20`. The fix suppresses notifications from
+destructor-driven wakes before retiring the cancelled task's wake stream. The
+pin contains no later generator changes from upstream main.
 
 After Store teardown, Wetware gives the child host `RpcSystem` a one-second
 `RPC_EOF_GRACE` to observe transport EOF. If the `RpcSystem` does not finish in

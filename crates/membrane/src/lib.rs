@@ -28,6 +28,11 @@
 //! revocation, rate limits, and auditing. `check` takes `&self` but may hold
 //! interior-mutable state; the membrane calls it once per invocation.
 
+mod rpc_bootstrap;
+pub use rpc_bootstrap::RpcBootstrap;
+mod rpc_system;
+pub use rpc_system::{initiate_disconnect, rpc_system};
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;

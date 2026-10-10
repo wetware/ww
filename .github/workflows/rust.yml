@@ -311,6 +311,9 @@ jobs:
     - name: Build and validate native P3 fixture
       run: make test-p3-fixture
 
+    - name: Validate real guest RPC session cancellation
+      run: make test-guest-session-cancel
+
     - name: Build and validate first-party P3 components
       run: make test-wasm
 
