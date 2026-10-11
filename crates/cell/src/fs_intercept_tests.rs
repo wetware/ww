@@ -18,6 +18,9 @@ struct Harness {
     pinner: Arc<CountingPinner>,
     tree: Option<Arc<CidTree>>,
     descriptors: DescriptorContexts,
+    filesystem_scope: cache::FsScope,
+    _filesystem_owner: cache::FsOwner,
+    _filesystem_finalizer: cache::FsFinalizer,
     staging: tempfile::TempDir,
     scratch: tempfile::TempDir,
 }
@@ -35,6 +38,7 @@ impl FilesystemHostState for Harness {
             table: &mut self.table,
             cache_mode: &self.cache,
             cid_tree: &self.tree,
+            filesystem_scope: &self.filesystem_scope,
             descriptors: &mut self.descriptors,
         }
     }
@@ -102,6 +106,7 @@ fn harness() -> (Store<Harness>, u32, u32) {
     let cache = Some(Arc::new(cache::CacheMode::Isolated(
         cache::IsolatedPinset::new(pinner.clone()).unwrap(),
     )));
+    let (filesystem_scope, filesystem_owner, filesystem_finalizer, _) = cache::FsScope::new();
     let mut state = Harness {
         wasi: builder.build(),
         table: ResourceTable::new(),
@@ -109,6 +114,9 @@ fn harness() -> (Store<Harness>, u32, u32) {
         pinner,
         tree: Some(tree),
         descriptors: DescriptorContexts::default(),
+        filesystem_scope,
+        _filesystem_owner: filesystem_owner,
+        _filesystem_finalizer: filesystem_finalizer,
         staging,
         scratch,
     };

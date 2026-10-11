@@ -170,6 +170,21 @@ impl CidTree {
     /// 2. Staging disk (hit → populate LRU, return)
     /// 3. IPFS daemon `ls()` (populate both caches, return)
     pub async fn ls_dir(&self, cid: &Cid) -> Result<Vec<DirEntry>> {
+        let (scope, owner, finalizer, _completion) = cache::FsScope::new();
+        let finalizer_task = tokio::spawn(finalizer.run());
+        let result = self.ls_dir_in(&scope, cid).await;
+        drop(owner);
+        finalizer_task
+            .await
+            .context("standalone listing finalizer task failed")??;
+        result
+    }
+
+    pub(crate) async fn ls_dir_in(
+        &self,
+        filesystem_scope: &cache::FsScope,
+        cid: &Cid,
+    ) -> Result<Vec<DirEntry>> {
         // Tier 1: in-memory LRU
         if let Some(entries) = self
             .dir_cache
@@ -182,16 +197,20 @@ impl CidTree {
 
         // Tier 2: staging disk
         let disk_path = self.staging_dir.join(format!("{cid}{DIRLIST_SUFFIX}"));
-        if disk_path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&disk_path) {
-                if let Ok(entries) = serde_json::from_str::<Vec<DirEntry>>(&data) {
-                    // Populate LRU from disk
-                    if let Ok(mut cache) = self.dir_cache.lock() {
-                        cache.put(*cid, entries.clone());
-                    }
-                    return Ok(entries);
-                }
+        let read_path = disk_path.clone();
+        if let Ok(Some(entries)) = filesystem_scope
+            .run_blocking(cache::FilesystemOperation::ListingRead, move || {
+                std::fs::read_to_string(read_path)
+                    .ok()
+                    .and_then(|data| serde_json::from_str::<Vec<DirEntry>>(&data).ok())
+            })
+            .await
+        {
+            // Populate LRU from disk
+            if let Ok(mut cache) = self.dir_cache.lock() {
+                cache.put(*cid, entries.clone());
             }
+            return Ok(entries);
         }
 
         // Tier 3: IPFS daemon
@@ -217,12 +236,17 @@ impl CidTree {
             .collect();
 
         // Persist to staging disk
-        if let Ok(json) = serde_json::to_string(&entries) {
-            if let Some(parent) = disk_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&disk_path, json);
-        }
+        let persisted_entries = entries.clone();
+        let _ = filesystem_scope
+            .run_blocking(cache::FilesystemOperation::ListingWrite, move || {
+                if let Ok(json) = serde_json::to_string(&persisted_entries) {
+                    if let Some(parent) = disk_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&disk_path, json);
+                }
+            })
+            .await;
 
         // Populate LRU
         if let Ok(mut cache) = self.dir_cache.lock() {
@@ -237,9 +261,24 @@ impl CidTree {
     /// This compatibility entry point accepts leading slashes. Descriptor-relative
     /// callers use `resolve_at`, which rejects absolute guest paths.
     pub async fn resolve_path(&self, path: &str) -> Result<ResolvedNode> {
+        let (scope, owner, finalizer, _completion) = cache::FsScope::new();
+        let finalizer_task = tokio::spawn(finalizer.run());
+        let result = self.resolve_path_in(&scope, path).await;
+        drop(owner);
+        finalizer_task
+            .await
+            .context("standalone path finalizer task failed")??;
+        result
+    }
+
+    pub(crate) async fn resolve_path_in(
+        &self,
+        filesystem_scope: &cache::FsScope,
+        path: &str,
+    ) -> Result<ResolvedNode> {
         let root = self.root_cid();
         Ok(self
-            .resolve_path_inner(&root, path, path.ends_with('/'), 0)
+            .resolve_path_inner(filesystem_scope, &root, path, path.ends_with('/'), 0)
             .await?
             .node)
     }
@@ -256,6 +295,23 @@ impl CidTree {
         base_path: &str,
         path: &str,
     ) -> Result<ResolvedPath> {
+        let (scope, owner, finalizer, _completion) = cache::FsScope::new();
+        let finalizer_task = tokio::spawn(finalizer.run());
+        let result = self.resolve_at_in(&scope, root_cid, base_path, path).await;
+        drop(owner);
+        finalizer_task
+            .await
+            .context("standalone relative-path finalizer task failed")??;
+        result
+    }
+
+    pub(crate) async fn resolve_at_in(
+        &self,
+        filesystem_scope: &cache::FsScope,
+        root_cid: &Cid,
+        base_path: &str,
+        path: &str,
+    ) -> Result<ResolvedPath> {
         for relative in [base_path, path] {
             if relative.starts_with('/') || relative.split('/').any(|part| part == "..") {
                 return Err(ResolveError::InvalidPath.into());
@@ -267,22 +323,36 @@ impl CidTree {
             // Retaining this separator also requires a directory when path is empty.
             format!("{base_path}/{path}")
         };
-        self.resolve_path_inner(root_cid, &full_path, full_path.ends_with('/'), 0)
-            .await
+        self.resolve_path_inner(
+            filesystem_scope,
+            root_cid,
+            &full_path,
+            full_path.ends_with('/'),
+            0,
+        )
+        .await
     }
 
     fn resolve_path_inner<'a>(
         &'a self,
+        filesystem_scope: &'a cache::FsScope,
         root_cid: &'a Cid,
         path: &'a str,
         require_directory: bool,
         symlink_depth: usize,
     ) -> futures::future::BoxFuture<'a, Result<ResolvedPath>> {
-        Box::pin(self.resolve_path_inner_impl(root_cid, path, require_directory, symlink_depth))
+        Box::pin(self.resolve_path_inner_impl(
+            filesystem_scope,
+            root_cid,
+            path,
+            require_directory,
+            symlink_depth,
+        ))
     }
 
     async fn resolve_path_inner_impl(
         &self,
+        filesystem_scope: &cache::FsScope,
         root_cid: &Cid,
         path: &str,
         require_directory: bool,
@@ -299,7 +369,7 @@ impl CidTree {
         let mut current_cid = *root_cid;
 
         for (i, component) in components.iter().enumerate() {
-            let entries = self.ls_dir(&current_cid).await?;
+            let entries = self.ls_dir_in(filesystem_scope, &current_cid).await?;
             let entry = entries
                 .iter()
                 .find(|entry| entry.name == *component)
@@ -340,6 +410,7 @@ impl CidTree {
                     }
                     return self
                         .resolve_path_inner(
+                            filesystem_scope,
                             root_cid,
                             &resolved_target,
                             require_directory || resolved_target.ends_with('/'),

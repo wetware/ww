@@ -657,14 +657,6 @@ impl HostCallFrames {
 pub struct ComponentRunStates {
     pub wasi_ctx: WasiCtx,
     pub resource_table: ResourceTable,
-    /// Private empty root used by byte-loaded Executor children.
-    ///
-    /// A CidTree-backed cell uses the tree staging directory instead. Keeping
-    /// this TempDir in the store makes the preopen valid for the process
-    /// lifetime without exposing any host filesystem path.
-    pub image_root: Option<tempfile::TempDir>,
-    /// Process-private writable scratch preopened at `/tmp`.
-    pub scratch: tempfile::TempDir,
     /// Single-use, capability-granted P3 transport endpoint.
     pub(crate) granted_transport: crate::p3::GrantedTransport,
     /// Cache mode for this process. `None` means no cache (default).
@@ -672,6 +664,11 @@ pub struct ComponentRunStates {
     /// The staging directory for IPFS content is owned by the cache mode itself:
     /// host-wide shared dir for `Shared`, per-process dir for `Isolated`.
     pub cache_mode: Option<Arc<cache::CacheMode>>,
+    /// Owned custom filesystem work for this process.
+    pub(crate) filesystem_scope: cache::FsScope,
+    /// Closing this unique process lifetime rejects new work. The separately
+    /// registered finalizer owns actual completion and private-root teardown.
+    _filesystem_owner: cache::FsOwner,
     /// Virtual filesystem tree (lazy CID-based resolution).
     /// When `Some`, the guest filesystem is backed by a CidTree
     /// instead of a preopened host directory.
@@ -701,6 +698,52 @@ pub struct ComponentRunStates {
     /// Present only for the trusted PID0 process. Ordinary child linkers omit
     /// the corresponding WIT import entirely.
     pub kernel_ready_gate: Option<Arc<authority::KernelReadyGate>>,
+}
+
+/// Opaque ownership for all host filesystem work belonging to one Cell.
+///
+/// A generation can create this before its run future is polled, retain the
+/// completion proof, and inject the ownership into a [`Builder`]. This makes
+/// cancellation before first poll close an empty scope successfully while the
+/// same proof covers all work once construction starts.
+pub struct FilesystemOwnership {
+    scope: cache::FsScope,
+    owner: cache::FsOwner,
+    finalizer: cache::FsFinalizer,
+    completion: cache::FsCompletion,
+}
+
+impl FilesystemOwnership {
+    pub fn new() -> Self {
+        let (scope, owner, finalizer, completion) = cache::FsScope::new();
+        Self {
+            scope,
+            owner,
+            finalizer,
+            completion,
+        }
+    }
+
+    pub fn completion(&self) -> cache::FsCompletion {
+        self.completion.clone()
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        cache::FsScope,
+        cache::FsOwner,
+        cache::FsFinalizer,
+        cache::FsCompletion,
+    ) {
+        (self.scope, self.owner, self.finalizer, self.completion)
+    }
+}
+
+impl Default for FilesystemOwnership {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ComponentRunStates {
@@ -834,6 +877,10 @@ struct ProcInit {
     mode: ConstructionMode,
     fuel_estimator: Option<FuelEstimator>,
     fuel_observer: Option<FuelObserver>,
+    filesystem_scope: cache::FsScope,
+    filesystem_owner: cache::FsOwner,
+    #[cfg(test)]
+    fail_after_filesystem_setup: bool,
 }
 
 enum ConstructionMode {
@@ -844,42 +891,55 @@ enum ConstructionMode {
     },
 }
 
-struct ProcessFilesystem {
-    image_root: Option<tempfile::TempDir>,
-    scratch: tempfile::TempDir,
+struct PreparedProcessFilesystem {
+    wasi: WasiCtx,
+    #[allow(dead_code)]
+    image_root_path: Option<std::path::PathBuf>,
+    #[allow(dead_code)]
+    scratch_path: std::path::PathBuf,
 }
 
 fn configure_process_filesystem(
-    wasi_builder: &mut WasiCtxBuilder,
-    cid_tree: Option<&Arc<crate::vfs::CidTree>>,
-) -> Result<ProcessFilesystem> {
-    let image_root = if let Some(tree) = cid_tree {
+    mut wasi_builder: WasiCtxBuilder,
+    cid_tree_staging: Option<std::path::PathBuf>,
+    filesystem_scope: cache::FsScope,
+) -> Result<PreparedProcessFilesystem> {
+    let image_root_path = if let Some(staging) = cid_tree_staging {
         wasi_builder
-            .preopened_dir(tree.staging_dir(), "/", FsPerms::ReadOnly)
+            .preopened_dir(&staging, "/", FsPerms::ReadOnly)
             .map_err(|e| anyhow!("failed to preopen CidTree staging dir at /: {e}"))?;
         tracing::debug!(
-            staging = %tree.staging_dir().display(),
+            staging = %staging.display(),
             "Mounted CidTree staging at / (fs_intercept routes via virtual FS)"
         );
         None
     } else {
         let root = tempfile::TempDir::new()
             .map_err(|e| anyhow!("failed to create private process image root: {e}"))?;
+        let root_path = root.path().to_owned();
+        filesystem_scope
+            .own_temp_dir(cache::FilesystemOperation::ProcessCleanup, root)
+            .map_err(|e| anyhow!(e))?;
         wasi_builder
-            .preopened_dir(root.path(), "/", FsPerms::ReadOnly)
+            .preopened_dir(&root_path, "/", FsPerms::ReadOnly)
             .map_err(|e| anyhow!("failed to preopen private image root at /: {e}"))?;
-        Some(root)
+        Some(root_path)
     };
 
     let scratch = tempfile::TempDir::new()
         .map_err(|e| anyhow!("failed to create private process scratch: {e}"))?;
+    let scratch_path = scratch.path().to_owned();
+    filesystem_scope
+        .own_temp_dir(cache::FilesystemOperation::ProcessCleanup, scratch)
+        .map_err(|e| anyhow!(e))?;
     wasi_builder
-        .preopened_dir(scratch.path(), "/tmp", FsPerms::ReadWrite)
+        .preopened_dir(&scratch_path, "/tmp", FsPerms::ReadWrite)
         .map_err(|e| anyhow!("failed to preopen private process scratch at /tmp: {e}"))?;
 
-    Ok(ProcessFilesystem {
-        image_root,
-        scratch,
+    Ok(PreparedProcessFilesystem {
+        wasi: wasi_builder.build(),
+        image_root_path,
+        scratch_path,
     })
 }
 
@@ -1108,6 +1168,12 @@ pub struct Builder {
     mode: ConstructionMode,
     fuel_estimator: Option<FuelEstimator>,
     fuel_observer: Option<FuelObserver>,
+    filesystem_scope: cache::FsScope,
+    filesystem_owner: cache::FsOwner,
+    filesystem_finalizer: Option<cache::FsFinalizer>,
+    filesystem_completion: cache::FsCompletion,
+    #[cfg(test)]
+    fail_after_filesystem_setup: bool,
 }
 
 /// Handle for the host side of the capability-granted transport.
@@ -1188,6 +1254,8 @@ impl Builder {
         let handles = DataStreamHandles {
             host_transport: Some(host_transport),
         };
+        let (filesystem_scope, filesystem_owner, filesystem_finalizer, filesystem_completion) =
+            FilesystemOwnership::new().into_parts();
         let builder = Self {
             env: Vec::new(),
             args: Vec::new(),
@@ -1202,6 +1270,12 @@ impl Builder {
             mode,
             fuel_estimator: None,
             fuel_observer: None,
+            filesystem_scope,
+            filesystem_owner,
+            filesystem_finalizer: Some(filesystem_finalizer),
+            filesystem_completion,
+            #[cfg(test)]
+            fail_after_filesystem_setup: false,
         };
         (builder, handles)
     }
@@ -1256,8 +1330,49 @@ impl Builder {
         self
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn with_filesystem_test_hook(
+        self,
+        hook: Arc<dyn Fn(cache::FsTestEvent) + Send + Sync>,
+    ) -> Self {
+        self.filesystem_scope.set_test_hook(hook);
+        self
+    }
+
+    pub fn filesystem_completion(&self) -> cache::FsCompletion {
+        self.filesystem_completion.clone()
+    }
+
+    /// Replace the builder's fresh empty filesystem lifetime with ownership
+    /// created by the surrounding generation before its run future exists.
+    pub fn with_filesystem_ownership(mut self, ownership: FilesystemOwnership) -> Self {
+        let (scope, owner, finalizer, completion) = ownership.into_parts();
+        let old_owner = std::mem::replace(&mut self.filesystem_owner, owner);
+        let old_finalizer = self.filesystem_finalizer.replace(finalizer);
+        self.filesystem_scope = scope;
+        self.filesystem_completion = completion;
+        drop(old_owner);
+        drop(old_finalizer);
+        self
+    }
+
+    pub fn take_filesystem_finalizer(&mut self) -> Option<cache::FsFinalizer> {
+        self.filesystem_finalizer.take()
+    }
+
+    #[cfg(test)]
+    fn fail_after_filesystem_setup(mut self) -> Self {
+        self.fail_after_filesystem_setup = true;
+        self
+    }
+
     /// Build the host-side process representation.
-    pub async fn build(self) -> Result<Proc> {
+    pub async fn build(mut self) -> Result<Proc> {
+        if let Some(finalizer) = self.filesystem_finalizer.take() {
+            tokio::spawn(async move {
+                let _ = finalizer.run().await;
+            });
+        }
         Proc::new(ProcInit {
             env: self.env,
             args: self.args,
@@ -1271,6 +1386,10 @@ impl Builder {
             mode: self.mode,
             fuel_estimator: self.fuel_estimator,
             fuel_observer: self.fuel_observer,
+            filesystem_scope: self.filesystem_scope,
+            filesystem_owner: self.filesystem_owner,
+            #[cfg(test)]
+            fail_after_filesystem_setup: self.fail_after_filesystem_setup,
         })
         .await
     }
@@ -1305,6 +1424,10 @@ impl Proc {
             mode,
             fuel_estimator,
             fuel_observer,
+            filesystem_scope,
+            filesystem_owner,
+            #[cfg(test)]
+            fail_after_filesystem_setup,
         } = init;
         if let Program::Bytes(bytes) = &program {
             if bytes.len() > crate::sched::MAX_COMPONENT_BYTES {
@@ -1315,7 +1438,12 @@ impl Proc {
                 ));
             }
         }
-        let cache_mode = cache_mode.map(Arc::new);
+        let cache_mode = cache_mode
+            .map(|mut mode| {
+                mode.own_process_staging(&filesystem_scope)?;
+                Ok::<_, anyhow::Error>(Arc::new(mode))
+            })
+            .transpose()?;
         let (cid_tree, kernel_ready_gate) = match mode {
             ConstructionMode::Ordinary => (None, None),
             ConstructionMode::Kernel {
@@ -1373,18 +1501,31 @@ impl Proc {
         // `CidTree::resolve_path`. The preopen's actual on-disk contents
         // are dir-listing stubs populated lazily by `fs_intercept`, not
         // the guest's view. See doc/capabilities.md.
-        let filesystem = configure_process_filesystem(&mut wasi_builder, cid_tree.as_ref())?;
+        fn assert_send<T: Send>(_: &T) {}
+        assert_send(&wasi_builder);
+        let cid_tree_staging = cid_tree.as_ref().map(|tree| tree.staging_dir().to_owned());
+        let setup_scope = filesystem_scope.clone();
+        let filesystem = filesystem_scope
+            .run_blocking(cache::FilesystemOperation::ProcessSetup, move || {
+                configure_process_filesystem(wasi_builder, cid_tree_staging, setup_scope)
+            })
+            .await
+            .map_err(|error| anyhow!(error))??;
+        let wasi = filesystem.wasi;
 
-        let wasi = wasi_builder.build();
+        #[cfg(test)]
+        if fail_after_filesystem_setup {
+            return Err(anyhow!("injected failure after process filesystem setup"));
+        }
 
         let fuel_estimator = fuel_estimator.unwrap_or_else(|| FuelEstimator::new(INITIAL_FUEL));
         let state = ComponentRunStates {
             wasi_ctx: wasi,
             resource_table: ResourceTable::new(),
-            image_root: filesystem.image_root,
-            scratch: filesystem.scratch,
             granted_transport,
             cache_mode,
+            filesystem_scope,
+            _filesystem_owner: filesystem_owner,
             cid_tree,
             fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
             fuel_estimator,
@@ -1832,15 +1973,27 @@ mod tests {
         runtime_engine: &crate::engine::RuntimeEngine,
     ) -> ComponentRunStates {
         let (_host, granted_transport) = crate::p3::HostTransport::bounded_pair();
+        let (filesystem_scope, filesystem_owner, filesystem_finalizer, _completion) =
+            cache::FsScope::new();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = filesystem_finalizer.run().await;
+            });
+        } else {
+            // Synchronous fuel-accounting tests never create filesystem work.
+            // Dropping the finalizer exercises its fail-closed fallback without
+            // requiring those otherwise synchronous tests to own a runtime.
+            drop(filesystem_finalizer);
+        }
         let epoch_clock = runtime_engine.subscribe();
         let opened_epoch = epoch_clock.current_epoch();
         ComponentRunStates {
             wasi_ctx: WasiCtxBuilder::new().build(),
             resource_table: ResourceTable::new(),
-            image_root: None,
-            scratch: tempfile::TempDir::new().expect("component test scratch"),
             granted_transport,
             cache_mode: None,
+            filesystem_scope,
+            _filesystem_owner: filesystem_owner,
             cid_tree: None,
             fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
             fuel_estimator,
@@ -2840,6 +2993,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filesystem_finalizer_covers_process_construction_failure() {
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let (mut builder, _handles) = Builder::ordinary(
+            Program::Bytes(vec![0; crate::sched::MAX_COMPONENT_BYTES + 1]),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let completion = builder.filesystem_completion();
+        let finalizer = builder
+            .take_filesystem_finalizer()
+            .expect("builder owns one filesystem finalizer");
+        let finalizer_task = tokio::spawn(finalizer.run());
+
+        let error = match builder.with_runtime_engine(runtime_engine).build().await {
+            Ok(_) => panic!("oversized component unexpectedly compiled"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("component exceeds the fuel segment size bound"));
+        assert_eq!(completion.wait().await, Ok(()));
+        assert_eq!(finalizer_task.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_setup_construction_failure_cleans_private_paths_off_worker() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let bytes = wat::parse_str(P3_NOOP_COMMAND).expect("parse P3 no-op command");
+        let (mut builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytes),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let owner_thread = std::thread::current().id();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(Some(release_rx));
+        builder
+            .filesystem_scope
+            .set_test_hook(Arc::new(move |event| {
+                if event.operation == cache::FilesystemOperation::ProcessCleanup
+                    && event.stage == cache::FsTestStage::CleanupStarted
+                {
+                    if let Some(sender) = entered_tx.lock().unwrap().take() {
+                        sender
+                            .send((event.path.unwrap(), std::thread::current().id()))
+                            .unwrap();
+                        let receiver = release_rx.lock().unwrap().take().unwrap();
+                        let _ = receiver.recv();
+                    }
+                }
+            }));
+        let completion = builder.filesystem_completion();
+        let finalizer = builder.take_filesystem_finalizer().unwrap();
+        let finalizer_task = tokio::spawn(finalizer.run());
+        let build_task = tokio::spawn(
+            builder
+                .with_runtime_engine(runtime_engine)
+                .fail_after_filesystem_setup()
+                .build(),
+        );
+
+        let (private_path, cleanup_thread) = entered_rx.await.unwrap();
+        assert_ne!(cleanup_thread, owner_thread);
+        assert!(private_path.exists());
+        let mut pending_completion = Box::pin(completion.wait());
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                pending_completion.as_mut().poll(context),
+                Poll::Pending
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        release_tx.send(()).unwrap();
+
+        let error = match build_task.await.unwrap() {
+            Ok(_) => panic!("post-setup construction unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("injected failure after process filesystem setup"));
+        assert_eq!(finalizer_task.await.unwrap(), Ok(()));
+        assert_eq!(completion.wait().await, Ok(()));
+        assert!(!private_path.exists());
+    }
+
+    #[tokio::test]
+    async fn process_store_drop_releases_filesystem_owner_before_completion() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let (runtime_engine, _publisher) =
+            crate::engine::runtime_engine().expect("component runtime engine");
+        let bytes = wat::parse_str(P3_NOOP_COMMAND).expect("parse P3 no-op command");
+        let (mut builder, _handles) = Builder::ordinary(
+            Program::Bytes(bytes),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        );
+        let completion = builder.filesystem_completion();
+        let finalizer = builder
+            .take_filesystem_finalizer()
+            .expect("builder owns one filesystem finalizer");
+        let finalizer_task = tokio::spawn(finalizer.run());
+        let proc = builder
+            .with_runtime_engine(runtime_engine)
+            .build()
+            .await
+            .expect("build P3 no-op process");
+
+        let mut pending_completion = Box::pin(completion.wait());
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                pending_completion.as_mut().poll(context),
+                Poll::Pending
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        drop(proc);
+
+        assert_eq!(completion.wait().await, Ok(()));
+        assert_eq!(finalizer_task.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
     async fn zero_budget_builds_without_executing_a_trapping_start_function() {
         let (runtime_engine, _publisher) =
             crate::engine::runtime_engine().expect("component runtime engine");
@@ -3029,28 +3317,30 @@ mod tests {
         assert_eq!(updates[0].decision, FuelDecision::Exhausted);
     }
 
-    #[test]
-    fn byte_loaded_filesystem_uses_private_empty_root_and_cleans_scratch() {
-        let mut wasi = WasiCtxBuilder::new();
-        let filesystem =
-            configure_process_filesystem(&mut wasi, None).expect("configure byte-loaded roots");
-        let root = filesystem
-            .image_root
+    #[tokio::test]
+    async fn byte_loaded_filesystem_uses_private_empty_root_and_cleans_scratch() {
+        let (scope, owner, finalizer, completion) = cache::FsScope::new();
+        let filesystem = configure_process_filesystem(WasiCtxBuilder::new(), None, scope)
+            .expect("configure byte-loaded roots");
+        let root_path = filesystem
+            .image_root_path
             .as_ref()
             .expect("byte-loaded process owns an empty image root");
         assert!(
-            std::fs::read_dir(root.path())
+            std::fs::read_dir(root_path)
                 .expect("read private root")
                 .next()
                 .is_none(),
             "byte-loaded image root must contain no host or FHS files"
         );
-        let root_path = root.path().to_path_buf();
-        let scratch_path = filesystem.scratch.path().to_path_buf();
+        let root_path = root_path.to_owned();
+        let scratch_path = filesystem.scratch_path;
         assert_ne!(root_path, scratch_path);
         std::fs::write(scratch_path.join("marker"), b"private").expect("write scratch marker");
 
-        drop(filesystem);
+        drop(owner);
+        assert_eq!(finalizer.run().await, Ok(()));
+        assert_eq!(completion.wait().await, Ok(()));
         assert!(!root_path.exists(), "private empty root must be cleaned up");
         assert!(
             !scratch_path.exists(),
@@ -3058,8 +3348,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn image_backed_filesystem_retains_cid_tree_root_and_private_scratch() {
+    #[tokio::test]
+    async fn image_backed_filesystem_retains_cid_tree_root_and_private_scratch() {
         let staging = tempfile::tempdir().expect("image staging");
         let root_cid = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
         let tree = Arc::new(crate::vfs::CidTree::new(
@@ -3067,12 +3357,16 @@ mod tests {
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.path().to_path_buf(),
         ));
-        let mut wasi = WasiCtxBuilder::new();
-        let filesystem = configure_process_filesystem(&mut wasi, Some(&tree))
-            .expect("configure image-backed roots");
+        let (scope, owner, finalizer, completion) = cache::FsScope::new();
+        let filesystem = configure_process_filesystem(
+            WasiCtxBuilder::new(),
+            Some(tree.staging_dir().to_owned()),
+            scope,
+        )
+        .expect("configure image-backed roots");
 
         assert!(
-            filesystem.image_root.is_none(),
+            filesystem.image_root_path.is_none(),
             "image-backed cells must not be replaced by the byte-loaded empty root"
         );
         assert_eq!(
@@ -3080,7 +3374,12 @@ mod tests {
             ipfs::cid_identity::parse_cid(root_cid).unwrap()
         );
         assert_eq!(tree.staging_dir(), staging.path());
-        assert_ne!(filesystem.scratch.path(), tree.staging_dir());
+        assert_ne!(filesystem.scratch_path, tree.staging_dir());
+        let scratch_path = filesystem.scratch_path;
+        drop(owner);
+        assert_eq!(finalizer.run().await, Ok(()));
+        assert_eq!(completion.wait().await, Ok(()));
+        assert!(!scratch_path.exists());
     }
 
     #[tokio::test]

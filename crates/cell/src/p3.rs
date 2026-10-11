@@ -452,6 +452,9 @@ mod tests {
         cache_mode: Option<Arc<CacheMode>>,
         cid_tree: Option<Arc<CidTree>>,
         fs_descriptors: crate::fs_intercept::DescriptorContexts,
+        filesystem_scope: cache::FsScope,
+        _filesystem_owner: cache::FsOwner,
+        _filesystem_finalizer: cache::FsFinalizer,
         _image_root: Option<TempDir>,
         _tree_staging: Option<TempDir>,
         _scratch: TempDir,
@@ -490,6 +493,7 @@ mod tests {
                 table: &mut self.table,
                 cache_mode: &self.cache_mode,
                 cid_tree: &self.cid_tree,
+                filesystem_scope: &self.filesystem_scope,
                 descriptors: &mut self.fs_descriptors,
             }
         }
@@ -514,6 +518,7 @@ mod tests {
         builder
             .preopened_dir(image_root.path(), "/", FsPerms::ReadOnly)?
             .preopened_dir(scratch.path(), "/tmp", FsPerms::ReadWrite)?;
+        let (filesystem_scope, filesystem_owner, filesystem_finalizer, _) = cache::FsScope::new();
         Ok(HarnessState {
             wasi: builder.build(),
             table: ResourceTable::new(),
@@ -525,6 +530,9 @@ mod tests {
             cache_mode: None,
             cid_tree: None,
             fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
+            filesystem_scope,
+            _filesystem_owner: filesystem_owner,
+            _filesystem_finalizer: filesystem_finalizer,
             _image_root: Some(image_root),
             _tree_staging: None,
             _scratch: scratch,
@@ -1200,6 +1208,7 @@ mod tests {
         builder
             .preopened_dir(tree.staging_dir(), "/", FsPerms::ReadOnly)?
             .preopened_dir(scratch.path(), "/tmp", FsPerms::ReadWrite)?;
+        let (filesystem_scope, filesystem_owner, filesystem_finalizer, _) = cache::FsScope::new();
         Ok((
             HarnessState {
                 wasi: builder.build(),
@@ -1212,6 +1221,9 @@ mod tests {
                 cache_mode: Some(cache),
                 cid_tree: Some(tree),
                 fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
+                filesystem_scope,
+                _filesystem_owner: filesystem_owner,
+                _filesystem_finalizer: filesystem_finalizer,
                 _image_root: None,
                 _tree_staging: Some(tree_staging),
                 _scratch: scratch,

@@ -3,6 +3,9 @@ name = "cell"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+test-support = ["cache/test-support"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -33,6 +36,7 @@ cache = { package = "ww-cache", path = "../cache" }
 ipfs = { path = "../ipfs" }
 
 [dev-dependencies]
+cache = { package = "ww-cache", path = "../cache", features = ["test-support"] }
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
