@@ -229,7 +229,7 @@ Wetware signs and verifies IPNS records through the pinned `rust-ipns`
 implementation. Kubo transports the raw protobuf through
 `GET` and `PUT /routing/v1/ipns/{name}`. Kubo does not receive the private key
 and is not the cryptographic authority. The temporary `rust-ipns` git pin is
-commit `02c5ae7bf3f9568c7dbbb1308ae9299cfc7ba2d9`, pending upstream PR #503 or a
+commit `c6770c290e4aa03f5cf6e550f44ac518308b7094`, pending upstream PR #503 or a
 release that contains the reviewed V2-only validation fix.
 
 Publisher and follower state lives below private `~/.ww/ipns/`, outside the

@@ -27,7 +27,7 @@ capnp-rpc = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
 libp2p-core = { workspace = true }
-libp2p-identity = { version = "0.2", features = ["ed25519", "secp256k1"] }
+libp2p-identity = { workspace = true, features = ["ed25519", "secp256k1"] }
 rlp = "0.5"
 auth = { path = "../guest/auth" }
 tokio-test = "0.4"

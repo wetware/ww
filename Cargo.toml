@@ -35,9 +35,10 @@ dirs = "5"
 ed25519-dalek = "2"
 futures = "0.3"
 hex = "0.4"
-libp2p = { version = "0.56.0", default-features = false }
-libp2p-core = "0.43"
-libp2p-stream = "0.4.0-alpha"
+libp2p = { version = "0.57.0", default-features = false }
+libp2p-core = "0.44.0"
+libp2p-identity = "0.3.0"
+libp2p-stream = "0.5.0-alpha"
 log = "0.4"
 rand = "0.9.2"
 reqwest = { version = "0.12.24", default-features = false }
@@ -60,7 +61,6 @@ edition = "2021"
 
 [dependencies]
 # Dependencies needed for both host and guest
-multiaddr = "0.18.2"
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 base64 = "0.22.1"
@@ -82,7 +82,6 @@ blake3 = { workspace = true }
 # Host-only dependencies (not needed for WASM guests)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libp2p = { workspace = true, features = ["tokio", "tcp", "noise", "yamux", "macros", "identify", "rsa", "request-response", "ed25519", "kad", "autonat", "relay", "dcutr", "quic"] }
-libp2p-core = { workspace = true }
 ipfs = { path = "crates/ipfs" }
 clap = { version = "4.5.51", features = ["derive", "env"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
@@ -97,7 +96,7 @@ async-trait = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls", "json"] }
 # Temporary exact pin for V2-only record verification. Remove after
 # https://github.com/dariusc93/rust-ipfs/pull/503 ships in a rust-ipns release.
-rust-ipns = { git = "https://github.com/wetware/rust-ipfs", rev = "02c5ae7bf3f9568c7dbbb1308ae9299cfc7ba2d9", default-features = false, features = ["ed25519", "rsa"] }
+rust-ipns = { git = "https://github.com/wetware/rust-ipfs", rev = "c6770c290e4aa03f5cf6e550f44ac518308b7094", default-features = false, features = ["ed25519", "rsa"] }
 cache = { package = "ww-cache", path = "crates/cache" }
 cell = { path = "crates/cell" }
 rpc = { path = "crates/rpc" }

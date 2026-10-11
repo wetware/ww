@@ -17,7 +17,7 @@ cid = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 hex = { workspace = true }
 libp2p-core = { workspace = true }
-libp2p-identity = { version = "0.2", features = ["ed25519"] }
+libp2p-identity = { workspace = true, features = ["ed25519"] }
 rand = "0.8"
 auth = { path = "../guest/auth" }
 call-guard = { package = "wetware-membrane", path = "../membrane" }
