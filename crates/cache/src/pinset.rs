@@ -139,10 +139,20 @@ static MATERIALIZATION_SEQ: AtomicU64 = AtomicU64::new(1);
 struct MaterializationGuard {
     temporary_path: std::path::PathBuf,
     committed: bool,
+    #[cfg(test)]
+    cleanup_hook: Option<tests::MaterializationCleanupHook>,
+}
+
+enum MaterializationCommit {
+    Published,
+    Existing,
 }
 
 impl MaterializationGuard {
-    fn new(destination: &Path) -> Result<Self> {
+    fn new(
+        destination: &Path,
+        #[cfg(test)] cleanup_hook: Option<tests::MaterializationCleanupHook>,
+    ) -> Result<Self> {
         let parent = destination
             .parent()
             .ok_or_else(|| anyhow::anyhow!("materialization destination has no parent"))?;
@@ -155,29 +165,42 @@ impl MaterializationGuard {
         Ok(Self {
             temporary_path: parent.join(format!(".{name}.ww-part-{seq}")),
             committed: false,
+            #[cfg(test)]
+            cleanup_hook,
         })
     }
 
-    fn commit(mut self, destination: &Path) -> Result<()> {
+    fn commit(&mut self, destination: &Path) -> Result<MaterializationCommit> {
         if destination.exists() {
-            remove_materialized_path(&self.temporary_path)?;
-        } else {
-            std::fs::rename(&self.temporary_path, destination).with_context(|| {
-                format!(
-                    "failed to commit CAS materialization to {}",
-                    destination.display()
-                )
-            })?;
+            return Ok(MaterializationCommit::Existing);
         }
+        std::fs::rename(&self.temporary_path, destination).with_context(|| {
+            format!(
+                "failed to commit CAS materialization to {}",
+                destination.display()
+            )
+        })?;
         self.committed = true;
-        Ok(())
+        Ok(MaterializationCommit::Published)
     }
 
-    fn cleanup(mut self) -> io::Result<()> {
+    fn cleanup(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.cleanup_hook.as_mut() {
+            hook(&self.temporary_path)?;
+        }
         let result = remove_materialized_path(&self.temporary_path);
         self.committed = result.is_ok();
         result
     }
+}
+
+fn cleanup_materialization_slot(slot: &mut Option<MaterializationGuard>) -> io::Result<()> {
+    let result = slot.as_mut().map_or(Ok(()), MaterializationGuard::cleanup);
+    if result.is_ok() {
+        slot.take();
+    }
+    result
 }
 
 impl Drop for MaterializationGuard {
@@ -209,19 +232,22 @@ async fn fetch_to_path_atomically(
     let destination = destination.to_owned();
     let setup_destination = destination.clone();
     let setup_scope = filesystem_scope.clone();
+    #[cfg(test)]
+    let cleanup_hook = tests::take_materialization_cleanup_hook();
     let guard = filesystem_scope
         .run_blocking(crate::FilesystemOperation::FileStage, move || {
             let guard = Arc::new(std::sync::Mutex::new(Some(MaterializationGuard::new(
                 &setup_destination,
+                #[cfg(test)]
+                cleanup_hook,
             )?)));
             let cleanup_guard = Arc::clone(&guard);
             setup_scope
                 .own_cleanup(crate::FilesystemOperation::FileStage, move || {
-                    let guard = cleanup_guard
+                    let mut guard = cleanup_guard
                         .lock()
-                        .expect("materialization cleanup lock poisoned")
-                        .take();
-                    guard.map_or(Ok(()), MaterializationGuard::cleanup)
+                        .expect("materialization cleanup lock poisoned");
+                    cleanup_materialization_slot(&mut guard)
                 })
                 .map_err(anyhow::Error::from)?;
             Ok::<_, anyhow::Error>(guard)
@@ -246,11 +272,10 @@ async fn fetch_to_path_atomically(
         let cleanup_guard = Arc::clone(&guard);
         let cleanup = filesystem_scope
             .run_blocking(crate::FilesystemOperation::FileStage, move || {
-                cleanup_guard
+                let mut guard = cleanup_guard
                     .lock()
-                    .expect("materialization guard lock poisoned")
-                    .take()
-                    .map_or(Ok(()), MaterializationGuard::cleanup)
+                    .expect("materialization guard lock poisoned");
+                cleanup_materialization_slot(&mut guard)
             })
             .await?;
         if let Err(cleanup_error) = cleanup {
@@ -258,14 +283,34 @@ async fn fetch_to_path_atomically(
         }
         return Err(error);
     }
+    let commit_scope = filesystem_scope.clone();
     filesystem_scope
         .run_blocking(crate::FilesystemOperation::FileStage, move || {
-            let guard = guard
-                .lock()
-                .expect("materialization guard lock poisoned")
-                .take()
-                .expect("materialization guard already consumed");
-            guard.commit(&destination)
+            let mut guard = guard.lock().expect("materialization guard lock poisoned");
+            let commit = guard
+                .as_mut()
+                .expect("materialization guard already consumed")
+                .commit(&destination);
+            match commit {
+                Ok(MaterializationCommit::Published) => {
+                    guard.take();
+                    Ok(())
+                }
+                Ok(MaterializationCommit::Existing) => {
+                    if let Err(error) = cleanup_materialization_slot(&mut guard) {
+                        let error = anyhow::Error::from(error);
+                        commit_scope.record_cleanup_failure(&error);
+                        return Err(error);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    if let Err(cleanup_error) = cleanup_materialization_slot(&mut guard) {
+                        commit_scope.record_cleanup_failure(cleanup_error);
+                    }
+                    Err(error)
+                }
+            }
         })
         .await??;
     Ok(())
@@ -841,6 +886,34 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    pub(super) type MaterializationCleanupHook = Box<dyn FnMut(&Path) -> io::Result<()> + Send>;
+    thread_local! {
+        static MATERIALIZATION_CLEANUP_HOOK: std::cell::RefCell<Option<MaterializationCleanupHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn take_materialization_cleanup_hook() -> Option<MaterializationCleanupHook> {
+        MATERIALIZATION_CLEANUP_HOOK.with_borrow_mut(Option::take)
+    }
+
+    struct MaterializationCleanupHookGuard;
+
+    impl MaterializationCleanupHookGuard {
+        fn install(hook: impl FnMut(&Path) -> io::Result<()> + Send + 'static) -> Self {
+            MATERIALIZATION_CLEANUP_HOOK.with_borrow_mut(|slot| {
+                assert!(slot.is_none());
+                *slot = Some(Box::new(hook));
+            });
+            Self
+        }
+    }
+
+    impl Drop for MaterializationCleanupHookGuard {
+        fn drop(&mut self) {
+            MATERIALIZATION_CLEANUP_HOOK.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
     fn test_cid(n: u8) -> Cid {
         let mh = cid::multihash::Multihash::wrap(0x00, &[n]).unwrap();
         Cid::new_v1(0x55, mh)
@@ -1012,6 +1085,62 @@ mod tests {
         started: Notify,
         release: Notify,
         finished: AtomicBool,
+    }
+
+    struct ExistingWinnerPinner {
+        destination: std::path::PathBuf,
+    }
+
+    struct MissingTemporaryPinner;
+
+    #[async_trait::async_trait]
+    impl Pinner for ExistingWinnerPinner {
+        async fn pin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn unpin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(&self, _cid: &Cid) -> Result<Vec<u8>> {
+            anyhow::bail!("streaming path expected")
+        }
+
+        async fn fetch_to_path(&self, _cid: &Cid, dst: &Path) -> Result<()> {
+            std::fs::write(dst, b"loser")?;
+            std::fs::write(&self.destination, b"winner")?;
+            Ok(())
+        }
+
+        async fn size(&self, _cid: &Cid) -> Result<u64> {
+            Ok(6)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Pinner for MissingTemporaryPinner {
+        async fn pin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn unpin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(&self, _cid: &Cid) -> Result<Vec<u8>> {
+            anyhow::bail!("streaming path expected")
+        }
+
+        async fn fetch_to_path(&self, _cid: &Cid, dst: &Path) -> Result<()> {
+            std::fs::write(dst, b"temporary")?;
+            std::fs::remove_file(dst)?;
+            Ok(())
+        }
+
+        async fn size(&self, _cid: &Cid) -> Result<u64> {
+            Ok(9)
+        }
     }
 
     #[async_trait::async_trait]
@@ -1303,6 +1432,71 @@ mod tests {
             state.arc.contains(&cid),
             "the successfully committed bounded cache pin remains an intentional cache effect"
         );
+    }
+
+    #[tokio::test]
+    async fn commit_cleanup_failure_poisons_completion_and_preserves_winner() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let destination = staging.path().join("winner");
+        let pinner = Arc::new(ExistingWinnerPinner {
+            destination: destination.clone(),
+        });
+        let cid = test_cid(13);
+        let first_cleanup = Arc::new(AtomicBool::new(true));
+        let first_cleanup_in_hook = Arc::clone(&first_cleanup);
+        let _hook = MaterializationCleanupHookGuard::install(move |_| {
+            if first_cleanup_in_hook.swap(false, Ordering::SeqCst) {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected cleanup failure",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        let (scope, owner, finalizer, completion) = crate::FsScope::new();
+        let finalizer_task = tokio::spawn(finalizer.run());
+
+        let result = fetch_to_path_owned(&scope, pinner, cid, None, destination.clone()).await;
+        assert!(
+            result.is_err(),
+            "loser cleanup failure must reach its caller"
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"winner");
+        drop(owner);
+
+        let error = completion
+            .wait()
+            .await
+            .expect_err("commit cleanup failure must poison filesystem completion");
+        assert!(error.to_string().contains("cleanup failed"));
+        assert!(finalizer_task.await.unwrap().is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"winner");
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn commit_error_with_successful_cleanup_does_not_poison_completion() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let destination = staging.path().join("destination");
+        let (scope, owner, finalizer, completion) = crate::FsScope::new();
+        let finalizer_task = tokio::spawn(finalizer.run());
+
+        let result = fetch_to_path_owned(
+            &scope,
+            Arc::new(MissingTemporaryPinner),
+            test_cid(14),
+            None,
+            destination.clone(),
+        )
+        .await;
+        assert!(result.is_err(), "missing staged data must fail publication");
+        drop(owner);
+
+        completion.wait().await.unwrap();
+        finalizer_task.await.unwrap().unwrap();
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

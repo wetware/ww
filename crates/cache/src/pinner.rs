@@ -46,8 +46,7 @@ pub trait Pinner: Send + Sync {
 
     /// Stream CID subpath content directly into `dst`.
     ///
-    /// Default implementation falls back to `fetch_path()` and writes bytes
-    /// synchronously.
+    /// Default implementation falls back to `fetch_path()` and Tokio filesystem I/O.
     async fn fetch_path_to_path(&self, cid: &Cid, subpath: &str, dst: &Path) -> Result<()> {
         let bytes = self.fetch_path(cid, subpath).await?;
         if let Some(parent) = dst.parent() {

@@ -390,18 +390,20 @@ async fn materialize_resolved_descriptor(
                 let publish_path = staging_dir.clone();
                 #[cfg(test)]
                 let build_hook = tests::take_directory_build_hook();
-                #[cfg(any(test, feature = "test-support"))]
-                let event_scope = filesystem_scope.clone();
+                #[cfg(test)]
+                let cleanup_hook = tests::take_directory_cleanup_hook();
+                let build_scope = filesystem_scope.clone();
                 filesystem_scope
                     .run_blocking(cache::FilesystemOperation::DirectoryBuild, move || {
                         build_directory(
                             staging_root,
                             publish_path,
                             entries,
+                            build_scope,
                             #[cfg(test)]
                             build_hook,
-                            #[cfg(any(test, feature = "test-support"))]
-                            event_scope,
+                            #[cfg(test)]
+                            cleanup_hook,
                         )
                     })
                     .await
@@ -421,52 +423,70 @@ fn build_directory(
     staging_root: std::path::PathBuf,
     staging_dir: std::path::PathBuf,
     entries: Vec<crate::vfs::DirEntry>,
+    filesystem_scope: cache::FsScope,
     #[cfg(test)] mut build_hook: Option<tests::DirectoryBuildHook>,
-    #[cfg(any(test, feature = "test-support"))] event_scope: cache::FsScope,
+    #[cfg(test)] mut cleanup_hook: Option<tests::DirectoryCleanupHook>,
 ) -> Result<(), MaterializeError> {
     std::fs::create_dir_all(&staging_root).map_err(|_| MaterializeError::Io)?;
     let temporary = tempfile::Builder::new()
         .prefix(".cid-dir-")
         .tempdir_in(&staging_root)
         .map_err(|_| MaterializeError::Io)?;
-    for entry in entries {
-        if !is_confined_relative_path(&entry.name)
-            || std::path::Path::new(&entry.name).components().count() != 1
-        {
-            tracing::warn!(name = %entry.name, "rejected unconfined CidTree entry");
-            return Err(MaterializeError::Invalid);
-        }
-        let entry_path = temporary.path().join(&entry.name);
-        match entry.entry_type {
-            crate::vfs::EntryType::Dir => {
-                std::fs::create_dir_all(entry_path).map_err(|_| MaterializeError::Io)?;
+    let populate = (|| {
+        for entry in entries {
+            if !is_confined_relative_path(&entry.name)
+                || std::path::Path::new(&entry.name).components().count() != 1
+            {
+                tracing::warn!(name = %entry.name, "rejected unconfined CidTree entry");
+                return Err(MaterializeError::Invalid);
             }
-            _ => {
-                let file = std::fs::File::create(entry_path).map_err(|_| MaterializeError::Io)?;
-                file.set_len(entry.size).map_err(|_| MaterializeError::Io)?;
+            let entry_path = temporary.path().join(&entry.name);
+            match entry.entry_type {
+                crate::vfs::EntryType::Dir => {
+                    std::fs::create_dir_all(entry_path).map_err(|_| MaterializeError::Io)?;
+                }
+                _ => {
+                    let file =
+                        std::fs::File::create(entry_path).map_err(|_| MaterializeError::Io)?;
+                    file.set_len(entry.size).map_err(|_| MaterializeError::Io)?;
+                }
             }
+            #[cfg(test)]
+            tests::directory_build_hook(
+                &mut build_hook,
+                temporary.path(),
+                tests::BuildStage::Entry,
+            )?;
+            #[cfg(any(test, feature = "test-support"))]
+            filesystem_scope.test_event(
+                cache::FilesystemOperation::DirectoryBuild,
+                cache::FsTestStage::DirectoryEntry,
+                Some(temporary.path().to_owned()),
+            );
         }
         #[cfg(test)]
-        tests::directory_build_hook(&mut build_hook, temporary.path(), tests::BuildStage::Entry)?;
+        tests::directory_build_hook(
+            &mut build_hook,
+            temporary.path(),
+            tests::BuildStage::BeforePublish,
+        )?;
         #[cfg(any(test, feature = "test-support"))]
-        event_scope.test_event(
+        filesystem_scope.test_event(
             cache::FilesystemOperation::DirectoryBuild,
-            cache::FsTestStage::DirectoryEntry,
+            cache::FsTestStage::BeforePublish,
             Some(temporary.path().to_owned()),
         );
+        Ok(())
+    })();
+    if let Err(error) = populate {
+        cleanup_temporary_directory(
+            &filesystem_scope,
+            temporary,
+            #[cfg(test)]
+            &mut cleanup_hook,
+        );
+        return Err(error);
     }
-    #[cfg(test)]
-    tests::directory_build_hook(
-        &mut build_hook,
-        temporary.path(),
-        tests::BuildStage::BeforePublish,
-    )?;
-    #[cfg(any(test, feature = "test-support"))]
-    event_scope.test_event(
-        cache::FilesystemOperation::DirectoryBuild,
-        cache::FsTestStage::BeforePublish,
-        Some(temporary.path().to_owned()),
-    );
 
     use rustix::fs::{renameat_with, RenameFlags, CWD};
     match renameat_with(
@@ -485,16 +505,52 @@ fn build_directory(
                 tests::BuildStage::Published,
             )?;
             #[cfg(any(test, feature = "test-support"))]
-            event_scope.test_event(
+            filesystem_scope.test_event(
                 cache::FilesystemOperation::DirectoryBuild,
                 cache::FsTestStage::Published,
                 Some(_former_path.clone()),
             );
         }
-        Err(rustix::io::Errno::EXIST) if staging_dir.is_dir() => {}
-        Err(_) => return Err(MaterializeError::Io),
+        Err(rustix::io::Errno::EXIST) if staging_dir.is_dir() => {
+            cleanup_temporary_directory(
+                &filesystem_scope,
+                temporary,
+                #[cfg(test)]
+                &mut cleanup_hook,
+            );
+        }
+        Err(_) => {
+            cleanup_temporary_directory(
+                &filesystem_scope,
+                temporary,
+                #[cfg(test)]
+                &mut cleanup_hook,
+            );
+            return Err(MaterializeError::Io);
+        }
     }
     Ok(())
+}
+
+fn cleanup_temporary_directory(
+    filesystem_scope: &cache::FsScope,
+    temporary: tempfile::TempDir,
+    #[cfg(test)] cleanup_hook: &mut Option<tests::DirectoryCleanupHook>,
+) {
+    let temporary_path = temporary.path().to_owned();
+    #[cfg(test)]
+    if let Err(error) = tests::directory_cleanup_hook(cleanup_hook, &temporary_path) {
+        filesystem_scope.record_cleanup_failure(format!(
+            "failed to remove temporary CidTree directory {}: injected {error:?}",
+            temporary_path.display()
+        ));
+    }
+    if let Err(error) = temporary.close() {
+        filesystem_scope.record_cleanup_failure(format!(
+            "failed to remove temporary CidTree directory {}: {error}",
+            temporary_path.display()
+        ));
+    }
 }
 
 async fn materialize_ipfs_descriptor_in(
@@ -1114,10 +1170,21 @@ mod tests {
             const { std::cell::RefCell::new(None) };
     }
 
+    pub(super) type DirectoryCleanupHook =
+        Box<dyn FnMut(&std::path::Path) -> Result<(), MaterializeError> + Send>;
+    thread_local! {
+        static DIRECTORY_CLEANUP_HOOK: std::cell::RefCell<Option<DirectoryCleanupHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     // Materialization performs no awaits between tempdir creation and publish.
     // Tests install hooks only on dedicated threads or current-thread runtimes.
     pub(super) fn take_directory_build_hook() -> Option<DirectoryBuildHook> {
         DIRECTORY_BUILD_HOOK.with_borrow_mut(Option::take)
+    }
+
+    pub(super) fn take_directory_cleanup_hook() -> Option<DirectoryCleanupHook> {
+        DIRECTORY_CLEANUP_HOOK.with_borrow_mut(Option::take)
     }
 
     pub(super) fn directory_build_hook(
@@ -1127,6 +1194,16 @@ mod tests {
     ) -> Result<(), MaterializeError> {
         match hook {
             Some(hook) => hook(path, stage),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn directory_cleanup_hook(
+        hook: &mut Option<DirectoryCleanupHook>,
+        path: &std::path::Path,
+    ) -> Result<(), MaterializeError> {
+        match hook {
+            Some(hook) => hook(path),
             None => Ok(()),
         }
     }
@@ -1426,6 +1503,26 @@ mod tests {
         }
     }
 
+    struct CleanupHookGuard;
+
+    impl CleanupHookGuard {
+        fn install(
+            hook: impl FnMut(&std::path::Path) -> Result<(), MaterializeError> + Send + 'static,
+        ) -> Self {
+            DIRECTORY_CLEANUP_HOOK.with_borrow_mut(|slot| {
+                assert!(slot.is_none());
+                *slot = Some(Box::new(hook));
+            });
+            Self
+        }
+    }
+
+    impl Drop for CleanupHookGuard {
+        fn drop(&mut self) {
+            DIRECTORY_CLEANUP_HOOK.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
     fn directory_entries() -> Vec<crate::vfs::DirEntry> {
         vec![
             crate::vfs::DirEntry {
@@ -1570,6 +1667,45 @@ mod tests {
             .await
             .unwrap();
         assert_complete_directory(&final_path, false);
+    }
+
+    #[tokio::test]
+    async fn cid_tree_loser_cleanup_failure_poisons_completion_and_preserves_winner() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let tree = cached_directory_tree(staging.path(), &directory_entries());
+        let final_path = staging.path().join(format!("dir-{DIRECTORY_CID}"));
+        let temporary_path = Arc::new(std::sync::Mutex::new(None));
+        let temporary_in_hook = Arc::clone(&temporary_path);
+        let winner_in_hook = final_path.clone();
+        let _build_hook = BuildHookGuard::install(move |temporary, stage| {
+            if stage == BuildStage::BeforePublish {
+                *temporary_in_hook.lock().unwrap() = Some(temporary.to_owned());
+                std::fs::create_dir(&winner_in_hook).unwrap();
+                std::fs::write(winner_in_hook.join("winner"), b"winner").unwrap();
+            }
+            Ok(())
+        });
+        let _cleanup_hook = CleanupHookGuard::install(|_| Err(MaterializeError::Io));
+        let (scope, owner, finalizer, completion) = cache::FsScope::new();
+        let finalizer_task = tokio::spawn(finalizer.run());
+
+        let descriptor = materialize_cid_tree_descriptor_in(&scope, None, &tree, "", false)
+            .await
+            .unwrap();
+        let wasmtime_wasi::filesystem::Descriptor::Dir(_) = descriptor else {
+            panic!("expected the competing winner directory");
+        };
+        assert_eq!(std::fs::read(final_path.join("winner")).unwrap(), b"winner");
+
+        drop(owner);
+        let error = completion
+            .wait()
+            .await
+            .expect_err("loser cleanup failure must poison filesystem completion");
+        assert!(error.to_string().contains("cleanup failed"));
+        assert!(finalizer_task.await.unwrap().is_err());
+        assert_eq!(std::fs::read(final_path.join("winner")).unwrap(), b"winner");
+        assert!(!temporary_path.lock().unwrap().as_ref().unwrap().exists());
     }
 
     // Both independent trees reach partial construction and completed private
