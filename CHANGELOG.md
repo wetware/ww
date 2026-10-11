@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **Dialed streams now propagate clean peer EOF to guest reads.** The guest
+  retains a usable write direction after the peer half-closes its output.
 - **Finite WAGI responses now complete at the P3 stdout flush boundary.**
   Counter, snap, oracle HTTP, and status handlers await acknowledged output.
   Closed writers, final flush failures, and write failures after partial

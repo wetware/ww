@@ -11,7 +11,7 @@ use capnp_rpc::pry;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use libp2p::PeerId;
 use std::time::Duration;
-use tokio::io;
+use tokio::io::{self, AsyncWriteExt};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
 use authority::system_capnp;
@@ -31,8 +31,13 @@ where
     let (mut host_read, mut host_write) = io::split(host_side);
 
     let inbound = tokio::task::spawn_local(async move {
-        if let Err(error) = io::copy(&mut stream_read.compat(), &mut host_write).await {
-            tracing::debug!("stream→host pump error: {error}");
+        match io::copy(&mut stream_read.compat(), &mut host_write).await {
+            Ok(_) => {
+                if let Err(error) = host_write.shutdown().await {
+                    tracing::debug!("stream→host shutdown error: {error}");
+                }
+            }
+            Err(error) => tracing::debug!("stream→host pump error: {error}"),
         }
     });
 
@@ -130,22 +135,54 @@ mod tests {
     use std::sync::Arc;
     use std::task::{Context, Poll};
     use tokio::io::AsyncReadExt as _;
+    use tokio::sync::oneshot;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     struct DropTracked<T> {
         inner: T,
         dropped: Arc<AtomicBool>,
+        notification: Option<oneshot::Sender<()>>,
     }
 
     impl<T> DropTracked<T> {
-        fn new(inner: T, dropped: Arc<AtomicBool>) -> Self {
-            Self { inner, dropped }
+        fn new(inner: T) -> (Self, DropMonitor) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let (notification, receiver) = oneshot::channel();
+            (
+                Self {
+                    inner,
+                    dropped: dropped.clone(),
+                    notification: Some(notification),
+                },
+                DropMonitor { dropped, receiver },
+            )
         }
     }
 
     impl<T> Drop for DropTracked<T> {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::SeqCst);
+            if let Some(notification) = self.notification.take() {
+                let _ = notification.send(());
+            }
+        }
+    }
+
+    struct DropMonitor {
+        dropped: Arc<AtomicBool>,
+        receiver: oneshot::Receiver<()>,
+    }
+
+    impl DropMonitor {
+        fn is_dropped(&self) -> bool {
+            self.dropped.load(Ordering::SeqCst)
+        }
+
+        async fn wait(&mut self) {
+            (&mut self.receiver)
+                .await
+                .expect("drop notification sender disappeared");
+            assert!(self.is_dropped());
         }
     }
 
@@ -182,39 +219,128 @@ mod tests {
     ) -> (
         system_capnp::byte_stream::Client,
         io::DuplexStream,
-        Arc<AtomicBool>,
-        Arc<AtomicBool>,
+        DropMonitor,
+        DropMonitor,
     ) {
         let (network_side, network_peer) = io::duplex(capacity);
         let (network_read, network_write) = io::split(network_side);
-        let read_dropped = Arc::new(AtomicBool::new(false));
-        let write_dropped = Arc::new(AtomicBool::new(false));
-        let stream = dialed_byte_stream(
-            DropTracked::new(network_read.compat(), read_dropped.clone()),
-            DropTracked::new(network_write.compat_write(), write_dropped.clone()),
-        );
+        let (network_read, read_drop) = DropTracked::new(network_read.compat());
+        let (network_write, write_drop) = DropTracked::new(network_write.compat_write());
+        let stream = dialed_byte_stream(network_read, network_write);
         (
             capnp_rpc::new_client(stream),
             network_peer,
-            read_dropped,
-            write_dropped,
+            read_drop,
+            write_drop,
         )
+    }
+
+    #[tokio::test]
+    async fn peer_half_close_reaches_guest_eof() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (client, mut network_peer, mut read_drop, _write_drop) =
+                    tracked_dialer_stream(64);
+                network_peer.write_all(b"request").await.unwrap();
+                network_peer.shutdown().await.unwrap();
+                read_drop.wait().await;
+
+                let mut request = client.read_request();
+                request.get().set_max_bytes(7);
+                let response = request.send().promise.await.unwrap();
+                assert_eq!(response.get().unwrap().get_data().unwrap(), b"request");
+
+                let mut request = client.read_request();
+                request.get().set_max_bytes(1);
+                let read = request.send().promise;
+                tokio::pin!(read);
+                let response = match futures::poll!(read.as_mut()) {
+                    Poll::Ready(result) => result.expect("guest EOF read failed"),
+                    Poll::Pending => panic!("guest read remained pending after peer EOF"),
+                };
+                assert!(response.get().unwrap().get_data().unwrap().is_empty());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn peer_half_close_preserves_guest_output() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (client, mut network_peer, mut read_drop, mut write_drop) =
+                    tracked_dialer_stream(64);
+                network_peer.shutdown().await.unwrap();
+                read_drop.wait().await;
+
+                let mut request = client.read_request();
+                request.get().set_max_bytes(1);
+                let response = request.send().promise.await.unwrap();
+                assert!(response.get().unwrap().get_data().unwrap().is_empty());
+                assert!(!write_drop.is_dropped());
+
+                let mut request = client.write_request();
+                request.get().set_data(b"response");
+                request.send().promise.await.unwrap();
+                let mut response = [0u8; 8];
+                {
+                    let receive = network_peer.read_exact(&mut response);
+                    tokio::pin!(receive);
+                    tokio::select! {
+                        result = &mut receive => {
+                            result.unwrap();
+                        }
+                        () = write_drop.wait() => {
+                            panic!("outbound pump dropped before peer received response")
+                        }
+                    }
+                }
+                assert_eq!(&response, b"response");
+                assert!(!write_drop.is_dropped());
+
+                client.close_request().send().promise.await.unwrap();
+                write_drop.wait().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn idle_guest_output_remains_live_after_peer_eof() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (client, mut network_peer, mut read_drop, mut write_drop) =
+                    tracked_dialer_stream(1);
+                network_peer.shutdown().await.unwrap();
+                read_drop.wait().await;
+
+                let mut request = client.read_request();
+                request.get().set_max_bytes(1);
+                let response = request.send().promise.await.unwrap();
+                assert!(response.get().unwrap().get_data().unwrap().is_empty());
+                assert!(!write_drop.is_dropped());
+
+                client.close_request().send().promise.await.unwrap();
+                write_drop.wait().await;
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn close_cancels_pumps_blocked_on_network_input() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (client, _network_peer, read_dropped, write_dropped) = tracked_dialer_stream(1);
-                tokio::task::yield_now().await;
-                assert!(!read_dropped.load(Ordering::SeqCst));
-                assert!(!write_dropped.load(Ordering::SeqCst));
+                let (client, mut network_peer, mut read_drop, mut write_drop) =
+                    tracked_dialer_stream(1);
+                network_peer.write_all(b"x").await.unwrap();
+                let mut request = client.read_request();
+                request.get().set_max_bytes(1);
+                let response = request.send().promise.await.unwrap();
+                assert_eq!(response.get().unwrap().get_data().unwrap(), b"x");
+                assert!(!read_drop.is_dropped());
+                assert!(!write_drop.is_dropped());
 
                 client.close_request().send().promise.await.unwrap();
-                tokio::task::yield_now().await;
-
-                assert!(read_dropped.load(Ordering::SeqCst));
-                assert!(write_dropped.load(Ordering::SeqCst));
+                read_drop.wait().await;
+                write_drop.wait().await;
             })
             .await;
     }
@@ -223,7 +349,7 @@ mod tests {
     async fn close_cancels_pump_blocked_on_network_output() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (client, mut network_peer, read_dropped, write_dropped) =
+                let (client, mut network_peer, mut read_drop, mut write_drop) =
                     tracked_dialer_stream(1);
                 let mut request = client.write_request();
                 let payload = vec![b'x'; DIAL_BUFFER_BYTES];
@@ -232,15 +358,12 @@ mod tests {
 
                 let mut accepted = [0u8; 1];
                 network_peer.read_exact(&mut accepted).await.unwrap();
-                tokio::task::yield_now().await;
                 assert_eq!(accepted, [b'x']);
-                assert!(!write_dropped.load(Ordering::SeqCst));
+                assert!(!write_drop.is_dropped());
 
                 client.close_request().send().promise.await.unwrap();
-                tokio::task::yield_now().await;
-
-                assert!(read_dropped.load(Ordering::SeqCst));
-                assert!(write_dropped.load(Ordering::SeqCst));
+                read_drop.wait().await;
+                write_drop.wait().await;
             })
             .await;
     }
@@ -249,14 +372,17 @@ mod tests {
     async fn dropping_byte_stream_server_cancels_both_pumps() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (client, _network_peer, read_dropped, write_dropped) = tracked_dialer_stream(1);
-                tokio::task::yield_now().await;
+                let (client, mut network_peer, mut read_drop, mut write_drop) =
+                    tracked_dialer_stream(1);
+                network_peer.write_all(b"x").await.unwrap();
+                let mut request = client.read_request();
+                request.get().set_max_bytes(1);
+                let response = request.send().promise.await.unwrap();
+                assert_eq!(response.get().unwrap().get_data().unwrap(), b"x");
 
                 drop(client);
-                tokio::task::yield_now().await;
-
-                assert!(read_dropped.load(Ordering::SeqCst));
-                assert!(write_dropped.load(Ordering::SeqCst));
+                read_drop.wait().await;
+                write_drop.wait().await;
             })
             .await;
     }
