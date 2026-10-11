@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -138,10 +139,20 @@ static MATERIALIZATION_SEQ: AtomicU64 = AtomicU64::new(1);
 struct MaterializationGuard {
     temporary_path: std::path::PathBuf,
     committed: bool,
+    #[cfg(test)]
+    cleanup_hook: Option<tests::MaterializationCleanupHook>,
+}
+
+enum MaterializationCommit {
+    Published,
+    Existing,
 }
 
 impl MaterializationGuard {
-    fn new(destination: &Path) -> Result<Self> {
+    fn new(
+        destination: &Path,
+        #[cfg(test)] cleanup_hook: Option<tests::MaterializationCleanupHook>,
+    ) -> Result<Self> {
         let parent = destination
             .parent()
             .ok_or_else(|| anyhow::anyhow!("materialization destination has no parent"))?;
@@ -154,57 +165,194 @@ impl MaterializationGuard {
         Ok(Self {
             temporary_path: parent.join(format!(".{name}.ww-part-{seq}")),
             committed: false,
+            #[cfg(test)]
+            cleanup_hook,
         })
     }
 
-    fn commit(mut self, destination: &Path) -> Result<()> {
+    fn commit(&mut self, destination: &Path) -> Result<MaterializationCommit> {
         if destination.exists() {
-            remove_materialized_path(&self.temporary_path);
-        } else {
-            std::fs::rename(&self.temporary_path, destination).with_context(|| {
-                format!(
-                    "failed to commit CAS materialization to {}",
-                    destination.display()
-                )
-            })?;
+            return Ok(MaterializationCommit::Existing);
         }
+        std::fs::rename(&self.temporary_path, destination).with_context(|| {
+            format!(
+                "failed to commit CAS materialization to {}",
+                destination.display()
+            )
+        })?;
         self.committed = true;
-        Ok(())
+        Ok(MaterializationCommit::Published)
     }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.cleanup_hook.as_mut() {
+            hook(&self.temporary_path)?;
+        }
+        let result = remove_materialized_path(&self.temporary_path);
+        self.committed = result.is_ok();
+        result
+    }
+}
+
+fn cleanup_materialization_slot(slot: &mut Option<MaterializationGuard>) -> io::Result<()> {
+    let result = slot.as_mut().map_or(Ok(()), MaterializationGuard::cleanup);
+    if result.is_ok() {
+        slot.take();
+    }
+    result
 }
 
 impl Drop for MaterializationGuard {
     fn drop(&mut self) {
         if !self.committed {
-            remove_materialized_path(&self.temporary_path);
+            let _ = remove_materialized_path(&self.temporary_path);
         }
     }
 }
 
-fn remove_materialized_path(path: &Path) {
+fn remove_materialized_path(path: &Path) -> io::Result<()> {
     if path.is_dir() {
-        let _ = std::fs::remove_dir_all(path);
+        std::fs::remove_dir_all(path)
     } else {
-        let _ = std::fs::remove_file(path);
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
     }
 }
 
 async fn fetch_to_path_atomically(
+    filesystem_scope: &crate::FsScope,
     pinner: &dyn Pinner,
     cid: &Cid,
     subpath: Option<&str>,
     destination: &Path,
 ) -> Result<()> {
-    let guard = MaterializationGuard::new(destination)?;
-    match subpath {
+    let destination = destination.to_owned();
+    let setup_destination = destination.clone();
+    let setup_scope = filesystem_scope.clone();
+    #[cfg(test)]
+    let cleanup_hook = tests::take_materialization_cleanup_hook();
+    let guard = filesystem_scope
+        .run_blocking(crate::FilesystemOperation::FileStage, move || {
+            let guard = Arc::new(std::sync::Mutex::new(Some(MaterializationGuard::new(
+                &setup_destination,
+                #[cfg(test)]
+                cleanup_hook,
+            )?)));
+            let cleanup_guard = Arc::clone(&guard);
+            setup_scope
+                .own_cleanup(crate::FilesystemOperation::FileStage, move || {
+                    let mut guard = cleanup_guard
+                        .lock()
+                        .expect("materialization cleanup lock poisoned");
+                    cleanup_materialization_slot(&mut guard)
+                })
+                .map_err(anyhow::Error::from)?;
+            Ok::<_, anyhow::Error>(guard)
+        })
+        .await??;
+    let temporary_path = guard
+        .lock()
+        .expect("materialization guard lock poisoned")
+        .as_ref()
+        .expect("materialization guard already consumed")
+        .temporary_path
+        .clone();
+    let fetch_result = match subpath {
         Some(subpath) => {
             pinner
-                .fetch_path_to_path(cid, subpath, &guard.temporary_path)
-                .await?
+                .fetch_path_to_path(cid, subpath, &temporary_path)
+                .await
         }
-        None => pinner.fetch_to_path(cid, &guard.temporary_path).await?,
+        None => pinner.fetch_to_path(cid, &temporary_path).await,
+    };
+    if let Err(error) = fetch_result {
+        let cleanup_guard = Arc::clone(&guard);
+        let cleanup = filesystem_scope
+            .run_blocking(crate::FilesystemOperation::FileStage, move || {
+                let mut guard = cleanup_guard
+                    .lock()
+                    .expect("materialization guard lock poisoned");
+                cleanup_materialization_slot(&mut guard)
+            })
+            .await?;
+        if let Err(cleanup_error) = cleanup {
+            filesystem_scope.record_cleanup_failure(cleanup_error);
+        }
+        return Err(error);
     }
-    guard.commit(destination)
+    let commit_scope = filesystem_scope.clone();
+    filesystem_scope
+        .run_blocking(crate::FilesystemOperation::FileStage, move || {
+            let mut guard = guard.lock().expect("materialization guard lock poisoned");
+            let commit = guard
+                .as_mut()
+                .expect("materialization guard already consumed")
+                .commit(&destination);
+            match commit {
+                Ok(MaterializationCommit::Published) => {
+                    guard.take();
+                    Ok(())
+                }
+                Ok(MaterializationCommit::Existing) => {
+                    if let Err(error) = cleanup_materialization_slot(&mut guard) {
+                        let error = anyhow::Error::from(error);
+                        commit_scope.record_cleanup_failure(&error);
+                        return Err(error);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    if let Err(cleanup_error) = cleanup_materialization_slot(&mut guard) {
+                        commit_scope.record_cleanup_failure(cleanup_error);
+                    }
+                    Err(error)
+                }
+            }
+        })
+        .await??;
+    Ok(())
+}
+
+async fn fetch_to_path_owned(
+    filesystem_scope: &crate::FsScope,
+    pinner: Arc<dyn Pinner>,
+    cid: Cid,
+    subpath: Option<String>,
+    destination: std::path::PathBuf,
+) -> Result<()> {
+    let operation_scope = filesystem_scope.clone();
+    filesystem_scope
+        .run_operation(crate::FilesystemOperation::FileStage, async move {
+            fetch_to_path_atomically(
+                &operation_scope,
+                &*pinner,
+                &cid,
+                subpath.as_deref(),
+                &destination,
+            )
+            .await
+        })
+        .await??;
+    Ok(())
+}
+
+async fn fetch_to_path_standalone(
+    pinner: Arc<dyn Pinner>,
+    cid: Cid,
+    subpath: Option<String>,
+    destination: std::path::PathBuf,
+) -> Result<()> {
+    let (scope, owner, finalizer, _completion) = crate::FsScope::new();
+    let finalizer_task = tokio::spawn(finalizer.run());
+    let result = fetch_to_path_owned(&scope, pinner, cid, subpath, destination).await;
+    drop(owner);
+    finalizer_task
+        .await
+        .context("filesystem finalizer failed")??;
+    result
 }
 
 fn pin_entry_weighter(_k: &Cid, v: &PinEntry) -> usize {
@@ -373,23 +521,61 @@ impl PinsetCache {
     ///
     /// The CID should already be pinned via a prior `ensure()` call.
     pub async fn fetch_to_path(&self, cid: &Cid, dst: &Path) -> Result<()> {
-        fetch_to_path_atomically(&*self.pinner, cid, None, dst)
+        fetch_to_path_standalone(Arc::clone(&self.pinner), *cid, None, dst.to_owned())
             .await
             .with_context(|| format!("failed to stream CID /ipfs/{cid} to {}", dst.display()))
+    }
+
+    pub async fn fetch_to_path_in(
+        &self,
+        filesystem_scope: &crate::FsScope,
+        cid: &Cid,
+        dst: &Path,
+    ) -> Result<()> {
+        fetch_to_path_owned(
+            filesystem_scope,
+            Arc::clone(&self.pinner),
+            *cid,
+            None,
+            dst.to_owned(),
+        )
+        .await
     }
 
     /// Stream CID subpath content directly to `dst`.
     ///
     /// The CID should already be pinned via a prior `ensure()` call.
     pub async fn fetch_path_to_path(&self, cid: &Cid, subpath: &str, dst: &Path) -> Result<()> {
-        fetch_to_path_atomically(&*self.pinner, cid, Some(subpath), dst)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to stream CID subpath /ipfs/{cid}/{subpath} to {}",
-                    dst.display()
-                )
-            })
+        fetch_to_path_standalone(
+            Arc::clone(&self.pinner),
+            *cid,
+            Some(subpath.to_owned()),
+            dst.to_owned(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to stream CID subpath /ipfs/{cid}/{subpath} to {}",
+                dst.display()
+            )
+        })
+    }
+
+    pub async fn fetch_path_to_path_in(
+        &self,
+        filesystem_scope: &crate::FsScope,
+        cid: &Cid,
+        subpath: &str,
+        dst: &Path,
+    ) -> Result<()> {
+        fetch_to_path_owned(
+            filesystem_scope,
+            Arc::clone(&self.pinner),
+            *cid,
+            Some(subpath.to_owned()),
+            dst.to_owned(),
+        )
+        .await
     }
 
     /// Spawn background tasks to unpin evicted entries with retry.
@@ -444,6 +630,15 @@ pub enum CacheMode {
 }
 
 impl CacheMode {
+    /// Transfer process-private staging cleanup to the Cell filesystem
+    /// finalizer. Shared host cache state remains owned by the host cache.
+    pub fn own_process_staging(&mut self, filesystem_scope: &crate::FsScope) -> Result<()> {
+        match self {
+            CacheMode::Shared(_) => Ok(()),
+            CacheMode::Isolated(pinset) => pinset.transfer_staging_cleanup(filesystem_scope),
+        }
+    }
+
     /// Path to the staging directory for materialized IPFS content.
     ///
     /// - `Shared`: host-wide directory shared across all processes
@@ -487,11 +682,46 @@ impl CacheMode {
         }
     }
 
+    pub async fn fetch_to_path_in(
+        &self,
+        filesystem_scope: &crate::FsScope,
+        cid: &Cid,
+        dst: &Path,
+    ) -> Result<()> {
+        match self {
+            CacheMode::Shared(cache) => cache.fetch_to_path_in(filesystem_scope, cid, dst).await,
+            CacheMode::Isolated(pinset) => {
+                pinset.fetch_to_path_in(filesystem_scope, cid, dst).await
+            }
+        }
+    }
+
     /// Stream CID subpath content directly to `dst`.
     pub async fn fetch_path_to_path(&self, cid: &Cid, subpath: &str, dst: &Path) -> Result<()> {
         match self {
             CacheMode::Shared(cache) => cache.fetch_path_to_path(cid, subpath, dst).await,
             CacheMode::Isolated(pinset) => pinset.fetch_path_to_path(cid, subpath, dst).await,
+        }
+    }
+
+    pub async fn fetch_path_to_path_in(
+        &self,
+        filesystem_scope: &crate::FsScope,
+        cid: &Cid,
+        subpath: &str,
+        dst: &Path,
+    ) -> Result<()> {
+        match self {
+            CacheMode::Shared(cache) => {
+                cache
+                    .fetch_path_to_path_in(filesystem_scope, cid, subpath, dst)
+                    .await
+            }
+            CacheMode::Isolated(pinset) => {
+                pinset
+                    .fetch_path_to_path_in(filesystem_scope, cid, subpath, dst)
+                    .await
+            }
         }
     }
 }
@@ -502,7 +732,8 @@ pub struct IsolatedPinset {
     pinner: Arc<dyn Pinner>,
     pins: Mutex<HashMap<Cid, ()>>,
     /// Per-process staging directory. Cleaned up on drop.
-    staging: TempDir,
+    staging_path: std::path::PathBuf,
+    staging: Option<TempDir>,
 }
 
 impl IsolatedPinset {
@@ -512,13 +743,23 @@ impl IsolatedPinset {
         Ok(Self {
             pinner,
             pins: Mutex::new(HashMap::new()),
-            staging,
+            staging_path: staging.path().to_owned(),
+            staging: Some(staging),
         })
     }
 
     /// Path to the per-process staging directory.
     pub fn staging_dir(&self) -> &Path {
-        self.staging.path()
+        &self.staging_path
+    }
+
+    fn transfer_staging_cleanup(&mut self, filesystem_scope: &crate::FsScope) -> Result<()> {
+        if let Some(staging) = self.staging.take() {
+            filesystem_scope
+                .own_temp_dir(crate::FilesystemOperation::ProcessCleanup, staging)
+                .map_err(anyhow::Error::from)?;
+        }
+        Ok(())
     }
 
     /// Ensure a CID is pinned. Idempotent within this pinset.
@@ -560,23 +801,61 @@ impl IsolatedPinset {
     ///
     /// The CID should already be pinned via a prior `ensure()` call.
     pub async fn fetch_to_path(&self, cid: &Cid, dst: &Path) -> Result<()> {
-        fetch_to_path_atomically(&*self.pinner, cid, None, dst)
+        fetch_to_path_standalone(Arc::clone(&self.pinner), *cid, None, dst.to_owned())
             .await
             .with_context(|| format!("failed to stream CID /ipfs/{cid} to {}", dst.display()))
+    }
+
+    pub async fn fetch_to_path_in(
+        &self,
+        filesystem_scope: &crate::FsScope,
+        cid: &Cid,
+        dst: &Path,
+    ) -> Result<()> {
+        fetch_to_path_owned(
+            filesystem_scope,
+            Arc::clone(&self.pinner),
+            *cid,
+            None,
+            dst.to_owned(),
+        )
+        .await
     }
 
     /// Stream CID subpath content directly to `dst`.
     ///
     /// The CID should already be pinned via a prior `ensure()` call.
     pub async fn fetch_path_to_path(&self, cid: &Cid, subpath: &str, dst: &Path) -> Result<()> {
-        fetch_to_path_atomically(&*self.pinner, cid, Some(subpath), dst)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to stream CID subpath /ipfs/{cid}/{subpath} to {}",
-                    dst.display()
-                )
-            })
+        fetch_to_path_standalone(
+            Arc::clone(&self.pinner),
+            *cid,
+            Some(subpath.to_owned()),
+            dst.to_owned(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to stream CID subpath /ipfs/{cid}/{subpath} to {}",
+                dst.display()
+            )
+        })
+    }
+
+    pub async fn fetch_path_to_path_in(
+        &self,
+        filesystem_scope: &crate::FsScope,
+        cid: &Cid,
+        subpath: &str,
+        dst: &Path,
+    ) -> Result<()> {
+        fetch_to_path_owned(
+            filesystem_scope,
+            Arc::clone(&self.pinner),
+            *cid,
+            Some(subpath.to_owned()),
+            dst.to_owned(),
+        )
+        .await
     }
 }
 
@@ -606,6 +885,34 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    pub(super) type MaterializationCleanupHook = Box<dyn FnMut(&Path) -> io::Result<()> + Send>;
+    thread_local! {
+        static MATERIALIZATION_CLEANUP_HOOK: std::cell::RefCell<Option<MaterializationCleanupHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn take_materialization_cleanup_hook() -> Option<MaterializationCleanupHook> {
+        MATERIALIZATION_CLEANUP_HOOK.with_borrow_mut(Option::take)
+    }
+
+    struct MaterializationCleanupHookGuard;
+
+    impl MaterializationCleanupHookGuard {
+        fn install(hook: impl FnMut(&Path) -> io::Result<()> + Send + 'static) -> Self {
+            MATERIALIZATION_CLEANUP_HOOK.with_borrow_mut(|slot| {
+                assert!(slot.is_none());
+                *slot = Some(Box::new(hook));
+            });
+            Self
+        }
+    }
+
+    impl Drop for MaterializationCleanupHookGuard {
+        fn drop(&mut self) {
+            MATERIALIZATION_CLEANUP_HOOK.with_borrow_mut(|slot| *slot = None);
+        }
+    }
 
     fn test_cid(n: u8) -> Cid {
         let mh = cid::multihash::Multihash::wrap(0x00, &[n]).unwrap();
@@ -776,6 +1083,64 @@ mod tests {
 
     struct CancelledFetchPinner {
         started: Notify,
+        release: Notify,
+        finished: AtomicBool,
+    }
+
+    struct ExistingWinnerPinner {
+        destination: std::path::PathBuf,
+    }
+
+    struct MissingTemporaryPinner;
+
+    #[async_trait::async_trait]
+    impl Pinner for ExistingWinnerPinner {
+        async fn pin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn unpin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(&self, _cid: &Cid) -> Result<Vec<u8>> {
+            anyhow::bail!("streaming path expected")
+        }
+
+        async fn fetch_to_path(&self, _cid: &Cid, dst: &Path) -> Result<()> {
+            std::fs::write(dst, b"loser")?;
+            std::fs::write(&self.destination, b"winner")?;
+            Ok(())
+        }
+
+        async fn size(&self, _cid: &Cid) -> Result<u64> {
+            Ok(6)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Pinner for MissingTemporaryPinner {
+        async fn pin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn unpin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(&self, _cid: &Cid) -> Result<Vec<u8>> {
+            anyhow::bail!("streaming path expected")
+        }
+
+        async fn fetch_to_path(&self, _cid: &Cid, dst: &Path) -> Result<()> {
+            std::fs::write(dst, b"temporary")?;
+            std::fs::remove_file(dst)?;
+            Ok(())
+        }
+
+        async fn size(&self, _cid: &Cid) -> Result<u64> {
+            Ok(9)
+        }
     }
 
     #[async_trait::async_trait]
@@ -795,7 +1160,9 @@ mod tests {
         async fn fetch_to_path(&self, _cid: &Cid, dst: &Path) -> Result<()> {
             std::fs::write(dst, b"partial")?;
             self.started.notify_waiters();
-            std::future::pending::<Result<()>>().await
+            self.release.notified().await;
+            self.finished.store(true, Ordering::SeqCst);
+            anyhow::bail!("released cancelled fetch")
         }
 
         async fn size(&self, _cid: &Cid) -> Result<u64> {
@@ -1014,20 +1381,38 @@ mod tests {
     async fn cancelled_fetch_does_not_publish_or_leak_partial_staging_files() {
         let pinner = Arc::new(CancelledFetchPinner {
             started: Notify::new(),
+            release: Notify::new(),
+            finished: AtomicBool::new(false),
         });
         let cache = Arc::new(PinsetCache::new(pinner.clone(), 1024).unwrap());
         let cid = test_cid(10);
         cache.ensure(&cid).await.unwrap();
         let destination = cache.staging_dir().join(cid.to_string());
+        let (filesystem_scope, filesystem_owner, filesystem_finalizer, completion) =
+            crate::FsScope::new();
+        let finalizer_task = tokio::spawn(filesystem_finalizer.run());
         let started = pinner.started.notified();
         let task = {
             let cache = cache.clone();
             let destination = destination.clone();
-            tokio::spawn(async move { cache.fetch_to_path(&cid, &destination).await })
+            let filesystem_scope = filesystem_scope.clone();
+            tokio::spawn(async move {
+                cache
+                    .fetch_to_path_in(&filesystem_scope, &cid, &destination)
+                    .await
+            })
         };
         started.await;
         task.abort();
         let _ = task.await;
+        pinner.release.notify_one();
+        drop(filesystem_owner);
+        completion.wait().await.unwrap();
+        finalizer_task.await.unwrap().unwrap();
+        assert!(
+            pinner.finished.load(Ordering::SeqCst),
+            "waiter cancellation must not cancel the admitted backend operation"
+        );
 
         assert!(
             !destination.exists(),
@@ -1047,6 +1432,71 @@ mod tests {
             state.arc.contains(&cid),
             "the successfully committed bounded cache pin remains an intentional cache effect"
         );
+    }
+
+    #[tokio::test]
+    async fn commit_cleanup_failure_poisons_completion_and_preserves_winner() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let destination = staging.path().join("winner");
+        let pinner = Arc::new(ExistingWinnerPinner {
+            destination: destination.clone(),
+        });
+        let cid = test_cid(13);
+        let first_cleanup = Arc::new(AtomicBool::new(true));
+        let first_cleanup_in_hook = Arc::clone(&first_cleanup);
+        let _hook = MaterializationCleanupHookGuard::install(move |_| {
+            if first_cleanup_in_hook.swap(false, Ordering::SeqCst) {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected cleanup failure",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        let (scope, owner, finalizer, completion) = crate::FsScope::new();
+        let finalizer_task = tokio::spawn(finalizer.run());
+
+        let result = fetch_to_path_owned(&scope, pinner, cid, None, destination.clone()).await;
+        assert!(
+            result.is_err(),
+            "loser cleanup failure must reach its caller"
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"winner");
+        drop(owner);
+
+        let error = completion
+            .wait()
+            .await
+            .expect_err("commit cleanup failure must poison filesystem completion");
+        assert!(error.to_string().contains("cleanup failed"));
+        assert!(finalizer_task.await.unwrap().is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"winner");
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn commit_error_with_successful_cleanup_does_not_poison_completion() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let destination = staging.path().join("destination");
+        let (scope, owner, finalizer, completion) = crate::FsScope::new();
+        let finalizer_task = tokio::spawn(finalizer.run());
+
+        let result = fetch_to_path_owned(
+            &scope,
+            Arc::new(MissingTemporaryPinner),
+            test_cid(14),
+            None,
+            destination.clone(),
+        )
+        .await;
+        assert!(result.is_err(), "missing staged data must fail publication");
+        drop(owner);
+
+        completion.wait().await.unwrap();
+        finalizer_task.await.unwrap().unwrap();
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

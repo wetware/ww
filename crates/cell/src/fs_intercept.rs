@@ -32,6 +32,7 @@ pub(crate) struct IpfsFilesystemView<'a> {
     pub table: &'a mut wasmtime::component::ResourceTable,
     pub cache_mode: &'a Option<Arc<cache::CacheMode>>,
     pub cid_tree: &'a Option<Arc<CidTree>>,
+    pub filesystem_scope: &'a cache::FsScope,
     pub descriptors: &'a mut DescriptorContexts,
 }
 
@@ -55,6 +56,7 @@ fn ipfs_filesystem(state: &mut ComponentRunStates) -> IpfsFilesystemView<'_> {
         table: &mut state.resource_table,
         cache_mode: &state.cache_mode,
         cid_tree: &state.cid_tree,
+        filesystem_scope: &state.filesystem_scope,
         descriptors: &mut state.fs_descriptors,
     }
 }
@@ -275,16 +277,39 @@ pub(crate) async fn materialize_cid_tree_descriptor(
     path: &str,
     write_requested: bool,
 ) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
+    let (scope, owner, finalizer, _completion) = cache::FsScope::new();
+    let finalizer_task = tokio::spawn(finalizer.run());
+    let result =
+        materialize_cid_tree_descriptor_in(&scope, cache, cid_tree, path, write_requested).await;
+    drop(owner);
+    finalizer_task
+        .await
+        .map_err(|_| MaterializeError::Io)?
+        .map_err(|_| MaterializeError::Io)?;
+    result
+}
+
+#[cfg(test)]
+async fn materialize_cid_tree_descriptor_in(
+    filesystem_scope: &cache::FsScope,
+    cache: Option<&cache::CacheMode>,
+    cid_tree: &CidTree,
+    path: &str,
+    write_requested: bool,
+) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
     if write_requested {
         return Err(MaterializeError::NotPermitted);
     }
 
-    let resolved = cid_tree.resolve_path(path).await.map_err(|error| {
-        tracing::debug!(path, %error, "CidTree path resolution failed");
-        resolution_error(error)
-    })?;
+    let resolved = cid_tree
+        .resolve_path_in(filesystem_scope, path)
+        .await
+        .map_err(|error| {
+            tracing::debug!(path, %error, "CidTree path resolution failed");
+            resolution_error(error)
+        })?;
 
-    materialize_resolved_descriptor(cache, cid_tree, resolved).await
+    materialize_resolved_descriptor(filesystem_scope, cache, cid_tree, resolved).await
 }
 
 fn resolution_error(error: anyhow::Error) -> MaterializeError {
@@ -297,6 +322,7 @@ fn resolution_error(error: anyhow::Error) -> MaterializeError {
 }
 
 async fn materialize_resolved_descriptor(
+    filesystem_scope: &cache::FsScope,
     cache: Option<&cache::CacheMode>,
     cid_tree: &CidTree,
     resolved: ResolvedNode,
@@ -310,93 +336,225 @@ async fn materialize_resolved_descriptor(
                 MaterializeError::Io
             })?;
             let staging_path = cache.staging_dir().join(&canonical_cid);
-            if !staging_path.exists() {
+            let check_path = staging_path.clone();
+            let exists = filesystem_scope
+                .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+                    check_path.exists()
+                })
+                .await
+                .map_err(|_| MaterializeError::Io)?;
+            if !exists {
                 cache
-                    .fetch_to_path(&cid, &staging_path)
+                    .fetch_to_path_in(filesystem_scope, &cid, &staging_path)
                     .await
                     .map_err(|error| {
                         tracing::warn!(%canonical_cid, %error, "CidTree stream fetch failed");
                         MaterializeError::Io
                     })?;
             }
-            if !staging_path.exists() {
+            let check_path = staging_path.clone();
+            if !filesystem_scope
+                .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+                    check_path.exists()
+                })
+                .await
+                .map_err(|_| MaterializeError::Io)?
+            {
                 return Err(MaterializeError::Io);
             }
-            open_read_only_path(&staging_path)
+            filesystem_scope
+                .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+                    open_read_only_path(&staging_path)
+                })
+                .await
+                .map_err(|_| MaterializeError::Io)?
         }
         ResolvedNode::CidDir { cid } => {
             let canonical_cid = cid.to_string();
             let staging_dir = cid_tree.staging_dir().join(format!("dir-{canonical_cid}"));
-            if !staging_dir.exists() {
-                let entries = cid_tree.ls_dir(&cid).await.map_err(|error| {
-                    tracing::warn!(%canonical_cid, %error, "CidTree directory listing failed");
-                    MaterializeError::Io
-                })?;
-                // The reusable path must never be the construction path. A unique
-                // sibling keeps rename on one filesystem and isolates other builders.
-                std::fs::create_dir_all(cid_tree.staging_dir())
-                    .map_err(|_| MaterializeError::Io)?;
-                let temporary = tempfile::Builder::new()
-                    .prefix(".cid-dir-")
-                    .tempdir_in(cid_tree.staging_dir())
-                    .map_err(|_| MaterializeError::Io)?;
-                for entry in entries {
-                    if !is_confined_relative_path(&entry.name)
-                        || std::path::Path::new(&entry.name).components().count() != 1
-                    {
-                        tracing::warn!(name = %entry.name, "rejected unconfined CidTree entry");
-                        return Err(MaterializeError::Invalid);
-                    }
-                    let entry_path = temporary.path().join(&entry.name);
-                    match entry.entry_type {
-                        crate::vfs::EntryType::Dir => {
-                            std::fs::create_dir_all(entry_path)
-                                .map_err(|_| MaterializeError::Io)?;
-                        }
-                        _ => {
-                            let file = std::fs::File::create(entry_path)
-                                .map_err(|_| MaterializeError::Io)?;
-                            file.set_len(entry.size).map_err(|_| MaterializeError::Io)?;
-                        }
-                    }
-                    #[cfg(test)]
-                    tests::directory_build_hook(temporary.path(), tests::BuildStage::Entry)?;
-                }
+            let check_path = staging_dir.clone();
+            let exists = filesystem_scope
+                .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+                    check_path.exists()
+                })
+                .await
+                .map_err(|_| MaterializeError::Io)?;
+            if !exists {
+                let entries = cid_tree.ls_dir_in(filesystem_scope, &cid).await.map_err(
+                    |error| {
+                        tracing::warn!(%canonical_cid, %error, "CidTree directory listing failed");
+                        MaterializeError::Io
+                    },
+                )?;
+                let staging_root = cid_tree.staging_dir().to_owned();
+                let publish_path = staging_dir.clone();
                 #[cfg(test)]
-                tests::directory_build_hook(temporary.path(), tests::BuildStage::BeforePublish)?;
-
-                // Linux RENAME_NOREPLACE / macOS RENAME_EXCL preserve the first
-                // completed directory, including an empty one. `exists()` above
-                // is only a fast path; the filesystem arbitrates publication
-                // across CidTree instances and processes. Unsupported filesystems
-                // fail closed rather than fall back to a replacing rename.
-                use rustix::fs::{renameat_with, RenameFlags, CWD};
-                match renameat_with(
-                    CWD,
-                    temporary.path(),
-                    CWD,
-                    &staging_dir,
-                    RenameFlags::NOREPLACE,
-                ) {
-                    Ok(()) => {
-                        // Rename freed the old name. Disarm cleanup before another
-                        // builder can reuse it; this builder no longer owns it.
-                        let _former_path = temporary.keep();
-                        #[cfg(test)]
-                        tests::directory_build_hook(&_former_path, tests::BuildStage::Published)?;
-                    }
-                    Err(rustix::io::Errno::EXIST) if staging_dir.is_dir() => {}
-                    Err(_) => return Err(MaterializeError::Io),
-                }
-                // On failure or a lost race, TempDir removes only this builder's
-                // unpublished state. Success disarms cleanup of the freed name.
+                let build_hook = tests::take_directory_build_hook();
+                #[cfg(test)]
+                let cleanup_hook = tests::take_directory_cleanup_hook();
+                let build_scope = filesystem_scope.clone();
+                filesystem_scope
+                    .run_blocking(cache::FilesystemOperation::DirectoryBuild, move || {
+                        build_directory(
+                            staging_root,
+                            publish_path,
+                            entries,
+                            build_scope,
+                            #[cfg(test)]
+                            build_hook,
+                            #[cfg(test)]
+                            cleanup_hook,
+                        )
+                    })
+                    .await
+                    .map_err(|_| MaterializeError::Io)??;
             }
-            open_read_only_path(&staging_dir)
+            filesystem_scope
+                .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+                    open_read_only_path(&staging_dir)
+                })
+                .await
+                .map_err(|_| MaterializeError::Io)?
         }
     }
 }
 
-pub(crate) async fn materialize_ipfs_descriptor(
+fn build_directory(
+    staging_root: std::path::PathBuf,
+    staging_dir: std::path::PathBuf,
+    entries: Vec<crate::vfs::DirEntry>,
+    filesystem_scope: cache::FsScope,
+    #[cfg(test)] mut build_hook: Option<tests::DirectoryBuildHook>,
+    #[cfg(test)] mut cleanup_hook: Option<tests::DirectoryCleanupHook>,
+) -> Result<(), MaterializeError> {
+    std::fs::create_dir_all(&staging_root).map_err(|_| MaterializeError::Io)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".cid-dir-")
+        .tempdir_in(&staging_root)
+        .map_err(|_| MaterializeError::Io)?;
+    let populate = (|| {
+        for entry in entries {
+            if !is_confined_relative_path(&entry.name)
+                || std::path::Path::new(&entry.name).components().count() != 1
+            {
+                tracing::warn!(name = %entry.name, "rejected unconfined CidTree entry");
+                return Err(MaterializeError::Invalid);
+            }
+            let entry_path = temporary.path().join(&entry.name);
+            match entry.entry_type {
+                crate::vfs::EntryType::Dir => {
+                    std::fs::create_dir_all(entry_path).map_err(|_| MaterializeError::Io)?;
+                }
+                _ => {
+                    let file =
+                        std::fs::File::create(entry_path).map_err(|_| MaterializeError::Io)?;
+                    file.set_len(entry.size).map_err(|_| MaterializeError::Io)?;
+                }
+            }
+            #[cfg(test)]
+            tests::directory_build_hook(
+                &mut build_hook,
+                temporary.path(),
+                tests::BuildStage::Entry,
+            )?;
+            #[cfg(any(test, feature = "test-support"))]
+            filesystem_scope.test_event(
+                cache::FilesystemOperation::DirectoryBuild,
+                cache::FsTestStage::DirectoryEntry,
+                Some(temporary.path().to_owned()),
+            );
+        }
+        #[cfg(test)]
+        tests::directory_build_hook(
+            &mut build_hook,
+            temporary.path(),
+            tests::BuildStage::BeforePublish,
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        filesystem_scope.test_event(
+            cache::FilesystemOperation::DirectoryBuild,
+            cache::FsTestStage::BeforePublish,
+            Some(temporary.path().to_owned()),
+        );
+        Ok(())
+    })();
+    if let Err(error) = populate {
+        cleanup_temporary_directory(
+            &filesystem_scope,
+            temporary,
+            #[cfg(test)]
+            &mut cleanup_hook,
+        );
+        return Err(error);
+    }
+
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    match renameat_with(
+        CWD,
+        temporary.path(),
+        CWD,
+        &staging_dir,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            let _former_path = temporary.keep();
+            #[cfg(test)]
+            tests::directory_build_hook(
+                &mut build_hook,
+                &_former_path,
+                tests::BuildStage::Published,
+            )?;
+            #[cfg(any(test, feature = "test-support"))]
+            filesystem_scope.test_event(
+                cache::FilesystemOperation::DirectoryBuild,
+                cache::FsTestStage::Published,
+                Some(_former_path.clone()),
+            );
+        }
+        Err(rustix::io::Errno::EXIST) if staging_dir.is_dir() => {
+            cleanup_temporary_directory(
+                &filesystem_scope,
+                temporary,
+                #[cfg(test)]
+                &mut cleanup_hook,
+            );
+        }
+        Err(_) => {
+            cleanup_temporary_directory(
+                &filesystem_scope,
+                temporary,
+                #[cfg(test)]
+                &mut cleanup_hook,
+            );
+            return Err(MaterializeError::Io);
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_temporary_directory(
+    filesystem_scope: &cache::FsScope,
+    temporary: tempfile::TempDir,
+    #[cfg(test)] cleanup_hook: &mut Option<tests::DirectoryCleanupHook>,
+) {
+    let temporary_path = temporary.path().to_owned();
+    #[cfg(test)]
+    if let Err(error) = tests::directory_cleanup_hook(cleanup_hook, &temporary_path) {
+        filesystem_scope.record_cleanup_failure(format!(
+            "failed to remove temporary CidTree directory {}: injected {error:?}",
+            temporary_path.display()
+        ));
+    }
+    if let Err(error) = temporary.close() {
+        filesystem_scope.record_cleanup_failure(format!(
+            "failed to remove temporary CidTree directory {}: {error}",
+            temporary_path.display()
+        ));
+    }
+}
+
+async fn materialize_ipfs_descriptor_in(
+    filesystem_scope: &cache::FsScope,
     cache: Option<&cache::CacheMode>,
     ipfs_path: &IpfsCidPath,
     write_requested: bool,
@@ -419,12 +577,26 @@ pub(crate) async fn materialize_ipfs_descriptor(
     } else {
         staging_path.join(&ipfs_path.subpath)
     };
-    if !target_path.exists() {
+    let check_path = target_path.clone();
+    let exists = filesystem_scope
+        .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+            check_path.exists()
+        })
+        .await
+        .map_err(|_| MaterializeError::Io)?;
+    if !exists {
         let result = if ipfs_path.subpath.is_empty() {
-            cache.fetch_to_path(&ipfs_path.cid, &target_path).await
+            cache
+                .fetch_to_path_in(filesystem_scope, &ipfs_path.cid, &target_path)
+                .await
         } else {
             cache
-                .fetch_path_to_path(&ipfs_path.cid, &ipfs_path.subpath, &target_path)
+                .fetch_path_to_path_in(
+                    filesystem_scope,
+                    &ipfs_path.cid,
+                    &ipfs_path.subpath,
+                    &target_path,
+                )
                 .await
         };
         result.map_err(|error| {
@@ -432,10 +604,39 @@ pub(crate) async fn materialize_ipfs_descriptor(
             MaterializeError::Io
         })?;
     }
-    if !target_path.exists() {
+    let check_path = target_path.clone();
+    if !filesystem_scope
+        .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+            check_path.exists()
+        })
+        .await
+        .map_err(|_| MaterializeError::Io)?
+    {
         return Err(MaterializeError::NoEntry);
     }
-    open_read_only_path(&target_path)
+    filesystem_scope
+        .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+            open_read_only_path(&target_path)
+        })
+        .await
+        .map_err(|_| MaterializeError::Io)?
+}
+
+#[cfg(test)]
+pub(crate) async fn materialize_ipfs_descriptor(
+    cache: Option<&cache::CacheMode>,
+    ipfs_path: &IpfsCidPath,
+    write_requested: bool,
+) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
+    let (scope, owner, finalizer, _completion) = cache::FsScope::new();
+    let finalizer_task = tokio::spawn(finalizer.run());
+    let result = materialize_ipfs_descriptor_in(&scope, cache, ipfs_path, write_requested).await;
+    drop(owner);
+    finalizer_task
+        .await
+        .map_err(|_| MaterializeError::Io)?
+        .map_err(|_| MaterializeError::Io)?;
+    result
 }
 
 use wasmtime::component::{Access, Accessor, FutureReader, StreamReader};
@@ -724,10 +925,11 @@ impl<T: FilesystemHostState> p3_types::HostDescriptorWithStore<T> for IpfsFilesy
         open_flags: p3_types::OpenFlags,
         flags: p3_types::DescriptorFlags,
     ) -> P3FilesystemResult<Resource<wasmtime_wasi::filesystem::Descriptor>> {
-        let (cache, route) = store.with(|mut access| {
+        let (cache, filesystem_scope, route) = store.with(|mut access| {
             let view = access.get();
             Ok::<_, P3FilesystemError>((
                 view.cache_mode.clone(),
+                view.filesystem_scope.clone(),
                 view.route_open(&descriptor, &path)?,
             ))
         })?;
@@ -761,38 +963,57 @@ impl<T: FilesystemHostState> p3_types::HostDescriptorWithStore<T> for IpfsFilesy
         ) {
             return Err(p3_types::ErrorCode::NotPermitted.into());
         }
-        let (opened, context) = match route {
-            OpenRoute::CidTree(mut context, target) => {
-                let resolved = context
-                    .tree
-                    .resolve_at(&context.root, &context.path, &target)
-                    .await
-                    .map_err(resolution_error)
-                    .map_err(p3_types::ErrorCode::from)?;
-                let directory = matches!(resolved.node, ResolvedNode::CidDir { .. });
-                if !directory && open_flags.contains(p3_types::OpenFlags::DIRECTORY) {
-                    return Err(p3_types::ErrorCode::NotDirectory.into());
-                }
-                let opened =
-                    materialize_resolved_descriptor(cache.as_deref(), &context.tree, resolved.node)
+        let operation_scope = filesystem_scope.clone();
+        let operation_cache = cache.clone();
+        let operation_path = path.clone();
+        let operation = filesystem_scope
+            .run_operation(cache::FilesystemOperation::DescriptorOpen, async move {
+                Ok::<_, P3FilesystemError>(match route {
+                    OpenRoute::CidTree(mut context, target) => {
+                        let resolved = context
+                            .tree
+                            .resolve_at_in(&operation_scope, &context.root, &context.path, &target)
+                            .await
+                            .map_err(resolution_error)
+                            .map_err(p3_types::ErrorCode::from)?;
+                        let directory = matches!(resolved.node, ResolvedNode::CidDir { .. });
+                        if !directory && open_flags.contains(p3_types::OpenFlags::DIRECTORY) {
+                            return Err(p3_types::ErrorCode::NotDirectory.into());
+                        }
+                        let opened = materialize_resolved_descriptor(
+                            &operation_scope,
+                            operation_cache.as_deref(),
+                            &context.tree,
+                            resolved.node,
+                        )
                         .await
                         .map_err(p3_types::ErrorCode::from)?;
-                context.path = resolved.path;
-                (opened, directory.then_some(context))
-            }
-            OpenRoute::Ipfs(ipfs_path) => {
-                let opened = materialize_ipfs_descriptor(cache.as_deref(), &ipfs_path, false)
-                    .await
-                    .map_err(p3_types::ErrorCode::from)?;
-                if (open_flags.contains(p3_types::OpenFlags::DIRECTORY) || path.ends_with('/'))
-                    && !matches!(opened, wasmtime_wasi::filesystem::Descriptor::Dir(_))
-                {
-                    return Err(p3_types::ErrorCode::NotDirectory.into());
-                }
-                (opened, None)
-            }
-            OpenRoute::Wasi { .. } => unreachable!(),
-        };
+                        context.path = resolved.path;
+                        (opened, directory.then_some(context))
+                    }
+                    OpenRoute::Ipfs(ipfs_path) => {
+                        let opened = materialize_ipfs_descriptor_in(
+                            &operation_scope,
+                            operation_cache.as_deref(),
+                            &ipfs_path,
+                            false,
+                        )
+                        .await
+                        .map_err(p3_types::ErrorCode::from)?;
+                        if (open_flags.contains(p3_types::OpenFlags::DIRECTORY)
+                            || operation_path.ends_with('/'))
+                            && !matches!(opened, wasmtime_wasi::filesystem::Descriptor::Dir(_))
+                        {
+                            return Err(p3_types::ErrorCode::NotDirectory.into());
+                        }
+                        (opened, None)
+                    }
+                    OpenRoute::Wasi { .. } => unreachable!(),
+                })
+            })
+            .await
+            .map_err(|_| p3_types::ErrorCode::Io)?;
+        let (opened, context) = operation?;
         store.with(|mut access| {
             let view = access.get();
             let opened = view.table.push(opened)?;
@@ -942,23 +1163,49 @@ mod tests {
         Published,
     }
 
-    type DirectoryBuildHook =
-        Box<dyn FnMut(&std::path::Path, BuildStage) -> Result<(), MaterializeError>>;
+    pub(super) type DirectoryBuildHook =
+        Box<dyn FnMut(&std::path::Path, BuildStage) -> Result<(), MaterializeError> + Send>;
     thread_local! {
         static DIRECTORY_BUILD_HOOK: std::cell::RefCell<Option<DirectoryBuildHook>> =
             const { std::cell::RefCell::new(None) };
     }
 
+    pub(super) type DirectoryCleanupHook =
+        Box<dyn FnMut(&std::path::Path) -> Result<(), MaterializeError> + Send>;
+    thread_local! {
+        static DIRECTORY_CLEANUP_HOOK: std::cell::RefCell<Option<DirectoryCleanupHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     // Materialization performs no awaits between tempdir creation and publish.
     // Tests install hooks only on dedicated threads or current-thread runtimes.
+    pub(super) fn take_directory_build_hook() -> Option<DirectoryBuildHook> {
+        DIRECTORY_BUILD_HOOK.with_borrow_mut(Option::take)
+    }
+
+    pub(super) fn take_directory_cleanup_hook() -> Option<DirectoryCleanupHook> {
+        DIRECTORY_CLEANUP_HOOK.with_borrow_mut(Option::take)
+    }
+
     pub(super) fn directory_build_hook(
+        hook: &mut Option<DirectoryBuildHook>,
         path: &std::path::Path,
         stage: BuildStage,
     ) -> Result<(), MaterializeError> {
-        DIRECTORY_BUILD_HOOK.with_borrow_mut(|hook| match hook {
+        match hook {
             Some(hook) => hook(path, stage),
             None => Ok(()),
-        })
+        }
+    }
+
+    pub(super) fn directory_cleanup_hook(
+        hook: &mut Option<DirectoryCleanupHook>,
+        path: &std::path::Path,
+    ) -> Result<(), MaterializeError> {
+        match hook {
+            Some(hook) => hook(path),
+            None => Ok(()),
+        }
     }
 
     // ── CID path parsing tests ─────────────────────────────────────
@@ -1069,19 +1316,22 @@ mod tests {
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.path().to_path_buf(),
         );
-        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed_in_hook = observed.clone();
         let final_path = staging.path().join(format!("dir-{cid}"));
         let hook = BuildHookGuard::install(move |temporary, stage| {
             assert!(stage == BuildStage::Entry);
             assert_eq!(std::fs::metadata(temporary.join("first")).unwrap().len(), 7);
             assert!(!final_path.exists());
-            observed_in_hook.set(true);
+            observed_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         });
         let result = materialize_cid_tree_descriptor(None, &tree, "", false).await;
         drop(hook);
-        assert!(observed.get(), "the earlier valid entry must be populated");
+        assert!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            "the earlier valid entry must be populated"
+        );
         assert!(matches!(result, Err(MaterializeError::Invalid)));
         assert!(!staging.path().join(format!("dir-{cid}")).exists());
         assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 1);
@@ -1235,7 +1485,9 @@ mod tests {
 
     impl BuildHookGuard {
         fn install(
-            hook: impl FnMut(&std::path::Path, BuildStage) -> Result<(), MaterializeError> + 'static,
+            hook: impl FnMut(&std::path::Path, BuildStage) -> Result<(), MaterializeError>
+                + Send
+                + 'static,
         ) -> Self {
             DIRECTORY_BUILD_HOOK.with_borrow_mut(|slot| {
                 assert!(slot.is_none());
@@ -1248,6 +1500,26 @@ mod tests {
     impl Drop for BuildHookGuard {
         fn drop(&mut self) {
             DIRECTORY_BUILD_HOOK.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
+    struct CleanupHookGuard;
+
+    impl CleanupHookGuard {
+        fn install(
+            hook: impl FnMut(&std::path::Path) -> Result<(), MaterializeError> + Send + 'static,
+        ) -> Self {
+            DIRECTORY_CLEANUP_HOOK.with_borrow_mut(|slot| {
+                assert!(slot.is_none());
+                *slot = Some(Box::new(hook));
+            });
+            Self
+        }
+    }
+
+    impl Drop for CleanupHookGuard {
+        fn drop(&mut self) {
+            DIRECTORY_CLEANUP_HOOK.with_borrow_mut(|slot| *slot = None);
         }
     }
 
@@ -1299,7 +1571,7 @@ mod tests {
         let staging = tempfile::TempDir::new().unwrap();
         let tree = cached_directory_tree(staging.path(), &directory_entries());
         let final_path = staging.path().join(format!("dir-{DIRECTORY_CID}"));
-        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed_in_hook = observed.clone();
         let final_in_hook = final_path.clone();
         let hook = BuildHookGuard::install(move |temporary, stage| {
@@ -1309,12 +1581,12 @@ mod tests {
             assert_eq!(std::fs::metadata(temporary.join("first")).unwrap().len(), 7);
             assert!(!final_in_hook.exists());
             std::fs::write(temporary.join("nested"), b"obstruction").unwrap();
-            observed_in_hook.set(true);
+            observed_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         });
         let result = materialize_cid_tree_descriptor(None, &tree, "", false).await;
         drop(hook);
-        assert!(observed.get());
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(matches!(result, Err(MaterializeError::Io)));
         assert!(!final_path.exists());
         assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 1);
@@ -1336,6 +1608,104 @@ mod tests {
         assert_eq!(dir.open_mode, wasmtime_wasi::OpenMode::READ);
         assert_complete_directory(&final_path, false);
         assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_directory_waiter_retains_complete_publication_and_retry() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let tree = cached_directory_tree(staging.path(), &directory_entries());
+        let final_path = staging.path().join(format!("dir-{DIRECTORY_CID}"));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let published_tx = std::sync::Mutex::new(Some(published_tx));
+        let release_rx = std::sync::Mutex::new(Some(release_rx));
+        let first_entry = std::sync::atomic::AtomicBool::new(true);
+        let _hook = BuildHookGuard::install(move |_, stage| {
+            if stage == BuildStage::Entry
+                && first_entry.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                entered_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                let receiver = release_rx.lock().unwrap().take().unwrap();
+                let _ = receiver.recv();
+            }
+            if stage == BuildStage::Published {
+                published_tx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+            }
+            Ok(())
+        });
+        let waiter =
+            tokio::spawn(
+                async move { materialize_cid_tree_descriptor(None, &tree, "", false).await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        waiter.abort();
+        match waiter.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("materialization waiter completed before cancellation"),
+        }
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), published_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_complete_directory(&final_path, false);
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 2);
+        let retry_tree = cached_directory_tree(staging.path(), &directory_entries());
+        materialize_cid_tree_descriptor(None, &retry_tree, "", false)
+            .await
+            .unwrap();
+        assert_complete_directory(&final_path, false);
+    }
+
+    #[tokio::test]
+    async fn cid_tree_loser_cleanup_failure_poisons_completion_and_preserves_winner() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let tree = cached_directory_tree(staging.path(), &directory_entries());
+        let final_path = staging.path().join(format!("dir-{DIRECTORY_CID}"));
+        let temporary_path = Arc::new(std::sync::Mutex::new(None));
+        let temporary_in_hook = Arc::clone(&temporary_path);
+        let winner_in_hook = final_path.clone();
+        let _build_hook = BuildHookGuard::install(move |temporary, stage| {
+            if stage == BuildStage::BeforePublish {
+                *temporary_in_hook.lock().unwrap() = Some(temporary.to_owned());
+                std::fs::create_dir(&winner_in_hook).unwrap();
+                std::fs::write(winner_in_hook.join("winner"), b"winner").unwrap();
+            }
+            Ok(())
+        });
+        let _cleanup_hook = CleanupHookGuard::install(|_| Err(MaterializeError::Io));
+        let (scope, owner, finalizer, completion) = cache::FsScope::new();
+        let finalizer_task = tokio::spawn(finalizer.run());
+
+        let descriptor = materialize_cid_tree_descriptor_in(&scope, None, &tree, "", false)
+            .await
+            .unwrap();
+        let wasmtime_wasi::filesystem::Descriptor::Dir(_) = descriptor else {
+            panic!("expected the competing winner directory");
+        };
+        assert_eq!(std::fs::read(final_path.join("winner")).unwrap(), b"winner");
+
+        drop(owner);
+        let error = completion
+            .wait()
+            .await
+            .expect_err("loser cleanup failure must poison filesystem completion");
+        assert!(error.to_string().contains("cleanup failed"));
+        assert!(finalizer_task.await.unwrap().is_err());
+        assert_eq!(std::fs::read(final_path.join("winner")).unwrap(), b"winner");
+        assert!(!temporary_path.lock().unwrap().as_ref().unwrap().exists());
     }
 
     // Both independent trees reach partial construction and completed private
@@ -1482,7 +1852,7 @@ mod tests {
     async fn cid_tree_success_does_not_clean_reused_temporary_name() {
         let staging = tempfile::TempDir::new().unwrap();
         let tree = cached_directory_tree(staging.path(), &directory_entries());
-        let reused_path = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let reused_path = Arc::new(std::sync::Mutex::new(None));
         let reused_in_hook = reused_path.clone();
         let _hook = BuildHookGuard::install(move |temporary, stage| {
             if stage == BuildStage::Published {
@@ -1490,14 +1860,18 @@ mod tests {
                 // acquiring it before the successful publisher drops TempDir.
                 std::fs::create_dir(temporary).unwrap();
                 std::fs::write(temporary.join("other-builder"), b"in progress").unwrap();
-                *reused_in_hook.borrow_mut() = Some(temporary.to_path_buf());
+                *reused_in_hook.lock().unwrap() = Some(temporary.to_path_buf());
             }
             Ok(())
         });
         materialize_cid_tree_descriptor(None, &tree, "", false)
             .await
             .unwrap();
-        let reused = reused_path.borrow().clone().expect("publication hook ran");
+        let reused = reused_path
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("publication hook ran");
         assert_eq!(
             std::fs::read(reused.join("other-builder")).unwrap(),
             b"in progress"

@@ -24,4 +24,5 @@ interface fixture {
 world host-substrate-test {
     import connection;
     export fixture;
+    export wasi:cli/run@0.3.0;
 }

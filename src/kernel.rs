@@ -407,6 +407,7 @@ pub struct Generation {
     runtime_inputs: RuntimeInputs,
     stdio: Stdio,
     terminate_rx: watch::Receiver<()>,
+    filesystem_ownership: cell::FilesystemOwnership,
 }
 
 struct GenerationCleanup {
@@ -444,7 +445,14 @@ impl Generation {
             runtime_inputs,
             stdio,
             terminate_rx,
+            filesystem_ownership: cell::FilesystemOwnership::new(),
         }
+    }
+
+    /// Repeatable proof that this generation's filesystem work and private
+    /// cleanup have completed. Available before `run` is first polled.
+    pub fn filesystem_completion(&self) -> cache::FsCompletion {
+        self.filesystem_ownership.completion()
     }
 
     /// Instantiate and run the kernel Cell, its privileged RPC system, and
@@ -459,6 +467,7 @@ impl Generation {
             runtime_inputs,
             stdio,
             mut terminate_rx,
+            filesystem_ownership,
         } = self;
 
         guard
@@ -487,6 +496,7 @@ impl Generation {
             readiness_gate.clone(),
         );
         builder = builder
+            .with_filesystem_ownership(filesystem_ownership)
             .with_runtime_engine(runtime_inputs.runtime_engine.clone())
             .with_wasm_debug(runtime_inputs.wasm_debug)
             .with_env(guest_env)
@@ -494,7 +504,24 @@ impl Generation {
                 runtime_inputs.pinset_cache.clone(),
             ));
 
-        let proc = builder.build().await?;
+        let filesystem_completion = builder.filesystem_completion();
+        let filesystem_finalizer = builder
+            .take_filesystem_finalizer()
+            .expect("generation filesystem finalizer was already registered");
+        tokio::task::spawn_local(rpc::local_tasks::track(async move {
+            let _ = filesystem_finalizer.run().await;
+        }));
+        let proc = match builder.build().await {
+            Ok(proc) => proc,
+            Err(error) => {
+                filesystem_completion.wait().await.map_err(|cleanup_error| {
+                    anyhow::anyhow!(
+                        "kernel Cell construction failed ({error:#}) and filesystem cleanup failed: {cleanup_error}"
+                    )
+                })?;
+                return Err(error);
+            }
+        };
         let (reader, writer) = handles
             .take_host_split()
             .ok_or_else(|| anyhow::anyhow!("host stream was already consumed"))?;
@@ -546,7 +573,13 @@ impl Generation {
 
         readiness_gate.clear();
         drop(registration_scope);
-        let _ = cleanup.rpc.shutdown_and_join().await;
+        let (filesystem_result, _rpc_result) = tokio::join!(
+            filesystem_completion.wait(),
+            cleanup.rpc.shutdown_and_join(),
+        );
+        filesystem_result.map_err(|error| {
+            anyhow::anyhow!("kernel generation filesystem cleanup failed: {error}")
+        })?;
         tracing::debug!(?outcome, "Kernel generation exited");
         Ok(outcome)
     }

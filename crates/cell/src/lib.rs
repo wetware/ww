@@ -17,7 +17,7 @@ pub mod routing_key;
 pub mod sched;
 pub mod vfs;
 
-pub use proc::{Builder, Proc, Program};
+pub use proc::{Builder, FilesystemOwnership, Proc, Program};
 
 /// Trait for loading bytecode from various sources (IPFS, filesystem, etc.)
 ///

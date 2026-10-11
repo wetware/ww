@@ -1,5 +1,6 @@
 use futures::future::join3;
 use std::fs;
+use std::io::Write;
 use wasip3::filesystem::types::{Descriptor, DescriptorFlags, ErrorCode, OpenFlags, PathFlags};
 use wit_bindgen::{StreamResult, StreamWriter};
 
@@ -406,6 +407,52 @@ impl exports::wetware::transport::fixture::Guest for Fixture {
             image_write_rejected,
             scratch,
         }
+    }
+}
+
+impl exports::wasi::cli::run::Guest for Fixture {
+    async fn run() -> Result<(), ()> {
+        match std::env::args().nth(1).as_deref() {
+            Some("cold-file") => {
+                let image = fs::read("/known.txt").map_err(|_| ())?;
+                if image != b"lazy image bytes" {
+                    return Err(());
+                }
+            }
+            Some("directory") => {
+                let preopens = wasip3::filesystem::preopens::get_directories();
+                let root = preopens
+                    .iter()
+                    .find(|(_, path)| path == "/")
+                    .map(|(descriptor, _)| descriptor)
+                    .ok_or(())?;
+                let nested = open_file(root, "nested").await;
+                let child = open_file(&nested, "child").await;
+                if read_file(&child).await != b"nested child" {
+                    return Err(());
+                }
+            }
+            Some("scratch") => {
+                fs::write("/tmp/probe.txt", b"scratch-data").map_err(|_| ())?;
+                if fs::read("/tmp/probe.txt").map_err(|_| ())? != b"scratch-data" {
+                    return Err(());
+                }
+            }
+            Some("scratch-wait") => {
+                fs::write("/tmp/probe.txt", b"scratch-data").map_err(|_| ())?;
+                if fs::read("/tmp/probe.txt").map_err(|_| ())? != b"scratch-data" {
+                    return Err(());
+                }
+                {
+                    let mut stdout = std::io::stdout().lock();
+                    stdout.write_all(b"scratch-ready\n").map_err(|_| ())?;
+                    stdout.flush().map_err(|_| ())?;
+                }
+                wasip3::clocks::monotonic_clock::wait_for(60_000_000_000).await;
+            }
+            _ => return Err(()),
+        }
+        Ok(())
     }
 }
 

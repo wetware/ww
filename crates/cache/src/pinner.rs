@@ -34,27 +34,25 @@ pub trait Pinner: Send + Sync {
     /// Stream CID content directly into `dst` without materializing a full
     /// in-memory buffer.
     ///
-    /// Default implementation falls back to `fetch()` and writes bytes
-    /// synchronously.
+    /// Default implementation falls back to `fetch()` and Tokio filesystem I/O.
     async fn fetch_to_path(&self, cid: &Cid, dst: &Path) -> Result<()> {
         let bytes = self.fetch(cid).await?;
         if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        std::fs::write(dst, &bytes)?;
+        tokio::fs::write(dst, &bytes).await?;
         Ok(())
     }
 
     /// Stream CID subpath content directly into `dst`.
     ///
-    /// Default implementation falls back to `fetch_path()` and writes bytes
-    /// synchronously.
+    /// Default implementation falls back to `fetch_path()` and Tokio filesystem I/O.
     async fn fetch_path_to_path(&self, cid: &Cid, subpath: &str, dst: &Path) -> Result<()> {
         let bytes = self.fetch_path(cid, subpath).await?;
         if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        std::fs::write(dst, &bytes)?;
+        tokio::fs::write(dst, &bytes).await?;
         Ok(())
     }
 
