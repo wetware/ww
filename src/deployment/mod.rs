@@ -402,6 +402,7 @@ impl<'a> KernelLauncher<'a> {
             self.stdio,
             terminate_rx,
         );
+        let filesystem_completion = generation.filesystem_completion();
         let intended_seq = epoch.seq;
         let (result_tx, result_rx) = oneshot::channel();
         self.executor_pool
@@ -423,6 +424,7 @@ impl<'a> KernelLauncher<'a> {
             intended_seq,
             terminate_tx,
             result_rx,
+            filesystem_completion,
         })
     }
 }
@@ -431,6 +433,23 @@ struct RunningGeneration {
     intended_seq: u64,
     terminate_tx: watch::Sender<()>,
     result_rx: oneshot::Receiver<Result<kernel::Outcome>>,
+    filesystem_completion: cache::FsCompletion,
+}
+
+impl RunningGeneration {
+    async fn stopped(
+        &mut self,
+        completed_result: Option<Result<Result<kernel::Outcome>, oneshot::error::RecvError>>,
+    ) -> Result<GenerationStopped> {
+        if completed_result.is_none() {
+            let _ = (&mut self.result_rx).await;
+        }
+        self.filesystem_completion
+            .wait()
+            .await
+            .context("kernel generation filesystem cleanup failed")?;
+        Ok(GenerationStopped(()))
+    }
 }
 
 struct GenerationStopped(());
@@ -1003,7 +1022,9 @@ impl Deployment {
         let _ = running.terminate_tx.send(());
         let teardown_timer = tokio::time::sleep(KERNEL_TEARDOWN_TIMEOUT);
         tokio::pin!(teardown_timer);
-        let mut stopped = completed_result.map(|_| GenerationStopped(()));
+        let stopping = running.stopped(completed_result);
+        tokio::pin!(stopping);
+        let mut stopped = None;
         let mut attempt = PinSet::default();
         let mut attempt_head: Option<cid::Cid> = None;
         let mut retry = RETRY_BASE_DELAY;
@@ -1019,7 +1040,7 @@ impl Deployment {
         'target: loop {
             while matches!(self.speculation, Some(Speculation::Releasing { .. })) {
                 enum ReleaseEvent {
-                    Stopped,
+                    Stopped(Result<GenerationStopped>),
                     TimedOut,
                     Update(Result<Update>),
                     Released(Result<PinSet, tokio::task::JoinError>),
@@ -1034,16 +1055,13 @@ impl Deployment {
                 };
                 let event = tokio::select! {
                     biased;
-                    result = &mut running.result_rx, if stopped.is_none() => {
-                        let _ = result;
-                        ReleaseEvent::Stopped
-                    }
+                    result = &mut stopping, if stopped.is_none() => ReleaseEvent::Stopped(result),
                     _ = &mut teardown_timer, if stopped.is_none() => ReleaseEvent::TimedOut,
                     update = next_source_update(source_rx) => ReleaseEvent::Update(update),
                     result = release => ReleaseEvent::Released(result),
                 };
                 match event {
-                    ReleaseEvent::Stopped => stopped = Some(GenerationStopped(())),
+                    ReleaseEvent::Stopped(result) => stopped = Some(result?),
                     ReleaseEvent::Update(update) => target = self.accept_update(update?)?,
                     ReleaseEvent::Released(result) => {
                         let state = self.speculation.take();
@@ -1089,7 +1107,7 @@ impl Deployment {
             }
             if matches!(self.speculation, Some(Speculation::Stopping { .. })) {
                 enum StopEvent {
-                    Stopped,
+                    Stopped(Result<GenerationStopped>),
                     TimedOut,
                     Update(Result<Update>),
                     Prepared(Result<PreparationOutput, tokio::task::JoinError>),
@@ -1104,16 +1122,13 @@ impl Deployment {
                 };
                 let event = tokio::select! {
                     biased;
-                    result = &mut running.result_rx, if stopped.is_none() => {
-                        let _ = result;
-                        StopEvent::Stopped
-                    }
+                    result = &mut stopping, if stopped.is_none() => StopEvent::Stopped(result),
                     _ = &mut teardown_timer, if stopped.is_none() => StopEvent::TimedOut,
                     update = next_source_update(source_rx) => StopEvent::Update(update),
                     result = preparation => StopEvent::Prepared(result),
                 };
                 match event {
-                    StopEvent::Stopped => stopped = Some(GenerationStopped(())),
+                    StopEvent::Stopped(result) => stopped = Some(result?),
                     StopEvent::Update(update) => {
                         target = self.accept_update(update?)?;
                     }
@@ -1173,9 +1188,8 @@ impl Deployment {
                 loop {
                     tokio::select! {
                         biased;
-                        result = &mut running.result_rx, if stopped.is_none() => {
-                            let _ = result;
-                            stopped = Some(GenerationStopped(()));
+                        result = &mut stopping, if stopped.is_none() => {
+                            stopped = Some(result?);
                         }
                         _ = &mut teardown_timer, if stopped.is_none() => {
                             return Ok(Outcome::TeardownTimedOut {
@@ -1229,9 +1243,8 @@ impl Deployment {
                     };
                     tokio::select! {
                         biased;
-                        result = &mut running.result_rx, if stopped.is_none() => {
-                            let _ = result;
-                            stopped = Some(GenerationStopped(()));
+                        result = &mut stopping, if stopped.is_none() => {
+                            stopped = Some(result?);
                         }
                         _ = &mut teardown_timer, if stopped.is_none() => {
                             break None;
@@ -1282,9 +1295,8 @@ impl Deployment {
                 loop {
                     tokio::select! {
                         biased;
-                        result = &mut running.result_rx, if stopped.is_none() => {
-                            let _ = result;
-                            stopped = Some(GenerationStopped(()));
+                        result = &mut stopping, if stopped.is_none() => {
+                            stopped = Some(result?);
                         }
                         _ = &mut teardown_timer, if stopped.is_none() => {
                             break PreparationStep::TimedOut;
@@ -1329,9 +1341,8 @@ impl Deployment {
                         loop {
                             tokio::select! {
                                 biased;
-                                result = &mut running.result_rx, if stopped.is_none() => {
-                                    let _ = result;
-                                    stopped = Some(GenerationStopped(()));
+                                result = &mut stopping, if stopped.is_none() => {
+                                    stopped = Some(result?);
                                 }
                                 _ = &mut teardown_timer, if stopped.is_none() => {
                                     return Ok(Outcome::TeardownTimedOut {
@@ -1363,10 +1374,7 @@ impl Deployment {
                     while stopped.is_none() {
                         tokio::select! {
                             biased;
-                            result = &mut running.result_rx => {
-                                let _ = result;
-                                stopped = Some(GenerationStopped(()));
-                            }
+                            result = &mut stopping => stopped = Some(result?),
                             _ = &mut teardown_timer => {
                                 self.release_attempt(&mut { prepared.pins }).await;
                                 return Ok(Outcome::TeardownTimedOut {
@@ -2392,10 +2400,19 @@ mod tests {
                 intended_seq: 0,
                 terminate_tx,
                 result_rx,
+                filesystem_completion: completed_filesystem_scope(),
             },
             result_tx,
             terminate_rx,
         )
+    }
+
+    fn completed_filesystem_scope() -> cache::FsCompletion {
+        let (scope, owner, finalizer, completion) = cache::FsScope::new();
+        drop(scope);
+        drop(owner);
+        drop(finalizer);
+        completion
     }
 
     async fn next_request(requests: &mut mpsc::UnboundedReceiver<String>) -> String {
@@ -3289,6 +3306,7 @@ mod tests {
             intended_seq: 0,
             terminate_tx,
             result_rx,
+            filesystem_completion: completed_filesystem_scope(),
         };
         let head = Head {
             cid: ROOT.parse().unwrap(),
@@ -3318,6 +3336,195 @@ mod tests {
         assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
         assert_eq!(deployment.current_epoch().root, Some(ROOT.parse().unwrap()));
         server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lost_generation_result_waits_for_filesystem_completion_before_root_swap() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            assert_lost_generation_result_waits_for_filesystem_completion(false).await;
+            assert_lost_generation_result_waits_for_filesystem_completion(true).await;
+        })
+        .await
+        .expect("generation filesystem completion regression watchdog expired");
+    }
+
+    async fn assert_lost_generation_result_waits_for_filesystem_completion(
+        preconsume_result: bool,
+    ) {
+        let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
+        let staging = tempfile::tempdir().unwrap();
+        let stub = staging.path().join("dir-old-generation");
+        std::fs::create_dir(&stub).unwrap();
+        std::fs::write(stub.join("entry"), b"stale").unwrap();
+        let tree = Arc::new(CidTree::new(
+            OLD_ROOT.parse().unwrap(),
+            client.clone(),
+            staging.path().to_owned(),
+        ));
+        let (epoch_tx, epoch_rx) = watch::channel(Epoch {
+            seq: 0,
+            head: Vec::new(),
+            root: Some(OLD_ROOT.parse().unwrap()),
+        });
+        let (_source_tx, source_rx) = mpsc::channel(1);
+        let head = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+        let mut deployment = Deployment {
+            epoch_tx,
+            epoch_rx,
+            epoch_seq: 0,
+            frozen_layers: Vec::new(),
+            frozen_pins: PinSet::default(),
+            active_pins: PinSet::default(),
+            retained_pins: Vec::new(),
+            ipfs_client: client,
+            cid_tree: tree.clone(),
+            source_rx: Some(source_rx),
+            source_task: None,
+            candidate_rx: None,
+            candidate_initialized: false,
+            speculation: Some(Speculation::Ready {
+                prepared: PreparedRoot {
+                    head: Some(head.clone()),
+                    effective: head.cid,
+                    pins: PinSet::default(),
+                },
+                expires_at: tokio::time::Instant::now() + SPECULATIVE_RETENTION,
+            }),
+        };
+        let (filesystem_scope, filesystem_owner, filesystem_finalizer, filesystem_completion) =
+            cache::FsScope::new();
+        let private = tempfile::tempdir().unwrap();
+        let private_path = private.path().to_owned();
+        let (cleanup_entered_tx, cleanup_entered_rx) = oneshot::channel();
+        let (cleanup_release_tx, cleanup_release_rx) = std::sync::mpsc::channel();
+        filesystem_scope
+            .own_cleanup(cache::FilesystemOperation::ProcessCleanup, move || {
+                let _ = cleanup_entered_tx.send(());
+                let _ = cleanup_release_rx.recv();
+                private.close()
+            })
+            .unwrap();
+        drop(filesystem_scope);
+        drop(filesystem_owner);
+        let finalizer_task = tokio::spawn(async move { filesystem_finalizer.run().await });
+
+        let (terminate_tx, terminate_rx) = watch::channel(());
+        let (result_tx, result_rx) = oneshot::channel();
+        let mut running = RunningGeneration {
+            intended_seq: 0,
+            terminate_tx,
+            result_rx,
+            filesystem_completion,
+        };
+        drop(result_tx);
+        let completed_result = if preconsume_result {
+            Some((&mut running.result_rx).await)
+        } else {
+            None
+        };
+        let outcome = {
+            let replacement =
+                deployment.replace(running, vec![Update::Head(head)], completed_result);
+            tokio::pin!(replacement);
+
+            cleanup_entered_rx.await.unwrap();
+
+            assert!(matches!(
+                futures::poll!(&mut replacement),
+                std::task::Poll::Pending
+            ));
+            assert!(terminate_rx.has_changed().unwrap());
+            assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
+            assert!(
+                stub.exists(),
+                "stub cleanup ran before filesystem completion"
+            );
+            assert!(private_path.exists());
+
+            cleanup_release_tx.send(()).unwrap();
+            replacement.await.unwrap()
+        };
+        finalizer_task.await.unwrap().unwrap();
+        assert!(matches!(
+            outcome,
+            Outcome::Replaced {
+                old_epoch: 0,
+                new_epoch: 1,
+                ..
+            }
+        ));
+        assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
+        assert_eq!(deployment.current_epoch().root, Some(ROOT.parse().unwrap()));
+        assert!(!stub.exists());
+        assert!(!private_path.exists());
+    }
+
+    #[tokio::test]
+    async fn filesystem_cleanup_failure_denies_generation_replacement() {
+        let staging = tempfile::tempdir().unwrap();
+        let stub = staging.path().join("dir-old-generation");
+        std::fs::create_dir(&stub).unwrap();
+        let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".to_owned());
+        let (_source_tx, source_rx) = mpsc::channel(1);
+        let (_candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, tree, _epoch_rx) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        let head = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+        deployment.speculation = Some(Speculation::Ready {
+            prepared: PreparedRoot {
+                head: Some(head.clone()),
+                effective: head.cid,
+                pins: PinSet::default(),
+            },
+            expires_at: tokio::time::Instant::now() + SPECULATIVE_RETENTION,
+        });
+
+        let (filesystem_scope, filesystem_owner, filesystem_finalizer, filesystem_completion) =
+            cache::FsScope::new();
+        filesystem_scope
+            .own_cleanup(cache::FilesystemOperation::ProcessCleanup, || {
+                Err(std::io::Error::other("injected cleanup failure"))
+            })
+            .unwrap();
+        drop(filesystem_scope);
+        drop(filesystem_owner);
+        let finalizer_task = tokio::spawn(async move { filesystem_finalizer.run().await });
+
+        let (terminate_tx, _terminate_rx) = watch::channel(());
+        let (result_tx, result_rx) = oneshot::channel();
+        let mut running = RunningGeneration {
+            intended_seq: 0,
+            terminate_tx,
+            result_rx,
+            filesystem_completion,
+        };
+        drop(result_tx);
+        let completed_result = Some((&mut running.result_rx).await);
+
+        let error = match deployment
+            .replace(running, vec![Update::Head(head)], completed_result)
+            .await
+        {
+            Ok(_) => panic!("cleanup failure authorized generation replacement"),
+            Err(error) => error,
+        };
+        let finalizer_error = finalizer_task.await.unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("filesystem cleanup failed"));
+        assert!(
+            finalizer_error
+                .to_string()
+                .contains("injected cleanup failure")
+        );
+        assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
+        assert!(
+            stub.exists(),
+            "failed cleanup must not authorize stub sweep"
+        );
     }
 
     #[tokio::test]
@@ -3358,6 +3565,7 @@ mod tests {
             intended_seq: 0,
             terminate_tx,
             result_rx,
+            filesystem_completion: completed_filesystem_scope(),
         };
         let outcome = {
             let replacement = deployment.replace(
@@ -3558,6 +3766,7 @@ mod tests {
             intended_seq: 0,
             terminate_tx,
             result_rx,
+            filesystem_completion: completed_filesystem_scope(),
         };
         source_tx
             .send(SourceMessage::Error(anyhow::anyhow!("RPC unavailable")))
