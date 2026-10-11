@@ -338,6 +338,7 @@ pub struct ExecutorImpl {
 /// The task running this value owns the delegated authority through child exit.
 struct OwnedChildLifecycle {
     proc: Option<Proc>,
+    filesystem_completion: cache::FsCompletion,
     rpc_task: Option<ManagedRpc>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     membrane: Option<system_capnp::membrane::Client>,
@@ -365,7 +366,14 @@ impl OwnedChildLifecycle {
                 break 137;
             }
             tokio::select! {
+                biased;
                 _ = shutdown.cancelled() => break 137,
+                changed = self.kill_rx.changed() => {
+                    if changed.is_err() {
+                        // No termination controller remains to own execution.
+                        break 137;
+                    }
+                }
                 result = &mut proc_run => {
                     break match result {
                         Ok(()) => 0,
@@ -375,12 +383,6 @@ impl OwnedChildLifecycle {
                         }
                     };
                 }
-                changed = self.kill_rx.changed() => {
-                    if changed.is_err() {
-                        // No termination controller remains to own execution.
-                        break 137;
-                    }
-                }
             }
         };
 
@@ -389,12 +391,21 @@ impl OwnedChildLifecycle {
         // guest-owned RPC questions.
         drop(proc_run);
         self.bootstrap_control.clear();
-        let rpc_terminalization_completed = self.stop_auxiliary_tasks().await;
+        let filesystem_completion = self.filesystem_completion.clone();
+        let (filesystem_result, rpc_terminalization_completed) =
+            tokio::join!(filesystem_completion.wait(), self.stop_auxiliary_tasks());
+        let filesystem_completed = match filesystem_result {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(%error, "executor: child filesystem cleanup was not certified");
+                false
+            }
+        };
         // Release the delegated Membrane after child RPC and the stored guest
         // bootstrap are gone but before reporting exit to the parent.
         drop(self.membrane.take());
         tracing::info!("executor: child process exited with code {exit_code}");
-        if rpc_terminalization_completed {
+        if filesystem_completed && rpc_terminalization_completed {
             if let Some(cleanup) = self.cleanup.take() {
                 cleanup.cleaned(exit_code);
             }
@@ -576,10 +587,30 @@ impl system_capnp::executor::Server for ExecutorImpl {
                 builder = builder.with_cache(cache::CacheMode::Shared(pinset_cache));
             }
 
-            let proc = builder
-                .build()
-                .await
-                .map_err(|err| capnp::Error::failed(err.to_string()))?;
+            let filesystem_completion = builder.filesystem_completion();
+            let filesystem_finalizer = builder
+                .take_filesystem_finalizer()
+                .expect("new child builder owns one filesystem finalizer");
+            tokio::task::spawn_local(rpc::local_tasks::track(async move {
+                if let Err(error) = filesystem_finalizer.run().await {
+                    tracing::error!(%error, "executor: child filesystem finalization failed");
+                }
+            }));
+
+            let proc = match builder.build().await {
+                Ok(proc) => proc,
+                Err(error) => {
+                    filesystem_completion
+                        .wait()
+                        .await
+                        .map_err(|cleanup_error| {
+                            capnp::Error::failed(format!(
+                                "{error}; process filesystem cleanup failed: {cleanup_error}"
+                            ))
+                        })?;
+                    return Err(capnp::Error::failed(error.to_string()));
+                }
+            };
 
             let (reader, writer) = handles
                 .take_host_split()
@@ -616,6 +647,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
             let lifecycle_task = tokio::task::spawn_local(
                 OwnedChildLifecycle {
                     proc: Some(proc),
+                    filesystem_completion,
                     rpc_task: Some(rpc_task),
                     stderr_task: Some(stderr_task),
                     membrane: Some(child_membrane),
@@ -663,8 +695,310 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::rc::{Rc, Weak};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
+
+    const NATIVE_FIXTURE_CID: &str = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+
+    struct NativeFixturePinner {
+        contents: HashMap<cid::Cid, Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cache::Pinner for NativeFixturePinner {
+        async fn pin(&self, _: &cid::Cid) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn unpin(&self, _: &cid::Cid) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(&self, cid: &cid::Cid) -> anyhow::Result<Vec<u8>> {
+            self.contents
+                .get(cid)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown native fixture CID {cid}"))
+        }
+
+        async fn fetch_to_path(&self, cid: &cid::Cid, destination: &Path) -> anyhow::Result<()> {
+            let bytes = self.fetch(cid).await?;
+            if let Some(parent) = destination.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(destination, bytes).await?;
+            Ok(())
+        }
+
+        async fn size(&self, cid: &cid::Cid) -> anyhow::Result<u64> {
+            Ok(self
+                .contents
+                .get(cid)
+                .ok_or_else(|| anyhow::anyhow!("unknown native fixture CID {cid}"))?
+                .len() as u64)
+        }
+    }
+
+    fn native_fixture_cid(seed: u8) -> cid::Cid {
+        cid::Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::wrap(0x12, &[seed; 32]).unwrap(),
+        )
+    }
+
+    fn native_filesystem_fixture() -> (tempfile::TempDir, Arc<cell::vfs::CidTree>, cache::CacheMode)
+    {
+        let staging = tempfile::TempDir::new().unwrap();
+        let known: cid::Cid = NATIVE_FIXTURE_CID.parse().unwrap();
+        let nested_file = native_fixture_cid(11);
+        let root_entries = vec![
+            cell::vfs::DirEntry {
+                name: "known.txt".into(),
+                cid: known.to_string(),
+                entry_type: cell::vfs::EntryType::File,
+                size: 16,
+            },
+            cell::vfs::DirEntry {
+                name: "nested".into(),
+                cid: native_fixture_cid(2).to_string(),
+                entry_type: cell::vfs::EntryType::Dir,
+                size: 0,
+            },
+        ];
+        let mut nested_entries = vec![cell::vfs::DirEntry {
+            name: "child".into(),
+            cid: nested_file.to_string(),
+            entry_type: cell::vfs::EntryType::File,
+            size: 12,
+        }];
+        nested_entries.extend((0..2_048).map(|index| cell::vfs::DirEntry {
+            name: format!("stub-{index:04}"),
+            cid: nested_file.to_string(),
+            entry_type: cell::vfs::EntryType::File,
+            size: (index % 17) as u64,
+        }));
+        for (cid, entries) in [
+            (native_fixture_cid(1), root_entries),
+            (native_fixture_cid(2), nested_entries),
+        ] {
+            std::fs::write(
+                staging.path().join(format!("{cid}.dirlist.json")),
+                serde_json::to_vec(&entries).unwrap(),
+            )
+            .unwrap();
+        }
+        let tree = Arc::new(cell::vfs::CidTree::new(
+            native_fixture_cid(1),
+            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            staging.path().to_owned(),
+        ));
+        let pinner = Arc::new(NativeFixturePinner {
+            contents: HashMap::from([
+                (known, b"lazy image bytes".to_vec()),
+                (nested_file, b"nested child".to_vec()),
+            ]),
+        });
+        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        (staging, tree, cache)
+    }
+
+    fn native_fixture_component(
+        runtime_engine: &cell::engine::RuntimeEngine,
+    ) -> Arc<wasmtime::component::Component> {
+        let artifact = std::env::var_os("WW_NATIVE_P3_FIXTURE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target/native-p3-fixture/wasm32-wasip3/release/native_p3_fixture.wasm")
+            });
+        Arc::new(
+            wasmtime::component::Component::from_file(&runtime_engine.engine(), &artifact)
+                .unwrap_or_else(|error| panic!("load {}: {error}", artifact.display())),
+        )
+    }
+
+    fn spawn_spinning_sibling(
+        pool: &crate::services::ExecutorPool,
+        runtime_engine: cell::engine::RuntimeEngine,
+        progress: std::sync::mpsc::Sender<()>,
+    ) {
+        let wasm = Arc::new(
+            wasmtime::component::Component::new(
+                &runtime_engine.engine(),
+                wat::parse_str(include_str!("../tests/fixtures/spinning-component.wat")).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert!(pool
+            .spawn(crate::services::SpawnRequest {
+                name: "filesystem-progress-sibling".into(),
+                factory: Box::new(move |_| {
+                    Box::pin(async move {
+                        let fuel = FuelObserver::default();
+                        let (mut builder, _) = Builder::ordinary(
+                            Program::Precompiled(wasm),
+                            io::empty(),
+                            io::sink(),
+                            io::sink(),
+                        );
+                        builder = builder
+                            .with_runtime_engine(runtime_engine)
+                            .with_fuel_estimator(FuelEstimator::new_oneshot(u64::MAX, 10_000, 0))
+                            .with_fuel_observer(fuel.clone());
+                        let completion = builder.filesystem_completion();
+                        let finalizer = builder.take_filesystem_finalizer().unwrap();
+                        tokio::task::spawn_local(rpc::local_tasks::track(async move {
+                            let _ = finalizer.run().await;
+                        }));
+                        let proc = builder.build().await.unwrap();
+                        let mut run = Box::pin(proc.run());
+                        tokio::select! {
+                            result = &mut run => { result.unwrap(); }
+                            _ = fuel.wait_for_suspension(1) => {
+                                progress.send(()).unwrap();
+                                let _ = run.as_mut().await;
+                            }
+                        }
+                        drop(run);
+                        completion.wait().await.unwrap();
+                    })
+                }),
+                result_tx: None,
+            })
+            .is_ok());
+    }
+
+    struct ScratchLifecycleSignals {
+        cleanup_entered: std::sync::mpsc::Sender<PathBuf>,
+        release_rx: std::sync::mpsc::Receiver<()>,
+        wait_pending: std::sync::mpsc::Sender<()>,
+        wait_completed: std::sync::mpsc::Sender<i32>,
+        shutdown_observed: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    fn spawn_scratch_lifecycle(
+        pool: &crate::services::ExecutorPool,
+        runtime_engine: cell::engine::RuntimeEngine,
+        component: Arc<wasmtime::component::Component>,
+        signals: ScratchLifecycleSignals,
+    ) {
+        let ScratchLifecycleSignals {
+            cleanup_entered,
+            release_rx,
+            wait_pending,
+            wait_completed,
+            shutdown_observed,
+        } = signals;
+        let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+        let (cleanup_signal_tx, cleanup_signal_rx) = tokio::sync::oneshot::channel();
+        let cleanup_signal_tx = Arc::new(std::sync::Mutex::new(Some(cleanup_signal_tx)));
+        let hook: Arc<dyn Fn(cache::FsTestEvent) + Send + Sync> = Arc::new(move |event| {
+            if event.operation == cache::FilesystemOperation::ProcessCleanup
+                && event.stage == cache::FsTestStage::CleanupStarted
+                && event
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| path.join("probe.txt").is_file())
+            {
+                cleanup_entered.send(event.path.unwrap()).unwrap();
+                if let Some(sender) = cleanup_signal_tx.lock().unwrap().take() {
+                    let _ = sender.send(());
+                }
+                let receiver = release_rx.lock().unwrap().take().unwrap();
+                let _ = receiver.recv();
+            }
+        });
+        assert!(pool
+            .spawn(crate::services::SpawnRequest {
+                name: "scratch-cleanup-lifecycle".into(),
+                factory: Box::new(move |_| {
+                    Box::pin(async move {
+                        use std::future::Future;
+                        use std::task::Poll;
+                        use tokio::io::AsyncReadExt;
+
+                        let (mut lifecycle, process, _, _, observer) = lifecycle_loss_fixture();
+                        if let Some(old_rpc) = lifecycle.rpc_task.take() {
+                            old_rpc.shutdown();
+                        }
+                        let (_tree_staging, tree, cache) = native_filesystem_fixture();
+                        let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(authority::Epoch {
+                            seq: 1,
+                            head: Vec::new(),
+                            root: None,
+                        });
+                        let readiness = Arc::new(authority::KernelReadyGate::new(epoch_rx));
+                        readiness.bind_generation(1);
+                        let (mut stdout_reader, stdout_writer) = io::duplex(64);
+                        let (mut builder, mut handles) = Builder::kernel(
+                            Program::Precompiled(component),
+                            io::empty(),
+                            stdout_writer,
+                            io::sink(),
+                            tree,
+                            readiness,
+                        );
+                        builder = builder
+                            .with_runtime_engine(runtime_engine)
+                            .with_args(vec!["native-p3-fixture".into(), "scratch-wait".into()])
+                            .with_cache(cache)
+                            .with_filesystem_test_hook(hook);
+                        let filesystem_completion = builder.filesystem_completion();
+                        let finalizer = builder.take_filesystem_finalizer().unwrap();
+                        tokio::task::spawn_local(rpc::local_tasks::track(async move {
+                            let _ = finalizer.run().await;
+                        }));
+                        lifecycle.proc = Some(builder.build().await.unwrap());
+                        lifecycle.filesystem_completion = filesystem_completion;
+                        let (reader, writer) = handles.take_host_split().unwrap();
+                        let (rpc, _) = graft::build_child_membrane_rpc(
+                            reader,
+                            writer,
+                            lifecycle.membrane.as_ref().unwrap().clone(),
+                        );
+                        lifecycle.rpc_task = Some(rpc);
+                        let owner = tokio::task::spawn_local(lifecycle.run());
+                        let owner = if let Some(shutdown_observed) = shutdown_observed {
+                            let shutdown = rpc::local_tasks::shutdown_token();
+                            tokio::task::spawn_local(rpc::local_tasks::track(async move {
+                                shutdown.cancelled().await;
+                                owner.abort();
+                                assert!(owner.await.unwrap_err().is_cancelled());
+                                shutdown_observed.send(()).unwrap();
+                            }));
+                            None
+                        } else {
+                            Some(owner)
+                        };
+
+                        let mut marker = vec![0; b"scratch-ready\n".len()];
+                        stdout_reader.read_exact(&mut marker).await.unwrap();
+                        assert_eq!(marker, b"scratch-ready\n");
+                        let mut wait = Box::pin(process.wait_request().send().promise);
+                        process.kill_request().send().promise.await.unwrap();
+                        cleanup_signal_rx.await.unwrap();
+                        assert_eq!(observer.state(), rpc::CleanupState::Running);
+                        std::future::poll_fn(|context| {
+                            assert!(matches!(wait.as_mut().poll(context), Poll::Pending));
+                            Poll::Ready(())
+                        })
+                        .await;
+                        wait_pending.send(()).unwrap();
+                        let exit_code = wait.await.unwrap().get().unwrap().get_exit_code();
+                        wait_completed.send(exit_code).unwrap();
+                        if let Some(owner) = owner {
+                            owner.await.unwrap();
+                            assert_eq!(observer.state(), rpc::CleanupState::Cleaned(137));
+                        }
+                    })
+                }),
+                result_tx: None,
+            })
+            .is_ok());
+    }
 
     fn live_guard(
         seq: u64,
@@ -756,6 +1090,13 @@ mod tests {
         ))
     }
 
+    fn completed_filesystem_scope() -> cache::FsCompletion {
+        let (_scope, owner, finalizer, completion) = cache::FsScope::new();
+        drop(owner);
+        drop(finalizer);
+        completion
+    }
+
     fn lifecycle_loss_fixture() -> (
         OwnedChildLifecycle,
         system_capnp::process::Client,
@@ -799,6 +1140,7 @@ mod tests {
                 // These tests exercise loss of the owner before child polling,
                 // without allocating a Wasmtime Store.
                 proc: None,
+                filesystem_completion: completed_filesystem_scope(),
                 rpc_task: Some(rpc_task),
                 stderr_task: Some(stderr_task),
                 membrane: Some(tracked_cap()),
@@ -839,6 +1181,7 @@ mod tests {
 
         drop(OwnedChildLifecycle {
             proc: None,
+            filesystem_completion: completed_filesystem_scope(),
             rpc_task: None,
             stderr_task: None,
             membrane: None,
@@ -1186,13 +1529,16 @@ mod tests {
                 let fuel = FuelObserver::default();
                 let (builder, mut handles) =
                     Builder::ordinary(Program::Bytes(wasm), io::empty(), io::sink(), io::sink());
-                let proc = builder
+                let mut builder = builder
                     .with_runtime_engine(runtime_engine)
                     .with_fuel_estimator(FuelEstimator::new_oneshot(100_000, 10_000, 0))
-                    .with_fuel_observer(fuel.clone())
-                    .build()
-                    .await
-                    .unwrap();
+                    .with_fuel_observer(fuel.clone());
+                let filesystem_completion = builder.filesystem_completion();
+                let finalizer = builder.take_filesystem_finalizer().unwrap();
+                tokio::task::spawn_local(async move {
+                    let _ = finalizer.run().await;
+                });
+                let proc = builder.build().await.unwrap();
                 let (reader, writer) = handles.take_host_split().unwrap();
                 let (rpc_task, guest_bootstrap) =
                     graft::build_child_membrane_rpc(reader, writer, b.supplied_membrane.clone());
@@ -1222,6 +1568,7 @@ mod tests {
                 let owner = tokio::task::spawn_local(
                     OwnedChildLifecycle {
                         proc: Some(proc),
+                        filesystem_completion,
                         rpc_task: Some(rpc_task),
                         stderr_task: None,
                         membrane: Some(b.supplied_membrane.clone()),
@@ -1276,6 +1623,264 @@ mod tests {
     }
 
     #[test]
+    fn cold_file_staging_preserves_sibling_and_worker_zero_epoch_progress() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let pool = crate::services::ExecutorPool::new(1, shutdown_rx);
+        let runtime_engine = pool.runtime_engine();
+        let component = native_fixture_component(&runtime_engine);
+        let mut epoch = runtime_engine.subscribe();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let hook: Arc<dyn Fn(cache::FsTestEvent) + Send + Sync> = Arc::new(move |event| {
+            if event.operation == cache::FilesystemOperation::FileStage
+                && event.stage == cache::FsTestStage::Started
+                && starts.fetch_add(1, AtomicOrdering::SeqCst) == 1
+            {
+                entered_tx.send(()).unwrap();
+                let receiver = release_rx.lock().unwrap().take().unwrap();
+                let _ = receiver.recv();
+            }
+        });
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let cell_engine = runtime_engine.clone();
+        assert!(pool
+            .spawn(crate::services::SpawnRequest {
+                name: "cold-file-progress".into(),
+                factory: Box::new(move |_| {
+                    Box::pin(async move {
+                        let (_tree_staging, tree, cache) = native_filesystem_fixture();
+                        let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(authority::Epoch {
+                            seq: 1,
+                            head: Vec::new(),
+                            root: None,
+                        });
+                        let readiness = Arc::new(authority::KernelReadyGate::new(epoch_rx));
+                        readiness.bind_generation(1);
+                        let (mut builder, _) = Builder::kernel(
+                            Program::Precompiled(component),
+                            io::empty(),
+                            io::sink(),
+                            io::sink(),
+                            tree,
+                            readiness,
+                        );
+                        builder = builder
+                            .with_runtime_engine(cell_engine)
+                            .with_args(vec!["native-p3-fixture".into(), "cold-file".into()])
+                            .with_cache(cache)
+                            .with_filesystem_test_hook(hook);
+                        let completion = builder.filesystem_completion();
+                        let finalizer = builder.take_filesystem_finalizer().unwrap();
+                        tokio::task::spawn_local(rpc::local_tasks::track(async move {
+                            let _ = finalizer.run().await;
+                        }));
+                        builder.build().await.unwrap().run().await.unwrap();
+                        completion.wait().await.unwrap();
+                    })
+                }),
+                result_tx: Some(result_tx),
+            })
+            .is_ok());
+
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let held_epoch = runtime_engine.current_epoch();
+        let (sibling_tx, sibling_rx) = std::sync::mpsc::channel();
+        spawn_spinning_sibling(&pool, runtime_engine.clone(), sibling_tx);
+        sibling_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if epoch.changed().await.unwrap() > held_epoch {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            });
+        release_tx.send(()).unwrap();
+        assert_eq!(result_rx.blocking_recv().unwrap().unwrap(), 0);
+        drop(pool);
+    }
+
+    #[test]
+    fn directory_publication_preserves_sibling_progress_and_final_contents() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let pool = crate::services::ExecutorPool::new(1, shutdown_rx);
+        let runtime_engine = pool.runtime_engine();
+        let component = native_fixture_component(&runtime_engine);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+        let hook: Arc<dyn Fn(cache::FsTestEvent) + Send + Sync> = Arc::new(move |event| {
+            if event.operation == cache::FilesystemOperation::DirectoryBuild
+                && event.stage == cache::FsTestStage::BeforePublish
+            {
+                entered_tx.send(event.path).unwrap();
+                let receiver = release_rx.lock().unwrap().take().unwrap();
+                let _ = receiver.recv();
+            }
+        });
+        let (contents_tx, contents_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let cell_engine = runtime_engine.clone();
+        assert!(pool
+            .spawn(crate::services::SpawnRequest {
+                name: "directory-progress".into(),
+                factory: Box::new(move |_| {
+                    Box::pin(async move {
+                        let (tree_staging, tree, cache) = native_filesystem_fixture();
+                        let nested = tree_staging
+                            .path()
+                            .join(format!("dir-{}", native_fixture_cid(2)));
+                        let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(authority::Epoch {
+                            seq: 1,
+                            head: Vec::new(),
+                            root: None,
+                        });
+                        let readiness = Arc::new(authority::KernelReadyGate::new(epoch_rx));
+                        readiness.bind_generation(1);
+                        let (mut builder, _) = Builder::kernel(
+                            Program::Precompiled(component),
+                            io::empty(),
+                            io::sink(),
+                            io::sink(),
+                            tree,
+                            readiness,
+                        );
+                        builder = builder
+                            .with_runtime_engine(cell_engine)
+                            .with_args(vec!["native-p3-fixture".into(), "directory".into()])
+                            .with_cache(cache)
+                            .with_filesystem_test_hook(hook);
+                        let completion = builder.filesystem_completion();
+                        let finalizer = builder.take_filesystem_finalizer().unwrap();
+                        tokio::task::spawn_local(rpc::local_tasks::track(async move {
+                            let _ = finalizer.run().await;
+                        }));
+                        builder.build().await.unwrap().run().await.unwrap();
+                        completion.wait().await.unwrap();
+                        contents_tx
+                            .send(
+                                nested.is_dir()
+                                    && nested.join("child").metadata().unwrap().len() == 12
+                                    && std::fs::read_dir(&nested).unwrap().count() == 2_049,
+                            )
+                            .unwrap();
+                    })
+                }),
+                result_tx: Some(result_tx),
+            })
+            .is_ok());
+
+        let temporary = entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(temporary.join("child").is_file());
+        assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 2_049);
+        let (sibling_tx, sibling_rx) = std::sync::mpsc::channel();
+        spawn_spinning_sibling(&pool, runtime_engine, sibling_tx);
+        sibling_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(result_rx.blocking_recv().unwrap().unwrap(), 0);
+        assert!(contents_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        drop(pool);
+    }
+
+    #[test]
+    fn slow_scratch_teardown_keeps_process_wait_pending_and_sibling_running() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let pool = crate::services::ExecutorPool::new(1, shutdown_rx);
+        let runtime_engine = pool.runtime_engine();
+        let component = native_fixture_component(&runtime_engine);
+        let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        spawn_scratch_lifecycle(
+            &pool,
+            runtime_engine.clone(),
+            component,
+            ScratchLifecycleSignals {
+                cleanup_entered: cleanup_tx,
+                release_rx,
+                wait_pending: pending_tx,
+                wait_completed: completed_tx,
+                shutdown_observed: None,
+            },
+        );
+
+        let scratch_path = cleanup_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(scratch_path.join("probe.txt").is_file());
+        pending_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (sibling_tx, sibling_rx) = std::sync::mpsc::channel();
+        spawn_spinning_sibling(&pool, runtime_engine, sibling_tx);
+        sibling_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            completed_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            137
+        );
+        assert!(!scratch_path.exists());
+        drop(pool);
+    }
+
+    #[test]
+    fn executor_pool_shutdown_waits_for_owned_scratch_cleanup() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let pool = crate::services::ExecutorPool::new(1, shutdown_rx);
+        let runtime_engine = pool.runtime_engine();
+        let component = native_fixture_component(&runtime_engine);
+        let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let (completed_tx, _completed_rx) = std::sync::mpsc::channel();
+        let (shutdown_observed_tx, shutdown_observed_rx) = std::sync::mpsc::channel();
+        spawn_scratch_lifecycle(
+            &pool,
+            runtime_engine,
+            component,
+            ScratchLifecycleSignals {
+                cleanup_entered: cleanup_tx,
+                release_rx,
+                wait_pending: pending_tx,
+                wait_completed: completed_tx,
+                shutdown_observed: Some(shutdown_observed_tx),
+            },
+        );
+        let scratch_path = cleanup_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        pending_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (drop_started_tx, drop_started_rx) = std::sync::mpsc::channel();
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::channel();
+        let drop_thread = std::thread::spawn(move || {
+            drop_started_tx.send(()).unwrap();
+            drop(pool);
+            drop_done_tx.send(()).unwrap();
+        });
+        drop_started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        shutdown_observed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(
+            drop_done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        drop_done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop_thread.join().unwrap();
+        assert!(!scratch_path.exists());
+    }
+
+    #[test]
     fn executor_pool_shutdown_joins_child_lifecycle_and_rpc() {
         for close_spawn_channel in [false, true] {
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
@@ -1298,19 +1903,17 @@ mod tests {
                             io::sink(),
                             io::sink(),
                         );
-                        lifecycle.proc = Some(
-                            builder
-                                .with_runtime_engine(engine)
-                                .with_fuel_estimator(FuelEstimator::new_oneshot(
-                                    u64::MAX,
-                                    10_000,
-                                    0,
-                                ))
-                                .with_fuel_observer(fuel.clone())
-                                .build()
-                                .await
-                                .unwrap(),
-                        );
+                        let mut builder = builder
+                            .with_runtime_engine(engine)
+                            .with_fuel_estimator(FuelEstimator::new_oneshot(u64::MAX, 10_000, 0))
+                            .with_fuel_observer(fuel.clone());
+                        let filesystem_completion = builder.filesystem_completion();
+                        let finalizer = builder.take_filesystem_finalizer().unwrap();
+                        tokio::task::spawn_local(rpc::local_tasks::track(async move {
+                            let _ = finalizer.run().await;
+                        }));
+                        lifecycle.proc = Some(builder.build().await.unwrap());
+                        lifecycle.filesystem_completion = filesystem_completion;
                         let (reader, writer) = handles.take_host_split().unwrap();
                         let (rpc, _) = graft::build_child_membrane_rpc(
                             reader,

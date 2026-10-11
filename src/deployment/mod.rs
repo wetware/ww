@@ -3515,11 +3515,9 @@ mod tests {
         let finalizer_error = finalizer_task.await.unwrap().unwrap_err();
 
         assert!(error.to_string().contains("filesystem cleanup failed"));
-        assert!(
-            finalizer_error
-                .to_string()
-                .contains("injected cleanup failure")
-        );
+        assert!(finalizer_error
+            .to_string()
+            .contains("injected cleanup failure"));
         assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
         assert!(
             stub.exists(),
