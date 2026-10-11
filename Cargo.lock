@@ -8505,9 +8505,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cid",
+ "futures",
  "linked-hash-map",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
