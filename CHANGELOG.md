@@ -21,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- **Wasmtime uses Wetware's exact filesystem-lifecycle merge.** The coherent
+  `wasmtime`, `wasmtime-wasi`, and `wasmtime-wasi-io` pin adds synchronous
+  native-filesystem admission and retained opaque ownership through actual
+  work and native-result cleanup.
 - **Networking dependencies use rust-libp2p 0.57.** The refreshed temporary
   `rust-ipns` V2-only fix uses the same identity generation as Wetware.
 - **Finite WAGI completion regressions now cover every terminal write state.**
