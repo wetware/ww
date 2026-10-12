@@ -666,6 +666,8 @@ pub struct ComponentRunStates {
     pub cache_mode: Option<Arc<cache::CacheMode>>,
     /// Owned custom filesystem work for this process.
     pub(crate) filesystem_scope: cache::FsScope,
+    /// Cell-local and Host-aggregate filesystem admission for this process.
+    pub(crate) filesystem_resources: Arc<cache::CellResources>,
     /// Closing this unique process lifetime rejects new work. The separately
     /// registered finalizer owns actual completion and private-root teardown.
     _filesystem_owner: cache::FsOwner,
@@ -707,6 +709,7 @@ pub struct ComponentRunStates {
 /// cancellation before first poll close an empty scope successfully while the
 /// same proof covers all work once construction starts.
 pub struct FilesystemOwnership {
+    resources: Arc<cache::CellResources>,
     scope: cache::FsScope,
     owner: cache::FsOwner,
     finalizer: cache::FsFinalizer,
@@ -714,35 +717,76 @@ pub struct FilesystemOwnership {
 }
 
 impl FilesystemOwnership {
-    pub fn new() -> Self {
-        let (scope, owner, finalizer, completion) = cache::FsScope::new();
-        Self {
+    /// Reserve this Cell's cleanup root before any private filesystem effect.
+    pub fn try_new(resources: Arc<cache::CellResources>) -> Result<Self, cache::AdmissionError> {
+        let (scope, owner, finalizer, completion) = resources.host().try_filesystem_scope()?;
+        Ok(Self {
+            resources,
             scope,
             owner,
             finalizer,
             completion,
-        }
+        })
     }
 
     pub fn completion(&self) -> cache::FsCompletion {
         self.completion.clone()
     }
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_resources(&self) -> &Arc<cache::CellResources> {
+        &self.resources
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_scope(&self) -> &cache::FsScope {
+        &self.scope
+    }
+
+    #[cfg(test)]
+    fn test() -> Self {
+        static HOST: std::sync::OnceLock<Arc<cache::HostResources>> = std::sync::OnceLock::new();
+        let host = HOST.get_or_init(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test Host runtime");
+            let (owner, host) = cache::HostFsOwner::start(
+                runtime.handle().clone(),
+                cache::HostLimits::new(4_096, 1_025, 1_024).unwrap(),
+            )
+            .expect("test Host filesystem owner");
+            // One process-wide fixture keeps unit constructors explicit while
+            // allowing synchronous Builder-shape tests to share the same Host.
+            Box::leak(Box::new(runtime));
+            Box::leak(Box::new(owner));
+            host
+        });
+        Self::try_new(cache::CellResources::new(
+            Arc::clone(host),
+            cache::CellLimits::default(),
+        ))
+        .expect("test filesystem root")
+    }
+
     fn into_parts(
         self,
     ) -> (
+        Arc<cache::CellResources>,
         cache::FsScope,
         cache::FsOwner,
         cache::FsFinalizer,
         cache::FsCompletion,
     ) {
-        (self.scope, self.owner, self.finalizer, self.completion)
-    }
-}
-
-impl Default for FilesystemOwnership {
-    fn default() -> Self {
-        Self::new()
+        (
+            self.resources,
+            self.scope,
+            self.owner,
+            self.finalizer,
+            self.completion,
+        )
     }
 }
 
@@ -877,6 +921,7 @@ struct ProcInit {
     mode: ConstructionMode,
     fuel_estimator: Option<FuelEstimator>,
     fuel_observer: Option<FuelObserver>,
+    filesystem_resources: Arc<cache::CellResources>,
     filesystem_scope: cache::FsScope,
     filesystem_owner: cache::FsOwner,
     #[cfg(test)]
@@ -902,8 +947,15 @@ struct PreparedProcessFilesystem {
 fn configure_process_filesystem(
     mut wasi_builder: WasiCtxBuilder,
     cid_tree_staging: Option<std::path::PathBuf>,
+    filesystem_resources: Arc<cache::CellResources>,
     filesystem_scope: cache::FsScope,
+    setup: cache::ForegroundTransaction,
 ) -> Result<PreparedProcessFilesystem> {
+    crate::fs_intercept::install_native_filesystem_hook(
+        &mut wasi_builder,
+        Arc::clone(&filesystem_resources),
+        filesystem_scope.clone(),
+    );
     let image_root_path = if let Some(staging) = cid_tree_staging {
         wasi_builder
             .preopened_dir(&staging, "/", FsPerms::ReadOnly)
@@ -914,11 +966,35 @@ fn configure_process_filesystem(
         );
         None
     } else {
+        let cleanup = setup.try_cleanup_phase()?;
         let root = tempfile::TempDir::new()
             .map_err(|e| anyhow!("failed to create private process image root: {e}"))?;
         let root_path = root.path().to_owned();
+        #[cfg(any(test, feature = "test-support"))]
+        let cleanup_scope = filesystem_scope.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let cleanup_path = root_path.clone();
         filesystem_scope
-            .own_temp_dir(cache::FilesystemOperation::ProcessCleanup, root)
+            .own_cleanup_from_phase(
+                cleanup,
+                cache::FilesystemOperation::ProcessCleanup,
+                move || {
+                    #[cfg(any(test, feature = "test-support"))]
+                    cleanup_scope.test_event(
+                        cache::FilesystemOperation::ProcessCleanup,
+                        cache::FsTestStage::CleanupStarted,
+                        Some(cleanup_path.clone()),
+                    );
+                    let result = root.close();
+                    #[cfg(any(test, feature = "test-support"))]
+                    cleanup_scope.test_event(
+                        cache::FilesystemOperation::ProcessCleanup,
+                        cache::FsTestStage::Completed,
+                        Some(cleanup_path),
+                    );
+                    result
+                },
+            )
             .map_err(|e| anyhow!(e))?;
         wasi_builder
             .preopened_dir(&root_path, "/", FsPerms::ReadOnly)
@@ -926,11 +1002,35 @@ fn configure_process_filesystem(
         Some(root_path)
     };
 
+    let cleanup = setup.try_cleanup_phase()?;
     let scratch = tempfile::TempDir::new()
         .map_err(|e| anyhow!("failed to create private process scratch: {e}"))?;
     let scratch_path = scratch.path().to_owned();
+    #[cfg(any(test, feature = "test-support"))]
+    let cleanup_scope = filesystem_scope.clone();
+    #[cfg(any(test, feature = "test-support"))]
+    let cleanup_path = scratch_path.clone();
     filesystem_scope
-        .own_temp_dir(cache::FilesystemOperation::ProcessCleanup, scratch)
+        .own_cleanup_from_phase(
+            cleanup,
+            cache::FilesystemOperation::ProcessCleanup,
+            move || {
+                #[cfg(any(test, feature = "test-support"))]
+                cleanup_scope.test_event(
+                    cache::FilesystemOperation::ProcessCleanup,
+                    cache::FsTestStage::CleanupStarted,
+                    Some(cleanup_path.clone()),
+                );
+                let result = scratch.close();
+                #[cfg(any(test, feature = "test-support"))]
+                cleanup_scope.test_event(
+                    cache::FilesystemOperation::ProcessCleanup,
+                    cache::FsTestStage::Completed,
+                    Some(cleanup_path),
+                );
+                result
+            },
+        )
         .map_err(|e| anyhow!(e))?;
     wasi_builder
         .preopened_dir(&scratch_path, "/tmp", FsPerms::ReadWrite)
@@ -1168,6 +1268,7 @@ pub struct Builder {
     mode: ConstructionMode,
     fuel_estimator: Option<FuelEstimator>,
     fuel_observer: Option<FuelObserver>,
+    filesystem_resources: Arc<cache::CellResources>,
     filesystem_scope: cache::FsScope,
     filesystem_owner: cache::FsOwner,
     filesystem_finalizer: Option<cache::FsFinalizer>,
@@ -1203,23 +1304,7 @@ impl Builder {
         stdin: R,
         stdout: W1,
         stderr: W2,
-    ) -> (Self, DataStreamHandles)
-    where
-        R: AsyncRead + Send + Sync + Unpin + 'static,
-        W1: AsyncWrite + Send + Sync + Unpin + 'static,
-        W2: AsyncWrite + Send + Sync + Unpin + 'static,
-    {
-        Self::new(program, stdin, stdout, stderr, ConstructionMode::Ordinary)
-    }
-
-    /// Construct a kernel Cell with an authoritative root and readiness import.
-    pub fn kernel<R, W1, W2>(
-        program: Program,
-        stdin: R,
-        stdout: W1,
-        stderr: W2,
-        root: Arc<crate::vfs::CidTree>,
-        readiness_gate: Arc<authority::KernelReadyGate>,
+        filesystem: FilesystemOwnership,
     ) -> (Self, DataStreamHandles)
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -1231,6 +1316,32 @@ impl Builder {
             stdin,
             stdout,
             stderr,
+            filesystem,
+            ConstructionMode::Ordinary,
+        )
+    }
+
+    /// Construct a kernel Cell with an authoritative root and readiness import.
+    pub fn kernel<R, W1, W2>(
+        program: Program,
+        stdin: R,
+        stdout: W1,
+        stderr: W2,
+        root: Arc<crate::vfs::CidTree>,
+        readiness_gate: Arc<authority::KernelReadyGate>,
+        filesystem: FilesystemOwnership,
+    ) -> (Self, DataStreamHandles)
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+        W1: AsyncWrite + Send + Sync + Unpin + 'static,
+        W2: AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        Self::new(
+            program,
+            stdin,
+            stdout,
+            stderr,
+            filesystem,
             ConstructionMode::Kernel {
                 root,
                 readiness_gate,
@@ -1243,6 +1354,7 @@ impl Builder {
         stdin: R,
         stdout: W1,
         stderr: W2,
+        filesystem: FilesystemOwnership,
         mode: ConstructionMode,
     ) -> (Self, DataStreamHandles)
     where
@@ -1254,8 +1366,13 @@ impl Builder {
         let handles = DataStreamHandles {
             host_transport: Some(host_transport),
         };
-        let (filesystem_scope, filesystem_owner, filesystem_finalizer, filesystem_completion) =
-            FilesystemOwnership::new().into_parts();
+        let (
+            filesystem_resources,
+            filesystem_scope,
+            filesystem_owner,
+            filesystem_finalizer,
+            filesystem_completion,
+        ) = filesystem.into_parts();
         let builder = Self {
             env: Vec::new(),
             args: Vec::new(),
@@ -1270,6 +1387,7 @@ impl Builder {
             mode,
             fuel_estimator: None,
             fuel_observer: None,
+            filesystem_resources,
             filesystem_scope,
             filesystem_owner,
             filesystem_finalizer: Some(filesystem_finalizer),
@@ -1343,19 +1461,6 @@ impl Builder {
         self.filesystem_completion.clone()
     }
 
-    /// Replace the builder's fresh empty filesystem lifetime with ownership
-    /// created by the surrounding generation before its run future exists.
-    pub fn with_filesystem_ownership(mut self, ownership: FilesystemOwnership) -> Self {
-        let (scope, owner, finalizer, completion) = ownership.into_parts();
-        let old_owner = std::mem::replace(&mut self.filesystem_owner, owner);
-        let old_finalizer = self.filesystem_finalizer.replace(finalizer);
-        self.filesystem_scope = scope;
-        self.filesystem_completion = completion;
-        drop(old_owner);
-        drop(old_finalizer);
-        self
-    }
-
     pub fn take_filesystem_finalizer(&mut self) -> Option<cache::FsFinalizer> {
         self.filesystem_finalizer.take()
     }
@@ -1386,6 +1491,7 @@ impl Builder {
             mode: self.mode,
             fuel_estimator: self.fuel_estimator,
             fuel_observer: self.fuel_observer,
+            filesystem_resources: self.filesystem_resources,
             filesystem_scope: self.filesystem_scope,
             filesystem_owner: self.filesystem_owner,
             #[cfg(test)]
@@ -1424,6 +1530,7 @@ impl Proc {
             mode,
             fuel_estimator,
             fuel_observer,
+            filesystem_resources,
             filesystem_scope,
             filesystem_owner,
             #[cfg(test)]
@@ -1438,12 +1545,7 @@ impl Proc {
                 ));
             }
         }
-        let cache_mode = cache_mode
-            .map(|mut mode| {
-                mode.own_process_staging(&filesystem_scope)?;
-                Ok::<_, anyhow::Error>(Arc::new(mode))
-            })
-            .transpose()?;
+        let cache_mode = cache_mode.map(Arc::new);
         let (cid_tree, kernel_ready_gate) = match mode {
             ConstructionMode::Ordinary => (None, None),
             ConstructionMode::Kernel {
@@ -1493,6 +1595,14 @@ impl Proc {
             .envs(&envs)
             .args(&args);
 
+        // One Cell+Host logical charge and one foreground producer cover the
+        // serial private-directory/preopen setup. Cleanup authorization is
+        // admitted before each private effect and retains the same root/F.
+        let setup = filesystem_resources.host().try_cleanup_transaction(
+            filesystem_resources.try_logical_io()?,
+            &[&filesystem_scope],
+        )?;
+
         // Anchor the guest's WASI filesystem at `/` so wasi-libc has a
         // starting descriptor for absolute-path resolution. The preopened
         // path is `CidTree::staging_dir()` purely as a protocol anchor:
@@ -1505,13 +1615,20 @@ impl Proc {
         assert_send(&wasi_builder);
         let cid_tree_staging = cid_tree.as_ref().map(|tree| tree.staging_dir().to_owned());
         let setup_scope = filesystem_scope.clone();
-        let filesystem = filesystem_scope
+        let setup_resources = Arc::clone(&filesystem_resources);
+        let setup_context = setup.continuation();
+        let filesystem = setup
             .run_blocking(cache::FilesystemOperation::ProcessSetup, move || {
-                configure_process_filesystem(wasi_builder, cid_tree_staging, setup_scope)
+                configure_process_filesystem(
+                    wasi_builder,
+                    cid_tree_staging,
+                    setup_resources,
+                    setup_scope,
+                    setup_context,
+                )
             })
             .await
-            .map_err(|error| anyhow!(error))??;
-        let wasi = filesystem.wasi;
+            .map_err(|error| anyhow!(error))?;
 
         #[cfg(test)]
         if fail_after_filesystem_setup {
@@ -1519,24 +1636,37 @@ impl Proc {
         }
 
         let fuel_estimator = fuel_estimator.unwrap_or_else(|| FuelEstimator::new(INITIAL_FUEL));
-        let state = ComponentRunStates {
-            wasi_ctx: wasi,
-            resource_table: ResourceTable::new(),
-            granted_transport,
-            cache_mode,
-            filesystem_scope,
-            _filesystem_owner: filesystem_owner,
-            cid_tree,
-            fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
-            fuel_estimator,
-            epoch_clock,
-            opened_epoch,
-            pending_epoch: None,
-            returning_from_epoch_callback: false,
-            fuel_observer,
-            host_call_frames: HostCallFrames::default(),
-            kernel_ready_gate,
-        };
+        let state = filesystem.install(|filesystem| {
+            let filesystem = filesystem?;
+            Ok::<_, anyhow::Error>(ComponentRunStates {
+                wasi_ctx: filesystem.wasi,
+                resource_table: ResourceTable::new(),
+                granted_transport,
+                cache_mode,
+                filesystem_scope,
+                filesystem_resources,
+                _filesystem_owner: filesystem_owner,
+                cid_tree,
+                fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
+                fuel_estimator,
+                epoch_clock,
+                opened_epoch,
+                pending_epoch: None,
+                returning_from_epoch_callback: false,
+                fuel_observer,
+                host_call_frames: HostCallFrames::default(),
+                kernel_ready_gate,
+            })
+        })?;
+
+        drop(setup);
+
+        #[cfg(test)]
+        state.filesystem_scope.test_event(
+            cache::FilesystemOperation::ProcessSetup,
+            cache::FsTestStage::Published,
+            None,
+        );
 
         let mut store = Store::new(&engine, state);
 
@@ -1973,8 +2103,13 @@ mod tests {
         runtime_engine: &crate::engine::RuntimeEngine,
     ) -> ComponentRunStates {
         let (_host, granted_transport) = crate::p3::HostTransport::bounded_pair();
-        let (filesystem_scope, filesystem_owner, filesystem_finalizer, _completion) =
-            cache::FsScope::new();
+        let (
+            filesystem_resources,
+            filesystem_scope,
+            filesystem_owner,
+            filesystem_finalizer,
+            _completion,
+        ) = FilesystemOwnership::test().into_parts();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let _ = filesystem_finalizer.run().await;
@@ -1993,6 +2128,7 @@ mod tests {
             granted_transport,
             cache_mode: None,
             filesystem_scope,
+            filesystem_resources,
             _filesystem_owner: filesystem_owner,
             cid_tree: None,
             fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
@@ -2153,6 +2289,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let proc = builder
             .with_runtime_engine(runtime_engine)
@@ -2195,6 +2332,7 @@ mod tests {
                 tokio::io::empty(),
                 tokio::io::sink(),
                 tokio::io::sink(),
+                FilesystemOwnership::test(),
             );
             let proc = builder
                 .with_runtime_engine(runtime_engine)
@@ -2422,6 +2560,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             stderr_write,
+            FilesystemOwnership::test(),
         );
         builder.granted_transport =
             crate::p3::GrantedTransport::from_parts(FailingTransportReader, FailingTransportWriter);
@@ -2949,11 +3088,224 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         assert!(!builder.wasm_debug);
         assert!(builder.env.is_empty());
         assert!(builder.args.is_empty());
         assert!(matches!(builder.mode, ConstructionMode::Ordinary));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supplied_filesystem_ownership_uses_exactly_one_cleanup_root() {
+        let (host_owner, host) = cache::HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            cache::HostLimits::new(4, 2, 1).unwrap(),
+        )
+        .unwrap();
+        let resources = cache::CellResources::new(host.clone(), cache::CellLimits::new(1).unwrap());
+        let ownership = FilesystemOwnership::try_new(resources).unwrap();
+        assert_eq!(
+            match host.try_filesystem_scope() {
+                Ok(_) => panic!("cleanup root unexpectedly admitted"),
+                Err(error) => error.kind(),
+            },
+            cache::AdmissionKind::CleanupObligation
+        );
+
+        let (mut builder, _handles) = Builder::ordinary(
+            Program::Bytes(vec![0]),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+            ownership,
+        );
+        assert_eq!(
+            match host.try_filesystem_scope() {
+                Ok(_) => panic!("cleanup root unexpectedly admitted"),
+                Err(error) => error.kind(),
+            },
+            cache::AdmissionKind::CleanupObligation,
+            "Builder must consume the supplied root instead of reserving a replacement",
+        );
+        let completion = builder.filesystem_completion();
+        let finalizer = builder.take_filesystem_finalizer().unwrap();
+        drop(builder);
+        assert_eq!(finalizer.run().await, Ok(()));
+        assert_eq!(completion.wait().await, Ok(()));
+
+        let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+        drop(scope);
+        drop(owner);
+        assert_eq!(finalizer.run().await, Ok(()));
+        assert_eq!(completion.wait().await, Ok(()));
+        host_owner.close_admission();
+        host_owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_setup_logical_overload_has_no_filesystem_effect() {
+        let (host_owner, host) = cache::HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            cache::HostLimits::new(2, 2, 1).unwrap(),
+        )
+        .unwrap();
+        let resources = cache::CellResources::new(host, cache::CellLimits::new(1).unwrap());
+        let ownership = FilesystemOwnership::try_new(resources.clone()).unwrap();
+        let held_logical = resources.try_logical_io().unwrap();
+        let setup_events = Arc::new(AtomicUsize::new(0));
+        let observed = setup_events.clone();
+        let (runtime_engine, _publisher) = crate::engine::runtime_engine().unwrap();
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(wat::parse_str(P3_NOOP_COMMAND).unwrap()),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+            ownership,
+        );
+        let completion = builder.filesystem_completion();
+        builder
+            .filesystem_scope
+            .set_test_hook(Arc::new(move |event| {
+                if event.operation == cache::FilesystemOperation::ProcessSetup {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        let error = match builder.with_runtime_engine(runtime_engine).build().await {
+            Ok(_) => panic!("overloaded process setup unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<cache::AdmissionError>())
+                .map(cache::AdmissionError::kind),
+            Some(cache::AdmissionKind::CellLogical),
+        );
+        assert_eq!(setup_events.load(Ordering::SeqCst), 0);
+        drop(held_logical);
+        assert_eq!(completion.wait().await, Ok(()));
+        host_owner.close_admission();
+        host_owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_setup_foreground_overload_has_no_filesystem_effect() {
+        let (host_owner, host) = cache::HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            cache::HostLimits::new(2, 2, 1).unwrap(),
+        )
+        .unwrap();
+        let resources = cache::CellResources::new(host.clone(), cache::CellLimits::new(1).unwrap());
+        let ownership = FilesystemOwnership::try_new(resources).unwrap();
+        let held_foreground = host.try_foreground().unwrap();
+        let setup_events = Arc::new(AtomicUsize::new(0));
+        let observed = setup_events.clone();
+        let (runtime_engine, _publisher) = crate::engine::runtime_engine().unwrap();
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(wat::parse_str(P3_NOOP_COMMAND).unwrap()),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+            ownership,
+        );
+        let completion = builder.filesystem_completion();
+        builder
+            .filesystem_scope
+            .set_test_hook(Arc::new(move |event| {
+                if event.operation == cache::FilesystemOperation::ProcessSetup {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        let error = match builder.with_runtime_engine(runtime_engine).build().await {
+            Ok(_) => panic!("overloaded process setup unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<cache::AdmissionError>())
+                .map(cache::AdmissionError::kind),
+            Some(cache::AdmissionKind::ForegroundProducer),
+        );
+        assert_eq!(setup_events.load(Ordering::SeqCst), 0);
+        drop(held_foreground);
+        assert_eq!(completion.wait().await, Ok(()));
+        host_owner.close_admission();
+        host_owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_setup_releases_admission_before_compilation() {
+        let (host_owner, host) = cache::HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            cache::HostLimits::new(1, 2, 1).unwrap(),
+        )
+        .unwrap();
+        let resources = cache::CellResources::new(host.clone(), cache::CellLimits::new(1).unwrap());
+        let ownership = FilesystemOwnership::try_new(resources.clone()).unwrap();
+        let (runtime_engine, _publisher) = crate::engine::runtime_engine().unwrap();
+        let (builder, _handles) = Builder::ordinary(
+            Program::Bytes(wat::parse_str(P3_NOOP_COMMAND).unwrap()),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+            ownership,
+        );
+        let completion = builder.filesystem_completion();
+        let admission = Arc::new(std::sync::Mutex::new(None));
+        let observed = admission.clone();
+        let cleanup_paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_cleanup = cleanup_paths.clone();
+        let observed_host = host.clone();
+        builder
+            .filesystem_scope
+            .set_test_hook(Arc::new(move |event| {
+                if event.operation == cache::FilesystemOperation::ProcessSetup
+                    && event.stage == cache::FsTestStage::Published
+                {
+                    // Probe synchronously after installation, before compilation.
+                    // Release each probe before testing the next shared budget.
+                    let cell = resources.try_logical_io().map(drop).map_err(|e| e.kind());
+                    let host = observed_host
+                        .try_logical_io()
+                        .map(drop)
+                        .map_err(|e| e.kind());
+                    let foreground = observed_host
+                        .try_foreground()
+                        .map(drop)
+                        .map_err(|e| e.kind());
+                    let cleanup = observed_host
+                        .try_filesystem_scope()
+                        .map(drop)
+                        .map_err(|e| e.kind());
+                    *observed.lock().unwrap() = Some((cell, host, foreground, cleanup));
+                }
+                if event.operation == cache::FilesystemOperation::ProcessCleanup
+                    && event.stage == cache::FsTestStage::Completed
+                {
+                    observed_cleanup.lock().unwrap().push(event.path.unwrap());
+                }
+            }));
+
+        let proc = builder
+            .with_runtime_engine(runtime_engine)
+            .build()
+            .await
+            .unwrap();
+        drop(proc);
+        assert_eq!(completion.wait().await, Ok(()));
+        host_owner.close_admission();
+        host_owner.shutdown().await.unwrap();
+
+        assert_eq!(
+            admission.lock().unwrap().take(),
+            Some((Ok(()), Ok(()), Ok(()), Err(cache::AdmissionKind::CleanupObligation))),
+            "installed setup must release Cell/Host logical and foreground admission before compilation, while retaining cleanup ownership",
+        );
+        let paths = cleanup_paths.lock().unwrap();
+        assert_eq!(paths.len(), 2, "both private directories must be cleaned");
+        assert!(paths.iter().all(|path| !path.exists()));
     }
 
     #[test]
@@ -2963,6 +3315,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let builder = builder
             .with_wasm_debug(true)
@@ -2983,6 +3336,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
 
         let error = match builder.with_runtime_engine(runtime_engine).build().await {
@@ -3001,6 +3355,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let completion = builder.filesystem_completion();
         let finalizer = builder
@@ -3030,6 +3385,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let owner_thread = std::thread::current().id();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -3100,6 +3456,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let completion = builder.filesystem_completion();
         let finalizer = builder
@@ -3138,6 +3495,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
 
         let proc = builder
@@ -3169,6 +3527,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
 
         let proc = builder
@@ -3206,6 +3565,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let proc = builder
             .with_runtime_engine(runtime_engine)
@@ -3293,6 +3653,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let proc = builder
             .with_runtime_engine(runtime_engine)
@@ -3319,9 +3680,15 @@ mod tests {
 
     #[tokio::test]
     async fn byte_loaded_filesystem_uses_private_empty_root_and_cleans_scratch() {
-        let (scope, owner, finalizer, completion) = cache::FsScope::new();
-        let filesystem = configure_process_filesystem(WasiCtxBuilder::new(), None, scope)
-            .expect("configure byte-loaded roots");
+        let (resources, scope, owner, finalizer, completion) =
+            FilesystemOwnership::test().into_parts();
+        let setup = resources
+            .host()
+            .try_cleanup_transaction(resources.try_logical_io().unwrap(), &[&scope])
+            .unwrap();
+        let filesystem =
+            configure_process_filesystem(WasiCtxBuilder::new(), None, resources, scope, setup)
+                .expect("configure byte-loaded roots");
         let root_path = filesystem
             .image_root_path
             .as_ref()
@@ -3352,16 +3719,25 @@ mod tests {
     async fn image_backed_filesystem_retains_cid_tree_root_and_private_scratch() {
         let staging = tempfile::tempdir().expect("image staging");
         let root_cid = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
+        let (resources, scope, owner, finalizer, completion) =
+            FilesystemOwnership::test().into_parts();
         let tree = Arc::new(crate::vfs::CidTree::new(
             ipfs::cid_identity::parse_cid(root_cid).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.path().to_path_buf(),
+            Arc::clone(resources.host()),
+            scope.clone(),
         ));
-        let (scope, owner, finalizer, completion) = cache::FsScope::new();
+        let setup = resources
+            .host()
+            .try_cleanup_transaction(resources.try_logical_io().unwrap(), &[&scope])
+            .unwrap();
         let filesystem = configure_process_filesystem(
             WasiCtxBuilder::new(),
             Some(tree.staging_dir().to_owned()),
+            resources,
             scope,
+            setup,
         )
         .expect("configure image-backed roots");
 
@@ -3389,6 +3765,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
 
         let split = handles.take_host_split();
@@ -3413,6 +3790,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let mut proc = builder
             .with_runtime_engine(runtime_engine.clone())
@@ -3458,6 +3836,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let healthy_proc = builder
             .with_runtime_engine(runtime_engine)
@@ -3484,6 +3863,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let proc = builder
             .with_runtime_engine(runtime_engine.clone())
@@ -3532,6 +3912,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let healthy_proc = builder
             .with_runtime_engine(runtime_engine)
@@ -3560,6 +3941,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let proc = builder
             .with_runtime_engine(runtime_engine)
@@ -3732,6 +4114,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let proc = builder
             .with_runtime_engine(runtime_engine)
@@ -3768,6 +4151,7 @@ mod tests {
             tokio::io::empty(),
             tokio::io::sink(),
             tokio::io::sink(),
+            FilesystemOwnership::test(),
         );
         let proc = builder
             .with_runtime_engine(runtime_engine)
@@ -3982,6 +4366,7 @@ mod tests {
                 tokio::io::empty(),
                 tokio::io::sink(),
                 tokio::io::sink(),
+                FilesystemOwnership::test(),
             );
             let proc = builder
                 .with_runtime_engine(runtime_engine)

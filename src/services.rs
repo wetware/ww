@@ -26,6 +26,41 @@ use anyhow::{Context, Result};
 use cell::sched::EPOCH_TICK_MS;
 use tokio::sync::{mpsc, watch};
 
+#[cfg(test)]
+pub(crate) fn test_filesystem_resources() -> Arc<cache::HostResources> {
+    static RESOURCES: std::sync::OnceLock<Arc<cache::HostResources>> = std::sync::OnceLock::new();
+    Arc::clone(RESOURCES.get_or_init(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test Host runtime");
+        let (owner, resources) = cache::HostFsOwner::start(
+            runtime.handle().clone(),
+            cache::HostLimits::new(4_096, 1_025, 1_024).unwrap(),
+        )
+        .expect("test Host filesystem owner");
+        Box::leak(Box::new(runtime));
+        Box::leak(Box::new(owner));
+        resources
+    }))
+}
+
+#[cfg(test)]
+pub(crate) fn test_filesystem_scope() -> cache::FsScope {
+    static SCOPE: std::sync::OnceLock<cache::FsScope> = std::sync::OnceLock::new();
+    SCOPE
+        .get_or_init(|| {
+            let (scope, owner, finalizer, completion) = test_filesystem_resources()
+                .try_filesystem_scope()
+                .expect("test Host filesystem root");
+            Box::leak(Box::new(owner));
+            Box::leak(Box::new(finalizer));
+            drop(completion);
+            scope
+        })
+        .clone()
+}
+
 // ---------------------------------------------------------------------------
 // Service trait
 // ---------------------------------------------------------------------------
@@ -57,6 +92,8 @@ pub struct Host {
     shutdown_rx: watch::Receiver<()>,
     service_exit_tx: mpsc::UnboundedSender<ServiceExit>,
     service_exit_rx: mpsc::UnboundedReceiver<ServiceExit>,
+    filesystem_resources: Arc<cache::HostResources>,
+    filesystem_owner: Option<cache::HostFsOwner>,
 }
 
 /// An unexpected service-thread exit observed before host shutdown.
@@ -66,15 +103,12 @@ pub struct ServiceExit {
     pub error: Option<String>,
 }
 
-impl Default for Host {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Host {
     /// Create a new Host supervisor.
-    pub fn new() -> Self {
+    pub fn new(
+        filesystem_resources: Arc<cache::HostResources>,
+        filesystem_owner: cache::HostFsOwner,
+    ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let (service_exit_tx, service_exit_rx) = mpsc::unbounded_channel();
         Self {
@@ -83,7 +117,13 @@ impl Host {
             shutdown_rx,
             service_exit_tx,
             service_exit_rx,
+            filesystem_resources,
+            filesystem_owner: Some(filesystem_owner),
         }
+    }
+
+    pub fn filesystem_resources(&self) -> &Arc<cache::HostResources> {
+        &self.filesystem_resources
     }
 
     /// Get a shutdown receiver for passing to services or other components.
@@ -150,20 +190,47 @@ impl Host {
     ///
     /// Panicked or errored threads are logged but don't prevent other
     /// threads from shutting down.
-    pub fn shutdown(self) {
+    pub fn close_filesystem_admission(&self) {
+        self.filesystem_owner
+            .as_ref()
+            .expect("filesystem owner already shut down")
+            .close_admission();
+    }
+
+    pub async fn shutdown_filesystem(&mut self) -> Result<()> {
+        let Some(owner) = self.filesystem_owner.take() else {
+            return Ok(());
+        };
+        owner.shutdown().await.map_err(anyhow::Error::from)
+    }
+
+    pub async fn shutdown_services(mut self) {
         drop(self.shutdown_tx);
-        for (name, handle) in self.threads {
-            match handle.join() {
-                Ok(Ok(())) => tracing::info!(name, "service stopped"),
-                Ok(Err(e)) => tracing::error!(name, error = %e, "service failed"),
-                Err(panic) => {
-                    let msg = panic
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                        .unwrap_or("<non-string panic>");
-                    tracing::error!(name, panic = msg, "service panicked");
-                }
+        let threads = std::mem::take(&mut self.threads);
+        let _ = tokio::task::spawn_blocking(move || join_service_threads(threads)).await;
+    }
+
+    pub async fn shutdown(mut self) {
+        self.close_filesystem_admission();
+        if let Err(error) = self.shutdown_filesystem().await {
+            tracing::error!(%error, "filesystem services failed to shut down");
+        }
+        self.shutdown_services().await;
+    }
+}
+
+fn join_service_threads(threads: Vec<(String, JoinHandle<Result<()>>)>) {
+    for (name, handle) in threads {
+        match handle.join() {
+            Ok(Ok(())) => tracing::info!(name, "service stopped"),
+            Ok(Err(e)) => tracing::error!(name, error = %e, "service failed"),
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string panic>");
+                tracing::error!(name, panic = msg, "service panicked");
             }
         }
     }
@@ -210,6 +277,7 @@ pub struct ExecutorPool {
     /// Shared engine for all cells. Callers pass this to `cell::Builder` so
     /// all cells on a worker respond to `increment_epoch()` on the same engine.
     runtime_engine: cell::engine::RuntimeEngine,
+    filesystem_resources: Arc<cache::HostResources>,
 }
 
 impl ExecutorPool {
@@ -217,7 +285,11 @@ impl ExecutorPool {
     ///
     /// Each worker thread runs its own `current_thread` tokio runtime.
     /// Pass `0` to use `std::thread::available_parallelism()`.
-    pub fn try_new(n: usize, shutdown: watch::Receiver<()>) -> Result<Self> {
+    pub fn try_new(
+        n: usize,
+        shutdown: watch::Receiver<()>,
+        filesystem_resources: Arc<cache::HostResources>,
+    ) -> Result<Self> {
         let n = if n == 0 {
             std::thread::available_parallelism()
                 .map(|p| p.get())
@@ -262,14 +334,19 @@ impl ExecutorPool {
             cell_counts,
             next: AtomicUsize::new(0),
             runtime_engine,
+            filesystem_resources,
         })
     }
 
     /// Create a new executor pool, panicking on startup errors.
     ///
     /// Prefer `try_new` in startup paths that should return typed errors.
-    pub fn new(n: usize, shutdown: watch::Receiver<()>) -> Self {
-        Self::try_new(n, shutdown).unwrap_or_else(|e| panic!("{e:#}"))
+    pub fn new(
+        n: usize,
+        shutdown: watch::Receiver<()>,
+        filesystem_resources: Arc<cache::HostResources>,
+    ) -> Self {
+        Self::try_new(n, shutdown, filesystem_resources).unwrap_or_else(|e| panic!("{e:#}"))
     }
 
     /// Submit a cell to the pool using least-loaded assignment.
@@ -322,6 +399,24 @@ impl ExecutorPool {
     pub fn runtime_engine(&self) -> cell::engine::RuntimeEngine {
         self.runtime_engine.clone()
     }
+
+    pub fn filesystem_resources(&self) -> &Arc<cache::HostResources> {
+        &self.filesystem_resources
+    }
+
+    pub async fn shutdown_and_join(mut self) {
+        self.senders.clear();
+        let mut threads = std::mem::take(&mut self.threads);
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            for handle in &mut threads {
+                join_executor_thread(handle);
+            }
+        })
+        .await
+        {
+            tracing::error!(%error, "executor join task failed");
+        }
+    }
 }
 
 impl Drop for ExecutorPool {
@@ -330,19 +425,23 @@ impl Drop for ExecutorPool {
         self.senders.clear();
         // Join all worker threads.
         for handle in &mut self.threads {
-            if let Some(h) = handle.take() {
-                match h.join() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::error!(error = %e, "executor worker failed"),
-                    Err(panic) => {
-                        let msg = panic
-                            .downcast_ref::<&str>()
-                            .copied()
-                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                            .unwrap_or("<non-string panic>");
-                        tracing::error!(panic = msg, "executor worker panicked");
-                    }
-                }
+            join_executor_thread(handle);
+        }
+    }
+}
+
+fn join_executor_thread(handle: &mut Option<JoinHandle<Result<()>>>) {
+    if let Some(handle) = handle.take() {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(%error, "executor worker failed"),
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string panic>");
+                tracing::error!(panic = message, "executor worker panicked");
             }
         }
     }
@@ -815,6 +914,28 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
+    fn test_host() -> Host {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test Host runtime");
+        let (owner, resources) = cache::HostFsOwner::start(
+            runtime.handle().clone(),
+            cache::HostLimits::new(128, 65, 64).unwrap(),
+        )
+        .expect("test Host filesystem owner");
+        Box::leak(Box::new(runtime));
+        Host::new(resources, owner)
+    }
+
+    fn shutdown_host(host: Host) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test shutdown runtime")
+            .block_on(host.shutdown());
+    }
+
     /// A minimal service that sets a flag and waits for shutdown.
     struct FlagService {
         flag: Arc<AtomicBool>,
@@ -835,7 +956,7 @@ mod tests {
 
     #[test]
     fn host_spawns_and_shuts_down_services() {
-        let mut host = Host::new();
+        let mut host = test_host();
         let flag1 = Arc::new(AtomicBool::new(false));
         let flag2 = Arc::new(AtomicBool::new(false));
 
@@ -863,13 +984,13 @@ mod tests {
             "service 2 should have started"
         );
 
-        host.shutdown();
+        shutdown_host(host);
     }
 
     #[test]
     fn executor_pool_runs_cells() {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(2, shutdown_rx);
+        let pool = ExecutorPool::new(2, shutdown_rx, test_filesystem_resources());
 
         let (tx, rx) = std::sync::mpsc::channel();
         let request = SpawnRequest {
@@ -895,7 +1016,7 @@ mod tests {
     #[test]
     fn executor_pool_least_loaded_assignment() {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(2, shutdown_rx);
+        let pool = ExecutorPool::new(2, shutdown_rx, test_filesystem_resources());
 
         // Spawn a long-running cell on one worker.
         let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
@@ -940,7 +1061,7 @@ mod tests {
             }
         }
 
-        let mut host = Host::new();
+        let mut host = test_host();
         host.spawn("fail-svc", FailService);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -951,7 +1072,7 @@ mod tests {
             .expect("service exit event");
         assert_eq!(exit.name, "fail-svc");
         assert_eq!(exit.error.as_deref(), Some("intentional failure"));
-        host.shutdown();
+        shutdown_host(host);
     }
 
     #[test]
@@ -963,7 +1084,7 @@ mod tests {
             }
         }
 
-        let mut host = Host::new();
+        let mut host = test_host();
         host.spawn("panic-svc", PanicService);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -977,13 +1098,13 @@ mod tests {
             exit.error.as_deref(),
             Some("service panicked: intentional panic")
         );
-        host.shutdown();
+        shutdown_host(host);
     }
 
     #[test]
     fn executor_pool_spawn_after_shutdown() {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(1, shutdown_rx);
+        let pool = ExecutorPool::new(1, shutdown_rx, test_filesystem_resources());
 
         // Shut down the pool.
         drop(shutdown_tx);
@@ -1004,7 +1125,7 @@ mod tests {
     #[test]
     fn round_robin_distributes_across_idle_workers() {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(4, shutdown_rx);
+        let pool = ExecutorPool::new(4, shutdown_rx, test_filesystem_resources());
 
         // Spawn 4 short cells. With round-robin on idle workers,
         // they should distribute across all 4 workers (not all to worker 0).
@@ -1036,7 +1157,7 @@ mod tests {
     #[test]
     fn spawn_request_result_tx_receives_exit_code() {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(1, shutdown_rx);
+        let pool = ExecutorPool::new(1, shutdown_rx, test_filesystem_resources());
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let request = SpawnRequest {
@@ -1056,7 +1177,7 @@ mod tests {
     #[test]
     fn spawn_request_panic_sends_error_via_result_tx() {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(1, shutdown_rx);
+        let pool = ExecutorPool::new(1, shutdown_rx, test_filesystem_resources());
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let request = SpawnRequest {
@@ -1077,13 +1198,139 @@ mod tests {
         drop(shutdown_tx);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn executor_shutdown_joins_admitted_cell_and_reports_cancellation() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        let pool = ExecutorPool::new(1, shutdown_rx, test_filesystem_resources());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        assert!(pool
+            .spawn(SpawnRequest {
+                name: "admitted-shutdown".into(),
+                factory: Box::new(move |_shutdown| {
+                    Box::pin(async move {
+                        let _ = entered_tx.send(());
+                        std::future::pending::<()>().await;
+                    })
+                }),
+                result_tx: Some(result_tx),
+            })
+            .is_ok());
+        entered_rx.await.expect("admitted cell started");
+
+        pool.shutdown_and_join().await;
+        let error = result_rx
+            .await
+            .expect("worker must settle the admitted result")
+            .unwrap_err();
+        assert!(error.to_string().contains("executor shutting down"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_failure_runs_ordered_filesystem_teardown() {
+        let mut host = test_host();
+        let resources = Arc::clone(host.filesystem_resources());
+        let (scope, owner, finalizer, completion) = resources.try_filesystem_scope().unwrap();
+        let setup = resources
+            .try_cleanup_transaction(resources.try_logical_io().unwrap(), &[&scope])
+            .unwrap();
+        let cleanup = setup.try_cleanup_phase().unwrap();
+        let cleanup_scope = scope.clone();
+        let path = setup
+            .run_blocking(
+                cache::FilesystemOperation::ProcessSetup,
+                tempfile::TempDir::new,
+            )
+            .await
+            .unwrap()
+            .install(|directory| {
+                let directory = directory.unwrap();
+                let path = directory.path().to_owned();
+                cleanup_scope
+                    .own_cleanup_from_phase(
+                        cleanup,
+                        cache::FilesystemOperation::ProcessCleanup,
+                        move || directory.close(),
+                    )
+                    .unwrap();
+                path
+            });
+        drop(setup);
+        assert!(path.exists());
+
+        let startup_result = Err::<(), _>(anyhow::anyhow!("injected startup failure"));
+        host.close_filesystem_admission();
+        drop(scope);
+        drop(owner);
+        assert_eq!(finalizer.run().await, Ok(()));
+        assert_eq!(completion.wait().await, Ok(()));
+        host.shutdown_filesystem().await.unwrap();
+        host.shutdown_services().await;
+
+        assert!(startup_result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_shutdown_waits_for_admitted_work_and_root_cleanup() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let mut host = test_host();
+        let resources = Arc::clone(host.filesystem_resources());
+        let (scope, owner, finalizer, completion) = resources.try_filesystem_scope().unwrap();
+        let setup = resources
+            .try_cleanup_transaction(resources.try_logical_io().unwrap(), &[&scope])
+            .unwrap();
+        let cleanup = setup.try_cleanup_phase().unwrap();
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().to_owned();
+        scope
+            .own_cleanup_from_phase(
+                cleanup,
+                cache::FilesystemOperation::ProcessCleanup,
+                move || directory.close(),
+            )
+            .unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        setup.spawn_retained_terminal(
+            cache::FilesystemOperation::ProcessSetup,
+            async move {
+                let _ = release_rx.await;
+            },
+            move |result| {
+                let _ = terminal_tx.send(result);
+            },
+        );
+
+        host.close_filesystem_admission();
+        drop(scope);
+        drop(owner);
+        let mut shutdown = Box::pin(host.shutdown_filesystem());
+        std::future::poll_fn(|context| {
+            assert!(matches!(shutdown.as_mut().poll(context), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        assert!(path.exists());
+
+        release_tx.send(()).unwrap();
+        shutdown.await.unwrap();
+        terminal_rx.await.unwrap().unwrap();
+        assert_eq!(finalizer.run().await, Ok(()));
+        assert_eq!(completion.wait().await, Ok(()));
+        assert!(!path.exists());
+        host.shutdown_services().await;
+    }
+
     #[test]
     fn bounded_channel_rejects_after_shutdown() {
         // After shutdown the worker stops pulling from the channel.
         // We verify try_send fails on a closed channel, confirming
         // the bounded mpsc is wired correctly.
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(1, shutdown_rx);
+        let pool = ExecutorPool::new(1, shutdown_rx, test_filesystem_resources());
 
         // Shut down workers so the channel closes.
         drop(shutdown_tx);
@@ -1103,7 +1350,7 @@ mod tests {
     #[test]
     fn executor_pool_drop_joins_workers() {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(2, shutdown_rx);
+        let pool = ExecutorPool::new(2, shutdown_rx, test_filesystem_resources());
 
         // Spawn a cell so workers are doing real work.
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1153,7 +1400,7 @@ mod tests {
 
         for close_spawn_channel in [false, true] {
             let (shutdown_tx, shutdown_rx) = watch::channel(());
-            let pool = ExecutorPool::new(1, shutdown_rx);
+            let pool = ExecutorPool::new(1, shutdown_rx, test_filesystem_resources());
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             assert!(pool
                 .spawn(SpawnRequest {
@@ -1238,7 +1485,7 @@ mod tests {
     #[test]
     fn executor_pool_publishes_epochs_and_closes_the_clock_on_drop() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(1, shutdown_rx);
+        let pool = ExecutorPool::new(1, shutdown_rx, test_filesystem_resources());
         let mut subscription = pool.runtime_engine().subscribe();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1280,7 +1527,7 @@ mod tests {
     fn executor_pool_auto_detect_parallelism() {
         // n=0 should auto-detect available parallelism.
         let (_shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(0, shutdown_rx);
+        let pool = ExecutorPool::new(0, shutdown_rx, test_filesystem_resources());
         assert!(
             pool.worker_count() >= 1,
             "auto-detected pool should have at least 1 worker"
@@ -1291,7 +1538,7 @@ mod tests {
     fn spawn_request_no_result_tx_fire_and_forget() {
         // Cells without result_tx should complete without error.
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(1, shutdown_rx);
+        let pool = ExecutorPool::new(1, shutdown_rx, test_filesystem_resources());
 
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let request = SpawnRequest {

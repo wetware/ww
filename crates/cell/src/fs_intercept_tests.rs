@@ -17,10 +17,12 @@ struct Harness {
     cache: Option<Arc<cache::CacheMode>>,
     pinner: Arc<CountingPinner>,
     tree: Option<Arc<CidTree>>,
+    resources: Arc<cache::CellResources>,
     descriptors: DescriptorContexts,
     filesystem_scope: cache::FsScope,
     _filesystem_owner: cache::FsOwner,
     _filesystem_finalizer: cache::FsFinalizer,
+    _host_owner: cache::HostFsOwner,
     staging: tempfile::TempDir,
     scratch: tempfile::TempDir,
 }
@@ -38,6 +40,7 @@ impl FilesystemHostState for Harness {
             table: &mut self.table,
             cache_mode: &self.cache,
             cid_tree: &self.tree,
+            filesystem_resources: &self.resources,
             filesystem_scope: &self.filesystem_scope,
             descriptors: &mut self.descriptors,
         }
@@ -72,7 +75,7 @@ fn listing(staging: &std::path::Path, cid: &str, children: &[(&str, &str, bool)]
     )
     .unwrap();
 }
-fn harness() -> (Store<Harness>, u32, u32) {
+async fn harness() -> (Store<Harness>, u32, u32) {
     let staging = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
     listing(
@@ -91,32 +94,55 @@ fn harness() -> (Store<Harness>, u32, u32) {
     );
     listing(staging.path(), DEEPER, &[("child", DEEPER, false)]);
     listing(staging.path(), SIBLING, &[("child", SIBLING, false)]);
+    let (host_owner, host) = cache::HostFsOwner::start(
+        tokio::runtime::Handle::current(),
+        cache::HostLimits::default(),
+    )
+    .unwrap();
+    let resources = cache::CellResources::new(Arc::clone(&host), cache::CellLimits::default());
+    let (filesystem_scope, filesystem_owner, filesystem_finalizer, _) =
+        host.try_filesystem_scope().unwrap();
     let tree = Arc::new(CidTree::new(
         ipfs::cid_identity::parse_cid(ROOT).unwrap(),
         ipfs::HttpClient::new("http://127.0.0.1:1".into()),
         staging.path().into(),
+        Arc::clone(&host),
+        filesystem_scope.clone(),
     ));
     let mut builder = WasiCtxBuilder::new();
+    install_native_filesystem_hook(
+        &mut builder,
+        Arc::clone(&resources),
+        filesystem_scope.clone(),
+    );
     builder
         .preopened_dir(staging.path(), "/", FsPerms::ReadOnly)
         .unwrap()
         .preopened_dir(scratch.path(), "/tmp", FsPerms::ReadWrite)
         .unwrap();
     let pinner = Arc::new(CountingPinner::default());
+    let setup_logical = resources.try_logical_io().unwrap();
+    let setup = host
+        .try_cleanup_transaction(setup_logical, &[&filesystem_scope])
+        .unwrap();
     let cache = Some(Arc::new(cache::CacheMode::Isolated(
-        cache::IsolatedPinset::new(pinner.clone()).unwrap(),
+        cache::IsolatedPinset::new(pinner.clone(), filesystem_scope.clone(), &setup)
+            .await
+            .unwrap(),
     )));
-    let (filesystem_scope, filesystem_owner, filesystem_finalizer, _) = cache::FsScope::new();
+    drop(setup);
     let mut state = Harness {
         wasi: builder.build(),
         table: ResourceTable::new(),
         cache,
         pinner,
         tree: Some(tree),
+        resources,
         descriptors: DescriptorContexts::default(),
         filesystem_scope,
         _filesystem_owner: filesystem_owner,
         _filesystem_finalizer: filesystem_finalizer,
+        _host_owner: host_owner,
         staging,
         scratch,
     };
@@ -132,6 +158,21 @@ fn harness() -> (Store<Harness>, u32, u32) {
     config.wasm_component_model_async(true);
     let engine = Engine::new(&config).unwrap();
     (Store::new(&engine, state), root, tmp)
+}
+
+fn test_tree(
+    store: &Store<Harness>,
+    root: cid::Cid,
+    ipfs: ipfs::HttpClient,
+    staging: std::path::PathBuf,
+) -> Arc<CidTree> {
+    Arc::new(CidTree::new(
+        root,
+        ipfs,
+        staging,
+        Arc::clone(store.data().resources.host()),
+        store.data().filesystem_scope.clone(),
+    ))
 }
 async fn open(
     store: &mut Store<Harness>,
@@ -172,18 +213,150 @@ async fn read_open(
     .await
 }
 
+async fn get_type(
+    store: &mut Store<Harness>,
+    descriptor: u32,
+) -> Result<p3_types::DescriptorType, p3_types::ErrorCode> {
+    store
+        .run_concurrent(async |access| {
+            let access = access.with_getter::<IpfsFilesystem>(Harness::intercepted_filesystem);
+            <IpfsFilesystem as p3_types::HostDescriptorWithStore<Harness>>::get_type(
+                &access,
+                Resource::new_borrow(descriptor),
+            )
+            .await
+            .map_err(|error| error.downcast().expect("filesystem error"))
+        })
+        .await
+        .unwrap()
+}
+
+async fn get_flags(
+    store: &mut Store<Harness>,
+    descriptor: u32,
+) -> Result<p3_types::DescriptorFlags, p3_types::ErrorCode> {
+    store
+        .run_concurrent(async |access| {
+            let access = access.with_getter::<IpfsFilesystem>(Harness::intercepted_filesystem);
+            <IpfsFilesystem as p3_types::HostDescriptorWithStore<Harness>>::get_flags(
+                &access,
+                Resource::new_borrow(descriptor),
+            )
+            .await
+            .map_err(|error| error.downcast().expect("filesystem error"))
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn directory_type_is_constant_but_file_queries_and_identity_stay_charged() {
+    let (mut store, root, tmp) = harness().await;
+    let limited = cache::CellResources::new(
+        Arc::clone(store.data().resources.host()),
+        cache::CellLimits::new(1).unwrap(),
+    );
+    let hook_resources = Arc::clone(&limited);
+    let hook_scope = store.data().filesystem_scope.clone();
+    store
+        .data_mut()
+        .wasi
+        .filesystem()
+        .set_operation_hook(move || {
+            admit_native_filesystem_operation(&hook_resources, &hook_scope)
+        });
+    store.data_mut().resources = Arc::clone(&limited);
+
+    let file_path = store.data().scratch.path().join("type-probe");
+    std::fs::write(&file_path, b"probe").unwrap();
+    let file = store
+        .data_mut()
+        .table
+        .push(open_read_only_path(&file_path).unwrap())
+        .unwrap();
+    let held = limited.try_logical_io().unwrap();
+
+    assert_error(
+        read_open(&mut store, root, "child").await,
+        p3_types::ErrorCode::Busy,
+    );
+    assert_error(
+        open(
+            &mut store,
+            root,
+            "child",
+            p3_types::OpenFlags::CREATE,
+            p3_types::DescriptorFlags::READ,
+        )
+        .await,
+        p3_types::ErrorCode::NotPermitted,
+    );
+    assert_error(
+        read_open(&mut store, root, "../child").await,
+        p3_types::ErrorCode::Invalid,
+    );
+    assert_eq!(
+        store
+            .data()
+            .pinner
+            .0
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "rejected virtual admission must not begin resolution or materialization"
+    );
+
+    assert!(matches!(
+        get_type(&mut store, root).await.unwrap(),
+        p3_types::DescriptorType::Directory
+    ));
+    assert_error(
+        get_type(&mut store, file.rep()).await,
+        p3_types::ErrorCode::Busy,
+    );
+    assert_error(
+        get_flags(&mut store, file.rep()).await,
+        p3_types::ErrorCode::Busy,
+    );
+
+    let identity = store
+        .run_concurrent(async |access| {
+            let access = access.with_getter::<IpfsFilesystem>(Harness::intercepted_filesystem);
+            <IpfsFilesystem as p3_types::HostDescriptorWithStore<Harness>>::is_same_object(
+                &access,
+                Resource::new_borrow(root),
+                Resource::new_borrow(tmp),
+            )
+            .await
+        })
+        .await
+        .unwrap();
+    let error = identity.expect_err("identity rejection must remain a typed host error");
+    assert!(matches!(
+        error.downcast_ref::<FilesystemOperationError>(),
+        Some(FilesystemOperationError::Rejected)
+    ));
+
+    drop(held);
+    assert!(matches!(
+        get_type(&mut store, file.rep()).await.unwrap(),
+        p3_types::DescriptorType::RegularFile
+    ));
+}
+
 #[tokio::test]
 async fn alias_root_routes_through_own_tree() {
-    let (mut store, _, _) = harness();
+    let (mut store, _, _) = harness().await;
     let cid: cid::Cid = NESTED.parse().unwrap();
     let alias = cid
         .to_string_of_base(cid::multibase::Base::Base58Btc)
         .unwrap();
-    store.data_mut().tree = Some(Arc::new(CidTree::new(
+    let tree = test_tree(
+        &store,
         ipfs::cid_identity::parse_cid(&alias).unwrap(),
         ipfs::HttpClient::new("http://127.0.0.1:1".into()),
         store.data().staging.path().into(),
-    )));
+    );
+    store.data_mut().tree = Some(tree);
     let dirs =
         p3_preopens::Host::get_directories(&mut store.data_mut().intercepted_filesystem()).unwrap();
     let root = dirs.iter().find(|(_, path)| path == "/").unwrap().0.rep();
@@ -218,7 +391,7 @@ async fn alias_root_routes_through_own_tree() {
 
 #[tokio::test]
 async fn slash_bearing_bare_alias_does_not_change_single_segment_path_grammar() {
-    let (mut store, _, _) = harness();
+    let (mut store, _, _) = harness().await;
     let cid = cid::Cid::new_v1(
         0x55,
         cid::multihash::Multihash::<64>::wrap(0x12, &[255; 32]).unwrap(),
@@ -227,11 +400,13 @@ async fn slash_bearing_bare_alias_does_not_change_single_segment_path_grammar() 
     assert!(alias.contains('/'));
     assert_eq!(ipfs::cid_identity::parse_cid(&alias).unwrap(), cid);
 
-    store.data_mut().tree = Some(Arc::new(CidTree::new(
+    let tree = test_tree(
+        &store,
         cid,
         ipfs::HttpClient::new("http://127.0.0.1:1".into()),
         store.data().staging.path().into(),
-    )));
+    );
+    store.data_mut().tree = Some(tree);
     let dirs =
         p3_preopens::Host::get_directories(&mut store.data_mut().intercepted_filesystem()).unwrap();
     let root = dirs.iter().find(|(_, path)| path == "/").unwrap().0.rep();
@@ -253,7 +428,7 @@ async fn slash_bearing_bare_alias_does_not_change_single_segment_path_grammar() 
 
 #[tokio::test]
 async fn chained_directory_opens_keep_base_context() {
-    let (mut store, root, _) = harness();
+    let (mut store, root, _) = harness().await;
     let nested = read_open(&mut store, root, "nested").await.unwrap();
     // Only /nested has a deeper directory. Restarting at root returns NoEntry.
     let deeper = read_open(&mut store, nested.rep(), "deeper").await;
@@ -263,7 +438,7 @@ async fn chained_directory_opens_keep_base_context() {
 #[tokio::test]
 async fn immutable_flags_reject_before_lookup_or_staging() {
     use p3_types::{DescriptorFlags as D, ErrorCode as E, OpenFlags as O};
-    let (mut store, root, _) = harness();
+    let (mut store, root, _) = harness().await;
     let before = std::fs::read_dir(store.data().staging.path())
         .unwrap()
         .count();
@@ -317,7 +492,7 @@ async fn immutable_flags_reject_before_lookup_or_staging() {
 #[tokio::test]
 async fn file_base_and_target_types_have_exact_errors() {
     use p3_types::{DescriptorFlags as D, ErrorCode as E, OpenFlags as O};
-    let (mut store, root, _) = harness();
+    let (mut store, root, _) = harness().await;
     for (path, flags, error) in [
         ("child", O::DIRECTORY, E::NotDirectory),
         ("child/", O::empty(), E::NotDirectory),
@@ -342,7 +517,10 @@ async fn file_base_and_target_types_have_exact_errors() {
     assert!(read_open(&mut store, root, "nested").await.is_ok());
 }
 
-fn assert_error(result: Result<Fd, p3_types::ErrorCode>, expected: p3_types::ErrorCode) {
+fn assert_error<T: std::fmt::Debug>(
+    result: Result<T, p3_types::ErrorCode>,
+    expected: p3_types::ErrorCode,
+) {
     let actual = result.unwrap_err();
     assert_eq!(
         std::mem::discriminant(&actual),
@@ -415,7 +593,7 @@ async fn create_directory(store: &mut Store<Harness>, base: u32, path: &str) {
 
 #[tokio::test]
 async fn simultaneous_descriptors_select_distinct_same_name_children() {
-    let (mut store, root, _) = harness();
+    let (mut store, root, _) = harness().await;
     let nested = read_open(&mut store, root, "nested").await.unwrap();
     let sibling = read_open(&mut store, root, "sibling").await.unwrap();
     let deeper = read_open(&mut store, nested.rep(), "deeper").await.unwrap();
@@ -433,7 +611,7 @@ async fn simultaneous_descriptors_select_distinct_same_name_children() {
 
 #[tokio::test]
 async fn descriptors_retain_root_snapshot_and_namespace_after_swap() {
-    let (mut store, root, _) = harness();
+    let (mut store, root, _) = harness().await;
     let nested = read_open(&mut store, root, "nested").await.unwrap();
     store
         .data()
@@ -450,11 +628,13 @@ async fn descriptors_retain_root_snapshot_and_namespace_after_swap() {
     let new_root = dirs.iter().find(|(_, path)| path == "/").unwrap().0.rep();
     let file = read_open(&mut store, new_root, "child").await.unwrap();
     assert_eq!(read_contents(&store, &file), "sibling");
-    store.data_mut().tree = Some(Arc::new(CidTree::new(
+    let tree = test_tree(
+        &store,
         ipfs::cid_identity::parse_cid(DEEPER).unwrap(),
         ipfs::HttpClient::new("http://127.0.0.1:1".into()),
         store.data().staging.path().into(),
-    )));
+    );
+    store.data_mut().tree = Some(tree);
     let deeper = read_open(&mut store, nested.rep(), "deeper").await.unwrap();
     let file = read_open(&mut store, deeper.rep(), "child").await.unwrap();
     assert_eq!(read_contents(&store, &file), "deeper");
@@ -463,7 +643,7 @@ async fn descriptors_retain_root_snapshot_and_namespace_after_swap() {
 #[tokio::test]
 async fn drop_and_resource_id_reuse_clear_all_descriptor_context() {
     use p3_types::{DescriptorFlags as D, ErrorCode as E, OpenFlags as O};
-    let (mut store, root, tmp) = harness();
+    let (mut store, root, tmp) = harness().await;
     let nested = read_open(&mut store, root, "nested").await.unwrap();
     let id = nested.rep();
     drop_descriptor(&mut store, nested);
@@ -517,7 +697,7 @@ async fn drop_and_resource_id_reuse_clear_all_descriptor_context() {
 #[tokio::test]
 async fn nested_paths_stay_in_namespace_and_preserve_literal_spellings() {
     use p3_types::ErrorCode as E;
-    let (mut store, root, _) = harness();
+    let (mut store, root, _) = harness().await;
     let nested = read_open(&mut store, root, "nested").await.unwrap();
     for path in [
         "..",
@@ -555,7 +735,7 @@ async fn nested_paths_stay_in_namespace_and_preserve_literal_spellings() {
 #[tokio::test]
 async fn writable_tmp_delegates_and_does_not_inherit_cidtree_context() {
     use p3_types::{DescriptorFlags as D, OpenFlags as O};
-    let (mut store, root, tmp) = harness();
+    let (mut store, root, tmp) = harness().await;
     let nested = read_open(&mut store, root, "nested").await.unwrap();
     let reused_id = nested.rep();
     drop_descriptor(&mut store, nested);
@@ -580,7 +760,7 @@ async fn writable_tmp_delegates_and_does_not_inherit_cidtree_context() {
 #[tokio::test]
 async fn nested_writable_tmp_descriptor_preserves_writable_semantics() {
     use p3_types::{DescriptorFlags as D, OpenFlags as O};
-    let (mut store, _, tmp) = harness();
+    let (mut store, _, tmp) = harness().await;
 
     create_directory(&mut store, tmp, "nested").await;
     let nested = open(
@@ -633,15 +813,16 @@ async fn nested_writable_tmp_descriptor_preserves_writable_semantics() {
 #[tokio::test]
 async fn mutation_on_uncached_root_does_not_request_a_listing() {
     use p3_types::{DescriptorFlags as D, ErrorCode as E, OpenFlags as O};
-    let (mut store, _, _) = harness();
+    let (mut store, _, _) = harness().await;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let staging = tempfile::tempdir().unwrap();
-    let tree = Arc::new(CidTree::new(
+    let tree = test_tree(
+        &store,
         ipfs::cid_identity::parse_cid(ROOT).unwrap(),
         ipfs::HttpClient::new(format!("http://{}", listener.local_addr().unwrap())),
         staging.path().into(),
-    ));
+    );
     store.data_mut().tree = Some(tree);
     let dirs =
         p3_preopens::Host::get_directories(&mut store.data_mut().intercepted_filesystem()).unwrap();

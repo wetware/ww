@@ -11,7 +11,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   certification.** Lazy file and directory staging, descriptor access, and
   private-tree deletion run under an owned filesystem lifetime. Cancellation,
   process exit, pool shutdown, and generation replacement retain admitted work;
-  cleanup acknowledgements wait for actual work and private cleanup.
+  cleanup acknowledgements wait for actual work and private cleanup. One finite
+  Host resource authority now reaches deployment staging, caches, runtime
+  factories, and every Cell; per-Cell logical limits and pre-effect cleanup-root
+  reservation reject overload without creating private state. Startup failures
+  and normal exit share an ordered drain that keeps executor, RPC, Host-driver,
+  and dedicated cleanup scheduling alive until repeatable completion proofs are
+  available.
 - **Dialed streams now propagate clean peer EOF to guest reads.** The guest
   retains a usable write direction after the peer half-closes its output.
 - **Finite WAGI responses now complete at the P3 stdout flush boundary.**
@@ -21,6 +27,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- **Wasmtime uses Wetware's exact filesystem-lifecycle merge.** The coherent
+  `wasmtime`, `wasmtime-wasi`, and `wasmtime-wasi-io` pin adds synchronous
+  native-filesystem admission and retained opaque ownership through actual
+  work and native-result cleanup.
 - **Networking dependencies use rust-libp2p 0.57.** The refreshed temporary
   `rust-ipns` V2-only fix uses the same identity generation as Wetware.
 - **Finite WAGI completion regressions now cover every terminal write state.**

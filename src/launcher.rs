@@ -71,6 +71,7 @@ pub struct RuntimeImpl {
     /// publishing, routing, or network-dial API. Reads can still consume node
     /// network, disk, pin/cache budget, and eviction work.
     pinset_cache: Option<Arc<cache::PinsetCache>>,
+    filesystem_resources: Arc<cache::HostResources>,
     /// Optional integration-test observation of production fuel callbacks.
     fuel_observer: Option<FuelObserver>,
 }
@@ -93,6 +94,7 @@ impl RuntimeImpl {
             wasm_debug: self.wasm_debug,
             guard: self.guard.clone(),
             pinset_cache: self.pinset_cache.clone(),
+            filesystem_resources: Arc::clone(&self.filesystem_resources),
             fuel_observer: self.fuel_observer.clone(),
         })
     }
@@ -135,6 +137,7 @@ pub fn create_runtime_client(
     runtime_engine: cell::engine::RuntimeEngine,
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
+    filesystem_resources: Arc<cache::HostResources>,
 ) -> system_capnp::runtime::Client {
     create_runtime_client_with_options(
         wasm_debug,
@@ -142,8 +145,8 @@ pub fn create_runtime_client(
         runtime_engine,
         compile_tx,
         cache_policy,
-        None,
-        None,
+        filesystem_resources,
+        RuntimeClientOptions::default(),
     )
 }
 
@@ -159,6 +162,7 @@ pub fn create_runtime_client_with_pinset(
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
     pinset_cache: Option<Arc<cache::PinsetCache>>,
+    filesystem_resources: Arc<cache::HostResources>,
 ) -> system_capnp::runtime::Client {
     create_runtime_client_with_options(
         wasm_debug,
@@ -166,8 +170,11 @@ pub fn create_runtime_client_with_pinset(
         runtime_engine,
         compile_tx,
         cache_policy,
-        pinset_cache,
-        None,
+        filesystem_resources,
+        RuntimeClientOptions {
+            pinset_cache,
+            ..RuntimeClientOptions::default()
+        },
     )
 }
 
@@ -180,6 +187,7 @@ pub fn create_runtime_client_with_fuel_observer(
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
     fuel_observer: FuelObserver,
+    filesystem_resources: Arc<cache::HostResources>,
 ) -> system_capnp::runtime::Client {
     create_runtime_client_with_options(
         wasm_debug,
@@ -187,9 +195,18 @@ pub fn create_runtime_client_with_fuel_observer(
         runtime_engine,
         compile_tx,
         cache_policy,
-        None,
-        Some(fuel_observer),
+        filesystem_resources,
+        RuntimeClientOptions {
+            fuel_observer: Some(fuel_observer),
+            ..RuntimeClientOptions::default()
+        },
     )
+}
+
+#[derive(Default)]
+struct RuntimeClientOptions {
+    pinset_cache: Option<Arc<cache::PinsetCache>>,
+    fuel_observer: Option<FuelObserver>,
 }
 
 fn create_runtime_client_with_options(
@@ -198,8 +215,8 @@ fn create_runtime_client_with_options(
     runtime_engine: cell::engine::RuntimeEngine,
     compile_tx: Option<mpsc::Sender<CompileRequest>>,
     cache_policy: CachePolicy,
-    pinset_cache: Option<Arc<cache::PinsetCache>>,
-    fuel_observer: Option<FuelObserver>,
+    filesystem_resources: Arc<cache::HostResources>,
+    options: RuntimeClientOptions,
 ) -> system_capnp::runtime::Client {
     let runtime = RuntimeImpl {
         wasm_debug,
@@ -208,8 +225,9 @@ fn create_runtime_client_with_options(
         executor_cache: RefCell::new(HashMap::new()),
         runtime_engine,
         compile_tx,
-        pinset_cache,
-        fuel_observer,
+        pinset_cache: options.pinset_cache,
+        fuel_observer: options.fuel_observer,
+        filesystem_resources,
     };
     capnp_rpc::new_client(runtime)
 }
@@ -331,6 +349,7 @@ pub struct ExecutorImpl {
     guard: EpochGuard,
     pinset_cache: Option<Arc<cache::PinsetCache>>,
     fuel_observer: Option<FuelObserver>,
+    filesystem_resources: Arc<cache::HostResources>,
 }
 
 /// Owns every resource whose lifetime is exactly one running child.
@@ -554,8 +573,13 @@ impl system_capnp::executor::Server for ExecutorImpl {
         let wasm_debug = self.wasm_debug;
         let pinset_cache = self.pinset_cache.clone();
         let fuel_observer = self.fuel_observer.clone();
+        let filesystem_resources = Arc::clone(&self.filesystem_resources);
 
         Promise::from_future(async move {
+            let cell_resources =
+                cache::CellResources::new(filesystem_resources, cache::CellLimits::default());
+            let filesystem = cell::FilesystemOwnership::try_new(cell_resources)
+                .map_err(|error| capnp::Error::overloaded(error.to_string()))?;
             let (host_stderr, guest_stderr) = io::duplex(64 * 1024);
             let (host_stdin, guest_stdin) = io::duplex(64 * 1024);
             let (host_stdout, guest_stdout) = io::duplex(64 * 1024);
@@ -571,7 +595,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
                 None => Program::Bytes((*bytecode).clone()),
             };
             let (mut builder, mut handles) =
-                Builder::ordinary(program, guest_stdin, guest_stdout, guest_stderr);
+                Builder::ordinary(program, guest_stdin, guest_stdout, guest_stderr, filesystem);
             builder = builder
                 .with_runtime_engine(runtime_engine)
                 .with_env(env)
@@ -698,13 +722,23 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::rc::{Rc, Weak};
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     const NATIVE_FIXTURE_CID: &str = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
 
+    fn test_filesystem_host() -> Arc<cache::HostResources> {
+        crate::services::test_filesystem_resources()
+    }
+
+    fn test_filesystem_ownership() -> cell::FilesystemOwnership {
+        let resources =
+            cache::CellResources::new(test_filesystem_host(), cache::CellLimits::default());
+        cell::FilesystemOwnership::try_new(resources).expect("test process filesystem ownership")
+    }
+
     struct NativeFixturePinner {
         contents: HashMap<cid::Cid, Vec<u8>>,
+        fetch_gate: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     #[async_trait::async_trait]
@@ -718,6 +752,9 @@ mod tests {
         }
 
         async fn fetch(&self, cid: &cid::Cid) -> anyhow::Result<Vec<u8>> {
+            if let Some(gate) = &self.fetch_gate {
+                gate();
+            }
             self.contents
                 .get(cid)
                 .cloned()
@@ -749,8 +786,10 @@ mod tests {
         )
     }
 
-    fn native_filesystem_fixture() -> (tempfile::TempDir, Arc<cell::vfs::CidTree>, cache::CacheMode)
-    {
+    async fn native_filesystem_fixture(
+        filesystem: &cell::FilesystemOwnership,
+        fetch_gate: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> (tempfile::TempDir, Arc<cell::vfs::CidTree>, cache::CacheMode) {
         let staging = tempfile::TempDir::new().unwrap();
         let known: cid::Cid = NATIVE_FIXTURE_CID.parse().unwrap();
         let nested_file = native_fixture_cid(11);
@@ -794,14 +833,26 @@ mod tests {
             native_fixture_cid(1),
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.path().to_owned(),
+            Arc::clone(filesystem.test_resources().host()),
+            filesystem.test_scope().clone(),
         ));
         let pinner = Arc::new(NativeFixturePinner {
             contents: HashMap::from([
                 (known, b"lazy image bytes".to_vec()),
                 (nested_file, b"nested child".to_vec()),
             ]),
+            fetch_gate,
         });
-        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        let resources = filesystem.test_resources();
+        let host = Arc::clone(resources.host());
+        let scope = filesystem.test_scope().clone();
+        let logical = resources.try_logical_io().unwrap();
+        let setup = host.try_cleanup_transaction(logical, &[&scope]).unwrap();
+        let cache = cache::CacheMode::Isolated(
+            cache::IsolatedPinset::new(pinner, scope, &setup)
+                .await
+                .unwrap(),
+        );
         (staging, tree, cache)
     }
 
@@ -843,6 +894,7 @@ mod tests {
                             io::empty(),
                             io::sink(),
                             io::sink(),
+                            test_filesystem_ownership(),
                         );
                         builder = builder
                             .with_runtime_engine(runtime_engine)
@@ -924,7 +976,9 @@ mod tests {
                         if let Some(old_rpc) = lifecycle.rpc_task.take() {
                             old_rpc.shutdown();
                         }
-                        let (_tree_staging, tree, cache) = native_filesystem_fixture();
+                        let filesystem = test_filesystem_ownership();
+                        let (_tree_staging, tree, cache) =
+                            native_filesystem_fixture(&filesystem, None).await;
                         let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(authority::Epoch {
                             seq: 1,
                             head: Vec::new(),
@@ -940,6 +994,7 @@ mod tests {
                             io::sink(),
                             tree,
                             readiness,
+                            filesystem,
                         );
                         builder = builder
                             .with_runtime_engine(runtime_engine)
@@ -1091,7 +1146,9 @@ mod tests {
     }
 
     fn completed_filesystem_scope() -> cache::FsCompletion {
-        let (_scope, owner, finalizer, completion) = cache::FsScope::new();
+        let (_scope, owner, finalizer, completion) = test_filesystem_host()
+            .try_filesystem_scope()
+            .expect("test filesystem scope");
         drop(owner);
         drop(finalizer);
         completion
@@ -1294,8 +1351,13 @@ mod tests {
                 "#,
                 )
                 .expect("P3 no-op component");
-                let (builder, mut handles) =
-                    Builder::ordinary(Program::Bytes(wasm), io::empty(), io::sink(), io::sink());
+                let (builder, mut handles) = Builder::ordinary(
+                    Program::Bytes(wasm),
+                    io::empty(),
+                    io::sink(),
+                    io::sink(),
+                    test_filesystem_ownership(),
+                );
                 let (runtime_engine, _publisher) =
                     cell::engine::runtime_engine().expect("child runtime engine");
                 lifecycle.proc = Some(
@@ -1373,7 +1435,13 @@ mod tests {
                 (core instance $i (instantiate $noop (with "" (instance (export "return" (func $return))))))
                 (func $run async (result (result)) (canon lift (core func $i "run") async))
                 (instance (export (interface "wasi:cli/run@0.3.0")) (export "run" (func $run))))"#).unwrap();
-            let (builder, mut handles) = Builder::ordinary(Program::Bytes(wasm), io::empty(), io::sink(), io::sink());
+            let (builder, mut handles) = Builder::ordinary(
+                Program::Bytes(wasm),
+                io::empty(),
+                io::sink(),
+                io::sink(),
+                test_filesystem_ownership(),
+            );
             let (engine, _publisher) = cell::engine::runtime_engine().unwrap();
             lifecycle.proc = Some(builder.with_runtime_engine(engine).build().await.unwrap());
             let (mut reader, _writer) = handles.take_host_split().expect("child RPC transport");
@@ -1527,8 +1595,13 @@ mod tests {
                     .unwrap();
                 let (runtime_engine, _publisher) = cell::engine::runtime_engine().unwrap();
                 let fuel = FuelObserver::default();
-                let (builder, mut handles) =
-                    Builder::ordinary(Program::Bytes(wasm), io::empty(), io::sink(), io::sink());
+                let (builder, mut handles) = Builder::ordinary(
+                    Program::Bytes(wasm),
+                    io::empty(),
+                    io::sink(),
+                    io::sink(),
+                    test_filesystem_ownership(),
+                );
                 let mut builder = builder
                     .with_runtime_engine(runtime_engine)
                     .with_fuel_estimator(FuelEstimator::new_oneshot(100_000, 10_000, 0))
@@ -1625,21 +1698,16 @@ mod tests {
     #[test]
     fn cold_file_staging_preserves_sibling_and_worker_zero_epoch_progress() {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let pool = crate::services::ExecutorPool::new(1, shutdown_rx);
+        let pool = crate::services::ExecutorPool::new(1, shutdown_rx, test_filesystem_host());
         let runtime_engine = pool.runtime_engine();
         let component = native_fixture_component(&runtime_engine);
         let mut epoch = runtime_engine.subscribe();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
-        let starts = Arc::new(AtomicUsize::new(0));
-        let hook: Arc<dyn Fn(cache::FsTestEvent) + Send + Sync> = Arc::new(move |event| {
-            if event.operation == cache::FilesystemOperation::FileStage
-                && event.stage == cache::FsTestStage::Started
-                && starts.fetch_add(1, AtomicOrdering::SeqCst) == 1
-            {
+        let fetch_gate: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if let Some(receiver) = release_rx.lock().unwrap().take() {
                 entered_tx.send(()).unwrap();
-                let receiver = release_rx.lock().unwrap().take().unwrap();
                 let _ = receiver.recv();
             }
         });
@@ -1650,7 +1718,9 @@ mod tests {
                 name: "cold-file-progress".into(),
                 factory: Box::new(move |_| {
                     Box::pin(async move {
-                        let (_tree_staging, tree, cache) = native_filesystem_fixture();
+                        let filesystem = test_filesystem_ownership();
+                        let (_tree_staging, tree, cache) =
+                            native_filesystem_fixture(&filesystem, Some(fetch_gate)).await;
                         let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(authority::Epoch {
                             seq: 1,
                             head: Vec::new(),
@@ -1665,12 +1735,12 @@ mod tests {
                             io::sink(),
                             tree,
                             readiness,
+                            filesystem,
                         );
                         builder = builder
                             .with_runtime_engine(cell_engine)
                             .with_args(vec!["native-p3-fixture".into(), "cold-file".into()])
-                            .with_cache(cache)
-                            .with_filesystem_test_hook(hook);
+                            .with_cache(cache);
                         let completion = builder.filesystem_completion();
                         let finalizer = builder.take_filesystem_finalizer().unwrap();
                         tokio::task::spawn_local(rpc::local_tasks::track(async move {
@@ -1712,7 +1782,7 @@ mod tests {
     #[test]
     fn directory_publication_preserves_sibling_progress_and_final_contents() {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let pool = crate::services::ExecutorPool::new(1, shutdown_rx);
+        let pool = crate::services::ExecutorPool::new(1, shutdown_rx, test_filesystem_host());
         let runtime_engine = pool.runtime_engine();
         let component = native_fixture_component(&runtime_engine);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -1735,7 +1805,9 @@ mod tests {
                 name: "directory-progress".into(),
                 factory: Box::new(move |_| {
                     Box::pin(async move {
-                        let (tree_staging, tree, cache) = native_filesystem_fixture();
+                        let filesystem = test_filesystem_ownership();
+                        let (tree_staging, tree, cache) =
+                            native_filesystem_fixture(&filesystem, None).await;
                         let nested = tree_staging
                             .path()
                             .join(format!("dir-{}", native_fixture_cid(2)));
@@ -1753,6 +1825,7 @@ mod tests {
                             io::sink(),
                             tree,
                             readiness,
+                            filesystem,
                         );
                         builder = builder
                             .with_runtime_engine(cell_engine)
@@ -1797,7 +1870,7 @@ mod tests {
     #[test]
     fn slow_scratch_teardown_keeps_process_wait_pending_and_sibling_running() {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let pool = crate::services::ExecutorPool::new(1, shutdown_rx);
+        let pool = crate::services::ExecutorPool::new(1, shutdown_rx, test_filesystem_host());
         let runtime_engine = pool.runtime_engine();
         let component = native_fixture_component(&runtime_engine);
         let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
@@ -1835,7 +1908,7 @@ mod tests {
     #[test]
     fn executor_pool_shutdown_waits_for_owned_scratch_cleanup() {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let pool = crate::services::ExecutorPool::new(1, shutdown_rx);
+        let pool = crate::services::ExecutorPool::new(1, shutdown_rx, test_filesystem_host());
         let runtime_engine = pool.runtime_engine();
         let component = native_fixture_component(&runtime_engine);
         let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
@@ -1884,7 +1957,7 @@ mod tests {
     fn executor_pool_shutdown_joins_child_lifecycle_and_rpc() {
         for close_spawn_channel in [false, true] {
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-            let pool = crate::services::ExecutorPool::new(1, shutdown_rx);
+            let pool = crate::services::ExecutorPool::new(1, shutdown_rx, test_filesystem_host());
             let engine = pool.runtime_engine();
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             assert!(pool
@@ -1902,6 +1975,7 @@ mod tests {
                             io::empty(),
                             io::sink(),
                             io::sink(),
+                            test_filesystem_ownership(),
                         );
                         let mut builder = builder
                             .with_runtime_engine(engine)
@@ -1995,6 +2069,7 @@ mod tests {
                     runtime_engine,
                     None,
                     CachePolicy::Isolated,
+                    test_filesystem_host(),
                 );
 
                 let mut load = runtime.load_request();
@@ -2047,6 +2122,7 @@ mod tests {
                     runtime_engine,
                     None,
                     CachePolicy::Isolated,
+                    test_filesystem_host(),
                 );
                 for bytes in [b"first".as_slice(), b"second".as_slice()] {
                     let mut load = runtime.load_request();

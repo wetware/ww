@@ -451,10 +451,12 @@ mod tests {
         peak_host_call_depth: Arc<AtomicUsize>,
         cache_mode: Option<Arc<CacheMode>>,
         cid_tree: Option<Arc<CidTree>>,
+        filesystem_resources: Arc<cache::CellResources>,
         fs_descriptors: crate::fs_intercept::DescriptorContexts,
         filesystem_scope: cache::FsScope,
         _filesystem_owner: cache::FsOwner,
         _filesystem_finalizer: cache::FsFinalizer,
+        _host_owner: cache::HostFsOwner,
         _image_root: Option<TempDir>,
         _tree_staging: Option<TempDir>,
         _scratch: TempDir,
@@ -493,6 +495,7 @@ mod tests {
                 table: &mut self.table,
                 cache_mode: &self.cache_mode,
                 cid_tree: &self.cid_tree,
+                filesystem_resources: &self.filesystem_resources,
                 filesystem_scope: &self.filesystem_scope,
                 descriptors: &mut self.fs_descriptors,
             }
@@ -514,11 +517,23 @@ mod tests {
     fn transport_state(transport: GrantedTransport) -> Result<HarnessState> {
         let image_root = TempDir::new()?;
         let scratch = TempDir::new()?;
+        let (host_owner, host) = cache::HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            cache::HostLimits::default(),
+        )?;
+        let filesystem_resources =
+            cache::CellResources::new(Arc::clone(&host), cache::CellLimits::default());
+        let (filesystem_scope, filesystem_owner, filesystem_finalizer, _) =
+            host.try_filesystem_scope()?;
         let mut builder = WasiCtxBuilder::new();
+        crate::fs_intercept::install_native_filesystem_hook(
+            &mut builder,
+            Arc::clone(&filesystem_resources),
+            filesystem_scope.clone(),
+        );
         builder
             .preopened_dir(image_root.path(), "/", FsPerms::ReadOnly)?
             .preopened_dir(scratch.path(), "/tmp", FsPerms::ReadWrite)?;
-        let (filesystem_scope, filesystem_owner, filesystem_finalizer, _) = cache::FsScope::new();
         Ok(HarnessState {
             wasi: builder.build(),
             table: ResourceTable::new(),
@@ -529,10 +544,12 @@ mod tests {
             peak_host_call_depth: Arc::new(AtomicUsize::new(0)),
             cache_mode: None,
             cid_tree: None,
+            filesystem_resources,
             fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
             filesystem_scope,
             _filesystem_owner: filesystem_owner,
             _filesystem_finalizer: filesystem_finalizer,
+            _host_owner: host_owner,
             _image_root: Some(image_root),
             _tree_staging: None,
             _scratch: scratch,
@@ -1140,12 +1157,20 @@ mod tests {
         materialized: PathBuf,
     }
 
-    fn filesystem_state(
+    async fn filesystem_state(
         transport: GrantedTransport,
         pinner: Arc<CountingPinner>,
     ) -> Result<(HarnessState, FilesystemPaths)> {
         let tree_staging = TempDir::new()?;
         let scratch = TempDir::new()?;
+        let (host_owner, host) = cache::HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            cache::HostLimits::default(),
+        )?;
+        let filesystem_resources =
+            cache::CellResources::new(Arc::clone(&host), cache::CellLimits::default());
+        let (filesystem_scope, filesystem_owner, filesystem_finalizer, _) =
+            host.try_filesystem_scope()?;
         let cid: Cid = TEST_CID.parse()?;
         let entry = |name: &str, cid: Cid, entry_type: EntryType| DirEntry {
             name: name.to_string(),
@@ -1195,8 +1220,15 @@ mod tests {
             fixture_cid(1),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             tree_staging.path().to_path_buf(),
+            Arc::clone(&host),
+            filesystem_scope.clone(),
         ));
-        let cache = Arc::new(CacheMode::Isolated(IsolatedPinset::new(pinner)?));
+        let logical = filesystem_resources.try_logical_io()?;
+        let setup = host.try_cleanup_transaction(logical, &[&filesystem_scope])?;
+        let cache = Arc::new(CacheMode::Isolated(
+            IsolatedPinset::new(pinner, filesystem_scope.clone(), &setup).await?,
+        ));
+        drop(setup);
         let cache_staging = cache.staging_dir().to_path_buf();
         let paths = FilesystemPaths {
             scratch: scratch.path().to_path_buf(),
@@ -1205,10 +1237,14 @@ mod tests {
             cache_staging,
         };
         let mut builder = WasiCtxBuilder::new();
+        crate::fs_intercept::install_native_filesystem_hook(
+            &mut builder,
+            Arc::clone(&filesystem_resources),
+            filesystem_scope.clone(),
+        );
         builder
             .preopened_dir(tree.staging_dir(), "/", FsPerms::ReadOnly)?
             .preopened_dir(scratch.path(), "/tmp", FsPerms::ReadWrite)?;
-        let (filesystem_scope, filesystem_owner, filesystem_finalizer, _) = cache::FsScope::new();
         Ok((
             HarnessState {
                 wasi: builder.build(),
@@ -1220,10 +1256,12 @@ mod tests {
                 peak_host_call_depth: Arc::new(AtomicUsize::new(0)),
                 cache_mode: Some(cache),
                 cid_tree: Some(tree),
+                filesystem_resources,
                 fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
                 filesystem_scope,
                 _filesystem_owner: filesystem_owner,
                 _filesystem_finalizer: filesystem_finalizer,
+                _host_owner: host_owner,
                 _image_root: None,
                 _tree_staging: Some(tree_staging),
                 _scratch: scratch,
@@ -1240,7 +1278,7 @@ mod tests {
             contents: filesystem_contents(),
             fetches: AtomicUsize::new(0),
         });
-        let (state, paths) = filesystem_state(grant, Arc::clone(&pinner))?;
+        let (state, paths) = filesystem_state(grant, Arc::clone(&pinner)).await?;
         assert!(!paths.materialized.exists());
         assert_eq!(pinner.fetches.load(Ordering::Acquire), 0);
         let (mut store, instance) = instantiate(state).await?;

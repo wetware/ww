@@ -9,6 +9,8 @@
 #[path = "support/ticked_executor.rs"]
 mod ticked_executor;
 
+mod support;
+
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -272,6 +274,7 @@ async fn harness(wasm: &[u8]) -> Harness {
         ticked.runtime_engine(),
         None,
         CachePolicy::Shared,
+        support::filesystem_resources(),
     );
     let executor = load_executor(&runtime, wasm).await;
     Harness {
@@ -293,6 +296,7 @@ async fn fixed_epoch_zero_executor(
         ticked.runtime_engine(),
         None,
         CachePolicy::Isolated,
+        support::filesystem_resources(),
     );
     (load_executor(&runtime, wasm).await, ticked)
 }
@@ -1361,6 +1365,7 @@ fn typed_runtime_and_executor_extra_remain_distinct() {
             runtime_engine,
             None,
             CachePolicy::Isolated,
+            support::filesystem_resources(),
         );
         let report = probe_report_with_authority(
             &harness.executor,
@@ -1474,6 +1479,7 @@ fn runtime_is_available_only_when_explicitly_granted() {
                     runtime_engine,
                     None,
                     CachePolicy::Isolated,
+                    support::filesystem_resources(),
                 )),
                 ..FixedAuthority::default()
             },
@@ -1946,7 +1952,11 @@ fn explicitly_wired_known_cid_read_has_path_only_authority_and_node_effects() {
             fetches: AtomicUsize::new(0),
             unpins: AtomicUsize::new(0),
         });
-        let cache = Arc::new(cache::PinsetCache::new(pinner.clone(), 1024).unwrap());
+        let cache = Arc::new(
+            cache::PinsetCache::new(pinner.clone(), 1024, support::filesystem_resources())
+                .await
+                .unwrap(),
+        );
         let ticked = TickedExecutor::new();
         let runtime = create_runtime_client_with_pinset(
             false,
@@ -1955,6 +1965,7 @@ fn explicitly_wired_known_cid_read_has_path_only_authority_and_node_effects() {
             None,
             CachePolicy::Isolated,
             Some(cache.clone()),
+            support::filesystem_resources(),
         );
         let executor = load_executor(&runtime, &wasm).await;
         let path = format!("/ipfs/{KNOWN_CID}");

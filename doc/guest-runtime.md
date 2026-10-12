@@ -71,7 +71,9 @@ P3 transport completion participates in the outer session result.
 - If transport completion finishes first, orderly closure succeeds. A
   `TransportError::Failed` value fails the session.
 - If the host cancels the export or drops the Store, the complete Future tree
-  drops. Store teardown reclaims P3 resources and closes the host transport.
+  drops. Store teardown drops guest-visible P3 resources and closes the host
+  transport. Already-admitted native filesystem work can continue under Host
+  ownership until its result is disposed and the process root completes.
 
 The guest does not drain RPC for an arbitrary interval. A completed P3 stream
 write already waits for the underlying host flush.

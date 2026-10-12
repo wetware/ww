@@ -12,6 +12,8 @@
 #[path = "support/ticked_executor.rs"]
 mod ticked_executor;
 
+mod support;
+
 use capnp::capability::Promise;
 use tokio::sync::watch;
 
@@ -128,6 +130,7 @@ async fn status_cell_serves_json_with_required_peer_id() {
                 ticked.runtime_engine(),
                 None,
                 CachePolicy::Shared,
+                support::filesystem_resources(),
             );
             let membrane: system_capnp::membrane::Client = capnp_rpc::new_client(
                 authority::MembraneServer::new(epoch_rx, StatusGraft { network_state }),

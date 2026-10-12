@@ -320,6 +320,11 @@ Root-Future or Store cancellation drops Cap'n Proto and P3 resources in normal
 Rust ownership order. The guest does not leak resources with
 `std::mem::forget` and does not use a P2 resource-order workaround.
 
+Store cancellation is not filesystem completion. Native filesystem work
+admitted before cancellation retains its Host and Cell accounting until the
+native work and result disposal finish. `Process.wait()` reports only after the
+process filesystem completion proof resolves.
+
 ### Epoch guards
 
 Host capabilities grafted by pid0 are wrapped in epoch guards. When the host

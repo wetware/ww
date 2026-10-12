@@ -6,6 +6,8 @@
 #[path = "support/ticked_executor.rs"]
 mod ticked_executor;
 
+mod support;
+
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -381,6 +383,7 @@ impl PreparedExecutor {
             engine.runtime_engine(),
             Some(compile_tx),
             CachePolicy::Isolated,
+            support::filesystem_resources(),
         );
         let mut request = runtime.load_request();
         request.get().set_wasm(wasm);

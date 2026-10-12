@@ -3,6 +3,8 @@
 #[path = "support/ticked_executor.rs"]
 mod ticked_executor;
 
+mod support;
+
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -216,6 +218,7 @@ where
         tokio::io::empty(),
         stdout,
         tokio::io::sink(),
+        support::filesystem_ownership(),
     );
     let proc = builder
         .with_env(env)
@@ -302,6 +305,7 @@ async fn run_system_wagi(wasm: Vec<u8>, env: Vec<String>, graft: OracleGraft) ->
         ticked.runtime_engine(),
         None,
         CachePolicy::Shared,
+        support::filesystem_resources(),
     );
     let membrane: system_capnp::membrane::Client =
         capnp_rpc::new_client(authority::MembraneServer::new(epoch_rx, graft));

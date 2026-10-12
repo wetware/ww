@@ -139,5 +139,6 @@ an image. A published guest requires an application-specific composition path.
 - [Keys & identity](doc/keys.md): Ed25519 identity management
 - [RPC transport](doc/rpc-transport.md): transport plumbing and scheduling model
 - [Guest runtime](doc/guest-runtime.md): async runtime for WASM guests
+- [Runtime topology](doc/runtimes.md): host service threads and filesystem lifecycle
 - [Replay protection](doc/replay-protection.md): epoch-bound authentication
 - [Examples](examples/): echo, counter, oracle, chess, discovery, and snap-hello-rs

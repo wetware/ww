@@ -1446,6 +1446,26 @@ system::export!({iface_name}Guest);
         with_http_admin: Option<String>,
         ipfs_url: String,
     ) -> Result<()> {
+        let (filesystem_owner, filesystem_resources) = cache::HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            cache::HostLimits::default(),
+        )
+        .context("failed to start Host filesystem lifecycle")?;
+        let mut supervisor = ww::services::Host::new(
+            std::sync::Arc::clone(&filesystem_resources),
+            filesystem_owner,
+        );
+        let mut executor_pool_slot = None;
+        let mut deployment_slot = None;
+        let mut deployment_lifecycle_slot = None;
+
+        let outcome: Result<i32> = async {
+        let lifecycle = filesystem_resources
+            .try_filesystem_scope()
+            .context("failed to reserve deployment filesystem root")?;
+        let deployment_scope = lifecycle.0.clone();
+        deployment_lifecycle_slot = Some(lifecycle);
+
         // Dev-mode compat: if a single local root mount has boot/main.wasm
         // but not bin/main.wasm, copy it over (the runtime expects bin/).
         for mount in &mounts {
@@ -1523,7 +1543,6 @@ system::export!({iface_name}Guest);
         };
         let kernel_identity = version_info.kernel_identity.clone();
 
-        let mut supervisor = ww::services::Host::new();
         let fuel_registry = ww::metrics::new_fuel_registry();
         let rpc_metrics = ww::metrics::new_rpc_metrics();
         let cache_metrics = ww::metrics::new_cache_metrics();
@@ -1758,15 +1777,37 @@ system::export!({iface_name}Guest);
             }
         }
         let frozen_layers = layer_cids;
-        let staging_dir = std::env::temp_dir().join(format!("ww-staging-{}", std::process::id()));
-        std::fs::create_dir_all(&staging_dir)
-            .with_context(|| format!("failed to create staging dir {}", staging_dir.display()))?;
+        let staging_setup = filesystem_resources.try_cleanup_transaction(
+            filesystem_resources.try_logical_io()?,
+            &[&deployment_scope],
+        )?;
+        let staging_cleanup = staging_setup.try_cleanup_phase()?;
+        let staging_scope = deployment_scope.clone();
+        let staging_dir = staging_setup
+            .run_blocking(cache::FilesystemOperation::ProcessSetup, tempfile::TempDir::new)
+            .await?
+            .install(|directory| {
+                let directory = directory.context("failed to create deployment staging dir")?;
+                let path = directory.path().to_owned();
+                staging_scope.own_cleanup_from_phase(
+                    staging_cleanup,
+                    cache::FilesystemOperation::ProcessCleanup,
+                    move || directory.close(),
+                )?;
+                Ok::<_, anyhow::Error>(path)
+            })?;
+        drop(staging_setup);
 
         // Host-wide IPFS pin/content cache. CidTree uses this to materialize
         // CID-backed file content on demand. 128 MiB budget for pinned entries.
         let pinset_cache = std::sync::Arc::new(
-            cache::PinsetCache::new(std::sync::Arc::new(ipfs_client.clone()), 128 * 1024 * 1024)
-                .context("failed to create PinsetCache")?,
+            cache::PinsetCache::new(
+                std::sync::Arc::new(ipfs_client.clone()),
+                128 * 1024 * 1024,
+                std::sync::Arc::clone(&filesystem_resources),
+            )
+            .await
+            .context("failed to create PinsetCache")?,
         );
 
         // Attempt to fetch Kubo's identity so we can bootstrap the in-process
@@ -1857,9 +1898,17 @@ system::export!({iface_name}Guest);
         let network_state = swarm_ready.network_state;
         let stream_control = swarm_ready.stream_control;
         // Executor pool: M:N cell scheduling across N worker threads.
-        let executor_pool =
-            ww::services::ExecutorPool::try_new(executor_threads, supervisor.shutdown_rx())
-                .context("failed to start executor pool")?;
+        executor_pool_slot = Some(
+            ww::services::ExecutorPool::try_new(
+                executor_threads,
+                supervisor.shutdown_rx(),
+                std::sync::Arc::clone(&filesystem_resources),
+            )
+            .context("failed to start executor pool")?,
+        );
+        let executor_pool = executor_pool_slot
+            .as_ref()
+            .expect("executor pool was just installed");
 
         // Compilation service: offload component compilation from executor workers.
         let (compile_tx, compile_rx) = tokio::sync::mpsc::channel(64);
@@ -1932,8 +1981,10 @@ system::export!({iface_name}Guest);
             frozen_layers,
             ipfs_client: ipfs_client.clone(),
             staging_dir,
+            filesystem_host: std::sync::Arc::clone(&filesystem_resources),
+            filesystem_scope: deployment_scope.clone(),
         };
-        let mut deployment = tokio::select! {
+        deployment_slot = Some(tokio::select! {
             result = ww::deployment::Deployment::bootstrap(
                 deployment_config,
                 epoch_tx,
@@ -1942,7 +1993,10 @@ system::export!({iface_name}Guest);
             service_exit = supervisor.next_service_exit() => {
                 return Err(service_exit_error(service_exit));
             }
-        };
+        });
+        let deployment = deployment_slot
+            .as_mut()
+            .expect("deployment was just installed");
         let cid_tree = deployment.cid_tree();
         let rooted_epoch = deployment.current_epoch();
         let root_cid = rooted_epoch
@@ -1988,7 +2042,7 @@ system::export!({iface_name}Guest);
             kernel_bootstrap = kernel_bootstrap.with_route_registry(registry.clone());
         }
         let kernel_launcher = ww::deployment::KernelLauncher::new(
-            &executor_pool,
+            executor_pool,
             resolved_kernel,
             kernel_ready_gate,
             kernel_bootstrap,
@@ -1998,6 +2052,7 @@ system::export!({iface_name}Guest);
                 compile_tx,
                 cache_policy,
                 pinset_cache,
+                std::sync::Arc::clone(&filesystem_resources),
             ),
             ww::kernel::Stdio::Host,
         );
@@ -2073,22 +2128,62 @@ system::export!({iface_name}Guest);
                         teardown_ms = timeout.as_millis() as u64,
                         "Kernel generation teardown timed out"
                     );
-                    std::process::exit(1);
+                    break 'generations 1;
                 }
             }
         };
         tracing::info!(code = exit_code, "Kernel exited");
 
-        deployment.shutdown().await;
-        supervisor.shutdown();
-
-        // Hold the CidTree alive until after guest exits (its staging dir
-        // backs open file descriptors). ExecutorPool must also be dropped
-        // after the kernel exits but before process exit, to join worker
-        // threads cleanly.
-        drop(executor_pool);
+        // Hold the CidTree alive until after guest exits; the outer epilogue
+        // closes admission and drains workers/filesystem ownership in order.
         drop(cid_tree);
-        std::process::exit(exit_code);
+        Ok(exit_code)
+        }
+        .await;
+
+        supervisor.close_filesystem_admission();
+        if let Some(mut deployment) = deployment_slot.take() {
+            deployment.shutdown().await;
+        }
+        if let Some(executor_pool) = executor_pool_slot.take() {
+            executor_pool.shutdown_and_join().await;
+        }
+        let deployment_cleanup =
+            if let Some((scope, owner, finalizer, completion)) = deployment_lifecycle_slot.take() {
+                drop(scope);
+                drop(owner);
+                let finalization = finalizer.run().await;
+                let proof = completion.wait().await;
+                Some((finalization, proof))
+            } else {
+                None
+            };
+        let filesystem_shutdown = supervisor.shutdown_filesystem().await;
+        supervisor.shutdown_services().await;
+
+        let mut shutdown_errors = Vec::new();
+        if let Some((finalization, proof)) = deployment_cleanup {
+            if let Err(error) = finalization {
+                shutdown_errors.push(format!(
+                    "deployment filesystem finalization failed: {error}"
+                ));
+            }
+            if let Err(error) = proof {
+                shutdown_errors.push(format!("deployment filesystem completion failed: {error}"));
+            }
+        }
+        if let Err(error) = filesystem_shutdown {
+            shutdown_errors.push(format!("Host filesystem shutdown failed: {error}"));
+        }
+        match outcome {
+            Ok(exit_code) if shutdown_errors.is_empty() => std::process::exit(exit_code),
+            Ok(_) => Err(anyhow::anyhow!(shutdown_errors.join("; "))),
+            Err(error) if shutdown_errors.is_empty() => Err(error),
+            Err(error) => Err(error.context(format!(
+                "ordered shutdown also failed: {}",
+                shutdown_errors.join("; ")
+            ))),
+        }
     }
 
     /// Publish a wetware environment to IPFS

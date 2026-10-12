@@ -45,9 +45,9 @@
       "group": "THE HOST",
       "title": "Host supervisor",
       "subtitle": "Owns the node service threads.",
-      "files": ["src/services.rs", "src/host.rs", "src/ipns.rs"],
-      "what": "The `Host` supervisor starts and stops the swarm, WAGI service, compiler, admin service, executor pool, and host-owned IPNS republisher. Long-running services own dedicated threads; deployment coordination runs in the main host runtime.",
-      "built": "`src/services.rs` defines `Service` and `Host`. `src/host.rs` owns libp2p behavior, swarm events, bounded provider queries, and epoch-owned provider registrations. `src/ipns.rs` validates, persists, signs, transports, and republishes raw IPNS records. The executor pool uses local runtimes because Wasmtime stores are not `Send`."
+      "files": ["src/services.rs", "src/host.rs", "src/ipns.rs", "crates/cache/src/resources.rs", "crates/cache/src/fs_driver.rs", "crates/cache/src/fs_work.rs"],
+      "what": "The `Host` supervisor starts and stops the swarm, WAGI service, compiler, admin service, executor pool, and host-owned IPNS republisher. Long-running services own dedicated threads; deployment coordination runs in the main host runtime. One process-wide filesystem lifecycle has a unique `HostFsOwner` that retains the filesystem driver on the main host runtime and owns a separate bounded cleanup thread.",
+      "built": "`src/services.rs` defines `Service` and `Host`. `src/host.rs` owns libp2p behavior, swarm events, bounded provider queries, and epoch-owned provider registrations. `src/ipns.rs` validates, persists, signs, transports, and republishes raw IPNS records. The executor pool uses local runtimes because Wasmtime stores are not `Send`. `crates/cache/src/resources.rs` provides finite Host logical admission and partitions backend capacity B into foreground F=B−1 plus one cleanup-active lane C=1; admission is immediate. `crates/cache/src/fs_driver.rs` owns the retained main-runtime driver and dedicated cleanup runtime, while `crates/cache/src/fs_work.rs` tracks cleanup roots, actual-work receipts, and completion."
     },
     {
       "key": "epoch",
@@ -157,9 +157,9 @@
       "group": "THE CELL AND NETWORK",
       "title": "Isolated WASM cell",
       "subtitle": "A process with no ambient node authority.",
-      "files": ["crates/cell/src/lib.rs", "crates/cell/src/routing_key.rs", "crates/guest/routing-key/wit/key.wit"],
-      "what": "A cell has local computation, spawn-selected arguments and environment, stdio, clocks, randomness, and a private writable `/tmp`. RPC authority arrives through one parent-selected `Membrane`.",
-      "built": "`crates/cell` contains Wasmtime process execution, image mounting, stream plumbing, filesystem interception, fuel scheduling, and virtual filesystems. Components can optionally import pure CIDv1/raw/BLAKE3 routing-key derivation. `WW_CELL_MODE` selects vat, raw, HTTP, or pid0 stdio behavior."
+      "files": ["crates/cell/src/lib.rs", "crates/cell/src/routing_key.rs", "crates/guest/routing-key/wit/key.wit", "crates/cell/src/proc.rs", "crates/cell/src/fs_intercept.rs", "src/launcher.rs"],
+      "what": "A cell has local computation, spawn-selected arguments and environment, stdio, clocks, randomness, and a private writable `/tmp`. RPC authority arrives through one parent-selected `Membrane`. Each process reserves one bounded filesystem cleanup root K and finite Cell logical capacity nested under the finite Host capacity; filesystem admission is immediate. Accepted actual work survives Store or guest-task cancellation, and parent-visible `Process.wait` completes only after filesystem completion.",
+      "built": "`crates/cell` contains Wasmtime process execution, image mounting, stream plumbing, filesystem interception, fuel scheduling, and virtual filesystems. Components can optionally import pure CIDv1/raw/BLAKE3 routing-key derivation. `WW_CELL_MODE` selects vat, raw, HTTP, or pid0 stdio behavior. `crates/cell/src/proc.rs` binds each process to `CellResources`, one cleanup scope, and its `FsCompletion`. `crates/cell/src/fs_intercept.rs` validates virtual operations before logical admission and installs the native filesystem hook whose operation lease retains logical, foreground, and actual-work ownership. The Host driver retains accepted workers after Store cancellation. `src/launcher.rs` drops the Store, waits for `FsCompletion` and RPC terminalization, and only then publishes process exit."
     },
     {
       "key": "rpc",

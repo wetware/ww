@@ -106,11 +106,87 @@ pub struct CidTree {
     dir_cache: Mutex<LruCache<Cid, Vec<DirEntry>>>,
     /// Staging directory for persisted directory listings.
     staging_dir: PathBuf,
+    /// Authoritative Host resource domain and root that own this staging area.
+    host: Arc<cache::HostResources>,
+    filesystem_scope: cache::FsScope,
+}
+
+/// One serial CidTree traversal. Logical admission is lazy for standalone
+/// callers so a pure in-memory lookup consumes no Host allowance. A virtual
+/// Cell open supplies its already-admitted logical permit instead.
+pub(crate) struct CidTreeTraversal {
+    host: Arc<cache::HostResources>,
+    filesystem_scope: cache::FsScope,
+    // Kept before the transaction so L is released before F/root ownership.
+    // Actual driver operations clone this Arc, retaining the same logical
+    // debit when the waiting guest future is cancelled.
+    logical: Option<Arc<TraversalLogicalLease>>,
+    transaction: Option<cache::ForegroundTransaction>,
+}
+
+struct TraversalLogicalLease {
+    permit: cache::LogicalIoPermit,
+}
+
+impl CidTreeTraversal {
+    fn ensure_transaction(&mut self) -> Result<&cache::ForegroundTransaction> {
+        if self.transaction.is_none() {
+            if self.logical.is_none() {
+                self.logical = Some(Arc::new(TraversalLogicalLease {
+                    permit: self.host.try_logical_io()?,
+                }));
+            }
+            let logical = self
+                .logical
+                .as_ref()
+                .map(|lease| &lease.permit)
+                .expect("CidTree logical admission was initialized");
+            self.host.validate_logical(logical)?;
+
+            // Root work is reserved before F. This transaction intentionally
+            // borrows logical ownership: the virtual open carries L across the
+            // later ensure and materialization producer boundaries.
+            let work = self.filesystem_scope.try_work()?;
+            let producer = self.host.try_foreground()?;
+            self.transaction = Some(cache::ForegroundTransaction::from_parts(
+                producer,
+                vec![work],
+            )?);
+        }
+        Ok(self
+            .transaction
+            .as_ref()
+            .expect("CidTree transaction exists"))
+    }
+
+    fn logical_retention(&self) -> Arc<TraversalLogicalLease> {
+        Arc::clone(
+            self.logical
+                .as_ref()
+                .expect("CidTree logical admission was initialized"),
+        )
+    }
+
+    pub(crate) fn into_logical(mut self) -> Result<cache::LogicalIoPermit> {
+        let logical = self
+            .logical
+            .take()
+            .expect("Cell traversal always starts with logical admission");
+        Arc::try_unwrap(logical)
+            .map(|lease| lease.permit)
+            .map_err(|_| anyhow::anyhow!("CidTree traversal is still active"))
+    }
 }
 
 impl CidTree {
     /// Create a new CidTree with the given root CID.
-    pub fn new(root_cid: Cid, ipfs: ipfs::HttpClient, staging_dir: PathBuf) -> Self {
+    pub fn new(
+        root_cid: Cid,
+        ipfs: ipfs::HttpClient,
+        staging_dir: PathBuf,
+        host: Arc<cache::HostResources>,
+        filesystem_scope: cache::FsScope,
+    ) -> Self {
         Self {
             root: ArcSwap::from_pointee(root_cid),
             ipfs,
@@ -118,7 +194,32 @@ impl CidTree {
                 NonZeroUsize::new(DIR_CACHE_CAPACITY).unwrap(),
             )),
             staging_dir,
+            host,
+            filesystem_scope,
         }
+    }
+
+    fn standalone_traversal(&self) -> CidTreeTraversal {
+        CidTreeTraversal {
+            host: Arc::clone(&self.host),
+            filesystem_scope: self.filesystem_scope.clone(),
+            logical: None,
+            transaction: None,
+        }
+    }
+
+    pub(crate) fn traversal_in(
+        &self,
+        filesystem_scope: &cache::FsScope,
+        logical: cache::LogicalIoPermit,
+    ) -> std::result::Result<CidTreeTraversal, cache::AdmissionError> {
+        self.host.validate_logical(&logical)?;
+        Ok(CidTreeTraversal {
+            host: Arc::clone(&self.host),
+            filesystem_scope: filesystem_scope.clone(),
+            logical: Some(Arc::new(TraversalLogicalLease { permit: logical })),
+            transaction: None,
+        })
     }
 
     /// The current root CID.
@@ -170,19 +271,13 @@ impl CidTree {
     /// 2. Staging disk (hit → populate LRU, return)
     /// 3. IPFS daemon `ls()` (populate both caches, return)
     pub async fn ls_dir(&self, cid: &Cid) -> Result<Vec<DirEntry>> {
-        let (scope, owner, finalizer, _completion) = cache::FsScope::new();
-        let finalizer_task = tokio::spawn(finalizer.run());
-        let result = self.ls_dir_in(&scope, cid).await;
-        drop(owner);
-        finalizer_task
-            .await
-            .context("standalone listing finalizer task failed")??;
-        result
+        let mut traversal = self.standalone_traversal();
+        self.ls_dir_in(&mut traversal, cid).await
     }
 
     pub(crate) async fn ls_dir_in(
         &self,
-        filesystem_scope: &cache::FsScope,
+        traversal: &mut CidTreeTraversal,
         cid: &Cid,
     ) -> Result<Vec<DirEntry>> {
         // Tier 1: in-memory LRU
@@ -195,16 +290,57 @@ impl CidTree {
             return Ok(entries);
         }
 
+        traversal.ensure_transaction()?;
+        let transaction = traversal
+            .transaction
+            .as_ref()
+            .expect("CidTree transaction exists");
+        let logical = traversal.logical_retention();
+        self.ls_dir_under_retaining(transaction, cid, Some(logical))
+            .await
+    }
+
+    /// Complete a listing under an already-admitted serial producer. This is
+    /// used when directory publication owns the producer across listing,
+    /// construction, publication, descriptor open, and result installation.
+    pub(crate) async fn ls_dir_under(
+        &self,
+        transaction: &cache::ForegroundTransaction,
+        cid: &Cid,
+    ) -> Result<Vec<DirEntry>> {
+        self.ls_dir_under_retaining(transaction, cid, None).await
+    }
+
+    async fn ls_dir_under_retaining(
+        &self,
+        transaction: &cache::ForegroundTransaction,
+        cid: &Cid,
+        logical: Option<Arc<TraversalLogicalLease>>,
+    ) -> Result<Vec<DirEntry>> {
+        // Recheck after admission because another traversal may have populated
+        // the shared in-memory tier while this caller was being admitted.
+        if let Some(entries) = self
+            .dir_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(cid).cloned())
+        {
+            return Ok(entries);
+        }
+
         // Tier 2: staging disk
         let disk_path = self.staging_dir.join(format!("{cid}{DIRLIST_SUFFIX}"));
         let read_path = disk_path.clone();
-        if let Ok(Some(entries)) = filesystem_scope
+        let read_logical = logical.clone();
+        if let Some(entries) = transaction
             .run_blocking(cache::FilesystemOperation::ListingRead, move || {
+                let _logical = read_logical;
                 std::fs::read_to_string(read_path)
                     .ok()
                     .and_then(|data| serde_json::from_str::<Vec<DirEntry>>(&data).ok())
             })
-            .await
+            .await?
+            .into_inner()
         {
             // Populate LRU from disk
             if let Ok(mut cache) = self.dir_cache.lock() {
@@ -215,10 +351,15 @@ impl CidTree {
 
         // Tier 3: IPFS daemon
         let ipfs_path = format!("/ipfs/{cid}");
-        let raw_entries = self
-            .ipfs
-            .ls(&ipfs_path)
-            .await
+        let ipfs = self.ipfs.clone();
+        let network_logical = logical.clone();
+        let raw_entries = transaction
+            .run_operation(cache::FilesystemOperation::ListingRead, async move {
+                let _logical = network_logical;
+                ipfs.ls(&ipfs_path).await
+            })
+            .await?
+            .into_inner()
             .with_context(|| format!("ls failed for CID {cid}"))?;
 
         let entries: Vec<DirEntry> = raw_entries
@@ -237,8 +378,10 @@ impl CidTree {
 
         // Persist to staging disk
         let persisted_entries = entries.clone();
-        let _ = filesystem_scope
+        let write_logical = logical;
+        transaction
             .run_blocking(cache::FilesystemOperation::ListingWrite, move || {
+                let _logical = write_logical;
                 if let Ok(json) = serde_json::to_string(&persisted_entries) {
                     if let Some(parent) = disk_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
@@ -246,7 +389,8 @@ impl CidTree {
                     let _ = std::fs::write(&disk_path, json);
                 }
             })
-            .await;
+            .await?
+            .into_inner();
 
         // Populate LRU
         if let Ok(mut cache) = self.dir_cache.lock() {
@@ -261,24 +405,18 @@ impl CidTree {
     /// This compatibility entry point accepts leading slashes. Descriptor-relative
     /// callers use `resolve_at`, which rejects absolute guest paths.
     pub async fn resolve_path(&self, path: &str) -> Result<ResolvedNode> {
-        let (scope, owner, finalizer, _completion) = cache::FsScope::new();
-        let finalizer_task = tokio::spawn(finalizer.run());
-        let result = self.resolve_path_in(&scope, path).await;
-        drop(owner);
-        finalizer_task
-            .await
-            .context("standalone path finalizer task failed")??;
-        result
+        let mut traversal = self.standalone_traversal();
+        self.resolve_path_in(&mut traversal, path).await
     }
 
     pub(crate) async fn resolve_path_in(
         &self,
-        filesystem_scope: &cache::FsScope,
+        traversal: &mut CidTreeTraversal,
         path: &str,
     ) -> Result<ResolvedNode> {
         let root = self.root_cid();
         Ok(self
-            .resolve_path_inner(filesystem_scope, &root, path, path.ends_with('/'), 0)
+            .resolve_path_inner(traversal, &root, path, path.ends_with('/'), 0)
             .await?
             .node)
     }
@@ -295,54 +433,50 @@ impl CidTree {
         base_path: &str,
         path: &str,
     ) -> Result<ResolvedPath> {
-        let (scope, owner, finalizer, _completion) = cache::FsScope::new();
-        let finalizer_task = tokio::spawn(finalizer.run());
-        let result = self.resolve_at_in(&scope, root_cid, base_path, path).await;
-        drop(owner);
-        finalizer_task
+        let mut traversal = self.standalone_traversal();
+        self.resolve_at_in(&mut traversal, root_cid, base_path, path)
             .await
-            .context("standalone relative-path finalizer task failed")??;
-        result
     }
 
     pub(crate) async fn resolve_at_in(
         &self,
-        filesystem_scope: &cache::FsScope,
+        traversal: &mut CidTreeTraversal,
         root_cid: &Cid,
         base_path: &str,
         path: &str,
     ) -> Result<ResolvedPath> {
-        for relative in [base_path, path] {
-            if relative.starts_with('/') || relative.split('/').any(|part| part == "..") {
-                return Err(ResolveError::InvalidPath.into());
-            }
-        }
+        Self::validate_relative_path(base_path, path)?;
         let full_path = if base_path.is_empty() {
             path.to_string()
         } else {
             // Retaining this separator also requires a directory when path is empty.
             format!("{base_path}/{path}")
         };
-        self.resolve_path_inner(
-            filesystem_scope,
-            root_cid,
-            &full_path,
-            full_path.ends_with('/'),
-            0,
-        )
-        .await
+        self.resolve_path_inner(traversal, root_cid, &full_path, full_path.ends_with('/'), 0)
+            .await
+    }
+
+    /// Validate descriptor-relative syntax without touching a cache or the
+    /// filesystem. Virtual opens call this before reserving logical capacity.
+    pub(crate) fn validate_relative_path(base_path: &str, path: &str) -> Result<()> {
+        for relative in [base_path, path] {
+            if relative.starts_with('/') || relative.split('/').any(|part| part == "..") {
+                return Err(ResolveError::InvalidPath.into());
+            }
+        }
+        Ok(())
     }
 
     fn resolve_path_inner<'a>(
         &'a self,
-        filesystem_scope: &'a cache::FsScope,
+        traversal: &'a mut CidTreeTraversal,
         root_cid: &'a Cid,
         path: &'a str,
         require_directory: bool,
         symlink_depth: usize,
     ) -> futures::future::BoxFuture<'a, Result<ResolvedPath>> {
         Box::pin(self.resolve_path_inner_impl(
-            filesystem_scope,
+            traversal,
             root_cid,
             path,
             require_directory,
@@ -352,7 +486,7 @@ impl CidTree {
 
     async fn resolve_path_inner_impl(
         &self,
-        filesystem_scope: &cache::FsScope,
+        traversal: &mut CidTreeTraversal,
         root_cid: &Cid,
         path: &str,
         require_directory: bool,
@@ -369,7 +503,7 @@ impl CidTree {
         let mut current_cid = *root_cid;
 
         for (i, component) in components.iter().enumerate() {
-            let entries = self.ls_dir_in(filesystem_scope, &current_cid).await?;
+            let entries = self.ls_dir_in(traversal, &current_cid).await?;
             let entry = entries
                 .iter()
                 .find(|entry| entry.name == *component)
@@ -410,7 +544,7 @@ impl CidTree {
                     }
                     return self
                         .resolve_path_inner(
-                            filesystem_scope,
+                            traversal,
                             root_cid,
                             &resolved_target,
                             require_directory || resolved_target.ends_with('/'),
@@ -452,6 +586,16 @@ impl CidTree {
     pub fn staging_dir(&self) -> &Path {
         &self.staging_dir
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_cell_resources(&self) -> Arc<cache::CellResources> {
+        cache::CellResources::new(Arc::clone(&self.host), cache::CellLimits::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_filesystem_scope(&self) -> cache::FsScope {
+        self.filesystem_scope.clone()
+    }
 }
 
 impl std::fmt::Debug for CidTree {
@@ -467,9 +611,48 @@ impl std::fmt::Debug for CidTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Deref;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    struct TestTree {
+        tree: CidTree,
+        _scope_owner: cache::FsOwner,
+        _scope_finalizer: cache::FsFinalizer,
+        _host_owner: cache::HostFsOwner,
+    }
+
+    impl TestTree {
+        fn new(root: Cid, ipfs: ipfs::HttpClient, staging: PathBuf) -> Self {
+            Self::with_limits(root, ipfs, staging, cache::HostLimits::default())
+        }
+
+        fn with_limits(
+            root: Cid,
+            ipfs: ipfs::HttpClient,
+            staging: PathBuf,
+            limits: cache::HostLimits,
+        ) -> Self {
+            let (host_owner, host) =
+                cache::HostFsOwner::start(tokio::runtime::Handle::current(), limits).unwrap();
+            let (scope, scope_owner, scope_finalizer, _) = host.try_filesystem_scope().unwrap();
+            Self {
+                tree: CidTree::new(root, ipfs, staging, host, scope),
+                _scope_owner: scope_owner,
+                _scope_finalizer: scope_finalizer,
+                _host_owner: host_owner,
+            }
+        }
+    }
+
+    impl Deref for TestTree {
+        type Target = CidTree;
+
+        fn deref(&self) -> &Self::Target {
+            &self.tree
+        }
+    }
 
     fn fixture_cid(tag: u8) -> Cid {
         cid::Cid::new_v1(
@@ -495,7 +678,7 @@ mod tests {
         .unwrap();
     }
 
-    fn fixture_tree(staging: &Path) -> CidTree {
+    fn fixture_tree(staging: &Path) -> TestTree {
         fixture_listing(
             staging,
             1,
@@ -513,22 +696,22 @@ mod tests {
             ],
         );
         fixture_listing(staging, 3, &[fixture_entry("child", 12, EntryType::File)]);
-        CidTree::new(
+        TestTree::new(
             fixture_cid(1),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.to_path_buf(),
         )
     }
 
-    #[test]
-    fn typed_root_replacement_preserves_snapshot_on_invalid_ingress() {
+    #[tokio::test]
+    async fn typed_root_replacement_preserves_snapshot_on_invalid_ingress() {
         use ipfs::cid_identity::parse_cid;
         let staging = tempfile::TempDir::new().unwrap();
         let original = fixture_cid(1);
         let alias = original
             .to_string_of_base(cid::multibase::Base::Base58Btc)
             .unwrap();
-        let tree = CidTree::new(
+        let tree = TestTree::new(
             parse_cid(&alias).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.path().into(),
@@ -584,6 +767,112 @@ mod tests {
                 matches!(resolved.node, ResolvedNode::CidFile { cid, .. } if cid == fixture_cid(expected_tag))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn one_foreground_lease_spans_a_traversal_and_memory_hits_need_none() {
+        let staging = tempfile::TempDir::new().unwrap();
+        fixture_listing(
+            staging.path(),
+            1,
+            &[fixture_entry("nested", 2, EntryType::Dir)],
+        );
+        fixture_listing(
+            staging.path(),
+            2,
+            &[fixture_entry("deeper", 3, EntryType::Dir)],
+        );
+        fixture_listing(
+            staging.path(),
+            3,
+            &[fixture_entry("child", 12, EntryType::File)],
+        );
+        fixture_listing(staging.path(), 99, &[]);
+        let tree = TestTree::with_limits(
+            fixture_cid(1),
+            ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
+            staging.path().to_path_buf(),
+            cache::HostLimits::new(4, 2, 4).unwrap(),
+        );
+
+        let resolved = tree.resolve_path("nested/deeper/child").await.unwrap();
+        assert!(matches!(resolved, ResolvedNode::CidFile { cid, .. } if cid == fixture_cid(12)));
+
+        let held_foreground = tree.host.try_foreground().unwrap();
+        assert_eq!(tree.ls_dir(&fixture_cid(1)).await.unwrap().len(), 1);
+        let error = tree
+            .ls_dir(&fixture_cid(99))
+            .await
+            .expect_err("a disk lookup requires foreground admission");
+        assert_eq!(
+            error
+                .downcast_ref::<cache::AdmissionError>()
+                .map(|error| error.kind()),
+            Some(cache::AdmissionKind::ForegroundProducer)
+        );
+        drop(held_foreground);
+    }
+
+    #[tokio::test]
+    async fn cancelled_virtual_traversal_retains_logical_until_driver_work_finishes() {
+        let staging = tempfile::TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"Objects\":[{\"Links\":[]}]}",
+                )
+                .await
+                .unwrap();
+        });
+        let tree = Arc::new(TestTree::with_limits(
+            fixture_cid(1),
+            ipfs::HttpClient::new(format!("http://{address}")),
+            staging.path().to_path_buf(),
+            cache::HostLimits::new(1, 2, 4).unwrap(),
+        ));
+        let resources =
+            cache::CellResources::new(Arc::clone(&tree.host), cache::CellLimits::new(1).unwrap());
+        let task_tree = Arc::clone(&tree);
+        let task_resources = Arc::clone(&resources);
+        let task = tokio::spawn(async move {
+            let logical = task_resources.try_logical_io().unwrap();
+            let mut traversal = task_tree
+                .traversal_in(&task_tree.filesystem_scope, logical)
+                .unwrap();
+            task_tree.resolve_path_in(&mut traversal, "child").await
+        });
+
+        entered_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            resources.try_logical_io().unwrap_err().kind(),
+            cache::AdmissionKind::CellLogical,
+            "driver-retained listing work must retain the virtual open's logical permit"
+        );
+
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
+        let released = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(logical) = resources.try_logical_io() {
+                    break logical;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("logical admission was not released after driver completion");
+        drop(released);
     }
 
     #[tokio::test]
@@ -774,7 +1063,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let tree = CidTree::new(
+        let tree = TestTree::new(
             ipfs::cid_identity::parse_cid(root_cid).unwrap(),
             ipfs::HttpClient::new(format!("http://{address}")),
             staging.clone(),
@@ -829,7 +1118,7 @@ mod tests {
         }];
         let disk_path = staging.path().join(format!("{canonical}{DIRLIST_SUFFIX}"));
         std::fs::write(&disk_path, serde_json::to_vec(&entries).unwrap()).unwrap();
-        let tree = CidTree::new(
+        let tree = TestTree::new(
             ipfs::cid_identity::parse_cid(&alternate).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.path().to_path_buf(),
