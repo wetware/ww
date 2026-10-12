@@ -135,6 +135,16 @@ capability. A child cannot replace or widen it. Host-internal Kubo operations
 can resolve image layers, populate caches, manage pins, and publish content.
 Those operations are not a guest content-read surface.
 
+Filesystem access is also resource-scoped. The Host supplies one finite
+filesystem authority to every execution context, while each Cell receives a
+separate logical-I/O allowance and cleanup root. Process setup reserves that
+root and its cleanup authorization before creating private directories or
+preopens. Cancellation closes new work but retains already-admitted operations
+and native results until installation or disposal, then removes `/tmp` and any
+private image root before publishing cleanup completion. Generation replacement
+and process `wait()` therefore rely on an explicit filesystem completion proof;
+a dropped result channel or stopped guest is not itself cleanup proof.
+
 This does not mean a CAS read has no node effect. A read can fetch over the
 node's network, pin and materialize blocks on disk, occupy cache budget, affect
 cache timing, and cause eviction/unpin work. Those bounded cache effects are

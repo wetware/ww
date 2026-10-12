@@ -4,7 +4,9 @@ This document covers the tokio runtime layout inside `ww`. For the
 overall thread-per-subsystem rationale, see
 [`src/services.rs`](../src/services.rs); for the on-the-wire RPC
 plumbing, see [rpc-transport.md](rpc-transport.md); for the P3 guest
-execution model, see [guest-runtime.md](guest-runtime.md).
+execution model, see [guest-runtime.md](guest-runtime.md). The pinned Wasmtime
+filesystem hook and its removal gates are documented in
+[dependencies/wasmtime.md](dependencies/wasmtime.md).
 
 ## Thread-per-subsystem
 
@@ -19,6 +21,38 @@ shared runtimes.
 | Deployment coordinator and Stem follower | main `ww` runtime workers | `multi_thread` | Root preparation, source polling, and kernel teardown overlap without a separate service thread |
 | Libp2p swarm | `swarm` (+ `ww-swarm-worker-*`) | `multi_thread` | TLS handshake parallelism — see below |
 | Executor pool worker (×N) | `executor-N` | `current_thread` + `LocalSet` | `wasmtime::Store` is `!Send` |
+
+## Filesystem lifecycle runtime
+
+The CLI creates one `HostFsOwner` from the main Tokio runtime before it creates
+private filesystem state. Its `HostResources` is the sole authority propagated
+through the executor pool, runtime clients, deployment staging, `CidTree`, the
+shared pin cache, and every kernel or ordinary Cell. Each Cell reserves one
+cleanup root before process construction and has its own logical-I/O limit;
+Host logical, foreground-producer, and cleanup-root limits remain finite and
+private implementation policy.
+
+Foreground filesystem work submitted from an executor worker runs through the
+Host driver captured from the main runtime. Ready-root cleanup uses one
+dedicated cleanup thread and a separate cleanup lane, so saturating the main
+runtime's blocking pool or all foreground producer permits cannot prevent
+mandatory cleanup from progressing. Executor workers retain admitted
+transactions through native-resource installation or disposal; a returned
+value does not release its work receipt early.
+
+Shutdown preserves that scheduling topology. The Host first closes new
+filesystem admission, asks deployment generations to stop, and asynchronously
+joins executor workers while the main runtime remains available. It then drops
+cache and staging owners, waits for process and deployment completion proofs,
+drains retained work and cleanup roots through `HostFsOwner`, joins the cleanup
+thread, and only then broadcasts shutdown to the remaining service threads.
+Startup failures after Host creation use the same epilogue. Cleanup failures are
+reported alongside the original startup error rather than replacing it.
+
+The completion proof covers Wetware-owned admission, local producers, result
+disposal, and registered local cleanup. Cancelling or dropping a Kubo HTTP
+request does not prove that daemon-internal work stopped, so these limits do
+not claim to bound Kubo's internal queues or operations.
 
 The default is `current_thread`. We pick it because:
 

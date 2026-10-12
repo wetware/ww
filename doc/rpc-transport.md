@@ -135,6 +135,11 @@ Process abort therefore discards guest state and drops host-side P3 resources
 and transport adapters. Store destruction does not certify execution of guest
 Rust destructors. Neither does a Wasm `panic=abort` trap.
 
+Filesystem completion is a separate boundary. Already-admitted native work or
+results can outlive Store cancellation while Wasmtime retains their operation
+owners. The backend publishes `Cleaned(exit)` only after the process filesystem
+completion proof and managed RPC terminalization both finish.
+
 Generated P3 subtask cancellation is a separate path: it destroys the guest
 session while the Store and sibling tasks can continue. The synchronous session
 owner terminalizes RPC state during that destruction. Wetware pins upstream
