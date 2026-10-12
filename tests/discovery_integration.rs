@@ -10,6 +10,8 @@
 //! Requires a pre-built discovery WASM at `examples/discovery/bin/discovery.wasm`.
 //! Build:  make discovery
 
+mod support;
+
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
@@ -71,6 +73,7 @@ async fn spawn_greeter_on_pool(
                     None,
                     CachePolicy::Shared,
                     worker_fuel_observer,
+                    support::filesystem_resources(),
                 );
 
                 // Load WASM via runtime to get an Executor.
@@ -195,6 +198,7 @@ async fn spawn_manual_oneshot_greeter(
         None,
         CachePolicy::Isolated,
         fuel_observer.clone(),
+        support::filesystem_resources(),
     );
 
     let mut load = runtime.load_request();
@@ -358,7 +362,7 @@ async fn spaced_requests_on_the_ticked_engine_retain_fuel_for_a_large_response()
     local
         .run_until(async {
             let (_shutdown_tx, shutdown_rx) = watch::channel(());
-            let pool = ExecutorPool::new(1, shutdown_rx);
+            let pool = ExecutorPool::new(1, shutdown_rx, support::filesystem_resources());
             let (greeter, fuel_observer) = spawn_greeter_on_pool(&pool, wasm).await;
 
             for request_number in 0..60 {
@@ -453,7 +457,7 @@ async fn test_discovery_cell_greet() {
     local
         .run_until(async {
             let (_shutdown_tx, shutdown_rx) = watch::channel(());
-            let pool = ExecutorPool::new(1, shutdown_rx);
+            let pool = ExecutorPool::new(1, shutdown_rx, support::filesystem_resources());
             let (greeter, _fuel_observer) = spawn_greeter_on_pool(&pool, wasm).await;
 
             // Call greet() and verify the response.
@@ -500,7 +504,7 @@ async fn concurrent_rpc_calls_complete_while_application_clock_is_pending() {
     local
         .run_until(async {
             let (_shutdown_tx, shutdown_rx) = watch::channel(());
-            let pool = ExecutorPool::new(1, shutdown_rx);
+            let pool = ExecutorPool::new(1, shutdown_rx, support::filesystem_resources());
             let (greeter, _fuel_observer) = spawn_greeter_on_pool(&pool, wasm).await;
 
             // The discovery guest's application branch is suspended on a P3
@@ -547,7 +551,7 @@ async fn response_larger_than_p3_transport_capacity_completes() {
     local
         .run_until(async {
             let (_shutdown_tx, shutdown_rx) = watch::channel(());
-            let pool = ExecutorPool::new(1, shutdown_rx);
+            let pool = ExecutorPool::new(1, shutdown_rx, support::filesystem_resources());
             let (greeter, _fuel_observer) = spawn_greeter_on_pool(&pool, wasm).await;
             let name = "x".repeat(256 * 1024);
 

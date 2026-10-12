@@ -15,6 +15,20 @@ use ww::launcher::create_runtime_client;
 use ww::rpc::CachePolicy;
 use ww::system_capnp;
 
+fn filesystem_resources() -> std::sync::Arc<cache::HostResources> {
+    static RESOURCES: std::sync::OnceLock<std::sync::Arc<cache::HostResources>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(RESOURCES.get_or_init(|| {
+        let (owner, resources) = cache::HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            cache::HostLimits::new(128, 65, 64).unwrap(),
+        )
+        .expect("example filesystem authority");
+        Box::leak(Box::new(owner));
+        resources
+    }))
+}
+
 /// Create a Runtime client for testing with a fixed epoch-zero guard.
 fn setup_runtime() -> system_capnp::runtime::Client {
     let (runtime_engine, mut publisher) =
@@ -35,6 +49,7 @@ fn setup_runtime() -> system_capnp::runtime::Client {
         runtime_engine,
         None,
         CachePolicy::Shared,
+        filesystem_resources(),
     )
 }
 

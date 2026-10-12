@@ -7,6 +7,8 @@
 //! Requires a pre-built echo WASM binary:
 //!   make echo
 
+mod support;
+
 use ww::launcher::create_runtime_client;
 use ww::rpc::CachePolicy;
 use ww::system_capnp;
@@ -37,6 +39,7 @@ fn setup_runtime() -> system_capnp::runtime::Client {
         runtime_engine,
         None,
         CachePolicy::Shared,
+        support::filesystem_resources(),
     )
 }
 

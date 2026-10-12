@@ -15,7 +15,10 @@ use crate::proc::ComponentRunStates;
 use crate::vfs::{CidTree, ResolveError, ResolvedNode};
 use anyhow::Result;
 use wasmtime::component::{HasData, Linker, Resource};
-use wasmtime_wasi::filesystem::{WasiFilesystemCtx, WasiFilesystemCtxView};
+use wasmtime_wasi::filesystem::{
+    FilesystemOperation as WasiFilesystemOperation, FilesystemOperationError, WasiFilesystemCtx,
+    WasiFilesystemCtxView,
+};
 
 // ── Marker type for HasData ────────────────────────────────────────
 
@@ -32,6 +35,7 @@ pub(crate) struct IpfsFilesystemView<'a> {
     pub table: &'a mut wasmtime::component::ResourceTable,
     pub cache_mode: &'a Option<Arc<cache::CacheMode>>,
     pub cid_tree: &'a Option<Arc<CidTree>>,
+    pub filesystem_resources: &'a Arc<cache::CellResources>,
     pub filesystem_scope: &'a cache::FsScope,
     pub descriptors: &'a mut DescriptorContexts,
 }
@@ -56,9 +60,52 @@ fn ipfs_filesystem(state: &mut ComponentRunStates) -> IpfsFilesystemView<'_> {
         table: &mut state.resource_table,
         cache_mode: &state.cache_mode,
         cid_tree: &state.cid_tree,
+        filesystem_resources: &state.filesystem_resources,
         filesystem_scope: &state.filesystem_scope,
         descriptors: &mut state.fs_descriptors,
     }
+}
+
+/// Ownership carried by Wasmtime for exactly one native filesystem operation
+/// or P3 stream session. Field order is deliberate: L and F are released
+/// before the final actual-work receipt can make the root cleanup-ready.
+struct NativeFsLease {
+    _logical: cache::LogicalIoPermit,
+    _producer: cache::ForegroundProducerPermit,
+    _work: cache::FsWorkToken,
+}
+
+fn admit_native_filesystem_operation(
+    resources: &Arc<cache::CellResources>,
+    filesystem_scope: &cache::FsScope,
+) -> Result<WasiFilesystemOperation, FilesystemOperationError> {
+    let logical = resources
+        .try_logical_io()
+        .map_err(|_| FilesystemOperationError::Rejected)?;
+    let work = filesystem_scope
+        .try_work()
+        .map_err(|_| FilesystemOperationError::Rejected)?;
+    let producer = resources
+        .host()
+        .try_foreground()
+        .map_err(|_| FilesystemOperationError::Rejected)?;
+    Ok(WasiFilesystemOperation::new(NativeFsLease {
+        _logical: logical,
+        _producer: producer,
+        _work: work,
+    }))
+}
+
+/// Install the zero-argument Wasmtime lifecycle provider without capturing a
+/// Store, root owner, or Cell-local state.
+pub(crate) fn install_native_filesystem_hook(
+    builder: &mut wasmtime_wasi::WasiCtxBuilder,
+    resources: Arc<cache::CellResources>,
+    filesystem_scope: cache::FsScope,
+) {
+    builder.filesystem_operation_hook(move || {
+        admit_native_filesystem_operation(&resources, &filesystem_scope)
+    });
 }
 
 pub(crate) trait FilesystemHostState: Send + Sized + 'static {
@@ -249,8 +296,9 @@ fn open_read_only_path(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MaterializeError {
+    Busy(cache::AdmissionError),
     Invalid,
     Io,
     NoEntry,
@@ -261,6 +309,7 @@ pub(crate) enum MaterializeError {
 impl From<MaterializeError> for p3_types::ErrorCode {
     fn from(error: MaterializeError) -> Self {
         match error {
+            MaterializeError::Busy(_) => Self::Busy,
             MaterializeError::Invalid => Self::Invalid,
             MaterializeError::Io => Self::Io,
             MaterializeError::NoEntry => Self::NoEntry,
@@ -277,42 +326,58 @@ pub(crate) async fn materialize_cid_tree_descriptor(
     path: &str,
     write_requested: bool,
 ) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
-    let (scope, owner, finalizer, _completion) = cache::FsScope::new();
-    let finalizer_task = tokio::spawn(finalizer.run());
-    let result =
-        materialize_cid_tree_descriptor_in(&scope, cache, cid_tree, path, write_requested).await;
-    drop(owner);
-    finalizer_task
-        .await
-        .map_err(|_| MaterializeError::Io)?
-        .map_err(|_| MaterializeError::Io)?;
-    result
-}
-
-#[cfg(test)]
-async fn materialize_cid_tree_descriptor_in(
-    filesystem_scope: &cache::FsScope,
-    cache: Option<&cache::CacheMode>,
-    cid_tree: &CidTree,
-    path: &str,
-    write_requested: bool,
-) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
     if write_requested {
         return Err(MaterializeError::NotPermitted);
     }
-
+    let resources = cid_tree.test_cell_resources();
+    let filesystem_scope = cid_tree.test_filesystem_scope();
+    let logical = resources.try_logical_io().map_err(MaterializeError::Busy)?;
+    let mut traversal = cid_tree
+        .traversal_in(&filesystem_scope, logical)
+        .map_err(MaterializeError::Busy)?;
     let resolved = cid_tree
-        .resolve_path_in(filesystem_scope, path)
+        .resolve_path_in(&mut traversal, path)
         .await
-        .map_err(|error| {
-            tracing::debug!(path, %error, "CidTree path resolution failed");
-            resolution_error(error)
-        })?;
+        .map_err(resolution_error)?;
+    let logical = traversal.into_logical().map_err(resolution_error)?;
+    materialize_cid_tree_descriptor_in(
+        &filesystem_scope,
+        &resources,
+        logical,
+        cache,
+        cid_tree,
+        resolved,
+    )
+    .await?
+    .install(|result| result)
+}
 
-    materialize_resolved_descriptor(filesystem_scope, cache, cid_tree, resolved).await
+async fn materialize_cid_tree_descriptor_in(
+    filesystem_scope: &cache::FsScope,
+    resources: &Arc<cache::CellResources>,
+    logical: cache::LogicalIoPermit,
+    cache: Option<&cache::CacheMode>,
+    cid_tree: &CidTree,
+    resolved: ResolvedNode,
+) -> Result<
+    cache::FsResultEnvelope<Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError>>,
+    MaterializeError,
+> {
+    materialize_resolved_descriptor(
+        filesystem_scope,
+        resources,
+        logical,
+        cache,
+        cid_tree,
+        resolved,
+    )
+    .await
 }
 
 fn resolution_error(error: anyhow::Error) -> MaterializeError {
+    if let Some(error) = error.downcast_ref::<cache::AdmissionError>() {
+        return MaterializeError::Busy(error.clone());
+    }
     match error.downcast_ref::<ResolveError>() {
         Some(ResolveError::NoEntry) => MaterializeError::NoEntry,
         Some(ResolveError::NotDirectory) => MaterializeError::NotDirectory,
@@ -321,71 +386,93 @@ fn resolution_error(error: anyhow::Error) -> MaterializeError {
     }
 }
 
+fn materialization_error(error: anyhow::Error) -> MaterializeError {
+    if let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<cache::AdmissionError>())
+    {
+        MaterializeError::Busy(error.clone())
+    } else {
+        MaterializeError::Io
+    }
+}
+
 async fn materialize_resolved_descriptor(
     filesystem_scope: &cache::FsScope,
+    resources: &Arc<cache::CellResources>,
+    logical: cache::LogicalIoPermit,
     cache: Option<&cache::CacheMode>,
     cid_tree: &CidTree,
     resolved: ResolvedNode,
-) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
+) -> Result<
+    cache::FsResultEnvelope<Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError>>,
+    MaterializeError,
+> {
     match resolved {
         ResolvedNode::CidFile { cid, .. } => {
             let cache = cache.ok_or(MaterializeError::Io)?;
             let canonical_cid = cid.to_string();
-            cache.ensure(&cid).await.map_err(|error| {
-                tracing::warn!(%canonical_cid, %error, "CidTree cache ensure failed");
-                MaterializeError::Io
-            })?;
+            cache
+                .ensure_in(filesystem_scope, &logical, &cid)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%canonical_cid, %error, "CidTree cache ensure failed");
+                    materialization_error(error)
+                })?;
+            let transaction = cache
+                .try_materialization_transaction(filesystem_scope, logical)
+                .map_err(materialization_error)?;
             let staging_path = cache.staging_dir().join(&canonical_cid);
             let check_path = staging_path.clone();
-            let exists = filesystem_scope
+            let exists = transaction
                 .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
                     check_path.exists()
                 })
                 .await
-                .map_err(|_| MaterializeError::Io)?;
+                .map_err(|_| MaterializeError::Io)?
+                .into_inner();
             if !exists {
                 cache
-                    .fetch_to_path_in(filesystem_scope, &cid, &staging_path)
+                    .fetch_to_path_in(filesystem_scope, &transaction, &cid, &staging_path)
                     .await
                     .map_err(|error| {
                         tracing::warn!(%canonical_cid, %error, "CidTree stream fetch failed");
-                        MaterializeError::Io
+                        materialization_error(error)
                     })?;
             }
-            let check_path = staging_path.clone();
-            if !filesystem_scope
+            transaction
                 .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
-                    check_path.exists()
-                })
-                .await
-                .map_err(|_| MaterializeError::Io)?
-            {
-                return Err(MaterializeError::Io);
-            }
-            filesystem_scope
-                .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+                    if !staging_path.exists() {
+                        return Err(MaterializeError::Io);
+                    }
                     open_read_only_path(&staging_path)
                 })
                 .await
-                .map_err(|_| MaterializeError::Io)?
+                .map_err(|_| MaterializeError::Io)
         }
         ResolvedNode::CidDir { cid } => {
+            let transaction = resources
+                .host()
+                .try_cleanup_transaction(logical, &[filesystem_scope])
+                .map_err(MaterializeError::Busy)?;
             let canonical_cid = cid.to_string();
             let staging_dir = cid_tree.staging_dir().join(format!("dir-{canonical_cid}"));
             let check_path = staging_dir.clone();
-            let exists = filesystem_scope
+            let exists = transaction
                 .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
                     check_path.exists()
                 })
                 .await
-                .map_err(|_| MaterializeError::Io)?;
+                .map_err(|_| MaterializeError::Io)?
+                .into_inner();
             if !exists {
-                let entries = cid_tree.ls_dir_in(filesystem_scope, &cid).await.map_err(
-                    |error| {
+                let entries = cid_tree
+                    .ls_dir_under(&transaction, &cid)
+                    .await
+                    .map_err(|error| {
                         tracing::warn!(%canonical_cid, %error, "CidTree directory listing failed");
-                        MaterializeError::Io
-                    },
-                )?;
+                        materialization_error(error)
+                    })?;
                 let staging_root = cid_tree.staging_dir().to_owned();
                 let publish_path = staging_dir.clone();
                 #[cfg(test)]
@@ -393,7 +480,7 @@ async fn materialize_resolved_descriptor(
                 #[cfg(test)]
                 let cleanup_hook = tests::take_directory_cleanup_hook();
                 let build_scope = filesystem_scope.clone();
-                filesystem_scope
+                transaction
                     .run_blocking(cache::FilesystemOperation::DirectoryBuild, move || {
                         build_directory(
                             staging_root,
@@ -407,14 +494,15 @@ async fn materialize_resolved_descriptor(
                         )
                     })
                     .await
-                    .map_err(|_| MaterializeError::Io)??;
+                    .map_err(|_| MaterializeError::Io)?
+                    .into_inner()?;
             }
-            filesystem_scope
+            transaction
                 .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
                     open_read_only_path(&staging_dir)
                 })
                 .await
-                .map_err(|_| MaterializeError::Io)?
+                .map_err(|_| MaterializeError::Io)
         }
     }
 }
@@ -555,10 +643,14 @@ fn cleanup_temporary_directory(
 
 async fn materialize_ipfs_descriptor_in(
     filesystem_scope: &cache::FsScope,
+    logical: cache::LogicalIoPermit,
     cache: Option<&cache::CacheMode>,
     ipfs_path: &IpfsCidPath,
     write_requested: bool,
-) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
+) -> Result<
+    cache::FsResultEnvelope<Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError>>,
+    MaterializeError,
+> {
     if write_requested {
         return Err(MaterializeError::NotPermitted);
     }
@@ -567,10 +659,16 @@ async fn materialize_ipfs_descriptor_in(
     }
 
     let cache = cache.ok_or(MaterializeError::NoEntry)?;
-    cache.ensure(&ipfs_path.cid).await.map_err(|error| {
-        tracing::warn!(cid = %ipfs_path.cid, %error, "IPFS cache ensure failed");
-        MaterializeError::Io
-    })?;
+    cache
+        .ensure_in(filesystem_scope, &logical, &ipfs_path.cid)
+        .await
+        .map_err(|error| {
+            tracing::warn!(cid = %ipfs_path.cid, %error, "IPFS cache ensure failed");
+            materialization_error(error)
+        })?;
+    let transaction = cache
+        .try_materialization_transaction(filesystem_scope, logical)
+        .map_err(materialization_error)?;
     let staging_path = cache.staging_dir().join(ipfs_path.cid.to_string());
     let target_path = if ipfs_path.subpath.is_empty() {
         staging_path
@@ -578,21 +676,23 @@ async fn materialize_ipfs_descriptor_in(
         staging_path.join(&ipfs_path.subpath)
     };
     let check_path = target_path.clone();
-    let exists = filesystem_scope
+    let exists = transaction
         .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
             check_path.exists()
         })
         .await
-        .map_err(|_| MaterializeError::Io)?;
+        .map_err(|_| MaterializeError::Io)?
+        .into_inner();
     if !exists {
         let result = if ipfs_path.subpath.is_empty() {
             cache
-                .fetch_to_path_in(filesystem_scope, &ipfs_path.cid, &target_path)
+                .fetch_to_path_in(filesystem_scope, &transaction, &ipfs_path.cid, &target_path)
                 .await
         } else {
             cache
                 .fetch_path_to_path_in(
                     filesystem_scope,
+                    &transaction,
                     &ipfs_path.cid,
                     &ipfs_path.subpath,
                     &target_path,
@@ -601,42 +701,32 @@ async fn materialize_ipfs_descriptor_in(
         };
         result.map_err(|error| {
             tracing::warn!(cid = %ipfs_path.cid, subpath = %ipfs_path.subpath, %error, "IPFS stream fetch failed");
-            MaterializeError::Io
+            materialization_error(error)
         })?;
     }
-    let check_path = target_path.clone();
-    if !filesystem_scope
+    transaction
         .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
-            check_path.exists()
-        })
-        .await
-        .map_err(|_| MaterializeError::Io)?
-    {
-        return Err(MaterializeError::NoEntry);
-    }
-    filesystem_scope
-        .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+            if !target_path.exists() {
+                return Err(MaterializeError::NoEntry);
+            }
             open_read_only_path(&target_path)
         })
         .await
-        .map_err(|_| MaterializeError::Io)?
+        .map_err(|_| MaterializeError::Io)
 }
 
 #[cfg(test)]
 pub(crate) async fn materialize_ipfs_descriptor(
+    resources: &Arc<cache::CellResources>,
+    filesystem_scope: &cache::FsScope,
     cache: Option<&cache::CacheMode>,
     ipfs_path: &IpfsCidPath,
     write_requested: bool,
 ) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
-    let (scope, owner, finalizer, _completion) = cache::FsScope::new();
-    let finalizer_task = tokio::spawn(finalizer.run());
-    let result = materialize_ipfs_descriptor_in(&scope, cache, ipfs_path, write_requested).await;
-    drop(owner);
-    finalizer_task
-        .await
-        .map_err(|_| MaterializeError::Io)?
-        .map_err(|_| MaterializeError::Io)?;
-    result
+    let logical = resources.try_logical_io().map_err(MaterializeError::Busy)?;
+    materialize_ipfs_descriptor_in(filesystem_scope, logical, cache, ipfs_path, write_requested)
+        .await?
+        .install(|result| result)
 }
 
 use wasmtime::component::{Access, Accessor, FutureReader, StreamReader};
@@ -783,6 +873,15 @@ impl<T: FilesystemHostState> p3_types::HostDescriptorWithStore<T> for IpfsFilesy
         store: &Accessor<T, Self>,
         descriptor: Resource<wasmtime_wasi::filesystem::Descriptor>,
     ) -> P3FilesystemResult<p3_types::DescriptorType> {
+        let directory = store.with(|mut access| {
+            Ok::<_, P3FilesystemError>(matches!(
+                access.get().table.get(&descriptor)?,
+                wasmtime_wasi::filesystem::Descriptor::Dir(_)
+            ))
+        })?;
+        if directory {
+            return Ok(p3_types::DescriptorType::Directory);
+        }
         <WasiFilesystem as p3_types::HostDescriptorWithStore<T>>::get_type(
             &p3_wasi_accessor(store),
             descriptor,
@@ -925,10 +1024,11 @@ impl<T: FilesystemHostState> p3_types::HostDescriptorWithStore<T> for IpfsFilesy
         open_flags: p3_types::OpenFlags,
         flags: p3_types::DescriptorFlags,
     ) -> P3FilesystemResult<Resource<wasmtime_wasi::filesystem::Descriptor>> {
-        let (cache, filesystem_scope, route) = store.with(|mut access| {
+        let (cache, resources, filesystem_scope, route) = store.with(|mut access| {
             let view = access.get();
             Ok::<_, P3FilesystemError>((
                 view.cache_mode.clone(),
+                Arc::clone(view.filesystem_resources),
                 view.filesystem_scope.clone(),
                 view.route_open(&descriptor, &path)?,
             ))
@@ -963,65 +1063,79 @@ impl<T: FilesystemHostState> p3_types::HostDescriptorWithStore<T> for IpfsFilesy
         ) {
             return Err(p3_types::ErrorCode::NotPermitted.into());
         }
-        let operation_scope = filesystem_scope.clone();
-        let operation_cache = cache.clone();
-        let operation_path = path.clone();
-        let operation = filesystem_scope
-            .run_operation(cache::FilesystemOperation::DescriptorOpen, async move {
-                Ok::<_, P3FilesystemError>(match route {
-                    OpenRoute::CidTree(mut context, target) => {
-                        let resolved = context
-                            .tree
-                            .resolve_at_in(&operation_scope, &context.root, &context.path, &target)
-                            .await
-                            .map_err(resolution_error)
-                            .map_err(p3_types::ErrorCode::from)?;
-                        let directory = matches!(resolved.node, ResolvedNode::CidDir { .. });
-                        if !directory && open_flags.contains(p3_types::OpenFlags::DIRECTORY) {
-                            return Err(p3_types::ErrorCode::NotDirectory.into());
-                        }
-                        let opened = materialize_resolved_descriptor(
-                            &operation_scope,
-                            operation_cache.as_deref(),
-                            &context.tree,
-                            resolved.node,
-                        )
-                        .await
-                        .map_err(p3_types::ErrorCode::from)?;
-                        context.path = resolved.path;
-                        (opened, directory.then_some(context))
-                    }
-                    OpenRoute::Ipfs(ipfs_path) => {
-                        let opened = materialize_ipfs_descriptor_in(
-                            &operation_scope,
-                            operation_cache.as_deref(),
-                            &ipfs_path,
-                            false,
-                        )
-                        .await
-                        .map_err(p3_types::ErrorCode::from)?;
-                        if (open_flags.contains(p3_types::OpenFlags::DIRECTORY)
-                            || operation_path.ends_with('/'))
-                            && !matches!(opened, wasmtime_wasi::filesystem::Descriptor::Dir(_))
-                        {
-                            return Err(p3_types::ErrorCode::NotDirectory.into());
-                        }
-                        (opened, None)
-                    }
-                    OpenRoute::Wasi { .. } => unreachable!(),
-                })
-            })
-            .await
-            .map_err(|_| p3_types::ErrorCode::Io)?;
-        let (opened, context) = operation?;
+        if let OpenRoute::CidTree(context, target) = &route {
+            CidTree::validate_relative_path(&context.path, target)
+                .map_err(resolution_error)
+                .map_err(p3_types::ErrorCode::from)?;
+        }
+        let logical = resources
+            .try_logical_io()
+            .map_err(|_| p3_types::ErrorCode::Busy)?;
+        let (operation, context) = match route {
+            OpenRoute::CidTree(mut context, target) => {
+                let mut traversal = context
+                    .tree
+                    .traversal_in(&filesystem_scope, logical)
+                    .map_err(|error| p3_types::ErrorCode::from(MaterializeError::Busy(error)))?;
+                let resolved = context
+                    .tree
+                    .resolve_at_in(&mut traversal, &context.root, &context.path, &target)
+                    .await
+                    .map_err(resolution_error)
+                    .map_err(p3_types::ErrorCode::from)?;
+                // Traversal F ends before independent ensure/materialization,
+                // while its one logical permit transfers to the next phase.
+                let logical = traversal
+                    .into_logical()
+                    .map_err(resolution_error)
+                    .map_err(p3_types::ErrorCode::from)?;
+                let directory = matches!(resolved.node, ResolvedNode::CidDir { .. });
+                if !directory && open_flags.contains(p3_types::OpenFlags::DIRECTORY) {
+                    return Err(p3_types::ErrorCode::NotDirectory.into());
+                }
+                let operation = materialize_cid_tree_descriptor_in(
+                    &filesystem_scope,
+                    &resources,
+                    logical,
+                    cache.as_deref(),
+                    &context.tree,
+                    resolved.node,
+                )
+                .await
+                .map_err(p3_types::ErrorCode::from)?;
+                context.path = resolved.path;
+                (operation, directory.then_some(context))
+            }
+            OpenRoute::Ipfs(ipfs_path) => {
+                let operation = materialize_ipfs_descriptor_in(
+                    &filesystem_scope,
+                    logical,
+                    cache.as_deref(),
+                    &ipfs_path,
+                    false,
+                )
+                .await
+                .map_err(p3_types::ErrorCode::from)?;
+                (operation, None)
+            }
+            OpenRoute::Wasi { .. } => unreachable!(),
+        };
         store.with(|mut access| {
             let view = access.get();
-            let opened = view.table.push(opened)?;
-            view.descriptors.remove(opened.rep());
-            if let Some(context) = context {
-                view.descriptors.directories.insert(opened.rep(), context);
-            }
-            Ok(opened)
+            operation.install(|opened| {
+                let opened = opened.map_err(p3_types::ErrorCode::from)?;
+                if (open_flags.contains(p3_types::OpenFlags::DIRECTORY) || path.ends_with('/'))
+                    && !matches!(opened, wasmtime_wasi::filesystem::Descriptor::Dir(_))
+                {
+                    return Err(p3_types::ErrorCode::NotDirectory.into());
+                }
+                let opened = view.table.push(opened)?;
+                view.descriptors.remove(opened.rep());
+                if let Some(context) = context {
+                    view.descriptors.directories.insert(opened.rep(), context);
+                }
+                Ok(opened)
+            })
         })
     }
 
@@ -1156,6 +1270,85 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    struct TestFilesystem {
+        resources: Arc<cache::CellResources>,
+        scope: cache::FsScope,
+        _scope_owner: cache::FsOwner,
+        _scope_finalizer: cache::FsFinalizer,
+        completion: cache::FsCompletion,
+        _host_owner: cache::HostFsOwner,
+    }
+
+    struct TestTree {
+        tree: CidTree,
+        filesystem: TestFilesystem,
+    }
+
+    impl std::ops::Deref for TestTree {
+        type Target = CidTree;
+
+        fn deref(&self) -> &Self::Target {
+            &self.tree
+        }
+    }
+
+    fn test_tree(root: cid::Cid, ipfs: ipfs::HttpClient, staging: std::path::PathBuf) -> TestTree {
+        let filesystem = TestFilesystem::new();
+        let tree = filesystem.tree(root, ipfs, staging);
+        TestTree { tree, filesystem }
+    }
+
+    impl TestFilesystem {
+        fn new() -> Self {
+            Self::with_limits(cache::HostLimits::default(), cache::CellLimits::default())
+        }
+
+        fn with_limits(host_limits: cache::HostLimits, cell_limits: cache::CellLimits) -> Self {
+            let (host_owner, host) =
+                cache::HostFsOwner::start(tokio::runtime::Handle::current(), host_limits).unwrap();
+            let resources = cache::CellResources::new(Arc::clone(&host), cell_limits);
+            let (scope, scope_owner, scope_finalizer, completion) =
+                host.try_filesystem_scope().unwrap();
+            Self {
+                resources,
+                scope,
+                _scope_owner: scope_owner,
+                _scope_finalizer: scope_finalizer,
+                completion,
+                _host_owner: host_owner,
+            }
+        }
+
+        fn tree(
+            &self,
+            root: cid::Cid,
+            ipfs: ipfs::HttpClient,
+            staging: std::path::PathBuf,
+        ) -> CidTree {
+            CidTree::new(
+                root,
+                ipfs,
+                staging,
+                Arc::clone(self.resources.host()),
+                self.scope.clone(),
+            )
+        }
+
+        async fn isolated_cache(&self, pinner: Arc<dyn cache::Pinner>) -> cache::CacheMode {
+            let logical = self.resources.try_logical_io().unwrap();
+            let transaction = self
+                .resources
+                .host()
+                .try_cleanup_transaction(logical, &[&self.scope])
+                .unwrap();
+            cache::CacheMode::Isolated(
+                cache::IsolatedPinset::new(pinner, self.scope.clone(), &transaction)
+                    .await
+                    .unwrap(),
+            )
+        }
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(super) enum BuildStage {
         Entry,
@@ -1263,7 +1456,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_lease_clones_retain_one_admission_until_actual_work_releases() {
+        let (host_owner, host) = cache::HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            cache::HostLimits::new(1, 2, 1).unwrap(),
+        )
+        .unwrap();
+        let resources =
+            cache::CellResources::new(Arc::clone(&host), cache::CellLimits::new(1).unwrap());
+        let (scope, scope_owner, scope_finalizer, completion) =
+            host.try_filesystem_scope().unwrap();
+
+        let operation = admit_native_filesystem_operation(&resources, &scope).unwrap();
+        let native_worker = operation.clone();
+        drop(operation);
+        assert!(matches!(
+            admit_native_filesystem_operation(&resources, &scope),
+            Err(FilesystemOperationError::Rejected)
+        ));
+
+        drop(native_worker);
+        let replacement = admit_native_filesystem_operation(&resources, &scope).unwrap();
+        drop(replacement);
+        drop(scope_owner);
+        drop(scope_finalizer);
+        completion.wait().await.unwrap();
+        host_owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cid_tree_rejects_unconfined_directory_entry_names() {
+        let fs = TestFilesystem::new();
         let cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
         let staging = tempfile::TempDir::new().unwrap();
         let entries = vec![crate::vfs::DirEntry {
@@ -1277,7 +1500,7 @@ mod tests {
             serde_json::to_vec(&entries).unwrap(),
         )
         .unwrap();
-        let tree = CidTree::new(
+        let tree = fs.tree(
             ipfs::cid_identity::parse_cid(cid).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.path().to_path_buf(),
@@ -1290,6 +1513,7 @@ mod tests {
 
     #[tokio::test]
     async fn cid_tree_later_invalid_entry_leaves_no_published_directory() {
+        let fs = TestFilesystem::new();
         let cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
         let staging = tempfile::TempDir::new().unwrap();
         let entries = vec![
@@ -1311,7 +1535,7 @@ mod tests {
             serde_json::to_vec(&entries).unwrap(),
         )
         .unwrap();
-        let tree = CidTree::new(
+        let tree = fs.tree(
             ipfs::cid_identity::parse_cid(cid).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.path().to_path_buf(),
@@ -1339,6 +1563,7 @@ mod tests {
 
     #[tokio::test]
     async fn cid_tree_materialization_propagates_malformed_directory_listing() {
+        let fs = TestFilesystem::new();
         let cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
         let staging = tempfile::TempDir::new().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1352,7 +1577,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let tree = CidTree::new(
+        let tree = fs.tree(
             ipfs::cid_identity::parse_cid(cid).unwrap(),
             ipfs::HttpClient::new(format!("http://{address}")),
             staging.path().to_path_buf(),
@@ -1367,6 +1592,7 @@ mod tests {
 
     #[tokio::test]
     async fn cid_tree_rejects_unconfined_directory_cid() {
+        let fs = TestFilesystem::new();
         let root_cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
         let root = tempfile::TempDir::new().unwrap();
         let staging = root.path().join("staging");
@@ -1382,7 +1608,7 @@ mod tests {
             serde_json::to_vec(&entries).unwrap(),
         )
         .unwrap();
-        let tree = CidTree::new(
+        let tree = fs.tree(
             ipfs::cid_identity::parse_cid(root_cid).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             staging.clone(),
@@ -1396,6 +1622,7 @@ mod tests {
 
     #[tokio::test]
     async fn cid_tree_rejects_path_bearing_child_before_cache_effects() {
+        let fs = TestFilesystem::new();
         let content = b"confined file content";
         let (cid, pinner) = test_cid_and_pinner(content);
         let escape_root = tempfile::TempDir::new().unwrap();
@@ -1415,12 +1642,12 @@ mod tests {
             serde_json::to_vec(&entries).unwrap(),
         )
         .unwrap();
-        let tree = CidTree::new(
+        let tree = fs.tree(
             cid,
             ipfs::HttpClient::new("http://127.0.0.1:1".to_string()),
             tree_staging.path().to_path_buf(),
         );
-        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        let cache = fs.isolated_cache(pinner).await;
         let canonical_path = cache.staging_dir().join(cid.to_string());
 
         let result =
@@ -1442,6 +1669,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_alternate_child_cid_stages_canonical_file() {
+        let fs = TestFilesystem::new();
         let content = b"alias file";
         let cid = cid::Cid::new_v1(
             0x55,
@@ -1461,7 +1689,7 @@ mod tests {
             serde_json::to_vec(&entries).unwrap(),
         )
         .unwrap();
-        let tree = CidTree::new(
+        let tree = fs.tree(
             cid,
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.path().into(),
@@ -1470,7 +1698,7 @@ mod tests {
             data: HashMap::from([(cid, content.to_vec())]),
             path_data: HashMap::new(),
         });
-        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        let cache = fs.isolated_cache(pinner).await;
         materialize_cid_tree_descriptor(Some(&cache), &tree, "child", false)
             .await
             .unwrap();
@@ -1543,13 +1771,13 @@ mod tests {
     fn cached_directory_tree(
         staging: &std::path::Path,
         entries: &[crate::vfs::DirEntry],
-    ) -> CidTree {
+    ) -> TestTree {
         std::fs::write(
             staging.join(format!("{DIRECTORY_CID}.dirlist.json")),
             serde_json::to_vec(entries).unwrap(),
         )
         .unwrap();
-        CidTree::new(
+        test_tree(
             ipfs::cid_identity::parse_cid(DIRECTORY_CID).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.to_path_buf(),
@@ -1686,10 +1914,8 @@ mod tests {
             Ok(())
         });
         let _cleanup_hook = CleanupHookGuard::install(|_| Err(MaterializeError::Io));
-        let (scope, owner, finalizer, completion) = cache::FsScope::new();
-        let finalizer_task = tokio::spawn(finalizer.run());
-
-        let descriptor = materialize_cid_tree_descriptor_in(&scope, None, &tree, "", false)
+        let completion = tree.filesystem.completion.clone();
+        let descriptor = materialize_cid_tree_descriptor(None, &tree, "", false)
             .await
             .unwrap();
         let wasmtime_wasi::filesystem::Descriptor::Dir(_) = descriptor else {
@@ -1697,13 +1923,12 @@ mod tests {
         };
         assert_eq!(std::fs::read(final_path.join("winner")).unwrap(), b"winner");
 
-        drop(owner);
+        drop(tree);
         let error = completion
             .wait()
             .await
             .expect_err("loser cleanup failure must poison filesystem completion");
         assert!(error.to_string().contains("cleanup failed"));
-        assert!(finalizer_task.await.unwrap().is_err());
         assert_eq!(std::fs::read(final_path.join("winner")).unwrap(), b"winner");
         assert!(!temporary_path.lock().unwrap().as_ref().unwrap().exists());
     }
@@ -1718,7 +1943,7 @@ mod tests {
         let staging = tempfile::TempDir::new().unwrap();
         let entries = if empty { vec![] } else { directory_entries() };
         let first_tree = cached_directory_tree(staging.path(), &entries);
-        let second_tree = CidTree::new(
+        let second_tree = test_tree(
             ipfs::cid_identity::parse_cid(DIRECTORY_CID).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.path().to_path_buf(),
@@ -1805,13 +2030,13 @@ mod tests {
         assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 2);
     }
 
-    #[test]
-    fn cid_tree_concurrent_builders_publish_one_complete_directory() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cid_tree_concurrent_builders_publish_one_complete_directory() {
         concurrent_directory_publication(false);
     }
 
-    #[test]
-    fn cid_tree_concurrent_builders_preserve_empty_winner() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cid_tree_concurrent_builders_preserve_empty_winner() {
         concurrent_directory_publication(true);
     }
 
@@ -1828,7 +2053,7 @@ mod tests {
         std::fs::remove_file(staging.path().join(format!("{DIRECTORY_CID}.dirlist.json"))).unwrap();
         // A new tree has no LRU; its backend is unavailable. Final reuse must
         // not require listing or touch any published entry.
-        let tree = CidTree::new(
+        let tree = test_tree(
             ipfs::cid_identity::parse_cid(DIRECTORY_CID).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.path().into(),
@@ -1893,7 +2118,7 @@ mod tests {
             b"[]",
         )
         .unwrap();
-        let tree = CidTree::new(
+        let tree = test_tree(
             ipfs::cid_identity::parse_cid(&alternate).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.path().into(),
@@ -1908,7 +2133,7 @@ mod tests {
             .unwrap()
             .ino();
         std::fs::remove_file(staging.path().join(format!("{canonical}.dirlist.json"))).unwrap();
-        let tree = CidTree::new(
+        let tree = test_tree(
             ipfs::cid_identity::parse_cid(canonical).unwrap(),
             ipfs::HttpClient::new("http://127.0.0.1:1".into()),
             staging.path().into(),
@@ -1949,7 +2174,7 @@ mod tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
         });
-        let tree = CidTree::new(
+        let tree = test_tree(
             ipfs::cid_identity::parse_cid(DIRECTORY_CID).unwrap(),
             ipfs::HttpClient::new(format!("http://{address}")),
             staging.path().into(),
@@ -1965,6 +2190,93 @@ mod tests {
     }
 
     // ── Mock pinner for integration tests ──────────────────────────
+
+    struct GatedColdPinner {
+        contents: Vec<u8>,
+        gate_pin: bool,
+        gate_fetch: bool,
+        fail_fetch: bool,
+        pins: std::sync::atomic::AtomicUsize,
+        fetches: std::sync::atomic::AtomicUsize,
+        finished: std::sync::atomic::AtomicBool,
+        pin_started: tokio::sync::Notify,
+        release_pin: tokio::sync::Notify,
+        fetch_started: tokio::sync::Notify,
+        release_fetch: tokio::sync::Notify,
+    }
+
+    impl GatedColdPinner {
+        fn new(gate_pin: bool, gate_fetch: bool, fail_fetch: bool) -> Arc<Self> {
+            Arc::new(Self {
+                contents: b"retained cold materialization".to_vec(),
+                gate_pin,
+                gate_fetch,
+                fail_fetch,
+                pins: std::sync::atomic::AtomicUsize::new(0),
+                fetches: std::sync::atomic::AtomicUsize::new(0),
+                finished: std::sync::atomic::AtomicBool::new(false),
+                pin_started: tokio::sync::Notify::new(),
+                release_pin: tokio::sync::Notify::new(),
+                fetch_started: tokio::sync::Notify::new(),
+                release_fetch: tokio::sync::Notify::new(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cache::Pinner for GatedColdPinner {
+        async fn pin(&self, _cid: &cid::Cid) -> anyhow::Result<()> {
+            self.pins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.gate_pin {
+                let released = self.release_pin.notified();
+                self.pin_started.notify_waiters();
+                released.await;
+            }
+            Ok(())
+        }
+
+        async fn unpin(&self, _cid: &cid::Cid) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(&self, _cid: &cid::Cid) -> anyhow::Result<Vec<u8>> {
+            Ok(self.contents.clone())
+        }
+
+        async fn fetch_to_path(
+            &self,
+            _cid: &cid::Cid,
+            destination: &std::path::Path,
+        ) -> anyhow::Result<()> {
+            use std::io::Write;
+
+            let fetch_number = self
+                .fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)?;
+            file.write_all(&self.contents[..self.contents.len() / 2])?;
+            if self.gate_fetch && fetch_number == 1 {
+                let released = self.release_fetch.notified();
+                self.fetch_started.notify_waiters();
+                released.await;
+            }
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_fetch {
+                anyhow::bail!("injected retained fetch failure");
+            }
+            file.write_all(&self.contents[self.contents.len() / 2..])?;
+            Ok(())
+        }
+
+        async fn size(&self, _cid: &cid::Cid) -> anyhow::Result<u64> {
+            Ok(self.contents.len() as u64)
+        }
+    }
 
     struct MockPinner {
         data: HashMap<cid::Cid, Vec<u8>>,
@@ -2033,19 +2345,223 @@ mod tests {
         (cid, Arc::new(MockPinner { data, path_data }))
     }
 
+    fn spawn_materialization(
+        resources: Arc<cache::CellResources>,
+        scope: cache::FsScope,
+        cache: Arc<cache::CacheMode>,
+        path: IpfsCidPath,
+    ) -> tokio::task::JoinHandle<Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError>>
+    {
+        tokio::spawn(async move {
+            materialize_ipfs_descriptor(&resources, &scope, Some(&cache), &path, false).await
+        })
+    }
+
+    #[tokio::test]
+    async fn same_cid_cold_materializations_each_require_foreground_admission() {
+        let fs = TestFilesystem::with_limits(
+            cache::HostLimits::new(4, 2, 4).unwrap(),
+            cache::CellLimits::new(4).unwrap(),
+        );
+        let cid: cid::Cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+            .parse()
+            .unwrap();
+        let pinner = GatedColdPinner::new(true, true, false);
+        let cache = Arc::new(fs.isolated_cache(pinner.clone()).await);
+        let path = move || IpfsCidPath {
+            cid,
+            subpath: String::new(),
+        };
+        let pin_started = pinner.pin_started.notified();
+        let mut first = spawn_materialization(
+            Arc::clone(&fs.resources),
+            fs.scope.clone(),
+            Arc::clone(&cache),
+            path(),
+        );
+        pin_started.await;
+
+        let (second_entered_tx, second_entered_rx) = tokio::sync::oneshot::channel();
+        let second_resources = Arc::clone(&fs.resources);
+        let second_scope = fs.scope.clone();
+        let second_cache = Arc::clone(&cache);
+        let mut second = tokio::spawn(async move {
+            second_entered_tx.send(()).unwrap();
+            materialize_ipfs_descriptor(
+                &second_resources,
+                &second_scope,
+                Some(&second_cache),
+                &path(),
+                false,
+            )
+            .await
+        });
+        second_entered_rx.await.unwrap();
+        assert!(
+            !second.is_finished(),
+            "same-CID waiter must join the retained ensure owner"
+        );
+
+        let fetch_started = pinner.fetch_started.notified();
+        pinner.release_pin.notify_one();
+        fetch_started.await;
+        let (loser_was_first, loser) = tokio::select! {
+            result = &mut first => (true, result.unwrap()),
+            result = &mut second => (false, result.unwrap()),
+        };
+        let error = match loser {
+            Err(error) => error,
+            Ok(_) => panic!("the second independent cold transfer must be rejected"),
+        };
+        assert!(matches!(
+            error,
+            MaterializeError::Busy(ref admission)
+                if admission.kind() == cache::AdmissionKind::ForegroundProducer
+        ));
+        assert_eq!(
+            pinner.pins.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "same-CID ensure must stay deduplicated"
+        );
+        assert_eq!(
+            pinner.fetches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "whole materialization must not be coalesced or duplicated after F rejection"
+        );
+
+        pinner.release_fetch.notify_one();
+        let descriptor = if loser_was_first {
+            second.await.unwrap().unwrap()
+        } else {
+            first.await.unwrap().unwrap()
+        };
+        drop(descriptor);
+        assert_eq!(
+            std::fs::read(cache.staging_dir().join(cid.to_string())).unwrap(),
+            pinner.contents
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_materialization_reuses_one_foreground_lease_through_descriptor_open() {
+        let fs = TestFilesystem::with_limits(
+            cache::HostLimits::new(2, 2, 4).unwrap(),
+            cache::CellLimits::new(2).unwrap(),
+        );
+        let cid: cid::Cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+            .parse()
+            .unwrap();
+        let pinner = GatedColdPinner::new(false, false, false);
+        let cache = fs.isolated_cache(pinner.clone()).await;
+        let descriptor = materialize_ipfs_descriptor(
+            &fs.resources,
+            &fs.scope,
+            Some(&cache),
+            &IpfsCidPath {
+                cid,
+                subpath: String::new(),
+            },
+            false,
+        )
+        .await
+        .expect("one F must span staging, fetch, commit, and descriptor open");
+        drop(descriptor);
+        assert_eq!(pinner.fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retained_materialization_outlives_cell_runtime_until_rollback_and_completion() {
+        use futures::FutureExt as _;
+
+        let fs = TestFilesystem::with_limits(
+            cache::HostLimits::new(1, 2, 4).unwrap(),
+            cache::CellLimits::new(1).unwrap(),
+        );
+        let cid: cid::Cid = "QmYwAPJzv5CZsnN625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+            .parse()
+            .unwrap();
+        let pinner = GatedColdPinner::new(false, true, true);
+        let cache = Arc::new(fs.isolated_cache(pinner.clone()).await);
+        let staging = cache.staging_dir().to_path_buf();
+        let task_resources = Arc::clone(&fs.resources);
+        let task_scope = fs.scope.clone();
+        let task_cache = Arc::clone(&cache);
+        let fetch_started = pinner.fetch_started.notified();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let cell_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.spawn(async move {
+                let _ = materialize_ipfs_descriptor(
+                    &task_resources,
+                    &task_scope,
+                    Some(&task_cache),
+                    &IpfsCidPath {
+                        cid,
+                        subpath: String::new(),
+                    },
+                    false,
+                )
+                .await;
+            });
+            runtime.block_on(async { shutdown_rx.await.unwrap() });
+            drop(runtime);
+        });
+
+        fetch_started.await;
+        shutdown_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || cell_thread.join().unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            fs.resources.try_logical_io(),
+            Err(ref error) if error.kind() == cache::AdmissionKind::CellLogical
+        ));
+
+        let TestFilesystem {
+            resources: _,
+            scope: _,
+            _scope_owner: owner,
+            _scope_finalizer: finalizer,
+            completion,
+            _host_owner: host_owner,
+        } = fs;
+        drop(owner);
+        let finalizer_task = tokio::spawn(finalizer.run());
+        assert!(
+            completion.wait().now_or_never().is_none(),
+            "origin completion must remain pending while retained materialization is active"
+        );
+
+        pinner.release_fetch.notify_one();
+        finalizer_task.await.unwrap().unwrap();
+        completion.wait().await.unwrap();
+        assert!(pinner.finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !staging.exists(),
+            "failed retained materialization and root cleanup must remove partial staging"
+        );
+        drop(cache);
+        drop(host_owner);
+    }
+
     #[tokio::test]
     async fn materialize_ipfs_fetches_read_only_content() {
+        let fs = TestFilesystem::new();
         let content = b"hello ipfs world";
         let (cid, pinner) = test_cid_and_pinner(content);
-        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        let cache = fs.isolated_cache(pinner).await;
         let path = IpfsCidPath {
             cid,
             subpath: String::new(),
         };
 
-        let descriptor = materialize_ipfs_descriptor(Some(&cache), &path, false)
-            .await
-            .expect("materialize IPFS content");
+        let descriptor =
+            materialize_ipfs_descriptor(&fs.resources, &fs.scope, Some(&cache), &path, false)
+                .await
+                .expect("materialize IPFS content");
         drop(descriptor);
         assert_eq!(
             std::fs::read(cache.staging_dir().join(cid.to_string())).unwrap(),
@@ -2055,38 +2571,41 @@ mod tests {
 
     #[tokio::test]
     async fn materialize_ipfs_rejects_writes_and_missing_cache() {
+        let fs = TestFilesystem::new();
         let (cid, pinner) = test_cid_and_pinner(b"data");
-        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        let cache = fs.isolated_cache(pinner).await;
         let path = IpfsCidPath {
             cid,
             subpath: String::new(),
         };
 
         assert!(matches!(
-            materialize_ipfs_descriptor(Some(&cache), &path, true).await,
+            materialize_ipfs_descriptor(&fs.resources, &fs.scope, Some(&cache), &path, true).await,
             Err(MaterializeError::NotPermitted)
         ));
         assert!(matches!(
-            materialize_ipfs_descriptor(None, &path, false).await,
+            materialize_ipfs_descriptor(&fs.resources, &fs.scope, None, &path, false).await,
             Err(MaterializeError::NoEntry)
         ));
     }
 
     #[tokio::test]
     async fn materialize_ipfs_fetches_subpath_content() {
+        let fs = TestFilesystem::new();
         let root_bytes = b"root cid blob bytes";
         let nested_bytes = b"nested file content";
         let (cid, pinner) =
             test_cid_and_pinner_with_subpath(root_bytes, "sub/dir/file.txt", nested_bytes);
-        let cache = cache::CacheMode::Isolated(cache::IsolatedPinset::new(pinner).unwrap());
+        let cache = fs.isolated_cache(pinner).await;
         let path = IpfsCidPath {
             cid,
             subpath: "sub/dir/file.txt".to_string(),
         };
 
-        let descriptor = materialize_ipfs_descriptor(Some(&cache), &path, false)
-            .await
-            .expect("materialize IPFS subpath");
+        let descriptor =
+            materialize_ipfs_descriptor(&fs.resources, &fs.scope, Some(&cache), &path, false)
+                .await
+                .expect("materialize IPFS subpath");
         drop(descriptor);
         assert_eq!(
             std::fs::read(

@@ -6,13 +6,17 @@
 
 use std::{
     future::Future,
+    io,
     path::Path,
+    pin::Pin,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use cache::{PathWriteNotOwned, PathWriteSourcePanic};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 pub mod cid_identity;
@@ -34,6 +38,183 @@ type RetryObserver = Arc<dyn Fn(&str, u64) + Send + Sync>;
 pub struct HttpClient {
     pub(crate) http_client: reqwest::Client,
     pub(crate) base_url: String,
+}
+
+enum PumpFailure {
+    Source(anyhow::Error),
+    Sink(anyhow::Error),
+    Panic(PathWriteSourcePanic),
+}
+
+impl PumpFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Source(error) | Self::Sink(error) => error,
+            Self::Panic(error) => error.into(),
+        }
+    }
+}
+
+#[async_trait]
+trait LocalFilePump: Send {
+    async fn pump(self, file: &mut tokio::fs::File) -> std::result::Result<u64, PumpFailure>;
+}
+
+struct HttpFilePump<'a> {
+    client: &'a HttpClient,
+    path: &'a str,
+}
+
+#[async_trait]
+impl LocalFilePump for HttpFilePump<'_> {
+    async fn pump(self, file: &mut tokio::fs::File) -> std::result::Result<u64, PumpFailure> {
+        let mut response = self.client.cat_response(self.path).await.map_err(|error| {
+            PumpFailure::Source(error.context(format!(
+                "Failed to start streaming IPFS content from {}",
+                self.path
+            )))
+        })?;
+        let mut total = 0u64;
+        loop {
+            let chunk = response
+                .chunk()
+                .await
+                .with_context(|| format!("Failed to read streaming chunk from {}", self.path))
+                .map_err(PumpFailure::Source)?;
+            let Some(chunk) = chunk else {
+                return Ok(total);
+            };
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("Failed writing streaming chunk from {}", self.path))
+                .map_err(PumpFailure::Sink)?;
+            total += chunk.len() as u64;
+        }
+    }
+}
+
+struct CatchUnwind<F> {
+    future: Pin<Box<F>>,
+}
+
+impl<F> CatchUnwind<F> {
+    fn new(future: F) -> Self {
+        Self {
+            future: Box::pin(future),
+        }
+    }
+}
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.future.as_mut().poll(context)
+        })) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+#[async_trait]
+trait FileTerminal: Send {
+    fn try_into_std(
+        &mut self,
+        file: tokio::fs::File,
+    ) -> std::result::Result<std::fs::File, tokio::fs::File>;
+
+    async fn flush(&mut self, file: &mut tokio::fs::File) -> io::Result<()>;
+}
+
+struct TokioFileTerminal;
+
+#[async_trait]
+impl FileTerminal for TokioFileTerminal {
+    fn try_into_std(
+        &mut self,
+        file: tokio::fs::File,
+    ) -> std::result::Result<std::fs::File, tokio::fs::File> {
+        file.try_into_std()
+    }
+
+    async fn flush(&mut self, file: &mut tokio::fs::File) -> io::Result<()> {
+        file.flush().await
+    }
+}
+
+async fn wait_for_file_ownership<T: FileTerminal>(mut file: tokio::fs::File, terminal: &mut T) {
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match terminal.try_into_std(file) {
+            Ok(_) => return,
+            Err(returned) => file = returned,
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_millis(32));
+    }
+}
+
+async fn settle_failed_local_write<T: FileTerminal>(file: tokio::fs::File, terminal: &mut T) {
+    let mut file = match terminal.try_into_std(file) {
+        Ok(_) => return,
+        Err(file) => file,
+    };
+
+    if CatchUnwind::new(terminal.flush(&mut file)).await.is_err() {
+        wait_for_file_ownership(file, terminal).await;
+    }
+}
+
+async fn finish_local_file_write<P, T>(
+    mut file: tokio::fs::File,
+    pump: P,
+    terminal: &mut T,
+) -> Result<()>
+where
+    P: LocalFilePump,
+    T: FileTerminal,
+{
+    let pump_result = match CatchUnwind::new(pump.pump(&mut file)).await {
+        Ok(result) => result,
+        Err(payload) => Err(PumpFailure::Panic(PathWriteSourcePanic::new(
+            payload.as_ref(),
+        ))),
+    };
+
+    match pump_result {
+        Ok(_) => match CatchUnwind::new(terminal.flush(&mut file)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(PumpFailure::Sink(error.into()).into_error()),
+            Err(payload) => {
+                wait_for_file_ownership(file, terminal).await;
+                Err(anyhow::anyhow!(
+                    "terminal path flush panicked: {}",
+                    PathWriteSourcePanic::new(payload.as_ref())
+                ))
+            }
+        },
+        Err(primary) => {
+            settle_failed_local_write(file, terminal).await;
+            Err(primary.into_error())
+        }
+    }
+}
+
+async fn open_exclusive_write_only(dst: &Path) -> Result<tokio::fs::File> {
+    if let Some(parent) = dst.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| PathWriteNotOwned::new(anyhow::Error::from(error)))?;
+    }
+    tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(dst)
+        .await
+        .map_err(|error| PathWriteNotOwned::new(anyhow::Error::from(error)).into())
 }
 
 /// A non-success response from Kubo's HTTP API.
@@ -450,18 +631,12 @@ impl HttpClient {
     /// Stream file content from an IPFS path directly to `dst`.
     ///
     /// Accepts IPFS-family paths: `/ipfs/<cid>`, `/ipns/...`, `/ipld/...`.
+    /// Exclusively creates `dst` and returns only after every accepted local
+    /// write reaches terminal state. This does not provide `fsync` durability.
     pub async fn cat_to_path(&self, path: &str, dst: &Path) -> Result<()> {
-        if let Some(parent) = dst.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("Failed to create parent dir {}", parent.display()))?;
-        }
-
-        let mut out = tokio::fs::File::create(dst)
-            .await
-            .with_context(|| format!("Failed to create destination file {}", dst.display()))?;
-        self.cat_to_writer(path, &mut out).await?;
-        Ok(())
+        let file = open_exclusive_write_only(dst).await?;
+        let mut terminal = TokioFileTerminal;
+        finish_local_file_write(file, HttpFilePump { client: self, path }, &mut terminal).await
     }
 
     /// Fetch an IPFS directory and extract it to a local path.
@@ -583,15 +758,203 @@ impl HttpClient {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        fs::OpenOptions as StdOpenOptions,
+        io,
+        path::Path,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
+    };
 
+    use async_trait::async_trait;
+    use cache::{PathWriteNotOwned, PathWriteSourcePanic};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     use super::{
-        is_retryable_kubo_error, parse_kubo_ls_response, parse_kubo_mfs_ls_response, BootClient,
-        HttpClient,
+        finish_local_file_write, is_retryable_kubo_error, parse_kubo_ls_response,
+        parse_kubo_mfs_ls_response, BootClient, FileTerminal, HttpClient, PumpFailure,
     };
+
+    enum AcceptedPumpEnd {
+        SourceError,
+        SourcePanic,
+    }
+
+    struct AcceptedPump {
+        accepted: Option<oneshot::Sender<()>>,
+        end: AcceptedPumpEnd,
+    }
+
+    #[async_trait]
+    impl super::LocalFilePump for AcceptedPump {
+        async fn pump(
+            mut self,
+            file: &mut tokio::fs::File,
+        ) -> std::result::Result<u64, PumpFailure> {
+            file.write_all(b"accepted-local-write")
+                .await
+                .map_err(|error| PumpFailure::Sink(error.into()))?;
+            self.accepted.take().unwrap().send(()).unwrap();
+            match self.end {
+                AcceptedPumpEnd::SourceError => {
+                    Err(PumpFailure::Source(anyhow::anyhow!("source-primary")))
+                }
+                AcceptedPumpEnd::SourcePanic => panic!("source-panic"),
+            }
+        }
+    }
+
+    struct ProbeNotifier {
+        busy: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait]
+    impl FileTerminal for ProbeNotifier {
+        fn try_into_std(
+            &mut self,
+            file: tokio::fs::File,
+        ) -> std::result::Result<std::fs::File, tokio::fs::File> {
+            match file.try_into_std() {
+                Ok(file) => Ok(file),
+                Err(file) => {
+                    if let Some(busy) = self.busy.take() {
+                        busy.send(()).unwrap();
+                    }
+                    Err(file)
+                }
+            }
+        }
+
+        async fn flush(&mut self, file: &mut tokio::fs::File) -> io::Result<()> {
+            file.flush().await
+        }
+    }
+
+    enum ScriptedFlush {
+        Ok,
+        Error(&'static str),
+        Panic,
+    }
+
+    struct ScriptedTerminal {
+        busy_probes: usize,
+        probes: Arc<AtomicUsize>,
+        flushes: Arc<AtomicUsize>,
+        flush: ScriptedFlush,
+    }
+
+    #[async_trait]
+    impl FileTerminal for ScriptedTerminal {
+        fn try_into_std(
+            &mut self,
+            file: tokio::fs::File,
+        ) -> std::result::Result<std::fs::File, tokio::fs::File> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            if self.busy_probes > 0 {
+                self.busy_probes -= 1;
+                return Err(file);
+            }
+            file.try_into_std()
+        }
+
+        async fn flush(&mut self, _file: &mut tokio::fs::File) -> io::Result<()> {
+            let prior = self.flushes.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(prior, 0, "a consumed terminal completion was repolled");
+            match self.flush {
+                ScriptedFlush::Ok => Ok(()),
+                ScriptedFlush::Error(message) => Err(io::Error::other(message)),
+                ScriptedFlush::Panic => panic!("terminal-flush-panic"),
+            }
+        }
+    }
+
+    struct ImmediatePump(std::result::Result<u64, PumpFailure>);
+
+    #[async_trait]
+    impl super::LocalFilePump for ImmediatePump {
+        async fn pump(self, _file: &mut tokio::fs::File) -> std::result::Result<u64, PumpFailure> {
+            self.0
+        }
+    }
+
+    fn fresh_exclusive_file(path: &Path) -> tokio::fs::File {
+        tokio::fs::File::from_std(
+            StdOpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)
+                .unwrap(),
+        )
+    }
+
+    fn run_accepted_write_failure(end: AcceptedPumpEnd) -> anyhow::Error {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("staging");
+        let file = fresh_exclusive_file(&path);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let (blocker_started_tx, blocker_started_rx) = oneshot::channel();
+            let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::sync_channel(0);
+            let blocker = tokio::task::spawn_blocking(move || {
+                blocker_started_tx.send(()).unwrap();
+                release_blocker_rx.recv().unwrap();
+            });
+            tokio::time::timeout(Duration::from_secs(5), blocker_started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let (accepted_tx, accepted_rx) = oneshot::channel();
+            let (busy_tx, busy_rx) = oneshot::channel();
+            let transfer = tokio::spawn(async move {
+                let mut terminal = ProbeNotifier {
+                    busy: Some(busy_tx),
+                };
+                finish_local_file_write(
+                    file,
+                    AcceptedPump {
+                        accepted: Some(accepted_tx),
+                        end,
+                    },
+                    &mut terminal,
+                )
+                .await
+            });
+
+            tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), busy_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !transfer.is_finished(),
+                "primary failure returned before the accepted write became terminal"
+            );
+
+            release_blocker_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(5), transfer)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(std::fs::read(path).unwrap(), b"accepted-local-write");
+            error
+        })
+    }
 
     async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
         let mut request = Vec::new();
@@ -1181,6 +1544,177 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(error.to_string().contains("IPFS pin add made no progress"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn exclusive_path_creation_preserves_a_preexisting_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("existing");
+        std::fs::write(&destination, b"preexisting-owner").unwrap();
+        let client = HttpClient::new("http://127.0.0.1:1".into());
+
+        let error = client
+            .cat_to_path("/ipfs/bafy-test", &destination)
+            .await
+            .unwrap_err();
+
+        assert!(error.chain().any(|cause| cause.is::<PathWriteNotOwned>()));
+        assert_eq!(std::fs::read(destination).unwrap(), b"preexisting-owner");
+    }
+
+    #[tokio::test]
+    async fn cat_to_path_flushes_streamed_bytes_before_success() {
+        let body = "streamed-path-content";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("materialized");
+        let client = HttpClient::new(format!("http://{address}"));
+
+        client
+            .cat_to_path("/ipfs/bafy-test", &destination)
+            .await
+            .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), body.as_bytes());
+    }
+
+    #[test]
+    fn source_error_waits_for_an_accepted_real_tokio_file_write() {
+        let error = run_accepted_write_failure(AcceptedPumpEnd::SourceError);
+
+        assert_eq!(error.to_string(), "source-primary");
+    }
+
+    #[test]
+    fn source_panic_is_typed_and_waits_for_an_accepted_real_tokio_file_write() {
+        let error = run_accepted_write_failure(AcceptedPumpEnd::SourcePanic);
+
+        assert!(error
+            .chain()
+            .any(|cause| cause.is::<PathWriteSourcePanic>()));
+        assert!(error.to_string().contains("source-panic"));
+    }
+
+    #[tokio::test]
+    async fn successful_pump_observes_deferred_flush_error_before_returning() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = fresh_exclusive_file(&directory.path().join("staging"));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut terminal = ScriptedTerminal {
+            busy_probes: 0,
+            probes: Arc::clone(&probes),
+            flushes: Arc::clone(&flushes),
+            flush: ScriptedFlush::Error("deferred-write-failure"),
+        };
+
+        let error = finish_local_file_write(file, ImmediatePump(Ok(0)), &mut terminal)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("deferred-write-failure"));
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn primary_pump_error_wins_and_terminal_completion_is_observed_once() {
+        for primary in [
+            PumpFailure::Source(anyhow::anyhow!("source-primary")),
+            PumpFailure::Sink(anyhow::anyhow!("sink-primary")),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let file = fresh_exclusive_file(&directory.path().join("staging"));
+            let probes = Arc::new(AtomicUsize::new(0));
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let mut terminal = ScriptedTerminal {
+                busy_probes: 1,
+                probes: Arc::clone(&probes),
+                flushes: Arc::clone(&flushes),
+                flush: ScriptedFlush::Error("secondary-terminal-failure"),
+            };
+            let expected = match &primary {
+                PumpFailure::Source(_) => "source-primary",
+                PumpFailure::Sink(_) => "sink-primary",
+                PumpFailure::Panic(_) => unreachable!(),
+            };
+
+            let error = finish_local_file_write(file, ImmediatePump(Err(primary)), &mut terminal)
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(flushes.load(Ordering::SeqCst), 1);
+            assert_eq!(probes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_flush_panic_retains_file_until_ownership_probe_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = fresh_exclusive_file(&directory.path().join("staging"));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut terminal = ScriptedTerminal {
+            // One busy probe enters terminal flush; two more prove that a
+            // flush panic does not release the File before backing work ends.
+            busy_probes: 3,
+            probes: Arc::clone(&probes),
+            flushes: Arc::clone(&flushes),
+            flush: ScriptedFlush::Panic,
+        };
+
+        let error = finish_local_file_write(
+            file,
+            ImmediatePump(Err(PumpFailure::Source(anyhow::anyhow!("source-primary")))),
+            &mut terminal,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "source-primary");
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(probes.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn already_quiescent_primary_error_skips_terminal_flush() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = fresh_exclusive_file(&directory.path().join("staging"));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut terminal = ScriptedTerminal {
+            busy_probes: 0,
+            probes: Arc::new(AtomicUsize::new(0)),
+            flushes: Arc::clone(&flushes),
+            flush: ScriptedFlush::Ok,
+        };
+
+        let error = finish_local_file_write(
+            file,
+            ImmediatePump(Err(PumpFailure::Source(anyhow::anyhow!("source-primary")))),
+            &mut terminal,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "source-primary");
+        assert_eq!(flushes.load(Ordering::SeqCst), 0);
     }
 }
 

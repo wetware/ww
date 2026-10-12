@@ -353,6 +353,7 @@ pub struct RuntimeInputs {
     compile_tx: mpsc::Sender<CompileRequest>,
     cache_policy: rpc::CachePolicy,
     pinset_cache: Arc<cache::PinsetCache>,
+    filesystem_resources: Arc<cache::HostResources>,
 }
 
 impl RuntimeInputs {
@@ -362,6 +363,7 @@ impl RuntimeInputs {
         compile_tx: mpsc::Sender<CompileRequest>,
         cache_policy: rpc::CachePolicy,
         pinset_cache: Arc<cache::PinsetCache>,
+        filesystem_resources: Arc<cache::HostResources>,
     ) -> Self {
         Self {
             wasm_debug,
@@ -369,6 +371,7 @@ impl RuntimeInputs {
             compile_tx,
             cache_policy,
             pinset_cache,
+            filesystem_resources,
         }
     }
 }
@@ -435,8 +438,13 @@ impl Generation {
         runtime_inputs: RuntimeInputs,
         stdio: Stdio,
         terminate_rx: watch::Receiver<()>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, cache::AdmissionError> {
+        let filesystem_resources = cache::CellResources::new(
+            Arc::clone(&runtime_inputs.filesystem_resources),
+            cache::CellLimits::default(),
+        );
+        let filesystem_ownership = cell::FilesystemOwnership::try_new(filesystem_resources)?;
+        Ok(Self {
             artifact,
             root,
             guard,
@@ -445,8 +453,8 @@ impl Generation {
             runtime_inputs,
             stdio,
             terminate_rx,
-            filesystem_ownership: cell::FilesystemOwnership::new(),
-        }
+            filesystem_ownership,
+        })
     }
 
     /// Repeatable proof that this generation's filesystem work and private
@@ -494,9 +502,9 @@ impl Generation {
             stderr(),
             root.tree,
             readiness_gate.clone(),
+            filesystem_ownership,
         );
         builder = builder
-            .with_filesystem_ownership(filesystem_ownership)
             .with_runtime_engine(runtime_inputs.runtime_engine.clone())
             .with_wasm_debug(runtime_inputs.wasm_debug)
             .with_env(guest_env)
@@ -533,6 +541,7 @@ impl Generation {
             Some(runtime_inputs.compile_tx),
             runtime_inputs.cache_policy,
             Some(runtime_inputs.pinset_cache),
+            runtime_inputs.filesystem_resources,
         );
         let registration_scope = RegistrationScope::new();
         let rpc_system = rpc::graft::build_kernel_membrane_rpc(

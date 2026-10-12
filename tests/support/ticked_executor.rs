@@ -10,7 +10,11 @@ impl TickedExecutor {
     pub fn new() -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         Self {
-            pool: ww::services::ExecutorPool::new(1, shutdown_rx),
+            pool: ww::services::ExecutorPool::new(
+                1,
+                shutdown_rx,
+                crate::support::filesystem_resources(),
+            ),
             _shutdown_tx: shutdown_tx,
         }
     }

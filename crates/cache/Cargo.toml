@@ -10,7 +10,7 @@ test-support = []
 [dependencies]
 cid = { workspace = true }
 linked-hash-map = "0.5"
-tokio = { workspace = true, features = ["sync", "rt", "time", "fs"] }
+tokio = { workspace = true, features = ["sync", "rt", "time", "fs", "io-util"] }
 tokio-util = { workspace = true, features = ["rt"] }
 futures = { workspace = true }
 anyhow = { workspace = true }

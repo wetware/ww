@@ -71,6 +71,17 @@ impl std::fmt::Display for PermanentPreparationError {
 impl std::error::Error for PermanentPreparationError {}
 
 fn classify_failure(error: &anyhow::Error) -> FailureClass {
+    if let Some(admission) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<cache::AdmissionError>())
+    {
+        return match admission.kind() {
+            cache::AdmissionKind::Closed | cache::AdmissionKind::CleanupPoisoned => {
+                FailureClass::Permanent
+            }
+            _ => FailureClass::Transient,
+        };
+    }
     if error
         .chain()
         .any(|cause| cause.is::<PermanentPreparationError>())
@@ -153,6 +164,8 @@ enum Prewarm<'a> {
     Bootstrap {
         tree: &'a mut Option<Arc<CidTree>>,
         staging_dir: &'a Path,
+        filesystem_host: &'a Arc<cache::HostResources>,
+        filesystem_scope: &'a cache::FsScope,
     },
 }
 
@@ -204,11 +217,18 @@ async fn prepare_root(
 
     let tree = match prewarm {
         Prewarm::Existing(tree) => tree,
-        Prewarm::Bootstrap { tree, staging_dir } => tree.get_or_insert_with(|| {
+        Prewarm::Bootstrap {
+            tree,
+            staging_dir,
+            filesystem_host,
+            filesystem_scope,
+        } => tree.get_or_insert_with(|| {
             Arc::new(CidTree::new(
                 effective,
                 ipfs_client.clone(),
                 staging_dir.to_owned(),
+                Arc::clone(filesystem_host),
+                filesystem_scope.clone(),
             ))
         }),
     };
@@ -346,6 +366,8 @@ pub struct Config {
     pub frozen_layers: Vec<String>,
     pub ipfs_client: crate::ipfs::HttpClient,
     pub staging_dir: PathBuf,
+    pub filesystem_host: Arc<cache::HostResources>,
+    pub filesystem_scope: cache::FsScope,
 }
 
 /// Inputs shared by all kernel generations in one host process.
@@ -401,7 +423,7 @@ impl<'a> KernelLauncher<'a> {
             self.runtime_inputs.clone(),
             self.stdio,
             terminate_rx,
-        );
+        )?;
         let filesystem_completion = generation.filesystem_completion();
         let intended_seq = epoch.seq;
         let (result_tx, result_rx) = oneshot::channel();
@@ -587,6 +609,8 @@ impl Deployment {
             retained_pins: Vec::new(),
             ipfs_client: config.ipfs_client,
             staging_dir: config.staging_dir,
+            filesystem_host: config.filesystem_host,
+            filesystem_scope: config.filesystem_scope,
             source_rx,
             source_task,
             candidate_rx: config.candidates,
@@ -1526,6 +1550,8 @@ struct BootstrapState {
     retained_pins: Vec<PinSet>,
     ipfs_client: crate::ipfs::HttpClient,
     staging_dir: PathBuf,
+    filesystem_host: Arc<cache::HostResources>,
+    filesystem_scope: cache::FsScope,
     source_rx: Option<mpsc::Receiver<SourceMessage>>,
     source_task: Option<tokio::task::JoinHandle<()>>,
     candidate_rx: Option<watch::Receiver<Option<Vec<u8>>>>,
@@ -1563,6 +1589,8 @@ impl BootstrapState {
                     Prewarm::Bootstrap {
                         tree: &mut tree,
                         staging_dir: &self.staging_dir,
+                        filesystem_host: &self.filesystem_host,
+                        filesystem_scope: &self.filesystem_scope,
                     },
                     &mut attempt,
                     &mut cancel_rx,
@@ -1799,6 +1827,39 @@ mod tests {
 
     const ROOT: &str = "bafybeiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf354";
 
+    fn test_filesystem_host() -> Arc<cache::HostResources> {
+        crate::services::test_filesystem_resources()
+    }
+
+    fn test_filesystem_scope() -> cache::FsScope {
+        crate::services::test_filesystem_scope()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filesystem_admission_failure_classification_preserves_retry_policy() {
+        let (host_owner, host) = cache::HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            cache::HostLimits::new(2, 2, 1).unwrap(),
+        )
+        .unwrap();
+        let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+        let exhausted = match host.try_filesystem_scope() {
+            Ok(_) => panic!("cleanup-root overload unexpectedly admitted"),
+            Err(error) => anyhow::Error::new(error),
+        };
+        assert_eq!(classify_failure(&exhausted), FailureClass::Transient);
+
+        host_owner.close_admission();
+        let closed = anyhow::Error::new(host.try_logical_io().unwrap_err());
+        assert_eq!(classify_failure(&closed), FailureClass::Permanent);
+
+        drop(scope);
+        drop(owner);
+        assert_eq!(finalizer.run().await, Ok(()));
+        assert_eq!(completion.wait().await, Ok(()));
+        host_owner.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn pin_aliases_share_ownership_and_protection() {
         let root = crate::ipfs::cid_identity::parse_cid(ROOT).unwrap();
@@ -1840,6 +1901,8 @@ mod tests {
                     frozen_layers: vec![ROOT.to_owned(), invalid],
                     ipfs_client: client.clone(),
                     staging_dir: staging.path().to_owned(),
+                    filesystem_host: test_filesystem_host(),
+                    filesystem_scope: test_filesystem_scope(),
                 },
                 epoch_tx,
                 epoch_rx,
@@ -1899,6 +1962,8 @@ mod tests {
             Prewarm::Bootstrap {
                 tree: &mut tree,
                 staging_dir: staging.path(),
+                filesystem_host: &test_filesystem_host(),
+                filesystem_scope: &test_filesystem_scope(),
             },
             &mut pins,
             &mut cancel,
@@ -1918,6 +1983,8 @@ mod tests {
             Prewarm::Bootstrap {
                 tree: &mut tree,
                 staging_dir: staging.path(),
+                filesystem_host: &test_filesystem_host(),
+                filesystem_scope: &test_filesystem_scope(),
             },
             &mut pins,
             &mut cancel,
@@ -1982,6 +2049,8 @@ mod tests {
             Prewarm::Bootstrap {
                 tree: &mut tree,
                 staging_dir: staging.path(),
+                filesystem_host: &test_filesystem_host(),
+                filesystem_scope: &test_filesystem_scope(),
             },
             &mut pins,
             &mut cancel,
@@ -2001,6 +2070,8 @@ mod tests {
             Prewarm::Bootstrap {
                 tree: &mut tree,
                 staging_dir: staging.path(),
+                filesystem_host: &test_filesystem_host(),
+                filesystem_scope: &test_filesystem_scope(),
             },
             &mut pins,
             &mut cancel,
@@ -2090,6 +2161,8 @@ mod tests {
             retained_pins: Vec::new(),
             ipfs_client: crate::ipfs::HttpClient::new(format!("http://{address}")),
             staging_dir: staging.path().to_owned(),
+            filesystem_host: test_filesystem_host(),
+            filesystem_scope: test_filesystem_scope(),
             source_rx: Some(source_rx),
             source_task: None,
             candidate_rx: None,
@@ -2363,6 +2436,8 @@ mod tests {
             OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging_dir,
+            test_filesystem_host(),
+            test_filesystem_scope(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
@@ -2408,7 +2483,8 @@ mod tests {
     }
 
     fn completed_filesystem_scope() -> cache::FsCompletion {
-        let (scope, owner, finalizer, completion) = cache::FsScope::new();
+        let (scope, owner, finalizer, completion) =
+            test_filesystem_host().try_filesystem_scope().unwrap();
         drop(scope);
         drop(owner);
         drop(finalizer);
@@ -2472,6 +2548,8 @@ mod tests {
                 frozen_layers: vec![ROOT.to_owned()],
                 ipfs_client: crate::ipfs::HttpClient::new(format!("http://{address}")),
                 staging_dir: staging.path().to_owned(),
+                filesystem_host: test_filesystem_host(),
+                filesystem_scope: test_filesystem_scope(),
             },
             epoch_tx,
             epoch_rx,
@@ -2511,6 +2589,8 @@ mod tests {
                 frozen_layers: Vec::new(),
                 ipfs_client,
                 staging_dir: staging.path().to_owned(),
+                filesystem_host: test_filesystem_host(),
+                filesystem_scope: test_filesystem_scope(),
             },
             epoch_tx,
             epoch_rx,
@@ -2548,6 +2628,8 @@ mod tests {
                 frozen_layers: Vec::new(),
                 ipfs_client,
                 staging_dir: staging.path().to_owned(),
+                filesystem_host: test_filesystem_host(),
+                filesystem_scope: test_filesystem_scope(),
             },
             epoch_tx,
             epoch_rx,
@@ -2570,6 +2652,8 @@ mod tests {
             OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
         ));
         let initial = Epoch {
             seq: u64::MAX,
@@ -2616,6 +2700,8 @@ mod tests {
             OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 3,
@@ -2659,6 +2745,8 @@ mod tests {
             OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
         ));
         let mut pins = PinSet::default();
         let (_cancel, mut cancel_rx) = watch::channel(false);
@@ -3277,6 +3365,8 @@ mod tests {
             OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
@@ -3360,6 +3450,8 @@ mod tests {
             OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
@@ -3394,7 +3486,7 @@ mod tests {
             }),
         };
         let (filesystem_scope, filesystem_owner, filesystem_finalizer, filesystem_completion) =
-            cache::FsScope::new();
+            test_filesystem_host().try_filesystem_scope().unwrap();
         let private = tempfile::tempdir().unwrap();
         let private_path = private.path().to_owned();
         let (cleanup_entered_tx, cleanup_entered_rx) = oneshot::channel();
@@ -3484,7 +3576,7 @@ mod tests {
         });
 
         let (filesystem_scope, filesystem_owner, filesystem_finalizer, filesystem_completion) =
-            cache::FsScope::new();
+            test_filesystem_host().try_filesystem_scope().unwrap();
         filesystem_scope
             .own_cleanup(cache::FilesystemOperation::ProcessCleanup, || {
                 Err(std::io::Error::other("injected cleanup failure"))
@@ -3533,6 +3625,8 @@ mod tests {
             OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
@@ -3678,6 +3772,8 @@ mod tests {
                 frozen_layers: Vec::new(),
                 ipfs_client,
                 staging_dir: staging.path().to_path_buf(),
+                filesystem_host: test_filesystem_host(),
+                filesystem_scope: test_filesystem_scope(),
             },
             epoch_tx,
             epoch_rx,
@@ -3735,6 +3831,8 @@ mod tests {
             OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
@@ -3844,6 +3942,8 @@ mod tests {
             OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch {
             seq: 0,
@@ -3894,6 +3994,8 @@ mod tests {
             OLD_ROOT.parse().unwrap(),
             client.clone(),
             staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch::zero());
         let mut deployment = Deployment {
