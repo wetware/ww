@@ -29,8 +29,60 @@ private filesystem state. Its `HostResources` is the sole authority propagated
 through the executor pool, runtime clients, deployment staging, `CidTree`, the
 shared pin cache, and every kernel or ordinary Cell. Each Cell reserves one
 cleanup root before process construction and has its own logical-I/O limit;
-Host logical, foreground-producer, and cleanup-root limits remain finite and
-private implementation policy.
+Host logical, foreground-producer, and cleanup-root limits remain finite.
+
+The production `HostLimits` policy admits 128 logical filesystem operations
+(`H=128`) and 33 backend producers: 32 foreground lanes (`F=32`) plus one
+dedicated cleanup-active lane (`C=1`). Each Cell has a 16-operation logical
+limit (`L=16`). The Host also provides 128 cleanup roots (`K=128`) as a finite
+beta limit on simultaneously live cleanup obligations, not disk bytes. The
+pool is shared by the deployment root, the shared `PinsetCache` root, live
+Cell/process roots, and staged CID generations. It has no reserved staging
+partition, so any of these consumers can exhaust it. `H=128` does not itself
+bound idle content owners: a Cell root or staged generation can remain live
+after its logical operation and foreground work have finished.
+
+Current production construction has two long-lived non-Cell roots: deployment
+and the shared `PinsetCache`. With `C_live` live Cell/process roots, this leaves
+`126 - C_live` slots for staged or retiring generations, absent any additional
+roots. For example, one full foreground wave of 32 active generations can
+overlap 32 retiring generations while `C_live <= 62` because
+`2 + C_live + 32 + 32 <= 128`. This is an illustrative supported allocation,
+not an enforced reservation or partition and not an independent maximum-Cell
+guarantee. Idle Cells, native content owners, or retiring generations can use
+the shared slots in a different mix. When the pool is exhausted, new staging
+is rejected through the bounded admission path and surfaces as `Busy`.
+
+Each staged CID generation reserves one cleanup root before creating its
+private directory and holds that slot from generation creation through terminal
+reclamation. Cleanup-root exhaustion can therefore reject staging before the
+ARC byte target is reached. The rejection occurs before generation-private
+filesystem effects and follows the existing `CleanupObligation` admission path,
+which guest-visible filesystem work maps to `Busy`; Wetware never falls back to
+untracked staging.
+
+Staged subpaths are retained at CID-generation granularity. A live
+`StagedContentLease`, descriptor, or native handle for any path in a generation
+retains the entire staged generation, including materialized siblings and
+ancestors, until the final owner closes. This avoids unsafe ancestor deletion
+and a path-level ownership graph. Every generation has a physically unique,
+nonreused directory, so delayed cleanup captures only the retired generation
+and cannot delete a later admission of the same CID.
+
+ARC residency is a separate claim. The production 128 MiB ARC target is a
+`PinEntry` weight target; it is neither resident staging bytes nor a hard disk
+quota. ARC eviction drops only the `PinEntry` generation claim. Accepted
+publishers and Wasmtime native handles retain staged content independently, so
+oversized ARC-unresident content can still be materialized and used. Releasing
+the final content owner makes exact-generation cleanup eligible, providing
+eventual safe reclamation rather than a strict staging-byte bound.
+
+Wasmtime's `FilesystemOperation` owns active native work and admission, while
+`FilesystemHandle` carries native `File`/`Dir` authority plus the opaque
+`StagedContentLease` owner. An idle descriptor retains its generation without
+holding active-operation capacity. See
+[dependencies/wasmtime.md](dependencies/wasmtime.md) for the exact v48 backport
+and propagation contract.
 
 Foreground filesystem work submitted from an executor worker runs through the
 Host driver captured from the main runtime. Ready-root cleanup uses one

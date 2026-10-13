@@ -422,7 +422,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cranelift-assembler-x64-meta",
 ]
@@ -430,7 +430,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64-meta"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cranelift-srcgen",
 ]
@@ -438,7 +438,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bforest"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cranelift-entity",
  "wasmtime-internal-core",
@@ -447,7 +447,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bitset"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "serde",
  "serde_derive",
@@ -457,7 +457,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -487,7 +487,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-meta"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cranelift-assembler-x64-meta",
  "cranelift-codegen-shared",
@@ -499,12 +499,12 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-shared"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 
 [[package]]
 name = "cranelift-control"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "arbitrary",
 ]
@@ -512,7 +512,7 @@ dependencies = [
 [[package]]
 name = "cranelift-entity"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cranelift-bitset",
  "serde",
@@ -523,7 +523,7 @@ dependencies = [
 [[package]]
 name = "cranelift-frontend"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cranelift-codegen",
  "hashbrown 0.17.1",
@@ -535,12 +535,12 @@ dependencies = [
 [[package]]
 name = "cranelift-isle"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 
 [[package]]
 name = "cranelift-native"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cranelift-codegen",
  "libc",
@@ -550,7 +550,7 @@ dependencies = [
 [[package]]
 name = "cranelift-srcgen"
 version = "0.135.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 
 [[package]]
 name = "crc32fast"
@@ -1961,7 +1961,7 @@ dependencies = [
 [[package]]
 name = "pulley-interpreter"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cranelift-bitset",
  "log",
@@ -1972,7 +1972,7 @@ dependencies = [
 [[package]]
 name = "pulley-macros"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2643,7 +2643,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3137,7 +3137,7 @@ dependencies = [
 [[package]]
 name = "wasmtime"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "addr2line",
  "async-trait",
@@ -3189,7 +3189,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-environ"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "anyhow",
  "cpp_demangle",
@@ -3219,7 +3219,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-cache"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "base64 0.22.1",
  "directories-next",
@@ -3238,7 +3238,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-component-macro"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "anyhow",
  "proc-macro2",
@@ -3252,12 +3252,12 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-component-util"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 
 [[package]]
 name = "wasmtime-internal-core"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.1",
@@ -3268,7 +3268,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-cranelift"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cranelift-codegen",
  "cranelift-control",
@@ -3293,7 +3293,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-fiber"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cc",
  "libc",
@@ -3306,7 +3306,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-debug"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cc",
  "object",
@@ -3317,7 +3317,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-icache-coherence"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "libc",
  "wasmtime-internal-core",
@@ -3327,7 +3327,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-unwinder"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "cranelift-codegen",
  "log",
@@ -3338,7 +3338,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-versioned-export-macros"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3348,7 +3348,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-wit-bindgen"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -3361,7 +3361,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-wasi"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -3383,7 +3383,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-wasi-io"
 version = "48.0.1"
-source = "git+https://github.com/wetware/wasmtime?rev=a5fb020948a771aad3aa78dfb983caf3dfbf8f98#a5fb020948a771aad3aa78dfb983caf3dfbf8f98"
+source = "git+https://github.com/wetware/wasmtime?rev=fe367749da9584f974b516f28c5c8055861d1512#fe367749da9584f974b516f28c5c8055861d1512"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3494,7 +3494,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -3738,6 +3738,7 @@ dependencies = [
  "cid",
  "futures",
  "linked-hash-map",
+ "rustix",
  "tempfile",
  "tokio",
  "tokio-util",

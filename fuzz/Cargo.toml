@@ -21,9 +21,9 @@ serde_json = "=1.0.150"
 [patch.crates-io]
 capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a" }
 # Filesystem operation lifecycle hooks for bounded native WASI I/O.
-wasmtime = { git = "https://github.com/wetware/wasmtime", rev = "a5fb020948a771aad3aa78dfb983caf3dfbf8f98" }
-wasmtime-wasi = { git = "https://github.com/wetware/wasmtime", rev = "a5fb020948a771aad3aa78dfb983caf3dfbf8f98" }
-wasmtime-wasi-io = { git = "https://github.com/wetware/wasmtime", rev = "a5fb020948a771aad3aa78dfb983caf3dfbf8f98" }
+wasmtime = { git = "https://github.com/wetware/wasmtime", rev = "fe367749da9584f974b516f28c5c8055861d1512" }
+wasmtime-wasi = { git = "https://github.com/wetware/wasmtime", rev = "fe367749da9584f974b516f28c5c8055861d1512" }
+wasmtime-wasi-io = { git = "https://github.com/wetware/wasmtime", rev = "fe367749da9584f974b516f28c5c8055861d1512" }
 
 [[bin]]
 name = "fuzz_kubo_ls_response"

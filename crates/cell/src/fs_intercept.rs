@@ -16,8 +16,8 @@ use crate::vfs::{CidTree, ResolveError, ResolvedNode};
 use anyhow::Result;
 use wasmtime::component::{HasData, Linker, Resource};
 use wasmtime_wasi::filesystem::{
-    FilesystemOperation as WasiFilesystemOperation, FilesystemOperationError, WasiFilesystemCtx,
-    WasiFilesystemCtxView,
+    FilesystemHandle, FilesystemOperation as WasiFilesystemOperation, FilesystemOperationError,
+    WasiFilesystemCtx, WasiFilesystemCtxView,
 };
 
 // ── Marker type for HasData ────────────────────────────────────────
@@ -265,6 +265,7 @@ fn is_confined_relative_path(path: &str) -> bool {
 
 fn open_read_only_path(
     path: &std::path::Path,
+    lease: Option<cache::StagedContentLease>,
 ) -> Result<wasmtime_wasi::filesystem::Descriptor, MaterializeError> {
     use wasmtime_wasi::filesystem::{Descriptor, Dir, File};
     use wasmtime_wasi::{FsPerms, OpenMode};
@@ -273,8 +274,13 @@ fn open_read_only_path(
     if metadata.is_dir() {
         let dir = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
             .map_err(|_| MaterializeError::Io)?;
+        let native = dir.into_std_file();
+        let native = match lease {
+            Some(lease) => FilesystemHandle::new(native, lease),
+            None => native.into(),
+        };
         Ok(Descriptor::Dir(Dir::new(
-            dir.into_std_file(),
+            native,
             FsPerms::ReadOnly,
             OpenMode::READ,
             false,
@@ -287,8 +293,13 @@ fn open_read_only_path(
         .map_err(|_| MaterializeError::Io)?
         .open(path.file_name().unwrap_or_default())
         .map_err(|_| MaterializeError::Io)?;
+        let native = file.into_std();
+        let native = match lease {
+            Some(lease) => FilesystemHandle::new(native, lease),
+            None => native.into(),
+        };
         Ok(Descriptor::File(File::new(
-            file.into_std(),
+            native,
             FsPerms::ReadOnly,
             OpenMode::READ,
             false,
@@ -397,6 +408,80 @@ fn materialization_error(error: anyhow::Error) -> MaterializeError {
     }
 }
 
+async fn materialize_cache_path(
+    filesystem_scope: &cache::FsScope,
+    logical: cache::LogicalIoPermit,
+    cache: &cache::CacheMode,
+    cid: &cid::Cid,
+    subpath: Option<&str>,
+) -> Result<
+    (
+        cache::ForegroundTransaction,
+        std::path::PathBuf,
+        Option<cache::StagedContentLease>,
+    ),
+    MaterializeError,
+> {
+    cache
+        .ensure_in(filesystem_scope, &logical, cid)
+        .await
+        .map_err(materialization_error)?;
+    match cache {
+        cache::CacheMode::Shared(shared) => {
+            let staged = shared
+                .staged_content_in(filesystem_scope, logical, cid)
+                .await
+                .map_err(materialization_error)?;
+            let path = shared
+                .materialize_staged(&staged, subpath)
+                .await
+                .map_err(materialization_error)?;
+            Ok((
+                staged.transaction().continuation(),
+                path,
+                Some(staged.lease()),
+            ))
+        }
+        cache::CacheMode::Isolated(pinset) => {
+            let transaction = pinset
+                .try_materialization_transaction(filesystem_scope, logical)
+                .map_err(materialization_error)?;
+            let root = pinset.staging_dir().join(cid.to_string());
+            let path = subpath.map_or_else(|| root.clone(), |subpath| root.join(subpath));
+            let check_path = path.clone();
+            let exists = transaction
+                .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+                    check_path.exists()
+                })
+                .await
+                .map_err(|_| MaterializeError::Io)?
+                .into_inner();
+            if !exists {
+                match subpath {
+                    Some(subpath) => {
+                        pinset
+                            .fetch_path_to_path_in(
+                                filesystem_scope,
+                                &transaction,
+                                cid,
+                                subpath,
+                                &path,
+                            )
+                            .await
+                    }
+                    None => {
+                        pinset
+                            .fetch_to_path_in(filesystem_scope, &transaction, cid, &path)
+                            .await
+                    }
+                }
+                .map_err(materialization_error)?;
+            }
+            Ok((transaction, path, None))
+        }
+    }
+}
+
 async fn materialize_resolved_descriptor(
     filesystem_scope: &cache::FsScope,
     resources: &Arc<cache::CellResources>,
@@ -412,40 +497,24 @@ async fn materialize_resolved_descriptor(
         ResolvedNode::CidFile { cid, .. } => {
             let cache = cache.ok_or(MaterializeError::Io)?;
             let canonical_cid = cid.to_string();
-            cache
-                .ensure_in(filesystem_scope, &logical, &cid)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(%canonical_cid, %error, "CidTree cache ensure failed");
-                    materialization_error(error)
-                })?;
-            let transaction = cache
-                .try_materialization_transaction(filesystem_scope, logical)
-                .map_err(materialization_error)?;
-            let staging_path = cache.staging_dir().join(&canonical_cid);
-            let check_path = staging_path.clone();
-            let exists = transaction
-                .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
-                    check_path.exists()
-                })
-                .await
-                .map_err(|_| MaterializeError::Io)?
-                .into_inner();
-            if !exists {
-                cache
-                    .fetch_to_path_in(filesystem_scope, &transaction, &cid, &staging_path)
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(%canonical_cid, %error, "CidTree stream fetch failed");
-                        materialization_error(error)
-                    })?;
-            }
+            let (transaction, staging_path, lease) = materialize_cache_path(
+                filesystem_scope,
+                logical,
+                cache,
+                &cid,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(%canonical_cid, ?error, "CidTree cache materialization failed");
+                error
+            })?;
             transaction
                 .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
                     if !staging_path.exists() {
                         return Err(MaterializeError::Io);
                     }
-                    open_read_only_path(&staging_path)
+                    open_read_only_path(&staging_path, lease)
                 })
                 .await
                 .map_err(|_| MaterializeError::Io)
@@ -499,7 +568,7 @@ async fn materialize_resolved_descriptor(
             }
             transaction
                 .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
-                    open_read_only_path(&staging_dir)
+                    open_read_only_path(&staging_dir, None)
                 })
                 .await
                 .map_err(|_| MaterializeError::Io)
@@ -659,57 +728,20 @@ async fn materialize_ipfs_descriptor_in(
     }
 
     let cache = cache.ok_or(MaterializeError::NoEntry)?;
-    cache
-        .ensure_in(filesystem_scope, &logical, &ipfs_path.cid)
-        .await
-        .map_err(|error| {
-            tracing::warn!(cid = %ipfs_path.cid, %error, "IPFS cache ensure failed");
-            materialization_error(error)
-        })?;
-    let transaction = cache
-        .try_materialization_transaction(filesystem_scope, logical)
-        .map_err(materialization_error)?;
-    let staging_path = cache.staging_dir().join(ipfs_path.cid.to_string());
-    let target_path = if ipfs_path.subpath.is_empty() {
-        staging_path
-    } else {
-        staging_path.join(&ipfs_path.subpath)
-    };
-    let check_path = target_path.clone();
-    let exists = transaction
-        .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
-            check_path.exists()
-        })
-        .await
-        .map_err(|_| MaterializeError::Io)?
-        .into_inner();
-    if !exists {
-        let result = if ipfs_path.subpath.is_empty() {
-            cache
-                .fetch_to_path_in(filesystem_scope, &transaction, &ipfs_path.cid, &target_path)
-                .await
-        } else {
-            cache
-                .fetch_path_to_path_in(
-                    filesystem_scope,
-                    &transaction,
-                    &ipfs_path.cid,
-                    &ipfs_path.subpath,
-                    &target_path,
-                )
-                .await
-        };
-        result.map_err(|error| {
-            tracing::warn!(cid = %ipfs_path.cid, subpath = %ipfs_path.subpath, %error, "IPFS stream fetch failed");
-            materialization_error(error)
-        })?;
-    }
+    let subpath = (!ipfs_path.subpath.is_empty()).then_some(ipfs_path.subpath.as_str());
+    let (transaction, target_path, lease) =
+        materialize_cache_path(filesystem_scope, logical, cache, &ipfs_path.cid, subpath)
+            .await
+            .map_err(|error| {
+                tracing::warn!(cid = %ipfs_path.cid, subpath = %ipfs_path.subpath, ?error, "IPFS cache materialization failed");
+                error
+            })?;
     transaction
         .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
             if !target_path.exists() {
                 return Err(MaterializeError::NoEntry);
             }
-            open_read_only_path(&target_path)
+            open_read_only_path(&target_path, lease)
         })
         .await
         .map_err(|_| MaterializeError::Io)
@@ -1346,6 +1378,19 @@ mod tests {
                     .await
                     .unwrap(),
             )
+        }
+
+        async fn shared_cache(
+            &self,
+            pinner: Arc<dyn cache::Pinner>,
+            budget: usize,
+        ) -> (Arc<cache::PinsetCache>, cache::CacheMode) {
+            let shared = Arc::new(
+                cache::PinsetCache::new(pinner, budget, Arc::clone(self.resources.host()))
+                    .await
+                    .unwrap(),
+            );
+            (Arc::clone(&shared), cache::CacheMode::Shared(shared))
         }
     }
 
@@ -2567,6 +2612,89 @@ mod tests {
             std::fs::read(cache.staging_dir().join(cid.to_string())).unwrap(),
             content
         );
+    }
+
+    #[tokio::test]
+    async fn preserving_native_handle_retains_generation_after_descriptor_drop_and_eviction() {
+        use futures::FutureExt as _;
+        use std::io::Read as _;
+
+        let fs = TestFilesystem::with_limits(
+            cache::HostLimits::new(8, 3, 8).unwrap(),
+            cache::CellLimits::new(1).unwrap(),
+        );
+        let first_hash = cid::multihash::Multihash::wrap(0x00, &[71]).unwrap();
+        let second_hash = cid::multihash::Multihash::wrap(0x00, &[72]).unwrap();
+        let first = cid::Cid::new_v1(0x55, first_hash);
+        let second = cid::Cid::new_v1(0x55, second_hash);
+        let mut data = HashMap::new();
+        data.insert(first, b"first".to_vec());
+        data.insert(second, b"other".to_vec());
+        let mut path_data = HashMap::new();
+        path_data.insert(format!("{first}/a"), b"first-a".to_vec());
+        path_data.insert(format!("{first}/b"), b"first-b".to_vec());
+        let pinner = Arc::new(MockPinner { data, path_data });
+        let (shared, cache) = fs.shared_cache(pinner, 5).await;
+        let descriptor_a = materialize_ipfs_descriptor(
+            &fs.resources,
+            &fs.scope,
+            Some(&cache),
+            &IpfsCidPath {
+                cid: first,
+                subpath: "a".to_owned(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        let descriptor_b = materialize_ipfs_descriptor(
+            &fs.resources,
+            &fs.scope,
+            Some(&cache),
+            &IpfsCidPath {
+                cid: first,
+                subpath: "b".to_owned(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        let operation = admit_native_filesystem_operation(&fs.resources, &fs.scope).unwrap();
+        assert!(matches!(
+            admit_native_filesystem_operation(&fs.resources, &fs.scope),
+            Err(FilesystemOperationError::Rejected)
+        ));
+        drop(operation);
+        let operation = admit_native_filesystem_operation(&fs.resources, &fs.scope).unwrap();
+        drop(operation);
+        let (generation_path, completion) = shared.test_generation(&first).unwrap();
+        let cache_completion = shared.completion();
+        let wasmtime_wasi::filesystem::Descriptor::File(file) = &descriptor_a else {
+            panic!("expected staged file descriptor")
+        };
+        let native = file.file.try_clone().unwrap();
+        drop(descriptor_a);
+        drop(descriptor_b);
+
+        shared.ensure(&second).await.unwrap();
+        assert!(shared.test_generation(&first).is_some());
+        assert!(generation_path.exists());
+        assert_eq!(
+            std::fs::read(generation_path.join("content/b")).unwrap(),
+            b"first-b"
+        );
+        drop(cache);
+        drop(shared);
+        assert!(cache_completion.wait().now_or_never().is_none());
+        let mut contents = String::new();
+        let mut native_file = &*native;
+        native_file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "first-a");
+
+        drop(native);
+        completion.wait().await.unwrap();
+        cache_completion.wait().await.unwrap();
+        assert!(!generation_path.exists());
     }
 
     #[tokio::test]

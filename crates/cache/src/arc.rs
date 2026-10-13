@@ -172,6 +172,11 @@ impl<V> ArcInner<V> {
         self.t1.contains_key(k) || self.t2.contains_key(k)
     }
 
+    /// Borrow a resident value mutably without changing ARC recency.
+    pub(crate) fn value_mut(&mut self, k: &Cid) -> Option<&mut V> {
+        self.t1.get_mut(k).or_else(|| self.t2.get_mut(k))
+    }
+
     /// Number of entries in T1 + T2.
     pub fn len(&self) -> usize {
         self.t1.len() + self.t2.len()
