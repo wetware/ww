@@ -16,7 +16,7 @@ pub use fs_work::{
 #[cfg(feature = "test-support")]
 pub use fs_work::{FsTestEvent, FsTestStage};
 pub use pinner::{PathWriteNotOwned, PathWriteSourcePanic, Pinner};
-pub use pinset::{CacheMode, IsolatedPinset, PinsetCache};
+pub use pinset::{CacheMode, IsolatedPinset, PinsetCache, StagedContent, StagedContentLease};
 pub use resources::{
     AdmissionError, AdmissionKind, CellLimits, CellResources, ForegroundProducerPermit,
     ForegroundTransaction, HostLimits, HostResources, LogicalIoPermit, ResourceLimitError,

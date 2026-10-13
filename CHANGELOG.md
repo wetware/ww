@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **Evicted CID staging generations are reclaimed after their final content
+  owner closes.** ARC eviction drops cache residency while publishers,
+  descriptors, and native Wasmtime work retain whole-CID staged content.
+  Unique generation paths make delayed cleanup safe across same-CID
+  re-admission, and bounded cleanup admission rejects new staging before
+  creating private state. The 128 MiB ARC target remains a pinned-entry weight
+  target, not a staging-disk quota.
 - **Cell filesystem work no longer blocks executor progress or outlives cleanup
   certification.** Lazy file and directory staging, descriptor access, and
   private-tree deletion run under an owned filesystem lifetime. Cancellation,

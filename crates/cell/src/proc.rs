@@ -3134,7 +3134,20 @@ mod tests {
         assert_eq!(finalizer.run().await, Ok(()));
         assert_eq!(completion.wait().await, Ok(()));
 
-        let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+        let (scope, owner, finalizer, completion) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    match host.try_filesystem_scope() {
+                        Ok(scope) => break scope,
+                        Err(error) if error.kind() == cache::AdmissionKind::CleanupObligation => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => panic!("unexpected cleanup-root admission error: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("cleanup root was not released after completion publication");
         drop(scope);
         drop(owner);
         assert_eq!(finalizer.run().await, Ok(()));

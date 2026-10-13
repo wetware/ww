@@ -13,7 +13,10 @@ use crate::fs_work::{
 
 const DEFAULT_HOST_LOGICAL_IO: usize = 128;
 const DEFAULT_HOST_BACKEND_PRODUCERS: usize = 33;
-const DEFAULT_HOST_CLEANUP_ROOTS: usize = 64;
+// Finite beta policy: match the Host logical-I/O envelope. The pool is shared
+// by deployment, cache, Cell, and staged-generation roots; it is not
+// partitioned, so any of those owners can truthfully exhaust it.
+const DEFAULT_HOST_CLEANUP_ROOTS: usize = 128;
 const DEFAULT_CELL_LOGICAL_IO: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

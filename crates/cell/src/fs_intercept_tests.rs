@@ -272,7 +272,7 @@ async fn directory_type_is_constant_but_file_queries_and_identity_stay_charged()
     let file = store
         .data_mut()
         .table
-        .push(open_read_only_path(&file_path).unwrap())
+        .push(open_read_only_path(&file_path, None).unwrap())
         .unwrap();
     let held = limited.try_logical_io().unwrap();
 
@@ -506,7 +506,7 @@ async fn file_base_and_target_types_have_exact_errors() {
     let base = store
         .data_mut()
         .table
-        .push(open_read_only_path(&file_path).unwrap())
+        .push(open_read_only_path(&file_path, None).unwrap())
         .unwrap();
     for flags in [O::empty(), O::CREATE] {
         assert_error(
@@ -559,7 +559,8 @@ fn read_contents(store: &Store<Harness>, fd: &Fd) -> String {
         panic!("expected file")
     };
     let mut contents = String::new();
-    (&*file.file).read_to_string(&mut contents).unwrap();
+    let mut native = &**file.file;
+    native.read_to_string(&mut contents).unwrap();
     contents
 }
 fn write_contents(store: &Store<Harness>, fd: &Fd, contents: &[u8], append: bool) {
@@ -568,9 +569,11 @@ fn write_contents(store: &Store<Harness>, fd: &Fd, contents: &[u8], append: bool
         panic!("expected file")
     };
     if append {
-        (&*file.file).seek(SeekFrom::End(0)).unwrap();
+        let mut native = &**file.file;
+        native.seek(SeekFrom::End(0)).unwrap();
     }
-    (&*file.file).write_all(contents).unwrap();
+    let mut native = &**file.file;
+    native.write_all(contents).unwrap();
 }
 fn drop_descriptor(store: &mut Store<Harness>, fd: Fd) {
     p3_types::HostDescriptor::drop(&mut store.data_mut().intercepted_filesystem(), fd).unwrap();
@@ -654,7 +657,7 @@ async fn drop_and_resource_id_reuse_clear_all_descriptor_context() {
     let replacement = store
         .data_mut()
         .table
-        .push(open_read_only_path(&path).unwrap())
+        .push(open_read_only_path(&path, None).unwrap())
         .unwrap();
     assert_eq!(
         replacement.rep(),
@@ -685,7 +688,7 @@ async fn drop_and_resource_id_reuse_clear_all_descriptor_context() {
     let replacement = store
         .data_mut()
         .table
-        .push(open_read_only_path(&path.join("child")).unwrap())
+        .push(open_read_only_path(&path.join("child"), None).unwrap())
         .unwrap();
     assert_eq!(replacement.rep(), root);
     assert_error(

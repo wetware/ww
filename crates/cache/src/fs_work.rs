@@ -24,6 +24,7 @@ pub enum FilesystemOperation {
     DescriptorOpen,
     DirectoryBuild,
     FileStage,
+    GenerationCleanup,
     CachePin,
     CacheUnpin,
     ProcessSetup,

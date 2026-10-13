@@ -1994,7 +1994,13 @@ fn explicitly_wired_known_cid_read_has_path_only_authority_and_node_effects() {
         // and materialized bytes in the host-managed cache.
         assert_eq!(pinner.pins.load(Ordering::Relaxed), 1);
         assert_eq!(pinner.fetches.load(Ordering::Relaxed), 1);
-        assert!(cache.staging_dir().join(KNOWN_CID).is_file());
+        let staged_files = std::fs::read_dir(cache.staging_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("content/root"))
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        assert_eq!(staged_files.len(), 1);
+        assert_eq!(std::fs::read(&staged_files[0]).unwrap(), bytes);
         assert!(cache.probably_cached(&cid));
 
         let repeated_env = [("WW_PROBE_KNOWN_CID_PATH", path.as_str())];

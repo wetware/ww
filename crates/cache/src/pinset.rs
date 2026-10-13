@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use crate::arc::ArcInner;
@@ -24,6 +24,7 @@ pub struct PinEntry {
     /// Size in bytes of the pinned content.
     pub size: u64,
     cleanup: Option<CleanupRegistration>,
+    staged: Option<StagedContentLease>,
 }
 
 #[cfg(test)]
@@ -142,6 +143,48 @@ mod tests {
     }
 
     struct MissingTemporaryPinner;
+
+    struct ConcurrentFetchPinner {
+        calls: AtomicUsize,
+        both_started: Notify,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Pinner for ConcurrentFetchPinner {
+        async fn pin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn unpin(&self, _cid: &Cid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(&self, _cid: &Cid) -> Result<Vec<u8>> {
+            anyhow::bail!("path fetch expected")
+        }
+
+        async fn fetch_to_path(&self, _cid: &Cid, dst: &Path) -> Result<()> {
+            use std::io::Write as _;
+
+            let released = self.release.notified();
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dst)?;
+            file.write_all(&[call as u8])?;
+            if call == 2 {
+                self.both_started.notify_one();
+            }
+            released.await;
+            Ok(())
+        }
+
+        async fn size(&self, _cid: &Cid) -> Result<u64> {
+            Ok(1)
+        }
+    }
 
     #[async_trait::async_trait]
     impl Pinner for NotOwnedPathPinner {
@@ -999,12 +1042,338 @@ mod tests {
         assert_eq!(pinner.unpins.lock().unwrap().len(), 2);
         drop(host_owner);
     }
+
+    #[tokio::test]
+    async fn arc_eviction_reclaims_an_unowned_staged_generation() {
+        let pinner = MockPinner::new(&[(40, 1), (41, 1), (42, 1), (43, 1), (44, 1)]);
+        let fixture = test_cache(pinner, 1).await;
+        let mut previous: Option<(PathBuf, FsCompletion)> = None;
+        for n in 40..44 {
+            fixture.cache.ensure(&cid(n)).await.unwrap();
+            if let Some((path, completion)) = previous.take() {
+                completion.wait().await.unwrap();
+                assert!(!path.exists(), "eviction must reclaim the exact generation");
+            }
+            let staged = fixture.cache.staged_content(&cid(n)).await.unwrap();
+            let path = staged.content_path("");
+            std::fs::write(&path, b"old").unwrap();
+            previous = Some((path, staged.completion()));
+            drop(staged);
+        }
+        fixture.cache.ensure(&cid(44)).await.unwrap();
+        let (path, completion) = previous.unwrap();
+        completion.wait().await.unwrap();
+        assert!(!path.exists(), "final eviction must reclaim its generation");
+    }
+
+    #[tokio::test]
+    async fn a_live_content_lease_retains_the_whole_generation_after_eviction() {
+        let pinner = MockPinner::new(&[(42, 1), (43, 1)]);
+        let fixture = test_cache(pinner, 1).await;
+        fixture.cache.ensure(&cid(42)).await.unwrap();
+        let staged = fixture.cache.staged_content(&cid(42)).await.unwrap();
+        let first = staged.content_path("a");
+        let sibling = staged.content_path("b/nested");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&sibling, b"sibling").unwrap();
+        let lease = staged.lease();
+        let completion = staged.completion();
+        drop(staged);
+
+        fixture.cache.ensure(&cid(43)).await.unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling");
+
+        drop(lease);
+        completion.wait().await.unwrap();
+        assert!(!first.exists());
+        assert!(!sibling.exists());
+    }
+
+    #[tokio::test]
+    async fn oversized_unresident_content_has_a_publisher_lease_then_reclaims() {
+        let pinner = MockPinner::new(&[(44, 2)]);
+        let fixture = test_cache(pinner, 1).await;
+        fixture.cache.ensure(&cid(44)).await.unwrap();
+        let staged = fixture.cache.staged_content(&cid(44)).await.unwrap();
+        let path = fixture
+            .cache
+            .materialize_staged(&staged, None)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0; 2]);
+        let completion = staged.completion();
+        drop(staged);
+        completion.wait().await.unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn accepted_publisher_survives_eviction_and_waiter_cancellation() {
+        let pinner = Arc::new(CancelledFetchPinner {
+            started: Notify::new(),
+            release: Notify::new(),
+            finished: AtomicBool::new(false),
+        });
+        let fixture = test_cache_with_backend_limit(pinner.clone(), 1, 3).await;
+        fixture.cache.ensure(&cid(50)).await.unwrap();
+        let staged = fixture.cache.staged_content(&cid(50)).await.unwrap();
+        let generation_path = staged.lease.0.path.clone();
+        let destination = staged.content_path("");
+        let completion = staged.completion();
+        let started = pinner.started.notified();
+        let cache = Arc::clone(&fixture.cache);
+        let mut waiter = tokio::spawn(async move { cache.materialize_staged(&staged, None).await });
+        started.await;
+        assert!(!destination.exists());
+
+        fixture.cache.ensure(&cid(51)).await.unwrap();
+        waiter.abort();
+        let _ = (&mut waiter).await;
+        assert!(fixture.cache.test_generation(&cid(50)).is_some());
+        assert!(generation_path.exists());
+        assert!(!destination.exists());
+
+        pinner.release.notify_one();
+        completion.wait().await.unwrap();
+        assert!(pinner.finished.load(Ordering::SeqCst));
+        assert!(!generation_path.exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_cid_publishers_converge_without_loser_parts() {
+        let pinner = Arc::new(ConcurrentFetchPinner {
+            calls: AtomicUsize::new(0),
+            both_started: Notify::new(),
+            release: Notify::new(),
+        });
+        let fixture = test_cache_with_backend_limit(pinner.clone(), 1, 3).await;
+        fixture.cache.ensure(&cid(52)).await.unwrap();
+        let first = fixture.cache.staged_content(&cid(52)).await.unwrap();
+        let second = fixture.cache.staged_content(&cid(52)).await.unwrap();
+        let destination = first.content_path("");
+        let parts = first.parts_path();
+        assert_eq!(first.lease.0.path, second.lease.0.path);
+        let both_started = pinner.both_started.notified();
+        let first_cache = Arc::clone(&fixture.cache);
+        let second_cache = Arc::clone(&fixture.cache);
+        let first_task =
+            tokio::spawn(async move { first_cache.materialize_staged(&first, None).await });
+        let second_task =
+            tokio::spawn(async move { second_cache.materialize_staged(&second, None).await });
+        both_started.await;
+        assert!(!destination.exists());
+        pinner.release.notify_waiters();
+        first_task.await.unwrap().unwrap();
+        second_task.await.unwrap().unwrap();
+
+        assert!(matches!(
+            std::fs::read(&destination).unwrap().as_slice(),
+            [1] | [2]
+        ));
+        assert_eq!(std::fs::read_dir(parts).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn delayed_cleanup_cannot_delete_a_readmitted_same_cid_generation() {
+        let pinner = MockPinner::new(&[(45, 1), (46, 1)]);
+        let fixture = test_cache(pinner, 1).await;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let cleanup_gate = Arc::clone(&gate);
+        *fixture.cache.generation_cleanup_hook.lock().unwrap() =
+            Some(Arc::new(move |path, attempt| {
+                let _ = path;
+                if attempt == 1 {
+                    let _ = started_tx.send(());
+                    let (lock, ready) = &*cleanup_gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                }
+                Ok(())
+            }));
+        fixture.cache.ensure(&cid(45)).await.unwrap();
+        let first = fixture.cache.staged_content(&cid(45)).await.unwrap();
+        let first_path = first.lease.0.path.clone();
+        let first_file = first.content_path("");
+        std::fs::write(&first_file, b"first").unwrap();
+        let first_completion = first.completion();
+        drop(first);
+        fixture.cache.ensure(&cid(46)).await.unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("generation A cleanup did not start");
+
+        fixture.cache.ensure(&cid(45)).await.unwrap();
+        let second = fixture.cache.staged_content(&cid(45)).await.unwrap();
+        let second_path = second.lease.0.path.clone();
+        let second_file = second.content_path("");
+        std::fs::write(&second_file, b"second").unwrap();
+        assert_ne!(first_path, second_path);
+
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        first_completion.wait().await.unwrap();
+        assert!(!first_path.exists());
+        assert_eq!(std::fs::read(second_file).unwrap(), b"second");
+    }
+
+    #[tokio::test]
+    async fn generation_cleanup_retries_three_times_and_reports_terminal_failure() {
+        let pinner = MockPinner::new(&[(47, 2)]);
+        let fixture = test_cache(pinner, 1).await;
+        fixture.cache.ensure(&cid(47)).await.unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let hook_attempts = Arc::clone(&attempts);
+        *fixture.cache.generation_cleanup_hook.lock().unwrap() = Some(Arc::new(move |_, _| {
+            hook_attempts.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("injected generation cleanup failure"))
+        }));
+        let staged = fixture.cache.staged_content(&cid(47)).await.unwrap();
+        let generation_completion = staged.completion();
+        let cache_completion = fixture.cache.completion();
+        drop(staged);
+        assert!(generation_completion.wait().await.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let poisoned = match fixture.cache.staged_content(&cid(47)).await {
+            Err(error) => error,
+            Ok(_) => panic!("cleanup-poisoned cache admitted another generation"),
+        };
+        assert!(matches!(
+            poisoned.downcast_ref::<crate::AdmissionError>(),
+            Some(error) if error.kind() == crate::AdmissionKind::CleanupPoisoned
+        ));
+        drop(fixture.cache);
+        assert!(cache_completion.wait().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn generation_cleanup_succeeds_on_the_final_retry() {
+        let pinner = MockPinner::new(&[(53, 2)]);
+        let fixture = test_cache(pinner, 1).await;
+        fixture.cache.ensure(&cid(53)).await.unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let hook_attempts = Arc::clone(&attempts);
+        *fixture.cache.generation_cleanup_hook.lock().unwrap() = Some(Arc::new(move |_, _| {
+            let attempt = hook_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt < 3 {
+                Err(io::Error::other("injected retryable cleanup failure"))
+            } else {
+                Ok(())
+            }
+        }));
+        let staged = fixture.cache.staged_content(&cid(53)).await.unwrap();
+        let completion = staged.completion();
+        let path = staged.lease.0.path.clone();
+        drop(staged);
+
+        completion.wait().await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn generation_cleanup_uses_the_dedicated_lane_when_foreground_is_full() {
+        let pinner = MockPinner::new(&[(54, 2)]);
+        let fixture = test_cache(pinner, 1).await;
+        fixture.cache.ensure(&cid(54)).await.unwrap();
+        let staged = fixture.cache.staged_content(&cid(54)).await.unwrap();
+        let lease = staged.lease();
+        let completion = staged.completion();
+        let path = staged.lease.0.path.clone();
+        drop(staged);
+        let foreground = fixture.cache.host.try_foreground().unwrap();
+        assert!(fixture.cache.host.try_foreground().is_err());
+
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(2), completion.wait())
+            .await
+            .expect("cleanup did not progress while foreground was saturated")
+            .unwrap();
+        assert!(!path.exists());
+        drop(foreground);
+    }
+
+    #[tokio::test]
+    async fn cache_completion_waits_for_the_final_generation_owner() {
+        let pinner = MockPinner::new(&[(55, 2)]);
+        let fixture = test_cache(pinner, 1).await;
+        fixture.cache.ensure(&cid(55)).await.unwrap();
+        let staged = fixture.cache.staged_content(&cid(55)).await.unwrap();
+        let lease = staged.lease();
+        let generation_completion = staged.completion();
+        let cache_completion = fixture.cache.completion();
+        let path = staged.lease.0.path.clone();
+        drop(staged);
+        drop(fixture.cache);
+
+        assert!(cache_completion.wait().now_or_never().is_none());
+        assert!(path.exists());
+        drop(lease);
+        generation_completion.wait().await.unwrap();
+        cache_completion.wait().await.unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_root_exhaustion_precedes_generation_filesystem_effects() {
+        let pinner = MockPinner::new(&[(48, 2), (49, 2)]);
+        let (host_owner, host) = HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            HostLimits::new(8, 2, 2).unwrap(),
+        )
+        .unwrap();
+        let cache = Arc::new(PinsetCache::new(pinner, 1, host).await.unwrap());
+        cache.ensure(&cid(48)).await.unwrap();
+        let first = cache.staged_content(&cid(48)).await.unwrap();
+        let first_lease = first.lease();
+        drop(first);
+        let before = std::fs::read_dir(cache.staging_dir()).unwrap().count();
+
+        cache.ensure(&cid(49)).await.unwrap();
+        let error = match cache.staged_content(&cid(49)).await {
+            Err(error) => error,
+            Ok(_) => panic!("cleanup-root exhaustion admitted a generation"),
+        };
+        assert!(matches!(
+            error.downcast_ref::<crate::AdmissionError>(),
+            Some(error) if error.kind() == crate::AdmissionKind::CleanupObligation
+        ));
+        assert_eq!(
+            std::fs::read_dir(cache.staging_dir()).unwrap().count(),
+            before
+        );
+        drop(first_lease);
+        drop(cache);
+        drop(host_owner);
+    }
 }
 
 struct CacheState {
     arc: ArcInner<PinEntry>,
     inflight: HashMap<Cid, Arc<EnsureFlight>>,
     retiring: HashMap<Cid, Arc<RetireFlight>>,
+    generations: HashMap<Cid, Weak<StagedContentGeneration>>,
+    generation_inflight: HashMap<Cid, Arc<GenerationFlight>>,
+}
+
+struct GenerationFlight {
+    changed: Notify,
+    done: AtomicBool,
+}
+
+impl GenerationFlight {
+    fn new() -> Self {
+        Self {
+            changed: Notify::new(),
+            done: AtomicBool::new(false),
+        }
+    }
 }
 
 struct EnsureFlight {
@@ -1151,17 +1520,24 @@ impl EnsureOwner {
             return Err(primary);
         }
 
-        {
+        let retired_staged = {
             let mut state = self.state.lock().expect("cache state lock poisoned");
+            let mut retired_staged = Vec::new();
             let cleanup = self
                 .own_pin_cleanup
                 .take()
                 .expect("published pin must retain cleanup ownership");
+            let staged = state
+                .generations
+                .get(&self.cid)
+                .and_then(Weak::upgrade)
+                .map(StagedContentLease);
             let evicted = state.arc.put(
                 self.cid,
                 PinEntry {
                     size,
                     cleanup: Some(cleanup),
+                    staged,
                 },
             );
             for (cid, mut entry) in evicted {
@@ -1172,13 +1548,16 @@ impl EnsureOwner {
                     cid,
                     cleanup: entry.cleanup.take(),
                 });
+                retired_staged.extend(entry.staged.take());
                 self.terminal_retirements
                     .lock()
                     .expect("terminal retirements lock poisoned")
                     .push((cid, flight));
             }
             self.phase = EnsurePhase::Published;
-        }
+            retired_staged
+        };
+        drop(retired_staged);
         self.bloom.insert(&self.cid);
 
         self.finish_retirements().await
@@ -1305,11 +1684,77 @@ pub struct PinsetCache {
     cancel_next_owner: Mutex<Option<Arc<Notify>>>,
     #[cfg(test)]
     ensure_waiter_joined: Notify,
+    #[cfg(test)]
+    generation_cleanup_hook: Mutex<Option<GenerationCleanupHook>>,
 }
+
+#[cfg(test)]
+type GenerationCleanupHook = Arc<dyn Fn(&Path, u32) -> io::Result<()> + Send + Sync>;
 
 /// Maximum retry attempts for failed unpins.
 const MAX_UNPIN_RETRIES: u32 = 3;
 static MATERIALIZATION_SEQ: AtomicU64 = AtomicU64::new(1);
+static GENERATION_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// One claim on a physically unique staged CID generation.
+///
+/// Staged subpaths are retained at CID-generation granularity. A live
+/// descriptor or native handle for any path in the generation retains the
+/// entire staged generation until the final owner closes. This deliberately
+/// avoids unsafe ancestor deletion and a path-level ownership graph.
+#[derive(Clone)]
+pub struct StagedContentLease(Arc<StagedContentGeneration>);
+
+struct StagedContentGeneration {
+    cid: Cid,
+    path: PathBuf,
+    scope: FsScope,
+    _cleanup: CleanupRegistration,
+    _owner: FsOwner,
+    _finalizer: FsFinalizer,
+    #[cfg(any(test, feature = "test-support"))]
+    completion: FsCompletion,
+}
+
+/// An accepted materialization publisher and its admitted filesystem work.
+pub struct StagedContent {
+    lease: StagedContentLease,
+    transaction: ForegroundTransaction,
+}
+
+impl StagedContent {
+    pub fn lease(&self) -> StagedContentLease {
+        self.lease.clone()
+    }
+
+    pub fn content_path(&self, subpath: &str) -> PathBuf {
+        self.lease.content_path(subpath)
+    }
+
+    pub fn parts_path(&self) -> PathBuf {
+        self.lease.0.path.join("parts")
+    }
+
+    pub fn transaction(&self) -> &ForegroundTransaction {
+        &self.transaction
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn completion(&self) -> FsCompletion {
+        self.lease.0.completion.clone()
+    }
+}
+
+impl StagedContentLease {
+    pub fn content_path(&self, subpath: &str) -> PathBuf {
+        let content = self.0.path.join("content");
+        if subpath.is_empty() {
+            content.join("root")
+        } else {
+            content.join("subpaths").join(subpath)
+        }
+    }
+}
 
 struct MaterializationGuard {
     temporary_path: std::path::PathBuf,
@@ -1326,10 +1771,11 @@ enum MaterializationCommit {
 impl MaterializationGuard {
     fn new(
         destination: &Path,
+        parts: Option<&Path>,
         #[cfg(test)] cleanup_hook: Option<tests::MaterializationCleanupHook>,
     ) -> Result<Self> {
-        let parent = destination
-            .parent()
+        let parent = parts
+            .or_else(|| destination.parent())
             .ok_or_else(|| anyhow::anyhow!("materialization destination has no parent"))?;
         let name = destination
             .file_name()
@@ -1345,17 +1791,29 @@ impl MaterializationGuard {
     }
 
     fn commit(&mut self, destination: &Path) -> Result<MaterializationCommit> {
-        if destination.exists() {
-            return Ok(MaterializationCommit::Existing);
+        use rustix::fs::{renameat_with, RenameFlags, CWD};
+
+        match renameat_with(
+            CWD,
+            &self.temporary_path,
+            CWD,
+            destination,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {
+                self.committed = true;
+                Ok(MaterializationCommit::Published)
+            }
+            Err(rustix::io::Errno::EXIST) => Ok(MaterializationCommit::Existing),
+            Err(error) => {
+                Err(io::Error::from_raw_os_error(error.raw_os_error())).with_context(|| {
+                    format!(
+                        "failed to commit CAS materialization to {}",
+                        destination.display()
+                    )
+                })
+            }
         }
-        std::fs::rename(&self.temporary_path, destination).with_context(|| {
-            format!(
-                "failed to commit CAS materialization to {}",
-                destination.display()
-            )
-        })?;
-        self.committed = true;
-        Ok(MaterializationCommit::Published)
     }
 
     fn cleanup(&mut self) -> io::Result<()> {
@@ -1399,6 +1857,7 @@ async fn fetch_to_path_atomically(
     cid: &Cid,
     subpath: Option<&str>,
     destination: &Path,
+    parts: Option<&Path>,
 ) -> Result<()> {
     let destination = destination.to_owned();
     let setup_destination = destination.clone();
@@ -1406,6 +1865,7 @@ async fn fetch_to_path_atomically(
     let cleanup_hook = tests::take_materialization_cleanup_hook();
     let guard = Arc::new(Mutex::new(Some(MaterializationGuard::new(
         &setup_destination,
+        parts,
         #[cfg(test)]
         cleanup_hook,
     )?)));
@@ -1546,18 +2006,32 @@ async fn fetch_to_path_atomically(
     Ok(())
 }
 
+struct OwnedMaterialization {
+    cid: Cid,
+    subpath: Option<String>,
+    destination: PathBuf,
+    parts: Option<PathBuf>,
+    publisher: Option<StagedContentLease>,
+}
+
 async fn fetch_to_path_owned(
     filesystem_scope: FsScope,
     transaction: ForegroundTransaction,
     pinner: Arc<dyn Pinner>,
-    cid: Cid,
-    subpath: Option<String>,
-    destination: std::path::PathBuf,
+    materialization: OwnedMaterialization,
 ) -> Result<()> {
+    let OwnedMaterialization {
+        cid,
+        subpath,
+        destination,
+        parts,
+        publisher,
+    } = materialization;
     let operation_scope = filesystem_scope.clone();
     let operation_transaction = transaction.continuation();
     transaction
         .run_operation(crate::FilesystemOperation::FileStage, async move {
+            let _publisher = publisher;
             fetch_to_path_atomically(
                 &operation_scope,
                 &operation_transaction,
@@ -1565,11 +2039,95 @@ async fn fetch_to_path_owned(
                 &cid,
                 subpath.as_deref(),
                 &destination,
+                parts.as_deref(),
             )
             .await
         })
         .await?
         .into_inner()
+}
+
+struct GenerationFlightOwner {
+    state: Arc<Mutex<CacheState>>,
+    cid: Cid,
+    flight: Arc<GenerationFlight>,
+}
+
+impl GenerationFlightOwner {
+    fn finish(&mut self) {
+        let removed = {
+            let mut state = self.state.lock().expect("cache state lock poisoned");
+            if state
+                .generation_inflight
+                .get(&self.cid)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
+            {
+                state.generation_inflight.remove(&self.cid);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.flight.done.store(true, Ordering::Release);
+            self.flight.changed.notify_waiters();
+        }
+    }
+}
+
+impl Drop for GenerationFlightOwner {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+const MAX_GENERATION_CLEANUP_ATTEMPTS: u32 = 3;
+
+fn cleanup_staged_generation(
+    path: PathBuf,
+    owns_path: bool,
+    parent_scope: FsScope,
+    _parent_receipt: crate::FsWorkToken,
+    #[cfg(test)] cleanup_hook: Option<GenerationCleanupHook>,
+) -> io::Result<()> {
+    if !owns_path {
+        return Ok(());
+    }
+    for attempt in 1..=MAX_GENERATION_CLEANUP_ATTEMPTS {
+        #[cfg(test)]
+        let result = cleanup_hook
+            .as_ref()
+            .map_or(Ok(()), |hook| hook(&path, attempt))
+            .and_then(|()| std::fs::remove_dir_all(&path));
+        #[cfg(not(test))]
+        let result = std::fs::remove_dir_all(&path);
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if attempt < MAX_GENERATION_CLEANUP_ATTEMPTS => {
+                tracing::debug!(
+                    path = %path.display(),
+                    attempt,
+                    %error,
+                    "staged generation cleanup failed, retrying"
+                );
+                std::thread::sleep(Duration::from_millis(10 * u64::from(attempt)));
+            }
+            Err(error) => {
+                let error = io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to remove staged generation {} after {} attempts: {error}",
+                        path.display(),
+                        MAX_GENERATION_CLEANUP_ATTEMPTS
+                    ),
+                );
+                parent_scope.record_cleanup_failure(&error);
+                return Err(error);
+            }
+        }
+    }
+    unreachable!("finite generation cleanup loop must return")
 }
 
 fn pin_entry_weighter(_k: &Cid, v: &PinEntry) -> usize {
@@ -1612,6 +2170,8 @@ impl PinsetCache {
                 arc: ArcInner::new(budget, Self::DEFAULT_GHOST_CAPACITY, pin_entry_weighter),
                 inflight: HashMap::new(),
                 retiring: HashMap::new(),
+                generations: HashMap::new(),
+                generation_inflight: HashMap::new(),
             })),
             pinner,
             host,
@@ -1626,6 +2186,8 @@ impl PinsetCache {
             cancel_next_owner: Mutex::new(None),
             #[cfg(test)]
             ensure_waiter_joined: Notify::new(),
+            #[cfg(test)]
+            generation_cleanup_hook: Mutex::new(None),
         })
     }
 
@@ -1636,6 +2198,220 @@ impl PinsetCache {
 
     pub fn completion(&self) -> FsCompletion {
         self.completion.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_generation(&self, cid: &Cid) -> Option<(PathBuf, FsCompletion)> {
+        let generation = {
+            let state = self.state.lock().expect("cache state lock poisoned");
+            state.generations.get(cid)?.upgrade()?
+        };
+        Some((generation.path.clone(), generation.completion.clone()))
+    }
+
+    /// Acquire one publisher claim on the current CID generation.
+    pub async fn staged_content(&self, cid: &Cid) -> Result<StagedContent> {
+        let logical = self.host.try_logical_io()?;
+        self.staged_content_in(&self.scope, logical, cid).await
+    }
+
+    pub async fn staged_content_in(
+        &self,
+        origin: &FsScope,
+        logical: LogicalIoPermit,
+        cid: &Cid,
+    ) -> Result<StagedContent> {
+        let mut logical = Some(logical);
+        loop {
+            enum Decision {
+                Existing(Arc<StagedContentGeneration>),
+                Wait(Arc<GenerationFlight>),
+                Owner(Arc<GenerationFlight>),
+            }
+            let decision = {
+                let mut state = self.state.lock().expect("cache state lock poisoned");
+                state
+                    .generations
+                    .retain(|_, generation| generation.strong_count() > 0);
+                if let Some(generation) = state.generations.get(cid).and_then(Weak::upgrade) {
+                    Decision::Existing(generation)
+                } else if let Some(flight) = state.generation_inflight.get(cid) {
+                    Decision::Wait(Arc::clone(flight))
+                } else {
+                    state.generations.remove(cid);
+                    let flight = Arc::new(GenerationFlight::new());
+                    state.generation_inflight.insert(*cid, Arc::clone(&flight));
+                    Decision::Owner(flight)
+                }
+            };
+
+            match decision {
+                Decision::Existing(generation) => {
+                    let transaction = self.host.try_cleanup_transaction(
+                        logical.take().expect("logical permit consumed once"),
+                        &[origin, &self.scope, &generation.scope],
+                    )?;
+                    let lease = StagedContentLease(generation);
+                    self.retain_resident_generation(cid, &lease);
+                    return Ok(StagedContent { lease, transaction });
+                }
+                Decision::Wait(flight) => {
+                    let notified = flight.changed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if !flight.done.load(Ordering::Acquire) {
+                        notified.await;
+                    }
+                }
+                Decision::Owner(flight) => {
+                    let mut terminal = GenerationFlightOwner {
+                        state: Arc::clone(&self.state),
+                        cid: *cid,
+                        flight,
+                    };
+                    let staged = self
+                        .create_staged_generation(
+                            origin,
+                            logical.take().expect("logical permit consumed once"),
+                            *cid,
+                        )
+                        .await?;
+                    let replaced = {
+                        let mut state = self.state.lock().expect("cache state lock poisoned");
+                        state
+                            .generations
+                            .insert(*cid, Arc::downgrade(&staged.lease.0));
+                        if let Some(entry) = state.arc.value_mut(cid) {
+                            entry.staged.replace(staged.lease.clone())
+                        } else {
+                            None
+                        }
+                    };
+                    drop(replaced);
+                    terminal.finish();
+                    return Ok(staged);
+                }
+            }
+        }
+    }
+
+    fn retain_resident_generation(&self, cid: &Cid, lease: &StagedContentLease) {
+        let mut state = self.state.lock().expect("cache state lock poisoned");
+        if let Some(entry) = state.arc.value_mut(cid) {
+            if entry.staged.is_none() {
+                entry.staged = Some(lease.clone());
+            }
+        }
+    }
+
+    async fn create_staged_generation(
+        &self,
+        origin: &FsScope,
+        logical: LogicalIoPermit,
+        cid: Cid,
+    ) -> Result<StagedContent> {
+        // K is reserved before a generation-private pathname can exist.
+        let (scope, owner, finalizer, completion) = self.host.try_filesystem_scope()?;
+        let parent_receipt = self.scope.try_cleanup_work()?;
+        let transaction = self
+            .host
+            .try_cleanup_transaction(logical, &[origin, &self.scope, &scope])?;
+        let cleanup_phase = transaction.try_cleanup_phase()?;
+        let sequence = GENERATION_SEQ
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("staged CID generation identity exhausted"))?;
+        let path = self.staging_path.join(format!(".ww-stage-{sequence}"));
+        let cleanup_path = path.clone();
+        let parent_scope = self.scope.clone();
+        let owns_path = Arc::new(AtomicBool::new(false));
+        let cleanup_owns_path = Arc::clone(&owns_path);
+        #[cfg(test)]
+        let cleanup_hook = self
+            .generation_cleanup_hook
+            .lock()
+            .expect("generation cleanup hook lock poisoned")
+            .clone();
+        let cleanup = scope.own_cleanup_from_phase(
+            cleanup_phase,
+            crate::FilesystemOperation::GenerationCleanup,
+            move || {
+                cleanup_staged_generation(
+                    cleanup_path,
+                    cleanup_owns_path.load(Ordering::Acquire),
+                    parent_scope,
+                    parent_receipt,
+                    #[cfg(test)]
+                    cleanup_hook,
+                )
+            },
+        )?;
+        let generation = Arc::new(StagedContentGeneration {
+            cid,
+            path: path.clone(),
+            scope,
+            _cleanup: cleanup,
+            _owner: owner,
+            _finalizer: finalizer,
+            #[cfg(any(test, feature = "test-support"))]
+            completion: completion.clone(),
+        });
+        #[cfg(not(any(test, feature = "test-support")))]
+        drop(completion);
+        let setup_path = path;
+        transaction
+            .run_blocking(crate::FilesystemOperation::FileStage, move || {
+                std::fs::create_dir(&setup_path)?;
+                owns_path.store(true, Ordering::Release);
+                std::fs::create_dir(setup_path.join("content"))?;
+                std::fs::create_dir(setup_path.join("parts"))
+            })
+            .await?
+            .into_inner()
+            .context("failed to create staged CID generation")?;
+        Ok(StagedContent {
+            lease: StagedContentLease(generation),
+            transaction,
+        })
+    }
+
+    /// Materialize one path into an accepted generation and return its path.
+    pub async fn materialize_staged(
+        &self,
+        staged: &StagedContent,
+        subpath: Option<&str>,
+    ) -> Result<PathBuf> {
+        if !staged.transaction.owns_scope(&self.scope)
+            || !staged.transaction.owns_scope(&staged.lease.0.scope)
+        {
+            return Err(crate::AdmissionError::new(crate::AdmissionKind::Closed).into());
+        }
+        let destination = staged.lease.content_path(subpath.unwrap_or_default());
+        let check_path = destination.clone();
+        let exists = staged
+            .transaction
+            .run_blocking(crate::FilesystemOperation::DescriptorOpen, move || {
+                check_path.exists()
+            })
+            .await?
+            .into_inner();
+        if !exists {
+            fetch_to_path_owned(
+                self.scope.clone(),
+                staged.transaction.continuation(),
+                Arc::clone(&self.pinner),
+                OwnedMaterialization {
+                    cid: staged.lease.0.cid,
+                    subpath: subpath.map(str::to_owned),
+                    destination: destination.clone(),
+                    parts: Some(staged.parts_path()),
+                    publisher: Some(staged.lease()),
+                },
+            )
+            .await?;
+        }
+        Ok(destination)
     }
 
     /// Ensure a CID is pinned in the IPFS node and tracked by the ARC.
@@ -1861,9 +2637,13 @@ impl PinsetCache {
             filesystem_scope.clone(),
             transaction.continuation(),
             Arc::clone(&self.pinner),
-            *cid,
-            None,
-            dst.to_owned(),
+            OwnedMaterialization {
+                cid: *cid,
+                subpath: None,
+                destination: dst.to_owned(),
+                parts: None,
+                publisher: None,
+            },
         )
         .await
     }
@@ -1893,9 +2673,13 @@ impl PinsetCache {
             filesystem_scope.clone(),
             transaction.continuation(),
             Arc::clone(&self.pinner),
-            *cid,
-            Some(subpath.to_owned()),
-            dst.to_owned(),
+            OwnedMaterialization {
+                cid: *cid,
+                subpath: Some(subpath.to_owned()),
+                destination: dst.to_owned(),
+                parts: None,
+                publisher: None,
+            },
         )
         .await
     }
@@ -2375,9 +3159,13 @@ impl IsolatedPinset {
             filesystem_scope.clone(),
             transaction.continuation(),
             Arc::clone(&self.pinner),
-            *cid,
-            None,
-            dst.to_owned(),
+            OwnedMaterialization {
+                cid: *cid,
+                subpath: None,
+                destination: dst.to_owned(),
+                parts: None,
+                publisher: None,
+            },
         )
         .await
     }
@@ -2407,9 +3195,13 @@ impl IsolatedPinset {
             filesystem_scope.clone(),
             transaction.continuation(),
             Arc::clone(&self.pinner),
-            *cid,
-            Some(subpath.to_owned()),
-            dst.to_owned(),
+            OwnedMaterialization {
+                cid: *cid,
+                subpath: Some(subpath.to_owned()),
+                destination: dst.to_owned(),
+                parts: None,
+                publisher: None,
+            },
         )
         .await
     }
