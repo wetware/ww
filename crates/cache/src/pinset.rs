@@ -2318,7 +2318,7 @@ impl PinsetCache {
             .try_cleanup_transaction(logical, &[origin, &self.scope, &scope])?;
         let cleanup_phase = transaction.try_cleanup_phase()?;
         let sequence = GENERATION_SEQ
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| anyhow::anyhow!("staged CID generation identity exhausted"))?;
