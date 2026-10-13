@@ -2328,6 +2328,63 @@ mod tests {
         path_data: HashMap<String, Vec<u8>>,
     }
 
+    struct DirectoryRootPinner;
+
+    impl DirectoryRootPinner {
+        fn write_exclusive(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+            use std::io::Write as _;
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
+            file.write_all(bytes)?;
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cache::Pinner for DirectoryRootPinner {
+        async fn pin(&self, _cid: &cid::Cid) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn unpin(&self, _cid: &cid::Cid) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn fetch(&self, _cid: &cid::Cid) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("directory root requires path materialization")
+        }
+
+        async fn fetch_to_path(
+            &self,
+            _cid: &cid::Cid,
+            destination: &std::path::Path,
+        ) -> anyhow::Result<()> {
+            std::fs::create_dir(destination)?;
+            Self::write_exclusive(&destination.join("marker"), b"directory-root")
+        }
+
+        async fn fetch_path_to_path(
+            &self,
+            _cid: &cid::Cid,
+            subpath: &str,
+            destination: &std::path::Path,
+        ) -> anyhow::Result<()> {
+            let bytes = match subpath {
+                "root" => b"literal-root-child".as_slice(),
+                "root/nested" => b"nested-under-root-child".as_slice(),
+                _ => anyhow::bail!("unexpected test subpath: {subpath}"),
+            };
+            Self::write_exclusive(destination, bytes)
+        }
+
+        async fn size(&self, _cid: &cid::Cid) -> anyhow::Result<u64> {
+            Ok(1)
+        }
+    }
+
     #[async_trait::async_trait]
     impl cache::Pinner for MockPinner {
         async fn pin(&self, _cid: &cid::Cid) -> anyhow::Result<()> {
@@ -2680,7 +2737,7 @@ mod tests {
         assert!(shared.test_generation(&first).is_some());
         assert!(generation_path.exists());
         assert_eq!(
-            std::fs::read(generation_path.join("content/b")).unwrap(),
+            std::fs::read(generation_path.join("content/subpaths/b")).unwrap(),
             b"first-b"
         );
         drop(cache);
@@ -2695,6 +2752,112 @@ mod tests {
         completion.wait().await.unwrap();
         cache_completion.wait().await.unwrap();
         assert!(!generation_path.exists());
+    }
+
+    #[tokio::test]
+    async fn shared_generation_root_and_literal_root_subpaths_are_disjoint_in_both_orders() {
+        use std::io::Read as _;
+
+        async fn materialize(
+            fs: &TestFilesystem,
+            cache: &cache::CacheMode,
+            cid: cid::Cid,
+            subpath: &str,
+        ) -> wasmtime_wasi::filesystem::Descriptor {
+            materialize_ipfs_descriptor(
+                &fs.resources,
+                &fs.scope,
+                Some(cache),
+                &IpfsCidPath {
+                    cid,
+                    subpath: subpath.to_owned(),
+                },
+                false,
+            )
+            .await
+            .unwrap()
+        }
+
+        fn read_file(descriptor: &wasmtime_wasi::filesystem::Descriptor) -> Vec<u8> {
+            let wasmtime_wasi::filesystem::Descriptor::File(file) = descriptor else {
+                panic!("expected a staged file descriptor")
+            };
+            let native = file.file.try_clone().unwrap();
+            let mut reader = &*native;
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            bytes
+        }
+
+        for root_first in [true, false] {
+            let fs = TestFilesystem::new();
+            let cid: cid::Cid = DIRECTORY_CID.parse().unwrap();
+            let (shared, cache) = fs.shared_cache(Arc::new(DirectoryRootPinner), 8).await;
+
+            let (root, child) = if root_first {
+                (
+                    materialize(&fs, &cache, cid, "").await,
+                    materialize(&fs, &cache, cid, "root").await,
+                )
+            } else {
+                let child = materialize(&fs, &cache, cid, "root").await;
+                let root = materialize(&fs, &cache, cid, "").await;
+                (root, child)
+            };
+
+            assert!(matches!(
+                root,
+                wasmtime_wasi::filesystem::Descriptor::Dir(_)
+            ));
+            assert_eq!(read_file(&child), b"literal-root-child");
+
+            let (generation, _) = shared.test_generation(&cid).unwrap();
+            let root_path = generation.join("content/root");
+            let child_path = generation.join("content/subpaths/root");
+            assert_ne!(root_path, child_path);
+            assert!(root_path.is_dir());
+            assert_eq!(
+                std::fs::read(root_path.join("marker")).unwrap(),
+                b"directory-root"
+            );
+            assert_eq!(std::fs::read(child_path).unwrap(), b"literal-root-child");
+        }
+
+        for root_first in [true, false] {
+            let fs = TestFilesystem::new();
+            let cid: cid::Cid = DIRECTORY_CID.parse().unwrap();
+            let (shared, cache) = fs.shared_cache(Arc::new(DirectoryRootPinner), 8).await;
+
+            let (root, nested) = if root_first {
+                (
+                    materialize(&fs, &cache, cid, "").await,
+                    materialize(&fs, &cache, cid, "root/nested").await,
+                )
+            } else {
+                let nested = materialize(&fs, &cache, cid, "root/nested").await;
+                let root = materialize(&fs, &cache, cid, "").await;
+                (root, nested)
+            };
+
+            assert!(matches!(
+                root,
+                wasmtime_wasi::filesystem::Descriptor::Dir(_)
+            ));
+            assert_eq!(read_file(&nested), b"nested-under-root-child");
+
+            let (generation, _) = shared.test_generation(&cid).unwrap();
+            let root_path = generation.join("content/root");
+            let nested_path = generation.join("content/subpaths/root/nested");
+            assert!(!nested_path.starts_with(&root_path));
+            assert_eq!(
+                std::fs::read(root_path.join("marker")).unwrap(),
+                b"directory-root"
+            );
+            assert_eq!(
+                std::fs::read(nested_path).unwrap(),
+                b"nested-under-root-child"
+            );
+        }
     }
 
     #[tokio::test]

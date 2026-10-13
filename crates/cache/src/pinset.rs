@@ -1751,7 +1751,7 @@ impl StagedContentLease {
         if subpath.is_empty() {
             content.join("root")
         } else {
-            content.join(subpath)
+            content.join("subpaths").join(subpath)
         }
     }
 }
