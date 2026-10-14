@@ -112,6 +112,18 @@ pub fn decode_head_return(data: &[u8]) -> Result<CurrentHead> {
         alloy::sol_types::sol_data::Uint<64>,
         alloy::sol_types::sol_data::Bytes,
     );
+    if data.len() < 96 {
+        anyhow::bail!("head() return too short");
+    }
+    let mut cid_offset_word = [0_u8; 32];
+    cid_offset_word[31] = 64;
+    if data[32..64] != cid_offset_word {
+        anyhow::bail!("head() cid offset is not canonical");
+    }
+    let cid_len = alloy::primitives::U256::from_be_slice(&data[64..96]);
+    if cid_len > alloy::primitives::U256::from(data.len() - 96) {
+        anyhow::bail!("head() cid length exceeds return data");
+    }
     let (seq, cid) =
         HeadReturn::abi_decode_sequence(data, true).context("decode head() return parameters")?;
     Ok(CurrentHead {
@@ -277,6 +289,21 @@ mod tests {
     }
 
     #[test]
+    fn decode_head_return_extreme_lengths_return_error() {
+        for offset in [0_usize, 64, 65, 96, 128] {
+            let mut data = vec![0_u8; 96.max(offset + 32)];
+            data[24..32].copy_from_slice(&8_u64.to_be_bytes());
+            data[56..64].copy_from_slice(&(offset as u64).to_be_bytes());
+            data[offset + 24..offset + 32].copy_from_slice(&u64::MAX.to_be_bytes());
+
+            assert!(
+                decode_head_return(&data).is_err(),
+                "accepted extreme length at dynamic offset {offset}"
+            );
+        }
+    }
+
+    #[test]
     fn decode_head_return_truncated_cid_payload() {
         let data = encode_head_return_sequence(8, &[0x42; 36]);
         for truncated_len in [131, 159] {
@@ -298,6 +325,13 @@ mod tests {
     fn decode_head_return_rejects_trailing_bytes() {
         let mut data = encode_head_return_sequence(8, &[]);
         data.push(0);
+        assert!(decode_head_return(&data).is_err());
+    }
+
+    #[test]
+    fn decode_head_return_rejects_nonzero_padding() {
+        let mut data = encode_head_return_sequence(8, &[0x42; 36]);
+        *data.last_mut().unwrap() = 1;
         assert!(decode_head_return(&data).is_err());
     }
 
