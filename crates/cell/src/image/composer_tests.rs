@@ -498,6 +498,31 @@ async fn node_limit_accepts_boundary_and_rejects_one_beyond() {
 }
 
 #[tokio::test]
+async fn generated_nodes_count_toward_the_node_limit() {
+    let mut memory = Memory::default();
+    let base = memory.dir(&[("base", raw(b"base"))]);
+    let overlay = memory.dir(&[("overlay", raw(b"overlay"))]);
+
+    let result = compose_with_limits(
+        &memory,
+        &[base.cid, overlay.cid],
+        limits(5, usize::MAX, usize::MAX, usize::MAX),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.blocks.len(), 1);
+
+    let error = compose_with_limits(
+        &memory,
+        &[base.cid, overlay.cid],
+        limits(4, usize::MAX, usize::MAX, usize::MAX),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("node limit"), "{error:#}");
+}
+
+#[tokio::test]
 async fn input_byte_limit_accepts_boundary_and_rejects_one_beyond() {
     let mut memory = Memory::default();
     let child = memory.dir(&[]);
@@ -550,6 +575,46 @@ async fn generated_byte_limit_accepts_boundary_and_rejects_one_beyond() {
 }
 
 #[tokio::test]
+async fn discarded_intermediate_blocks_count_toward_the_generated_byte_limit() {
+    let mut memory = Memory::default();
+    let base = memory.dir(&[("base", raw(b"base"))]);
+    let overlay = memory.dir(&[("overlay", raw(b"overlay"))]);
+    let final_layer = memory.dir(&[("final", raw(b"final"))]);
+
+    let intermediate = compose(&memory, &[base.cid, overlay.cid]).await.unwrap();
+    let complete = compose(&memory, &[base.cid, overlay.cid, final_layer.cid])
+        .await
+        .unwrap();
+    assert_eq!(intermediate.blocks.len(), 1);
+    assert_eq!(complete.blocks.len(), 1);
+    assert_ne!(intermediate.root, complete.root);
+    assert!(
+        complete
+            .blocks
+            .iter()
+            .all(|(cid, _)| *cid != intermediate.root),
+        "the first merge result must be discarded from the final block set"
+    );
+    let charged_bytes = intermediate.blocks[0].1.len() + complete.blocks[0].1.len();
+
+    compose_with_limits(
+        &memory,
+        &[base.cid, overlay.cid, final_layer.cid],
+        limits(usize::MAX, usize::MAX, charged_bytes, usize::MAX),
+    )
+    .await
+    .unwrap();
+    let error = compose_with_limits(
+        &memory,
+        &[base.cid, overlay.cid, final_layer.cid],
+        limits(usize::MAX, usize::MAX, charged_bytes - 1, usize::MAX),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("output byte limit"), "{error:#}");
+}
+
+#[tokio::test]
 async fn work_limit_accepts_boundary_and_rejects_one_beyond() {
     let mut memory = Memory::default();
     let root = memory.dir(&[("file", raw(b"x"))]);
@@ -565,6 +630,84 @@ async fn work_limit_accepts_boundary_and_rejects_one_beyond() {
         &memory,
         &[root.cid],
         limits(usize::MAX, usize::MAX, usize::MAX, 1),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("work limit"), "{error:#}");
+}
+
+#[tokio::test]
+async fn shared_recursive_merges_preserve_aggregate_accounting() {
+    let mut memory = Memory::default();
+    let base_child = memory.dir(&[("base", raw(b"base"))]);
+    let overlay_child = memory.dir(&[("overlay", raw(b"overlay"))]);
+    let base_child_cid = base_child.cid;
+    let overlay_child_cid = overlay_child.cid;
+    let base = memory.dir(&[("left", base_child.clone()), ("right", base_child)]);
+    let overlay = memory.dir(&[("left", overlay_child.clone()), ("right", overlay_child)]);
+
+    let input_directories = [base.cid, base_child_cid, overlay.cid, overlay_child_cid];
+    let read_bytes = input_directories
+        .iter()
+        .map(|cid| memory.blocks[cid].len())
+        .sum();
+    let result = compose_with_limits(
+        &memory,
+        &[base.cid, overlay.cid],
+        limits(usize::MAX, read_bytes, usize::MAX, usize::MAX),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.blocks.len(), 2);
+    {
+        let reads = memory.reads.lock().unwrap();
+        for cid in input_directories {
+            assert_eq!(
+                reads.iter().filter(|read| **read == cid).count(),
+                1,
+                "shared input directory {cid} must be charged once"
+            );
+        }
+    }
+
+    let error = compose_with_limits(
+        &memory,
+        &[base.cid, overlay.cid],
+        limits(usize::MAX, read_bytes - 1, usize::MAX, usize::MAX),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("input byte limit"), "{error:#}");
+
+    compose_with_limits(
+        &memory,
+        &[base.cid, overlay.cid],
+        limits(8, usize::MAX, usize::MAX, usize::MAX),
+    )
+    .await
+    .unwrap();
+    let error = compose_with_limits(
+        &memory,
+        &[base.cid, overlay.cid],
+        limits(7, usize::MAX, usize::MAX, usize::MAX),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("node limit"), "{error:#}");
+
+    let result = compose_with_limits(
+        &memory,
+        &[base.cid, overlay.cid],
+        limits(usize::MAX, usize::MAX, usize::MAX, 18),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.blocks.len(), 2);
+
+    let error = compose_with_limits(
+        &memory,
+        &[base.cid, overlay.cid],
+        limits(usize::MAX, usize::MAX, usize::MAX, 17),
     )
     .await
     .unwrap_err();

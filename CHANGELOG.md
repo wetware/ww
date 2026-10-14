@@ -77,6 +77,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Composer v1 fuzz regressions now replay in CI.** Three targets exercise
   strict DAG-PB decoding, UnixFS metadata validation, and Kubo import
   acknowledgements against checked-in deterministic corpora.
+- **Composer v1 verification now covers its remaining accounting and identity
+  edges.** Focused tests cover generated nodes, discarded intermediate bytes,
+  and shared recursive accounting; the golden vector pins exact reachable
+  generated blocks, and the local fuzz workflow is documented.
 - **Breaking: every Cell now bootstraps through one typed `Membrane`.**
   `Membrane.graft()` returns direct `peerId`, `Stat`, grouped `Network`,
   `Routing`, runtime, authority, identity, IPFS, and application-only `extras`
