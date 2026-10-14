@@ -192,6 +192,65 @@ HAMT input. They retain a Kubo-generated recursive chunked file and reproduce
 rejection of File-to-Directory links and incorrect file `blocksizes`. They do
 not require equality with historical MFS root CIDs.
 
+### Local fuzzing and deterministic replay
+
+The CI fuzz lane pins Rust `nightly-2026-08-30` and `cargo-fuzz` 0.13.2. Match
+that environment from the repository root:
+
+```sh
+rustup toolchain install nightly-2026-08-30
+RUSTUP_TOOLCHAIN=nightly-2026-08-30 cargo install cargo-fuzz --version 0.13.2 --locked
+
+RUSTUP_TOOLCHAIN=nightly-2026-08-30 cargo fuzz build fuzz_composer_dagpb_decode
+RUSTUP_TOOLCHAIN=nightly-2026-08-30 cargo fuzz build fuzz_composer_unixfs_metadata
+RUSTUP_TOOLCHAIN=nightly-2026-08-30 cargo fuzz build fuzz_kubo_dag_import_response
+```
+
+Run a bounded 60-second mutation campaign for each Composer target:
+
+```sh
+RUSTUP_TOOLCHAIN=nightly-2026-08-30 cargo fuzz run fuzz_composer_dagpb_decode fuzz/corpus/fuzz_composer_dagpb_decode -- -max_total_time=60
+RUSTUP_TOOLCHAIN=nightly-2026-08-30 cargo fuzz run fuzz_composer_unixfs_metadata fuzz/corpus/fuzz_composer_unixfs_metadata -- -max_total_time=60
+RUSTUP_TOOLCHAIN=nightly-2026-08-30 cargo fuzz run fuzz_kubo_dag_import_response fuzz/corpus/fuzz_kubo_dag_import_response -- -max_total_time=60
+```
+
+Replay one checked-in seed directly by passing its file as the corpus argument:
+
+```sh
+RUSTUP_TOOLCHAIN=nightly-2026-08-30 cargo fuzz run fuzz_composer_dagpb_decode fuzz/corpus/fuzz_composer_dagpb_decode/duplicate_data_field
+WW_FUZZ_SEMANTIC_REPLAY=1 RUSTUP_TOOLCHAIN=nightly-2026-08-30 cargo fuzz run fuzz_kubo_dag_import_response fuzz/corpus/fuzz_kubo_dag_import_response/accepted/canonical_success
+```
+
+`WW_FUZZ_SEMANTIC_REPLAY=1` enables the import-response semantic oracle used by
+CI. Import-response regression seeds must begin with `expect:accept\n` or
+`expect:reject\n`; the remainder is the Kubo response. Leave the variable unset
+during mutation campaigns so mutations probe arbitrary parser input without
+turning every changed expectation marker into a finding.
+
+LibFuzzer writes a discovered failure under
+`fuzz/artifacts/<target>/`. Replay and minimize that exact artifact with:
+
+```sh
+RUSTUP_TOOLCHAIN=nightly-2026-08-30 cargo fuzz run <target> fuzz/artifacts/<target>/<artifact>
+RUSTUP_TOOLCHAIN=nightly-2026-08-30 cargo fuzz tmin <target> fuzz/artifacts/<target>/<artifact>
+```
+
+Replay the minimized artifact, give it a descriptive stable name, and copy it
+under `fuzz/corpus/<target>/`. For `fuzz_kubo_dag_import_response`, preserve or
+add the applicable expectation marker and replay with
+`WW_FUZZ_SEMANTIC_REPLAY=1` before committing the seed.
+
+The deterministic model cases are library tests, not a separate integration
+test target:
+
+```sh
+cargo test -p cell image::composer::property_tests::production_matches_independent_overlay_model_for_64_cases --lib --locked -- --exact --nocapture
+```
+
+A failure identifies its case number. Reproduce that case with the command
+above, reduce its generated layers manually, and preserve the reduced input as
+a fixed unit-test fixture. No automatic property-case shrinker is required.
+
 References: [DAG-PB specification](https://ipld.io/specs/codecs/dag-pb/spec/),
 [UnixFS specification](https://specs.ipfs.tech/unixfs/), and
 [CARv1 specification](https://ipld.io/specs/transport/car/carv1/).
