@@ -106,50 +106,30 @@ pub fn decode_log_to_observed(log_value: &Value) -> Result<HeadUpdatedObserved> 
     })
 }
 
-/// Decode head() return data (eth_call result): (uint64, bytes) ABI via alloy sol-types.
-/// Falls back to manual decode if the contract uses a non-standard offset (e.g. 64 instead of 32).
+/// Decode head() return data (eth_call result) as a `(uint64, bytes)` ABI parameter sequence.
 pub fn decode_head_return(data: &[u8]) -> Result<CurrentHead> {
     type HeadReturn = (
         alloy::sol_types::sol_data::Uint<64>,
         alloy::sol_types::sol_data::Bytes,
     );
-    if let Ok((seq, cid)) = HeadReturn::abi_decode(data, false) {
-        return Ok(CurrentHead {
-            seq,
-            cid: cid.to_vec(),
-        });
-    }
-    decode_head_return_manual(data)
-}
-
-/// Manual (uint64, bytes) decode for contracts that use offset 64 in word1 (e.g. some Solidity layouts).
-fn decode_head_return_manual(data: &[u8]) -> Result<CurrentHead> {
-    if data.len() < 64 {
+    if data.len() < 96 {
         anyhow::bail!("head() return too short");
     }
-    let seq = u64::from_be_bytes(
-        data[24..32]
-            .try_into()
-            .context("head() seq bytes [24..32]")?,
-    );
-    let cid_offset = u32::from_be_bytes(
-        data[60..64]
-            .try_into()
-            .context("head() cid offset bytes [60..64]")?,
-    ) as usize;
-    if data.len() < cid_offset + 32 {
-        anyhow::bail!("head() return too short for cid offset");
+    let mut cid_offset_word = [0_u8; 32];
+    cid_offset_word[31] = 64;
+    if data[32..64] != cid_offset_word {
+        anyhow::bail!("head() cid offset is not canonical");
     }
-    let cid_len = u32::from_be_bytes(
-        data[cid_offset + 28..cid_offset + 32]
-            .try_into()
-            .context("head() cid length bytes")?,
-    ) as usize;
-    if data.len() < cid_offset + 32 + cid_len {
-        anyhow::bail!("head() return too short for cid");
+    let cid_len = alloy::primitives::U256::from_be_slice(&data[64..96]);
+    if cid_len > alloy::primitives::U256::from(data.len() - 96) {
+        anyhow::bail!("head() cid length exceeds return data");
     }
-    let cid = data[cid_offset + 32..cid_offset + 32 + cid_len].to_vec();
-    Ok(CurrentHead { seq, cid })
+    let (seq, cid) =
+        HeadReturn::abi_decode_sequence(data, true).context("decode head() return parameters")?;
+    Ok(CurrentHead {
+        seq,
+        cid: cid.to_vec(),
+    })
 }
 
 /// Decode event data (single ABI `bytes`). Uses alloy when layout is standard; falls back to manual when offset != 32 (e.g. 64).
@@ -235,9 +215,36 @@ mod tests {
         alloy::sol_types::sol_data::Bytes,
     );
 
+    fn encode_head_return_sequence(seq: u64, cid: &[u8]) -> Vec<u8> {
+        let padded_len = cid.len().div_ceil(32) * 32;
+        let mut data = vec![0; 96 + padded_len];
+        data[24..32].copy_from_slice(&seq.to_be_bytes());
+        data[56..64].copy_from_slice(&64_u64.to_be_bytes());
+        data[88..96].copy_from_slice(&(cid.len() as u64).to_be_bytes());
+        data[96..96 + cid.len()].copy_from_slice(cid);
+        data
+    }
+
+    #[test]
+    fn decode_head_return_solidity_parameter_sequence() {
+        // Binary form of bafkreibm6jg3ux5qugqkmfqt5uj5rxszb4sa4e3u7jj4c5ukv5s4xvcc7a.
+        let cid =
+            hex::decode("015512202cf24dba5fb0a1a0a61613ed13d8de590f240e1374fa53c1768aaf65cbd442f8")
+                .unwrap();
+        let data = encode_head_return_sequence(8, &cid);
+
+        let (alloy_seq, alloy_cid) = HeadReturn::abi_decode_sequence(&data, true).unwrap();
+        assert_eq!(alloy_seq, 8);
+        assert_eq!(alloy_cid.as_ref(), cid);
+
+        let head = decode_head_return(&data).unwrap();
+
+        assert_eq!(head, CurrentHead { seq: 8, cid });
+    }
+
     #[test]
     fn decode_head_return_minimal() {
-        let data = HeadReturn::abi_encode(&(0u64, alloy::primitives::Bytes::new()));
+        let data = encode_head_return_sequence(0, &[]);
         let head = decode_head_return(&data).unwrap();
         assert_eq!(head.seq, 0);
         assert!(head.cid.is_empty());
@@ -247,7 +254,7 @@ mod tests {
     fn decode_head_return_with_cid() {
         let seq: u64 = 42;
         let cid: &[u8] = b"QmFoo";
-        let data = HeadReturn::abi_encode(&(seq, alloy::primitives::Bytes::from(cid)));
+        let data = encode_head_return_sequence(seq, cid);
         let head = decode_head_return(&data).unwrap();
         assert_eq!(head.seq, 42);
         assert_eq!(head.cid.as_slice(), cid);
@@ -278,6 +285,53 @@ mod tests {
         data[60..64].copy_from_slice(&64u32.to_be_bytes());
         // cid_len at offset 64+28..64+32 = 9999 (way past end)
         data[92..96].copy_from_slice(&9999u32.to_be_bytes());
+        assert!(decode_head_return(&data).is_err());
+    }
+
+    #[test]
+    fn decode_head_return_extreme_lengths_return_error() {
+        for offset in [0_usize, 64, 65, 96, 128] {
+            let mut data = vec![0_u8; 96.max(offset + 32)];
+            data[24..32].copy_from_slice(&8_u64.to_be_bytes());
+            data[56..64].copy_from_slice(&(offset as u64).to_be_bytes());
+            data[offset + 24..offset + 32].copy_from_slice(&u64::MAX.to_be_bytes());
+
+            assert!(
+                decode_head_return(&data).is_err(),
+                "accepted extreme length at dynamic offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_head_return_truncated_cid_payload() {
+        let data = encode_head_return_sequence(8, &[0x42; 36]);
+        for truncated_len in [131, 159] {
+            assert!(
+                decode_head_return(&data[..truncated_len]).is_err(),
+                "accepted head return truncated to {truncated_len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_head_return_rejects_uint64_overflow() {
+        let mut data = encode_head_return_sequence(8, &[]);
+        data[0] = 1;
+        assert!(decode_head_return(&data).is_err());
+    }
+
+    #[test]
+    fn decode_head_return_rejects_trailing_bytes() {
+        let mut data = encode_head_return_sequence(8, &[]);
+        data.push(0);
+        assert!(decode_head_return(&data).is_err());
+    }
+
+    #[test]
+    fn decode_head_return_rejects_nonzero_padding() {
+        let mut data = encode_head_return_sequence(8, &[0x42; 36]);
+        *data.last_mut().unwrap() = 1;
         assert!(decode_head_return(&data).is_err());
     }
 
