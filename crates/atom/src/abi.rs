@@ -107,49 +107,17 @@ pub fn decode_log_to_observed(log_value: &Value) -> Result<HeadUpdatedObserved> 
 }
 
 /// Decode head() return data (eth_call result): (uint64, bytes) ABI via alloy sol-types.
-/// Falls back to manual decode if the contract uses a non-standard offset (e.g. 64 instead of 32).
 pub fn decode_head_return(data: &[u8]) -> Result<CurrentHead> {
     type HeadReturn = (
         alloy::sol_types::sol_data::Uint<64>,
         alloy::sol_types::sol_data::Bytes,
     );
-    if let Ok((seq, cid)) = HeadReturn::abi_decode(data, false) {
-        return Ok(CurrentHead {
-            seq,
-            cid: cid.to_vec(),
-        });
-    }
-    decode_head_return_manual(data)
-}
-
-/// Manual (uint64, bytes) decode for contracts that use offset 64 in word1 (e.g. some Solidity layouts).
-fn decode_head_return_manual(data: &[u8]) -> Result<CurrentHead> {
-    if data.len() < 64 {
-        anyhow::bail!("head() return too short");
-    }
-    let seq = u64::from_be_bytes(
-        data[24..32]
-            .try_into()
-            .context("head() seq bytes [24..32]")?,
-    );
-    let cid_offset = u32::from_be_bytes(
-        data[60..64]
-            .try_into()
-            .context("head() cid offset bytes [60..64]")?,
-    ) as usize;
-    if data.len() < cid_offset + 32 {
-        anyhow::bail!("head() return too short for cid offset");
-    }
-    let cid_len = u32::from_be_bytes(
-        data[cid_offset + 28..cid_offset + 32]
-            .try_into()
-            .context("head() cid length bytes")?,
-    ) as usize;
-    if data.len() < cid_offset + 32 + cid_len {
-        anyhow::bail!("head() return too short for cid");
-    }
-    let cid = data[cid_offset + 32..cid_offset + 32 + cid_len].to_vec();
-    Ok(CurrentHead { seq, cid })
+    let (seq, cid) =
+        HeadReturn::abi_decode_sequence(data, false).context("decode head() return")?;
+    Ok(CurrentHead {
+        seq,
+        cid: cid.to_vec(),
+    })
 }
 
 /// Decode event data (single ABI `bytes`). Uses alloy when layout is standard; falls back to manual when offset != 32 (e.g. 64).
@@ -237,7 +205,7 @@ mod tests {
 
     #[test]
     fn decode_head_return_minimal() {
-        let data = HeadReturn::abi_encode(&(0u64, alloy::primitives::Bytes::new()));
+        let data = HeadReturn::abi_encode_sequence(&(0u64, alloy::primitives::Bytes::new()));
         let head = decode_head_return(&data).unwrap();
         assert_eq!(head.seq, 0);
         assert!(head.cid.is_empty());
@@ -247,10 +215,37 @@ mod tests {
     fn decode_head_return_with_cid() {
         let seq: u64 = 42;
         let cid: &[u8] = b"QmFoo";
-        let data = HeadReturn::abi_encode(&(seq, alloy::primitives::Bytes::from(cid)));
+        let data = HeadReturn::abi_encode_sequence(&(seq, alloy::primitives::Bytes::from(cid)));
         let head = decode_head_return(&data).unwrap();
         assert_eq!(head.seq, 42);
         assert_eq!(head.cid.as_slice(), cid);
+    }
+
+    #[test]
+    fn decode_head_return_solidity_parameter_sequence() {
+        // Binary form of bafkreibm6jg3ux5qugqkmfqt5uj5rxszb4sa4e3u7jj4c5ukv5s4xvcc7a.
+        const CID: [u8; 36] = [
+            0x01, 0x55, 0x12, 0x20, 0x2c, 0xf2, 0x4d, 0xba, 0x5f, 0xb0, 0xa1, 0xa0, 0xa6, 0x16,
+            0x13, 0xed, 0x13, 0xd8, 0xde, 0x59, 0x0f, 0x24, 0x0e, 0x13, 0x74, 0xfa, 0x53, 0xc1,
+            0x76, 0x8a, 0xaf, 0x65, 0xcb, 0xd4, 0x42, 0xf8,
+        ];
+
+        // Solidity returns (uint64, bytes) as a top-level parameter sequence:
+        // seq word, bytes offset, bytes length, then the padded bytes payload.
+        let mut data = vec![0u8; 160];
+        data[24..32].copy_from_slice(&8u64.to_be_bytes());
+        data[56..64].copy_from_slice(&64u64.to_be_bytes());
+        data[88..96].copy_from_slice(&(CID.len() as u64).to_be_bytes());
+        data[96..96 + CID.len()].copy_from_slice(&CID);
+
+        let head = decode_head_return(&data).unwrap();
+        assert_eq!(
+            head,
+            CurrentHead {
+                seq: 8,
+                cid: CID.to_vec(),
+            }
+        );
     }
 
     // -- Error path tests for defensive unwrap→? migration --
