@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **Atom head reads decode Solidity return parameters correctly.** Standard
+  `(uint64, bytes)` responses preserve both the sequence and CID bytes.
 - **Evicted CID staging generations are reclaimed after their final content
   owner closes.** ARC eviction drops cache residency while publishers,
   descriptors, and native Wasmtime work retain whole-CID staged content.
