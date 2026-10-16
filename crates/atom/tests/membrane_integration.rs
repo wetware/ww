@@ -1,4 +1,4 @@
-//! Integration test: Epoch → Terminal → Membrane → graft → runtime.shutdown (epoch-guarded).
+//! Integration test: Epoch → Terminal → Membrane → graft → runtime.load (epoch-guarded).
 //! All local: servers and clients are in-process (capnp-rpc local dispatch).
 //!
 //! Terminal = authentication gate (challenge-response).
@@ -70,6 +70,18 @@ fn observed_to_epoch(ev: &atom::HeadUpdatedObserved) -> Epoch {
         head: ev.cid.clone(),
         root: None,
     }
+}
+
+/// Load a minimal Wasm module and verify the supported operation returns authority.
+async fn load_executor(
+    runtime: &system_capnp::runtime::Client,
+) -> Result<system_capnp::executor::Client, capnp::Error> {
+    let mut request = runtime.load_request();
+    request.get().set_wasm(b"\0asm\x01\0\0\0");
+    let response = request.send().promise.await?;
+    let results = response.get()?;
+    assert!(results.has_executor(), "load must return an Executor");
+    results.get_executor()
 }
 
 /// Helper: create a Membrane client (no auth — pure ocap).
@@ -168,7 +180,7 @@ async fn test_membrane_graft_runtime_against_anvil() {
     let terminal = terminal_membrane(rx, vk);
     let signer_client: auth_capnp::signer::Client = new_client(TestSigner::from_ed25519(&sk));
 
-    // Login via Terminal → get Membrane → graft → runtime.shutdown → Ok
+    // Login via Terminal → get Membrane → graft → runtime.load → Ok
     let mut login_req = terminal.login_request();
     login_req.get().set_signer(signer_client);
     let login_resp = login_req.send().promise.await.expect("login RPC");
@@ -188,18 +200,13 @@ async fn test_membrane_graft_runtime_against_anvil() {
     let graft_response = graft_rpc_response.get().expect("graft results");
     let runtime = graft_response.get_runtime().expect("runtime");
 
-    // Verify runtime works under current epoch (shutdown succeeds).
-    runtime
-        .shutdown_request()
-        .send()
-        .promise
-        .await
-        .expect("shutdown RPC");
+    // Verify runtime works under current epoch (load succeeds).
+    load_executor(&runtime).await.expect("load RPC");
 
-    // Advance epoch → same runtime.shutdown → staleEpoch error
+    // Advance epoch → same runtime.load → staleEpoch error
     tx.send(epoch2).unwrap();
-    match runtime.shutdown_request().send().promise.await {
-        Ok(_) => panic!("shutdown should fail with RPC error after epoch advance"),
+    match load_executor(&runtime).await {
+        Ok(_) => panic!("load should fail with RPC error after epoch advance"),
         Err(e) => assert!(
             e.to_string().contains("staleEpoch"),
             "error should mention staleEpoch, got: {e}"
@@ -229,16 +236,11 @@ async fn test_membrane_graft_no_auth() {
     let results = graft_resp.get().expect("graft results");
     let runtime = results.get_runtime().expect("runtime");
 
-    // Verify runtime works (shutdown succeeds under current epoch).
-    runtime
-        .shutdown_request()
-        .send()
-        .promise
-        .await
-        .expect("shutdown RPC");
+    // Verify runtime works (load succeeds under current epoch).
+    load_executor(&runtime).await.expect("load RPC");
 }
 
-/// No-chain: runtime.shutdown fails with staleEpoch after epoch advance, then re-graft recovers.
+/// No-chain: runtime.load fails with staleEpoch after epoch advance, then re-graft recovers.
 #[tokio::test]
 async fn test_membrane_stale_epoch_then_recovery_no_chain() {
     let epoch1 = Epoch {
@@ -255,7 +257,7 @@ async fn test_membrane_stale_epoch_then_recovery_no_chain() {
     let (tx, rx) = watch::channel(epoch1.clone());
     let membrane = stub_membrane(rx);
 
-    // Graft → runtime.shutdown → Ok
+    // Graft → runtime.load → Ok
     let graft_resp = membrane
         .graft_request()
         .send()
@@ -265,24 +267,21 @@ async fn test_membrane_stale_epoch_then_recovery_no_chain() {
     let graft_results = graft_resp.get().expect("graft results");
     let runtime = graft_results.get_runtime().expect("runtime");
 
-    runtime
-        .shutdown_request()
-        .send()
-        .promise
+    load_executor(&runtime)
         .await
-        .expect("shutdown should succeed under current epoch");
+        .expect("load should succeed under current epoch");
 
-    // Advance epoch → same runtime.shutdown → staleEpoch
+    // Advance epoch → same runtime.load → staleEpoch
     tx.send(epoch2).unwrap();
-    match runtime.shutdown_request().send().promise.await {
-        Ok(_) => panic!("shutdown should fail with RPC error after epoch advance"),
+    match load_executor(&runtime).await {
+        Ok(_) => panic!("load should fail with RPC error after epoch advance"),
         Err(e) => assert!(
             e.to_string().contains("staleEpoch"),
             "error should mention staleEpoch, got: {e}"
         ),
     }
 
-    // Re-graft → new runtime.shutdown → Ok
+    // Re-graft → new runtime.load → Ok
     let graft_resp2 = membrane
         .graft_request()
         .send()
@@ -292,12 +291,9 @@ async fn test_membrane_stale_epoch_then_recovery_no_chain() {
     let results2 = graft_resp2.get().expect("re-graft results");
     let runtime2 = results2.get_runtime().expect("runtime");
 
-    runtime2
-        .shutdown_request()
-        .send()
-        .promise
+    load_executor(&runtime2)
         .await
-        .expect("shutdown after re-graft should succeed");
+        .expect("load after re-graft should succeed");
 }
 
 /// Terminal login with wrong key should fail authentication.
@@ -401,19 +397,14 @@ async fn test_graft_returns_typed_capabilities_and_dynamic_extras() {
     );
     let runtime = results.get_runtime().expect("runtime");
 
-    // Verify runtime actually works (shutdown succeeds).
-    runtime
-        .shutdown_request()
-        .send()
-        .promise
-        .await
-        .expect("shutdown RPC");
+    // Verify runtime actually works (load succeeds).
+    load_executor(&runtime).await.expect("load RPC");
 }
 
 /// Test Terminal-gated Membrane over a VatNetwork stream pair.
 ///
 /// Server side: bootstrap = Terminal(Membrane).
-/// Client side: bootstrap Terminal → login(signer) → get Membrane → graft → runtime.shutdown.
+/// Client side: bootstrap Terminal → login(signer) → get Membrane → graft → runtime.load.
 #[tokio::test]
 async fn test_terminal_over_stream_pair() {
     use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -466,7 +457,7 @@ async fn test_terminal_over_stream_pair() {
                 let _ = client_rpc.await;
             });
 
-            // Login with correct signer → get Membrane → graft → runtime.shutdown.
+            // Login with correct signer → get Membrane → graft → runtime.load.
             let signer_client: auth_capnp::signer::Client =
                 new_client(TestSigner::from_ed25519(&sk));
             let mut login_req = remote_terminal.login_request();
@@ -495,13 +486,10 @@ async fn test_terminal_over_stream_pair() {
 
             let results = graft_resp.get().expect("graft results");
             let runtime = results.get_runtime().expect("runtime");
-            timeout(
-                Duration::from_secs(5),
-                runtime.shutdown_request().send().promise,
-            )
-            .await
-            .expect("shutdown timed out")
-            .expect("shutdown RPC");
+            timeout(Duration::from_secs(5), load_executor(&runtime))
+                .await
+                .expect("load timed out")
+                .expect("load RPC");
         })
         .await;
 }

@@ -1024,7 +1024,7 @@ mod graft_tests {
         ));
         let mut rpc = membrane::rpc_system(Box::new(network), None);
         let remote: system_capnp::executor::Client = rpc.bootstrap(Side::Server);
-        let pending = remote.cid_request().send();
+        let pending = remote.bytecode_cid_request().send();
         let disconnect = rpc.get_disconnector();
         let result = futures::executor::block_on(select_session_with_disconnect(
             std::future::pending(),
@@ -1082,7 +1082,7 @@ mod graft_tests {
             "pending call must be rejected before the guest driver is dropped"
         );
         assert!(remote
-            .cid_request()
+            .bytecode_cid_request()
             .send()
             .promise
             .now_or_never()
@@ -1118,7 +1118,7 @@ mod graft_tests {
         );
         use futures::FutureExt;
         assert!(remote
-            .cid_request()
+            .bytecode_cid_request()
             .send()
             .promise
             .now_or_never()

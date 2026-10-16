@@ -180,14 +180,30 @@ mod tests {
 
     #[allow(refining_impl_trait)]
     impl system_capnp::runtime::Server for RuntimeStub {
-        fn shutdown(
+        fn load(
             self: capnp::capability::Rc<Self>,
-            _params: system_capnp::runtime::ShutdownParams,
-            _results: system_capnp::runtime::ShutdownResults,
+            _params: system_capnp::runtime::LoadParams,
+            mut results: system_capnp::runtime::LoadResults,
         ) -> Promise<(), capnp::Error> {
             self.calls.set(self.calls.get() + 1);
+            results
+                .get()
+                .set_executor(capnp_rpc::new_client(ExecutorStub));
             Promise::ok(())
         }
+    }
+
+    struct ExecutorStub;
+
+    impl system_capnp::executor::Server for ExecutorStub {}
+
+    async fn load_executor(runtime: &system_capnp::runtime::Client) {
+        let mut request = runtime.load_request();
+        request.get().set_wasm(b"\0asm\x01\0\0\0");
+        let response = request.send().promise.await.expect("load RPC");
+        let results = response.get().expect("load results");
+        assert!(results.has_executor(), "load must return an Executor");
+        results.get_executor().expect("executor capability");
     }
 
     struct RejectingRuntime;
@@ -324,7 +340,7 @@ mod tests {
         };
         let local = tokio::task::LocalSet::new();
         local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
-            runtime.shutdown_request().send().promise.await.unwrap();
+            load_executor(&runtime).await;
         });
         assert_eq!(calls.get(), 1);
     }
@@ -463,7 +479,7 @@ mod tests {
                 let runtime = system_capnp::runtime::Client {
                     client: entry.capability().clone(),
                 };
-                runtime.shutdown_request().send().promise.await.unwrap();
+                load_executor(&runtime).await;
             }
         });
         assert_eq!(calls.get(), 2);
@@ -532,7 +548,7 @@ mod tests {
                 client: decoded.iter().next().unwrap().capability().clone(),
             };
             executor
-                .cid_request()
+                .bytecode_cid_request()
                 .send()
                 .promise
                 .await

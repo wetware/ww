@@ -715,10 +715,10 @@ mod tests {
     struct ExecutorStub;
     #[allow(refining_impl_trait)]
     impl system_capnp::executor::Server for ExecutorStub {
-        fn cid(
+        fn bytecode_cid(
             self: capnp::capability::Rc<Self>,
-            _params: system_capnp::executor::CidParams,
-            mut results: system_capnp::executor::CidResults,
+            _params: system_capnp::executor::BytecodeCidParams,
+            mut results: system_capnp::executor::BytecodeCidResults,
         ) -> capnp::capability::Promise<(), capnp::Error> {
             results
                 .get()

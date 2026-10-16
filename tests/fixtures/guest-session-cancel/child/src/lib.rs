@@ -144,7 +144,7 @@ fn register(cx: &mut Context<'_>) {
 }
 
 async fn roundtrip(remote: &executor::Client) {
-    let response = remote.cid_request().send().promise.await.unwrap();
+    let response = remote.bytecode_cid_request().send().promise.await.unwrap();
     assert_eq!(response.get().unwrap().get_cid().unwrap(), "session-probe");
 }
 
@@ -291,7 +291,7 @@ impl exports::wetware::session_cancel::child::Guest for Child {
         event(25);
         assert!(retained
             .import
-            .cid_request()
+            .bytecode_cid_request()
             .send()
             .promise
             .now_or_never()

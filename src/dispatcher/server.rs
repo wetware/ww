@@ -186,10 +186,10 @@ mod tests {
             ))
         }
 
-        fn cid(
+        fn bytecode_cid(
             self: capnp::capability::Rc<Self>,
-            _params: system_capnp::executor::CidParams,
-            mut results: system_capnp::executor::CidResults,
+            _params: system_capnp::executor::BytecodeCidParams,
+            mut results: system_capnp::executor::BytecodeCidResults,
         ) -> Promise<(), capnp::Error> {
             results
                 .get()
