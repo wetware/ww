@@ -133,14 +133,14 @@ impl membrane::Policy for DenyKill {
 
 #[allow(refining_impl_trait)]
 impl system_capnp::executor::Server for ObservedExecutor {
-    fn cid(
+    fn bytecode_cid(
         self: capnp::capability::Rc<Self>,
-        _params: system_capnp::executor::CidParams,
-        mut results: system_capnp::executor::CidResults,
+        _params: system_capnp::executor::BytecodeCidParams,
+        mut results: system_capnp::executor::BytecodeCidResults,
     ) -> Promise<(), capnp::Error> {
-        let cid = self.inner.cid_request().send().promise;
+        let bytecode_cid = self.inner.bytecode_cid_request().send().promise;
         Promise::from_future(async move {
-            let response = cid.await?;
+            let response = bytecode_cid.await?;
             results.get().set_cid(response.get()?.get_cid()?);
             Ok(())
         })
@@ -496,8 +496,8 @@ impl Harness {
             .expect("normal executor spawned P3 child")
     }
 
-    async fn executor_cid(&self) -> String {
-        bounded(self.executor.cid_request().send().promise)
+    async fn executor_bytecode_cid(&self) -> String {
+        bounded(self.executor.bytecode_cid_request().send().promise)
             .await
             .expect("shared Executor connection remains callable")
             .get()
@@ -609,7 +609,7 @@ async fn real_p3_completion_timeout_releases_permit_and_execution() {
                 "freeze time before peer EOF can arm the deadline"
             );
             tokio::time::advance(Duration::from_secs(29)).await;
-            h.executor_cid().await;
+            h.executor_bytecode_cid().await;
             assert_eq!(h.budget.active(), 1, "completion grace remains open");
             assert_eq!(
                 tokio::time::Instant::now(),
@@ -697,8 +697,8 @@ async fn real_p3_timing_out_one_sibling_preserves_the_other() {
             let prepared = PreparedExecutor::new(&wasm).await;
             let clock = ControlledClock::hold();
             let mut h = Harness::new(prepared, false).await;
-            let executor_cid = h.executor_cid().await;
-            assert!(!executor_cid.is_empty());
+            let executor_bytecode_cid = h.executor_bytecode_cid().await;
+            assert!(!executor_bytecode_cid.is_empty());
             let mut a = h.open().await;
             let child_a = h.child().await;
             let mut b = h.open().await;
@@ -716,7 +716,7 @@ async fn real_p3_timing_out_one_sibling_preserves_the_other() {
                 "sibling setup must not consume A's completion grace"
             );
             tokio::time::advance(Duration::from_secs(29)).await;
-            assert_eq!(h.executor_cid().await, executor_cid);
+            assert_eq!(h.executor_bytecode_cid().await, executor_bytecode_cid);
             assert_eq!(
                 h.budget.active(),
                 2,
@@ -735,8 +735,8 @@ async fn real_p3_timing_out_one_sibling_preserves_the_other() {
                 started + Duration::from_secs(30)
             );
             assert_eq!(
-                h.executor_cid().await,
-                executor_cid,
+                h.executor_bytecode_cid().await,
+                executor_bytecode_cid,
                 "A timeout must preserve the shared Executor RPC connection"
             );
             clock.resume().await;
@@ -759,7 +759,7 @@ async fn real_p3_timing_out_one_sibling_preserves_the_other() {
             budget_released(&h.budget, 0).await;
             h.executor_rpc.disconnect().await;
             assert!(
-                bounded(h.executor.cid_request().send().promise)
+                bounded(h.executor.bytecode_cid_request().send().promise)
                     .await
                     .is_err(),
                 "listener must use the RPC import, not bypass it with the local Executor"

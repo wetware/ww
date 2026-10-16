@@ -327,8 +327,8 @@ async fn invoke_named(membrane: Membrane, requested: String) -> Value {
                 let mut load = runtime.load_request();
                 load.get().set_wasm(&[]);
                 let executor = load.send().promise.await?.get()?.get_executor()?;
-                let cid = executor
-                    .cid_request()
+                let bytecode_cid = executor
+                    .bytecode_cid_request()
                     .send()
                     .promise
                     .await?
@@ -337,7 +337,7 @@ async fn invoke_named(membrane: Membrane, requested: String) -> Value {
                     .to_str()
                     .map_err(|error| capnp::Error::failed(error.to_string()))?
                     .to_owned();
-                Ok(json!({"executor_obtained": true, "executor_cid": cid}))
+                Ok(json!({"executor_obtained": true, "executor_bytecode_cid": bytecode_cid}))
             }
             "routing-finder" => {
                 let routing = graft.get_routing()?;
@@ -470,8 +470,8 @@ async fn invoke_named(membrane: Membrane, requested: String) -> Value {
                     .get_cap()
                     .get_as_capability::<capnp::capability::Client>()?;
                 let executor = system_capnp::executor::Client::new(cap.hook);
-                let cid = executor
-                    .cid_request()
+                let bytecode_cid = executor
+                    .bytecode_cid_request()
                     .send()
                     .promise
                     .await?
@@ -480,7 +480,7 @@ async fn invoke_named(membrane: Membrane, requested: String) -> Value {
                     .to_str()
                     .map_err(|error| capnp::Error::failed(error.to_string()))?
                     .to_owned();
-                Ok(json!({"rpc_reached": true, "executor_cid": cid}))
+                Ok(json!({"rpc_reached": true, "executor_bytecode_cid": bytecode_cid}))
             }
             "http-listener" => {
                 let network = graft.get_network()?;
@@ -522,8 +522,8 @@ async fn invoke_named(membrane: Membrane, requested: String) -> Value {
                 let mut load = runtime.load_request();
                 load.get().set_wasm(&[]);
                 let executor = load.send().promise.await?.get()?.get_executor()?;
-                let cid = executor
-                    .cid_request()
+                let bytecode_cid = executor
+                    .bytecode_cid_request()
                     .send()
                     .promise
                     .await?
@@ -532,7 +532,7 @@ async fn invoke_named(membrane: Membrane, requested: String) -> Value {
                     .to_str()
                     .map_err(|error| capnp::Error::failed(error.to_string()))?
                     .to_owned();
-                Ok(json!({"cid": cid}))
+                Ok(json!({"bytecode_cid": bytecode_cid}))
             }
         }
     }
@@ -600,11 +600,11 @@ async fn run_alias_redelivery() -> Result<(), capnp::Error> {
                     let mut load = runtime.load_request();
                     load.get().set_wasm(&[]);
                     let executor = load.send().promise.await?.get()?.get_executor()?;
-                    let response = executor.cid_request().send().promise.await?;
+                    let response = executor.bytecode_cid_request().send().promise.await?;
                     observed.push(json!({
                         "delivery": delivery + 1,
                         "name": name,
-                        "cid": response.get()?.get_cid()?.to_str().map_err(|error| capnp::Error::failed(error.to_string()))?,
+                        "bytecode_cid": response.get()?.get_cid()?.to_str().map_err(|error| capnp::Error::failed(error.to_string()))?,
                     }));
                 }
             }
@@ -634,18 +634,10 @@ async fn run_attenuated() -> Result<(), capnp::Error> {
             let mut load = runtime.load_request();
             load.get().set_wasm(&[]);
             let executor = load.send().promise.await?.get()?.get_executor()?;
-            let cid_denied = match executor.cid_request().send().promise.await {
+            let bytecode_cid_denied = match executor.bytecode_cid_request().send().promise.await {
                 Ok(_) => {
                     return Err(capnp::Error::failed(
-                        "recursively attenuated Executor unexpectedly allowed cid".into(),
-                    ))
-                }
-                Err(error) => error,
-            };
-            let shutdown_denied = match runtime.shutdown_request().send().promise.await {
-                Ok(_) => {
-                    return Err(capnp::Error::failed(
-                        "attenuated runtime unexpectedly allowed shutdown".into(),
+                        "recursively attenuated Executor unexpectedly allowed bytecodeCid".into(),
                     ))
                 }
                 Err(error) => error,
@@ -653,8 +645,7 @@ async fn run_attenuated() -> Result<(), capnp::Error> {
             Ok(json!({
                 "extras": names(&read_extras(&membrane).await?),
                 "executor_returned": true,
-                "cid_denied": cid_denied.to_string(),
-                "shutdown_denied": shutdown_denied.to_string(),
+                "bytecode_cid_denied": bytecode_cid_denied.to_string(),
             }))
         }
         .await;
@@ -685,8 +676,8 @@ async fn run_trusted_lattice() -> Result<(), capnp::Error> {
             let mut load = runtime.load_request();
             load.get().set_wasm(&image);
             let selected = load.send().promise.await?.get()?.get_executor()?;
-            let selected_cid = selected
-                .cid_request()
+            let selected_bytecode_cid = selected
+                .bytecode_cid_request()
                 .send()
                 .promise
                 .await?
@@ -695,8 +686,8 @@ async fn run_trusted_lattice() -> Result<(), capnp::Error> {
                 .to_str()
                 .map_err(|error| capnp::Error::failed(error.to_string()))?
                 .to_owned();
-            let bound_cid = bound
-                .cid_request()
+            let bound_bytecode_cid = bound
+                .bytecode_cid_request()
                 .send()
                 .promise
                 .await?
@@ -708,9 +699,9 @@ async fn run_trusted_lattice() -> Result<(), capnp::Error> {
             Ok(json!({
                 "extras": names(&caps),
                 "runtime": true,
-                "selected_cid": selected_cid,
-                "bound_cid": bound_cid,
-                "different_images": selected_cid != bound_cid,
+                "selected_bytecode_cid": selected_bytecode_cid,
+                "bound_bytecode_cid": bound_bytecode_cid,
+                "different_bytecode": selected_bytecode_cid != bound_bytecode_cid,
             }))
         }
         .await;
@@ -795,8 +786,8 @@ async fn run_late_delegation() -> Result<(), capnp::Error> {
             let mut load = delegated.load_request();
             load.get().set_wasm(&[]);
             let executor = load.send().promise.await?.get()?.get_executor()?;
-            let cid = executor
-                .cid_request()
+            let bytecode_cid = executor
+                .bytecode_cid_request()
                 .send()
                 .promise
                 .await?
@@ -811,7 +802,7 @@ async fn run_late_delegation() -> Result<(), capnp::Error> {
                 "received_later": ["delegated-x"],
                 "current_holdings": ["mailbox", "delegated-x"],
                 "after_names": after_names,
-                "delegated_cid": cid,
+                "delegated_bytecode_cid": bytecode_cid,
             }))
         }
         .await;

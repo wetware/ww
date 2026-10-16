@@ -68,9 +68,6 @@ interface Membrane @0xdb52c25106bc2c5e {
 interface Runtime {
   load @0 (wasm :Data) -> (executor :Executor);
   # Compile or retrieve a cached executor bound to the supplied WASM bytes.
-
-  shutdown @1 () -> ();
-  # Terminate tasks spawned through this Runtime.
 }
 
 struct FuelPolicy {
@@ -112,7 +109,9 @@ interface Executor {
   # Retain the returned owning Process capability for continued execution.
   # There is no detach or daemon mode.
 
-  cid @1 () -> (cid :Text);
+  bytecodeCid @1 () -> (cid :Text);
+  # Return the canonical CIDv1/raw/BLAKE3-256 identity of this Executor's WASM bytecode.
+  # This does not identify a deployment/image root, execution environment, or Process instance.
 }
 
 interface StreamListener {

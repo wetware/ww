@@ -184,14 +184,20 @@ UnixFS mutation, or CID derivation.
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `load` | `(wasm: Data) -> (executor: Executor)` | Compile (or cache-hit) WASM bytes and return an Executor bound to that binary. |
-| `shutdown` | `() -> ()` | Terminate all tasks spawned through this Runtime. |
+
+`Runtime` provides image loading. Retain the owning `Process` capability to
+keep a spawned process running; use `Process.kill()` to request termination
+and `Process.wait()` to observe completed cleanup.
 
 ### Executor
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `spawn` | `(args: List(Text), env: List(Text), membrane: Membrane, fuelPolicy: FuelPolicy) -> (process: Process)` | Spawn a new instance with the supplied Membrane and fuel policy. |
-| `cid` | `() -> (cid: Text)` | Return the CID of the WASM binary bound to this Executor. |
+| `bytecodeCid` | `() -> (cid: Text)` | Return the canonical CIDv1/raw/BLAKE3-256 identity of this Executor's WASM bytes. This identifies bytecode, not a deployment/image root, execution environment, or Process instance. |
+
+The HTTP listener puts the Executor bytecode CID in `X-Wetware-Cell`. The
+header name and behavior are unchanged.
 
 ### Process
 

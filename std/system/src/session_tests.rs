@@ -96,7 +96,7 @@ fn cancel_before_first_rpc_poll_terminalizes_retained_connection() {
     );
     assert!(
         retained
-            .cid_request()
+            .bytecode_cid_request()
             .send()
             .promise
             .now_or_never()
@@ -175,7 +175,7 @@ impl QueuedConnection {
         assert_eq!(self.released.get(), 1, "connection must release its export");
         let pending = self.pending.take().unwrap();
         assert_ready_error(pending.promise);
-        assert_ready_error(self.retained.cid_request().send().promise);
+        assert_ready_error(self.retained.bytecode_cid_request().send().promise);
         drop(pending.pipeline);
         assert_eq!(
             self.released.get(),
@@ -564,7 +564,11 @@ fn observe_drop<F>(
         // Record instead of asserting inside Drop so a violated ordering cannot
         // abort the test process while another panic is already unwinding.
         let terminal = matches!(
-            retained.cid_request().send().promise.now_or_never(),
+            retained
+                .bytecode_cid_request()
+                .send()
+                .promise
+                .now_or_never(),
             Some(Err(_))
         );
         observations

@@ -87,8 +87,8 @@ fn append_custom_section(component: &mut Vec<u8>, name: &[u8], payload: &[u8]) {
 }
 
 /// A byte-distinct build of the status component. The custom section changes
-/// the runtime CID without changing behavior, so `X-Wetware-Cell` identifies
-/// which deployment root's bytes are serving.
+/// the bytecode CID without changing behavior, so `X-Wetware-Cell` distinguishes
+/// the status bytecode served by each test generation, not its deployment root.
 fn status_variant(base: &[u8], tag: &[u8]) -> (Vec<u8>, cid::Cid) {
     let mut bytes = base.to_vec();
     append_custom_section(&mut bytes, b"ww.test.epoch", tag);

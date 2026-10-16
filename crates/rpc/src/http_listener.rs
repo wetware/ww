@@ -213,8 +213,9 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
             // PID0 must not call `kernel_ready()` until the target component is
             // valid. A failed preflight is an initialization failure, not a
             // transient unavailable route.
-            let cid_response = executor.cid_request().send().promise.await?;
-            let cell_cid = read_preflight_cid(&cid_response).map_err(capnp::Error::failed)?;
+            let cid_response = executor.bytecode_cid_request().send().promise.await?;
+            let bytecode_cid =
+                read_preflight_bytecode_cid(&cid_response).map_err(capnp::Error::failed)?;
             guard.check()?;
 
             let (tx, rx) = mpsc::channel::<CgiRequest>(64);
@@ -245,7 +246,7 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
                     registration_scope,
                     executor,
                     membrane,
-                    cell_cid,
+                    bytecode_cid,
                 },
                 rx,
             ));
@@ -262,7 +263,7 @@ struct DispatchLoop {
     registration_scope: Option<tokio::sync::watch::Receiver<()>>,
     executor: system_capnp::executor::Client,
     membrane: system_capnp::membrane::Client,
-    cell_cid: String,
+    bytecode_cid: String,
 }
 
 async fn dispatch_loop(
@@ -292,33 +293,34 @@ async fn dispatch_loop(
         }
         let executor = dispatch.executor.clone();
         let membrane = dispatch.membrane.clone();
-        let cell_cid = dispatch.cell_cid.clone();
+        let bytecode_cid = dispatch.bytecode_cid.clone();
         // Handle each request concurrently.
         tokio::task::spawn_local(async move {
             let mut response = handle_one_request(&executor, &membrane, &req).await;
+            // This header identifies the Executor bytecode, not a deployment or Process.
             response
                 .headers
-                .push(("X-Wetware-Cell".to_string(), cell_cid));
+                .push(("X-Wetware-Cell".to_string(), bytecode_cid));
             let _ = req.response_tx.send(response);
         });
     }
 }
 
-fn read_preflight_cid(
-    response: &capnp::capability::Response<system_capnp::executor::cid_results::Owned>,
+fn read_preflight_bytecode_cid(
+    response: &capnp::capability::Response<system_capnp::executor::bytecode_cid_results::Owned>,
 ) -> Result<String, String> {
     let results = response
         .get()
-        .map_err(|error| format!("failed to read cell CID response: {error}"))?;
+        .map_err(|error| format!("failed to read bytecode CID response: {error}"))?;
     let reader = results
         .get_cid()
-        .map_err(|error| format!("failed to read cell CID: {error}"))?;
+        .map_err(|error| format!("failed to read bytecode CID: {error}"))?;
     let value = reader
         .to_str()
-        .map_err(|error| format!("failed to decode cell CID: {error}"))?;
+        .map_err(|error| format!("failed to decode bytecode CID: {error}"))?;
     let cid = value
         .parse::<cid::Cid>()
-        .map_err(|error| format!("failed to parse cell CID: {error}"))?;
+        .map_err(|error| format!("failed to parse bytecode CID: {error}"))?;
     Ok(cid.to_string())
 }
 
@@ -521,7 +523,7 @@ mod tests {
     use tokio::io::{self, AsyncWriteExt};
     use tokio::sync::{oneshot, watch};
 
-    const TEST_CELL_CID: &str = "bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a";
+    const TEST_BYTECODE_CID: &str = "bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a";
 
     /// Build an EpochGuard at seq=1 paired with its sender.
     fn test_epoch_guard() -> (
@@ -703,12 +705,12 @@ mod tests {
             Promise::err(capnp::Error::failed("stub executor".into()))
         }
 
-        fn cid(
+        fn bytecode_cid(
             self: capnp::capability::Rc<Self>,
-            _params: system_capnp::executor::CidParams,
-            mut results: system_capnp::executor::CidResults,
+            _params: system_capnp::executor::BytecodeCidParams,
+            mut results: system_capnp::executor::BytecodeCidResults,
         ) -> Promise<(), capnp::Error> {
-            results.get().set_cid(TEST_CELL_CID);
+            results.get().set_cid(TEST_BYTECODE_CID);
             Promise::ok(())
         }
     }
@@ -747,12 +749,12 @@ mod tests {
             Promise::ok(())
         }
 
-        fn cid(
+        fn bytecode_cid(
             self: capnp::capability::Rc<Self>,
-            _params: system_capnp::executor::CidParams,
-            mut results: system_capnp::executor::CidResults,
+            _params: system_capnp::executor::BytecodeCidParams,
+            mut results: system_capnp::executor::BytecodeCidResults,
         ) -> Promise<(), capnp::Error> {
-            results.get().set_cid(TEST_CELL_CID);
+            results.get().set_cid(TEST_BYTECODE_CID);
             Promise::ok(())
         }
     }
@@ -775,10 +777,10 @@ mod tests {
 
     #[allow(refining_impl_trait)]
     impl system_capnp::executor::Server for GatedCidExecutor {
-        fn cid(
+        fn bytecode_cid(
             self: capnp::capability::Rc<Self>,
-            _params: system_capnp::executor::CidParams,
-            mut results: system_capnp::executor::CidResults,
+            _params: system_capnp::executor::BytecodeCidParams,
+            mut results: system_capnp::executor::BytecodeCidResults,
         ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
             let gate = self.gate.borrow_mut().take().expect("single CID request");
             let outcome = self.outcome;
@@ -892,14 +894,13 @@ mod tests {
             .get("/unreadable")
             .cloned()
             .expect("pending route");
-        let response =
-            capnp::capability::Response::<system_capnp::executor::cid_results::Owned>::new(
-                Box::new(UnreadableCidResponse),
-            );
+        let response = capnp::capability::Response::<
+            system_capnp::executor::bytecode_cid_results::Owned,
+        >::new(Box::new(UnreadableCidResponse));
 
-        let error = read_preflight_cid(&response).expect_err("response read must fail");
+        let error = read_preflight_bytecode_cid(&response).expect_err("response read must fail");
         assert!(
-            error.contains("failed to read cell CID response"),
+            error.contains("failed to read bytecode CID response"),
             "{error}"
         );
         assert!(!pending.is_live());
@@ -1304,7 +1305,7 @@ mod tests {
                     let response = response_rx.await.expect("CGI response");
                     assert_eq!(response.status, 200);
                     assert!(response.headers.iter().any(|(name, value)| {
-                        name == "X-Wetware-Cell" && value == TEST_CELL_CID
+                        name == "X-Wetware-Cell" && value == TEST_BYTECODE_CID
                     }));
                 }
 

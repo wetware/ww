@@ -576,18 +576,20 @@ async fn probe_report_with_authority(
         .unwrap_or_else(|error| panic!("probe emitted invalid JSON ({error}): {text:?}"))
 }
 
-struct CidExecutor {
-    cid: String,
+struct BytecodeCidExecutor {
+    bytecode_cid: String,
+    calls: Rc<Cell<u32>>,
 }
 
 #[allow(refining_impl_trait)]
-impl system_capnp::executor::Server for CidExecutor {
-    fn cid(
+impl system_capnp::executor::Server for BytecodeCidExecutor {
+    fn bytecode_cid(
         self: capnp::capability::Rc<Self>,
-        _params: system_capnp::executor::CidParams,
-        mut results: system_capnp::executor::CidResults,
+        _params: system_capnp::executor::BytecodeCidParams,
+        mut results: system_capnp::executor::BytecodeCidResults,
     ) -> Promise<(), capnp::Error> {
-        results.get().set_cid(&self.cid);
+        self.calls.set(self.calls.get() + 1);
+        results.get().set_cid(&self.bytecode_cid);
         Promise::ok(())
     }
 }
@@ -717,8 +719,9 @@ impl system_capnp::vat_client::Server for RecordingVatDialer {
             return Promise::err(capnp::Error::failed("unexpected vat protocol".into()));
         }
         self.calls.vat_dialer.set(self.calls.vat_dialer.get() + 1);
-        let executor: system_capnp::executor::Client = capnp_rpc::new_client(CidExecutor {
-            cid: "network-returned-executor".into(),
+        let executor: system_capnp::executor::Client = capnp_rpc::new_client(BytecodeCidExecutor {
+            bytecode_cid: "network-returned-executor".into(),
+            calls: Rc::default(),
         });
         results
             .get()
@@ -757,7 +760,8 @@ impl system_capnp::http_listener::Server for RecordingHttpListener {
 
 struct CountingRuntime {
     calls: Rc<Cell<u32>>,
-    cid: String,
+    executor_calls: Rc<Cell<u32>>,
+    bytecode_cid: String,
 }
 
 #[allow(refining_impl_trait)]
@@ -768,19 +772,21 @@ impl system_capnp::runtime::Server for CountingRuntime {
         mut results: system_capnp::runtime::LoadResults,
     ) -> Promise<(), capnp::Error> {
         self.calls.set(self.calls.get() + 1);
-        let executor: system_capnp::executor::Client = capnp_rpc::new_client(CidExecutor {
-            cid: self.cid.clone(),
+        let executor: system_capnp::executor::Client = capnp_rpc::new_client(BytecodeCidExecutor {
+            bytecode_cid: self.bytecode_cid.clone(),
+            calls: self.executor_calls.clone(),
         });
         results.get().set_executor(executor);
         Promise::ok(())
     }
 }
 
-fn counting_runtime(cid: &str) -> (Grant, Rc<Cell<u32>>) {
+fn counting_runtime(bytecode_cid: &str) -> (Grant, Rc<Cell<u32>>) {
     let calls = Rc::new(Cell::new(0));
     let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(CountingRuntime {
         calls: calls.clone(),
-        cid: cid.to_owned(),
+        executor_calls: Rc::default(),
+        bytecode_cid: bytecode_cid.to_owned(),
     });
     (
         Grant {
@@ -824,17 +830,17 @@ struct CancellationTrackedRuntime {
     started: Arc<tokio::sync::Notify>,
 }
 
-struct GatedCidExecutor {
+struct GatedBytecodeCidExecutor {
     started: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
 
 #[allow(refining_impl_trait)]
-impl system_capnp::executor::Server for GatedCidExecutor {
-    async fn cid(
+impl system_capnp::executor::Server for GatedBytecodeCidExecutor {
+    async fn bytecode_cid(
         self: capnp::capability::Rc<Self>,
-        _params: system_capnp::executor::CidParams,
-        mut results: system_capnp::executor::CidResults,
+        _params: system_capnp::executor::BytecodeCidParams,
+        mut results: system_capnp::executor::BytecodeCidResults,
     ) -> Result<(), capnp::Error> {
         self.started.notify_one();
         self.release.notified().await;
@@ -874,8 +880,9 @@ impl system_capnp::runtime::Server for GatedDropTrackedRuntime {
     ) -> Result<(), capnp::Error> {
         self.started.notify_one();
         self.release.notified().await;
-        let executor: system_capnp::executor::Client = capnp_rpc::new_client(CidExecutor {
-            cid: "record-pinned".into(),
+        let executor: system_capnp::executor::Client = capnp_rpc::new_client(BytecodeCidExecutor {
+            bytecode_cid: "record-pinned".into(),
+            calls: Rc::default(),
         });
         results.get().set_executor(executor);
         Ok(())
@@ -1059,7 +1066,7 @@ fn capnp_fork_gate_same_cap_two_names_survives_redelivery() {
                 assert!(observed.iter().any(|entry| {
                     entry["delivery"] == delivery
                         && entry["name"] == alias
-                        && entry["cid"] == identity
+                        && entry["bytecode_cid"] == identity
                 }));
             }
         }
@@ -1252,13 +1259,14 @@ fn promised_and_broken_references_preserve_behavior_through_membrane_extras() {
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
         let harness = harness(&wasm).await;
         let promised_calls = Rc::new(Cell::new(0));
-        let promised_cid = "promised-runtime".to_owned();
+        let promised_bytecode_cid = "promised-runtime".to_owned();
         let promised_calls_server = promised_calls.clone();
         let promised: system_capnp::runtime::Client = capnp_rpc::new_future_client(async move {
             tokio::task::yield_now().await;
             Ok(capnp_rpc::new_client(CountingRuntime {
                 calls: promised_calls_server,
-                cid: promised_cid,
+                executor_calls: Rc::default(),
+                bytecode_cid: promised_bytecode_cid,
             }))
         });
         let promised_report = probe_report(
@@ -1307,9 +1315,11 @@ fn attenuated_runtime_recursively_denies_returned_executor_through_real_wasm() {
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
         let harness = harness(&wasm).await;
         let calls = Rc::new(Cell::new(0));
+        let executor_calls = Rc::new(Cell::new(0));
         let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(CountingRuntime {
             calls: calls.clone(),
-            cid: "attenuated".into(),
+            executor_calls: executor_calls.clone(),
+            bytecode_cid: "attenuated".into(),
         });
         let policy = membrane::MethodProfile::<system_capnp::runtime::Client>::new()
             .allow_method(system_capnp::runtime::Client::load_request)
@@ -1332,22 +1342,58 @@ fn attenuated_runtime_recursively_denies_returned_executor_through_real_wasm() {
         assert_eq!(report["detail"]["extras"], serde_json::json!([]));
         assert_eq!(report["detail"]["executor_returned"], true);
         assert!(
-            report["detail"]["cid_denied"]
+            report["detail"]["bytecode_cid_denied"]
                 .as_str()
                 .is_some_and(|error| error.contains(membrane::DENIED_MARKER)),
             "recursive Executor denial must retain its stable class: {report}"
-        );
-        assert!(
-            report["detail"]["shutdown_denied"]
-                .as_str()
-                .is_some_and(|error| error.contains(membrane::DENIED_MARKER)),
-            "Runtime denial must retain its stable class: {report}"
         );
         assert_eq!(
             calls.get(),
             1,
             "only the allowed Runtime.load reached the server"
         );
+        assert_eq!(
+            executor_calls.get(),
+            0,
+            "denied Executor.bytecodeCid reached the server"
+        );
+    });
+}
+
+#[test]
+fn attenuated_runtime_denies_load_before_server_dispatch_through_real_wasm() {
+    let wasm = probe_bytes();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
+        let harness = harness(&wasm).await;
+        let calls = Rc::new(Cell::new(0));
+        let runtime: system_capnp::runtime::Client = capnp_rpc::new_client(CountingRuntime {
+            calls: calls.clone(),
+            executor_calls: Rc::default(),
+            bytecode_cid: "denied".into(),
+        });
+        let policy = membrane::MethodProfile::<system_capnp::runtime::Client>::new().build();
+        let attenuated = membrane::membrane(runtime, Rc::new(policy));
+
+        let report = probe_report_with_authority(
+            &harness.executor,
+            "invoke",
+            &[("WW_PROBE_CAP", "runtime")],
+            FixedAuthority {
+                runtime: Some(attenuated),
+                ..FixedAuthority::default()
+            },
+            &[],
+        )
+        .await;
+        assert_eq!(report["ok"], false, "Runtime.load was allowed: {report}");
+        assert!(
+            report["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(membrane::DENIED_MARKER)),
+            "Runtime denial must retain its stable class: {report}"
+        );
+        assert_eq!(calls.get(), 0, "denied Runtime.load reached the server");
     });
 }
 
@@ -1387,7 +1433,7 @@ fn typed_runtime_and_executor_extra_remain_distinct() {
             serde_json::json!(["bound-executor"])
         );
         assert_eq!(report["detail"]["runtime"], true);
-        assert_eq!(report["detail"]["different_images"], true);
+        assert_eq!(report["detail"]["different_bytecode"], true);
     });
 }
 
@@ -1436,7 +1482,7 @@ fn late_delegation_uses_explicit_conduit_without_mutating_birth_set() {
             "Membrane.graft() must retain the immutable birth extras"
         );
         assert_eq!(
-            report["detail"]["delegated_cid"],
+            report["detail"]["delegated_bytecode_cid"],
             serde_json::json!("late-x")
         );
         assert_eq!(conduit_calls.get(), 1);
@@ -1569,8 +1615,9 @@ fn typed_network_capabilities_are_callable_through_real_wasm() {
             )),
             ..FixedAuthority::default()
         };
-        let executor: system_capnp::executor::Client = capnp_rpc::new_client(CidExecutor {
-            cid: "bound-network-executor".into(),
+        let executor: system_capnp::executor::Client = capnp_rpc::new_client(BytecodeCidExecutor {
+            bytecode_cid: "bound-network-executor".into(),
+            calls: Rc::default(),
         });
         let bound_executor = Grant {
             name: "bound-executor".into(),
@@ -1606,7 +1653,7 @@ fn typed_network_capabilities_are_callable_through_real_wasm() {
             }
             if name == "vat-dialer" {
                 assert_eq!(
-                    report["detail"]["executor_cid"],
+                    report["detail"]["executor_bytecode_cid"],
                     "network-returned-executor"
                 );
             }
@@ -1679,7 +1726,10 @@ fn parent_local_drop_does_not_revoke_membrane_pinned_authority() {
             report["ok"], true,
             "membrane-pinned invocation failed: {report}"
         );
-        assert_eq!(report["detail"]["cid"], serde_json::json!("record-pinned"));
+        assert_eq!(
+            report["detail"]["bytecode_cid"],
+            serde_json::json!("record-pinned")
+        );
     });
 }
 
@@ -1773,10 +1823,11 @@ fn epoch_revocation_rejects_an_in_flight_production_p3_capability_call() {
 
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let executor: system_capnp::executor::Client = capnp_rpc::new_client(GatedCidExecutor {
-            started: started.clone(),
-            release: release.clone(),
-        });
+        let executor: system_capnp::executor::Client =
+            capnp_rpc::new_client(GatedBytecodeCidExecutor {
+                started: started.clone(),
+                release: release.clone(),
+            });
         let grants = [Grant {
             name: "bound-executor".into(),
             cap: executor.client,
@@ -1797,7 +1848,7 @@ fn epoch_revocation_rejects_an_in_flight_production_p3_capability_call() {
         .expect("spawn epoch-revocation P3 probe");
         tokio::time::timeout(std::time::Duration::from_secs(5), call_started)
             .await
-            .expect("HttpListener CID preflight did not become pending");
+            .expect("HttpListener bytecode CID preflight did not become pending");
 
         epoch_tx.send_replace(authority::Epoch {
             seq: 2,

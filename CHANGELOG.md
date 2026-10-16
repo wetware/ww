@@ -36,6 +36,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- **Renamed `Executor.cid()` to `Executor.bytecodeCid()`.** The method still
+  checks the epoch and returns the canonical CIDv1/raw/BLAKE3-256 identity of
+  the loaded WASM bytes. Its ordinal remains 1; the result field remains `cid`.
+- **Breaking: removed the unsupported `Runtime.shutdown()` RPC.** The method
+  checked the epoch but returned success without terminating any task.
+  `Runtime.load` remains the supported operation. Process termination remains
+  `Process.kill()` followed by
+  `Process.wait()` to observe completed cleanup.
 - **Wasmtime uses Wetware's exact filesystem-lifecycle merge.** The coherent
   `wasmtime`, `wasmtime-wasi`, and `wasmtime-wasi-io` pin adds synchronous
   native-filesystem admission and retained opaque ownership through actual
@@ -240,7 +248,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   lookup now lives in `std/system`, ready for reuse by the replacement kernel
   without changing current kernel behavior.
 - **HttpListener routes require target preflight before becoming live.** Newly
-  registered routes remain pending until `executor.cid()` succeeds. A failed
+  registered routes remain pending until `executor.bytecodeCid()` succeeds. A failed
   preflight removes the route instead of exposing it as live with an unknown
   CID. Route liveness remains a dispatch property and no longer participates
   in PID0 readiness.
@@ -637,7 +645,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`ww/test` actually registers and runs tests now.** The registry used `def` from inside `deftest`, which writes the closure's own root rather than the module's — so `*tests*` never grew and `run-tests` always reported "0 tests, all pass" (false green, wetware/ww#574). The registry is now atom-backed (`reset!`/`deref`), and `run-tests`/`reset-tests` read/clear through the atom. End-to-end regression tests: registration count, a pass+fail run reporting accurate counts, assert-throws, and reset.
 - **Closures now resolve macros reached through expansion.** A closure whose body called a macro that expands to reference another global (e.g. `try` → `try-catches`) returned `nil`: closures capture only their free variables, computed on the un-expanded body, so the hidden global was never captured and the expansion fell through to host dispatch. `(defn f [] (try (throw 1) (catch _ e e)))` reproduced it. Slim closure capture now also retains every macro in scope (macros are authority-free, so cap-status detection is unaffected). Unblocks effect handlers and stdlib code that use `try`/structured error handling inside a `fn`.
 - **Synapse graft and process bootstrap exports now carry real invokables.** Core membrane graft exports and `Process.bootstrap()` now write Synapses backed by the actual capability clients instead of placeholder/noop invokables, preserving the public Synapse ABI while keeping the existing placeholder test helpers available.
-- **WAGI cell provenance header lookup no longer panics on malformed executor CID responses (#557).** `HttpListener` now logs malformed or undecodable `executor.cid()` results and falls back to `X-Wetware-Cell: unknown`, matching the existing RPC error fallback.
+- **WAGI cell provenance header lookup no longer panics on malformed executor CID responses (#557).** `HttpListener` now logs malformed or undecodable Executor bytecode CID results and falls back to `X-Wetware-Cell: unknown`, matching the existing RPC error fallback.
 - **IPFS release publishing now fails boundedly instead of hanging indefinitely.** The GitHub publish job has a 30-minute cap, each VPS publish attempt is wrapped in a 12-minute timeout, and the release publish script applies explicit timeouts to IPFS add, pin, IPNS publish, and DHT provide operations.
 - **IPFS release publishing no longer depends on flaky `kubectl cp`.** The VPS release tree is streamed into the IPFS pod as a tar archive over `kubectl exec -i`, avoiding repeated short `context deadline exceeded` failures from the Kubernetes copy helper.
 - **CI IPFS release publishing now tolerates slow pod staging.** The publish helper uses a unique pod staging path, retries `kubectl cp`, keeps repo stats and pod cleanup best-effort, and logs each production publish phase so slow k3s API behavior is diagnosable without changing release pin retention semantics.

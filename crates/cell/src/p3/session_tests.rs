@@ -103,7 +103,7 @@ fn add_observer(linker: &mut Linker<State>) -> wasmtime::Result<()> {
 
 #[derive(Default)]
 struct Counts {
-    cid: AtomicUsize,
+    bytecode_cid: AtomicUsize,
     spawn: AtomicUsize,
 }
 
@@ -113,12 +113,12 @@ struct Peer {
 }
 
 impl executor::Server for Peer {
-    fn cid(
+    fn bytecode_cid(
         self: capnp::capability::Rc<Self>,
-        _: executor::CidParams,
-        mut results: executor::CidResults,
+        _: executor::BytecodeCidParams,
+        mut results: executor::BytecodeCidResults,
     ) -> impl Future<Output = capnp::Result<()>> + 'static {
-        self.counts.cid.fetch_add(1, Ordering::Relaxed);
+        self.counts.bytecode_cid.fetch_add(1, Ordering::Relaxed);
         results.get().set_cid("session-probe");
         Promise::ok(())
     }
@@ -133,7 +133,7 @@ impl executor::Server for Peer {
             .borrow_mut()
             .push(params.get().unwrap().get_membrane().unwrap());
         // Retaining the real imported export and unresolved response is the
-        // pressure on connection-owned cleanup. A later cid is the ordered
+        // pressure on connection-owned cleanup. A later bytecodeCid is the ordered
         // dispatch barrier, so no sleeps or native-task scheduling assumption
         // establish readiness.
         Promise::from_future(std::future::pending())
@@ -271,10 +271,10 @@ async fn scenario(engine: &Engine, component: &Component, mode: u32, cancel: boo
     .await;
     assert_eq!(main_result???.0, 42, "mode={mode} cancel={cancel}");
     assert_eq!(sibling_result???.0, 99, "mode={mode} cancel={cancel}");
-    assert_eq!(sibling_peer.counts.cid.load(Ordering::Relaxed), 2);
+    assert_eq!(sibling_peer.counts.bytecode_cid.load(Ordering::Relaxed), 2);
     assert_eq!(sibling_peer.counts.spawn.load(Ordering::Relaxed), 0);
     assert_eq!(
-        victim_peer.counts.cid.load(Ordering::Relaxed),
+        victim_peer.counts.bytecode_cid.load(Ordering::Relaxed),
         if mode == 1 || mode == 2 { 2 } else { 0 }
     );
     assert_eq!(
@@ -289,7 +289,7 @@ async fn scenario(engine: &Engine, component: &Component, mode: u32, cancel: boo
     )
     .await???;
     assert_eq!(result.0, 123);
-    assert_eq!(reentry_peer.counts.cid.load(Ordering::Relaxed), 1);
+    assert_eq!(reentry_peer.counts.bytecode_cid.load(Ordering::Relaxed), 1);
 
     let events = observer.events();
     for code in [

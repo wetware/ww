@@ -317,16 +317,6 @@ impl system_capnp::runtime::Server for RuntimeImpl {
             Ok(())
         })
     }
-
-    fn shutdown(
-        self: capnp::capability::Rc<Self>,
-        _params: system_capnp::runtime::ShutdownParams,
-        _results: system_capnp::runtime::ShutdownResults,
-    ) -> Promise<(), capnp::Error> {
-        pry!(self.check_epoch());
-        tracing::info!("runtime.shutdown: stub (tokio-runtime-per-Runtime is a future PR)");
-        Promise::ok(())
-    }
 }
 
 // =========================================================================
@@ -702,10 +692,10 @@ impl system_capnp::executor::Server for ExecutorImpl {
         })
     }
 
-    fn cid(
+    fn bytecode_cid(
         self: capnp::capability::Rc<Self>,
-        _params: system_capnp::executor::CidParams,
-        mut results: system_capnp::executor::CidResults,
+        _params: system_capnp::executor::BytecodeCidParams,
+        mut results: system_capnp::executor::BytecodeCidResults,
     ) -> Promise<(), capnp::Error> {
         pry!(self.guard.check());
         let cid = cell::routing_key::derive(&self.bytecode);
@@ -2073,7 +2063,7 @@ mod tests {
                 );
 
                 let mut load = runtime.load_request();
-                load.get().set_wasm(b"executor identity bytes");
+                load.get().set_wasm(b"wetware");
                 let executor = load
                     .send()
                     .promise
@@ -2083,12 +2073,17 @@ mod tests {
                     .expect("load results")
                     .get_executor()
                     .expect("Executor result");
-                executor
-                    .cid_request()
+                let response = executor
+                    .bytecode_cid_request()
                     .send()
                     .promise
                     .await
                     .expect("fresh Executor must answer");
+                assert_eq!(
+                    response.get().unwrap().get_cid().unwrap().to_str().unwrap(),
+                    "bafkr4id4izs4xqbbbmlhwbc7gu5bl3ogbclvqyepzdqfxgjpyoovqmqtnm",
+                    "Executor must return the canonical bytecode CID",
+                );
 
                 epoch_tx.send_replace(authority::Epoch {
                     seq: 2,
@@ -2103,7 +2098,12 @@ mod tests {
                     "Runtime must reject calls after its epoch advances"
                 );
                 assert!(
-                    executor.cid_request().send().promise.await.is_err(),
+                    executor
+                        .bytecode_cid_request()
+                        .send()
+                        .promise
+                        .await
+                        .is_err(),
                     "Executor must reject calls after its epoch advances"
                 );
             })

@@ -20,7 +20,7 @@ use authority::routing_capnp;
 // Stub runtime + executor + session builder for epoch-guarded capability tests
 // ---------------------------------------------------------------------------
 
-/// Minimal runtime that checks epoch guard on load/shutdown.
+/// Minimal runtime that checks epoch guard on load.
 /// Used by membrane integration tests to verify epoch-staleness semantics.
 pub struct StubRuntime {
     guard: EpochGuard,
@@ -37,15 +37,6 @@ impl system_capnp::runtime::Server for StubRuntime {
         results
             .get()
             .set_executor(capnp_rpc::new_client(StubExecutor));
-        Promise::ok(())
-    }
-
-    fn shutdown(
-        self: capnp::capability::Rc<Self>,
-        _params: system_capnp::runtime::ShutdownParams,
-        _results: system_capnp::runtime::ShutdownResults,
-    ) -> Promise<(), capnp::Error> {
-        pry!(self.guard.check());
         Promise::ok(())
     }
 }
