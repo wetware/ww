@@ -83,8 +83,10 @@ examples.
 `ww run` starts a libp2p node on port 2025 and merges any [image layers](doc/images.md)
 into a virtual FHS filesystem. The Host selects trusted PID0 independently
 through `KernelSource`: `--kernel` takes precedence over `WW_KERNEL`, and the
-default is embedded `std/kernel`. `ww build` produces `boot/main.wasm` as the
-conventional application artifact; the Host does not use it as PID0 input.
+default is embedded `std/kernel`. `ww build` places the application component at
+`bin/<project-directory>.wasm`. `ww push` imports that image tree and reports its
+IPFS directory-root CID. The Host does not use the application component as PID0
+input. See the [image lifecycle](doc/images.md#build-and-publication).
 
 PID0 and ordinary children both receive a `Membrane`. PID0 receives a broad
 root implementation. Each child receives the exact narrow implementation that
@@ -119,6 +121,7 @@ plumbing:
 ## Publishing a cell
 
 ```sh
+cd examples                                 # from the repository root
 ww init myapp                                # scaffold a new cell project
 cd myapp && ww build                         # compile to WASM
 ww push . --ipfs-url http://localhost:5001   # publish to IPFS

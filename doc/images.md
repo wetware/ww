@@ -5,15 +5,66 @@ Each wetware image follows a minimal FHS convention:
 ```
 <image>/
   bin/
-    main.wasm          # conventional application entrypoint
+    <name>.wasm        # named application component
     status.wasm        # status component used by the shipped Rust PID0
   svc/                 # optional application content; not composed automatically
 ```
 
 The Host selects PID0 independently from the effective application root. The
 shipped Rust PID0 consumes only `bin/status.wasm` from that root. An
-application-specific composition can select `bin/main.wasm`; the shipped Rust
-PID0 does not select it automatically.
+application-specific composition selects its own component paths. The shipped
+Rust PID0 does not automatically load components produced by `ww build`.
+
+## Build and publication
+
+The image lifecycle is:
+
+```text
+source project -> ww build -> canonical image tree -> ww push -> published content root
+```
+
+For a generated project, run these commands from the repository root after
+installing the [native P3 toolchain](cli.md#native-wasi-p3-toolchain) and starting
+Kubo:
+
+```sh
+cd examples
+ww init greeter
+ww build greeter
+ww push greeter
+```
+
+The scaffold uses `../../std/system` and `../../capnp`. Build compiles and
+validates the project's single WASM artifact, then writes `greeter/bin/greeter.wasm`.
+The resolved project directory name determines the filename. Building from inside
+`greeter` with `ww build` produces the same path. No `boot/` directory, `main.wasm`
+alias, image manifest, or image-root CID is generated.
+
+The project directory is the image tree. `Cargo.toml`, `build.rs`, source files,
+the Cap'n Proto schema, and any supporting content remain ordinary files there.
+`target/` holds intermediate build output.
+
+Push imports files using the existing local-image importer. The importer excludes
+entries named `target`, `.git`, `.gitignore`, and `Cargo.lock` at every depth.
+Other regular files, including project source and configuration, are included.
+Empty directories and special files are omitted. Symlinks are followed; Unix
+metadata is not preserved. Keep private files outside the image tree.
+
+Push requires at least one `bin/*.wasm` file and accepts multiple named components.
+It does not modify the input tree or generate executable aliases. The `CID:` line
+reports Kubo's wrapped UnixFS directory-root CID, which identifies the imported
+paths and file content. Kubo's default import behavior pins this root. Repeated
+imports of unchanged content under the same Kubo settings yield the same root.
+
+The directory-root CID differs from the identity of a contained executable.
+`Executor.bytecodeCid()` identifies only the loaded WASM bytes using
+CIDv1/raw/BLAKE3-256. Kubo's file CID uses its own import encoding. A deployment
+can compose this directory with other layers into a different effective root.
+Push neither creates a deployment nor updates Atom or IPNS.
+
+`ww run /ipfs/<root-cid>` mounts the published tree. Component loading remains
+the responsibility of the selected PID0 or application composition. Publication
+alone does not make the shipped Rust PID0 launch `bin/greeter.wasm`.
 
 ## Rust PID0 boot flow
 

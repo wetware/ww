@@ -36,6 +36,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- **Reconciled `ww build` and `ww push` around `bin/<name>.wasm` image trees.**
+  Push publishes the existing tree and reports its directory-root CID without
+  copying `boot/main.wasm` to `bin/main.wasm`. Run no longer creates that alias.
+  Push rejects the removed, unsupported Atom flags `--stem`, `--rpc-url`, and
+  `--private-key`. Build uses Cargo's reported artifact and the resolved project
+  directory name, including when invoked from the project directory.
 - **Renamed `Executor.cid()` to `Executor.bytecodeCid()`.** The method still
   checks the epoch and returns the canonical CIDv1/raw/BLAKE3-256 identity of
   the loaded WASM bytes. Its ordinal remains 1; the result field remains `cid`.

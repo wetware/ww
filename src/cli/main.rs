@@ -87,7 +87,7 @@ enum Commands {
     /// Initialize a new typed cell guest project.
     ///
     /// Scaffolds a complete Rust project for a Wetware guest with
-    /// Cap'n Proto schema, build script, and FHS boot layout.
+    /// Cap'n Proto schema and build script.
     Init {
         /// Project name (e.g., 'oracle', 'greeter')
         #[arg(value_name = "NAME")]
@@ -97,7 +97,7 @@ enum Commands {
     /// Build a guest project, placing artifacts in bin/.
     ///
     /// Compiles a Rust project targeting native wasm32-wasip3 and copies the
-    /// artifact into the project's FHS root at bin/<project>.wasm.
+    /// artifact into the project's image tree at bin/<directory-name>.wasm.
     ///
     /// Expects Cargo.toml at the root of <path>.
     Build {
@@ -293,12 +293,12 @@ enum Commands {
         action: DaemonAction,
     },
 
-    /// Snapshot a project and push it to IPFS.
+    /// Publish a built image tree to IPFS.
     ///
-    /// Adds the entire FHS tree to IPFS as a directory and returns the
-    /// resulting CID. Optionally updates the on-chain Atom contract.
+    /// Imports the tree as a directory and reports its root CID.
+    /// Uses the same import rules as local image mounts.
     ///
-    /// Expects boot/main.wasm to exist (run 'ww build' first).
+    /// Requires at least one bin/*.wasm file (run 'ww build' first).
     Push {
         /// Path to the wetware environment (default: current directory)
         #[arg(default_value = ".", value_name = "PATH")]
@@ -307,20 +307,6 @@ enum Commands {
         /// IPFS HTTP API endpoint
         #[arg(long, default_value = "http://localhost:5001")]
         ipfs_url: String,
-
-        /// Atom contract address (hex, 0x-prefixed). If provided, updates
-        /// the on-chain HEAD to point to the published CID.
-        #[arg(long)]
-        stem: Option<String>,
-
-        /// HTTP JSON-RPC URL for eth_sendTransaction.
-        #[arg(long, default_value = "http://127.0.0.1:8545")]
-        rpc_url: String,
-
-        /// Private key (hex, 0x-prefixed) to sign contract transactions.
-        /// Required only if --stem is provided.
-        #[arg(long)]
-        private_key: Option<String>,
     },
 
     /// Effectful operations that mutate state beyond the current directory.
@@ -845,13 +831,7 @@ impl Commands {
                     .map(|_| ()),
                 DaemonAction::Uninstall => Self::daemon_uninstall().await,
             },
-            Commands::Push {
-                path,
-                ipfs_url,
-                stem,
-                rpc_url,
-                private_key,
-            } => Self::push(path, ipfs_url, stem, rpc_url, private_key).await,
+            Commands::Push { path, ipfs_url } => Self::push(path, ipfs_url).await,
             Commands::Keygen { output } => Self::keygen(output).await,
             Commands::Perform { action } => match action {
                 PerformAction::Install => Self::perform_install().await,
@@ -1210,6 +1190,10 @@ system::export!({iface_name}Guest);
     }
 
     async fn build(path: PathBuf) -> Result<()> {
+        // Resolve '.' and relative spellings before deriving the image filename.
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("Failed to resolve project directory: {}", path.display()))?;
         let cargo_toml = path.join("Cargo.toml");
 
         if !cargo_toml.exists() {
@@ -1231,6 +1215,7 @@ system::export!({iface_name}Guest);
             .arg(format!("+{}", p3_toolchain::NIGHTLY))
             .args(["build", "-Z", "build-std=std,panic_abort"])
             .args(["--target", "wasm32-wasip3", "--release"])
+            .arg("--message-format=json-render-diagnostics")
             .arg("--manifest-path")
             .arg(&cargo_toml)
             .env("CARGO_TARGET_WASM32_WASIP3_LINKER", &toolchain.component_ld)
@@ -1245,41 +1230,25 @@ system::export!({iface_name}Guest);
             bail!("cargo build failed:\n{}", stderr);
         }
 
-        // Find the built WASM artifact
-        let target_dir = target_root.join("wasm32-wasip3/release");
-        let mut wasm_file = None;
-
-        // Look for the first .wasm file (or the crate name if it matches)
-        for entry in std::fs::read_dir(&target_dir).context("Failed to read target directory")? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "wasm") {
-                wasm_file = Some(path);
-                break;
-            }
-        }
-
-        let src_wasm = wasm_file.ok_or_else(|| {
-            anyhow::anyhow!(
-                "WASM artifact not found in {}. Check your Cargo.toml configuration.",
-                target_dir.display()
-            )
-        })?;
+        let src_wasm = built_wasm_artifact(&output.stdout, &cargo_toml)?;
         toolchain.validate_component(&src_wasm)?;
 
         // Copy WASM to bin/<name>.wasm
         let bin_dir = path.join("bin");
         std::fs::create_dir_all(&bin_dir).context("Failed to create bin directory")?;
 
-        let crate_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("main");
-        let dst_wasm = bin_dir.join(format!("{crate_name}.wasm"));
+        let project_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("Project directory must have a UTF-8 name")?;
+        let dst_wasm = bin_dir.join(format!("{project_name}.wasm"));
         std::fs::copy(&src_wasm, &dst_wasm).context(format!(
             "Failed to copy {} to {}",
             src_wasm.display(),
             dst_wasm.display()
         ))?;
 
-        println!("  bin/{crate_name}.wasm");
+        println!("  bin/{project_name}.wasm");
 
         println!("Build complete: {}", path.display());
         Ok(())
@@ -1459,22 +1428,6 @@ system::export!({iface_name}Guest);
             .context("failed to reserve deployment filesystem root")?;
         let deployment_scope = lifecycle.0.clone();
         deployment_lifecycle_slot = Some(lifecycle);
-
-        // Dev-mode compat: if a single local root mount has boot/main.wasm
-        // but not bin/main.wasm, copy it over (the runtime expects bin/).
-        for mount in &mounts {
-            if mount.is_root() && !ipfs::is_ipfs_path(&mount.source) {
-                let src = Path::new(&mount.source);
-                let boot_wasm = src.join("boot/main.wasm");
-                let bin_wasm = src.join("bin/main.wasm");
-                if boot_wasm.exists() && !bin_wasm.exists() {
-                    let bin_dir = src.join("bin");
-                    std::fs::create_dir_all(&bin_dir).context("Failed to create bin directory")?;
-                    std::fs::copy(&boot_wasm, &bin_wasm)
-                        .context("Failed to prepare WASM artifact for runtime")?;
-                }
-            }
-        }
 
         // Reject local configuration before Kubo readiness can intentionally
         // wait forever in production. A bad path must remain actionable.
@@ -2181,31 +2134,30 @@ system::export!({iface_name}Guest);
     }
 
     /// Publish a wetware environment to IPFS
-    async fn push(
-        path: PathBuf,
-        ipfs_url: String,
-        stem: Option<String>,
-        _rpc_url: String,
-        _private_key: Option<String>,
-    ) -> Result<()> {
-        // Verify environment is built
-        let boot_wasm = path.join("boot/main.wasm");
-        if !boot_wasm.exists() {
+    async fn push(path: PathBuf, ipfs_url: String) -> Result<()> {
+        // An image can contain several named components. Publication does not
+        // choose an entrypoint or rewrite the input tree.
+        let bin_dir = path.join("bin");
+        let mut has_component = false;
+        if bin_dir.is_dir() {
+            for entry in
+                std::fs::read_dir(&bin_dir).context("Failed to read image bin directory")?
+            {
+                let entry = entry?.path();
+                if entry.is_file() && entry.extension().is_some_and(|ext| ext == "wasm") {
+                    has_component = true;
+                    break;
+                }
+            }
+        }
+        if !has_component {
             bail!(
-                "boot/main.wasm not found at: {}\n\
+                "No bin/*.wasm file found in: {}\n\
                  \n\
                  Please run 'ww build' first to compile your guest program.",
-                boot_wasm.display()
+                path.display()
             );
         }
-
-        // Create a compatibility layer: the runtime expects bin/main.wasm.
-        // We copy boot/main.wasm to bin/main.wasm for the published image.
-        let bin_dir = path.join("bin");
-        std::fs::create_dir_all(&bin_dir).context("Failed to create bin directory")?;
-
-        let bin_wasm = bin_dir.join("main.wasm");
-        std::fs::copy(&boot_wasm, &bin_wasm).context("Failed to prepare WASM artifact for IPFS")?;
 
         println!("Publishing to IPFS...");
 
@@ -2219,27 +2171,8 @@ system::export!({iface_name}Guest);
         println!("Published to IPFS!");
         println!("CID: {}", cid);
         println!("IPFS path: /ipfs/{}", cid);
-        println!("\nTo run this environment:");
+        println!("\nTo mount this image on a node:");
         println!("  ww run /ipfs/{}", cid);
-
-        // Optionally update on-chain Atom contract
-        if let Some(stem_addr) = stem {
-            if _private_key.is_none() {
-                bail!("--private-key is required when --stem is provided");
-            }
-
-            println!("\nUpdating on-chain Atom contract...");
-
-            let contract = parse_contract_address(&stem_addr)?;
-
-            // Note: Full on-chain update implementation would go here.
-            // For now, we'll just acknowledge the request.
-            println!("Note: On-chain contract update via CLI is not yet implemented.");
-            println!(
-                "The CID can be manually updated at contract: 0x{}",
-                hex::encode(contract)
-            );
-        }
 
         Ok(())
     }
@@ -2354,9 +2287,8 @@ system::export!({iface_name}Guest);
         // Embedded WASM blobs are served by EmbeddedLoader at runtime.
         // We no longer write them to disk; just check if they're present
         // in the binary to decide whether to republish the std namespace.
-        // The kernel is named main.wasm (not kernel.wasm) because the
-        // host validator requires bin/main.wasm at the merged image root.
-        // Other cells keep their canonical names.
+        // Keep the embedded kernel's artifact name. PID0 selection does not
+        // require bin/main.wasm in the application image.
         let embedded_cells: &[(&str, &[u8])] = &[
             ("main.wasm", EMBEDDED_KERNEL),
             ("status.wasm", EMBEDDED_STATUS),
@@ -2968,9 +2900,65 @@ fn to_pascal_case(s: &str) -> String {
         .collect()
 }
 
+/// Select this project's artifact from this Cargo invocation, including cached
+/// compiler-artifact messages. Never select stale files by directory iteration.
+fn built_wasm_artifact(stdout: &[u8], manifest: &Path) -> Result<PathBuf> {
+    let mut artifacts = std::collections::BTreeSet::new();
+    for line in stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let message: serde_json::Value =
+            serde_json::from_slice(line).context("Invalid Cargo JSON output")?;
+        if message["reason"] != "compiler-artifact"
+            || message["manifest_path"].as_str().map(Path::new) != Some(manifest)
+        {
+            continue;
+        }
+        if let Some(filenames) = message["filenames"].as_array() {
+            for filename in filenames.iter().filter_map(|value| value.as_str()) {
+                let path = PathBuf::from(filename);
+                if path.extension().is_some_and(|ext| ext == "wasm") {
+                    artifacts.insert(path);
+                }
+            }
+        }
+    }
+    if artifacts.len() != 1 {
+        bail!(
+            "Expected exactly one WASM artifact for {}, found {}. Configure a single guest target.",
+            manifest.display(),
+            artifacts.len()
+        );
+    }
+    Ok(artifacts.into_iter().next().unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_selects_only_the_current_projects_reported_wasm() {
+        let messages = concat!(
+            "{\"reason\":\"compiler-artifact\",\"manifest_path\":\"/dependency/Cargo.toml\",\"filenames\":[\"/target/dependency.wasm\"]}\n",
+            "{\"reason\":\"compiler-artifact\",\"manifest_path\":\"/project/Cargo.toml\",\"filenames\":[\"/target/guest.wasm\",\"/target/guest.d\"],\"fresh\":true}\n",
+            "{\"reason\":\"build-finished\",\"success\":true}\n",
+        );
+        assert_eq!(
+            built_wasm_artifact(messages.as_bytes(), Path::new("/project/Cargo.toml")).unwrap(),
+            PathBuf::from("/target/guest.wasm")
+        );
+    }
+
+    #[test]
+    fn build_rejects_missing_and_ambiguous_wasm_artifacts() {
+        let manifest = Path::new("/project/Cargo.toml");
+        assert!(built_wasm_artifact(b"", manifest).is_err());
+        let ambiguous = br#"{"reason":"compiler-artifact","manifest_path":"/project/Cargo.toml","filenames":["/target/a.wasm","/target/b.wasm"]}"#;
+        assert!(built_wasm_artifact(ambiguous, manifest).is_err());
+        assert!(built_wasm_artifact(b"not JSON", manifest).is_err());
+    }
 
     #[tokio::test]
     async fn wait_for_kubo_ready_times_out_against_unreachable_node() {

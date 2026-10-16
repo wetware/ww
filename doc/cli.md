@@ -8,8 +8,9 @@ Scaffold a new typed cell guest project.
 ww init <NAME>
 ```
 
-Creates a Rust project with Cap'n Proto schema, build script, and
-FHS boot layout.
+Creates a Rust project with a Cap'n Proto schema, build script, and guest source.
+The scaffold uses repository-relative dependencies: create the project under
+`examples/` so `../../std/system` and `../../capnp` resolve.
 
 ## ww build
 
@@ -20,10 +21,17 @@ ww build [PATH]
 ```
 
 Targets native `wasm32-wasip3`, validates the component and its imports, then
-places the artifact at `bin/<project>.wasm`. Defaults to the current directory.
+places the artifact at `bin/<project-directory>.wasm`. Defaults to the current
+directory. The resolved directory name determines the output filename; `ww build
+app`, `ww build /path/to/app`, and `ww build` inside `app` all write `bin/app.wasm`.
+The Cargo invocation must report exactly one WASM artifact for the project.
 
 `ww build` rejects WASI 0.2 and socket imports. The command uses the pinned P3
 toolchain described below.
+
+The project directory is the image tree. Build does not create an image manifest
+or calculate an image-root CID. Existing supporting files stay in place. See
+[build and publication](images.md#build-and-publication) for the import rules.
 
 ### Native WASI P3 toolchain
 
@@ -161,21 +169,27 @@ The command prints `ok` and exits zero only when every requested check passes.
 
 ## ww push
 
-Snapshot a project's FHS tree and publish to IPFS.
+Publish a built image tree to IPFS.
 
 ```
 ww push [PATH] [OPTIONS]
 ```
 
-Adds the tree to IPFS as a directory and returns the root CID.
-Optionally updates the on-chain Atom contract HEAD.
+Requires at least one regular `bin/*.wasm` file. Imports the tree using the same
+rules as local runtime image mounts. It does not select an entrypoint, rename
+components, or modify the input tree. Kubo pins the imported directory by default.
+
+The `CID:` line identifies the imported directory root. It does not identify
+only the contained WASM bytes or a deployment. The command does not update Atom
+or IPNS. Removed flags `--stem`, `--rpc-url`, and `--private-key` are rejected.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--ipfs-url <URL>` | `http://localhost:5001` | IPFS HTTP API endpoint |
-| `--stem <ADDR>` | none | Atom contract address to update |
-| `--rpc-url <URL>` | `http://127.0.0.1:8545` | JSON-RPC for eth_sendTransaction |
-| `--private-key <KEY>` | none | Hex private key (required with `--stem`) |
+
+`PATH` defaults to the current directory. `--help` prints command help. See the
+[image lifecycle](images.md#build-and-publication) for a complete example and
+the files excluded from publication.
 
 ## ww keygen
 
