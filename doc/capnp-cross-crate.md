@@ -49,8 +49,8 @@ for schema in schemas {
 compiler.run().expect("failed to compile shared schemas");
 ```
 
-Compile `stem.capnp` in the same command only when the crate also uses its
-epoch and provenance types. `system.capnp` does not import `stem.capnp`.
+Epoch lifecycle state is host-owned in `authority::Epoch`
+(`crates/authority/src/epoch.rs`); it has no Cap'n Proto schema.
 
 The standalone `membrane.capnp` schema no longer exists. `Membrane`, `Export`,
 `Network`, `Routing`, `Executor`, and the listener interfaces all live in

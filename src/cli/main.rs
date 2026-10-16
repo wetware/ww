@@ -1075,7 +1075,6 @@ fn main() {{
         .file(capnp_dir.join("system.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("auth.capnp"))
-        .file(capnp_dir.join("stem.capnp"))
         .file(capnp_dir.join("http.capnp"))
         .run()
         .expect("failed to compile shared capnp schemas");
@@ -1087,7 +1086,7 @@ fn main() {{
         .run()
         .expect("failed to compile {name}.capnp");
 
-    for schema in &["system", "routing", "auth", "stem", "http"] {{
+    for schema in &["system", "routing", "auth", "http"] {{
         println!(
             "cargo:rerun-if-changed={{}}",
             capnp_dir.join(format!("{{schema}}.capnp")).display()
@@ -1109,11 +1108,6 @@ use system::Guest;
 #[allow(dead_code)]
 mod system_capnp {{
     include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
-}}
-
-#[allow(dead_code)]
-mod stem_capnp {{
-    include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
 }}
 
 #[allow(dead_code)]

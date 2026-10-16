@@ -9,13 +9,7 @@ fn main() {
         .canonicalize()
         .expect("capnp dir not found");
 
-    let schemas = [
-        "system.capnp",
-        "routing.capnp",
-        "auth.capnp",
-        "stem.capnp",
-        "http.capnp",
-    ];
+    let schemas = ["system.capnp", "routing.capnp", "auth.capnp", "http.capnp"];
     let mut compiler = capnpc::CompilerCommand::new();
     compiler
         .src_prefix(&capnp_dir)

@@ -38,7 +38,6 @@ fn main() {
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("http.capnp"))
         .file(capnp_dir.join("auth.capnp"))
-        .file(capnp_dir.join("stem.capnp"))
         .run()
         .expect("failed to compile shared capnp schemas");
 
@@ -51,7 +50,7 @@ fn main() {
 
     // ── Cargo rebuild triggers ──────────────────────────────────────
     // Re-run this build script whenever any schema file changes.
-    for schema in &["system", "routing", "auth", "http", "stem"] {
+    for schema in &["system", "routing", "auth", "http"] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()

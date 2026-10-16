@@ -31,7 +31,8 @@ If they want to browse, show the menu:
 > 2. **System capabilities** — Membrane, Stat, Network, Executor, Process, streams
 >    (`capnp/system.capnp`)
 > 3. **Membrane & auth** — `Membrane` (`capnp/system.capnp`), `Terminal` and
->    `Identity` (`capnp/auth.capnp`), and `Epoch` (`capnp/stem.capnp`)
+>    `Identity` (`capnp/auth.capnp`), and host-owned `authority::Epoch`
+>    (`crates/authority/src/epoch.rs`)
 > 4. **Routing / DHT** — provide, findProviders
 >    (`capnp/routing.capnp`, `doc/routing.md`)
 > 5. **CLI** — flags, subcommands, env vars (`doc/cli.md`)

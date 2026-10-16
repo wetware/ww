@@ -5,7 +5,7 @@ use capnp::Error;
 use cid::Cid;
 use tokio::sync::watch;
 
-/// Epoch value used by the membrane (matches capnp struct Epoch).
+/// Host-owned epoch lifecycle state used by the membrane.
 ///
 /// An epoch anchors a point-in-time snapshot of a namespace's content root.
 /// The host allocates `seq` locally. Every process starts at epoch zero.

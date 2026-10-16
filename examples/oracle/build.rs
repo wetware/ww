@@ -21,7 +21,6 @@ fn main() {
         .file(capnp_dir.join("system.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("auth.capnp"))
-        .file(capnp_dir.join("stem.capnp"))
         .file(capnp_dir.join("http.capnp"))
         .run()
         .expect("failed to compile shared capnp schemas");
@@ -32,7 +31,7 @@ fn main() {
         .run()
         .expect("failed to compile oracle.capnp");
 
-    for schema in &["system", "routing", "auth", "stem", "http"] {
+    for schema in &["system", "routing", "auth", "http"] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()

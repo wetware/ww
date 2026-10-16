@@ -1,7 +1,4 @@
 # Auth/session schema: Signer, Identity, and Terminal definitions.
-#
-# Split from stem.capnp to separate authentication/session concerns from
-# epoch/provenance and membrane transport metadata.
 
 @0xd0e3f9c78a4b21f1;
 
