@@ -1,6 +1,6 @@
 //! Epoch-scoped capability primitives over Cap'n Proto RPC.
 //!
-//! - **Epoch** -- a monotonic sequence number anchored to on-chain state
+//! - **Epoch** -- a host-local monotonic generation identifying the currently authoritative deployment state
 //! - **EpochGuard** -- checks whether a capability's epoch is still current
 //! - **MembraneServer** -- server that exposes epoch-scoped authority through `graft()`
 //! - **GraftBuilder** -- trait for populating domain-specific graft fields
@@ -13,15 +13,6 @@ pub mod system_capnp {
 #[allow(unused_parens, clippy::match_single_binding)]
 pub mod routing_capnp {
     include!(concat!(env!("OUT_DIR"), "/capnp/routing_capnp.rs"));
-}
-
-#[allow(
-    unused_parens,
-    clippy::extra_unused_type_parameters,
-    clippy::match_single_binding
-)]
-pub mod stem_capnp {
-    include!(concat!(env!("OUT_DIR"), "/capnp/stem_capnp.rs"));
 }
 
 #[allow(

@@ -219,10 +219,12 @@ Schema definitions live in `capnp/`:
 - **`system.capnp`** — Membrane, Stat, Network, Routing, Export, Runtime,
   Executor, Process, ByteStream, StreamListener, StreamDialer, VatListener,
   VatClient, HttpListener
-- **`stem.capnp`** — Epoch and provenance metadata
 - **`auth.capnp`** — Terminal, Signer, Identity, Authority policy constructor
 - **`routing.capnp`** — independent Kademlia provider `Finder` and `Announcer`
 - **`http.capnp`** — HttpClient
+
+Epoch lifecycle state is host-owned in `authority::Epoch`
+(`crates/authority/src/epoch.rs`).
 
 Build scripts generate typed Rust bindings. `Export { name, cap }` survives
 only for application-defined `Membrane.extras` entries.

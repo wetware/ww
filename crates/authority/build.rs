@@ -10,13 +10,12 @@ fn main() {
         .file(capnp_dir.join("system.capnp"))
         .file(capnp_dir.join("routing.capnp"))
         .file(capnp_dir.join("auth.capnp"))
-        .file(capnp_dir.join("stem.capnp"))
         .file(capnp_dir.join("http.capnp"))
         .file("test_session.capnp")
         .run()
         .expect("capnp compile schemas");
 
-    for schema in &["system", "routing", "auth", "stem", "http"] {
+    for schema in &["system", "routing", "auth", "http"] {
         println!(
             "cargo:rerun-if-changed={}",
             capnp_dir.join(format!("{schema}.capnp")).display()

@@ -263,6 +263,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   authority-free.
 
 ### Removed
+- **Obsolete Stem wire schema and generated bindings.** Removed `capnp/stem.capnp`
+  and its codegen wiring because epoch lifecycle is now host-owned.
 - **Obsolete kernel ABI reporting and unused runtime scaffolding.** Removed the
   kernel ABI fingerprint/version fields from builds and `/version`, together
   with disconnected architectural machinery that had no production consumers.

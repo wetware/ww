@@ -38,11 +38,6 @@ mod system_capnp {
     include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
 }
 
-#[allow(dead_code)]
-mod stem_capnp {
-    include!(concat!(env!("OUT_DIR"), "/stem_capnp.rs"));
-}
-
 #[allow(
     dead_code,
     clippy::extra_unused_type_parameters,
