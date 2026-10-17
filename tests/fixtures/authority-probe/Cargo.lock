@@ -14,7 +14,6 @@ version = "0.1.0"
 dependencies = [
  "capnp",
  "capnp-rpc",
- "capnpc",
  "rand",
  "serde",
  "serde_json",

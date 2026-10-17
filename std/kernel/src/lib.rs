@@ -7,32 +7,8 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use system::Guest;
+use system::{system_capnp, Guest};
 use wit_bindgen::StreamResult;
-
-#[allow(dead_code, clippy::extra_unused_type_parameters)]
-mod system_capnp {
-    include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
-}
-
-#[allow(
-    dead_code,
-    clippy::extra_unused_type_parameters,
-    clippy::match_single_binding
-)]
-mod auth_capnp {
-    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
-}
-
-#[allow(dead_code, clippy::extra_unused_type_parameters)]
-mod routing_capnp {
-    include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
-}
-
-#[allow(dead_code, clippy::extra_unused_type_parameters)]
-mod http_capnp {
-    include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
-}
 
 mod kernel_runtime {
     wit_bindgen::generate!({

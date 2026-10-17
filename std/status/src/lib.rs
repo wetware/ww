@@ -20,7 +20,7 @@
 //! WAGI mode only. Runs once per HTTP request — fresh cell, no state.
 
 use std::future::Future;
-use system::Guest;
+use system::{system_capnp, Guest};
 
 #[cfg(target_arch = "wasm32")]
 mod wasi {
@@ -29,30 +29,6 @@ mod wasi {
         world: "monotonic",
         generate_all,
     });
-}
-
-#[allow(dead_code)]
-mod system_capnp {
-    include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
-}
-
-#[allow(
-    dead_code,
-    clippy::extra_unused_type_parameters,
-    clippy::match_single_binding
-)]
-mod auth_capnp {
-    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
-}
-
-#[allow(dead_code)]
-mod routing_capnp {
-    include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
-}
-
-#[allow(dead_code)]
-mod http_capnp {
-    include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
 }
 
 type Membrane = system_capnp::membrane::Client;

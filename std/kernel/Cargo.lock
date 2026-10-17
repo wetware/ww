@@ -204,7 +204,6 @@ version = "0.1.0"
 dependencies = [
  "capnp",
  "capnp-rpc",
- "capnpc",
  "log",
  "system",
  "wit-bindgen",

@@ -715,7 +715,6 @@ dependencies = [
  "bs58",
  "capnp",
  "capnp-rpc",
- "capnpc",
  "futures",
  "log",
  "multiaddr",
