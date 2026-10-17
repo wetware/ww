@@ -852,9 +852,8 @@ jobs:
         cp CHANGELOG.md "$STAGE/"
 
         # WASM cells (flat under bin/)
-        # The host validator requires bin/main.wasm at the merged image
-        # root, so the kernel is named main.wasm. Other cells keep their
-        # canonical names (loaded by name via embedded loader / VFS).
+        # Keep the kernel's release artifact name. PID0 selection is independent
+        # of the application image; other cells retain their component names.
         cp artifacts/wasm-artifacts/std/kernel/bin/main.wasm   "$STAGE/bin/main.wasm"
         cp artifacts/wasm-artifacts/std/status/bin/status.wasm "$STAGE/bin/status.wasm"
 

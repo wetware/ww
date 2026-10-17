@@ -297,7 +297,7 @@ The image root visible to pid0 follows the FHS convention:
 
 ```
 <image>/
-  boot/main.wasm    # conventional application entrypoint produced by ww build
+  bin/<name>.wasm   # application component produced by ww build
   bin/status.wasm   # status component loaded by the shipped Rust PID0
 ```
 

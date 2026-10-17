@@ -1,7 +1,7 @@
 # Wetware build system
 #
 # Builds std/ components and examples as native wasm32-wasip3 artifacts.
-# Publish to IPFS with: ww push std/
+# Publish a built component image with: ww push std/status
 
 P3_BUILD := scripts/build_wasip3_component.sh
 P3_TARGET_DIR ?= $(CURDIR)/target/wasip3
