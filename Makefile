@@ -33,13 +33,13 @@ all: std try-publish-std examples host
 # --- Host --------------------------------------------------------------------
 
 host:
-	cargo build --release
+	cargo build --release --locked
 
 test-deps:
 	git submodule update --init contracts/stem/lib/forge-std
 
 test: test-deps
-	cargo test --workspace
+	cargo test --workspace --locked
 
 test-p3-fixture:
 	bash scripts/check_native_p3_fixture.sh
@@ -282,7 +282,7 @@ test-wasm: std examples authority-probe routing-key-probe stream-lifecycle-probe
 # --- Run ---------------------------------------------------------------------
 
 run-kernel: kernel status
-	cargo run -- run std/status
+	cargo run --locked -- run std/status
 
 # --- Clean -------------------------------------------------------------------
 
