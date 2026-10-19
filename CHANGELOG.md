@@ -36,6 +36,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- **Repository Cargo builds consume committed lockfiles.** Host checks, tests,
+  Make targets, and native/cross releases now use locked resolution. CI checks
+  all tracked lockfile owners before Rust builds, including the fuzz workspace
+  whose cargo-fuzz version cannot forward `--locked`. Dependency updates remain
+  an explicit workflow.
 - **Development containers cache the real Cargo build.** Docker BuildKit and
   Podman 4.1+ reuse Cargo downloads and host/P3 build outputs without dummy
   sources, a duplicate workspace list, or ignored cache-warming failures.

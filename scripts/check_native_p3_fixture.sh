@@ -32,4 +32,4 @@ artifact="$target_dir/wasm32-wasip3/release/native_p3_fixture.wasm"
   --allow-import wasi:filesystem/preopens@0.3.0
 
 WW_NATIVE_P3_FIXTURE="$artifact" \
-  cargo test -p cell 'p3::tests::p3_' -- --ignored --test-threads=1
+  cargo test -p cell 'p3::tests::p3_' --locked -- --ignored --test-threads=1

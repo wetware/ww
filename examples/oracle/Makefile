@@ -10,7 +10,7 @@ all:
 	$(MAKE) -C $(ROOT) p3-oracle
 
 test:
-	cargo test --manifest-path Cargo.toml
+	cargo test --locked --manifest-path Cargo.toml
 
 clean:
 	rm -f bin/oracle.wasm

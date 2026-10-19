@@ -61,6 +61,9 @@ make                              # build everything (host + std + examples)
 Guest builds use the pinned native P3 toolchain. `ww doctor` reports missing
 WASI SDK, `component-ld`, or `wasm-tools` dependencies. Optional: [Kubo](https://docs.ipfs.tech/install/) for IPFS resolution and DHT-based peer discovery.
 
+Repository builds use committed Cargo lockfiles. See the
+[lockfile policy and dependency-update workflow](doc/dependencies/lockfiles.md).
+
 ### Run a node
 
 ```bash

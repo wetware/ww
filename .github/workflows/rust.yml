@@ -79,6 +79,16 @@ jobs:
 
   # === Always-run checks (PRs and pushes) ===
 
+  lockfiles:
+    name: Check committed Cargo lockfiles
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - uses: dtolnay/rust-toolchain@stable
+    # Always resolve before dependent jobs restore compiler caches or build.
+    - run: bash scripts/check_cargo_lockfiles.sh
+    - run: bash tests/test_cargo_lockfiles.sh
+
   test-architecture-map:
     name: Test architecture map
     runs-on: ubuntu-latest
@@ -129,6 +139,7 @@ jobs:
 
   fuzz-corpus:
     name: Fuzz corpus regressions
+    needs: lockfiles
     runs-on: ubuntu-latest
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-30
@@ -150,6 +161,8 @@ jobs:
 
     - uses: ./.github/actions/setup-capnp
 
+    # cargo-fuzz 0.13.2 cannot forward --locked. The lockfiles job checks the
+    # separate fuzz workspace before this lane; see doc/dependencies/lockfiles.md.
     - name: Build fuzz targets
       run: |
         cargo fuzz build fuzz_kubo_ls_response
@@ -188,6 +201,7 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: lockfiles
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -204,7 +218,7 @@ jobs:
     - uses: Swatinem/rust-cache@v2
 
     - name: cargo clippy (host workspace)
-      run: cargo clippy --workspace --all-targets -- -D warnings
+      run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   solidity:
     name: Solidity (Foundry)
@@ -239,6 +253,7 @@ jobs:
 
   build:
     name: Build ww binary
+    needs: lockfiles
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -258,10 +273,11 @@ jobs:
         shared-key: build-test
 
     - name: Build host workspace test binaries
-      run: cargo build --workspace --tests
+      run: cargo build --workspace --tests --locked
 
   build-wasm:
     name: Build native wasm32-wasip3 components
+    needs: lockfiles
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -416,7 +432,7 @@ jobs:
         test -s target/stream-lifecycle-probe/wasm32-wasip3/release/stream_lifecycle_probe.wasm
 
     - name: Run host workspace tests
-      run: cargo test --workspace -- --test-threads=2
+      run: cargo test --workspace --locked -- --test-threads=2
       env:
         WW_TEST_REQUIRE_KUBO: "1"
         WW_REQUIRE_P3_FIXTURES: "1"
@@ -428,7 +444,7 @@ jobs:
       run: |
         set -euo pipefail
         proof_exit=0
-        cargo run -q -p chess --example authority_proof \
+        cargo run --locked -q -p chess --example authority_proof \
           >proof.stdout 2>proof.stderr || proof_exit=$?
         status=0
         if [ "$proof_exit" -ne 0 ]; then
@@ -463,9 +479,9 @@ jobs:
     - name: Run standalone standard-library tests
       if: ${{ always() }}
       run: |
-        cargo test --manifest-path crates/wagi-guest/Cargo.toml
-        cargo test --manifest-path std/kernel/Cargo.toml
-        cargo test --manifest-path std/status/Cargo.toml
+        cargo test --locked --manifest-path crates/wagi-guest/Cargo.toml
+        cargo test --locked --manifest-path std/kernel/Cargo.toml
+        cargo test --locked --manifest-path std/status/Cargo.toml
 
   build-architecture-map:
     name: Build architecture map
@@ -601,11 +617,14 @@ jobs:
 
     - name: Build (native)
       if: ${{ !matrix.use_cross }}
-      run: cargo build --release --target ${{ matrix.target }}
+      run: cargo build --release --locked --target ${{ matrix.target }}
 
     - name: Build (cross)
       if: ${{ matrix.use_cross }}
-      run: cross build --release --target ${{ matrix.target }}
+      # cross runs its own unlocked metadata before forwarding build flags.
+      run: |
+        cargo metadata --locked --format-version 1 --manifest-path Cargo.toml > /dev/null
+        cross build --release --locked --target ${{ matrix.target }}
 
     - name: Package binary
       run: |
