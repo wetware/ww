@@ -1,11 +1,11 @@
 # Multi-stage build for wetware
 # Works with: podman build -t wetware:latest .
 #         or: docker build -t wetware:latest -f Containerfile .
+# Requires Docker BuildKit (Dockerfile frontend 1.2+) or Podman 4.1+.
+# The pinned WASI tools below require a linux/amd64 builder.
 
 # ── Stage 1: Builder ─────────────────────────────────────────────────
 FROM rust:bookworm AS builder
-
-ARG WW_BUILD_GIT_SHA=unknown
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -47,55 +47,38 @@ ENV WASM_TOOLS=/opt/p3-tools/wasm-tools-1.258.0-x86_64-linux/wasm-tools
 
 WORKDIR /usr/src/app
 
-# ── Dependency cache layer ───────────────────────────────────────────
-# Copy manifests, lockfile, build scripts, and capnp schemas first.
-# build.rs files in membrane/ and kernel/ reference ../../capnp/*.capnp,
-# so the schema dir must be present for the cache-warming build.
-
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY capnp/ capnp/
-
-# Workspace member manifests + build scripts
-COPY crates/atom/Cargo.toml crates/atom/Cargo.toml
-COPY crates/cache/Cargo.toml crates/cache/Cargo.toml
-COPY crates/stem/Cargo.toml crates/stem/Cargo.toml
-COPY crates/authority/Cargo.toml crates/authority/build.rs crates/authority/
-COPY crates/membrane/Cargo.toml crates/membrane/build.rs crates/membrane/
-COPY crates/guest/auth/Cargo.toml crates/guest/auth/Cargo.toml
-COPY std/system/Cargo.toml std/system/Cargo.toml
-COPY examples/chess/Cargo.toml examples/chess/build.rs examples/chess/
-COPY examples/discovery/Cargo.toml examples/discovery/build.rs examples/discovery/
-
-# Dummy source files so cargo can resolve the workspace
-RUN mkdir -p src/cli && echo 'fn main() {}' > src/cli/main.rs \
-    && mkdir -p crates/atom/src && echo '' > crates/atom/src/lib.rs \
-    && mkdir -p crates/cache/src && echo '' > crates/cache/src/lib.rs \
-    && mkdir -p crates/stem/src && echo '' > crates/stem/src/lib.rs \
-    && mkdir -p crates/authority/src && echo '' > crates/authority/src/lib.rs \
-    && mkdir -p crates/membrane/src && echo '' > crates/membrane/src/lib.rs \
-    && mkdir -p crates/guest/auth/src && echo '' > crates/guest/auth/src/lib.rs \
-    && mkdir -p std/system/src && echo '' > std/system/src/lib.rs \
-    && mkdir -p examples/chess/src && echo '' > examples/chess/src/lib.rs \
-    && mkdir -p examples/discovery/src && echo '' > examples/discovery/src/lib.rs
-
-# Warm the dependency cache (errors expected from dummy sources; || true)
-RUN cargo build --release || true
+# Resolve the host toolchain before source changes invalidate the build layer.
+COPY rust-toolchain.toml ./
+RUN rustup show active-toolchain
 
 # ── Full source build ────────────────────────────────────────────────
-# Remove dummy sources, copy real project
-RUN find . -name '*.rs' -path '*/src/*' -delete
 COPY . .
 
-# WW_BUILD_GIT_SHA is set after cache-warming so the hash does not bust the dependency cache.
+# Declare provenance after toolchain installation so SHA changes reuse setup.
+ARG WW_BUILD_GIT_SHA=unknown
 ENV WW_BUILD_GIT_SHA=${WW_BUILD_GIT_SHA}
 
-# Build std + echo example (embedded by build.rs), then host binary
-RUN make std echo host
+# Cache the real host and standalone P3 builds, including target/wasip3.
+# The locked target mount serializes builds sharing these caches. Cargo tracks
+# manifests, lockfiles, build inputs, and compiler used by each build.
+# Refresh source timestamps on a layer miss: an older checkout can otherwise
+# appear unchanged to Cargo when paired with newer cached target fingerprints.
+# This rebuilds local crates while retaining compiled registry/git dependencies.
+# P3 outputs are copied to std/ and examples/ by the build script. The host
+# binary must leave the target cache before this RUN ends for the runtime COPY.
+# Keep the sole locked mount last for Podman 4.1 / Buildah 1.26 compatibility.
+RUN --mount=type=cache,id=wetware-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=wetware-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=wetware-target,target=/usr/src/app/target,sharing=locked \
+    find . -path ./target -prune -o -type f -exec touch {} + \
+    && make std echo host \
+    && mkdir -p /out \
+    && cp target/release/ww /out/ww
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────
 FROM gcr.io/distroless/cc-debian12
 
-COPY --from=builder /usr/src/app/target/release/ww /usr/local/bin/ww
+COPY --from=builder /out/ww /usr/local/bin/ww
 
 # Kernel layer (FHS: bin/main.wasm)
 COPY --from=builder /usr/src/app/std/kernel/bin/main.wasm \

@@ -36,6 +36,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- **Development containers cache the real Cargo build.** Docker BuildKit and
+  Podman 4.1+ reuse Cargo downloads and host/P3 build outputs without dummy
+  sources, a duplicate workspace list, or ignored cache-warming failures.
 - **RPC guests reuse shared platform bindings from `std/system`.** Six guests
   no longer generate duplicate platform schemas. Chess, oracle, discovery, and
   `ww init` generate only application-local schemas. Wire schemas, component

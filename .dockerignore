@@ -1,8 +1,11 @@
 # Build artifacts
 target/
 
-# Git (commit hash passed via --build-arg GIT_COMMIT)
+# Git (commit hash passed via --build-arg WW_BUILD_GIT_SHA)
 .git/
+
+# Local workspace state
+.context/
 
 # CI/CD
 .github/
