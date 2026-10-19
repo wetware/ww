@@ -21,7 +21,7 @@ use std::rc::Rc;
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
-use system::Guest;
+use system::{http_capnp, routing_capnp, system_capnp, Guest};
 
 #[cfg(target_arch = "wasm32")]
 mod wasi {
@@ -33,30 +33,6 @@ mod wasi {
 }
 
 // Cap'n Proto generated modules
-#[allow(dead_code)]
-mod system_capnp {
-    include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
-}
-
-#[allow(
-    dead_code,
-    clippy::extra_unused_type_parameters,
-    clippy::match_single_binding
-)]
-mod auth_capnp {
-    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
-}
-
-#[allow(dead_code)]
-mod routing_capnp {
-    include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
-}
-
-#[allow(dead_code)]
-mod http_capnp {
-    include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
-}
-
 #[allow(dead_code)]
 mod oracle_capnp {
     include!(concat!(env!("OUT_DIR"), "/oracle_capnp.rs"));

@@ -36,6 +36,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- **RPC guests reuse shared platform bindings from `std/system`.** Six guests
+  no longer generate duplicate platform schemas. Chess, oracle, discovery, and
+  `ww init` generate only application-local schemas. Wire schemas, component
+  imports/exports, authority policy, and runtime capability grants are unchanged.
 - **Reconciled `ww build` and `ww push` around `bin/<name>.wasm` image trees.**
   Push publishes the existing tree and reports its directory-root CID without
   copying `boot/main.wasm` to `bin/main.wasm`. Run no longer creates that alias.

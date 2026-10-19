@@ -20,7 +20,7 @@ use capnp_rpc::pry;
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
 use shakmaty::{Chess, EnPassantMode, Position};
-use system::Guest;
+use system::{routing_capnp, system_capnp, Guest};
 
 #[cfg(target_arch = "wasm32")]
 mod wasi {
@@ -34,30 +34,6 @@ mod wasi {
 // ---------------------------------------------------------------------------
 // Cap'n Proto generated modules
 // ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-mod system_capnp {
-    include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
-}
-
-#[allow(
-    dead_code,
-    clippy::extra_unused_type_parameters,
-    clippy::match_single_binding
-)]
-mod auth_capnp {
-    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
-}
-
-#[allow(dead_code)]
-mod routing_capnp {
-    include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
-}
-
-#[allow(dead_code)]
-mod http_capnp {
-    include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
-}
 
 #[allow(dead_code)]
 pub mod chess_capnp {

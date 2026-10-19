@@ -1030,49 +1030,14 @@ capnp-rpc = {{ git = "https://github.com/wetware/capnproto-rust", rev = "b3befb3
         );
         std::fs::write(target_dir.join("Cargo.toml"), cargo_toml)?;
 
-        // build.rs — compiles schemas
+        // build.rs — compiles the application schema; system provides platform bindings.
         let build_rs = format!(
-            r#"use std::env;
-use std::path::Path;
-
-fn main() {{
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    let manifest_path = Path::new(&manifest_dir);
-    let capnp_dir = manifest_path
-        .join("../..")
-        .join("capnp")
-        .canonicalize()
-        .expect("capnp dir not found");
-
-    let local_schema = manifest_path
-        .join("{name}.capnp")
-        .canonicalize()
-        .expect("{name}.capnp not found next to Cargo.toml");
-
-    // Pass 1: shared schemas
+            r#"fn main() {{
     capnpc::CompilerCommand::new()
-        .src_prefix(&capnp_dir)
-        .file(capnp_dir.join("system.capnp"))
-        .file(capnp_dir.join("routing.capnp"))
-        .file(capnp_dir.join("auth.capnp"))
-        .file(capnp_dir.join("http.capnp"))
-        .run()
-        .expect("failed to compile shared capnp schemas");
-
-    // Pass 2: local schema
-    capnpc::CompilerCommand::new()
-        .src_prefix(manifest_path)
-        .file(&local_schema)
+        .file("{name}.capnp")
         .run()
         .expect("failed to compile {name}.capnp");
-
-    for schema in &["system", "routing", "auth", "http"] {{
-        println!(
-            "cargo:rerun-if-changed={{}}",
-            capnp_dir.join(format!("{{schema}}.capnp")).display()
-        );
-    }}
-    println!("cargo:rerun-if-changed={{}}", local_schema.display());
+    println!("cargo:rerun-if-changed={name}.capnp");
 }}
 "#,
         );
@@ -1083,27 +1048,7 @@ fn main() {{
             r#"use std::rc::Rc;
 
 use capnp::capability::Promise;
-use system::Guest;
-
-#[allow(dead_code)]
-mod system_capnp {{
-    include!(concat!(env!("OUT_DIR"), "/system_capnp.rs"));
-}}
-
-#[allow(dead_code)]
-mod auth_capnp {{
-    include!(concat!(env!("OUT_DIR"), "/auth_capnp.rs"));
-}}
-
-#[allow(dead_code)]
-mod routing_capnp {{
-    include!(concat!(env!("OUT_DIR"), "/routing_capnp.rs"));
-}}
-
-#[allow(dead_code)]
-mod http_capnp {{
-    include!(concat!(env!("OUT_DIR"), "/http_capnp.rs"));
-}}
+use system::{{system_capnp, Guest}};
 
 #[allow(dead_code)]
 mod {name}_capnp {{
