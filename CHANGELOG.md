@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Composer v1 supports immutable targeted file and directory composition (#734 Landing A).**
+  Ordered operations preserve strict ancestor metadata and produce deterministic
+  root CIDs. Standalone source inspection verifies cumulative sizes, and typed
+  errors report deterministic composition failures. Public CLI targeted mounts
+  are not enabled yet.
+
 ### Fixed
 - **Atom head reads decode Solidity return parameters correctly.** Standard
   `(uint64, bytes)` responses preserve both the sequence and CID bytes.
