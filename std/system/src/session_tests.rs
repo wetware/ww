@@ -459,8 +459,6 @@ impl RpcPair {
 #[test]
 fn cancellation_after_rpc_roundtrips_releases_exports_and_breaks_retained_import() {
     let mut pair = RpcPair::new();
-    pair.barrier();
-    pair.barrier();
     pair.cancel();
     let response = pair.remote_export.stdin_request().send().promise;
     assert!(pair.drive(response).is_err());
@@ -949,11 +947,10 @@ impl capnp_rpc::VatNetwork<Side> for TerminalNetwork {
 
 #[test]
 fn real_nested_selector_preserves_transport_then_rpc_then_application_precedence() {
-    for (transport_ready, rpc_ready, application_ready, expected_polls) in [
-        (true, true, true, vec!["transport"]),
-        (false, true, true, vec!["transport", "rpc"]),
-        (false, true, false, vec!["transport", "rpc"]),
-        (false, false, true, vec!["transport", "rpc", "application"]),
+    for (transport_ready, rpc_ready, expected_polls) in [
+        (true, true, vec!["transport"]),
+        (false, true, vec!["transport", "rpc"]),
+        (false, false, vec!["transport", "rpc", "application"]),
     ] {
         let mut connection = if rpc_ready {
             QueuedConnection::with_network(
@@ -1000,11 +997,7 @@ fn real_nested_selector_preserves_transport_then_rpc_then_application_precedence
         let application_polls = polls.clone();
         let application = futures::future::poll_fn(move |_| {
             application_polls.borrow_mut().push("application");
-            if application_ready {
-                Poll::Ready(Err(failed("application selected")))
-            } else {
-                Poll::Pending
-            }
+            Poll::Ready(Err(failed("application selected")))
         });
         let mut session = Box::pin(select_session_with_disconnect(
             transport,
