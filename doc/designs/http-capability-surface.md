@@ -1,10 +1,10 @@
 # HTTP Capability Surface Design
 
-## Status: Phase 1 complete (WAGI adapter + lightweight spawn)
+## Status: WAGI listener and outbound HTTP implemented
 
 **Supersedes** the original raw-HTTP/stdin model and long-lived cell default.
-See `~/.gstack/projects/wetware-ww/ceo-plans/2026-03-31-wagi-http-cells.md`
-for the full Phase 1 plan with CEO review.
+The original phase plan is historical. Current contracts are documented in the
+[guest API](../api/wasm-guest.md) and [CLI reference](../cli.md#ww-run).
 
 ## Overview
 
@@ -15,8 +15,8 @@ CGI-formatted response from stdout. Fresh cell per request. Stateless.
 This is infrastructure interop, not Wetware's primary stateful service
 model.
 
-All HTTP capabilities are epoch-scoped and follow wetware's
-zero-ambient-authority model.
+All HTTP capabilities are epoch-scoped. Cells have no ambient node-control
+authority; their fixed WASI substrate is separate from HTTP capability grants.
 
 ## The Spec
 
@@ -70,9 +70,9 @@ wagi::export_async!(Counter);
 
 That's ~8 lines. Down from the 306-line FastCGI implementation.
 
-### WebSocket (persistent bidirectional stream, Phase 2)
+### WebSocket (proposed persistent bidirectional stream)
 
-The upgrade request arrives as a normal WAGI invocation:
+The following upgrade flow remains a proposal:
 
 - `HTTP_UPGRADE=websocket` and `HTTP_CONNECTION=Upgrade` in env vars
 - Cell writes `101 Switching Protocols` + WebSocket accept headers to stdout
@@ -122,39 +122,47 @@ accepted prefix in stdout.
 
 ### Spawn Path
 
-All cell types get `with_data_streams()` + membrane RPC. The WIT
-membrane channel is universal. stdin/stdout semantics vary by cell type:
+`Executor.spawn` supplies data streams and the explicit parent-selected
+`Membrane` through the process-local P3 RPC transport. The HTTP listener passes
+its registration-time `Membrane` unchanged. Stdio semantics vary by cell type:
 
 - **Raw cells:** stdin/stdout carry wire protocol bytes.
 - **HTTP/WAGI cells:** stdin/stdout carry CGI request/response.
-- **Cap'n Proto cells:** stdin close = graceful shutdown signal,
-  stdout unused. All I/O goes through the WIT side-channel.
+- **Cap'n Proto cells:** stdio is application-defined; RPC uses the separate
+  `wetware:transport` connection.
+
+Stdin EOF is not a universal shutdown request. `Process` references own ordinary
+child execution. Final `Process` owner loss or `Process.kill()` requests
+termination; the backend performs asynchronous teardown. `Process.wait()`
+observes cleanup completion without retaining execution ownership. Stdio and
+bootstrap capabilities alone do not own execution. See
+[Process lifecycle](../api/wasm-guest.md#process).
 
 ### Per-request Flow
 
 ```
-HTTP request arrives (Phase 2: axum, Phase 1: ww test http)
+Before requests: register prefix, Executor, and Membrane with HttpListener
     |
-    +-- 1. build_cgi_env("GET", "/counter", "", headers, ...)
+HTTP request arrives through the axum WagiService
+    |
+    +-- 1. Dispatch to the current valid prefix registration
+    |
+    +-- 2. build_cgi_env("GET", "/counter", "", headers, ...)
     |       -> ["REQUEST_METHOD=GET", "PATH_INFO=/counter", ...]
     |
-    +-- 2. runtime.load(wasm_bytes) -> Executor
-    |       (Arc<bytecode> clone, cached by BLAKE3 hash)
-    |
-    +-- 3. executor.spawn(args, env=cgi_env) [lightweight path]
+    +-- 3. executor.spawn(args, env=cgi_env, membrane=registration_membrane)
     |       -> Creates duplex pipes (stdin/stdout/stderr)
-    |       -> Skips membrane, skips RPC system
-    |       -> tokio::task::spawn_local(proc.run())
+    |       -> Establishes P3 capability transport with that Membrane
+    |       -> Schedules the child lifecycle on the executor worker
     |       -> Returns Process client
     |
-    +-- 4. Write request body to stdin, close stdin
-    |
-    +-- 5. tokio::time::timeout(30s, read_stdout + wait)
+    +-- 4. tokio::time::timeout(30s, run_spawned_process)
     |       |
+    |       +-- Write body to stdin, close stdin, read stdout, wait for cleanup
     |       +-- Success: parse_cgi_response(stdout) -> HTTP response
-    |       +-- Timeout: Process.kill() -> 504 Gateway Timeout
+    |       +-- Timeout: request best-effort Process.kill() -> 504 Gateway Timeout
     |
-    +-- 6. Return response
+    +-- 5. Return response; release the request's Process reference
 ```
 
 ### Error-to-HTTP Status Mapping
@@ -183,7 +191,7 @@ for observability only. Intentional deviation from CGI spec.
 | Cell floods stdout | `MAX_RESPONSE_BYTES` (16 MiB) | Built |
 | Cell eats all CPU | EWMA fuel scheduler (wasmtime fuel + call-hook) | Built |
 | Cell eats all memory | wasmtime `StoreLimits` | TODO |
-| Cell hangs forever | per-request timeout (30s) | TODO |
+| Spawned cell hangs | request I/O and wait timeout (30s) | Built |
 | Concurrent request flood | max cells per prefix | TODO (Phase 2) |
 
 ## Cap'n Proto Schema
@@ -191,43 +199,36 @@ for observability only. Intentional deviation from CGI spec.
 No schema change needed. HTTP listener registration receives the path prefix
 explicitly; WASM custom sections do not select HTTP routing.
 
-### Outgoing HTTP (HttpClient, deferred)
+### Outgoing HTTP (HttpClient)
 
 ```
-WASI Guest --Cap'n Proto RPC--> EpochGuardedHttpClient (reqwest) --> Internet
+WASI Guest --Cap'n Proto RPC--> EpochGuardedHttpProxy (reqwest) --> Internet
 ```
 
-- HttpClientBuilder.build() returns an epoch-guarded HttpClient
-- Every RPC method calls EpochGuard::check()
-- Membrane attenuation: httpClient can be withheld from remote peers
+- `--http-dial <HOST>` enables an epoch-guarded `HttpClient` with a host allowlist.
+- The proxy checks `EpochGuard` and the destination host before sending a request.
+  Redirects must also pass the host allowlist.
+- The root `Membrane` exposes the client as `network.http.dialer`; without
+  `--http-dial`, that field is null. A parent can omit it from a child `Membrane`.
 
-### Membrane Integration (Phase 2)
+### Membrane Integration
 
-HttpClientBuilder added to graft() return. HttpListener withheld without
-`--with-http`.
+`--http-listen <ADDR>` enables the WAGI server and root
+`network.http.listener`. A guest registers a prefix with an `Executor` and an
+explicit child `Membrane`. Each request uses that same `Membrane`.
+The dispatch task owns the route registration. Epoch or registration-scope
+expiry removes that registration; a stale registration cannot remove its
+replacement.
 
 ## Implementation Status
 
-### Phase 1: WAGI Adapter + Lightweight Spawn (done)
-- [x] WagiAdapter: `build_cgi_env()`, `parse_cgi_response()`, 16 unit tests
-- [x] wagi-guest crate: env var helpers + CGI response formatting
-- [x] Counter example rewritten as WAGI cell (306 -> 32 lines)
-- [x] Lightweight spawn path in `ExecutorImpl::spawn()`
-- [x] EWMA fuel scheduler (call-hook refueling at host boundaries, 10 unit tests)
-- [x] Process.kill() via watch channel + tokio::select!
-- [ ] Per-request timeout (30s)
-- [ ] `ww test http` CLI subcommand
-- [ ] `ww new http` CLI scaffolding
-- [ ] Three-point benchmark
-- [ ] Quickstart doc
+Implemented: CGI environment/response handling, awaited finite P3 output,
+explicit spawn Membranes, Process termination and cleanup observation,
+request I/O/wait timeout, axum route dispatch, and scoped outbound HTTP.
 
-### Phase 2: Production HTTP Server
-- `--with-http host:port` flag, axum router, route table
-- WebSocket upgrade support
-- HttpClient capability (outgoing HTTP via reqwest)
-
-### Phase 3: Multi-Language
-- Go (TinyGo), Python (componentize-py) WAGI examples
+The earlier phase checklist is superseded. It does not define current CLI
+commands or a second spawn path. WebSocket upgrades and additional language
+examples remain proposals.
 
 ## Prior Art
 

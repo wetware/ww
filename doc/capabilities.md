@@ -205,12 +205,15 @@ image root and optional known-CID CAS wiring. RPC revocation works two ways:
   that can trigger key-scoped revocation or replace bindings. Until that
   pre-alpha API lands, generic published services use epoch advance for
   operator-triggered invalidation.
-- **Kill and respawn under a different root Atom.** New cell, new root
-  CID, fresh CID graph. The old cell's content knowledge is gone with
-  the old process.
+- **Kill and respawn under a different image root.** A different root Atom is
+  one source configuration. The new Cell receives the selected root CID.
+  The old process's memory ends with that process; previously shared content
+  knowledge is not revoked.
 
 Both lifecycle checks use the same call-guard substrate as method policy.
-Atom remains the source and coordinator of global epoch lifecycle.
+The Host's `Deployment` coordinates the local epoch lifecycle and publishes
+epoch transitions. Atom and IPNS are selectable source adapters; static
+deployments use the same Host lifecycle without a source task.
 
 ## Cap'n Proto schemas
 

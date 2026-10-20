@@ -1608,9 +1608,9 @@ impl Proc {
         // path is `CidTree::staging_dir()` purely as a protocol anchor:
         // `fs_intercept` overrides every open/readdir/stat call before
         // it reads from this directory and routes through
-        // `CidTree::resolve_path`. The preopen's actual on-disk contents
-        // are dir-listing stubs populated lazily by `fs_intercept`, not
-        // the guest's view. See doc/capabilities.md.
+        // descriptor-relative `CidTree::resolve_at_in`. The preopen's actual
+        // on-disk contents are dir-listing stubs populated lazily by
+        // `fs_intercept`, not the guest's view. See doc/capabilities.md.
         fn assert_send<T: Send>(_: &T) {}
         assert_send(&wasi_builder);
         let cid_tree_staging = cid_tree.as_ref().map(|tree| tree.staging_dir().to_owned());

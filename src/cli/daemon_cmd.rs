@@ -89,8 +89,9 @@ pub(super) async fn daemon_install(
 
 /// Materialize the install-owned FHS layer outside the private host-state tree.
 ///
-/// Release binaries carry the status component. Install-script layouts from
-/// older versions provide the same bytes under `~/.ww/std/status`.
+/// Release binaries carry the status component. The current install script
+/// also writes `~/.ww/std/status/bin/status.wasm`, used when embedded bytes
+/// are absent.
 pub(super) fn refresh_default_fhs(ww_dir: &Path) -> Result<(PathBuf, bool)> {
     let fhs_dir = ww_dir.join("fhs");
     let bin_dir = fhs_dir.join("bin");

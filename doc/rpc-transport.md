@@ -148,6 +148,26 @@ owner terminalizes RPC state during that destruction. Wetware pins upstream
 destructor-driven wakes before retiring the cancelled task's wake stream. The
 pin contains no later generator changes from upstream main.
 
+### wit-bindgen validation and removal
+
+[#720](https://github.com/wetware/ww/issues/720) owns replacement of this temporary
+fork. A released upstream candidate must contain both
+[#1740](https://github.com/bytecodealliance/wit-bindgen/pull/1740), the
+destruction-time wake fix, and
+[#1743](https://github.com/bytecodealliance/wit-bindgen/pull/1743), which lets
+spawned Rust tasks finish after cancellation of the component task's root
+computation. The current pin contains the narrower wake fix.
+
+Before removal, run the guest cancellation/async regressions, including
+`make test-guest-session-cancel`, and verify root-versus-spawned-task cancellation
+semantics against the candidate. Upstream inclusion alone does not validate a
+replacement for Wetware. Migrate all manifest and lockfile sites together,
+including standalone guests and native-P3 fixtures. Remove obsolete fork pins
+and provenance guidance only after those checks pass. Dependency replacement
+remains separate from #683.
+
+### Managed RPC teardown
+
 Wetware-owned RPC drivers use managed disconnect. Normal completion, transport
 failure, explicit shutdown, and owner cancellation explicitly disconnect Cap'n
 Proto before abandoning its driver. This releases exported capabilities even

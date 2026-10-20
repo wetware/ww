@@ -136,9 +136,10 @@ that omit the import do not receive its bindings.
 
 ## Epoch and PID0 lifecycle
 
-An **epoch** is a host-local authority generation. Every host process assigns
-epoch `0` to its boot deployment. Each accepted authoritative transition uses
-checked local increment. Backend revisions, Atom blocks, timestamps, and
+An **epoch** is a host-local authority generation. Every host process starts
+its deployment baseline at epoch `0`. Each accepted authoritative transition
+uses checked local increment, including updates before the first rooted boot
+activation. Backend revisions, Atom blocks, timestamps, and
 provenance do not become `Epoch.seq` and do not survive a process restart.
 
 An optional `stem::Source` establishes the authoritative mutable base head.

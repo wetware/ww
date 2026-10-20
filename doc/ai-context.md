@@ -9,10 +9,12 @@ referenced below.
 ---
 
 **Wetware** is a peer-to-peer operating system for autonomous agents.
-It replaces ambient authority with capability-based security.  Agents
-run as WASM processes called **Cells** with zero ambient authority --
-they can only do what they've been explicitly granted capabilities
-to do.
+Agents run as WASM processes called **Cells** with no ambient node-control
+authority. Node-control operations require explicitly granted capabilities.
+Cells also receive fixed WASI stdio, arguments/environment, clocks, randomness,
+an image-root filesystem, and private writable `/tmp`. Known-CID reads depend on
+the execution context's root or cache wiring. See
+[WASI host functions](api/wasm-guest.md#wasi-host-functions).
 
 **Cells** are the unit of computation. Each Cell is a native
 `wasm32-wasip3` component. Async RPC Cells receive one capability-granted

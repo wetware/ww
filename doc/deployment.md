@@ -10,11 +10,12 @@ The host-side `deployment` module owns runtime deployment transitions. A
 deployment combines an optional authoritative Stem head with configured frozen
 root layers. Later layers override earlier layers during DAG composition.
 
-The boot deployment always uses local epoch `0`. Atom contract revisions and
-IPNS record sequences are Source state; neither value becomes `Epoch.seq`. A
-host restart allocates epoch `0` again. Static startup prepares the frozen
-layers through the same path, publishes a rooted epoch `0`, and starts no
-Source task.
+The initial deployment baseline starts at local epoch `0`. Accepted Source
+updates during boot preparation can advance the local epoch before the first
+rooted activation. Atom contract revisions and IPNS record sequences are Source
+state; neither value becomes `Epoch.seq`. A host restart starts at epoch `0`
+again. Static startup prepares the frozen layers through the same path,
+publishes a rooted epoch `0`, and starts no Source task.
 
 For a replacement, deployment publishes the new local epoch with `root: None`
 before root preparation. This publication revokes old authority. Deployment

@@ -147,9 +147,6 @@ filesystem root. Existing capabilities then fail with `staleEpoch`.
 Deployment publishes the same epoch with its effective root only after
 preparation succeeds and old PID0 terminates.
 
-`--epoch-drain-secs` is deprecated and inert. The Host accepts the option for
-CLI compatibility, but the value does not delay the authority broadcast.
-
 ## Summary
 
 | Layer | Mechanism | Defends against |
