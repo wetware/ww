@@ -11,7 +11,7 @@ mod ticked_executor;
 
 mod support;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -795,6 +795,34 @@ fn counting_runtime(bytecode_cid: &str) -> (Grant, Rc<Cell<u32>>) {
         },
         calls,
     )
+}
+
+/// Test-only authority-delivery probe. Records calls without network announcement.
+struct RecordingAnnouncer {
+    announced: Rc<RefCell<Vec<String>>>,
+}
+
+impl ww::routing_capnp::announcer::Server for RecordingAnnouncer {
+    async fn provide(
+        self: capnp::capability::Rc<Self>,
+        params: ww::routing_capnp::announcer::ProvideParams,
+        _results: ww::routing_capnp::announcer::ProvideResults,
+    ) -> Result<(), capnp::Error> {
+        let cid = params.get()?.get_key()?.to_str()?.to_owned();
+        self.announced.borrow_mut().push(cid);
+        Ok(())
+    }
+}
+
+fn recording_announcer() -> (
+    ww::routing_capnp::announcer::Client,
+    Rc<RefCell<Vec<String>>>,
+) {
+    let announced = Rc::new(RefCell::new(Vec::new()));
+    let client = capnp_rpc::new_client(RecordingAnnouncer {
+        announced: announced.clone(),
+    });
+    (client, announced)
 }
 
 struct DropTrackedRuntime {
@@ -2239,9 +2267,7 @@ fn announcer_only_can_announce_but_cannot_use_finder() {
     let local = tokio::task::LocalSet::new();
     local.block_on(&tokio::runtime::Runtime::new().unwrap(), async move {
         let harness = harness(&wasm).await;
-        let routing = ww::rpc::routing::LocalProviderRouting::new();
-        let announcer: ww::routing_capnp::announcer::Client =
-            capnp_rpc::new_client(routing.announcer());
+        let (announcer, announced) = recording_announcer();
         let report = probe_report_with_authority(
             &harness.executor,
             "routing-announcer",
@@ -2256,6 +2282,7 @@ fn announcer_only_can_announce_but_cannot_use_finder() {
         assert_eq!(report["ok"], true, "Announcer probe failed: {report}");
         assert_eq!(report["detail"]["provide"], true);
         assert_eq!(report["detail"]["finder_withheld"], true);
+        assert_eq!(*announced.borrow(), [KNOWN_CID]);
     });
 }
 
@@ -2274,8 +2301,7 @@ fn finder_and_announcer_are_available_only_when_both_are_explicitly_granted() {
             },
         );
         let finder: ww::routing_capnp::finder::Client = capnp_rpc::new_client(routing.finder());
-        let announcer: ww::routing_capnp::announcer::Client =
-            capnp_rpc::new_client(routing.announcer());
+        let (announcer, announced) = recording_announcer();
         let report = probe_report_with_authority(
             &harness.executor,
             "routing-both",
@@ -2293,6 +2319,7 @@ fn finder_and_announcer_are_available_only_when_both_are_explicitly_granted() {
             "combined routing probe failed: {report}"
         );
         assert_eq!(report["detail"]["provide"], true);
+        assert_eq!(*announced.borrow(), [KNOWN_CID]);
         assert_eq!(report["detail"]["find_providers"], true);
         assert_eq!(report["detail"]["providers"], 1);
         assert_eq!(report["detail"]["done"], true);

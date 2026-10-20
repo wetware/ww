@@ -571,9 +571,10 @@ impl CidTree {
     ///
     /// **The staging directory is host-side scratch, not guest-visible
     /// state.** `fs_intercept` overrides every fs op before it reads
-    /// from this directory, routing through `CidTree::resolve_path`. The
-    /// directory's actual on-disk contents are dir-listing stubs (sparse
-    /// files with correct sizes, populated by `fs_intercept` on demand
+    /// from this directory, resolving descriptor-relative paths through
+    /// `CidTree::resolve_at_in`. The directory's actual on-disk contents
+    /// are dir-listing stubs (sparse files with correct sizes, populated
+    /// by `fs_intercept` on demand
     /// for `cap_std::fs::Dir::readdir`) plus persisted JSON dir listings
     /// keyed by CID. Raw file bytes live in `PinsetCache`'s tempdir, not
     /// here.

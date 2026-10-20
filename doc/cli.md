@@ -85,9 +85,8 @@ Layers stack with per-file union; later layers win.
 | `--ipns-stem <IPNS_NAME>` | none | Follow an IPNS name as the authoritative deployment Stem. Conflicts with `--stem`. |
 | `--ipns-routing-url <URL>` | `http://localhost:8080` | Kubo Gateway listener for raw HTTP Routing V1 records. Also reads `IPFS_ROUTING_API`. |
 | `--rpc-url <URL>` | `http://127.0.0.1:8545` | HTTP JSON-RPC for finalized-depth `eth_blockNumber` and `eth_call` polling. |
-| `--ws-url <URL>` | `ws://127.0.0.1:8545` | Deprecated compatibility option. Atom following does not require event subscriptions. |
+| `--ws-url <URL>` | `ws://127.0.0.1:8545` | Atom event endpoint for optional advisory pre-finality preparation. Authoritative following uses HTTP polling through `--rpc-url`; event subscriptions are not required for correctness. |
 | `--confirmation-depth <N>` | `6` | Chain depth used when reading authoritative `Atom.head()` state. |
-| `--epoch-drain-secs <N>` | `1` | Deprecated compatibility option. The value is ignored. Epoch authority advances immediately. |
 
 ### Examples
 

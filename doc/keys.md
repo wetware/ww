@@ -13,9 +13,10 @@ concerns that were previously conflated:
    name is the Base36 CIDv1 form of the same `PeerId`.
 
 2. **Operator identity (secp256k1)** — the Stem contract owner key. This is
-   the one key that calls `setHead()` to advance the on-chain epoch. It is
-   an operator concern, not a node concern. Nodes are chain readers (they
-   watch HeadUpdated events via the AtomIndexer); they never transact.
+   the key that calls `setHead()` to update the Atom head/revision. This source
+   revision is distinct from the Host's local deployment epoch. Nodes read
+   authoritative state through HTTP polling and use `HeadUpdated` events through
+   `AtomIndexer` for advisory preparation; they never transact.
 
 **Why the split:** The original "one key, two roles" design gave every node
 an EVM address it never used. Nodes don't transact on-chain. Only the cluster

@@ -36,6 +36,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- **Removed unsupported entry paths and reconciled guidance (#683 Landing 8).**
+  The inert `--epoch-drain-secs` option now fails CLI parsing. Public
+  `LocalAnnouncer` and `LocalProviderRouting::announcer()` are removed;
+  deterministic provider lookup remains supported. Generated guests export
+  their capability through `system::serve()` without the empty `serve` argument
+  branch. Documentation now distinguishes the fixed WASI substrate, required
+  Kubo backend, Host-owned epochs, and HTTP Process lifecycle, and preserves
+  live advisory `--ws-url` guidance. The wit-bindgen retirement criteria link
+  to #720; dependency pins and runtime lifecycle behavior are unchanged.
 - Lifecycle tests use explicit service startup and worker shutdown signals.
   Executor assignment tests observe worker identities, duplicate shutdown
   coverage is removed, and session tests omit redundant RPC barriers and

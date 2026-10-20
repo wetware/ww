@@ -4,8 +4,12 @@
 
 Wetware lets you safely run code you didn't write, don't trust, and cannot see: third-party MCP servers, code your LLM produced at runtime, tools other agents handed you across the swarm. It's a decentralized operating system for multi-tool agent swarms.
 
-Cells are WASM processes that run with zero ambient authority. Their only
-access to the world is through explicitly granted, typed Cap'n Proto
+Cells are WASM processes with no ambient node-control authority. They receive
+a fixed WASI substrate: stdio, arguments/environment, clocks, randomness, an
+image-root filesystem, and private writable `/tmp`. Known-CID reads additionally
+depend on the execution context's root or cache wiring. See the
+[WASI host functions](doc/api/wasm-guest.md#wasi-host-functions).
+Node-control operations require explicitly granted, typed Cap'n Proto
 capabilities. Those references can be attenuated to a method allowlist; the
 restriction travels with the reference across local and libp2p RPC boundaries
 and recursively confines capabilities returned through it. Argument- and
@@ -59,7 +63,12 @@ make                              # build everything (host + std + examples)
 ```
 
 Guest builds use the pinned native P3 toolchain. `ww doctor` reports missing
-WASI SDK, `component-ld`, or `wasm-tools` dependencies. Optional: [Kubo](https://docs.ipfs.tech/install/) for IPFS resolution and DHT-based peer discovery.
+WASI SDK, `component-ld`, or `wasm-tools` dependencies. Current `ww run` boot
+requires [Kubo](https://docs.ipfs.tech/install/), including local-image boot with
+embedded PID0. Kubo provides the image/content backend; Composer merges image
+directories in-process, and provider routing uses Wetware's own swarm. Guest
+compilation and pure/unit tests do not require a running Kubo daemon. See
+[deployment startup requirements](doc/deployment.md).
 
 Repository builds use committed Cargo lockfiles. See the
 [lockfile policy and dependency-update workflow](doc/dependencies/lockfiles.md).
@@ -102,8 +111,9 @@ explicitly re-delegates fresh references or respawns the child.
 
 ### Cell modes
 
-WASM processes ("cells") run with zero ambient authority. Async RPC Cells use
-the granted P3 transport. `WW_CELL_MODE` identifies separate application
+WASM processes ("cells") have no ambient node-control authority and receive
+the WASI substrate described above. Async RPC Cells use the granted P3
+transport. `WW_CELL_MODE` identifies separate application
 plumbing:
 
 | Mode | stdio carries | Host wiring |

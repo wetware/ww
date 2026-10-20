@@ -196,7 +196,7 @@ impl RunningNode {
                 .arg(&stem.rpc_url)
                 .arg("--ws-url")
                 .arg(&stem.ws_url)
-                .args(["--confirmation-depth", "0", "--epoch-drain-secs", "0"]);
+                .args(["--confirmation-depth", "0"]);
         }
         if let Some((seq, address)) = options.pid0_result_race {
             command.env("WW_TEST_PID0_RESULT_RACE", format!("{seq}@{address}"));

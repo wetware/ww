@@ -186,10 +186,6 @@ enum Commands {
         #[arg(long, default_value = "6")]
         confirmation_depth: u64,
 
-        /// Deprecated and inert. Epoch authority now changes immediately.
-        #[arg(long, default_value = "1")]
-        epoch_drain_secs: u64,
-
         /// Number of executor worker threads for cell scheduling.
         /// Each worker runs its own single-threaded tokio runtime.
         /// 0 = auto-detect (one per CPU core). NOTE: auto-detect reads the
@@ -747,7 +743,6 @@ impl Commands {
                 rpc_url,
                 ws_url,
                 confirmation_depth,
-                epoch_drain_secs,
                 executor_threads,
                 http_listen,
                 http_dial,
@@ -792,7 +787,6 @@ impl Commands {
                     rpc_url,
                     ws_url,
                     confirmation_depth,
-                    epoch_drain_secs,
                     executor_threads,
                     http_listen,
                     http_dial,
@@ -1088,27 +1082,14 @@ struct {iface_name}Guest;
 
 impl Guest for {iface_name}Guest {{
     async fn run() -> Result<(), ()> {{
-        let result = match std::env::args().nth(1).as_deref() {{
-            Some("serve") => {{
-                log::info!("{name}: serve");
-                system::run(|_membrane: Membrane| async move {{
-                    // TODO: provide on DHT, discover peers, etc.
-
-                    Ok(())
-                }})
-                .await
-            }}
-            _ => {{
-                // Default (no args): export the service capability.
-                let impl_ = {iface_name}Impl;
-                let client: {name}_capnp::{snake_name}::Client = capnp_rpc::new_client(impl_);
-                log::info!("{name}: cell mode");
-                system::serve(client.client, |_membrane: Membrane| async move {{
-                    std::future::pending().await
-                }})
-                .await
-            }}
-        }};
+        // Export the service capability through the guest RPC session.
+        let impl_ = {iface_name}Impl;
+        let client: {name}_capnp::{snake_name}::Client = capnp_rpc::new_client(impl_);
+        log::info!("{name}: cell mode");
+        let result = system::serve(client.client, |_membrane: Membrane| async move {{
+            std::future::pending().await
+        }})
+        .await;
         result.map_err(|error| {{
             log::error!("{name} RPC failed: {{error}}");
         }})
@@ -1346,7 +1327,6 @@ system::export!({iface_name}Guest);
         rpc_url: String,
         ws_url: String,
         confirmation_depth: u64,
-        epoch_drain_secs: u64,
         executor_threads: usize,
         http_listen: Option<String>,
         http_dial: Vec<String>,
@@ -1394,13 +1374,6 @@ system::export!({iface_name}Guest);
             .context("Failed to scan namespace configs")?;
 
         ww::config::init_tracing_to_stderr(false);
-
-        if epoch_drain_secs != 0 {
-            tracing::warn!(
-                epoch_drain_secs,
-                "--epoch-drain-secs is deprecated and has no effect"
-            );
-        }
 
         let ipfs_client = ipfs::HttpClient::new(ipfs_url);
 
@@ -3029,7 +3002,6 @@ mod tests {
             rpc_url: "http://127.0.0.1:8545".to_string(),
             ws_url: "ws://127.0.0.1:8545".to_string(),
             confirmation_depth: 6,
-            epoch_drain_secs: 1,
             executor_threads: 0,
             http_listen: None,
             http_dial: Vec::new(),
@@ -3069,6 +3041,17 @@ mod tests {
     #[test]
     fn run_admin_defaults_to_localhost() {
         assert_eq!(parse_run_admin_addr(&["ww", "run"]), "127.0.0.1:2026");
+    }
+
+    #[test]
+    fn run_rejects_removed_epoch_drain_option() {
+        for value in ["0", "1"] {
+            let error = Cli::try_parse_from(["ww", "run", "--epoch-drain-secs", value])
+                .err()
+                .expect("removed drain option must fail during parsing");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+            assert!(error.to_string().contains("--epoch-drain-secs"));
+        }
     }
 
     #[test]

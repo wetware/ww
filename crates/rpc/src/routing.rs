@@ -33,10 +33,10 @@ fn cid_to_kad_key(cid_text: &str) -> Result<Vec<u8>, capnp::Error> {
     Ok(cid.hash().to_bytes())
 }
 
-/// Deterministic provider table for integration tests and local embedders.
+/// Deterministic provider lookup table for integration tests and local embedders.
 ///
-/// The factory returns distinct Finder and Announcer servers over one table;
-/// it is not itself a broad capability.
+/// Seed entries with [`Self::provide_as`] and expose lookup through [`Self::finder`].
+/// This table does not announce providers to the network.
 #[derive(Clone, Default)]
 pub struct LocalProviderRouting {
     providers: Arc<Mutex<HashMap<String, Vec<PeerInfo>>>>,
@@ -49,12 +49,6 @@ impl LocalProviderRouting {
 
     pub fn finder(&self) -> LocalFinder {
         LocalFinder {
-            providers: Arc::clone(&self.providers),
-        }
-    }
-
-    pub fn announcer(&self) -> LocalAnnouncer {
-        LocalAnnouncer {
             providers: Arc::clone(&self.providers),
         }
     }
@@ -113,32 +107,6 @@ impl routing_capnp::finder::Server for LocalFinder {
             sink.done_request().send().promise.await?;
             Ok(())
         })
-    }
-}
-
-pub struct LocalAnnouncer {
-    providers: Arc<Mutex<HashMap<String, Vec<PeerInfo>>>>,
-}
-
-#[allow(refining_impl_trait)]
-impl routing_capnp::announcer::Server for LocalAnnouncer {
-    fn provide(
-        self: capnp::capability::Rc<Self>,
-        params: routing_capnp::announcer::ProvideParams,
-        _results: routing_capnp::announcer::ProvideResults,
-    ) -> Promise<(), capnp::Error> {
-        let cid = pry!(pry!(params.get()).get_key())
-            .to_string()
-            .unwrap_or_default();
-        let _: Cid = pry!(cid
-            .parse()
-            .map_err(|error| capnp::Error::failed(format!("invalid CID '{cid}': {error}"))));
-        self.providers
-            .lock()
-            .expect("local provider table poisoned")
-            .entry(cid)
-            .or_default();
-        Promise::ok(())
     }
 }
 
@@ -626,9 +594,14 @@ mod tests {
 
         tokio::task::LocalSet::new()
             .run_until(async {
-                let routing = LocalProviderRouting::new();
-                let finder = bootstrap_finder(routing.finder());
-                let announcer = bootstrap_announcer(routing.announcer());
+                let (_epoch_tx, epoch_rx) = watch::channel(epoch(1));
+                let (swarm_tx, mut swarm_rx) = mpsc::channel(4);
+                let guard = EpochGuard {
+                    issued_seq: 1,
+                    receiver: epoch_rx,
+                };
+                let finder = bootstrap_finder(FinderImpl::new(swarm_tx.clone(), guard.clone()));
+                let announcer = bootstrap_announcer(AnnouncerImpl::new(swarm_tx, guard));
 
                 for client in [finder.client, announcer.client] {
                     let request = client
@@ -643,6 +616,7 @@ mod tests {
                     };
                     assert_eq!(error.kind, capnp::ErrorKind::Unimplemented);
                 }
+                assert!(swarm_rx.try_recv().is_err());
             })
             .await;
     }
