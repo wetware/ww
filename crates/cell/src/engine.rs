@@ -589,9 +589,7 @@ mod tests {
         let mut subscription = runtime_engine.subscribe();
         assert_eq!(subscription.current_epoch(), 1);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), subscription.changed())
-                .await
-                .is_err(),
+            futures::poll!(Box::pin(subscription.changed())).is_pending(),
             "a fresh subscription must not observe ticks from before subscription"
         );
 

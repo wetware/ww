@@ -911,7 +911,6 @@ impl Service for CompilationService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     fn test_host() -> Host {
@@ -936,14 +935,14 @@ mod tests {
             .block_on(host.shutdown());
     }
 
-    /// A minimal service that sets a flag and waits for shutdown.
-    struct FlagService {
-        flag: Arc<AtomicBool>,
+    struct StartedService {
+        name: &'static str,
+        started: std::sync::mpsc::Sender<&'static str>,
     }
 
-    impl Service for FlagService {
+    impl Service for StartedService {
         fn run(self, mut shutdown: watch::Receiver<()>) -> Result<()> {
-            self.flag.store(true, Ordering::SeqCst);
+            self.started.send(self.name)?;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -957,32 +956,22 @@ mod tests {
     #[test]
     fn host_spawns_and_shuts_down_services() {
         let mut host = test_host();
-        let flag1 = Arc::new(AtomicBool::new(false));
-        let flag2 = Arc::new(AtomicBool::new(false));
-
-        host.spawn(
-            "svc-1",
-            FlagService {
-                flag: flag1.clone(),
-            },
-        );
-        host.spawn(
-            "svc-2",
-            FlagService {
-                flag: flag2.clone(),
-            },
-        );
-
-        // Give threads a moment to start.
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            flag1.load(Ordering::SeqCst),
-            "service 1 should have started"
-        );
-        assert!(
-            flag2.load(Ordering::SeqCst),
-            "service 2 should have started"
-        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        for name in ["svc-1", "svc-2"] {
+            host.spawn(
+                name,
+                StartedService {
+                    name,
+                    started: started_tx.clone(),
+                },
+            );
+        }
+        let mut started = [
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ];
+        started.sort_unstable();
+        assert_eq!(started, ["svc-1", "svc-2"]);
 
         shutdown_host(host);
     }
@@ -1009,47 +998,64 @@ mod tests {
         assert_eq!(result, 42);
 
         drop(shutdown_tx);
-        // Give workers time to drain.
-        std::thread::sleep(Duration::from_millis(100));
     }
 
-    #[test]
-    fn executor_pool_least_loaded_assignment() {
+    #[tokio::test]
+    async fn executor_pool_least_loaded_assignment() {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let pool = ExecutorPool::new(2, shutdown_rx, test_filesystem_resources());
 
-        // Spawn a long-running cell on one worker.
-        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        let (block_tx, block_rx) = tokio::sync::oneshot::channel::<()>();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let long_cell = SpawnRequest {
             name: "long-cell".into(),
             factory: Box::new(move |_shutdown| {
                 Box::pin(async move {
-                    let _ = tokio::task::spawn_blocking(move || block_rx.recv()).await;
+                    started_tx.send(std::thread::current().id()).unwrap();
+                    let _ = block_rx.await;
                 })
             }),
             result_tx: None,
         };
         assert!(pool.spawn(long_cell).is_ok(), "spawn long_cell failed");
-        std::thread::sleep(Duration::from_millis(50));
+        let busy_worker = tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("long cell must start")
+            .unwrap();
 
-        // Worker 0 has count=1. Next cell should go to worker 1.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let short_cell = SpawnRequest {
-            name: "short-cell".into(),
-            factory: Box::new(move |_shutdown| {
-                Box::pin(async move {
-                    tx.send(()).unwrap();
-                })
-            }),
-            result_tx: None,
-        };
-        assert!(pool.spawn(short_cell).is_ok(), "spawn short_cell failed");
-        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Both calls must avoid the occupied worker. Round-robin alone would
+        // route the second call back to it.
+        for _ in 0..2 {
+            let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let short_cell = SpawnRequest {
+                name: "short-cell".into(),
+                factory: Box::new(move |_shutdown| {
+                    Box::pin(async move {
+                        release_rx.await.unwrap();
+                        worker_tx.send(std::thread::current().id()).unwrap();
+                    })
+                }),
+                result_tx: Some(result_tx),
+            };
+            assert!(pool.spawn(short_cell).is_ok(), "spawn short_cell failed");
+            // spawn increments the count after enqueueing. Hold completion
+            // until that increment has happened.
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), result_rx)
+                    .await
+                    .expect("short cell must finish")
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            assert_ne!(worker_rx.await.unwrap(), busy_worker);
+        }
 
-        // Clean up.
         let _ = block_tx.send(());
         drop(shutdown_tx);
-        std::thread::sleep(Duration::from_millis(100));
     }
 
     #[test]
@@ -1101,14 +1107,15 @@ mod tests {
         shutdown_host(host);
     }
 
-    #[test]
-    fn executor_pool_spawn_after_shutdown() {
+    #[tokio::test]
+    async fn executor_pool_spawn_after_shutdown() {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let pool = ExecutorPool::new(1, shutdown_rx, test_filesystem_resources());
 
-        // Shut down the pool.
         drop(shutdown_tx);
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::timeout(Duration::from_secs(5), pool.senders[0].closed())
+            .await
+            .expect("worker must close admission after shutdown");
 
         // Spawn should fail gracefully.
         let request = SpawnRequest {
@@ -1122,33 +1129,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn round_robin_distributes_across_idle_workers() {
+    #[tokio::test]
+    async fn round_robin_distributes_across_idle_workers() {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let pool = ExecutorPool::new(4, shutdown_rx, test_filesystem_resources());
 
-        // Spawn 4 short cells. With round-robin on idle workers,
-        // they should distribute across all 4 workers (not all to worker 0).
-        let barriers: Vec<_> = (0..4)
-            .map(|i| {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let request = SpawnRequest {
-                    name: format!("rr-cell-{}", i),
-                    factory: Box::new(move |_shutdown| {
-                        Box::pin(async move {
-                            tx.send(()).unwrap();
-                        })
-                    }),
-                    result_tx: None,
-                };
-                assert!(pool.spawn(request).is_ok());
-                rx
-            })
-            .collect();
-
-        // All 4 should complete.
-        for rx in barriers {
-            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut workers = std::collections::HashSet::new();
+        for i in 0..4 {
+            let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let request = SpawnRequest {
+                name: format!("rr-cell-{i}"),
+                factory: Box::new(move |_shutdown| {
+                    Box::pin(async move {
+                        release_rx.await.unwrap();
+                        worker_tx.send(std::thread::current().id()).unwrap();
+                    })
+                }),
+                result_tx: Some(result_tx),
+            };
+            assert!(pool.spawn(request).is_ok());
+            // Hold completion until spawn has incremented the count. The
+            // result then certifies all workers are idle for the next call.
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), result_rx)
+                    .await
+                    .expect("cell must finish")
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            assert!(workers.insert(worker_rx.await.unwrap()));
         }
 
         drop(shutdown_tx);
@@ -1322,29 +1335,6 @@ mod tests {
         assert_eq!(completion.wait().await, Ok(()));
         assert!(!path.exists());
         host.shutdown_services().await;
-    }
-
-    #[test]
-    fn bounded_channel_rejects_after_shutdown() {
-        // After shutdown the worker stops pulling from the channel.
-        // We verify try_send fails on a closed channel, confirming
-        // the bounded mpsc is wired correctly.
-        let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let pool = ExecutorPool::new(1, shutdown_rx, test_filesystem_resources());
-
-        // Shut down workers so the channel closes.
-        drop(shutdown_tx);
-        std::thread::sleep(Duration::from_millis(100));
-
-        let request = SpawnRequest {
-            name: "rejected".into(),
-            factory: Box::new(|_| Box::pin(async {})),
-            result_tx: None,
-        };
-        assert!(
-            pool.spawn(request).is_err(),
-            "spawn should fail on closed bounded channel"
-        );
     }
 
     #[test]

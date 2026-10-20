@@ -36,6 +36,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- Lifecycle tests use explicit service startup and worker shutdown signals.
+  Executor assignment tests observe worker identities, duplicate shutdown
+  coverage is removed, and session tests omit redundant RPC barriers and
+  selector cases. Generated P3 cancellation coverage is unchanged.
 - **Repository Cargo builds consume committed lockfiles.** Host checks, tests,
   Make targets, and native/cross releases now use locked resolution. CI checks
   all tracked lockfile owners before Rust builds, including the fuzz workspace
