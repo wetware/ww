@@ -10,6 +10,29 @@ const MAX_IMPORT_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_IMPORT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 
+/// A bounded HTTP response exceeded its advertised or streamed byte limit.
+///
+/// The status distinguishes successful block bodies from backend error pages.
+/// Callers must not treat an oversized error page as invalid immutable content.
+#[derive(Debug)]
+pub struct KuboResponseLimit {
+    pub operation: String,
+    pub status: reqwest::StatusCode,
+    pub limit: usize,
+}
+
+impl std::fmt::Display for KuboResponseLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} response exceeds {} bytes",
+            self.operation, self.limit
+        )
+    }
+}
+
+impl std::error::Error for KuboResponseLimit {}
+
 impl BootClient {
     /// Read an immutable block under the existing boot retry policy.
     pub async fn block_get(&self, cid: &Cid, max_bytes: usize) -> Result<Vec<u8>> {
@@ -147,7 +170,11 @@ async fn read_response(
         response
             .content_length()
             .is_none_or(|length| length <= limit as u64),
-        "{operation} response exceeds {limit} bytes"
+        KuboResponseLimit {
+            operation: operation.to_owned(),
+            status,
+            limit
+        }
     );
     let mut body = Vec::new();
     while let Some(chunk) = response
@@ -157,7 +184,11 @@ async fn read_response(
     {
         ensure!(
             chunk.len() <= limit.saturating_sub(body.len()),
-            "{operation} response exceeds {limit} bytes"
+            KuboResponseLimit {
+                operation: operation.to_owned(),
+                status,
+                limit
+            }
         );
         body.extend_from_slice(&chunk);
     }

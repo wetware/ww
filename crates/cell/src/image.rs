@@ -17,6 +17,9 @@ use crate::mount::Mount;
 
 mod codec;
 mod composer;
+mod operation;
+
+pub use operation::{CompositionError, FrozenMount, FrozenSource, GuestTarget, SourceKind};
 
 /// Versioned identity profile for structural image composition.
 pub const COMPOSER_PROFILE: &str = composer::PROFILE;
@@ -152,11 +155,44 @@ pub async fn dag_merge_cids(
     client: &ipfs::BootClient,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<Cid> {
-    if cids.is_empty() {
-        bail!("No CIDs to merge");
-    }
     await_or_cancel(cancel, async {
         let composition = composer::compose(client, cids).await?;
+        client
+            .import_composed(&composition.root, &composition.blocks)
+            .await
+            .context("storing and pinning composed root")?;
+        Ok(composition.root)
+    })
+    .await
+}
+
+/// Inspect an immutable source already retained and available to the caller.
+///
+/// Reads standalone raw bytes to verify their CID and cumulative size. Directory
+/// raw-child links retain the existing Composer v1 opaque-size contract. This
+/// value does not acquire a pin; the caller must keep the source retained.
+pub async fn inspect_source(
+    cid: Cid,
+    client: &ipfs::BootClient,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<FrozenSource> {
+    await_or_cancel(cancel, composer::inspect_source(client, cid)).await
+}
+
+/// Apply ordered frozen operations over an optional retained directory root.
+///
+/// Strict ancestors preserve metadata. Exact directory targets merge; other
+/// collisions replace the entry. With no initial root, targeted operations start
+/// from a deterministic empty directory. All input DAGs must remain retained by
+/// the caller. Success requires the existing recursive CAR pin acknowledgement.
+pub async fn compose_mounts(
+    initial_root: Option<Cid>,
+    mounts: &[FrozenMount],
+    client: &ipfs::BootClient,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<Cid> {
+    await_or_cancel(cancel, async {
+        let composition = composer::compose_mounts(client, initial_root, mounts).await?;
         client
             .import_composed(&composition.root, &composition.blocks)
             .await

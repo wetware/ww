@@ -1,7 +1,10 @@
 //! Independent bounded model checks for Composer v1.
 
-use super::{compose_with_limits, BlockSource, Composition, Limits};
+use super::{
+    compose_mounts, compose_with_limits, inspect_source, BlockSource, Composition, Limits,
+};
 use crate::image::codec::{self, Directory, Link, Node};
+use crate::image::{FrozenMount, GuestTarget, SourceKind};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -107,6 +110,72 @@ fn compose_model(layers: &[ModelNode]) -> ModelNode {
     layers[1..].iter().fold(layers[0].clone(), |base, overlay| {
         overlay_model(&base, overlay)
     })
+}
+
+#[derive(Clone, Debug)]
+struct ModelMount {
+    source: ModelNode,
+    target: Vec<String>,
+}
+
+impl ModelMount {
+    fn new(source: ModelNode, target: &str) -> Self {
+        Self {
+            source,
+            target: target
+                .split('/')
+                .skip(1)
+                .filter(|component| !component.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
+    fn target_string(&self) -> String {
+        format!("/{}", self.target.join("/"))
+    }
+}
+
+/// A mutable semantic tree walk, independent of production path editing and
+/// directory encoding. The oracle preserves ancestor metadata by changing only
+/// the selected entry, and uses the existing independent overlay model exactly
+/// at the destination. Errors identify the obstructing strict ancestor.
+fn compose_mount_model(
+    initial: Option<&ModelNode>,
+    mounts: &[ModelMount],
+) -> std::result::Result<ModelNode, (String, String)> {
+    let mut root = initial
+        .cloned()
+        .unwrap_or_else(|| ModelNode::directory(DIRECTORY, []));
+    for mount in mounts {
+        if mount.target.is_empty() {
+            assert!(matches!(mount.source, ModelNode::Directory(_)));
+            root = overlay_model(&root, &mount.source);
+            continue;
+        }
+        let mut parent = &mut root;
+        for (index, name) in mount.target.iter().enumerate() {
+            let ModelNode::Directory(directory) = parent else {
+                return Err((
+                    mount.target_string(),
+                    format!("/{}", mount.target[..index].join("/")),
+                ));
+            };
+            if index + 1 == mount.target.len() {
+                let replacement = directory.entries.get(name).map_or_else(
+                    || mount.source.clone(),
+                    |existing| overlay_model(existing, &mount.source),
+                );
+                directory.entries.insert(name.clone(), replacement);
+                break;
+            }
+            parent = directory
+                .entries
+                .entry(name.clone())
+                .or_insert_with(|| ModelNode::directory(DIRECTORY, []));
+        }
+    }
+    Ok(root)
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -444,6 +513,136 @@ fn generated_layers(case: u64, leaves: &[ModelNode]) -> Vec<ModelNode> {
         .collect()
 }
 
+fn generated_mounts(case: u64, leaves: &[ModelNode]) -> (Option<ModelNode>, Vec<ModelMount>) {
+    let mut rng = Deterministic::new(case);
+    let source = generate_directory(&mut rng, leaves, 0);
+    let later_root = generate_directory(&mut rng, leaves, 0);
+    let file = leaves[rng.index(4)].clone();
+    let obstruction = leaves[[0, 2, 4][(case as usize / 8) % 3]].clone();
+    let head = ModelNode::directory(
+        MODE_0755_MTIME_7_NS_9,
+        [
+            ("keep".into(), leaves[3].clone()),
+            ("blocked".into(), obstruction),
+            (
+                "a".into(),
+                ModelNode::directory(
+                    MODE_0700,
+                    [(
+                        "b".into(),
+                        ModelNode::directory(MTIME_7, [("old".into(), leaves[4].clone())]),
+                    )],
+                ),
+            ),
+        ],
+    );
+    let mount = ModelMount::new;
+    match case % 8 {
+        0 => (
+            None,
+            vec![
+                mount(file.clone(), "/a/b/config"),
+                mount(source, "/a"),
+                mount(later_root, "/"),
+                mount(file.clone(), "/é"),
+                mount(leaves[3].clone(), "/e\u{301}"),
+                mount(file, "/space name/\\literal/x:y/\u{85}"),
+            ],
+        ),
+        1 => (
+            Some(head),
+            vec![
+                mount(file.clone(), "/a/b/config"),
+                // Metadata omission erases b's metadata, preserving / and /a.
+                mount(ModelNode::directory(DIRECTORY, []), "/a/b"),
+                mount(source, "/a/b"),
+                mount(file, "/a/b/config"),
+            ],
+        ),
+        2 => (
+            None,
+            vec![
+                mount(source, "/"),
+                mount(file.clone(), "/slot"),
+                mount(later_root, "/"),
+                mount(file, "/slot"),
+            ],
+        ),
+        3 => (Some(head), vec![mount(file, "/blocked/child")]),
+        4 => (None, vec![mount(file, "/a"), mount(source, "/a/b")]),
+        5 => (
+            Some(head),
+            vec![
+                // Explicit exact-target replacement repairs each obstruction kind.
+                mount(source, "/blocked"),
+                mount(file, "/blocked/child"),
+            ],
+        ),
+        6 => {
+            const TARGETS: &[&str] = &[
+                "/",
+                "/a",
+                "/a/b",
+                "/a/b/c",
+                "/slot",
+                "/slot/a",
+                "/é",
+                "/e\u{301}",
+            ];
+            let mut mounts = Vec::new();
+            for _ in 0..6 {
+                let target = TARGETS[rng.index(TARGETS.len())];
+                let source = if target == "/" || rng.index(2) == 0 {
+                    generate_directory(&mut rng, leaves, 0)
+                } else {
+                    leaves[rng.index(4)].clone()
+                };
+                mounts.push(mount(source, target));
+            }
+            (Some(head), mounts)
+        }
+        7 => (
+            None,
+            vec![
+                mount(file.clone(), "/a/b"),
+                mount(file.clone(), "/a"),
+                mount(source, "/a"),
+                mount(file.clone(), "/a/b"),
+                mount(
+                    ModelNode::directory(
+                        MODE_0700,
+                        [("b".into(), ModelNode::directory(MTIME_7, []))],
+                    ),
+                    "/a",
+                ),
+                mount(file, "/a/b/deep"),
+            ],
+        ),
+        _ => unreachable!(),
+    }
+}
+
+async fn freeze_model_mounts(fixture: &mut Fixture, mounts: &[ModelMount]) -> Vec<FrozenMount> {
+    let mut frozen = Vec::new();
+    for mount in mounts {
+        let encoded = fixture.encode_tree(&mount.source);
+        let source = inspect_source(fixture, encoded.cid).await.unwrap();
+        assert_eq!(source.cid(), encoded.cid);
+        assert_eq!(source.dag_size(), encoded.size);
+        assert_eq!(
+            source.kind(),
+            if matches!(mount.source, ModelNode::Directory(_)) {
+                SourceKind::Directory
+            } else {
+                SourceKind::File
+            }
+        );
+        let target = GuestTarget::new(&mount.target_string()).unwrap();
+        frozen.push(FrozenMount::new(source, target).unwrap());
+    }
+    frozen
+}
+
 fn property_limits() -> Limits {
     Limits {
         max_nodes: 512,
@@ -556,6 +755,104 @@ async fn production_matches_independent_overlay_model_for_64_cases() {
         saw_nested_directory_collision,
         "the deterministic cases must exercise recursive directory merge"
     );
+}
+
+#[tokio::test]
+async fn targeted_production_matches_independent_model_for_192_ordered_cases() {
+    let mut successes = 0;
+    let mut obstructions = 0;
+    for case in 0..192 {
+        let mut fixture = Fixture::default();
+        let leaves = fixture.stable_leaves();
+        let (initial, mounts) = generated_mounts(case, &leaves);
+        let initial_cid = initial.as_ref().map(|tree| fixture.encode_tree(tree).cid);
+        let frozen = freeze_model_mounts(&mut fixture, &mounts).await;
+
+        // Check every prefix so a later replacement cannot hide incorrect
+        // metadata, earlier child loss, or an operation-order mistake.
+        for end in 1..=mounts.len() {
+            let expected = compose_mount_model(initial.as_ref(), &mounts[..end]);
+            let actual = compose_mounts(&fixture, initial_cid, &frozen[..end]).await;
+            match expected {
+                Ok(expected) => {
+                    let actual = actual.unwrap_or_else(|error| {
+                        panic!("case {case}, prefix {end}: unexpected failure: {error:#}")
+                    });
+                    assert_eq!(
+                        fixture.decode_semantic(&actual, actual.root),
+                        expected,
+                        "case {case}, prefix {end}: {mounts:#?}"
+                    );
+                    let repeated = compose_mounts(&fixture, initial_cid, &frozen[..end])
+                        .await
+                        .unwrap();
+                    assert_eq!(actual.root, repeated.root, "case {case}, prefix {end}");
+                    assert_eq!(actual.blocks, repeated.blocks, "case {case}, prefix {end}");
+                    successes += 1;
+                }
+                Err((expected_target, expected_ancestor)) => {
+                    let error = match actual {
+                        Err(error) => error,
+                        Ok(_) => panic!(
+                            "case {case}, prefix {end}: expected obstruction at {expected_ancestor}"
+                        ),
+                    };
+                    match error.downcast_ref::<super::super::CompositionError>() {
+                        Some(super::super::CompositionError::TargetObstruction {
+                            target,
+                            ancestor,
+                        }) => {
+                            assert_eq!(
+                                target.components(),
+                                GuestTarget::new(&expected_target).unwrap().components(),
+                                "case {case}, prefix {end}: obstructed operation"
+                            );
+                            assert_eq!(
+                                ancestor.components(),
+                                GuestTarget::new(&expected_ancestor).unwrap().components(),
+                                "case {case}, prefix {end}: obstructing ancestor"
+                            );
+                        }
+                        other => panic!(
+                            "case {case}, prefix {end}: expected TargetObstruction, got {other:?}: {error:#}"
+                        ),
+                    }
+                    obstructions += 1;
+                }
+            }
+        }
+    }
+    assert!(successes >= 400, "insufficient successful target coverage");
+    assert!(obstructions >= 48, "insufficient obstruction coverage");
+}
+
+#[tokio::test]
+async fn frozen_root_mounts_preserve_adapter_identity_for_64_cases() {
+    for case in 0..64 {
+        let mut fixture = Fixture::default();
+        let leaves = fixture.stable_leaves();
+        let layers = generated_layers(case, &leaves);
+        let roots = layers
+            .iter()
+            .map(|tree| fixture.encode_tree(tree).cid)
+            .collect::<Vec<_>>();
+        let mounts = layers
+            .into_iter()
+            .map(|source| ModelMount::new(source, "/"))
+            .collect::<Vec<_>>();
+        let frozen = freeze_model_mounts(&mut fixture, &mounts).await;
+        let legacy = compose_with_limits(&fixture, &roots, property_limits())
+            .await
+            .unwrap();
+        let targeted = compose_mounts(&fixture, None, &frozen).await.unwrap();
+        let with_head = compose_mounts(&fixture, Some(roots[0]), &frozen[1..])
+            .await
+            .unwrap();
+        assert_eq!(targeted.root, legacy.root, "root adapter case {case}");
+        assert_eq!(targeted.blocks, legacy.blocks, "root adapter case {case}");
+        assert_eq!(with_head.root, legacy.root, "initial head case {case}");
+        assert_eq!(with_head.blocks, legacy.blocks, "initial head case {case}");
+    }
 }
 
 #[tokio::test]

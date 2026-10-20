@@ -805,3 +805,699 @@ async fn same_raw_cid_uses_later_advertised_size() {
     assert_eq!(result.root, overlay.cid);
     assert!(result.blocks.is_empty());
 }
+
+async fn frozen_mount(memory: &Memory, source: &Link, target: &str) -> FrozenMount {
+    FrozenMount::new(
+        inspect_source(memory, source.cid).await.unwrap(),
+        GuestTarget::new(target).unwrap(),
+    )
+    .unwrap()
+}
+
+fn deterministic_error(error: &anyhow::Error) -> &CompositionError {
+    error
+        .downcast_ref::<CompositionError>()
+        .unwrap_or_else(|| panic!("expected typed deterministic error: {error:#}"))
+}
+
+#[test]
+fn guest_targets_validate_lexically_without_normalizing_names() {
+    assert!(GuestTarget::root().components().is_empty());
+    assert_eq!(GuestTarget::new("/").unwrap(), GuestTarget::root());
+    for invalid in [
+        "", "relative", "//", "/a/", "/a//b", "/.", "/..", "/a/./b", "/a/../b",
+    ] {
+        let error = GuestTarget::new(invalid).unwrap_err();
+        assert!(
+            matches!(
+                deterministic_error(&error),
+                CompositionError::InvalidTarget(_)
+            ),
+            "{invalid:?}"
+        );
+    }
+    for byte in (0u8..=31).chain(std::iter::once(127)) {
+        let target = format!("/a{}b", char::from(byte));
+        let error = GuestTarget::new(&target).unwrap_err();
+        assert!(matches!(
+            deterministic_error(&error),
+            CompositionError::InvalidTarget(_)
+        ));
+    }
+    let target = GuestTarget::new("/ a\\b : /é/e\u{301}/\u{85}\u{200d}").unwrap();
+    assert_eq!(
+        target.components(),
+        &[" a\\b : ", "é", "e\u{301}", "\u{85}\u{200d}"]
+    );
+    assert_ne!(
+        GuestTarget::new("/é").unwrap(),
+        GuestTarget::new("/e\u{301}").unwrap()
+    );
+}
+
+#[test]
+fn guest_target_byte_and_depth_limits_are_inclusive() {
+    assert!(GuestTarget::new(&format!("/{}", "x".repeat(4095))).is_ok());
+    assert!(GuestTarget::new(&format!("/{}", "x".repeat(4096))).is_err());
+    assert!(GuestTarget::new(&format!("/{}x", "é".repeat(2047))).is_ok());
+    assert!(GuestTarget::new(&format!("/{}", "é".repeat(2048))).is_err());
+    assert_eq!(
+        GuestTarget::new(&"/x".repeat(MAX_DEPTH))
+            .unwrap()
+            .components()
+            .len(),
+        MAX_DEPTH
+    );
+    assert!(GuestTarget::new(&"/x".repeat(MAX_DEPTH + 1)).is_err());
+}
+
+#[tokio::test]
+async fn standalone_sources_report_verified_dag_sizes_and_exact_target_cids() {
+    let mut memory = Memory::default();
+    let raw = memory.raw_block(b"raw");
+    let legacy = memory.dagpb_raw(b"legacy");
+    let inline = memory.file(b"inline", vec![], &[]);
+    let chunked = memory.file(b"prefix", vec![3, 6], &[raw.clone(), legacy.clone()]);
+    let empty = memory.dir(&[]);
+    let directory = memory.dir(&[("child", inline.clone())]);
+    for (link, kind) in [
+        (raw, SourceKind::File),
+        (legacy, SourceKind::File),
+        (inline, SourceKind::File),
+        (chunked, SourceKind::File),
+        (empty, SourceKind::Directory),
+        (directory, SourceKind::Directory),
+    ] {
+        let frozen = inspect_source(&memory, link.cid).await.unwrap();
+        assert_eq!(frozen.cid(), link.cid);
+        assert_eq!(frozen.kind(), kind);
+        assert_eq!(frozen.dag_size(), link.size);
+        let operation = FrozenMount::new(frozen, GuestTarget::new("/exact").unwrap()).unwrap();
+        let result = compose_mounts(&memory, None, &[operation]).await.unwrap();
+        let root = memory.result_dir(&result, result.root);
+        assert_eq!(root.entries.len(), 1);
+        assert_eq!(root.entries["exact"], link);
+    }
+}
+
+#[tokio::test]
+async fn root_mount_requires_directory_and_empty_operations_require_head() {
+    let mut memory = Memory::default();
+    let file = memory.raw_block(b"file");
+    let source = inspect_source(&memory, file.cid).await.unwrap();
+    let error = FrozenMount::new(source, GuestTarget::root()).unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::InvalidSource(_)
+    ));
+    let error = compose_mounts(&memory, None, &[]).await.unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::EmptyOperations
+    ));
+    let root = memory.dir(&[]);
+    let result = compose_mounts(&memory, Some(root.cid), &[]).await.unwrap();
+    assert_eq!(result.root, root.cid);
+    assert!(result.blocks.is_empty());
+}
+
+#[tokio::test]
+async fn standalone_validation_distinguishes_invalid_content_profile_and_transport() {
+    let mut memory = Memory::default();
+    let raw = memory.raw_block(b"correct");
+    memory.blocks.insert(raw.cid, b"corrupt".to_vec());
+    let error = inspect_source(&memory, raw.cid).await.unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::InvalidDag(_)
+    ));
+    memory.blocks.remove(&raw.cid);
+    let error = inspect_source(&memory, raw.cid).await.unwrap_err();
+    assert!(
+        error.downcast_ref::<CompositionError>().is_none(),
+        "transport failure became deterministic: {error:#}"
+    );
+    let unsupported = Cid::new_v1(0x71, *raw.cid.hash());
+    let error = inspect_source(&memory, unsupported).await.unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::UnsupportedProfile(_)
+    ));
+    let unsupported_hash = Cid::new_v1(
+        0x55,
+        cid::multihash::Multihash::wrap(0, b"identity").unwrap(),
+    );
+    let error = inspect_source(&memory, unsupported_hash).await.unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::UnsupportedProfile(_)
+    ));
+    let bytes = vec![0xff];
+    let malformed = Cid::new_v1(
+        0x70,
+        cid::multihash::Multihash::wrap(0x12, &Sha256::digest(&bytes)).unwrap(),
+    );
+    memory.blocks.insert(malformed, bytes);
+    let error = inspect_source(&memory, malformed).await.unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::InvalidDag(_)
+    ));
+}
+
+#[tokio::test]
+async fn standalone_file_validation_rejects_incorrect_chunk_sizes_and_types() {
+    for bad_blocksize in [0, 2] {
+        let mut memory = Memory::default();
+        let chunk = memory.raw_block(b"x");
+        let file = memory.file(&[], vec![bad_blocksize], &[chunk]);
+        let error = inspect_source(&memory, file.cid).await.unwrap_err();
+        assert!(matches!(
+            deterministic_error(&error),
+            CompositionError::InvalidDag(_)
+        ));
+    }
+    let mut memory = Memory::default();
+    let chunk = memory.raw_block(b"x");
+    let wrong = Link {
+        size: chunk.size + 1,
+        ..chunk
+    };
+    let file = memory.file(&[], vec![1], &[wrong]);
+    let error = inspect_source(&memory, file.cid).await.unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::InvalidDag(_)
+    ));
+    let directory = memory.dir(&[]);
+    let file = memory.file(&[], vec![0], &[directory]);
+    let error = inspect_source(&memory, file.cid).await.unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::InvalidDag(_)
+    ));
+}
+
+#[tokio::test]
+async fn targeted_edit_preserves_every_strict_ancestor_metadata_and_unrelated_link() {
+    const ROOT: &[u8] = &[8, 1, 56, 0xed, 3, 66, 2, 8, 1];
+    const ETC: &[u8] = &[8, 1, 56, 0xc0, 3, 66, 2, 8, 2];
+    const APP: &[u8] = &[8, 1, 56, 0x80, 3, 66, 2, 8, 3];
+    let mut memory = Memory::default();
+    let old = raw(b"old");
+    let app = memory.dir_with_data(&[("config", old.clone()), ("keep", old.clone())], APP);
+    let etc = memory.dir_with_data(&[("app", app), ("keep", old.clone())], ETC);
+    let root = memory.dir_with_data(&[("etc", etc), ("keep", old.clone())], ROOT);
+    let new = memory.raw_block(b"new");
+    let mount = frozen_mount(&memory, &new, "/etc/app/config").await;
+    let result = compose_mounts(&memory, Some(root.cid), &[mount])
+        .await
+        .unwrap();
+    let root = memory.result_dir(&result, result.root);
+    let etc = memory.result_dir(&result, root.entries["etc"].cid);
+    let app = memory.result_dir(&result, etc.entries["app"].cid);
+    for (directory, expected) in [(&root, ROOT), (&etc, ETC), (&app, APP)] {
+        assert_eq!(directory.data.as_ref(), expected);
+        assert_eq!(directory.entries["keep"], old);
+    }
+    assert_eq!(app.entries["config"], new);
+    assert_eq!(result.blocks.len(), 3);
+}
+
+#[tokio::test]
+async fn targeted_directory_metadata_omissions_are_local_to_collision() {
+    const DATA: &[u8] = &[8, 1, 56, 0xed, 3, 66, 2, 8, 7];
+    let mut memory = Memory::default();
+    let child = raw(b"keep");
+    let app = memory.dir_with_data(&[("keep", child.clone())], DATA);
+    let root = memory.dir_with_data(&[("app", app)], DATA);
+    let overlay = memory.dir(&[]);
+    let mount = frozen_mount(&memory, &overlay, "/app").await;
+    let result = compose_mounts(&memory, Some(root.cid), &[mount])
+        .await
+        .unwrap();
+    let root = memory.result_dir(&result, result.root);
+    let app = memory.result_dir(&result, root.entries["app"].cid);
+    assert_eq!(root.data.as_ref(), DATA);
+    assert_eq!(app.data.as_ref(), &[8, 1]);
+    assert_eq!(app.entries["keep"], child);
+}
+
+#[tokio::test]
+async fn target_only_missing_ancestors_are_canonical_empty_metadata() {
+    let mut memory = Memory::default();
+    let file = memory.raw_block(b"config");
+    let mount = frozen_mount(&memory, &file, "/etc/app/config").await;
+    let result = compose_mounts(&memory, None, &[mount]).await.unwrap();
+    let root = memory.result_dir(&result, result.root);
+    let etc = memory.result_dir(&result, root.entries["etc"].cid);
+    let app = memory.result_dir(&result, etc.entries["app"].cid);
+    for directory in [&root, &etc, &app] {
+        assert_eq!(directory.data.as_ref(), &[8, 1]);
+        assert_eq!(directory.entries.len(), 1);
+    }
+    assert_eq!(app.entries["config"], file);
+    assert_eq!(
+        result.blocks.len(),
+        3,
+        "discard unreachable empty seed and intermediate roots"
+    );
+}
+
+#[tokio::test]
+async fn root_and_target_operations_keep_original_interleaving() {
+    let mut memory = Memory::default();
+    let a = memory.raw_block(b"a");
+    let b = memory.raw_block(b"b");
+    let c = memory.raw_block(b"c");
+    let root_a = memory.dir(&[("value", a.clone()), ("keep", a)]);
+    let root_c = memory.dir(&[("value", c.clone())]);
+    let root_a = frozen_mount(&memory, &root_a, "/").await;
+    let target_b = frozen_mount(&memory, &b, "/value").await;
+    let root_c = frozen_mount(&memory, &root_c, "/").await;
+    for (mounts, expected) in [
+        (
+            vec![root_a.clone(), target_b.clone(), root_c.clone()],
+            c.clone(),
+        ),
+        (
+            vec![target_b.clone(), root_c.clone(), target_b.clone()],
+            b.clone(),
+        ),
+        (vec![root_a, root_c, target_b], b),
+    ] {
+        let result = compose_mounts(&memory, None, &mounts).await.unwrap();
+        assert_eq!(
+            memory.result_dir(&result, result.root).entries["value"],
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn exact_targets_replace_files_directories_and_symlinks_without_following() {
+    let mut memory = Memory::default();
+    let file = memory.raw_block(b"new");
+    let old = memory.raw_block(b"old");
+    let directory = memory.dir(&[("child", old.clone())]);
+    let symlink = memory.unixfs_node(4, b"/elsewhere", None, vec![], &[]);
+    let error = inspect_source(&memory, symlink.cid).await.unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::InvalidSource(_)
+    ));
+    for (base, replacement) in [
+        (old.clone(), file.clone()),
+        (directory.clone(), file.clone()),
+        (symlink.clone(), file),
+        (old, directory.clone()),
+        (symlink, directory),
+    ] {
+        let root = memory.dir(&[("exact", base)]);
+        let mount = frozen_mount(&memory, &replacement, "/exact").await;
+        let result = compose_mounts(&memory, Some(root.cid), &[mount])
+            .await
+            .unwrap();
+        assert_eq!(
+            memory.result_dir(&result, result.root).entries["exact"],
+            replacement
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_ancestor_obstruction_is_typed_and_can_be_explicitly_replaced() {
+    let mut memory = Memory::default();
+    let file = memory.raw_block(b"file");
+    let symlink = memory.unixfs_node(4, b"/other", None, vec![], &[]);
+    let directory = memory.dir(&[]);
+    let child_mount = frozen_mount(&memory, &file, "/a/b").await;
+    let replace = frozen_mount(&memory, &directory, "/a").await;
+    for obstruction in [file.clone(), symlink] {
+        let root = memory.dir(&[("a", obstruction)]);
+        let error = compose_mounts(&memory, Some(root.cid), std::slice::from_ref(&child_mount))
+            .await
+            .unwrap_err();
+        match deterministic_error(&error) {
+            CompositionError::TargetObstruction { target, ancestor } => {
+                assert_eq!(target, &GuestTarget::new("/a/b").unwrap());
+                assert_eq!(ancestor, &GuestTarget::new("/a").unwrap());
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let result = compose_mounts(
+            &memory,
+            Some(root.cid),
+            &[replace.clone(), child_mount.clone()],
+        )
+        .await
+        .unwrap();
+        let root = memory.result_dir(&result, result.root);
+        assert_eq!(
+            memory.result_dir(&result, root.entries["a"].cid).entries["b"],
+            file
+        );
+    }
+}
+
+#[tokio::test]
+async fn parent_child_order_merges_directories_and_later_files_remove_subtrees() {
+    let mut memory = Memory::default();
+    let file = memory.raw_block(b"child");
+    let other = memory.raw_block(b"other");
+    let directory = memory.dir(&[("other", other.clone())]);
+    let child = frozen_mount(&memory, &file, "/a/b").await;
+    let parent = frozen_mount(&memory, &directory, "/a").await;
+    for mounts in [
+        vec![child.clone(), parent.clone()],
+        vec![parent, child.clone()],
+    ] {
+        let result = compose_mounts(&memory, None, &mounts).await.unwrap();
+        let root = memory.result_dir(&result, result.root);
+        let a = memory.result_dir(&result, root.entries["a"].cid);
+        assert_eq!(a.entries["b"], file);
+        assert_eq!(a.entries["other"], other);
+    }
+    let parent_file = frozen_mount(&memory, &other, "/a").await;
+    let result = compose_mounts(&memory, None, &[child.clone(), parent_file.clone()])
+        .await
+        .unwrap();
+    assert_eq!(memory.result_dir(&result, result.root).entries["a"], other);
+    assert_eq!(
+        result.blocks.len(),
+        1,
+        "removed child subtree is unreachable"
+    );
+    let error = compose_mounts(&memory, None, &[parent_file, child])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::TargetObstruction { .. }
+    ));
+}
+
+#[tokio::test]
+async fn targeted_directory_identity_prefers_full_base_cid_and_root_seed_is_unchanged() {
+    let mut memory = Memory::default();
+    let overlay = memory.dir(&[("child", raw(b"same"))]);
+    let v0 = Cid::new_v0(*overlay.cid.hash()).unwrap();
+    memory
+        .blocks
+        .insert(v0, memory.blocks[&overlay.cid].clone());
+    let base = Link {
+        cid: v0,
+        size: overlay.size,
+    };
+    let root = memory.dir(&[("a", base.clone())]);
+    let mount = frozen_mount(&memory, &overlay, "/a").await;
+    let result = compose_mounts(&memory, Some(root.cid), &[mount])
+        .await
+        .unwrap();
+    assert_eq!(result.root, root.cid);
+    assert!(result.blocks.is_empty());
+    let mount = frozen_mount(&memory, &base, "/").await;
+    let result = compose_mounts(&memory, None, &[mount]).await.unwrap();
+    assert_eq!(result.root, v0);
+    assert!(result.blocks.is_empty());
+}
+
+#[tokio::test]
+async fn targeted_source_height_includes_file_chunks_even_after_cached_shallow_placement() {
+    let mut memory = Memory::default();
+    let mut file = memory.raw_block(b"x");
+    for _ in 0..MAX_DEPTH - 1 {
+        file = memory.file(&[], vec![1], &[file]);
+    }
+    let shallow = frozen_mount(&memory, &file, "/a").await;
+    compose_mounts(&memory, None, std::slice::from_ref(&shallow))
+        .await
+        .unwrap();
+    let deep = frozen_mount(&memory, &file, "/a/b").await;
+    let error = compose_mounts(&memory, None, &[shallow, deep])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::ResourceLimit(_)
+    ));
+}
+
+#[tokio::test]
+async fn target_operation_limit_counts_authoritative_head_but_not_empty_seed() {
+    let mut memory = Memory::default();
+    let file = memory.raw_block(b"x");
+    let mount = frozen_mount(&memory, &file, "/a").await;
+    let root = memory.dir(&[]);
+    compose_mounts(&memory, None, &vec![mount.clone(); MAX_LAYERS])
+        .await
+        .unwrap();
+    compose_mounts(
+        &memory,
+        Some(root.cid),
+        &vec![mount.clone(); MAX_LAYERS - 1],
+    )
+    .await
+    .unwrap();
+    for head in [None, Some(root.cid)] {
+        let count = MAX_LAYERS + usize::from(head.is_none());
+        let error = compose_mounts(&memory, head, &vec![mount.clone(); count])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            deterministic_error(&error),
+            CompositionError::ResourceLimit(_)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn targeted_composition_charges_reads_nodes_generated_bytes_and_work() {
+    let mut memory = Memory::default();
+    let file = memory.raw_block(b"payload");
+    let root = memory.dir(&[]);
+    let mounts = [frozen_mount(&memory, &file, "/a").await];
+    let expected = compose_mounts(&memory, Some(root.cid), &mounts)
+        .await
+        .unwrap();
+    let input_bytes = memory.blocks[&root.cid].len() + memory.blocks[&file.cid].len();
+    let generated_bytes = expected.blocks.iter().map(|(_, bytes)| bytes.len()).sum();
+    for bounds in [
+        limits(3, usize::MAX, usize::MAX, usize::MAX),
+        limits(usize::MAX, input_bytes, usize::MAX, usize::MAX),
+        limits(usize::MAX, usize::MAX, generated_bytes, usize::MAX),
+        // One target-path visit and one final-root entry visit.
+        limits(usize::MAX, usize::MAX, usize::MAX, 2),
+    ] {
+        let result = compose_mounts_with_limits(&memory, Some(root.cid), &mounts, bounds)
+            .await
+            .unwrap();
+        assert_eq!(result.root, expected.root);
+    }
+    for bounds in [
+        limits(2, usize::MAX, usize::MAX, usize::MAX),
+        limits(usize::MAX, input_bytes - 1, usize::MAX, usize::MAX),
+        limits(usize::MAX, usize::MAX, generated_bytes - 1, usize::MAX),
+        limits(usize::MAX, usize::MAX, usize::MAX, 1),
+    ] {
+        let error = compose_mounts_with_limits(&memory, Some(root.cid), &mounts, bounds)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            deterministic_error(&error),
+            CompositionError::ResourceLimit(_)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn composition_revalidates_sources_even_when_later_operations_overwrite_them() {
+    let mut memory = Memory::default();
+    let bad = memory.raw_block(b"captured");
+    let good = memory.raw_block(b"replacement");
+    let mounts = [
+        frozen_mount(&memory, &bad, "/a").await,
+        frozen_mount(&memory, &good, "/a").await,
+    ];
+    memory.blocks.insert(bad.cid, b"corrupt".to_vec());
+    let error = compose_mounts(&memory, None, &mounts).await.unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::InvalidDag(_)
+    ));
+}
+
+#[tokio::test]
+async fn targeted_directory_reuses_alternate_encoding_and_leaf_replacement_uses_later_cid() {
+    let mut memory = Memory::default();
+    let overlay = memory.dir(&[("child", raw(b"same"))]);
+    let links_first = &memory.blocks[&overlay.cid];
+    assert!(links_first.ends_with(&[10, 2, 8, 1]));
+    let mut data_first = vec![10, 2, 8, 1];
+    data_first.extend_from_slice(&links_first[..links_first.len() - 4]);
+    let alternate = Cid::new_v1(
+        0x70,
+        cid::multihash::Multihash::wrap(0x12, &Sha256::digest(&data_first)).unwrap(),
+    );
+    memory.blocks.insert(alternate, data_first);
+    let base = Link {
+        cid: alternate,
+        size: overlay.size,
+    };
+    let root = memory.dir(&[("a", base)]);
+    let mount = frozen_mount(&memory, &overlay, "/a").await;
+    let result = compose_mounts(&memory, Some(root.cid), &[mount])
+        .await
+        .unwrap();
+    assert_eq!(result.root, root.cid);
+    assert!(result.blocks.is_empty());
+
+    let file = memory.file(b"same", vec![], &[]);
+    let v0 = Cid::new_v0(*file.cid.hash()).unwrap();
+    memory.blocks.insert(v0, memory.blocks[&file.cid].clone());
+    let root = memory.dir(&[(
+        "a",
+        Link {
+            cid: v0,
+            size: file.size,
+        },
+    )]);
+    let mount = frozen_mount(&memory, &file, "/a").await;
+    let result = compose_mounts(&memory, Some(root.cid), &[mount])
+        .await
+        .unwrap();
+    assert_eq!(memory.result_dir(&result, result.root).entries["a"], file);
+}
+
+#[tokio::test]
+async fn frozen_directory_preserves_opaque_raw_link_size_without_fetching_payload() {
+    let mut memory = Memory::default();
+    let raw = Link {
+        size: 1234,
+        ..raw(b"not stored")
+    };
+    let directory = memory.dir(&[("raw", raw.clone())]);
+    let source = inspect_source(&memory, directory.cid).await.unwrap();
+    assert_eq!(source.dag_size(), directory.size);
+    let mount = FrozenMount::new(source, GuestTarget::new("/a").unwrap()).unwrap();
+    let result = compose_mounts(&memory, None, &[mount]).await.unwrap();
+    let root = memory.result_dir(&result, result.root);
+    assert_eq!(root.entries["a"], directory);
+    assert!(!memory.reads.lock().unwrap().contains(&raw.cid));
+}
+
+#[tokio::test]
+async fn standalone_raw_obeys_block_size_limit() {
+    let mut memory = Memory::default();
+    let accepted = memory.raw_block(&vec![0; codec::MAX_BLOCK_BYTES]);
+    assert_eq!(
+        inspect_source(&memory, accepted.cid)
+            .await
+            .unwrap()
+            .dag_size(),
+        codec::MAX_BLOCK_BYTES as u64
+    );
+    let oversized = memory.raw_block(&vec![0; codec::MAX_BLOCK_BYTES + 1]);
+    let error = inspect_source(&memory, oversized.cid).await.unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::ResourceLimit(_)
+    ));
+}
+
+#[tokio::test]
+async fn targeted_composition_and_standalone_inspection_are_cancellable_during_reads() {
+    struct Pending(Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+    #[async_trait]
+    impl BlockSource for Pending {
+        async fn get(&self, _: &Cid) -> Result<Vec<u8>> {
+            self.0.lock().unwrap().take().unwrap().send(()).unwrap();
+            std::future::pending().await
+        }
+    }
+    let mut memory = Memory::default();
+    let file = memory.raw_block(b"payload");
+    let mounts = [frozen_mount(&memory, &file, "/a").await];
+    for inspecting in [true, false] {
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let source = Pending(Mutex::new(Some(started_tx)));
+        let work = async {
+            if inspecting {
+                inspect_source(&source, file.cid).await.map(|_| ())
+            } else {
+                compose_mounts(&source, None, &mounts).await.map(|_| ())
+            }
+        };
+        let pending = super::super::await_or_cancel(&mut cancel_rx, work);
+        tokio::pin!(pending);
+        tokio::select! {
+            _ = &mut pending => panic!("block read must remain pending"),
+            started = started_rx => started.unwrap(),
+        }
+        cancel_tx.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn standalone_raw_is_verified_even_when_already_cached_as_directory_child() {
+    let mut memory = Memory::default();
+    let raw = memory.raw_block(b"payload");
+    let root = memory.dir(&[(
+        "opaque",
+        Link {
+            size: 999,
+            ..raw.clone()
+        },
+    )]);
+    let mount = frozen_mount(&memory, &raw, "/verified").await;
+    let result = compose_mounts(&memory, Some(root.cid), std::slice::from_ref(&mount))
+        .await
+        .unwrap();
+    let directory = memory.result_dir(&result, result.root);
+    assert_eq!(directory.entries["opaque"].size, 999);
+    assert_eq!(directory.entries["verified"], raw);
+    memory.blocks.insert(raw.cid, b"corrupt".to_vec());
+    let error = compose_mounts(&memory, Some(root.cid), std::slice::from_ref(&mount))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::InvalidDag(_)
+    ));
+    memory.blocks.remove(&raw.cid);
+    let error = compose_mounts(&memory, Some(root.cid), &[mount])
+        .await
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<CompositionError>().is_none(),
+        "missing source block must retain its transport classification: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn root_adapter_rejects_raw_files_without_fetching_their_payload() {
+    let memory = Memory::default();
+    let file = raw(b"not available locally");
+    for error in [
+        compose(&memory, &[file.cid]).await.unwrap_err(),
+        compose_mounts(&memory, Some(file.cid), &[])
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                error.downcast_ref::<CompositionError>(),
+                Some(CompositionError::InvalidSource(_))
+            ),
+            "{error:#}"
+        );
+    }
+    assert!(memory.reads.lock().unwrap().is_empty());
+}
