@@ -43,7 +43,7 @@ pub(super) trait BlockSource: Sync {
         let bytes = self.get(cid).await?;
         ensure!(
             bytes.len() <= limit,
-            "capture block read allowance exceeded"
+            CompositionError::ResourceLimit("capture block read allowance exceeded")
         );
         Ok(bytes)
     }
@@ -174,6 +174,7 @@ pub(super) async fn inspect_path(
     inspector.bounded_source_reads = true;
     let result = async {
         let mut selected = root;
+        let mut selected_size = None;
         for (depth, component) in components.iter().enumerate() {
             inspector.charge_work(1)?;
             let node = inspector.load(selected, depth).await?;
@@ -183,13 +184,22 @@ pub(super) async fn inspect_path(
                 ))
                 .into());
             };
-            selected = directory
-                .entries
-                .get(component)
-                .with_context(|| format!("immutable source has no entry {component:?}"))?
-                .cid;
+            let link = directory.entries.get(component).ok_or_else(|| {
+                CompositionError::MissingPath(format!(
+                    "immutable source has no entry {component:?}"
+                ))
+            })?;
+            selected = link.cid;
+            selected_size = Some(link.size);
         }
-        inspector.inspect(selected, components.len(), false).await
+        let inspected = inspector.inspect(selected, components.len(), false).await?;
+        // Ordinary directory raw links stay opaque during whole-DAG inspection.
+        // Selecting that raw file measures its bytes and validates its own link.
+        ensure!(
+            selected_size.is_none_or(|size| size == inspected.dag_size()),
+            CompositionError::InvalidDag(format!("incorrect Tsize for {selected}"))
+        );
+        Ok(inspected)
     }
     .await;
     budget.nodes += inspector.nodes.len();
@@ -563,7 +573,7 @@ impl<S: BlockSource> Composer<'_, S> {
             let bytes = self.source.get_capture(cid, allowance).await?;
             ensure!(
                 bytes.len() <= allowance,
-                "capture block exceeds reserved allowance"
+                CompositionError::ResourceLimit("capture block exceeds reserved allowance")
             );
             self.read_bytes -= allowance;
             bytes

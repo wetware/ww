@@ -13,6 +13,7 @@ use cid::Cid;
 pub enum CompositionError {
     InvalidTarget(String),
     InvalidSource(String),
+    MissingPath(String),
     UnsupportedProfile(String),
     InvalidDag(String),
     ResourceLimit(&'static str),
@@ -28,6 +29,7 @@ impl fmt::Display for CompositionError {
         match self {
             Self::InvalidTarget(message)
             | Self::InvalidSource(message)
+            | Self::MissingPath(message)
             | Self::UnsupportedProfile(message)
             | Self::InvalidDag(message) => f.write_str(message),
             Self::ResourceLimit(message) => f.write_str(message),

@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -16,6 +16,11 @@ use crate::cell::loaders::{HostPathLoader, IpfsLoader};
 use crate::cell::{Builder, Loader, Program};
 use crate::host::SwarmCommand;
 use crate::services::CompileRequest;
+
+mod compilation;
+pub use compilation::Compilation;
+mod preparation;
+pub use preparation::PreparedKernel;
 
 /// Source selected for the pid0 component.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,7 +100,7 @@ impl Artifact {
     }
 }
 
-/// Late-bound identity published by the admin plane after source resolution.
+/// Content identity computed during preparation, before a generation runs.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct Identity {
     pub cid: String,
@@ -105,18 +110,36 @@ pub struct Identity {
     pub size: usize,
 }
 
-/// Shared identity state keeps `/version` available before Kubo and pid0.
+/// Identity of a running generation, distinct from its readiness state.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct RunningIdentity {
+    #[serde(flatten)]
+    pub content: Identity,
+    pub epoch_seq: u64,
+    pub effective_root: Cid,
+}
+
+#[derive(Debug)]
+struct PublishedIdentity {
+    identity: RunningIdentity,
+    owner: Arc<()>,
+}
+
+/// Shared identity state keeps `/version` available before Kubo and PID0.
+/// Reads hide any snapshot that no longer matches the authoritative epoch.
 #[derive(Clone, Debug)]
 pub struct IdentityState {
     requested_source: String,
-    resolved: Arc<OnceLock<Identity>>,
+    epoch_rx: watch::Receiver<authority::Epoch>,
+    current: Arc<Mutex<Option<PublishedIdentity>>>,
 }
 
 impl IdentityState {
-    pub fn pending(source: &Source) -> Self {
+    pub fn pending(source: &Source, epoch_rx: watch::Receiver<authority::Epoch>) -> Self {
         Self {
             requested_source: source.record().to_string(),
-            resolved: Arc::new(OnceLock::new()),
+            epoch_rx,
+            current: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -124,14 +147,88 @@ impl IdentityState {
         format!("<pending: {}>", self.requested_source)
     }
 
-    pub fn get(&self) -> Option<&Identity> {
-        self.resolved.get()
+    pub fn get(&self) -> Option<RunningIdentity> {
+        // Keep the epoch read fence until the coherent identity is copied.
+        let epoch = self.epoch_rx.borrow();
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        current.as_ref().and_then(|published| {
+            let identity = &published.identity;
+            (epoch.seq == identity.epoch_seq && epoch.root == Some(identity.effective_root))
+                .then(|| identity.clone())
+        })
     }
 
-    pub fn publish(&self, identity: Identity) -> Result<()> {
-        self.resolved
-            .set(identity)
-            .map_err(|_| anyhow::anyhow!("kernel runtime identity was already published"))
+    /// Confirm the epoch/root approved by Deployment's source admission.
+    /// A later revocation can race admitted execution; epoch-bound authority
+    /// still rejects that execution's capabilities and readiness commit.
+    fn publish(
+        &self,
+        content: Identity,
+        issued_seq: u64,
+        effective_root: Cid,
+        terminate_rx: &watch::Receiver<()>,
+    ) -> Option<IdentityGuard> {
+        let epoch = self.epoch_rx.borrow();
+        if epoch.seq != issued_seq
+            || epoch.root != Some(effective_root)
+            || terminate_rx.has_changed().unwrap_or(true)
+        {
+            return None;
+        }
+        let owner = Arc::new(());
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *current = Some(PublishedIdentity {
+            identity: RunningIdentity {
+                content,
+                epoch_seq: issued_seq,
+                effective_root,
+            },
+            owner: Arc::clone(&owner),
+        });
+        Some(IdentityGuard {
+            current: Arc::clone(&self.current),
+            owner,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(
+        &self,
+        content: Identity,
+        issued_seq: u64,
+        effective_root: Cid,
+    ) -> impl Drop {
+        let (_terminate_tx, terminate_rx) = watch::channel(());
+        self.publish(content, issued_seq, effective_root, &terminate_rx)
+            .expect("test identity must match its authoritative epoch")
+    }
+}
+
+/// The generation owns this guard from admission through exit or cancellation.
+/// Pointer identity also distinguishes two generations with identical content.
+struct IdentityGuard {
+    current: Arc<Mutex<Option<PublishedIdentity>>>,
+    owner: Arc<()>,
+}
+
+impl Drop for IdentityGuard {
+    fn drop(&mut self) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|published| Arc::ptr_eq(&published.owner, &self.owner))
+        {
+            *current = None;
+        }
     }
 }
 
@@ -288,13 +385,18 @@ pub fn runtime_cid(bytes: &[u8]) -> Cid {
 /// Prepared filesystem root for one kernel generation.
 #[derive(Clone)]
 pub struct Root {
+    cid: Cid,
     path: String,
     tree: Arc<cell::vfs::CidTree>,
 }
 
 impl Root {
-    pub fn new(path: String, tree: Arc<cell::vfs::CidTree>) -> Self {
-        Self { path, tree }
+    pub fn new(cid: Cid, tree: Arc<cell::vfs::CidTree>) -> Self {
+        Self {
+            cid,
+            path: format!("/ipfs/{cid}"),
+            tree,
+        }
     }
 }
 
@@ -400,27 +502,39 @@ pub enum Outcome {
     Terminated,
 }
 
+/// Construction-to-launch handshake with the deployment's source observer.
+/// Deployment drains authoritative updates before acknowledging admission.
+pub struct LaunchAdmission {
+    pub constructed: tokio::sync::oneshot::Sender<()>,
+    pub admitted: tokio::sync::oneshot::Receiver<()>,
+}
+
 /// Host-owned lifecycle of one kernel Cell within one deployment epoch.
 pub struct Generation {
     artifact: Artifact,
     root: Root,
     guard: EpochGuard,
+    identity_state: IdentityState,
     readiness_gate: Arc<authority::KernelReadyGate>,
     bootstrap: Bootstrap,
     runtime_inputs: RuntimeInputs,
     stdio: Stdio,
     terminate_rx: watch::Receiver<()>,
     filesystem_ownership: cell::FilesystemOwnership,
+    compilation: Compilation,
+    admission: LaunchAdmission,
 }
 
 struct GenerationCleanup {
     proc_abort: tokio::task::AbortHandle,
     rpc: rpc::managed_rpc::ManagedRpc,
     readiness_gate: Arc<authority::KernelReadyGate>,
+    identity: Option<IdentityGuard>,
 }
 
 impl Drop for GenerationCleanup {
     fn drop(&mut self) {
+        self.identity.take();
         self.readiness_gate.clear();
         self.proc_abort.abort();
         self.rpc.shutdown();
@@ -433,11 +547,14 @@ impl Generation {
         artifact: Artifact,
         root: Root,
         guard: EpochGuard,
+        identity_state: IdentityState,
         readiness_gate: Arc<authority::KernelReadyGate>,
         bootstrap: Bootstrap,
         runtime_inputs: RuntimeInputs,
         stdio: Stdio,
         terminate_rx: watch::Receiver<()>,
+        compilation: Compilation,
+        admission: LaunchAdmission,
     ) -> Result<Self, cache::AdmissionError> {
         let filesystem_resources = cache::CellResources::new(
             Arc::clone(&runtime_inputs.filesystem_resources),
@@ -448,12 +565,15 @@ impl Generation {
             artifact,
             root,
             guard,
+            identity_state,
             readiness_gate,
             bootstrap,
             runtime_inputs,
             stdio,
             terminate_rx,
             filesystem_ownership,
+            compilation,
+            admission,
         })
     }
 
@@ -470,17 +590,24 @@ impl Generation {
             artifact,
             root,
             guard,
+            identity_state,
             readiness_gate,
             bootstrap,
             runtime_inputs,
             stdio,
             mut terminate_rx,
             filesystem_ownership,
+            compilation,
+            admission,
         } = self;
 
-        guard
-            .check()
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            identity_state.epoch_rx.same_channel(&guard.receiver),
+            "kernel identity and generation must share the authoritative epoch channel"
+        );
+        if !generation_is_current(&guard, root.cid, &terminate_rx) {
+            return Ok(Outcome::Terminated);
+        }
         crate::config::init_tracing();
 
         tracing::info!(
@@ -493,10 +620,20 @@ impl Generation {
             "Loaded selected kernel artifact"
         );
 
-        let stdin = kernel_stdin(stdio);
+        let identity = artifact.identity();
         let guest_env = prepare_guest_env(&root.path, &artifact.cid);
+        let prepared = tokio::select! {
+            biased;
+            _ = terminate_rx.changed() => return Ok(Outcome::Terminated),
+            _ = generation_revoked(&guard, root.cid) => return Ok(Outcome::Terminated),
+            prepared = compilation.prepare(runtime_inputs.runtime_engine.clone(), artifact.bytes) => prepared?,
+        };
+        if prepared.runtime_cid() != artifact.cid {
+            bail!("prepared kernel content identity differs from the selected artifact");
+        }
+        let stdin = kernel_stdin(stdio);
         let (mut builder, mut handles) = Builder::kernel(
-            Program::Bytes(artifact.bytes),
+            Program::ValidatedKernel(prepared),
             stdin,
             stdout(),
             stderr(),
@@ -519,7 +656,13 @@ impl Generation {
         tokio::task::spawn_local(rpc::local_tasks::track(async move {
             let _ = filesystem_finalizer.run().await;
         }));
-        let proc = match builder.build().await {
+        let construction = tokio::select! {
+            biased;
+            _ = terminate_rx.changed() => return Ok(Outcome::Terminated),
+            _ = generation_revoked(&guard, root.cid) => return Ok(Outcome::Terminated),
+            constructed = builder.build() => constructed,
+        };
+        let proc = match construction {
             Ok(proc) => proc,
             Err(error) => {
                 filesystem_completion.wait().await.map_err(|cleanup_error| {
@@ -533,6 +676,37 @@ impl Generation {
         let (reader, writer) = handles
             .take_host_split()
             .ok_or_else(|| anyhow::anyhow!("host stream was already consumed"))?;
+
+        // The executor cannot observe Deployment's queued source messages.
+        // Ask the authoritative owner to drain those messages after async
+        // construction, then recheck the published epoch before launch.
+        if admission.constructed.send(()).is_err() {
+            return Ok(Outcome::Terminated);
+        }
+        tokio::select! {
+            biased;
+            _ = terminate_rx.changed() => return Ok(Outcome::Terminated),
+            _ = generation_revoked(&guard, root.cid) => return Ok(Outcome::Terminated),
+            admitted = admission.admitted => {
+                if admitted.is_err() {
+                    return Ok(Outcome::Terminated);
+                }
+            }
+        }
+
+        // Construction can await filesystem work. Recheck epoch, root, and
+        // termination after it completes and before executable guest work or
+        // a privileged Membrane is admitted. No await separates publication
+        // from spawning the admitted process.
+        let Some(identity_guard) =
+            identity_state.publish(identity, guard.issued_seq, root.cid, &terminate_rx)
+        else {
+            drop(proc);
+            filesystem_completion.wait().await.map_err(|error| {
+                anyhow::anyhow!("canceled kernel construction filesystem cleanup failed: {error}")
+            })?;
+            return Ok(Outcome::Terminated);
+        };
 
         let runtime_client = crate::launcher::create_runtime_client_with_pinset(
             runtime_inputs.wasm_debug,
@@ -566,6 +740,7 @@ impl Generation {
             proc_abort: proc_task.abort_handle(),
             rpc: rpc_system,
             readiness_gate: readiness_gate.clone(),
+            identity: Some(identity_guard),
         };
         let outcome = tokio::select! {
             joined = &mut proc_task => map_join_outcome(joined),
@@ -580,6 +755,7 @@ impl Generation {
             }
         };
 
+        cleanup.identity.take();
         readiness_gate.clear();
         drop(registration_scope);
         let (filesystem_result, _rpc_result) = tokio::join!(
@@ -591,6 +767,34 @@ impl Generation {
         })?;
         tracing::debug!(?outcome, "Kernel generation exited");
         Ok(outcome)
+    }
+}
+
+fn generation_is_current(
+    guard: &EpochGuard,
+    root: Cid,
+    terminate_rx: &watch::Receiver<()>,
+) -> bool {
+    let epoch = guard.receiver.borrow();
+    epoch.seq == guard.issued_seq
+        && epoch.root == Some(root)
+        && !terminate_rx.has_changed().unwrap_or(true)
+}
+
+async fn generation_revoked(guard: &EpochGuard, root: Cid) {
+    let mut receiver = guard.receiver.clone();
+    loop {
+        {
+            let epoch = receiver.borrow_and_update();
+            if epoch.seq != guard.issued_seq || epoch.root != Some(root) {
+                return;
+            }
+        }
+        if receiver.changed().await.is_err() {
+            // A fixed guard has no sender. Closing a watch channel alone does
+            // not change its last authoritative epoch; termination is separate.
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -678,11 +882,18 @@ mod tests {
         use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
         tokio::task::LocalSet::new()
             .run_until(async {
+                let root = runtime_cid(b"root");
                 let (_epoch_tx, epoch_rx) = watch::channel(authority::Epoch {
                     seq: 1,
                     head: vec![],
-                    root: None,
+                    root: Some(root),
                 });
+                let identity_state =
+                    IdentityState::pending(&Source::Embedded("main"), epoch_rx.clone());
+                let (_terminate_tx, terminate_rx) = watch::channel(());
+                let identity = identity_state
+                    .publish(test_identity(), 1, root, &terminate_rx)
+                    .unwrap();
                 let ready = Arc::new(authority::KernelReadyGate::new(epoch_rx));
                 ready.bind_generation(1);
                 ready.kernel_ready().unwrap();
@@ -709,8 +920,10 @@ mod tests {
                     proc_abort: proc.abort_handle(),
                     rpc: ManagedRpc::spawn(rpc),
                     readiness_gate: ready.clone(),
+                    identity: Some(identity),
                 };
                 drop(owner);
+                assert!(identity_state.get().is_none());
                 assert!(!ready.is_ready());
                 assert!(proc.await.unwrap_err().is_cancelled());
                 assert!(
@@ -885,25 +1098,492 @@ mod tests {
         assert!(format!("{error:#}").contains("missing or empty"));
     }
 
-    #[test]
-    fn identity_is_late_bound_once() {
+    fn test_identity() -> Identity {
         let source = Source::Embedded("main");
-        let state = IdentityState::pending(&source);
-        assert_eq!(state.pending_source(), "<pending: embedded:main>");
-        assert!(state.get().is_none());
-
-        let resolved = Artifact {
+        Artifact {
             bytes: b"kernel".to_vec(),
             cid: runtime_cid(b"kernel"),
             source: source.record(),
             metadata: Metadata {
                 size: 6,
+                source_cid: Some(TEST_CID.parse().unwrap()),
+                load_duration: Duration::ZERO,
+            },
+        }
+        .identity()
+    }
+
+    fn test_epoch(seq: u64, root: Option<Cid>) -> authority::Epoch {
+        authority::Epoch {
+            seq,
+            root,
+            head: Vec::new(),
+        }
+    }
+
+    struct TestGeneration {
+        generation: Generation,
+        identity: IdentityState,
+        epoch_tx: watch::Sender<authority::Epoch>,
+        terminate_tx: watch::Sender<()>,
+        constructed_rx: tokio::sync::oneshot::Receiver<()>,
+        admit_tx: tokio::sync::oneshot::Sender<()>,
+    }
+
+    async fn test_generation(bytes: Vec<u8>, staging_dir: PathBuf) -> TestGeneration {
+        let root_cid = runtime_cid(b"generation root");
+        let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root_cid)));
+        let source = Source::Embedded("main");
+        let identity_state = IdentityState::pending(&source, epoch_rx.clone());
+        let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
+        let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".into());
+        let resources = crate::services::test_filesystem_resources();
+        let tree = Arc::new(cell::vfs::CidTree::new(
+            root_cid,
+            client.clone(),
+            staging_dir,
+            resources.clone(),
+            crate::services::test_filesystem_scope(),
+        ));
+        let pinset_cache = Arc::new(
+            cache::PinsetCache::new(
+                Arc::new(crate::deployment::RetainedPinner::new(client)),
+                1024,
+                resources.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (runtime_engine, _publisher) = cell::engine::runtime_engine().unwrap();
+        let (compile_tx, _compile_rx) = mpsc::channel(1);
+        let (swarm_cmd_tx, _swarm_cmd_rx) = mpsc::channel(1);
+        let (terminate_tx, terminate_rx) = watch::channel(());
+        let (constructed_tx, constructed_rx) = tokio::sync::oneshot::channel();
+        let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
+        let artifact = Artifact {
+            cid: runtime_cid(&bytes),
+            metadata: Metadata {
+                size: bytes.len(),
                 source_cid: None,
                 load_duration: Duration::ZERO,
             },
+            bytes,
+            source: source.record(),
         };
-        state.publish(resolved.identity()).unwrap();
-        assert_eq!(state.get().unwrap().cid, runtime_cid(b"kernel").to_string());
-        assert!(state.publish(resolved.identity()).is_err());
+        let generation = Generation::new(
+            artifact,
+            Root::new(root_cid, tree),
+            EpochGuard {
+                issued_seq: 1,
+                receiver: epoch_rx,
+            },
+            identity_state.clone(),
+            readiness_gate,
+            Bootstrap::new(
+                rpc::NetworkState::new(),
+                swarm_cmd_tx,
+                Arc::new(SigningKey::from_bytes(&[7; 32])),
+                libp2p_stream::Behaviour::new().new_control(),
+                Vec::new(),
+            ),
+            RuntimeInputs::new(
+                false,
+                runtime_engine,
+                compile_tx,
+                rpc::CachePolicy::Shared,
+                pinset_cache,
+                resources,
+            ),
+            Stdio::Closed,
+            terminate_rx,
+            Compilation::default(),
+            LaunchAdmission {
+                constructed: constructed_tx,
+                admitted: admit_rx,
+            },
+        )
+        .unwrap();
+        TestGeneration {
+            generation,
+            identity: identity_state,
+            epoch_tx,
+            terminate_tx,
+            constructed_rx,
+            admit_tx,
+        }
+    }
+
+    fn valid_kernel_bytes() -> Vec<u8> {
+        wat::parse_str(include_str!(
+            "../crates/cell/tests/fixtures/kernel-command.wat"
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn invalid_kernel_generation_never_publishes_identity() {
+        let staging = tempfile::tempdir().unwrap();
+        let TestGeneration {
+            generation,
+            identity,
+            epoch_tx: _epoch_tx,
+            terminate_tx: _terminate_tx,
+            ..
+        } = test_generation(b"invalid component".to_vec(), staging.path().to_owned()).await;
+        let completion = generation.filesystem_completion();
+        assert!(generation.run().await.is_err());
+        completion.wait().await.unwrap();
+        assert!(identity.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn generation_rejects_identity_from_an_unrelated_epoch_channel() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let staging = tempfile::tempdir().unwrap();
+                let TestGeneration {
+                    mut generation,
+                    identity,
+                    epoch_tx: _epoch_tx,
+                    terminate_tx: _terminate_tx,
+                    constructed_rx: _constructed_rx,
+                    admit_tx,
+                } = test_generation(valid_kernel_bytes(), staging.path().to_owned()).await;
+                let (_unrelated_tx, unrelated_rx) =
+                    watch::channel(generation.guard.receiver.borrow().clone());
+                let unrelated_identity =
+                    IdentityState::pending(&Source::Embedded("main"), unrelated_rx);
+                generation.identity_state = unrelated_identity.clone();
+                let completion = generation.filesystem_completion();
+                admit_tx.send(()).unwrap();
+
+                let error = generation.run().await.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("share the authoritative epoch channel"),
+                    "{error:#}"
+                );
+                completion.wait().await.unwrap();
+                assert!(identity.get().is_none());
+                assert!(unrelated_identity.get().is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn failed_async_generation_construction_never_publishes_identity() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let staging_file = tempfile::NamedTempFile::new().unwrap();
+                let TestGeneration {
+                    generation,
+                    identity,
+                    epoch_tx: _epoch_tx,
+                    terminate_tx: _terminate_tx,
+                    ..
+                } = test_generation(valid_kernel_bytes(), staging_file.path().to_owned()).await;
+                let completion = generation.filesystem_completion();
+                let error = generation.run().await.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("failed to preopen CidTree staging dir"),
+                    "{error:#}"
+                );
+                completion.wait().await.unwrap();
+                assert!(identity.get().is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn immediate_generation_exit_clears_identity_after_enqueue() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let staging = tempfile::tempdir().unwrap();
+                let TestGeneration {
+                    generation,
+                    identity,
+                    epoch_tx: _epoch_tx,
+                    terminate_tx: _terminate_tx,
+                    constructed_rx,
+                    admit_tx,
+                } = test_generation(valid_kernel_bytes(), staging.path().to_owned()).await;
+                let completion = generation.filesystem_completion();
+                let worker = tokio::task::spawn_local(generation.run());
+                constructed_rx.await.unwrap();
+                assert!(identity.get().is_none());
+                admit_tx.send(()).unwrap();
+                assert_eq!(worker.await.unwrap().unwrap(), Outcome::Exited(0));
+                completion.wait().await.unwrap();
+                assert!(identity.get().is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn generation_supersession_during_compile_admission_does_not_wait_for_native_worker() {
+        let staging = tempfile::tempdir().unwrap();
+        let TestGeneration {
+            generation,
+            identity,
+            epoch_tx,
+            terminate_tx: _terminate_tx,
+            ..
+        } = test_generation(valid_kernel_bytes(), staging.path().to_owned()).await;
+        let compiler = generation.compilation.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let native_worker = tokio::spawn(async move {
+            compiler
+                .run(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await
+                .unwrap();
+        });
+        entered_rx.await.unwrap();
+        let completion = generation.filesystem_completion();
+        let mut run = Box::pin(generation.run());
+        assert!(futures::poll!(run.as_mut()).is_pending());
+        epoch_tx.send_replace(test_epoch(2, None));
+        assert_eq!(run.await.unwrap(), Outcome::Terminated);
+        completion.wait().await.unwrap();
+        assert!(identity.get().is_none());
+        assert!(!native_worker.is_finished());
+        release_tx.send(()).unwrap();
+        native_worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generation_rechecks_epoch_and_root_after_async_construction() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for replacement in [
+                    test_epoch(2, None),
+                    test_epoch(1, Some(runtime_cid(b"different root"))),
+                ] {
+                    let staging = tempfile::tempdir().unwrap();
+                    let TestGeneration {
+                        generation,
+                        identity,
+                        epoch_tx,
+                        terminate_tx: _terminate_tx,
+                        constructed_rx,
+                        admit_tx,
+                    } = test_generation(valid_kernel_bytes(), staging.path().to_owned()).await;
+                    let completion = generation.filesystem_completion();
+                    let ready = generation.readiness_gate.clone();
+                    let worker = tokio::task::spawn_local(generation.run());
+                    constructed_rx.await.unwrap();
+                    assert!(identity.get().is_none());
+                    epoch_tx.send_replace(replacement);
+                    // Approval and revocation are both ready. Revocation must win.
+                    admit_tx.send(()).unwrap();
+                    assert_eq!(worker.await.unwrap().unwrap(), Outcome::Terminated);
+                    completion.wait().await.unwrap();
+                    assert!(identity.get().is_none());
+                    assert!(!ready.is_ready());
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn generation_abort_while_waiting_for_admission_never_publishes_identity() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let staging = tempfile::tempdir().unwrap();
+                let TestGeneration {
+                    generation,
+                    identity,
+                    epoch_tx: _epoch_tx,
+                    terminate_tx: _terminate_tx,
+                    constructed_rx,
+                    admit_tx: _admit_tx,
+                } = test_generation(valid_kernel_bytes(), staging.path().to_owned()).await;
+                let completion = generation.filesystem_completion();
+                let worker = tokio::task::spawn_local(generation.run());
+                constructed_rx.await.unwrap();
+                assert!(identity.get().is_none());
+                worker.abort();
+                assert!(worker.await.unwrap_err().is_cancelled());
+                completion.wait().await.unwrap();
+                assert!(identity.get().is_none());
+            })
+            .await;
+    }
+
+    #[test]
+    fn identity_admission_checks_epoch_root_and_termination() {
+        let root = runtime_cid(b"root");
+        let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1, None));
+        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let (terminate_tx, terminate_rx) = watch::channel(());
+        assert_eq!(state.pending_source(), "<pending: embedded:main>");
+        assert!(state.get().is_none());
+        assert!(state
+            .publish(test_identity(), 1, root, &terminate_rx)
+            .is_none());
+        epoch_tx.send_replace(test_epoch(1, Some(root)));
+        assert!(state
+            .publish(test_identity(), 0, root, &terminate_rx)
+            .is_none());
+        assert!(state
+            .publish(
+                test_identity(),
+                1,
+                runtime_cid(b"wrong root"),
+                &terminate_rx
+            )
+            .is_none());
+        terminate_tx.send_replace(());
+        assert!(state
+            .publish(test_identity(), 1, root, &terminate_rx)
+            .is_none());
+        drop(terminate_tx);
+        assert!(state
+            .publish(test_identity(), 1, root, &terminate_rx)
+            .is_none());
+        assert!(state.get().is_none());
+    }
+
+    #[test]
+    fn identity_hides_unrooted_and_mismatched_epochs_before_cleanup() {
+        let root = runtime_cid(b"root");
+        let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
+        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let (_terminate_tx, terminate_rx) = watch::channel(());
+        let _identity = state
+            .publish(test_identity(), 1, root, &terminate_rx)
+            .unwrap();
+        let running = state.get().unwrap();
+        assert_eq!(running.content.cid, runtime_cid(b"kernel").to_string());
+        assert_eq!(running.content.source_cid.as_deref(), Some(TEST_CID));
+        assert_ne!(
+            running.content.source_cid.as_deref(),
+            Some(running.content.cid.as_str())
+        );
+        assert_eq!(running.epoch_seq, 1);
+        assert_eq!(running.effective_root, root);
+
+        epoch_tx.send_replace(test_epoch(1, Some(runtime_cid(b"different root"))));
+        assert!(state.get().is_none());
+        epoch_tx.send_replace(test_epoch(2, None));
+        assert!(state.get().is_none());
+        epoch_tx.send_replace(test_epoch(2, Some(root)));
+        assert!(state.get().is_none());
+        assert!(state
+            .publish(test_identity(), 1, root, &terminate_rx)
+            .is_none());
+    }
+
+    #[test]
+    fn same_kernel_bytes_receive_new_epoch_and_old_cleanup_cannot_clear_them() {
+        let root = runtime_cid(b"root");
+        let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
+        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let (_terminate_tx, terminate_rx) = watch::channel(());
+        let old = state
+            .publish(test_identity(), 1, root, &terminate_rx)
+            .unwrap();
+        epoch_tx.send_replace(test_epoch(2, Some(root)));
+        assert!(state.get().is_none());
+        let current = state
+            .publish(test_identity(), 2, root, &terminate_rx)
+            .unwrap();
+        drop(old);
+        let running = state.get().unwrap();
+        assert_eq!(running.epoch_seq, 2);
+        assert_eq!(running.content, test_identity());
+        drop(current);
+        assert!(state.get().is_none());
+    }
+
+    #[test]
+    fn identity_cleanup_uses_generation_owner_even_when_epoch_and_bytes_match() {
+        let root = runtime_cid(b"root");
+        let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
+        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let (_terminate_tx, terminate_rx) = watch::channel(());
+        let old = state
+            .publish(test_identity(), 1, root, &terminate_rx)
+            .unwrap();
+        let current = state
+            .publish(test_identity(), 1, root, &terminate_rx)
+            .unwrap();
+        drop(old);
+        assert!(state.get().is_some());
+        drop(current);
+        assert!(state.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_clears_when_enqueued_execution_exits_immediately() {
+        let root = runtime_cid(b"root");
+        let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
+        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let (_terminate_tx, terminate_rx) = watch::channel(());
+        let worker_state = state.clone();
+        tokio::spawn(async move {
+            let _identity = worker_state
+                .publish(test_identity(), 1, root, &terminate_rx)
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        // The launcher has no publication to perform after the worker exits.
+        assert!(state.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_clears_after_panic_and_abort() {
+        let root = runtime_cid(b"root");
+        let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
+        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let (_terminate_tx, terminate_rx) = watch::channel(());
+        let worker_state = state.clone();
+        let worker_terminate_rx = terminate_rx.clone();
+        let panicked = tokio::spawn(async move {
+            let _identity = worker_state
+                .publish(test_identity(), 1, root, &worker_terminate_rx)
+                .unwrap();
+            panic!("injected generation panic");
+        })
+        .await
+        .unwrap_err();
+        assert!(panicked.is_panic());
+        assert!(state.get().is_none());
+
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let worker_state = state.clone();
+        let worker = tokio::spawn(async move {
+            let _identity = worker_state
+                .publish(test_identity(), 1, root, &terminate_rx)
+                .unwrap();
+            published_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        published_rx.await.unwrap();
+        assert!(state.get().is_some());
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(state.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn generation_revocation_observes_updates_that_precede_its_first_poll() {
+        let root = runtime_cid(b"root");
+        let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
+        let guard = EpochGuard {
+            issued_seq: 1,
+            receiver: epoch_rx,
+        };
+        let (_terminate_tx, terminate_rx) = watch::channel(());
+        assert!(generation_is_current(&guard, root, &terminate_rx));
+        let revoked = generation_revoked(&guard, root);
+        epoch_tx.send_replace(test_epoch(2, None));
+        revoked.await;
+        assert!(!generation_is_current(&guard, root, &terminate_rx));
     }
 }

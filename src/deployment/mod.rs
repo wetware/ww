@@ -75,6 +75,24 @@ impl std::fmt::Display for PermanentPreparationError {
 impl std::error::Error for PermanentPreparationError {}
 
 fn classify_failure(error: &anyhow::Error) -> FailureClass {
+    if let Some(selection) = error.downcast_ref::<cell::image::KernelFileError>() {
+        return match selection.kind() {
+            cell::image::KernelFileFailure::MissingPath
+            | cell::image::KernelFileFailure::InvalidSource => FailureClass::Permanent,
+            cell::image::KernelFileFailure::Unavailable => FailureClass::Transient,
+            cell::image::KernelFileFailure::Cancelled | cell::image::KernelFileFailure::Unknown => {
+                FailureClass::Unknown
+            }
+        };
+    }
+    if let Some(validation) = error.downcast_ref::<cell::proc::KernelValidationError>() {
+        return match validation.kind() {
+            cell::proc::KernelValidationFailure::SizeLimit
+            | cell::proc::KernelValidationFailure::InvalidComponent
+            | cell::proc::KernelValidationFailure::Compatibility => FailureClass::Permanent,
+            cell::proc::KernelValidationFailure::Compilation => FailureClass::Unknown,
+        };
+    }
     if let Some(admission) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<cache::AdmissionError>())
@@ -384,6 +402,7 @@ pub struct Config {
 pub struct KernelLauncher<'a> {
     executor_pool: &'a ExecutorPool,
     artifact: kernel::Artifact,
+    identity_state: kernel::IdentityState,
     readiness_gate: Arc<authority::KernelReadyGate>,
     bootstrap: kernel::Bootstrap,
     runtime_inputs: kernel::RuntimeInputs,
@@ -394,6 +413,7 @@ impl<'a> KernelLauncher<'a> {
     pub fn new(
         executor_pool: &'a ExecutorPool,
         artifact: kernel::Artifact,
+        identity_state: kernel::IdentityState,
         readiness_gate: Arc<authority::KernelReadyGate>,
         bootstrap: kernel::Bootstrap,
         runtime_inputs: kernel::RuntimeInputs,
@@ -402,6 +422,7 @@ impl<'a> KernelLauncher<'a> {
         Self {
             executor_pool,
             artifact,
+            identity_state,
             readiness_gate,
             bootstrap,
             runtime_inputs,
@@ -414,25 +435,34 @@ impl<'a> KernelLauncher<'a> {
         epoch: Epoch,
         epoch_rx: watch::Receiver<Epoch>,
         cid_tree: Arc<CidTree>,
+        compilation: kernel::Compilation,
     ) -> Result<RunningGeneration> {
         let root = epoch
             .root
             .as_ref()
             .context("cannot launch a kernel for an unrooted deployment epoch")?;
         let (terminate_tx, terminate_rx) = watch::channel(());
+        let (constructed_tx, constructed_rx) = oneshot::channel();
+        let (admitted_tx, admitted_rx) = oneshot::channel();
         let result_epoch_rx = epoch_rx.clone();
         let generation = kernel::Generation::new(
             self.artifact.clone(),
-            kernel::Root::new(format!("/ipfs/{root}"), cid_tree),
+            kernel::Root::new(*root, cid_tree),
             EpochGuard {
                 issued_seq: epoch.seq,
                 receiver: epoch_rx,
             },
+            self.identity_state.clone(),
             self.readiness_gate.clone(),
             self.bootstrap.clone(),
             self.runtime_inputs.clone(),
             self.stdio,
             terminate_rx,
+            compilation,
+            kernel::LaunchAdmission {
+                constructed: constructed_tx,
+                admitted: admitted_rx,
+            },
         )?;
         let filesystem_completion = generation.filesystem_completion();
         let intended_seq = epoch.seq;
@@ -453,6 +483,7 @@ impl<'a> KernelLauncher<'a> {
             })
             .map_err(|_| anyhow::anyhow!("executor pool rejected kernel spawn"))?;
         Ok(RunningGeneration {
+            admission: Some((constructed_rx, admitted_tx)),
             intended_seq,
             terminate_tx,
             result_rx,
@@ -462,6 +493,7 @@ impl<'a> KernelLauncher<'a> {
 }
 
 struct RunningGeneration {
+    admission: Option<(oneshot::Receiver<()>, oneshot::Sender<()>)>,
     intended_seq: u64,
     terminate_tx: watch::Sender<()>,
     result_rx: oneshot::Receiver<Result<kernel::Outcome>>,
@@ -535,6 +567,7 @@ impl Target {
 
 /// The single owner of deployment transitions for one host process.
 pub struct Deployment {
+    compilation: kernel::Compilation,
     epoch_tx: watch::Sender<Epoch>,
     epoch_rx: watch::Receiver<Epoch>,
     epoch_seq: u64,
@@ -790,8 +823,19 @@ impl Deployment {
 
     /// Launch and supervise the current rooted deployment generation.
     pub async fn run_generation(&mut self, launcher: &KernelLauncher<'_>) -> Result<Outcome> {
+        if let Some(outcome) = self.replace_queued_before_launch().await? {
+            return Ok(outcome);
+        }
+        // The final empty queue observation and enqueue have no intervening
+        // await. Generation checks the accepted epoch/root again after async
+        // construction before publishing identity or executing guest code.
         let epoch = self.current_epoch();
-        let running = match launcher.launch(epoch, self.epoch_rx.clone(), self.cid_tree.clone()) {
+        let running = match launcher.launch(
+            epoch,
+            self.epoch_rx.clone(),
+            self.cid_tree.clone(),
+            self.compilation.clone(),
+        ) {
             Ok(running) => running,
             Err(error) => {
                 self.shutdown_speculation().await;
@@ -803,6 +847,14 @@ impl Deployment {
             self.shutdown_speculation().await;
         }
         outcome
+    }
+
+    async fn replace_queued_before_launch(&mut self) -> Result<Option<Outcome>> {
+        let updates = self.drain_source_updates()?;
+        if updates.is_empty() {
+            return Ok(None);
+        }
+        self.replace_generation(None, updates, None).await.map(Some)
     }
 
     /// Stop advisory work and release every speculative pin before host shutdown.
@@ -863,6 +915,7 @@ impl Deployment {
             }
 
             enum LiveEvent {
+                Constructed,
                 Source(Option<SourceMessage>),
                 Kernel(Result<Result<kernel::Outcome>, oneshot::error::RecvError>),
                 Candidate(Result<(), watch::error::RecvError>),
@@ -872,6 +925,7 @@ impl Deployment {
             }
 
             let source_rx = self.source_rx.as_mut();
+            let admission_rx = running.admission.as_mut().map(|(rx, _)| rx);
             let candidate_rx = self.candidate_rx.as_mut();
             let (preparation_task, release_task, expires_at) = match self.speculation.as_mut() {
                 Some(Speculation::InFlight(task)) => {
@@ -886,6 +940,7 @@ impl Deployment {
                 biased;
                 message = async { source_rx.expect("source receiver is present").recv().await }, if source_rx.is_some() => LiveEvent::Source(message),
                 result = &mut running.result_rx => LiveEvent::Kernel(result),
+                _ = async { admission_rx.expect("admission receiver is present").await }, if admission_rx.is_some() => LiveEvent::Constructed,
                 result = async { preparation_task.expect("preparation task is present").await }, if preparation_task.is_some() => LiveEvent::Prepared(result),
                 result = async { release_task.expect("release task is present").await }, if release_task.is_some() => LiveEvent::Released(result),
                 changed = async { candidate_rx.expect("candidate receiver is present").changed().await }, if candidate_rx.is_some() => LiveEvent::Candidate(changed),
@@ -893,6 +948,17 @@ impl Deployment {
             };
 
             match event {
+                LiveEvent::Constructed => {
+                    let (_, admitted) = running.admission.take().expect("admission is present");
+                    // This is launch admission's linearization point: consume
+                    // every queued authoritative update before approving guest
+                    // execution. No await separates the drain from approval.
+                    let updates = self.drain_source_updates()?;
+                    if !updates.is_empty() {
+                        return self.replace(running, updates, None).await;
+                    }
+                    let _ = admitted.send(());
+                }
                 LiveEvent::Source(Some(SourceMessage::Update(update))) => {
                     return self.replace(running, vec![update], None).await;
                 }
@@ -1023,11 +1089,23 @@ impl Deployment {
 
     async fn replace(
         &mut self,
-        mut running: RunningGeneration,
+        running: RunningGeneration,
         updates: Vec<Update>,
         completed_result: Option<Result<Result<kernel::Outcome>, oneshot::error::RecvError>>,
     ) -> Result<Outcome> {
-        let old_epoch = running.intended_seq;
+        self.replace_generation(Some(running), updates, completed_result)
+            .await
+    }
+
+    async fn replace_generation(
+        &mut self,
+        mut running: Option<RunningGeneration>,
+        updates: Vec<Update>,
+        completed_result: Option<Result<Result<kernel::Outcome>, oneshot::error::RecvError>>,
+    ) -> Result<Outcome> {
+        let old_epoch = running
+            .as_ref()
+            .map_or(self.epoch_seq, |running| running.intended_seq);
         let started = Instant::now();
         let mut updates = updates.into_iter();
         let mut target = self.accept_update(
@@ -1039,10 +1117,19 @@ impl Deployment {
             target = self.accept_update(update)?;
         }
         wait_at_pid0_epoch_race_barrier(self.epoch_seq).await;
-        let _ = running.terminate_tx.send(());
+        if let Some(running) = &running {
+            let _ = running.terminate_tx.send(());
+        }
         let teardown_timer = tokio::time::sleep(KERNEL_TEARDOWN_TIMEOUT);
         tokio::pin!(teardown_timer);
-        let stopping = running.stopped(completed_result);
+        let stopping = async {
+            match running.as_mut() {
+                Some(running) => running.stopped(completed_result).await,
+                // Admission has not enqueued a generation. The preceding
+                // replacement already established its teardown barrier.
+                None => Ok(GenerationStopped(())),
+            }
+        };
         tokio::pin!(stopping);
         let mut stopped = None;
         let mut attempt = PinSet::default();
@@ -1682,6 +1769,7 @@ impl BootstrapState {
                         source_task: self.source_task,
                         candidate_rx: self.candidate_rx,
                         candidate_initialized: false,
+                        compilation: kernel::Compilation::default(),
                         speculation: None,
                     });
                 }
@@ -1934,6 +2022,22 @@ mod tests {
             })),
             FailureClass::Transient
         );
+    }
+
+    #[test]
+    fn deterministic_kernel_validation_errors_preserve_later_head_recovery() {
+        let (runtime, _clock) = cell::engine::runtime_engine().unwrap();
+        for bytes in [
+            b"invalid wasm".to_vec(),
+            wat::parse_str("(component)").unwrap(),
+            vec![0; cell::sched::MAX_COMPONENT_BYTES + 1],
+        ] {
+            let error = match cell::proc::ValidatedKernel::compile(&runtime, &bytes) {
+                Ok(_) => panic!("invalid kernel accepted"),
+                Err(error) => anyhow::Error::new(error).context("preparing selected kernel"),
+            };
+            assert_eq!(classify_failure(&error), FailureClass::Permanent);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2604,6 +2708,7 @@ mod tests {
             source_task: None,
             candidate_rx: Some(candidate_rx),
             candidate_initialized: false,
+            compilation: kernel::Compilation::default(),
             speculation: None,
         };
         (deployment, tree, epoch_rx)
@@ -2618,6 +2723,7 @@ mod tests {
         let (result_tx, result_rx) = oneshot::channel();
         (
             RunningGeneration {
+                admission: None,
                 intended_seq: 0,
                 terminate_tx,
                 result_rx,
@@ -2626,6 +2732,92 @@ mod tests {
             result_tx,
             terminate_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn queued_source_update_wins_over_completed_construction_admission() {
+        let (client, _calls, _requests, shutdown, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let (source_tx, source_rx) = mpsc::channel(2);
+        let (_candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, _tree, epoch_rx) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        let (mut running, result_tx, mut terminate_rx) = test_running_generation();
+        let (constructed_tx, constructed_rx) = oneshot::channel();
+        let (admitted_tx, admitted_rx) = oneshot::channel();
+        running.admission = Some((constructed_rx, admitted_tx));
+        constructed_tx.send(()).unwrap();
+        source_tx
+            .send(SourceMessage::Update(Update::Head(Head {
+                cid: ROOT.parse().unwrap(),
+            })))
+            .await
+            .unwrap();
+        let worker = tokio::spawn(async move {
+            terminate_rx.changed().await.unwrap();
+            result_tx.send(Ok(kernel::Outcome::Terminated)).unwrap();
+        });
+        let outcome = deployment.await_generation(running).await.unwrap();
+        worker.await.unwrap();
+        assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
+        assert!(
+            admitted_rx.await.is_err(),
+            "obsolete construction must not receive approval"
+        );
+        assert_eq!(epoch_rx.borrow().seq, 1);
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_updates_supersede_an_activated_root_before_launch() {
+        let (client, calls, _requests, shutdown, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let (source_tx, source_rx) = mpsc::channel(2);
+        let (_candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, tree, epoch_rx) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        let head = Head {
+            cid: ROOT.parse().unwrap(),
+        };
+        // Model updates queued while cleanup follows activation. No generation
+        // has been enqueued; the stale activated root must not reach launch.
+        source_tx
+            .send(SourceMessage::Update(Update::InvalidHead(InvalidHead {
+                selected: vec![1],
+                reason: "superseded invalid head".into(),
+            })))
+            .await
+            .unwrap();
+        source_tx
+            .send(SourceMessage::Update(Update::Head(head.clone())))
+            .await
+            .unwrap();
+        let outcome = deployment
+            .replace_queued_before_launch()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            Outcome::Replaced {
+                old_epoch: 0,
+                new_epoch: 2,
+                ..
+            }
+        ));
+        assert_eq!(epoch_rx.borrow().seq, 2);
+        assert_eq!(epoch_rx.borrow().head, head.bytes());
+        assert_eq!(epoch_rx.borrow().root, Some(head.cid));
+        assert_eq!(*tree.root_cid(), head.cid);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(deployment
+            .replace_queued_before_launch()
+            .await
+            .unwrap()
+            .is_none());
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
     }
 
     fn completed_filesystem_scope() -> cache::FsCompletion {
@@ -2819,6 +3011,7 @@ mod tests {
             source_task: None,
             candidate_rx: None,
             candidate_initialized: false,
+            compilation: kernel::Compilation::default(),
             speculation: None,
         };
 
@@ -2866,6 +3059,7 @@ mod tests {
             source_task: None,
             candidate_rx: None,
             candidate_initialized: false,
+            compilation: kernel::Compilation::default(),
             speculation: None,
         };
         let prepared = PreparedRoot {
@@ -3532,11 +3726,13 @@ mod tests {
             source_task: None,
             candidate_rx: None,
             candidate_initialized: false,
+            compilation: kernel::Compilation::default(),
             speculation: None,
         };
         let (terminate_tx, terminate_rx) = watch::channel(());
         let (result_tx, result_rx) = oneshot::channel();
         let running = RunningGeneration {
+            admission: None,
             intended_seq: 0,
             terminate_tx,
             result_rx,
@@ -3620,6 +3816,7 @@ mod tests {
             source_task: None,
             candidate_rx: None,
             candidate_initialized: false,
+            compilation: kernel::Compilation::default(),
             speculation: Some(Speculation::Ready {
                 prepared: PreparedRoot {
                     head: Some(head.clone()),
@@ -3649,6 +3846,7 @@ mod tests {
         let (terminate_tx, terminate_rx) = watch::channel(());
         let (result_tx, result_rx) = oneshot::channel();
         let mut running = RunningGeneration {
+            admission: None,
             intended_seq: 0,
             terminate_tx,
             result_rx,
@@ -3733,6 +3931,7 @@ mod tests {
         let (terminate_tx, _terminate_rx) = watch::channel(());
         let (result_tx, result_rx) = oneshot::channel();
         let mut running = RunningGeneration {
+            admission: None,
             intended_seq: 0,
             terminate_tx,
             result_rx,
@@ -3793,11 +3992,13 @@ mod tests {
             source_task: None,
             candidate_rx: None,
             candidate_initialized: false,
+            compilation: kernel::Compilation::default(),
             speculation: None,
         };
         let (terminate_tx, terminate_rx) = watch::channel(());
         let (result_tx, result_rx) = oneshot::channel();
         let running = RunningGeneration {
+            admission: None,
             intended_seq: 0,
             terminate_tx,
             result_rx,
@@ -3999,11 +4200,13 @@ mod tests {
             source_task: None,
             candidate_rx: None,
             candidate_initialized: false,
+            compilation: kernel::Compilation::default(),
             speculation: None,
         };
         let (terminate_tx, _terminate_rx) = watch::channel(());
         let (result_tx, result_rx) = oneshot::channel();
         let running = RunningGeneration {
+            admission: None,
             intended_seq: 0,
             terminate_tx,
             result_rx,
@@ -4109,6 +4312,7 @@ mod tests {
             source_task: None,
             candidate_rx: None,
             candidate_initialized: false,
+            compilation: kernel::Compilation::default(),
             speculation: Some(Speculation::Ready {
                 prepared: PreparedRoot {
                     head: Some(Head {
@@ -4159,6 +4363,7 @@ mod tests {
             source_task: None,
             candidate_rx: None,
             candidate_initialized: false,
+            compilation: kernel::Compilation::default(),
             speculation: None,
         };
         let mut attempt = PinSet {

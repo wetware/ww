@@ -1435,7 +1435,7 @@ system::export!({iface_name}Guest);
             oci_image_id: std::env::var("WW_OCI_IMAGE_ID")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            kernel_identity: ww::kernel::IdentityState::pending(&kernel_source),
+            kernel_identity: ww::kernel::IdentityState::pending(&kernel_source, epoch_rx.clone()),
         };
         let kernel_identity = version_info.kernel_identity.clone();
 
@@ -1522,7 +1522,6 @@ system::export!({iface_name}Guest);
             bytes = resolved_identity.size,
             "Kernel source resolved"
         );
-        kernel_identity.publish(resolved_identity)?;
         runtime_status.set_phase("resolving-configuration");
 
         let mut all_mounts: Vec<ww::cell::mount::Mount> = Vec::new();
@@ -1928,6 +1927,7 @@ system::export!({iface_name}Guest);
         let kernel_launcher = ww::deployment::KernelLauncher::new(
             executor_pool,
             resolved_kernel,
+            kernel_identity,
             kernel_ready_gate,
             kernel_bootstrap,
             ww::kernel::RuntimeInputs::new(

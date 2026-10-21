@@ -173,12 +173,21 @@ pub(super) fn validate_metadata(data: &[u8]) -> Result<()> {
     validated_metadata(data).map(|_| ())
 }
 
+fn inline_metadata(bytes: &[u8]) -> Result<UnixFs> {
+    let node =
+        PbNode::from_bytes(Bytes::copy_from_slice(bytes)).context("malformed file DAG-PB block")?;
+    metadata(node.data.as_deref().context("missing UnixFS metadata")?)
+}
+
+/// Read inline content after strict DAG-PB validation, allowing UnixFS metadata.
+pub(super) fn file_inline(bytes: &[u8]) -> Result<Bytes> {
+    Ok(inline_metadata(bytes)?.data.unwrap_or_default())
+}
+
 /// Read inline content after strict DAG-PB validation, rejecting host metadata.
 /// Kept separate from ordinary Composer, which preserves immutable metadata.
 pub(super) fn capture_inline(bytes: &[u8]) -> Result<Bytes> {
-    let node = PbNode::from_bytes(Bytes::copy_from_slice(bytes))
-        .context("malformed capture DAG-PB block")?;
-    let metadata = metadata(node.data.as_deref().context("missing UnixFS metadata")?)?;
+    let metadata = inline_metadata(bytes)?;
     if metadata.mode.is_some() || metadata.mtime.is_some() {
         bail!("captured UnixFS source unexpectedly contains mode or mtime");
     }

@@ -950,6 +950,19 @@ async fn assert_unready_and_old_generation_dead(
         .await
         .expect("read readiness during Host retry");
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let identity = version(client, admin_addr).await;
+    for field in [
+        "kernel_cid",
+        "kernel_source_cid",
+        "kernel_epoch_seq",
+        "kernel_effective_root",
+    ] {
+        assert_eq!(
+            identity[field],
+            Value::Null,
+            "unrooted epoch reported {field}"
+        );
+    }
     assert_route_unavailable(client, http_addr, "/status").await;
 }
 
@@ -1175,6 +1188,9 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
         wait_for_ready(&client, &ready_url, &mut node).await;
         assert_status_cell(&client, http_addr, &overlay_status_cid, &node).await;
         let initial_root = activated_root(&node, 0);
+        let initial_identity = version(&client, admin_addr).await;
+        assert_eq!(initial_identity["kernel_epoch_seq"], 0);
+        assert_eq!(initial_identity["kernel_effective_root"], initial_root.to_string());
         let frozen_config = immutable_path_cid(&client, kubo_addr, &initial_root, "etc/app/config").await;
         let frozen_directory = immutable_path_cid(&client, kubo_addr, &initial_root, "etc/overlay").await;
         let frozen_status = immutable_path_cid(&client, kubo_addr, &initial_root, "bin/status.wasm").await;
@@ -1215,6 +1231,9 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
             assert_eq!(ipfs.cat(&format!("{root_path}/generation.txt")).await.unwrap(), format!("epoch-{}\n", if seq == 1 { 11 } else { 13 }).as_bytes());
             let identity = version(&client, admin_addr).await;
             assert_eq!(identity["kernel_cid"], ww::kernel::runtime_cid(&kernel).to_string());
+            assert_eq!(identity["kernel_epoch_seq"], seq);
+            assert_eq!(identity["kernel_effective_root"], effective.to_string());
+            assert_eq!(identity["kernel_cid"], initial_identity["kernel_cid"]);
             assert_eq!(ipfs.cat(&format!("{root_path}/boot/kernel.wasm")).await.unwrap(), b"ordinary image bytes, not PID0");
             assert!(kubo_pin_is_present(&client, kubo_addr, &effective).await);
             assert!(kubo_pin_is_present(&client, kubo_addr, &hidden_cid).await, "overwritten source must remain frozen");

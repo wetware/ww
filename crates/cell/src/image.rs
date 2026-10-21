@@ -19,6 +19,7 @@ mod codec;
 mod composer;
 mod operation;
 mod resolution;
+mod selection;
 mod snapshot;
 mod verify_capture;
 
@@ -27,6 +28,7 @@ pub use capture::{
 };
 pub use operation::{CompositionError, FrozenMount, FrozenSource, GuestTarget, SourceKind};
 pub use resolution::{resolve_frozen_mounts_with_cancel, MountResolutionFailure, ResolvedMounts};
+pub use selection::{select_kernel_file, KernelFileError, KernelFileFailure, VerifiedKernelFile};
 pub use snapshot::{PublishedSources, SnapshotPublicationFailure};
 
 /// Versioned identity profile for structural image composition.

@@ -846,17 +846,57 @@ mod tests {
         (staging, tree, cache)
     }
 
-    fn native_fixture_component(
+    fn native_kernel_fixture_component(
         runtime_engine: &cell::engine::RuntimeEngine,
     ) -> Arc<wasmtime::component::Component> {
+        use wasm_encoder::{
+            ComponentImportSection, ComponentSection, ComponentTypeRef, ComponentTypeSection,
+            ComponentValType, InstanceType, TypeBounds,
+        };
+
         let artifact = std::env::var_os("WW_NATIVE_P3_FIXTURE")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("target/native-p3-fixture/wasm32-wasip3/release/native_p3_fixture.wasm")
             });
+        let mut bytes = std::fs::read(&artifact)
+            .unwrap_or_else(|error| panic!("read {}: {error}", artifact.display()));
+        let types = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("valid native P3 fixture");
+        let readiness_type = types.as_ref().component_type_count();
+
+        // These filesystem tests need the kernel's CidTree. Add the kernel-only
+        // readiness contract to the in-memory fixture without changing its code
+        // or the ordinary Cell artifact. The guest does not call this import.
+        let mut readiness = InstanceType::new();
+        readiness
+            .ty()
+            .defined_type()
+            .enum_type(["stale-generation"]);
+        readiness.export("ready-error", ComponentTypeRef::Type(TypeBounds::Eq(0)));
+        readiness
+            .ty()
+            .defined_type()
+            .result(None, Some(ComponentValType::Type(1)));
+        readiness
+            .ty()
+            .function()
+            .params(std::iter::empty::<(&str, ComponentValType)>())
+            .result(Some(ComponentValType::Type(2)));
+        readiness.export("kernel-ready", ComponentTypeRef::Func(3));
+        let mut types = ComponentTypeSection::new();
+        types.instance(&readiness);
+        types.append_to_component(&mut bytes);
+        let mut imports = ComponentImportSection::new();
+        imports.import(
+            "wetware:kernel-runtime/readiness@1.0.0",
+            ComponentTypeRef::Instance(readiness_type),
+        );
+        imports.append_to_component(&mut bytes);
         Arc::new(
-            wasmtime::component::Component::from_file(&runtime_engine.engine(), &artifact)
+            cell::engine::compile_component(&runtime_engine.engine(), &bytes)
                 .unwrap_or_else(|error| panic!("load {}: {error}", artifact.display())),
         )
     }
@@ -1690,7 +1730,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let pool = crate::services::ExecutorPool::new(1, shutdown_rx, test_filesystem_host());
         let runtime_engine = pool.runtime_engine();
-        let component = native_fixture_component(&runtime_engine);
+        let component = native_kernel_fixture_component(&runtime_engine);
         let mut epoch = runtime_engine.subscribe();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1774,7 +1814,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let pool = crate::services::ExecutorPool::new(1, shutdown_rx, test_filesystem_host());
         let runtime_engine = pool.runtime_engine();
-        let component = native_fixture_component(&runtime_engine);
+        let component = native_kernel_fixture_component(&runtime_engine);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
@@ -1862,7 +1902,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let pool = crate::services::ExecutorPool::new(1, shutdown_rx, test_filesystem_host());
         let runtime_engine = pool.runtime_engine();
-        let component = native_fixture_component(&runtime_engine);
+        let component = native_kernel_fixture_component(&runtime_engine);
         let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (pending_tx, pending_rx) = std::sync::mpsc::channel();
@@ -1900,7 +1940,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let pool = crate::services::ExecutorPool::new(1, shutdown_rx, test_filesystem_host());
         let runtime_engine = pool.runtime_engine();
-        let component = native_fixture_component(&runtime_engine);
+        let component = native_kernel_fixture_component(&runtime_engine);
         let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (pending_tx, pending_rx) = std::sync::mpsc::channel();

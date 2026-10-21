@@ -455,7 +455,8 @@ async fn readyz_handler(State(state): State<AdminState>) -> impl IntoResponse {
 async fn version_handler(State(state): State<AdminState>) -> impl IntoResponse {
     let runtime = state.runtime_status.snapshot();
     let cache = state.wasmtime_cache_metrics.snapshot();
-    let kernel_identity = state.version_info.kernel_identity.get();
+    let running_identity = state.version_info.kernel_identity.get();
+    let kernel_identity = running_identity.as_ref().map(|identity| &identity.content);
     let kernel_source = kernel_identity
         .map(|identity| identity.source.clone())
         .unwrap_or_else(|| state.version_info.kernel_identity.pending_source());
@@ -467,6 +468,8 @@ async fn version_handler(State(state): State<AdminState>) -> impl IntoResponse {
         "kernel_source_cid": kernel_identity.and_then(|identity| identity.source_cid.as_deref()),
         "kernel_wasm_blake3": kernel_identity.map(|identity| identity.wasm_blake3.as_str()),
         "kernel_size": kernel_identity.map(|identity| identity.size),
+        "kernel_epoch_seq": running_identity.as_ref().map(|identity| identity.epoch_seq),
+        "kernel_effective_root": running_identity.as_ref().map(|identity| identity.effective_root.to_string()),
         "degraded": runtime.degraded || cache.state == WasmtimeCacheState::Fallback,
         "degraded_reasons": runtime.degraded_reasons,
         "wasmtime_cache_state": cache.state.as_str(),
@@ -621,18 +624,9 @@ mod tests {
             head: Vec::new(),
             root: None,
         });
-        let kernel_ready_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx));
+        let kernel_ready_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
         let source = crate::kernel::Source::Embedded("main");
-        let kernel_identity = crate::kernel::IdentityState::pending(&source);
-        kernel_identity
-            .publish(crate::kernel::Identity {
-                cid: "kernel-cid".to_string(),
-                source: "embedded:main".to_string(),
-                wasm_blake3: "kernel".to_string(),
-                source_cid: None,
-                size: 42,
-            })
-            .unwrap();
+        let kernel_identity = crate::kernel::IdentityState::pending(&source, epoch_rx);
         AdminState {
             peer_id: "12D3KooWTestPeerId".to_string(),
             network_state: rpc::NetworkState::new(),
@@ -746,8 +740,29 @@ mod tests {
 
     #[tokio::test]
     async fn version_reports_provenance_and_cache_degradation() {
-        let state = test_state();
-        let response = version_handler(State(state)).await.into_response();
+        let mut state = test_state();
+        let root = crate::kernel::runtime_cid(b"effective root");
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(Epoch {
+            seq: 2,
+            head: Vec::new(),
+            root: Some(root),
+        });
+        state.version_info.kernel_identity = crate::kernel::IdentityState::pending(
+            &crate::kernel::Source::Embedded("main"),
+            epoch_rx,
+        );
+        let _identity = state.version_info.kernel_identity.publish_for_test(
+            crate::kernel::Identity {
+                cid: "kernel-cid".to_string(),
+                source: "embedded:main".to_string(),
+                wasm_blake3: "kernel".to_string(),
+                source_cid: None,
+                size: 42,
+            },
+            2,
+            root,
+        );
+        let response = version_handler(State(state.clone())).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -759,9 +774,34 @@ mod tests {
         assert_eq!(value["kernel_source"], "embedded:main");
         assert_eq!(value["kernel_wasm_blake3"], "kernel");
         assert_eq!(value["kernel_size"], 42);
+        assert_eq!(value["kernel_epoch_seq"], 2);
+        assert_eq!(value["kernel_effective_root"], root.to_string());
         assert!(value["wasmtime_cache_hits_total"].is_u64());
         assert!(value["wasmtime_cache_stores_total"].is_u64());
         assert!(value["wasmtime_component_compilations_total"].is_u64());
+
+        // Authority revokes identity immediately, before the old generation's
+        // lifetime guard is dropped or its asynchronous cleanup completes.
+        epoch_tx.send_replace(Epoch {
+            seq: 3,
+            head: Vec::new(),
+            root: None,
+        });
+        let response = version_handler(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for field in [
+            "kernel_cid",
+            "kernel_source_cid",
+            "kernel_wasm_blake3",
+            "kernel_size",
+            "kernel_epoch_seq",
+            "kernel_effective_root",
+        ] {
+            assert_eq!(value[field], serde_json::Value::Null, "{field}");
+        }
     }
 
     #[tokio::test]
@@ -769,6 +809,7 @@ mod tests {
         let mut state = test_state();
         state.version_info.kernel_identity = crate::kernel::IdentityState::pending(
             &crate::kernel::Source::Path("/tmp/pid0.wasm".into()),
+            tokio::sync::watch::channel(Epoch::zero()).1,
         );
         let response = version_handler(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
@@ -778,6 +819,8 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("version JSON");
         assert_eq!(value["kernel_cid"], serde_json::Value::Null);
         assert_eq!(value["kernel_wasm_blake3"], serde_json::Value::Null);
+        assert_eq!(value["kernel_epoch_seq"], serde_json::Value::Null);
+        assert_eq!(value["kernel_effective_root"], serde_json::Value::Null);
         assert_eq!(value["kernel_source"], "<pending: file:/tmp/pid0.wasm>");
     }
 
