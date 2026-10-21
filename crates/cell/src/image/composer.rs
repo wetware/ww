@@ -37,6 +37,16 @@ const LIMITS: Limits = Limits {
 #[async_trait]
 pub(super) trait BlockSource: Sync {
     async fn get(&self, cid: &Cid) -> Result<Vec<u8>>;
+
+    /// Capture verification makes one attempt with its remaining byte allowance.
+    async fn get_capture(&self, cid: &Cid, limit: usize) -> Result<Vec<u8>> {
+        let bytes = self.get(cid).await?;
+        ensure!(
+            bytes.len() <= limit,
+            "capture block read allowance exceeded"
+        );
+        Ok(bytes)
+    }
 }
 
 #[async_trait]
@@ -57,6 +67,34 @@ impl BlockSource for ipfs::BootClient {
                     error
                 }
             })
+    }
+
+    async fn get_capture(&self, cid: &Cid, limit: usize) -> Result<Vec<u8>> {
+        // Do not hide repeated/partial reads behind BootClient's retry loop.
+        let fetch = self.client().snapshot_block_get(cid, limit);
+        let timeout = match (self.operation_timeout(), self.retry_max_duration()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, fetch).await.map_err(|_| {
+                ipfs::KuboOperationTimeout::new("capture verification block retrieval", timeout)
+            })?,
+            None => fetch.await,
+        }
+        .map_err(|error| {
+            if error
+                .downcast_ref::<ipfs::KuboResponseLimit>()
+                .is_some_and(|limit| limit.status.is_success())
+            {
+                anyhow::Error::new(CompositionError::ResourceLimit(
+                    "capture verification block exceeds remaining byte allowance",
+                ))
+                .context(error)
+            } else {
+                error
+            }
+        })
     }
 }
 
@@ -89,6 +127,7 @@ struct Composer<'a, S> {
     read_bytes: usize,
     written_bytes: usize,
     work: usize,
+    capture_blocks: Option<HashMap<Cid, Vec<u8>>>,
 }
 
 pub(super) async fn compose(source: &impl BlockSource, layers: &[Cid]) -> Result<Composition> {
@@ -112,6 +151,62 @@ async fn compose_with_limits(
 
 pub(super) async fn inspect_source(source: &impl BlockSource, cid: Cid) -> Result<FrozenSource> {
     Composer::new(source, LIMITS).inspect(cid, 0, false).await
+}
+
+/// Cumulative validation allowance for a complete local-source batch.
+#[derive(Default)]
+pub(super) struct InspectionBudget {
+    nodes: usize,
+    read_bytes: usize,
+    work: usize,
+}
+
+impl InspectionBudget {
+    pub(super) fn charge_work(&mut self) -> Result<()> {
+        ensure!(
+            self.work < MAX_WORK,
+            CompositionError::ResourceLimit("capture verification work limit exceeded")
+        );
+        self.work += 1;
+        Ok(())
+    }
+}
+
+pub(super) struct CaptureInspection {
+    pub source: FrozenSource,
+    pub blocks: HashMap<Cid, Vec<u8>>,
+}
+
+pub(super) async fn inspect_capture(
+    source: &impl BlockSource,
+    cid: Cid,
+    budget: &mut InspectionBudget,
+) -> Result<CaptureInspection> {
+    let mut inspector = Composer::new(
+        source,
+        Limits {
+            max_nodes: MAX_NODES.saturating_sub(budget.nodes),
+            max_read_bytes: MAX_BYTES.saturating_sub(budget.read_bytes),
+            max_written_bytes: 0,
+            max_work: MAX_WORK.saturating_sub(budget.work),
+        },
+    );
+    inspector.capture_blocks = Some(HashMap::new());
+    let result = inspector.inspect(cid, 0, false).await;
+    // Preserve aggregate charges on failure. The caller cannot retry with fresh limits.
+    budget.nodes += inspector
+        .nodes
+        .len()
+        .max(inspector.capture_blocks.as_ref().map_or(0, HashMap::len));
+    budget.read_bytes += inspector.read_bytes;
+    budget.work += inspector.work;
+    Ok(CaptureInspection {
+        source: result?,
+        blocks: inspector
+            .capture_blocks
+            .take()
+            .expect("capture recording enabled"),
+    })
 }
 
 pub(super) async fn compose_mounts(
@@ -234,6 +329,7 @@ impl<S: BlockSource> Composer<'_, S> {
             read_bytes: 0,
             written_bytes: 0,
             work: 0,
+            capture_blocks: None,
         }
     }
 
@@ -408,11 +504,29 @@ impl<S: BlockSource> Composer<'_, S> {
     }
 
     async fn read_block(&mut self, cid: &Cid) -> Result<Vec<u8>> {
-        let bytes = self
-            .source
-            .get(cid)
-            .await
-            .with_context(|| format!("reading composition block {cid}"))?;
+        let bytes = if self.capture_blocks.is_some() {
+            let allowance = codec::MAX_BLOCK_BYTES
+                .min(self.limits.max_read_bytes.saturating_sub(self.read_bytes));
+            ensure!(
+                self.capture_blocks.as_ref().map_or(0, HashMap::len) < self.limits.max_nodes,
+                CompositionError::ResourceLimit("capture verification node limit exceeded")
+            );
+            // Reserve before I/O. A failed request keeps the reservation because
+            // the transport cannot report bytes consumed before failure.
+            self.read_bytes += allowance;
+            let bytes = self.source.get_capture(cid, allowance).await?;
+            ensure!(
+                bytes.len() <= allowance,
+                "capture block exceeds reserved allowance"
+            );
+            self.read_bytes -= allowance;
+            bytes
+        } else {
+            self.source
+                .get(cid)
+                .await
+                .with_context(|| format!("reading composition block {cid}"))?
+        };
         ensure!(
             bytes.len() <= codec::MAX_BLOCK_BYTES,
             CompositionError::ResourceLimit("Composer v1 block exceeds 1048576 bytes")
@@ -427,6 +541,9 @@ impl<S: BlockSource> Composer<'_, S> {
             self.read_bytes <= self.limits.max_read_bytes,
             CompositionError::ResourceLimit("Composer v1 input byte limit exceeded")
         );
+        if let Some(blocks) = &mut self.capture_blocks {
+            blocks.insert(*cid, bytes.clone());
+        }
         Ok(bytes)
     }
 
@@ -454,6 +571,9 @@ impl<S: BlockSource> Composer<'_, S> {
     fn load(&mut self, cid: Cid, depth: usize) -> BoxFuture<'_, Result<Cached>> {
         Box::pin(async move {
             tokio::task::yield_now().await;
+            if self.capture_blocks.is_some() {
+                self.charge_work(1)?;
+            }
             ensure!(
                 depth <= MAX_DEPTH,
                 CompositionError::ResourceLimit("Composer v1 directory depth limit exceeded")
@@ -482,7 +602,11 @@ impl<S: BlockSource> Composer<'_, S> {
                     height: 0,
                 };
                 self.nodes.insert(cid, node.clone());
-                return Ok(node);
+                return if self.capture_blocks.is_some() {
+                    self.measure_raw(cid, node).await
+                } else {
+                    Ok(node)
+                };
             }
             ensure!(
                 cid.codec() == 0x70,
@@ -560,7 +684,7 @@ impl<S: BlockSource> Composer<'_, S> {
                     let mut height = 0;
                     for link in directory.entries.values() {
                         let child = self.load(link.cid, depth + 1).await?;
-                        if link.cid.codec() != 0x55 {
+                        if link.cid.codec() != 0x55 || self.capture_blocks.is_some() {
                             ensure!(
                                 link.size == child.size,
                                 CompositionError::InvalidDag(format!(

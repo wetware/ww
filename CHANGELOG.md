@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Local mount capture and verified Kubo publication (#734 Landing B).**
+  The library captures bounded local files and directories without following
+  symlinks, preserves empty directories, and verifies imported DAGs against
+  captured bytes. Strict publication and recursive-pin acknowledgements precede
+  frozen-source delivery. CLI and deployment integration remain in Landing C.
 - **Composer v1 supports immutable targeted file and directory composition (#734 Landing A).**
   Ordered operations preserve strict ancestor metadata and produce deterministic
   root CIDs. Standalone source inspection verifies cumulative sizes, and typed

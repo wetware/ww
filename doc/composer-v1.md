@@ -1,5 +1,9 @@
 # Wetware Composer v1
 
+For the mount-specific local capture and publication library, see
+[Local mount snapshots](local-snapshots.md). CLI/deployment integration remains
+in #734 Landing C.
+
 `cell::image::COMPOSER_PROFILE` identifies `wetware-composer-v1`. For accepted
 inputs, the same ordered layer CIDs and this profile produce the same root CID.
 Historical Kubo MFS root identity is not part of the contract.

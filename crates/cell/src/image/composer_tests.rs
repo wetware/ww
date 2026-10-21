@@ -1501,3 +1501,89 @@ async fn root_adapter_rejects_raw_files_without_fetching_their_payload() {
     }
     assert!(memory.reads.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn capture_inspection_fetches_raw_directory_children() {
+    let mut store = Memory::default();
+    let raw = store.raw_block(b"captured bytes");
+    let (cid, bytes, _) = codec::encode(&Directory {
+        data: Bytes::from_static(&[8, 1]),
+        entries: BTreeMap::from([("file".into(), raw.clone())]),
+    })
+    .unwrap();
+    store.blocks.insert(cid, bytes);
+    let inspected = inspect_capture(&store, cid, &mut InspectionBudget::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        inspected.blocks.get(&raw.cid).map(Vec::as_slice),
+        Some(b"captured bytes".as_slice())
+    );
+}
+
+#[tokio::test]
+async fn capture_inspection_budgets_span_sources_and_failed_attempts() {
+    let mut store = Memory::default();
+    let raw = store.raw_block(b"abc");
+    let empty = store.raw_block(b"");
+    let mut budget = InspectionBudget {
+        read_bytes: MAX_BYTES - 3,
+        ..Default::default()
+    };
+    inspect_capture(&store, raw.cid, &mut budget).await.unwrap();
+    assert_eq!(budget.read_bytes, MAX_BYTES);
+    // Empty raw blocks consume no byte allowance, even at the inclusive boundary.
+    inspect_capture(&store, empty.cid, &mut budget)
+        .await
+        .unwrap();
+    assert!(inspect_capture(&store, raw.cid, &mut budget).await.is_err());
+    assert_eq!(budget.read_bytes, MAX_BYTES);
+
+    let mut nodes = InspectionBudget {
+        nodes: MAX_NODES - 1,
+        ..Default::default()
+    };
+    inspect_capture(&store, raw.cid, &mut nodes).await.unwrap();
+    assert_eq!(nodes.nodes, MAX_NODES);
+    assert!(inspect_capture(&store, empty.cid, &mut nodes)
+        .await
+        .is_err());
+
+    let mut work = InspectionBudget {
+        work: MAX_WORK - 1,
+        ..Default::default()
+    };
+    inspect_capture(&store, raw.cid, &mut work).await.unwrap();
+    assert_eq!(work.work, MAX_WORK);
+    assert!(inspect_capture(&store, empty.cid, &mut work).await.is_err());
+
+    store.blocks.remove(&raw.cid);
+    let mut failure = InspectionBudget::default();
+    assert!(inspect_capture(&store, raw.cid, &mut failure)
+        .await
+        .is_err());
+    assert_eq!(failure.read_bytes, codec::MAX_BLOCK_BYTES);
+    assert!(inspect_capture(&store, raw.cid, &mut failure)
+        .await
+        .is_err());
+    assert_eq!(failure.read_bytes, 2 * codec::MAX_BLOCK_BYTES);
+}
+
+#[tokio::test]
+async fn capture_inspection_rejects_raw_tsize_without_changing_ordinary_composer() {
+    let mut store = Memory::default();
+    let mut raw = store.raw_block(b"abc");
+    raw.size = 99;
+    let (cid, bytes, _) = codec::encode(&Directory {
+        data: Bytes::from_static(&[8, 1]),
+        entries: BTreeMap::from([("file".into(), raw)]),
+    })
+    .unwrap();
+    store.blocks.insert(cid, bytes);
+    assert!(inspect_source(&store, cid).await.is_ok());
+    assert!(
+        inspect_capture(&store, cid, &mut InspectionBudget::default())
+            .await
+            .is_err()
+    );
+}

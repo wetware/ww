@@ -3608,7 +3608,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "cid",
+ "futures",
+ "http",
+ "http-body-util",
  "reqwest",
  "serde",
  "serde_ipld_dagcbor",
