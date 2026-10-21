@@ -498,3 +498,42 @@ async fn cancellation_interrupts_reads_and_imports_without_success() {
         assert_eq!(kubo.requests().last().unwrap().endpoint, endpoint);
     }
 }
+
+#[tokio::test]
+async fn standalone_http_block_limits_are_typed_but_transport_errors_are_not() {
+    let oversized = "x".repeat(codec::MAX_BLOCK_BYTES + 1);
+    let cid = Cid::new_v1(
+        0x55,
+        cid::multihash::Multihash::wrap(0x12, &Sha256::digest(oversized.as_bytes())).unwrap(),
+    );
+    for (response, deterministic) in [
+        (format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", oversized.len()), true),
+        (format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{oversized}\r\n0\r\n\r\n", oversized.len()), true),
+        ("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\nConnection: close\r\n\r\nerror".into(), false),
+        // An oversized backend error page is not evidence of an oversized DAG.
+        ("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 70000\r\nConnection: close\r\n\r\n".into(), false),
+        ("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nx".into(), false),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            // Limit rejection may close the socket before the whole body arrives.
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        let client = ipfs::BootClient::one_attempt(
+            ipfs::HttpClient::new(format!("http://{address}")),
+            Duration::from_secs(5),
+        );
+        let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let error = inspect_source(cid, &client, &mut cancel).await.unwrap_err();
+        if deterministic {
+            assert!(matches!(error.downcast_ref::<CompositionError>(), Some(CompositionError::ResourceLimit(_))), "{error:#}");
+        } else {
+            assert!(error.downcast_ref::<CompositionError>().is_none(), "{error:#}");
+        }
+        server.await.unwrap();
+    }
+}

@@ -1,4 +1,5 @@
 //! Strict UnixFS boundary for Composer v1.
+use super::operation::CompositionError;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use cid::Cid;
@@ -172,7 +173,7 @@ pub(super) fn validate_metadata(data: &[u8]) -> Result<()> {
     validated_metadata(data).map(|_| ())
 }
 
-fn validate_name(name: &str) -> Result<()> {
+pub(super) fn validate_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."
         || name == ".."
@@ -186,7 +187,9 @@ fn validate_name(name: &str) -> Result<()> {
 
 pub(super) fn verify_cid(cid: &Cid, bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_BLOCK_BYTES {
-        bail!("Composer v1 block exceeds {MAX_BLOCK_BYTES} bytes");
+        bail!(CompositionError::ResourceLimit(
+            "Composer v1 block exceeds 1048576 bytes"
+        ));
     }
     if cid.hash().code() != 0x12 || cid.hash().size() != 32 {
         bail!("Composer v1 supports only sha2-256 CIDs");
@@ -325,9 +328,9 @@ pub(super) fn encode(directory: &Directory) -> Result<(Cid, Vec<u8>, u64)> {
     }
     .into_bytes();
     if bytes.len() > MAX_BLOCK_BYTES {
-        bail!(
-            "Composer v1 directory exceeds {MAX_BLOCK_BYTES} bytes; HAMT sharding is unsupported"
-        );
+        bail!(CompositionError::ResourceLimit(
+            "Composer v1 directory exceeds 1048576 bytes; HAMT sharding is unsupported"
+        ));
     }
     let size = children_size
         .checked_add(bytes.len() as u64)

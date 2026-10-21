@@ -22,7 +22,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub mod cid_identity;
 mod composed;
 
-pub use composed::parse_kubo_dag_import_response;
+pub use composed::{parse_kubo_dag_import_response, KuboResponseLimit};
 
 // A failed TCP connection must not hold an IPFS operation indefinitely.
 const KUBO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
