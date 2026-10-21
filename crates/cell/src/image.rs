@@ -15,11 +15,18 @@ use sha2::{Digest, Sha256};
 
 use crate::mount::Mount;
 
+mod capture;
 mod codec;
 mod composer;
 mod operation;
+mod snapshot;
+mod verify_capture;
 
+pub use capture::{
+    CaptureBatch, CaptureCancellation, CaptureRequest, CaptureStats, CapturedSource,
+};
 pub use operation::{CompositionError, FrozenMount, FrozenSource, GuestTarget, SourceKind};
+pub use snapshot::{PublishedSources, SnapshotPublicationFailure};
 
 /// Versioned identity profile for structural image composition.
 pub const COMPOSER_PROFILE: &str = composer::PROFILE;

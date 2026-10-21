@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+http = "1"
+http-body-util = "0.1"
 anyhow = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls", "json", "stream", "multipart"] }
 tar = "0.4"

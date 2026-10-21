@@ -2,6 +2,7 @@
 
 use anyhow::{ensure, Context, Result};
 use cid::Cid;
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{BootClient, HttpClient, KuboApiError, KuboOperationTimeout};
@@ -59,6 +60,16 @@ impl HttpClient {
     /// Fetch a raw immutable block, bounding both advertised and streamed bytes.
     /// The composer verifies the content against the requested CID.
     pub async fn block_get(&self, cid: &Cid, max_bytes: usize) -> Result<Vec<u8>> {
+        self.get_block_with_limits(cid, max_bytes, MAX_IMPORT_RESPONSE_BYTES)
+            .await
+    }
+
+    async fn get_block_with_limits(
+        &self,
+        cid: &Cid,
+        max_bytes: usize,
+        error_bytes: usize,
+    ) -> Result<Vec<u8>> {
         let response = self
             .http_client
             .post(format!("{}/api/v0/block/get", self.base_url))
@@ -66,7 +77,19 @@ impl HttpClient {
             .send()
             .await
             .with_context(|| format!("Failed to fetch IPFS block {cid}"))?;
-        read_response(response, max_bytes, &format!("IPFS block get ({cid})")).await
+        read_response_with_error_limit(
+            response,
+            max_bytes,
+            error_bytes,
+            &format!("IPFS block get ({cid})"),
+        )
+        .await
+    }
+
+    /// Capture-only single request with one bound for success and error bodies.
+    pub async fn snapshot_block_get(&self, cid: &Cid, max_bytes: usize) -> Result<Vec<u8>> {
+        self.get_block_with_limits(cid, max_bytes, max_bytes.min(MAX_IMPORT_RESPONSE_BYTES))
+            .await
     }
 
     /// Store generated directories and recursively retain `root` under one Kubo
@@ -156,15 +179,32 @@ pub fn parse_kubo_dag_import_response(response_body: &[u8], expected_root: &Cid)
 }
 
 async fn read_response(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     max_bytes: usize,
     operation: &str,
 ) -> Result<Vec<u8>> {
+    read_response_with_error_limit(response, max_bytes, MAX_IMPORT_RESPONSE_BYTES, operation).await
+}
+
+async fn read_response_with_error_limit(
+    response: reqwest::Response,
+    max_bytes: usize,
+    error_bytes: usize,
+    operation: &str,
+) -> Result<Vec<u8>> {
     let status = response.status();
+    ensure!(
+        response
+            .headers()
+            .get_all("X-Stream-Error")
+            .iter()
+            .all(|value| value.as_bytes().is_empty()),
+        "{operation} returned a streaming error header"
+    );
     let limit = if status.is_success() {
         max_bytes
     } else {
-        MAX_IMPORT_RESPONSE_BYTES
+        error_bytes
     };
     ensure!(
         response
@@ -176,12 +216,26 @@ async fn read_response(
             limit
         }
     );
+    let response: http::Response<reqwest::Body> = response.into();
+    let mut frames = response.into_body();
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .with_context(|| format!("Failed to read {operation} response"))?
-    {
+    while let Some(frame) = frames.frame().await {
+        let frame = frame.with_context(|| format!("Failed to read {operation} response"))?;
+        let chunk = match frame.into_data() {
+            Ok(chunk) => chunk,
+            Err(frame) => {
+                if let Some(trailers) = frame.trailers_ref() {
+                    ensure!(
+                        trailers
+                            .get_all("X-Stream-Error")
+                            .iter()
+                            .all(|value| value.as_bytes().is_empty()),
+                        "{operation} returned a streaming error trailer"
+                    );
+                }
+                continue;
+            }
+        };
         ensure!(
             chunk.len() <= limit.saturating_sub(body.len()),
             KuboResponseLimit {
@@ -435,6 +489,36 @@ mod tests {
         ] {
             let (client, server) = serve(response).await;
             assert!(client.block_get(&root(), 4).await.is_err());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_block_get_bounds_error_bodies_by_remaining_allowance() {
+        for response in [
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\nConnection: close\r\n\r\nerror".to_owned(),
+            "HTTP/1.1 500 Internal Server Error\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nerror\r\n0\r\n\r\n".to_owned(),
+        ] {
+            let (client, server) = serve(response).await;
+            let error = client.snapshot_block_get(&root(), 4).await.unwrap_err();
+            let limit = error.downcast_ref::<KuboResponseLimit>()
+                .expect("capture error body must obey the same remaining-byte bound");
+            assert_eq!(limit.limit, 4);
+            assert_eq!(limit.status.as_u16(), 500);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn import_rejects_stream_error_headers_and_late_trailers() {
+        let good = success();
+        for response in [
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-Stream-Error: failed pinning\r\nConnection: close\r\n\r\n{good}", good.len()),
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Stream-Error\r\nConnection: close\r\n\r\n{:x}\r\n{good}\r\n0\r\nX-Stream-Error: failed pinning\r\n\r\n", good.len()),
+        ] {
+            let (client, server) = serve(response).await;
+            assert!(client.import_composed(&root(), &[]).await.is_err(),
+                "CAR acknowledgement must reject HTTP stream errors");
             server.await.unwrap();
         }
     }

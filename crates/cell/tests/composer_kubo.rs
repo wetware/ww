@@ -10,6 +10,499 @@ use cell::image::{compose_mounts, inspect_source, FrozenMount, GuestTarget, Sour
 use cid::Cid;
 use serde_json::Value;
 
+async fn capture_local(requests: Vec<cell::image::CaptureRequest>) -> cell::image::CaptureBatch {
+    static CAPTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _capture = CAPTURE.lock().await;
+    let (owner, host) = cache::HostFsOwner::start(
+        tokio::runtime::Handle::current(),
+        cache::HostLimits::default(),
+    )
+    .unwrap();
+    let (scope, fs_owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+    let transaction = host
+        .try_foreground_transaction(host.try_logical_io().unwrap(), &[&scope])
+        .unwrap();
+    let result =
+        cell::image::CaptureBatch::capture(requests, &transaction, Default::default()).await;
+    drop(transaction);
+    drop(fs_owner);
+    finalizer.run().await.unwrap();
+    completion.wait().await.unwrap();
+    owner.shutdown().await.unwrap();
+    result.unwrap()
+}
+
+// Forward one complete test request to a real isolated backend. Closing the
+// backend connection makes response completion explicit, including chunk trailers.
+async fn forward_snapshot_request(
+    stream: &mut tokio::net::TcpStream,
+    backend: &str,
+) -> (String, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut request = Vec::new();
+    let header_end = loop {
+        let mut chunk = [0; 8192];
+        let count = stream.read(&mut chunk).await.unwrap();
+        assert!(count > 0);
+        request.extend_from_slice(&chunk[..count]);
+        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end + 4;
+        }
+        assert!(request.len() < 65536);
+    };
+    let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
+    while request.len() < header_end + length {
+        let mut chunk = [0; 8192];
+        let count = stream.read(&mut chunk).await.unwrap();
+        assert!(count > 0);
+        request.extend_from_slice(&chunk[..count]);
+    }
+    let mut upstream = tokio::net::TcpStream::connect(backend).await.unwrap();
+    upstream
+        .write_all(&request[..header_end - 2])
+        .await
+        .unwrap();
+    upstream
+        .write_all(b"Connection: close\r\n\r\n")
+        .await
+        .unwrap();
+    upstream.write_all(&request[header_end..]).await.unwrap();
+    let mut response = Vec::new();
+    upstream.read_to_end(&mut response).await.unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "backend failed: {}",
+        String::from_utf8_lossy(&response)
+    );
+    (headers.lines().next().unwrap().to_owned(), response)
+}
+
+// Withhold the last multipart file until GC finishes. A file event proves
+// /add acquired its pin lock; GC completion with an unfinished request proves
+// Kubo yielded that lock while retaining its partially imported directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn captured_directory_yields_to_gc_before_upload_finishes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some(kubo) = Kubo::start() else { return };
+    let local = tempfile::tempdir().unwrap();
+    let local_path = local.path().canonicalize().unwrap();
+    const FILES: usize = 40;
+    for index in 0..FILES {
+        std::fs::write(
+            local_path.join(format!("a{index:02}")),
+            vec![index as u8; 64 * 1024],
+        )
+        .unwrap();
+    }
+    let batch = capture_local(vec![cell::image::CaptureRequest {
+        path: local_path,
+        root_mount: false,
+    }])
+    .await;
+    local.close().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let api: Vec<_> = kubo.api.split('/').collect();
+    let backend = format!("{}:{}", api[2], api[4]);
+    let gc_repo = kubo.repo.path().to_owned();
+    let gc_api = kubo.api.clone();
+    let (yielded_tx, yielded_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut downstream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0; 8192];
+            let count = downstream.read(&mut chunk).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+            assert!(request.len() < 65536);
+        };
+        let headers = std::str::from_utf8(&request[..header_end])
+            .unwrap()
+            .to_owned();
+        assert!(headers.lines().next().unwrap().contains("/api/v0/add?"));
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let boundary = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-type")
+                    .then(|| value.split("boundary=").nth(1).unwrap().trim())
+            })
+            .unwrap();
+        while request.len() < header_end + length {
+            let mut chunk = [0; 8192];
+            let count = downstream.read(&mut chunk).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&chunk[..count]);
+        }
+        // Every gate ends after the following part's headers. The multipart
+        // parser can then finish the previous file without receiving the next.
+        let delimiter = format!("--{boundary}\r\n");
+        let body = &request[header_end..];
+        let starts: Vec<_> = body
+            .windows(delimiter.len())
+            .enumerate()
+            .filter_map(|(index, bytes)| (bytes == delimiter.as_bytes()).then_some(index))
+            .collect();
+        assert_eq!(starts.len(), FILES + 1); // one directory and FILES files
+        let gates: Vec<_> = starts
+            .iter()
+            .map(|start| {
+                start
+                    + body[*start..]
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .unwrap()
+                    + 4
+            })
+            .collect();
+        let mut upstream = tokio::net::TcpStream::connect(&backend).await.unwrap();
+        upstream
+            .write_all(&request[..header_end - 2])
+            .await
+            .unwrap();
+        upstream
+            .write_all(b"Connection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let (mut upstream_read, mut upstream_write) = upstream.into_split();
+        let (_downstream_read, mut downstream_write) = downstream.into_split();
+        let (first_event_tx, first_event_rx) = tokio::sync::oneshot::channel();
+        let mut readers = tokio::task::JoinSet::new();
+        readers.spawn(async move {
+            let mut first_event_tx = Some(first_event_tx);
+            let mut response = Vec::new();
+            loop {
+                let mut chunk = [0; 8192];
+                let count = upstream_read.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                response.extend_from_slice(&chunk[..count]);
+                assert!(response.len() <= 1024 * 1024);
+                if response
+                    .windows(b"\"Name\":\"source/a00\"".len())
+                    .any(|w| w == b"\"Name\":\"source/a00\"")
+                {
+                    if let Some(sender) = first_event_tx.take() {
+                        sender.send(()).unwrap();
+                    }
+                }
+                downstream_write.write_all(&chunk[..count]).await.unwrap();
+            }
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+            assert!(
+                first_event_tx.is_none(),
+                "Kubo never emitted the first file event"
+            );
+        });
+        let mut sent = gates[2]; // root directory, a00, and a01 headers
+        upstream_write.write_all(&body[..sent]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), first_event_rx)
+            .await
+            .expect("Kubo did not stream an event before the upload finished")
+            .unwrap();
+        let mut command = Kubo::command(&gc_repo);
+        command
+            .arg(format!("--api={gc_api}"))
+            .args(["repo", "gc"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut gc = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut completed = false;
+            for &gate in &gates[3..] {
+                if let Ok(status) =
+                    tokio::time::timeout(Duration::from_millis(200), gc.wait()).await
+                {
+                    assert!(status.unwrap().success());
+                    completed = true;
+                    break;
+                }
+                // Leave the final file body withheld even at the last gate.
+                upstream_write.write_all(&body[sent..gate]).await.unwrap();
+                sent = gate;
+            }
+            if !completed {
+                assert!(tokio::time::timeout(Duration::from_secs(1), gc.wait())
+                    .await
+                    .expect("GC did not finish while /add remained unfinished")
+                    .unwrap()
+                    .success());
+            }
+        })
+        .await
+        .expect("GC-yield gate exceeded its deadline");
+        assert!(sent <= *gates.last().unwrap() && sent < body.len());
+        yielded_tx.send(()).unwrap();
+        upstream_write.write_all(&body[sent..]).await.unwrap();
+        readers.join_next().await.unwrap().unwrap();
+        // The production publisher still has to acknowledge the recursive pin
+        // and independently verify every block after the interrupted import.
+        loop {
+            let (mut downstream, _) = listener.accept().await.unwrap();
+            let (_, response) = forward_snapshot_request(&mut downstream, &backend).await;
+            downstream.write_all(&response).await.unwrap();
+        }
+    });
+    let client = ipfs::BootClient::one_attempt(
+        ipfs::HttpClient::new(format!("http://{address}")),
+        Duration::from_secs(20),
+    );
+    let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+    let result =
+        tokio::time::timeout(Duration::from_secs(25), batch.publish(&client, &mut cancel)).await;
+    server.abort();
+    let server_result = server.await;
+    if let Err(error) = server_result {
+        assert!(error.is_cancelled(), "gated proxy failed: {error}");
+    }
+    let published = result.expect("gated publication timed out").unwrap();
+    yielded_rx
+        .await
+        .expect("GC completion was not observed before the final file");
+    let root = published.sources()[0].cid().to_string();
+    kubo.cli(&["repo", "gc"]);
+    kubo.cli(&["pin", "ls", "--type=recursive", &root]);
+    for index in 0..FILES {
+        assert_eq!(
+            kubo.bytes(&["cat", &format!("/ipfs/{root}/a{index:02}")]),
+            vec![index as u8; 64 * 1024]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_snapshot_publication_retains_overlapping_real_pins() {
+    use tokio::io::AsyncWriteExt;
+    let Some(kubo) = Kubo::start() else { return };
+    let bytes = b"shared captured bytes";
+    let existing = kubo.add_file(bytes, "1", "true");
+    let api: Vec<_> = kubo.api.split('/').collect();
+    let backend = format!("{}:{}", api[2], api[4]);
+    // Lose /add completion, lose CAR acknowledgement after backend pin, then
+    // cancel after CAR acknowledgement while verification is pending.
+    for stop_at in 0..3 {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), bytes).unwrap();
+        let batch = capture_local(vec![cell::image::CaptureRequest {
+            path: file.path().canonicalize().unwrap(),
+            root_mount: false,
+        }])
+        .await;
+        file.close().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let backend = backend.clone();
+        let (cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            for step in 0..=stop_at {
+                let (mut downstream, _) = listener.accept().await.unwrap();
+                if step == 2 {
+                    // Receiving the block request proves publication returned a
+                    // valid CAR acknowledgement before cancellation.
+                    use tokio::io::AsyncReadExt;
+                    let mut request = [0; 4096];
+                    let count = downstream.read(&mut request).await.unwrap();
+                    assert!(
+                        String::from_utf8_lossy(&request[..count]).contains("/api/v0/block/get")
+                    );
+                    cancel_tx.send(true).unwrap();
+                    return;
+                }
+                let (request, response) = forward_snapshot_request(&mut downstream, &backend).await;
+                assert!(request.contains(if step == 0 {
+                    "/api/v0/add?"
+                } else {
+                    "/api/v0/dag/import?"
+                }));
+                if step == stop_at {
+                    return;
+                }
+                downstream.write_all(&response).await.unwrap();
+            }
+        });
+        let client = ipfs::BootClient::one_attempt(
+            ipfs::HttpClient::new(format!("http://{address}")),
+            Duration::from_secs(5),
+        );
+        let failure = batch.publish(&client, &mut cancel).await.unwrap_err();
+        if stop_at == 2 {
+            assert_eq!(
+                failure.acknowledged_roots,
+                [existing.parse::<Cid>().unwrap()]
+            );
+            assert_eq!(failure.uncertain_source, None);
+        } else {
+            assert_eq!(failure.uncertain_source, Some(0));
+            assert!(failure.acknowledged_roots.is_empty());
+        }
+        server.await.unwrap();
+        kubo.cli(&["repo", "gc"]);
+        kubo.cli(&["pin", "ls", "--type=recursive", &existing]);
+        assert_eq!(kubo.bytes(&["cat", &existing]), bytes);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn captured_local_sources_publish_verify_and_survive_gc() {
+    use cell::image::{CaptureRequest, SourceKind};
+    let Some(kubo) = Kubo::start() else { return };
+    let local = tempfile::tempdir().unwrap();
+    // macOS /var is a symlink. Tests select its explicit real path; production
+    // capture must reject symlink components rather than canonicalize them.
+    let local_path = local.path().canonicalize().unwrap();
+    let standalone = local_path.join("standalone");
+    let chunks: Vec<u8> = (0..700_001).map(|n| (n % 251) as u8).collect();
+    std::fs::write(&standalone, &chunks).unwrap();
+    let directory = local_path.join("directory");
+    std::fs::create_dir_all(directory.join("empty/nested")).unwrap();
+    for name in [
+        "target",
+        ".git",
+        ".gitignore",
+        "Cargo.lock",
+        "café",
+        "a\\b",
+        "a\"b",
+        "\u{85}\u{200d}",
+    ] {
+        std::fs::write(directory.join(name), name.as_bytes()).unwrap();
+    }
+    let empty = local_path.join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let empty_file = local_path.join("empty-file");
+    let small_file = local_path.join("small-file");
+    std::fs::write(&empty_file, []).unwrap();
+    std::fs::write(&small_file, b"small captured file").unwrap();
+    std::fs::create_dir(directory.join("prefix")).unwrap();
+    std::fs::write(directory.join("prefix/child"), b"child").unwrap();
+    std::fs::write(directory.join("prefix-sibling"), b"sibling").unwrap();
+    let batch = capture_local(vec![
+        CaptureRequest {
+            path: standalone.clone(),
+            root_mount: false,
+        },
+        CaptureRequest {
+            path: directory.clone(),
+            root_mount: false,
+        },
+        CaptureRequest {
+            path: directory.clone(),
+            root_mount: true,
+        },
+        CaptureRequest {
+            path: empty,
+            root_mount: false,
+        },
+        CaptureRequest {
+            path: empty_file,
+            root_mount: false,
+        },
+        CaptureRequest {
+            path: small_file,
+            root_mount: false,
+        },
+    ])
+    .await;
+    // Destruction after capture cannot affect any upload or verification read.
+    local.close().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gc_stop = stop.clone();
+    let gc_repo = kubo.repo.path().to_owned();
+    let gc_api = kubo.api.clone();
+    let gc = std::thread::spawn(move || {
+        let mut runs = 0;
+        while !gc_stop.load(std::sync::atomic::Ordering::Acquire) {
+            let status = Kubo::command(&gc_repo)
+                .arg(format!("--api={gc_api}"))
+                .args(["repo", "gc"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            runs += 1;
+        }
+        runs
+    });
+    let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+    let result = batch.publish(&kubo.client(), &mut cancel).await;
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    assert!(gc.join().unwrap() > 0);
+    let published = result.unwrap();
+    let sources = published.sources();
+    assert_eq!(sources.len(), 6);
+    assert_eq!(sources[0].kind(), SourceKind::File);
+    assert_eq!(
+        sources[0].dag_size(),
+        kubo.measured_dag_size(sources[0].cid())
+    );
+    assert_eq!(kubo.bytes(&["cat", &sources[0].cid().to_string()]), chunks);
+    let targeted = sources[1].cid().to_string();
+    let root = sources[2].cid().to_string();
+    for name in ["target", ".git", ".gitignore", "Cargo.lock"] {
+        assert_eq!(
+            kubo.bytes(&["cat", &format!("/ipfs/{targeted}/{name}")]),
+            name.as_bytes()
+        );
+        assert!(!kubo
+            .command_api()
+            .args(["resolve", &format!("/ipfs/{root}/{name}")])
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+    assert!(kubo
+        .node(&kubo.cid_at(&targeted, "empty/nested"))
+        .links
+        .is_empty());
+    assert!(kubo.node(&sources[3].cid().to_string()).links.is_empty());
+    assert_eq!(sources[4].dag_size(), 0);
+    assert_eq!(sources[4].kind(), SourceKind::File);
+    assert!(kubo
+        .bytes(&["cat", &sources[4].cid().to_string()])
+        .is_empty());
+    assert_eq!(
+        kubo.bytes(&["cat", &sources[5].cid().to_string()]),
+        b"small captured file"
+    );
+    let retained: Vec<_> = sources.iter().map(|s| s.cid()).collect();
+    drop(published);
+    kubo.cli(&["repo", "gc"]);
+    for cid in retained {
+        kubo.cli(&["pin", "ls", "--type=recursive", &cid.to_string()]);
+        kubo.bytes(&["block", "get", &cid.to_string()]);
+    }
+    assert_eq!(
+        kubo.bytes(&["cat", &kubo.cid_at(&targeted, "café")]),
+        "café".as_bytes()
+    );
+}
+
 struct Kubo {
     child: Child,
     repo: tempfile::TempDir,
