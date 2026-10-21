@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Shared kernel preparation and generation identity (#735 Landing 1 of 3).**
+  The library verifies immutable kernel-file selection against an explicit FHS
+  root and shares native P3 static kernel validation. Current kernel identity
+  reporting is bound to the active generation. PID0 compilation admits at most
+  one physically outstanding compilation per Deployment and retains only the
+  latest pending target. Logical cancellation is immediate; superseded native
+  work can continue and holds admission until physical completion. Native
+  completion and shutdown latency have no hard upper bound. Existing boot
+  selection and packaging remain unchanged.
 - **CLI targeted mounts and immutable Stem replay (#734 Landing C).**
   `ww run` accepts ordered `source[:/guest/target]` operations, including local
   files and directories. Startup captures all local sources once, verifies and
