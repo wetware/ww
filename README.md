@@ -92,6 +92,11 @@ examples.
 
 ## How it works
 
+Mounts use `source[:/guest/target]`, for example `ww run ./config:/etc/myapp`.
+Local sources freeze once at startup; Stem updates reuse those exact snapshots.
+Use explicit local paths (`./app`, `/path`, or `~/app`). Bare `ww run` does not
+mount CWD or select installed state; pass an image or configure a Stem.
+
 `ww run` starts a libp2p node on port 2025 and merges any [image layers](doc/images.md)
 into a virtual FHS filesystem. The Host selects trusted PID0 independently
 through `KernelSource`: `--kernel` takes precedence over `WW_KERNEL`, and the

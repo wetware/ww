@@ -128,6 +128,7 @@ struct Composer<'a, S> {
     written_bytes: usize,
     work: usize,
     capture_blocks: Option<HashMap<Cid, Vec<u8>>>,
+    bounded_source_reads: bool,
 }
 
 pub(super) async fn compose(source: &impl BlockSource, layers: &[Cid]) -> Result<Composition> {
@@ -151,6 +152,50 @@ async fn compose_with_limits(
 
 pub(super) async fn inspect_source(source: &impl BlockSource, cid: Cid) -> Result<FrozenSource> {
     Composer::new(source, LIMITS).inspect(cid, 0, false).await
+}
+
+/// Validate immutable traversal with the same cumulative allowance as local
+/// snapshot verification. Ordinary directory raw children remain opaque.
+pub(super) async fn inspect_path(
+    source: &impl BlockSource,
+    root: Cid,
+    components: &[String],
+    budget: &mut InspectionBudget,
+) -> Result<FrozenSource> {
+    let mut inspector = Composer::new(
+        source,
+        Limits {
+            max_nodes: MAX_NODES.saturating_sub(budget.nodes),
+            max_read_bytes: MAX_BYTES.saturating_sub(budget.read_bytes),
+            max_written_bytes: 0,
+            max_work: MAX_WORK.saturating_sub(budget.work),
+        },
+    );
+    inspector.bounded_source_reads = true;
+    let result = async {
+        let mut selected = root;
+        for (depth, component) in components.iter().enumerate() {
+            inspector.charge_work(1)?;
+            let node = inspector.load(selected, depth).await?;
+            let CachedKind::Directory(directory) = node.kind else {
+                return Err(CompositionError::InvalidSource(format!(
+                    "immutable source component {component:?} has a file or symlink ancestor"
+                ))
+                .into());
+            };
+            selected = directory
+                .entries
+                .get(component)
+                .with_context(|| format!("immutable source has no entry {component:?}"))?
+                .cid;
+        }
+        inspector.inspect(selected, components.len(), false).await
+    }
+    .await;
+    budget.nodes += inspector.nodes.len();
+    budget.read_bytes += inspector.read_bytes;
+    budget.work += inspector.work;
+    result
 }
 
 /// Cumulative validation allowance for a complete local-source batch.
@@ -330,6 +375,7 @@ impl<S: BlockSource> Composer<'_, S> {
             written_bytes: 0,
             work: 0,
             capture_blocks: None,
+            bounded_source_reads: false,
         }
     }
 
@@ -504,7 +550,7 @@ impl<S: BlockSource> Composer<'_, S> {
     }
 
     async fn read_block(&mut self, cid: &Cid) -> Result<Vec<u8>> {
-        let bytes = if self.capture_blocks.is_some() {
+        let bytes = if self.capture_blocks.is_some() || self.bounded_source_reads {
             let allowance = codec::MAX_BLOCK_BYTES
                 .min(self.limits.max_read_bytes.saturating_sub(self.read_bytes));
             ensure!(

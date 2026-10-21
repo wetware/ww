@@ -49,6 +49,8 @@ fn decode_component(encoded: &str) -> String {
 #[derive(Clone, Copy)]
 enum ResponseMode {
     Success,
+    Resolve,
+    Named(&'static str),
     ReadFailure,
     ImportFailure,
     MissingAcknowledgement,
@@ -155,8 +157,35 @@ impl FakeKubo {
                             b"{}".to_vec()
                         }
                         "dag/import" => {
+                            let root =
+                                if matches!(mode, ResponseMode::Resolve | ResponseMode::Named(_)) {
+                                    blocks
+                                        .keys()
+                                        .copied()
+                                        .chain(std::iter::once(root))
+                                        .filter_map(|cid| {
+                                            let bytes = cid.to_bytes();
+                                            request
+                                                .body
+                                                .windows(bytes.len())
+                                                .position(|window| window == bytes)
+                                                .map(|index| (index, cid))
+                                        })
+                                        .min_by_key(|(index, _)| *index)
+                                        .unwrap()
+                                        .1
+                                } else {
+                                    root
+                                };
                             format!(r#"{{"Root":{{"Cid":{{"/":"{root}"}},"PinErrorMsg":""}}}}"#)
                                 .into_bytes()
+                        }
+                        "pin/add" => b"{}".to_vec(),
+                        "name/resolve" if matches!(mode, ResponseMode::Named(_)) => {
+                            let ResponseMode::Named(suffix) = mode else {
+                                unreachable!()
+                            };
+                            format!(r#"{{"Path":"/ipfs/{root}{suffix}"}}"#).into_bytes()
                         }
                         endpoint => panic!("composition requested forbidden endpoint {endpoint}"),
                     }
@@ -184,9 +213,10 @@ impl FakeKubo {
     fn requests(&self) -> Vec<Request> {
         let requests = self.requests.lock().unwrap().clone();
         assert!(
-            requests
-                .iter()
-                .all(|request| matches!(request.endpoint.as_str(), "block/get" | "dag/import")),
+            requests.iter().all(|request| matches!(
+                request.endpoint.as_str(),
+                "block/get" | "dag/import" | "name/resolve" | "pin/add"
+            )),
             "{requests:?}"
         );
         requests
@@ -273,15 +303,10 @@ async fn slash_bearing_root_mount_alias_needs_no_path_resolution() {
     );
     let alias = multibase(Base::Base64, root.to_bytes());
     assert!(alias.contains('/'));
-    let kubo = FakeKubo::new(HashMap::new(), root, ResponseMode::Success).await;
-    let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
     assert_eq!(
-        resolve_bare_cid(&format!("/ipfs/{alias}"), &kubo.client, &mut cancel)
-            .await
-            .unwrap(),
-        root.to_string()
+        crate::mount::parse_immutable_path(&format!("/ipfs/{alias}")).unwrap(),
+        (root, Vec::new())
     );
-    assert!(kubo.requests().is_empty());
 }
 
 #[tokio::test]
@@ -536,4 +561,286 @@ async fn standalone_http_block_limits_are_typed_but_transport_errors_are_not() {
         }
         server.await.unwrap();
     }
+}
+
+async fn resolve_fixture(kubo: &FakeKubo, mounts: &[Mount], head: bool) -> Result<ResolvedMounts> {
+    let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+    resolve_fixture_with_cancel(kubo, mounts, head, &mut cancel).await
+}
+
+async fn resolve_fixture_with_cancel(
+    kubo: &FakeKubo,
+    mounts: &[Mount],
+    head: bool,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<ResolvedMounts> {
+    let (owner, host) = cache::HostFsOwner::start(
+        tokio::runtime::Handle::current(),
+        cache::HostLimits::default(),
+    )
+    .unwrap();
+    let (scope, scope_owner, finalizer, _completion) = host.try_filesystem_scope().unwrap();
+    let transaction = host
+        .try_foreground_transaction(host.try_logical_io().unwrap(), &[&scope])
+        .unwrap();
+    let result =
+        resolve_frozen_mounts_with_cancel(mounts, &kubo.client, &transaction, head, cancel).await;
+    drop(transaction);
+    drop(scope_owner);
+    drop(finalizer);
+    owner.shutdown().await.unwrap();
+    result
+}
+
+#[tokio::test]
+async fn resolution_retains_parent_and_selected_and_freezes_exact_operations() {
+    let bytes = b"selected bytes";
+    let (root, block) = directory(&[("child", bytes)]);
+    let selected = Cid::new_v1(
+        0x55,
+        cid::multihash::Multihash::wrap(0x12, &Sha256::digest(bytes)).unwrap(),
+    );
+    let kubo = FakeKubo::new(
+        HashMap::from([(root, block), (selected, bytes.to_vec())]),
+        root,
+        ResponseMode::Resolve,
+    )
+    .await;
+    let mounts = crate::mount::parse_args(&[
+        format!("/ipfs/{root}/child:/etc/a"),
+        format!("{selected}:/etc/a"),
+    ])
+    .unwrap();
+    let resolved = resolve_fixture(&kubo, &mounts, false).await.unwrap();
+    assert_eq!(resolved.mounts.len(), 2);
+    assert!(resolved
+        .mounts
+        .iter()
+        .all(|mount| mount.source().cid() == selected));
+    assert_eq!(resolved.mounts[0].target().to_string(), "/etc/a");
+    assert_eq!(resolved.retained_roots, [root, selected, selected]);
+    let requests = kubo.requests();
+    assert_eq!(
+        requests[0].endpoint, "pin/add",
+        "parent fetched and retained before traversal"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.endpoint == "dag/import")
+            .count(),
+        3
+    );
+    assert!(!requests.iter().any(|request| request.endpoint == "resolve"));
+}
+
+#[tokio::test]
+async fn resolution_names_resolve_once_and_append_components_structurally() {
+    let bytes = b"selected bytes";
+    let (child, child_block) = directory(&[("leaf", bytes)]);
+    let selected = Cid::new_v1(
+        0x55,
+        cid::multihash::Multihash::wrap(0x12, &Sha256::digest(bytes)).unwrap(),
+    );
+    let (root, root_block, _) = super::codec::encode(&Directory {
+        data: Bytes::from_static(&[0x08, 0x01]),
+        entries: BTreeMap::from([(
+            "child".into(),
+            Link {
+                cid: child,
+                size: child_block.len() as u64 + bytes.len() as u64,
+            },
+        )]),
+    })
+    .unwrap();
+    let kubo = FakeKubo::new(
+        HashMap::from([
+            (root, root_block),
+            (child, child_block),
+            (selected, bytes.to_vec()),
+        ]),
+        root,
+        ResponseMode::Named("/child"),
+    )
+    .await;
+    let mounts = crate::mount::parse_args(&["/ipns/example.com/leaf:/etc/file".into()]).unwrap();
+    let resolved = resolve_fixture(&kubo, &mounts, false).await.unwrap();
+    assert_eq!(resolved.mounts[0].source().cid(), selected);
+    let requests = kubo.requests();
+    let names = requests
+        .iter()
+        .filter(|request| request.endpoint == "name/resolve")
+        .collect::<Vec<_>>();
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0].argument(), "example.com");
+}
+
+#[tokio::test]
+async fn resolution_rejects_file_ancestors_and_root_files_and_keeps_acknowledged_pins() {
+    let bytes = b"file";
+    let (root, block) = directory(&[("file", bytes)]);
+    let file = Cid::new_v1(
+        0x55,
+        cid::multihash::Multihash::wrap(0x12, &Sha256::digest(bytes)).unwrap(),
+    );
+    for argument in [format!("/ipfs/{root}/file/child:/etc"), file.to_string()] {
+        let kubo = FakeKubo::new(
+            HashMap::from([(root, block.clone()), (file, bytes.to_vec())]),
+            root,
+            ResponseMode::Resolve,
+        )
+        .await;
+        let mounts = crate::mount::parse_args(&[argument]).unwrap();
+        let error = resolve_fixture(&kubo, &mounts, false).await.unwrap_err();
+        let error = error.downcast_ref::<MountResolutionFailure>().unwrap();
+        assert_eq!(error.retained_roots.len(), 1);
+        assert!(!error.uncertain_publication);
+        assert!(!kubo
+            .requests()
+            .iter()
+            .any(|request| request.endpoint == "pin/rm"));
+    }
+}
+
+#[tokio::test]
+async fn resolution_rejects_invalid_batches_before_any_request_and_counts_head() {
+    let (root, block) = directory(&[]);
+    let kubo = FakeKubo::new(HashMap::from([(root, block)]), root, ResponseMode::Resolve).await;
+    let mut mounts = crate::mount::parse_args(&vec![root.to_string(); 128]).unwrap();
+    assert!(resolve_fixture(&kubo, &mounts, true).await.is_err());
+    mounts.truncate(2);
+    mounts[1].source = "/ipns/name/../escape".into();
+    assert!(resolve_fixture(&kubo, &mounts, false).await.is_err());
+    mounts[1].source = "./relative".into();
+    assert!(resolve_fixture(&kubo, &mounts, false).await.is_err());
+    assert!(kubo.requests().is_empty());
+    assert!(resolve_fixture(&kubo, &[], true)
+        .await
+        .unwrap()
+        .mounts
+        .is_empty());
+}
+
+#[tokio::test]
+async fn resolution_lost_retention_acknowledgement_is_uncertain_without_success() {
+    let (root, block) = directory(&[]);
+    let kubo = FakeKubo::new(
+        HashMap::from([(root, block)]),
+        root,
+        ResponseMode::MissingAcknowledgement,
+    )
+    .await;
+    let mounts = crate::mount::parse_args(&[root.to_string()]).unwrap();
+    let error = resolve_fixture(&kubo, &mounts, false).await.unwrap_err();
+    let error = error.downcast_ref::<MountResolutionFailure>().unwrap();
+    assert!(error.uncertain_publication);
+    assert!(error.retained_roots.is_empty());
+    assert_eq!(kubo.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn resolution_captures_entire_local_batch_before_publishing_any_source() {
+    let _serial = super::capture::tests::ASYNC_CAPTURE_TEST.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().canonicalize().unwrap();
+    std::fs::write(directory.join("first"), b"captured").unwrap();
+    let mounts = crate::mount::parse_args(&[
+        format!("{}:/first", directory.join("first").display()),
+        format!("{}:/missing", directory.join("missing").display()),
+    ])
+    .unwrap();
+    let (root, block) = self::directory(&[]);
+    let kubo = FakeKubo::new(HashMap::from([(root, block)]), root, ResponseMode::Resolve).await;
+    let error = resolve_fixture(&kubo, &mounts, false).await.unwrap_err();
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<rustix::io::Errno>()
+                == Some(&rustix::io::Errno::NOENT)),
+        "{error:#}"
+    );
+    assert!(kubo.requests().is_empty());
+}
+
+#[tokio::test]
+async fn resolution_never_follows_immutable_symlinks() {
+    let symlink_block = vec![0x0a, 0x08, 0x08, 0x04, 0x12, 0x04, b'f', b'i', b'l', b'e'];
+    let symlink = Cid::new_v1(
+        0x70,
+        cid::multihash::Multihash::wrap(0x12, &Sha256::digest(&symlink_block)).unwrap(),
+    );
+    let (root, block, _) = super::codec::encode(&Directory {
+        data: Bytes::from_static(&[0x08, 0x01]),
+        entries: BTreeMap::from([(
+            "link".into(),
+            Link {
+                cid: symlink,
+                size: symlink_block.len() as u64,
+            },
+        )]),
+    })
+    .unwrap();
+    for suffix in ["link", "link/child"] {
+        let kubo = FakeKubo::new(
+            HashMap::from([(root, block.clone()), (symlink, symlink_block.clone())]),
+            root,
+            ResponseMode::Resolve,
+        )
+        .await;
+        let mounts = crate::mount::parse_args(&[format!("/ipfs/{root}/{suffix}:/etc")]).unwrap();
+        let error = resolve_fixture(&kubo, &mounts, false).await.unwrap_err();
+        assert!(format!("{error:#}").contains("symlink"));
+        assert_eq!(
+            error
+                .downcast_ref::<MountResolutionFailure>()
+                .unwrap()
+                .retained_roots,
+            [root]
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolution_cancels_pending_name_lookup_without_frozen_operations() {
+    let (root, block) = directory(&[]);
+    let kubo = FakeKubo::new(
+        HashMap::from([(root, block)]),
+        root,
+        ResponseMode::Stall("name/resolve"),
+    )
+    .await;
+    let mounts = crate::mount::parse_args(&["/ipns/example.com".into()]).unwrap();
+    let (tx, mut cancel) = tokio::sync::watch::channel(false);
+    let resolution = resolve_fixture_with_cancel(&kubo, &mounts, false, &mut cancel);
+    tokio::pin!(resolution);
+    tokio::select! {
+        result = &mut resolution => panic!("completed before cancellation: {result:?}"),
+        _ = kubo.stalled.notified() => {},
+    }
+    tx.send(true).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), resolution)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("cancelled"));
+    assert!(error
+        .downcast_ref::<MountResolutionFailure>()
+        .unwrap()
+        .retained_roots
+        .is_empty());
+    assert_eq!(kubo.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn resolution_rejects_noncanonical_name_results_before_retention() {
+    let (root, block) = directory(&[]);
+    let kubo = FakeKubo::new(
+        HashMap::from([(root, block)]),
+        root,
+        ResponseMode::Named("/../escape"),
+    )
+    .await;
+    let mounts = crate::mount::parse_args(&["/ipns/example.com".into()]).unwrap();
+    assert!(resolve_fixture(&kubo, &mounts, false).await.is_err());
+    assert_eq!(kubo.requests().len(), 1);
 }

@@ -1,8 +1,8 @@
 # Local mount snapshots
 
-Landing B of #734 adds a library capture/publication path. Public `ww run`,
-mount parsing, deployment epochs, and `ww push` still use their existing paths.
-Landing C integrates the library with startup and deployment ownership.
+`ww run` captures local mount sources once before deployment. Ordered immutable
+source CIDs and guest targets replay unchanged across authoritative Stem epochs.
+`ww push` retains its separate importer and publication contract.
 
 ## Capture
 
@@ -10,8 +10,8 @@ Landing C integrates the library with startup and deployment ownership.
 `cache::ForegroundTransaction`. All local sources enter one batch before any
 source is published. No identity, key, namespace, or adjacent `~/.ww` discovery
 occurs. Explicitly selecting private content still imports that content.
-Relative paths use the worker's captured CWD descriptor. Landing C must construct
-absolute requests from invocation-time CWD before starting capture.
+The CLI constructs absolute requests from invocation-time CWD before starting
+capture. Explicit `~/` sources expand once; no `~/.ww` fallback occurs.
 
 One blocking worker uses descriptor-relative `rustix` opens. Every source
 component and included descendant rejects symlinks. Directory opens require
@@ -99,8 +99,8 @@ they are not an exact process RSS limit.
 | Verification nodes / work visits | 100,000 / 1,000,000 |
 | CAR acknowledgement response | Existing 64 KiB limit |
 
-Landing C must count immutable/named sources and the authoritative head against
-the same 128-operation envelope. Composer additionally checks target depth plus
+Immutable/named sources and the authoritative head count against the same
+128-operation envelope. Composer additionally checks target depth plus
 source DAG height. A captured payload can fit 64 MiB while its imported DAG
 exceeds verification or composition bounds; that batch fails before activation.
 The stored-path allowance includes manifest, digest, and mutation-record keys.
@@ -108,7 +108,7 @@ The stored-path allowance includes manifest, digest, and mutation-record keys.
 ## Retention ownership
 
 `PublishedSources` carries verified identities, not independent pin claims.
-Landing C must transfer all roots to deployment's frozen-source ownership before
+Startup transfers all roots to deployment's frozen-source ownership before
 preparation. Roots hidden by later operations still require retention.
 
 Dropping success or failure values never unpins. `SnapshotPublicationFailure`
@@ -116,6 +116,12 @@ reports acknowledged roots and an uncertain source index when upload outcome
 is unknown. Interrupted publication can leave blocks or pins. An aborted future
 cannot return that report; callers must treat its publication outcome as unknown.
 Repeated Kubo pins are CID-centric and cannot justify compensating unpins.
+
+The deployment cache uses `RetainedPinner`: cache eviction releases local staging
+and residency but does not remove shared Kubo pins. A cached file CID can also
+be a frozen source root. Retained Kubo content can outlive the deployment and
+requires explicit operator cleanup after all users release it. This policy does
+not change other `PinsetCache` callers or add a global pin ownership registry.
 
 This path adds no general retention registry, durable snapshot catalog, or
 restart recovery protocol. Source identity and retention ownership remain

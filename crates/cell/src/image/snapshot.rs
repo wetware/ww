@@ -75,8 +75,18 @@ impl CaptureBatch {
         client: &ipfs::BootClient,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<PublishedSources, SnapshotPublicationFailure> {
-        let publication = PublicationBudget::default();
         let mut verification = verify_capture::VerificationBudget::default();
+        self.publish_with_budget(client, cancel, &mut verification)
+            .await
+    }
+
+    pub(super) async fn publish_with_budget(
+        self,
+        client: &ipfs::BootClient,
+        cancel: &mut watch::Receiver<bool>,
+        verification: &mut verify_capture::VerificationBudget,
+    ) -> Result<PublishedSources, SnapshotPublicationFailure> {
+        let publication = PublicationBudget::default();
         let mut acknowledged_roots = Vec::new();
         let mut sources = Vec::new();
         for (index, captured) in self.into_sources().into_iter().enumerate() {
@@ -105,7 +115,7 @@ impl CaptureBatch {
             acknowledged_roots.push(published.events[""].cid);
             let verified = await_or_cancel(
                 cancel,
-                verify_capture::verify(client, &captured, &published.events, &mut verification),
+                verify_capture::verify(client, &captured, &published.events, verification),
             )
             .await;
             match verified {

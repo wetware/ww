@@ -282,7 +282,7 @@ test-wasm: std examples authority-probe routing-key-probe stream-lifecycle-probe
 # --- Run ---------------------------------------------------------------------
 
 run-kernel: kernel status
-	cargo run --locked -- run std/status
+	cargo run --locked -- run ./std/status
 
 # --- Clean -------------------------------------------------------------------
 

@@ -7,18 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **CLI targeted mounts and immutable Stem replay (#734 Landing C).**
+  `ww run` accepts ordered `source[:/guest/target]` operations, including local
+  files and directories. Startup captures all local sources once, verifies and
+  retains their immutable CIDs, and replays the same operations over each Stem
+  head. CLI overlays keep highest precedence. Retention failures abort startup
+  and report residual pins instead of activating a partial deployment.
 - **Local mount capture and verified Kubo publication (#734 Landing B).**
   The library uses bounded, descriptor-relative capture without following
   symlinks and publishes immutable UnixFS snapshots through Kubo. Strict import
   response and DAG/manifest verification, plus explicit retained-root
   acknowledgements, precede frozen-source delivery. Failure cleanup preserves
-  blocks and pins with uncertain ownership. Public CLI and deployment integration
-  remain in Landing C.
+  blocks and pins with uncertain ownership.
 - **Composer v1 supports immutable targeted file and directory composition (#734 Landing A).**
   Ordered operations preserve strict ancestor metadata and produce deterministic
   root CIDs. Standalone source inspection verifies cumulative sizes, and typed
-  errors report deterministic composition failures. Public CLI targeted mounts
-  are not enabled yet.
+  errors report deterministic composition failures.
 
 ### Fixed
 - **Atom head reads decode Solidity return parameters correctly.** Standard
@@ -50,6 +54,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- **Mount sources are explicit (#734 Landing C).** `ww run` no longer defaults
+  to CWD or searches `~/.ww` for missing relative sources. Local names require
+  `./`, `/`, or `~/`; bare operands must be complete CIDs. Zero mount arguments
+  require namespace configuration supplying an image or an authoritative Stem.
+  An empty namespace root fails before Host startup or Kubo waiting. Installed
+  default boot remains deferred to #735; PID0 selectors and `--ws-url` remain.
 - **Removed unsupported entry paths and reconciled guidance (#683 Landing 8).**
   The inert `--epoch-drain-secs` option now fails CLI parsing. Public
   `LocalAnnouncer` and `LocalProviderRouting::announcer()` are removed;

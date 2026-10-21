@@ -7,21 +7,32 @@ master is therefore a release build, not a production deployment.
 ## Runtime deployment lifecycle
 
 The host-side `deployment` module owns runtime deployment transitions. A
-deployment combines an optional authoritative Stem head with configured frozen
-root layers. Later layers override earlier layers during DAG composition.
+deployment combines an optional authoritative Stem head with ordered
+`FrozenMount` operations. Namespace root operations precede explicit CLI
+operations. CLI operations therefore retain highest composition precedence.
+Directory targets merge recursively; other collisions use the later source.
+
+Before deployment starts, the CLI captures all local sources in one admitted
+batch, then publishes and verifies the snapshots. Source CIDs, targets, and
+retained source-root identities transfer to deployment before preparation.
+Every epoch replays those same operations. Local paths and successfully frozen
+names are never read again during retry, speculation, or replacement.
 
 The initial deployment baseline starts at local epoch `0`. Accepted Source
 updates during boot preparation can advance the local epoch before the first
 rooted activation. Atom contract revisions and IPNS record sequences are Source
 state; neither value becomes `Epoch.seq`. A host restart starts at epoch `0`
-again. Static startup prepares the frozen layers through the same path,
+again. Static startup prepares the frozen operations through the same path,
 publishes a rooted epoch `0`, and starts no Source task.
 
 For a replacement, deployment publishes the new local epoch with `root: None`
 before root preparation. This publication revokes old authority. Deployment
 then prepares a `PreparedRoot` while the old `kernel::Generation` terminates.
-Preparation pins the head, merges the head with frozen layers, pins the
-effective root, and pre-warms the root without changing `CidTree`.
+Preparation pins the head, applies the frozen operations, pins the effective
+root, and pre-warms the root without changing `CidTree`.
+Typed `CompositionError` failures, including target obstruction, leave the
+accepted epoch unrooted. A later valid head can recover using the same frozen
+operations. Transport failures retain their distinct retry policy.
 
 Deployment drains queued Source updates after preparation and teardown. A
 newer update supersedes the prepared root. If the prepared root remains current,
@@ -31,7 +42,18 @@ ordinary generation through deployment. The CLI retains interactive behavior,
 exit codes, signals, and teardown-timeout process policy.
 
 Deployment tracks frozen, active, preparation-attempt, and failed-unpin pin
-ownership. It does not unpin a CID that another live category references.
+ownership. Its protected set includes every frozen source and retained source
+root, including sources hidden by later operations. Repeated Kubo pins do not
+create independent ownership. Frozen source pins remain retained after shutdown;
+failed or uncertain publication never triggers compensating unpins.
+
+The deployment cache uses `RetainedPinner`. Cache eviction releases local
+staging and residency while retaining Kubo pins that could overlap deployment
+content. Retained Kubo content requires explicit operator cleanup after all users
+release it. Known candidate roots still use deployment's protected-set cleanup.
+Each cleanup pass shares at most 128 unpin attempts and one 30-second deadline
+across queued sets. Remaining work is reported and deferred. These protections apply within the
+current deployment, not across independent processes sharing a Kubo node.
 `CidTree::swap_root` only changes the root and clears its in-memory directory
 cache. Deployment removes stale readdir stubs after rooted publication.
 

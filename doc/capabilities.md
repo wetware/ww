@@ -165,16 +165,14 @@ publication. The removed broad `Routing` interface formerly contained
 private and ephemeral. Read-only image and `/ipfs` access do not acquire the
 removed CID-transform semantics.
 
-## Local overrides
+## Local mount snapshots
 
-Backend virtual mode rejects targeted mounts, so host-local overrides are
-currently not part of the backend runtime surface. Publish content to IPFS/IPNS
-and mount it as a root layer instead.
-
-A future host-mount facility must require explicit host authorization and must
-expose files and directories read-only. It must not grant ambient host-filesystem
-authority. The design must define overlay precedence and reject `/ipfs` and all
-of its descendants as mount targets. No such facility exists now.
+`ww run ./config:/etc/app` explicitly selects local content for immutable
+capture and publication. Guest filesystem reads use the retained IPFS DAG;
+they do not reopen host paths or receive ambient host-filesystem authority.
+CLI operations apply after the authoritative head and namespace images.
+Stem updates replay the same frozen operations, including targeted files and
+directories. See [local snapshots](local-snapshots.md) for capture restrictions.
 
 ## Capability lifecycle
 

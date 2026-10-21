@@ -40,6 +40,14 @@ pub(super) async fn daemon_install(
 ) -> Result<bool> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
     let ww_dir = home.join(".ww");
+    // Service startup has a different working directory. Freeze explicitly
+    // selected local sources while the install invocation still owns its CWD.
+    let mut image_mounts = ww::cell::mount::parse_args(&images)?;
+    ww::cell::mount::freeze_local_paths(
+        &mut image_mounts,
+        &std::env::current_dir().context("read daemon install CWD")?,
+        Some(&home),
+    )?;
 
     // 1. Resolve identity path — default to ~/.ww/identity.
     let key_path = identity.unwrap_or_else(|| ww_dir.join("identity"));
@@ -69,7 +77,17 @@ pub(super) async fn daemon_install(
         let (fhs_dir, _) = refresh_default_fhs(&ww_dir)?;
         (vec![ww_dir.clone()], vec![fhs_dir])
     } else {
-        (Vec::new(), images.iter().map(PathBuf::from).collect())
+        let images = image_mounts
+            .into_iter()
+            .map(|mount| {
+                if mount.is_root() {
+                    PathBuf::from(mount.source)
+                } else {
+                    PathBuf::from(format!("{}:{}", mount.source, mount.target))
+                }
+            })
+            .collect();
+        (Vec::new(), images)
     };
 
     // Default WAGI HTTP listener so Rust PID0 responds to curl on first boot.

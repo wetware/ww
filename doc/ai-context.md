@@ -88,7 +88,7 @@ Quick start:
 ```
 rustup toolchain install nightly-2026-08-30 --component rust-src
 make
-cargo run -- run --http-listen 127.0.0.1:2080 std/status
+cargo run -- run --http-listen 127.0.0.1:2080 ./std/status
 curl http://127.0.0.1:2080/status
 ```
 

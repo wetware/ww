@@ -1587,3 +1587,37 @@ async fn capture_inspection_rejects_raw_tsize_without_changing_ordinary_composer
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn local_capture_and_immutable_resolution_share_verification_allowances() {
+    let mut memory = Memory::default();
+    let file = memory.raw_block(b"four");
+    let directory = memory.dir(&[("file", file.clone())]);
+    let mut budget = InspectionBudget {
+        nodes: MAX_NODES - 2,
+        ..Default::default()
+    };
+    inspect_capture(&memory, file.cid, &mut budget)
+        .await
+        .unwrap();
+    assert_eq!(budget.nodes, MAX_NODES - 1);
+    let error = inspect_path(&memory, directory.cid, &[], &mut budget)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        deterministic_error(&error),
+        CompositionError::ResourceLimit(_)
+    ));
+
+    let mut budget = InspectionBudget {
+        read_bytes: MAX_BYTES - 4,
+        ..Default::default()
+    };
+    inspect_capture(&memory, file.cid, &mut budget)
+        .await
+        .unwrap();
+    assert_eq!(budget.read_bytes, MAX_BYTES);
+    assert!(inspect_path(&memory, file.cid, &[], &mut budget)
+        .await
+        .is_err());
+}
