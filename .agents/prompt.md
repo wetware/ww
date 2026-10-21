@@ -67,7 +67,7 @@ With `:target`, source overlays that guest path.
 Layers stack with per-file union; later layers win.
 
 ```
-ww run images/app ~/.ww/identity:/etc/identity ~/data:/var/data
+ww run ./images/app ./config:/etc/myapp ~/data:/var/data
 ```
 
 ## Standard ports

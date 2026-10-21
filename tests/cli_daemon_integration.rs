@@ -176,6 +176,46 @@ fn daemon_install_writes_service_with_listen_args() {
     assert!(service.contains("--identity"), "{service}");
 }
 
+#[test]
+fn daemon_install_freezes_explicit_local_mounts_against_invocation_cwd() {
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        return;
+    }
+    let home = tempfile::tempdir().expect("temp home");
+    let cwd = tempfile::tempdir().expect("temp invocation directory");
+    let output = ww_command(
+        home.path(),
+        &[
+            "daemon",
+            "install",
+            "--images",
+            "./image",
+            "--images",
+            "./config:/etc/app",
+        ],
+    )
+    .current_dir(cwd.path())
+    .output()
+    .expect("execute daemon install");
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    let service_path = if cfg!(target_os = "macos") {
+        home.path().join("Library/LaunchAgents/io.wetware.ww.plist")
+    } else {
+        home.path().join(".config/systemd/user/ww.service")
+    };
+    let service = std::fs::read_to_string(service_path).expect("read generated service");
+    let arguments = service_arguments(&service);
+    // current_dir() resolves the process working directory before paths freeze.
+    let resolved_cwd = cwd.path().canonicalize().unwrap();
+    assert_eq!(
+        image_arguments(&arguments),
+        [
+            resolved_cwd.join("image").display().to_string(),
+            format!("{}/config:/etc/app", resolved_cwd.display()),
+        ]
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn perform_update_restarts_for_service_definition_change_only() {
@@ -399,5 +439,38 @@ async fn default_daemon_import_excludes_private_host_state() {
     assert!(
         !request.contains("PRIVATE_PUBLISHER_RECORD_SENTINEL"),
         "{request}"
+    );
+}
+
+#[tokio::test]
+async fn bare_run_from_private_cwd_fails_without_contacting_kubo() {
+    let home = tempfile::tempdir().unwrap();
+    let private = home.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::write(
+        private.join("identity"),
+        b"private material must stay local",
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let mut command = ww_command(home.path(), &["run", "--ipfs-url", &url]);
+    command.current_dir(&private).env_remove("WW_KERNEL");
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
+        .await
+        .expect("bare startup must fail before waiting for dependencies")
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr_text(&output).contains("No explicit image source"));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(
+        !home.path().join(".ww").exists(),
+        "bare startup must not initialize Host state"
     );
 }

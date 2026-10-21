@@ -105,7 +105,7 @@ ww keygen --output ~/.ww/identity
 ww keygen > ~/.ww/identity          # equivalent
 
 # Run with a persistent identity
-ww run --identity ~/.ww/identity images/my-app
+ww run --identity ~/.ww/identity ./images/my-app
 ```
 
 ## File format

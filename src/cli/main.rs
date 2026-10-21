@@ -108,16 +108,18 @@ enum Commands {
 
     /// Run a wetware environment.
     ///
-    /// Every positional argument is a mount source mounted at `/` (image layer).
-    /// Targeted mounts (`source:/guest/path`) are rejected in backend virtual mode.
+    /// Mount sources use source[:/guest/target], applied in argument order.
+    /// Local files require an explicit target; root sources must be directories.
+    /// Local sources require ./, /, or ~/; no implicit current-directory mount.
     ///
     /// Examples:
-    ///   ww run .                                    # dev mode
-    ///   ww run images/app
-    ///   ww run /ipfs/QmHash /ipns/k51qzi5uqu5...
+    ///   ww run .
+    ///   ww run ./images/app ./config:/etc/myapp
+    ///   ww run ./kernel.wasm:/boot/kernel.wasm
+    ///   ww run /ipfs/<directory-cid>
     Run {
-        /// Mount source(s) at `/` (image layers).
-        #[arg(default_value = ".", value_name = "MOUNT")]
+        /// Ordered source[:/guest/target] mounts. No default source.
+        #[arg(value_name = "MOUNT")]
         mounts: Vec<String>,
 
         /// Host-only roots whose `etc/ns` directories configure namespace layers.
@@ -292,7 +294,7 @@ enum Commands {
     /// Publish a built image tree to IPFS.
     ///
     /// Imports the tree as a directory and reports its root CID.
-    /// Uses the same import rules as local image mounts.
+    /// Uses the legacy directory importer, separate from `run` snapshots.
     ///
     /// Requires at least one bin/*.wasm file (run 'ww build' first).
     Push {
@@ -360,7 +362,7 @@ enum DaemonAction {
         )]
         listen: Vec<Multiaddr>,
 
-        /// Image layers to run (local paths or IPFS CIDs).
+        /// Mounts to run: source[:/guest/target]. Local paths require ./, /, or ~/.
         #[arg(long, value_name = "PATH")]
         images: Vec<String>,
 
@@ -750,8 +752,13 @@ impl Commands {
                 with_http_admin,
                 ipfs_url,
             } => {
-                let mounts = ww::cell::mount::parse_args(&mount_args)?;
-                Self::validate_backend_mount_policy(&mounts)?;
+                let mut mounts = ww::cell::mount::parse_args(&mount_args)?;
+                let invocation_cwd = std::env::current_dir().context("read invocation CWD")?;
+                ww::cell::mount::freeze_local_paths(
+                    &mut mounts,
+                    &invocation_cwd,
+                    dirs::home_dir().as_deref(),
+                )?;
                 let env_kernel = match std::env::var("WW_KERNEL") {
                     Ok(value) => Some(value),
                     Err(std::env::VarError::NotPresent) => None,
@@ -1246,31 +1253,64 @@ system::export!({iface_name}Guest);
         }
     }
 
-    /// Backend policy: only root mounts are allowed.
-    ///
-    /// Backend virtual mode uses one data plane. Publish content to IPFS/IPNS
-    /// and mount it as a root layer.
-    fn validate_backend_mount_policy(mounts: &[ww::cell::mount::Mount]) -> Result<()> {
-        let targeted: Vec<&ww::cell::mount::Mount> =
-            mounts.iter().filter(|m| !m.is_root()).collect();
-        if targeted.is_empty() {
-            return Ok(());
+    /// Require an explicit image or authoritative source before starting Host services.
+    fn startup_namespaces(
+        mounts: &[ww::cell::mount::Mount],
+        namespace_roots: &[PathBuf],
+        authoritative_source: bool,
+    ) -> Result<Vec<ww::ns::NamespaceConfig>> {
+        image::validate_mounts_virtual(mounts)?;
+        // Metadata preflight keeps invalid local input actionable during a
+        // backend outage. Capture still performs authoritative no-follow reads.
+        for mount in mounts
+            .iter()
+            .filter(|mount| ww::cell::mount::is_local_source(&mount.source))
+        {
+            let metadata = std::fs::symlink_metadata(&mount.source)
+                .with_context(|| format!("inspect local mount source {:?}", mount.source))?;
+            anyhow::ensure!(
+                metadata.is_dir() || metadata.is_file(),
+                "local mount source must be a regular file or directory (symlinks are not allowed): {:?}",
+                mount.source
+            );
+            anyhow::ensure!(
+                !mount.is_root() || metadata.is_dir(),
+                "root mount requires a directory; give file {:?} an explicit guest target",
+                mount.source
+            );
         }
-
-        let mut details = String::new();
-        for mount in targeted {
-            details.push_str(&format!(
-                "\n  - {}:{}",
-                mount.source,
-                mount.target.display()
-            ));
+        let local_roots = mounts
+            .iter()
+            .filter(|mount| mount.is_root() && ww::cell::mount::is_local_source(&mount.source))
+            .map(|mount| Path::new(&mount.source));
+        let scan_roots: Vec<&Path> = namespace_roots
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(local_roots)
+            .collect();
+        let configs = ww::ns::scan_namespace_configs(&scan_roots)
+            .context("Failed to scan namespace configs")?;
+        let mut namespace_images = 0;
+        for config in &configs {
+            if let Some(source) = config.ipfs_path()? {
+                // Validate configured image syntax before waiting on Kubo.
+                ww::cell::mount::parse_args(&[source])?;
+                namespace_images += 1;
+            }
         }
-
-        bail!(
-            "targeted mounts are not supported in backend virtual mode.\n\
-             Use root image layers (`/ipfs/...`, `/ipns/...`, or local dirs) and publish data explicitly.\n\
-             Offending mount(s):{details}"
+        anyhow::ensure!(
+            mounts.len() + namespace_images + usize::from(authoritative_source)
+                <= ww::cell::mount::MAX_MOUNT_OPERATIONS,
+            "mount operation limit exceeded (including namespace images and authoritative head)"
         );
+        if mounts.is_empty() && namespace_images == 0 && !authoritative_source {
+            bail!(
+                "No explicit image source or authoritative Stem configured. \
+                 Pass an explicit source (for example, `ww run .`), \
+                 a namespace root containing an image, --stem, or --ipns-stem."
+            );
+        }
+        Ok(configs)
     }
 
     /// Generate a new Ed25519 identity secret.
@@ -1334,6 +1374,15 @@ system::export!({iface_name}Guest);
         with_http_admin: Option<String>,
         ipfs_url: String,
     ) -> Result<()> {
+        let stem_contract = stem.as_deref().map(parse_contract_address).transpose()?;
+        let ipns_stem_name = ipns_stem
+            .as_deref()
+            .map(ww::ipns::parse_name)
+            .transpose()
+            .context("parse --ipns-stem")?;
+        let authoritative_source = stem_contract.is_some() || ipns_stem_name.is_some();
+        let ns_configs = Self::startup_namespaces(&mounts, &namespace_roots, authoritative_source)?;
+
         let (filesystem_owner, filesystem_resources) = cache::HostFsOwner::start(
             tokio::runtime::Handle::current(),
             cache::HostLimits::default(),
@@ -1346,6 +1395,7 @@ system::export!({iface_name}Guest);
         let mut executor_pool_slot = None;
         let mut deployment_slot = None;
         let mut deployment_lifecycle_slot = None;
+        let mut retained_startup_roots = Vec::new();
 
         let outcome: Result<i32> = async {
         let lifecycle = filesystem_resources
@@ -1353,25 +1403,6 @@ system::export!({iface_name}Guest);
             .context("failed to reserve deployment filesystem root")?;
         let deployment_scope = lifecycle.0.clone();
         deployment_lifecycle_slot = Some(lifecycle);
-
-        // Reject local configuration before Kubo readiness can intentionally
-        // wait forever in production. A bad path must remain actionable.
-        if !mounts.is_empty() || (stem.is_none() && ipns_stem.is_none()) {
-            image::validate_mounts_virtual(&mounts)?;
-        }
-        let user_mounts = mounts.clone();
-        let local_roots: Vec<&std::path::Path> = mounts
-            .iter()
-            .filter(|mount| mount.is_root() && !ww::ipfs::is_ipfs_path(&mount.source))
-            .map(|mount| std::path::Path::new(&mount.source))
-            .collect();
-        let namespace_scan_roots: Vec<&std::path::Path> = namespace_roots
-            .iter()
-            .map(PathBuf::as_path)
-            .chain(local_roots.iter().copied())
-            .collect();
-        let ns_configs = ww::ns::scan_namespace_configs(&namespace_scan_roots)
-            .context("Failed to scan namespace configs")?;
 
         ww::config::init_tracing_to_stderr(false);
 
@@ -1495,13 +1526,6 @@ system::export!({iface_name}Guest);
         runtime_status.set_phase("resolving-configuration");
 
         let mut all_mounts: Vec<ww::cell::mount::Mount> = Vec::new();
-        let stem_contract = stem.as_deref().map(parse_contract_address).transpose()?;
-        let ipns_stem_name = ipns_stem
-            .as_deref()
-            .map(ww::ipns::parse_name)
-            .transpose()
-            .context("parse --ipns-stem")?;
-
         // The installed `ww` namespace uses the host identity as its default
         // IPNS signer. Publish before namespace resolution so a newly migrated
         // name exists before Kubo resolves it. The republisher then becomes
@@ -1595,53 +1619,47 @@ system::export!({iface_name}Guest);
             };
             for (name, ipfs_path) in &resolved {
                 tracing::info!(ns = %name, path = %ipfs_path, "Mounting namespace");
-                // Pin the namespace tree so subsequent boots use the local copy.
-                if let Err(error) = boot_ipfs_client.pin_add_once(ipfs_path).await {
-                    tracing::warn!(ns = %name, path = %ipfs_path, "Failed to pin namespace: {error}");
-                }
                 all_mounts.push(ww::cell::mount::Mount {
                     source: ipfs_path.clone(),
-                    target: PathBuf::from("/"),
+                    target: image::GuestTarget::root(),
                 });
             }
         }
 
         // Append user-specified mounts after namespace layers.
         // User mounts are highest priority — they override everything.
-        let user_layer_start = all_mounts.len();
         all_mounts.extend(mounts);
 
-        // Resolve mounts into a merged root CID. Guest filesystem reads are
-        // lazy via CidTree and backed by the IPFS DAG.
+        // Freeze the complete ordered batch once. Deployment replays these
+        // retained identities without reopening paths or resolving names again.
         runtime_status.set_phase("resolving-mounts");
-        tracing::debug!("resolving mounts (virtual)...");
+        let mount_transaction = filesystem_resources.try_foreground_transaction(
+            filesystem_resources.try_logical_io()?,
+            &[&deployment_scope],
+        )?;
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-        let mut mount_resolution = Box::pin(image::resolve_mount_layers_virtual_with_cancel(
+        let mut mount_resolution = Box::pin(image::resolve_frozen_mounts_with_cancel(
             &all_mounts,
             &boot_ipfs_client,
+            &mount_transaction,
+            authoritative_source,
             &mut cancel_rx,
         ));
-        let layer_cids = tokio::select! {
+        let resolved_mounts = tokio::select! {
             result = &mut mount_resolution => result?,
             service_exit = supervisor.next_service_exit() => {
                 let _ = cancel_tx.send(true);
                 if let Err(cleanup_error) = mount_resolution.await {
-                    tracing::warn!("mount resolution cancelled after service exit: {cleanup_error:#}");
+                    tracing::error!("mount resolution cancelled after service exit: {cleanup_error:#}");
                 }
                 return Err(service_exit_error(service_exit));
             }
         };
-        for (mount, cid) in user_mounts
-            .iter()
-            .zip(layer_cids.iter().skip(user_layer_start))
-        {
-            if ipfs::is_ipfs_path(&mount.source) {
-                if let Err(error) = boot_ipfs_client.pin_add_once(cid).await {
-                    tracing::warn!(%cid, "Failed to pin user IPFS layer: {error}");
-                }
-            }
-        }
-        let frozen_layers = layer_cids;
+        drop(mount_resolution);
+        drop(mount_transaction);
+        let frozen_mounts = resolved_mounts.mounts;
+        let retained_source_roots = resolved_mounts.retained_roots;
+        retained_startup_roots.clone_from(&retained_source_roots);
         let staging_setup = filesystem_resources.try_cleanup_transaction(
             filesystem_resources.try_logical_io()?,
             &[&deployment_scope],
@@ -1667,7 +1685,7 @@ system::export!({iface_name}Guest);
         // CID-backed file content on demand. 128 MiB budget for pinned entries.
         let pinset_cache = std::sync::Arc::new(
             cache::PinsetCache::new(
-                std::sync::Arc::new(ipfs_client.clone()),
+                std::sync::Arc::new(ww::deployment::RetainedPinner::new(ipfs_client.clone())),
                 128 * 1024 * 1024,
                 std::sync::Arc::clone(&filesystem_resources),
             )
@@ -1843,7 +1861,8 @@ system::export!({iface_name}Guest);
         let deployment_config = ww::deployment::Config {
             source: stem_source,
             candidates: candidate_rx,
-            frozen_layers,
+            frozen_mounts,
+            retained_source_roots,
             ipfs_client: ipfs_client.clone(),
             staging_dir,
             filesystem_host: std::sync::Arc::clone(&filesystem_resources),
@@ -2040,6 +2059,16 @@ system::export!({iface_name}Guest);
         if let Err(error) = filesystem_shutdown {
             shutdown_errors.push(format!("Host filesystem shutdown failed: {error}"));
         }
+        let outcome = outcome.map_err(|error| {
+            if retained_startup_roots.is_empty() {
+                error
+            } else {
+                error.context(format!(
+                    "frozen source pins remain retained after startup/deployment failure: {:?}",
+                    retained_startup_roots
+                ))
+            }
+        });
         match outcome {
             Ok(exit_code) if shutdown_errors.is_empty() => std::process::exit(exit_code),
             Ok(_) => Err(anyhow::anyhow!(shutdown_errors.join("; "))),
@@ -2960,70 +2989,112 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_mount_policy_accepts_root_mounts() {
-        let mounts =
-            ww::cell::mount::parse_args(&[".".to_string(), "/ipfs/bafybeigdyrzt".to_string()])
-                .unwrap();
-        Commands::validate_backend_mount_policy(&mounts).unwrap();
-    }
-
-    #[test]
-    fn test_validate_backend_mount_policy_rejects_targeted_mounts() {
-        let mounts = ww::cell::mount::parse_args(&[
-            ".".to_string(),
-            "~/.ww/identity:/etc/identity".to_string(),
-        ])
-        .unwrap();
-        let err = Commands::validate_backend_mount_policy(&mounts).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("targeted mounts are not supported in backend virtual mode"),
-            "unexpected error: {msg}"
-        );
-        assert!(
-            msg.contains("/etc/identity"),
-            "error should include offending target path: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_run_command_rejects_targeted_mounts_preflight() {
-        let cmd = Commands::Run {
-            mounts: vec![".".to_string(), "~/.ww/identity:/etc/identity".to_string()],
-            namespace_root: Vec::new(),
-            listen: Vec::new(),
-            wasm_debug: false,
-            kernel: None,
-            identity: None,
-            insecure_ephemeral: false,
-            stem: None,
-            ipns_stem: None,
-            ipns_routing_url: "http://localhost:8080".to_string(),
-            rpc_url: "http://127.0.0.1:8545".to_string(),
-            ws_url: "ws://127.0.0.1:8545".to_string(),
-            confirmation_depth: 6,
-            executor_threads: 0,
-            http_listen: None,
-            http_dial: Vec::new(),
-            runtime_cache_policy: "shared".to_string(),
-            with_http_admin: "off".to_string(),
-            ipfs_url: "http://localhost:5001".to_string(),
+    fn run_has_no_implicit_current_directory_mount() {
+        let cli = Cli::try_parse_from(["ww", "run"]).unwrap();
+        let Commands::Run { mounts, .. } = cli.command else {
+            panic!("expected run command");
         };
+        assert!(mounts.is_empty());
+    }
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+    #[tokio::test]
+    async fn run_without_image_fails_before_identity_or_kubo() {
+        let cli = Cli::try_parse_from(["ww", "run", "--ipfs-url", "http://127.0.0.1:1"]).unwrap();
+        let error = cli.command.run().await.unwrap_err();
+        assert!(
+            error.to_string().contains("No explicit image source"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn startup_requires_an_actual_namespace_image() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        assert!(Commands::startup_namespaces(&[], &roots, false).is_err());
+        std::fs::create_dir_all(root.path().join("etc/ns")).unwrap();
+        std::fs::write(root.path().join("etc/ns/empty"), "# no image\n").unwrap();
+        assert!(Commands::startup_namespaces(&[], &roots, false).is_err());
+        std::fs::write(
+            root.path().join("etc/ns/ww"),
+            "bootstrap=bafkreigh2akiscaildcw453gm7nmiv5df6b5u3rtmw3klhyxqqzkjureme\n",
+        )
+        .unwrap();
+        assert!(Commands::startup_namespaces(&[], &roots, false).is_ok());
+    }
+
+    #[test]
+    fn startup_accepts_stem_or_explicit_targeted_source() {
+        assert!(Commands::startup_namespaces(&[], &[], true).is_ok());
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("config");
+        std::fs::write(&file, b"configuration").unwrap();
+        let mounts =
+            ww::cell::mount::parse_args(&[format!("{}:/etc/myapp", file.display())]).unwrap();
+        assert!(Commands::startup_namespaces(&mounts, &[], false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_local_source_fails_before_identity_or_kubo() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        for (source, expected) in [
+            (root.path().join("missing"), "inspect local mount source"),
+            (file, "root mount requires a directory"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "ww",
+                "run",
+                source.to_str().unwrap(),
+                "--ipfs-url",
+                "http://127.0.0.1:1",
+            ])
             .unwrap();
-        let err = rt.block_on(cmd.run()).unwrap_err();
-        let msg = err.to_string();
+            let error = cli.command.run().await.unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_rejects_local_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        let mounts =
+            ww::cell::mount::parse_args(&[format!("{}:/etc/app", link.display())]).unwrap();
+        let error = Commands::startup_namespaces(&mounts, &[], false).unwrap_err();
         assert!(
-            msg.contains("targeted mounts are not supported in backend virtual mode"),
-            "unexpected error: {msg}"
+            error.to_string().contains("symlinks are not allowed"),
+            "{error:#}"
         );
-        assert!(
-            msg.contains("/etc/identity"),
-            "error should include offending target path: {msg}"
-        );
+    }
+
+    #[test]
+    fn startup_counts_authoritative_head_against_operation_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mounts =
+            ww::cell::mount::parse_args(&vec![format!("{}:/etc/app", root.path().display()); 128])
+                .unwrap();
+        assert!(Commands::startup_namespaces(&mounts, &[], false).is_ok());
+        assert!(Commands::startup_namespaces(&mounts, &[], true).is_err());
+        mounts.pop();
+        assert!(Commands::startup_namespaces(&mounts, &[], true).is_ok());
+    }
+
+    #[test]
+    fn targeted_directory_does_not_supply_host_namespaces() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("etc/ns")).unwrap();
+        std::fs::write(root.path().join("etc/ns/invalid"), "bootstrap=not-a-cid\n").unwrap();
+        let mounts =
+            ww::cell::mount::parse_args(&[format!("{}:/etc/app", root.path().display())]).unwrap();
+        assert!(Commands::startup_namespaces(&mounts, &[], false)
+            .unwrap()
+            .is_empty());
+        let mounts = ww::cell::mount::parse_args(&[root.path().display().to_string()]).unwrap();
+        assert!(Commands::startup_namespaces(&mounts, &[], false).is_err());
     }
 
     fn parse_run_admin_addr(args: &[&str]) -> String {
@@ -3082,7 +3153,7 @@ mod tests {
         let command = Cli::try_parse_from([
             "ww",
             "run",
-            "std/status",
+            "./std/status",
             "--kernel",
             "cid:bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a",
         ])
@@ -3091,7 +3162,7 @@ mod tests {
 
         match command {
             Commands::Run { mounts, kernel, .. } => {
-                assert_eq!(mounts, vec!["std/status"]);
+                assert_eq!(mounts, vec!["./std/status"]);
                 assert_eq!(
                     kernel.as_deref(),
                     Some("cid:bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a")

@@ -18,12 +18,15 @@ use rand::Rng;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
-use crate::cell::image::dag_merge_cids;
+use crate::cell::image::{compose_mounts, CompositionError, FrozenMount};
 use crate::cell::vfs::CidTree;
-use crate::ipfs::cid_identity::{decode_cid, parse_cid};
+use crate::ipfs::cid_identity::decode_cid;
 use crate::kernel;
 use crate::services::{ExecutorPool, SpawnRequest};
 use crate::stem::{Head, InvalidHead, Source, Update};
+
+mod retained_pinner;
+pub use retained_pinner::RetainedPinner;
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
@@ -32,6 +35,7 @@ const RETRY_JITTER_MAX: Duration = Duration::from_millis(500);
 const SOURCE_QUEUE_CAPACITY: usize = 16;
 const KERNEL_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const SPECULATIVE_RETENTION: Duration = Duration::from_secs(5 * 60);
+const MAX_PIN_RELEASES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureClass {
@@ -84,7 +88,7 @@ fn classify_failure(error: &anyhow::Error) -> FailureClass {
     }
     if error
         .chain()
-        .any(|cause| cause.is::<PermanentPreparationError>())
+        .any(|cause| cause.is::<PermanentPreparationError>() || cause.is::<CompositionError>())
     {
         FailureClass::Permanent
     } else if error.chain().any(|cause| {
@@ -171,7 +175,7 @@ enum Prewarm<'a> {
 
 async fn prepare_root(
     head: Option<Head>,
-    frozen_layers: &[Cid],
+    frozen_mounts: &[FrozenMount],
     ipfs_client: &crate::ipfs::HttpClient,
     prewarm: Prewarm<'_>,
     pins: &mut PinSet,
@@ -180,7 +184,6 @@ async fn prepare_root(
     if *cancel.borrow() {
         anyhow::bail!("deployment preparation cancelled");
     }
-    let mut layers = Vec::with_capacity(frozen_layers.len() + usize::from(head.is_some()));
     if let Some(head) = &head {
         let cid = head.cid;
         if !pins.contains(&cid) {
@@ -189,13 +192,11 @@ async fn prepare_root(
                 .context("pinning deployment head")?;
             pins.insert(cid);
         }
-        layers.push(cid);
     }
     if *cancel.borrow() {
         anyhow::bail!("deployment preparation cancelled");
     }
-    layers.extend_from_slice(frozen_layers);
-    if layers.is_empty() {
+    if head.is_none() && frozen_mounts.is_empty() {
         return Err(PermanentPreparationError(
             "deployment has neither a Stem head nor configured root layers".to_owned(),
         )
@@ -205,7 +206,12 @@ async fn prepare_root(
     let boot_client = crate::ipfs::BootClient::one_attempt(ipfs_client.clone(), OPERATION_TIMEOUT);
     let effective = bounded(
         "effective-root merge",
-        dag_merge_cids(&layers, &boot_client, cancel),
+        compose_mounts(
+            head.as_ref().map(|head| head.cid),
+            frozen_mounts,
+            &boot_client,
+            cancel,
+        ),
     )
     .await
     .context("composing effective deployment root")?;
@@ -249,7 +255,7 @@ struct PreparationOutput {
 
 async fn prepare_root_owned(
     head: Head,
-    frozen_layers: Vec<Cid>,
+    frozen_mounts: Vec<FrozenMount>,
     ipfs_client: crate::ipfs::HttpClient,
     cid_tree: Arc<CidTree>,
     mut pins: PinSet,
@@ -257,7 +263,7 @@ async fn prepare_root_owned(
 ) -> PreparationOutput {
     let result = prepare_root(
         Some(head),
-        &frozen_layers,
+        &frozen_mounts,
         &ipfs_client,
         Prewarm::Existing(&cid_tree),
         &mut pins,
@@ -363,7 +369,11 @@ pub struct Config {
     pub source: Option<Box<dyn Source>>,
     /// Latest observed Atom `HeadUpdated` CID bytes. These values are advisory only.
     pub candidates: Option<watch::Receiver<Option<Vec<u8>>>>,
-    pub frozen_layers: Vec<String>,
+    /// Ordered, inspected sources retained before deployment preparation.
+    pub frozen_mounts: Vec<FrozenMount>,
+    /// Acknowledged source pins, including immutable subpath parent roots.
+    /// These are shared native pins, not independent reference-counted claims.
+    pub retained_source_roots: Vec<Cid>,
     pub ipfs_client: crate::ipfs::HttpClient,
     pub staging_dir: PathBuf,
     pub filesystem_host: Arc<cache::HostResources>,
@@ -528,7 +538,7 @@ pub struct Deployment {
     epoch_tx: watch::Sender<Epoch>,
     epoch_rx: watch::Receiver<Epoch>,
     epoch_seq: u64,
-    frozen_layers: Vec<Cid>,
+    frozen_mounts: Vec<FrozenMount>,
     frozen_pins: PinSet,
     active_pins: PinSet,
     retained_pins: Vec<PinSet>,
@@ -548,41 +558,27 @@ impl Deployment {
         epoch_tx: watch::Sender<Epoch>,
         epoch_rx: watch::Receiver<Epoch>,
     ) -> Result<Self> {
-        let frozen_layers = config
-            .frozen_layers
-            .iter()
-            .map(|layer| {
-                parse_cid(layer).map_err(|error| {
-                    PermanentPreparationError(format!(
-                        "malformed configured deployment layer {layer}: {error}"
-                    ))
-                })
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
+        let frozen_mounts = config.frozen_mounts;
         let mut frozen_pins = PinSet::default();
-        let mut pin_delay = RETRY_BASE_DELAY;
-        for layer in &frozen_layers {
-            loop {
-                match bounded(
-                    "frozen-layer pin",
-                    config.ipfs_client.pin_add(&layer.to_string()),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        frozen_pins.insert(*layer);
-                        pin_delay = RETRY_BASE_DELAY;
-                        break;
-                    }
-                    Err(error) if classify_failure(&error) == FailureClass::Transient => {
-                        let retry = retry_delay(&mut pin_delay);
-                        warn!(%layer, retry_ms = retry.as_millis() as u64, "Frozen layer pin failed; retry scheduled: {error:#}");
-                        tokio::time::sleep(retry).await;
-                    }
-                    Err(error) => return Err(error.context("pinning configured deployment layer")),
-                }
+        for cid in config.retained_source_roots {
+            frozen_pins.insert(cid);
+        }
+        // Resolution has already acknowledged retention. Repeating pin/add
+        // would not create another owner and must not authorize later unpinning.
+        for mount in &frozen_mounts {
+            if !frozen_pins.contains(&mount.source().cid()) {
+                return Err(PermanentPreparationError(format!(
+                    "frozen mount source {} has no acknowledged retention",
+                    mount.source().cid()
+                ))
+                .into());
             }
+        }
+        if frozen_mounts.len() + usize::from(config.source.is_some()) > 128 {
+            return Err(CompositionError::ResourceLimit(
+                "deployment source operation limit exceeded",
+            )
+            .into());
         }
 
         let (target, source_rx, source_task) = match config.source {
@@ -604,7 +600,7 @@ impl Deployment {
             epoch_rx,
             epoch_seq: 0,
             target,
-            frozen_layers,
+            frozen_mounts,
             frozen_pins,
             retained_pins: Vec::new(),
             ipfs_client: config.ipfs_client,
@@ -640,7 +636,7 @@ impl Deployment {
         let (cancel, cancel_rx) = watch::channel(false);
         let task = tokio::spawn(prepare_root_owned(
             candidate.head.clone(),
-            self.frozen_layers.clone(),
+            self.frozen_mounts.clone(),
             self.ipfs_client.clone(),
             self.cid_tree.clone(),
             PinSet::default(),
@@ -1197,7 +1193,7 @@ impl Deployment {
                 }
             }
 
-            // `frozen_layers` never changes after bootstrap, so the head CID is
+            // `frozen_mounts` never changes after bootstrap, so the head CID is
             // the only variable preparation input within one `Deployment`.
 
             if let Target::Invalid(invalid) = &target {
@@ -1242,7 +1238,7 @@ impl Deployment {
                 Update(Update),
                 TimedOut,
             }
-            let frozen_layers = self.frozen_layers.clone();
+            let frozen_mounts = self.frozen_mounts.clone();
             let ipfs_client = self.ipfs_client.clone();
             let cid_tree = self.cid_tree.clone();
             let step = if matches!(
@@ -1309,7 +1305,7 @@ impl Deployment {
                 let (_cancel, mut cancel_rx) = watch::channel(false);
                 let preparation = prepare_root(
                     head,
-                    &frozen_layers,
+                    &frozen_mounts,
                     &ipfs_client,
                     Prewarm::Existing(&cid_tree),
                     &mut attempt,
@@ -1452,6 +1448,7 @@ impl Deployment {
                     self.release_retained().await;
                     info!(
                         seq = self.epoch_seq,
+                        root = %self.cid_tree.root_cid(),
                         teardown_ms = started.elapsed().as_millis() as u64,
                         "Deployment root activated"
                     );
@@ -1501,10 +1498,15 @@ impl Deployment {
     }
 
     fn protected_cids(&self, extra: Option<&PinSet>) -> HashSet<Cid> {
+        let prepared = match self.speculation.as_ref() {
+            Some(Speculation::Ready { prepared, .. }) => Some(&prepared.pins),
+            _ => None,
+        };
         self.frozen_pins
             .cids
             .iter()
             .chain(self.active_pins.cids.iter())
+            .chain(prepared.into_iter().flat_map(|pins| pins.cids.iter()))
             .chain(extra.into_iter().flat_map(|pins| pins.cids.iter()))
             .cloned()
             .collect()
@@ -1513,8 +1515,16 @@ impl Deployment {
     async fn release_retained(&mut self) {
         let protected = self.protected_cids(None);
         let mut handled = HashSet::new();
+        let mut budget = PinReleaseBudget::new();
         for pins in &mut self.retained_pins {
-            release_pin_set(pins, &self.ipfs_client, &protected, &mut handled).await;
+            release_pin_set_with_budget(
+                pins,
+                &self.ipfs_client,
+                &protected,
+                &mut handled,
+                &mut budget,
+            )
+            .await;
         }
         self.retained_pins.retain(|pins| !pins.is_empty());
     }
@@ -1545,7 +1555,7 @@ struct BootstrapState {
     epoch_rx: watch::Receiver<Epoch>,
     epoch_seq: u64,
     target: Target,
-    frozen_layers: Vec<Cid>,
+    frozen_mounts: Vec<FrozenMount>,
     frozen_pins: PinSet,
     retained_pins: Vec<PinSet>,
     ipfs_client: crate::ipfs::HttpClient,
@@ -1584,7 +1594,7 @@ impl BootstrapState {
                 let (_cancel, mut cancel_rx) = watch::channel(false);
                 let preparation = prepare_root(
                     head,
-                    &self.frozen_layers,
+                    &self.frozen_mounts,
                     &self.ipfs_client,
                     Prewarm::Bootstrap {
                         tree: &mut tree,
@@ -1662,7 +1672,7 @@ impl BootstrapState {
                         epoch_tx: self.epoch_tx,
                         epoch_rx: self.epoch_rx,
                         epoch_seq: self.epoch_seq,
-                        frozen_layers: self.frozen_layers,
+                        frozen_mounts: self.frozen_mounts,
                         frozen_pins: self.frozen_pins,
                         active_pins: std::mem::take(&mut prepared.pins),
                         retained_pins: self.retained_pins,
@@ -1746,24 +1756,73 @@ impl BootstrapState {
     }
 }
 
+struct PinReleaseBudget {
+    deadline: tokio::time::Instant,
+    remaining: usize,
+}
+
+impl PinReleaseBudget {
+    fn new() -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + OPERATION_TIMEOUT,
+            remaining: MAX_PIN_RELEASES,
+        }
+    }
+}
+
 async fn release_pin_set(
     pins: &mut PinSet,
     ipfs_client: &crate::ipfs::HttpClient,
     protected: &HashSet<Cid>,
     handled: &mut HashSet<Cid>,
 ) {
+    release_pin_set_with_budget(
+        pins,
+        ipfs_client,
+        protected,
+        handled,
+        &mut PinReleaseBudget::new(),
+    )
+    .await;
+}
+
+async fn release_pin_set_with_budget(
+    pins: &mut PinSet,
+    ipfs_client: &crate::ipfs::HttpClient,
+    protected: &HashSet<Cid>,
+    handled: &mut HashSet<Cid>,
+    budget: &mut PinReleaseBudget,
+) {
     let mut retained = Vec::new();
+    let mut attempts = 0;
     for cid in pins.cids.drain(..) {
         if protected.contains(&cid) || !handled.insert(cid) {
             continue;
         }
-        match bounded("pin removal", ipfs_client.pin_rm(&cid.to_string())).await {
+        if budget.remaining == 0 || tokio::time::Instant::now() >= budget.deadline {
+            retained.push(cid);
+            continue;
+        }
+        attempts += 1;
+        budget.remaining -= 1;
+        let removal =
+            tokio::time::timeout_at(budget.deadline, ipfs_client.pin_rm(&cid.to_string()))
+                .await
+                .map_err(|_| anyhow::anyhow!("deployment pin cleanup deadline reached"))
+                .and_then(|result| result);
+        match removal {
             Ok(()) => info!(%cid, "Released deployment pin"),
             Err(error) => {
                 warn!(%cid, "Deployment pin release deferred: {error:#}");
                 retained.push(cid);
             }
         }
+    }
+    if !retained.is_empty() {
+        warn!(
+            roots = retained.len(),
+            attempts, "Deployment pins remain retained after bounded cleanup"
+        );
     }
     pins.cids = retained;
 }
@@ -1827,12 +1886,54 @@ mod tests {
 
     const ROOT: &str = "bafybeiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf354";
 
+    async fn frozen_root(cid: &str) -> FrozenMount {
+        let (client, _, _requests, shutdown, server) = recording_kubo().await;
+        let client = crate::ipfs::BootClient::one_attempt(client, OPERATION_TIMEOUT);
+        let (_cancel, mut cancel) = watch::channel(false);
+        let source = crate::cell::image::inspect_source(cid.parse().unwrap(), &client, &mut cancel)
+            .await
+            .unwrap();
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+        FrozenMount::new(source, crate::cell::image::GuestTarget::root()).unwrap()
+    }
+
     fn test_filesystem_host() -> Arc<cache::HostResources> {
         crate::services::test_filesystem_resources()
     }
 
     fn test_filesystem_scope() -> cache::FsScope {
         crate::services::test_filesystem_scope()
+    }
+
+    #[test]
+    fn deterministic_composer_errors_preserve_later_head_recovery() {
+        use crate::cell::image::GuestTarget;
+        for error in [
+            CompositionError::TargetObstruction {
+                target: GuestTarget::new("/etc/app/config").unwrap(),
+                ancestor: GuestTarget::new("/etc").unwrap(),
+            },
+            CompositionError::InvalidDag("malformed source".into()),
+            CompositionError::UnsupportedProfile("unsupported source".into()),
+            CompositionError::ResourceLimit("source limit"),
+        ] {
+            assert_eq!(
+                classify_failure(&anyhow::Error::new(error).context("preparing root")),
+                FailureClass::Permanent
+            );
+        }
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!("unclassified error")),
+            FailureClass::Unknown
+        );
+        assert_eq!(
+            classify_failure(&anyhow::Error::new(OperationTimeout {
+                operation: "test",
+                timeout: OPERATION_TIMEOUT,
+            })),
+            FailureClass::Transient
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1885,33 +1986,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_frozen_layer_vector_fails_before_any_pin() {
+    async fn cleanup_defers_roots_beyond_the_attempt_limit() {
+        let (client, calls, _requests, shutdown, server) = recording_kubo().await;
+        let mut pins = PinSet::default();
+        for index in 0..=MAX_PIN_RELEASES {
+            let digest = [index as u8; 32];
+            pins.insert(Cid::new_v1(
+                0x55,
+                cid::multihash::Multihash::wrap(0x12, &digest).unwrap(),
+            ));
+        }
+        release_pin_set(&mut pins, &client, &HashSet::new(), &mut HashSet::new()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_PIN_RELEASES);
+        assert_eq!(pins.cids.len(), 1);
+        release_pin_set(&mut pins, &client, &HashSet::new(), &mut HashSet::new()).await;
+        assert!(pins.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_PIN_RELEASES + 1);
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_budget_is_shared_across_retained_pin_sets() {
         let (client, calls, _requests, shutdown, server) = recording_kubo().await;
         let staging = tempfile::tempdir().unwrap();
-        for invalid in [
-            "not-a-cid".to_owned(),
-            cid::multibase::encode(cid::multibase::Base::Base32Lower, [1, 0x55, 0, 1, b'x', 0]),
-        ] {
-            let (epoch_tx, epoch_rx) = watch::channel(Epoch::zero());
-            let observer = epoch_rx.clone();
-            let result = Deployment::bootstrap(
-                Config {
-                    source: None,
-                    candidates: None,
-                    frozen_layers: vec![ROOT.to_owned(), invalid],
-                    ipfs_client: client.clone(),
-                    staging_dir: staging.path().to_owned(),
-                    filesystem_host: test_filesystem_host(),
-                    filesystem_scope: test_filesystem_scope(),
-                },
-                epoch_tx,
-                epoch_rx,
-            )
-            .await;
-            assert!(result.is_err());
-            assert_eq!(observer.borrow().root, None);
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let (_source_tx, source_rx) = mpsc::channel(2);
+        let (_candidate_tx, candidate_rx) = watch::channel(None);
+        let (mut deployment, _, _) =
+            test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
+        for index in 0..=MAX_PIN_RELEASES {
+            let digest = [index as u8; 32];
+            deployment.retained_pins.push(PinSet {
+                cids: vec![Cid::new_v1(
+                    0x55,
+                    cid::multihash::Multihash::wrap(0x12, &digest).unwrap(),
+                )],
+            });
         }
+        deployment.release_retained().await;
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_PIN_RELEASES);
+        assert_eq!(deployment.retained_pins.len(), 1);
+        deployment.release_retained().await;
+        assert!(deployment.retained_pins.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_PIN_RELEASES + 1);
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unretained_frozen_mount_fails_before_any_pin() {
+        let mount = frozen_root(ROOT).await;
+        let (client, calls, _requests, shutdown, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let (epoch_tx, epoch_rx) = watch::channel(Epoch::zero());
+        let observer = epoch_rx.clone();
+        let result = Deployment::bootstrap(
+            Config {
+                source: None,
+                candidates: None,
+                frozen_mounts: vec![mount],
+                retained_source_roots: Vec::new(),
+                ipfs_client: client,
+                staging_dir: staging.path().to_owned(),
+                filesystem_host: test_filesystem_host(),
+                filesystem_scope: test_filesystem_scope(),
+            },
+            epoch_tx,
+            epoch_rx,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(observer.borrow().root, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         shutdown.send(()).unwrap();
         server.await.unwrap();
     }
@@ -2154,7 +2300,7 @@ mod tests {
             epoch_rx,
             epoch_seq: 0,
             target: Target::Head(initial),
-            frozen_layers: vec![frozen.parse().unwrap()],
+            frozen_mounts: vec![frozen_root(frozen).await],
             frozen_pins: PinSet {
                 cids: vec![frozen.parse().unwrap()],
             },
@@ -2448,7 +2594,7 @@ mod tests {
             epoch_tx,
             epoch_rx: epoch_rx.clone(),
             epoch_seq: 0,
-            frozen_layers: Vec::new(),
+            frozen_mounts: Vec::new(),
             frozen_pins: PinSet::default(),
             active_pins: PinSet::default(),
             retained_pins: Vec::new(),
@@ -2524,12 +2670,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for expected in [
-                "/api/v0/pin/add",
-                "/api/v0/block/get",
-                "/api/v0/dag/import",
-                "/api/v0/ls",
-            ] {
+            for expected in ["/api/v0/block/get", "/api/v0/dag/import", "/api/v0/ls"] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 assert!(
@@ -2545,7 +2686,8 @@ mod tests {
             Config {
                 source: None,
                 candidates: None,
-                frozen_layers: vec![ROOT.to_owned()],
+                frozen_mounts: vec![frozen_root(ROOT).await],
+                retained_source_roots: vec![ROOT.parse().unwrap()],
                 ipfs_client: crate::ipfs::HttpClient::new(format!("http://{address}")),
                 staging_dir: staging.path().to_owned(),
                 filesystem_host: test_filesystem_host(),
@@ -2586,7 +2728,8 @@ mod tests {
             Config {
                 source: Some(Box::new(source)),
                 candidates: None,
-                frozen_layers: Vec::new(),
+                frozen_mounts: Vec::new(),
+                retained_source_roots: Vec::new(),
                 ipfs_client,
                 staging_dir: staging.path().to_owned(),
                 filesystem_host: test_filesystem_host(),
@@ -2625,7 +2768,8 @@ mod tests {
             Config {
                 source: Some(Box::new(source)),
                 candidates: None,
-                frozen_layers: Vec::new(),
+                frozen_mounts: Vec::new(),
+                retained_source_roots: Vec::new(),
                 ipfs_client,
                 staging_dir: staging.path().to_owned(),
                 filesystem_host: test_filesystem_host(),
@@ -2665,7 +2809,7 @@ mod tests {
             epoch_tx,
             epoch_rx,
             epoch_seq: u64::MAX,
-            frozen_layers: Vec::new(),
+            frozen_mounts: Vec::new(),
             frozen_pins: PinSet::default(),
             active_pins: PinSet::default(),
             retained_pins: Vec::new(),
@@ -2712,7 +2856,7 @@ mod tests {
             epoch_tx,
             epoch_rx,
             epoch_seq: 3,
-            frozen_layers: Vec::new(),
+            frozen_mounts: Vec::new(),
             frozen_pins: PinSet::default(),
             active_pins: PinSet::default(),
             retained_pins: Vec::new(),
@@ -3378,7 +3522,7 @@ mod tests {
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
-            frozen_layers: Vec::new(),
+            frozen_mounts: Vec::new(),
             frozen_pins: PinSet::default(),
             active_pins: PinSet::default(),
             retained_pins: Vec::new(),
@@ -3466,7 +3610,7 @@ mod tests {
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
-            frozen_layers: Vec::new(),
+            frozen_mounts: Vec::new(),
             frozen_pins: PinSet::default(),
             active_pins: PinSet::default(),
             retained_pins: Vec::new(),
@@ -3639,7 +3783,7 @@ mod tests {
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
-            frozen_layers: Vec::new(),
+            frozen_mounts: Vec::new(),
             frozen_pins: PinSet::default(),
             active_pins: PinSet::default(),
             retained_pins: Vec::new(),
@@ -3769,7 +3913,8 @@ mod tests {
             Config {
                 source: Some(Box::new(source)),
                 candidates: None,
-                frozen_layers: Vec::new(),
+                frozen_mounts: Vec::new(),
+                retained_source_roots: Vec::new(),
                 ipfs_client,
                 staging_dir: staging.path().to_path_buf(),
                 filesystem_host: test_filesystem_host(),
@@ -3844,7 +3989,7 @@ mod tests {
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
-            frozen_layers: Vec::new(),
+            frozen_mounts: Vec::new(),
             frozen_pins: PinSet::default(),
             active_pins: PinSet::default(),
             retained_pins: Vec::new(),
@@ -3954,7 +4099,7 @@ mod tests {
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
-            frozen_layers: Vec::new(),
+            frozen_mounts: Vec::new(),
             frozen_pins: PinSet::default(),
             active_pins: PinSet::default(),
             retained_pins: Vec::new(),
@@ -4002,7 +4147,7 @@ mod tests {
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
-            frozen_layers: Vec::new(),
+            frozen_mounts: Vec::new(),
             frozen_pins: PinSet::default(),
             active_pins: PinSet::default(),
             retained_pins: vec![PinSet {

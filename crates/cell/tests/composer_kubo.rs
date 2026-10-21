@@ -533,6 +533,10 @@ impl Kubo {
     }
 
     fn start() -> Option<Self> {
+        Self::start_mode(false)
+    }
+
+    fn start_mode(networked: bool) -> Option<Self> {
         if std::env::var_os("WW_TEST_REQUIRE_KUBO").is_none() {
             eprintln!("skipping composer interoperability; set WW_TEST_REQUIRE_KUBO=1");
             return None;
@@ -550,9 +554,22 @@ impl Kubo {
         run(&["init", "--profile=test"]);
         run(&["config", "Addresses.API", "/ip4/127.0.0.1/tcp/0"]);
         run(&["config", "Addresses.Gateway", "/ip4/127.0.0.1/tcp/0"]);
-        run(&["config", "--json", "Addresses.Swarm", "[]"]);
-        let child = Self::command(repo.path())
-            .args(["daemon", "--offline", "--enable-gc"])
+        run(&[
+            "config",
+            "--json",
+            "Addresses.Swarm",
+            if networked {
+                r#"["/ip4/127.0.0.1/tcp/0"]"#
+            } else {
+                "[]"
+            },
+        ]);
+        let mut command = Self::command(repo.path());
+        command.args(["daemon", "--enable-gc"]);
+        if !networked {
+            command.arg("--offline");
+        }
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -1520,4 +1537,81 @@ async fn targeted_composition_acknowledgements_remain_readable_during_and_after_
             "head content"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn immutable_mount_resolution_fetches_remote_roots_and_subpaths_before_acknowledgement() {
+    let Some(remote) = Kubo::start_mode(true) else {
+        return;
+    };
+    let local = Kubo::start_mode(true).unwrap();
+    let id: Value = serde_json::from_slice(&remote.bytes(&["id"])).unwrap();
+    let peer = id["Addresses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|address| address.starts_with("/ip4/127.0.0.1/tcp/"))
+        .unwrap();
+    local.cli(&["swarm", "connect", peer]);
+    let (owner, host) = cache::HostFsOwner::start(
+        tokio::runtime::Handle::current(),
+        cache::HostLimits::default(),
+    )
+    .unwrap();
+    let (scope, fs_owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+    let transaction = host
+        .try_foreground_transaction(host.try_logical_io().unwrap(), &[&scope])
+        .unwrap();
+    let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+    let mut selected = Vec::new();
+    for (suffix, target, bytes) in [
+        ("", "/", "remote root"),
+        ("/nested/file", "/etc/file", "remote selected file"),
+    ] {
+        let root = remote.add(&[("nested/file", bytes)]);
+        let expected = if suffix.is_empty() {
+            root.clone()
+        } else {
+            remote.cid_at(&root, "nested/file")
+        };
+        let local_blocks = local.cli(&["refs", "local"]);
+        assert!(
+            !local_blocks
+                .lines()
+                .any(|cid| cid == root || cid == expected),
+            "fixture must begin without remote source blocks"
+        );
+        let mounts = cell::mount::parse_args(&[format!("/ipfs/{root}{suffix}:{target}")]).unwrap();
+        let frozen = cell::image::resolve_frozen_mounts_with_cancel(
+            &mounts,
+            &local.client(),
+            &transaction,
+            false,
+            &mut cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(frozen.mounts[0].source().cid().to_string(), expected);
+        assert!(frozen.retained_roots.contains(&root.parse().unwrap()));
+        assert!(frozen.retained_roots.contains(&expected.parse().unwrap()));
+        selected.push((root, expected, suffix, bytes));
+    }
+    drop(remote);
+    local.cli(&["repo", "gc"]);
+    for (root, selected, suffix, bytes) in selected {
+        let path = if suffix.is_empty() {
+            format!("/ipfs/{selected}/nested/file")
+        } else {
+            format!("/ipfs/{selected}")
+        };
+        assert_eq!(local.cli(&["cat", &path]), bytes);
+        local.cli(&["pin", "ls", "--type=recursive", &root]);
+        local.cli(&["pin", "ls", "--type=recursive", &selected]);
+    }
+    drop(transaction);
+    drop(fs_owner);
+    finalizer.run().await.unwrap();
+    completion.wait().await.unwrap();
+    owner.shutdown().await.unwrap();
 }

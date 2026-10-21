@@ -633,11 +633,12 @@ impl Capture {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::os::unix::{ffi::OsStringExt, fs::symlink};
 
-    static ASYNC_CAPTURE_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(in crate::image) static ASYNC_CAPTURE_TEST: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     fn fixture() -> tempfile::TempDir {
         // macOS /var and /tmp aliases are deliberately rejected by capture.

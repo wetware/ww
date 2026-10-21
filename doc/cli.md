@@ -65,7 +65,23 @@ ww run [OPTIONS] [MOUNT...]
 Every positional argument is a mount: `source[:target]`.
 Without `:target`, the source is mounted at `/` (image layer).
 With `:target`, the source is overlaid at that guest path.
-Layers stack with per-file union; later layers win.
+Directory targets merge recursively; files and other type replacements use the later source.
+Operations keep argument order, including repeated and overlapping targets.
+Local sources use `.`, `./path`, `/absolute/path`, or `~/path`. Bare names must
+be complete CIDs; use `./name` to select a local name. No implicit CWD mount
+or `~/.ww` source fallback exists. With no mounts, startup requires a namespace
+configuration that supplies an image or an authoritative `--stem`/`--ipns-stem`.
+An empty `--namespace-root` does not supply an image.
+
+Targets must be absolute and canonical: no trailing slash, repeated slash, `.`,
+`..`, or control characters. Root mounts require directories. Files require an
+explicit target. Source paths reject symlink traversal. A colon separates the
+source from its target and cannot appear in a source operand.
+
+All local sources are captured in one bounded batch before publication. The
+resulting retained source CIDs and targets replay unchanged after Stem updates.
+Editing local paths after capture does not update the running deployment.
+See [local snapshots](local-snapshots.md) for exclusions, limits, and failure behavior.
 
 ### Options
 
@@ -77,6 +93,7 @@ Layers stack with per-file union; later layers win.
 | `--http-listen <ADDR>` | none | Enable WAGI HTTP server (e.g. `127.0.0.1:2080`) |
 | `--http-dial <HOST>` | none | Allow outbound HTTP to host. Repeatable. Supports exact hosts, `*.example.com`, or `*`. Without this flag, `network.http.dialer` is null. |
 | `--with-http-admin <ADDR>` | `127.0.0.1:2026` | Local HTTP admin endpoint (`/healthz`, `/readyz`, `/version`, `/metrics`, `/host/id`, `/host/addrs`); set `off` to disable (case-insensitive). Also reads `WW_HTTP_ADMIN`. A non-loopback address exposes unauthenticated host diagnostics. |
+| `--kernel <PATH\|CID>` | embedded kernel | Select PID0 separately from mounted content. CLI overrides `WW_KERNEL`. |
 | `--wasm-debug` | off | Enable WASM debug info for guest processes |
 | `--executor-threads <N>` | `0` | Executor worker threads (0 = auto-detect, one per CPU core) |
 | `--runtime-cache-policy` | `shared` | `shared`: same WASM bytes share Executor. `isolated`: always fresh. |
@@ -101,10 +118,16 @@ ww run . --http-listen 0.0.0.0:2080 --http-dial api.example.com
 ww run . --with-http-admin 127.0.0.1:3030
 
 # Explicit identity path + image layers
-ww run --identity ~/.ww/identity images/app /ipfs/QmDataLayer
+ww run --identity ~/.ww/identity ./images/app /ipfs/QmDataLayer
 
 # Run from IPFS
 ww run /ipfs/QmHash...
+
+# Targeted local file and directory snapshots
+ww run ./kernel.wasm:/boot/kernel.wasm ./config:/etc/myapp
+
+# Targeted immutable file (PID0 selection remains separate)
+ww run /ipfs/<file-cid>:/boot/kernel.wasm
 
 # Atom-backed deployment lifecycle
 ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545

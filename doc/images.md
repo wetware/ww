@@ -79,19 +79,39 @@ as layers (later mounts override earlier ones):
 
 | Form | Example |
 |------|---------|
-| Local path | `std/status` |
+| Local directory | `./std/status` |
+| Local file at target | `./kernel.wasm:/boot/kernel.wasm` |
+| Local directory at target | `./config:/etc/myapp` |
 | IPFS path | `/ipfs/QmAbc123...` |
 | IPNS path | `/ipns/k51qzi5uqu5...` |
-| Layered | `ww run /ipfs/QmBase my-overlay` |
+| Layered | `ww run /ipfs/<directory-cid> ./my-overlay` |
 
 [Wetware Composer v1](composer-v1.md) merges ordinary UnixFS directory DAGs.
 It preserves unchanged subtree CIDs and exact UTF-8 names. HAMT directories and
 inputs outside the documented profile limits fail explicitly.
 
-Targeted mounts (`source:/guest/path`) are not accepted by backend virtual mode.
-An `/ipns/...` mount is an image layer that Kubo resolves during composition.
+Targeted mounts use `source:/guest/path`. Files require explicit targets; root
+mounts require directories. Targets must be absolute and canonical. Directory
+collisions merge recursively, while other collisions replace the earlier entry.
+Strict target ancestors retain metadata and cannot traverse symlinks.
+
+Local sources require explicit `.`, `./`, `/`, or `~/` syntax. Bare values must
+be complete CIDs. Local sources are [captured once](local-snapshots.md), verified,
+and retained before deployment. Empty directories survive capture; symlinks and
+special files fail. Root snapshots exclude `target`, `.git`, `.gitignore`, and
+`Cargo.lock`; targeted directory snapshots include those names. The `ww push`
+importer described above remains separate.
+
+An `/ipns/...` mount resolves once and freezes the selected immutable CID.
 It is distinct from `--ipns-stem`, which follows signed changes and replaces
-the active deployment generation.
+the active deployment generation. Each generation applies the original ordered
+CLI operations after the authoritative head and namespace images. CLI operations
+keep highest precedence, including when their source paths change or disappear.
+
+`ww run` does not mount CWD implicitly or search `~/.ww` for source paths.
+Without explicit mounts, startup requires namespace configuration supplying an
+image or an authoritative Stem. Mounting `/boot/kernel.wasm` does not select
+PID0: `--kernel`, `WW_KERNEL`, and the embedded-kernel default remain unchanged.
 
 ## Installed host layout
 
