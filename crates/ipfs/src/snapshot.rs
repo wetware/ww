@@ -47,7 +47,7 @@ impl PublicationBudget {
 
 fn charge(counter: &AtomicUsize, amount: usize, limit: usize, what: &str) -> Result<()> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
             used.checked_add(amount).filter(|total| *total <= limit)
         })
         .map_err(|_| anyhow::anyhow!("snapshot {what} exceeds {limit} bytes"))?;
