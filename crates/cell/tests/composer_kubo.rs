@@ -748,6 +748,64 @@ async fn compose_frozen(
 }
 
 #[tokio::test]
+async fn verified_kernel_selection_reads_explicit_roots_and_metadata_chunks_after_gc() {
+    use cell::image::select_kernel_file;
+
+    let Some(kubo) = Kubo::start() else { return };
+    let raw_bytes = b"\0asm\x0d\0\x01\0";
+    let raw_file = kubo.add_file(raw_bytes, "1", "true");
+    assert_eq!(raw_file.parse::<Cid>().unwrap().codec(), 0x55);
+    let raw_mount = freeze(&kubo, &raw_file, "/boot/kernel.wasm").await;
+    let raw_root = compose_frozen(&kubo, None, &[raw_mount]).await.unwrap();
+
+    let chunked_bytes = vec![0xa5; 4 * 262_144 + 1];
+    let plain_file = kubo.add_file(&chunked_bytes, "1", "true");
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &chunked_bytes).unwrap();
+    let metadata_file = kubo.cli(&[
+        "add",
+        "-Q",
+        "--pin=true",
+        "--cid-version=1",
+        "--hash=sha2-256",
+        "--chunker=size-262144",
+        "--mode=493",
+        "--mtime=123",
+        file.path().to_str().unwrap(),
+    ]);
+    assert_ne!(plain_file, metadata_file);
+    let node = kubo.node(&metadata_file);
+    let metadata = node.data.unwrap();
+    assert!(metadata.windows(3).any(|bytes| bytes == [0x38, 0xed, 0x03]));
+    assert!(metadata.windows(4).any(|bytes| bytes == [0x42, 2, 8, 123]));
+    assert_eq!(node.links.len(), 5);
+    assert!(node.links[..4]
+        .iter()
+        .all(|link| link.cid == node.links[0].cid));
+    let metadata_mount = freeze(&kubo, &metadata_file, "/boot/kernel.wasm").await;
+    let metadata_root = compose_frozen(&kubo, None, &[metadata_mount])
+        .await
+        .unwrap();
+    assert_ne!(raw_root, metadata_root);
+    kubo.cli(&["repo", "gc"]);
+
+    // Creating another effective root does not change an explicitly rooted read.
+    let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+    for (root, source, bytes) in [
+        (&metadata_root, &metadata_file, chunked_bytes.as_slice()),
+        (&raw_root, &raw_file, raw_bytes.as_slice()),
+    ] {
+        let root = root.parse::<Cid>().unwrap();
+        let selected = select_kernel_file(root, &kubo.client(), &mut cancel)
+            .await
+            .unwrap();
+        assert_eq!(selected.effective_root(), root);
+        assert_eq!(selected.source_file(), source.parse::<Cid>().unwrap());
+        assert_eq!(selected.bytes().as_ref(), bytes);
+    }
+}
+
+#[tokio::test]
 async fn visible_semantics_match_mfs_and_survive_gc() {
     let Some(kubo) = Kubo::start() else { return };
     let base = kubo.add(&[

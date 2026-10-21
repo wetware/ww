@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, OwnedMutexGuard};
-use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
+use wasmtime::component::{types::ComponentItem, Component, HasSelf, Linker, ResourceTable};
 #[cfg(test)]
 use wasmtime::Engine;
 use wasmtime::{AsContextMut, CallHook, CallHookHandler, Store, StoreContextMut};
@@ -1080,6 +1080,161 @@ fn add_p3_wasi_to_linker(linker: &mut Linker<ComponentRunStates>) -> Result<()> 
     Ok(())
 }
 
+/// The same host interface configuration serves static preparation and execution.
+fn production_linker(
+    engine: &wasmtime::Engine,
+    kernel: bool,
+    intercept_filesystem: bool,
+) -> Result<Linker<ComponentRunStates>> {
+    let mut linker = Linker::new(engine);
+    add_p3_wasi_to_linker(&mut linker)?;
+    crate::p3::add_transport_to_linker(&mut linker)?;
+    add_routing_key_to_linker(&mut linker)?;
+    if kernel {
+        add_pid0_readiness_to_linker(&mut linker)?;
+    }
+    if intercept_filesystem {
+        crate::fs_intercept::override_p3_filesystem_linker(&mut linker)?;
+    }
+    Ok(linker)
+}
+
+fn validate_command(
+    component: &Component,
+    linker: &Linker<ComponentRunStates>,
+    kernel: bool,
+) -> Result<WasiCliCommandPre<ComponentRunStates>> {
+    if kernel {
+        let engine = component.engine();
+        let ty = component.component_type();
+        for (interface, member) in [
+            ("wetware:transport/connection@0.2.0", "open"),
+            ("wetware:kernel-runtime/readiness@1.0.0", "kernel-ready"),
+        ] {
+            let imported = ty.imports(engine).find(|(name, _)| *name == interface);
+            let present = match imported {
+                Some((_, import)) => match import.ty {
+                    ComponentItem::ComponentInstance(instance) => instance
+                        .get_export(engine, member)
+                        .is_some_and(|export| matches!(export.ty, ComponentItem::ComponentFunc(_))),
+                    _ => false,
+                },
+                None => false,
+            };
+            anyhow::ensure!(present, "kernel must import function {interface}#{member}");
+        }
+    }
+    // Presence alone does not check function signatures. The production linker
+    // checks every requested type; CommandPre checks the native P3 command ABI.
+    Ok(WasiCliCommandPre::new(linker.instantiate_pre(component)?)?)
+}
+
+/// Stage at which static kernel preparation failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelValidationFailure {
+    SizeLimit,
+    InvalidComponent,
+    /// Native compilation failed without a typed Wasm validation error.
+    Compilation,
+    Compatibility,
+}
+
+/// A static preparation failure with its original diagnostic chain.
+#[derive(Debug)]
+pub struct KernelValidationError {
+    kind: KernelValidationFailure,
+    source: anyhow::Error,
+}
+
+impl KernelValidationError {
+    pub fn kind(&self) -> KernelValidationFailure {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for KernelValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "kernel preparation failed ({:?}): {}",
+            self.kind, self.source
+        )
+    }
+}
+
+impl std::error::Error for KernelValidationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Immutable kernel validated against the exact production host interfaces.
+///
+/// Creation compiles and checks types, but creates no Store, filesystem owner,
+/// transport grant, readiness gate, or executable guest instance. The runtime
+/// CID identifies the exact input bytes, independently of a UnixFS file CID.
+/// Callers retain their verified source-file and effective-root identities.
+pub struct ValidatedKernel {
+    pre: WasiCliCommandPre<ComponentRunStates>,
+    engine: Arc<wasmtime::Engine>,
+    runtime_cid: cid::Cid,
+}
+
+impl ValidatedKernel {
+    /// Compile synchronously. Dropping an async waiter cannot stop this call.
+    pub fn compile(
+        runtime_engine: &crate::engine::RuntimeEngine,
+        wasm: &[u8],
+    ) -> std::result::Result<Self, KernelValidationError> {
+        check_component_size(wasm).map_err(|source| KernelValidationError {
+            kind: KernelValidationFailure::SizeLimit,
+            source,
+        })?;
+        let engine = runtime_engine.engine();
+        let component = crate::engine::compile_component(&engine, wasm).map_err(|error| {
+            let source: anyhow::Error = error.into();
+            // Wasmtime reports a core-module/component mismatch as an untyped
+            // error. Its own parser's header predicate classifies that case;
+            // the canonical compiler still performs all binary validation.
+            let kind = if !wasmparser::Parser::is_component(wasm)
+                || source
+                    .downcast_ref::<wasmparser::BinaryReaderError>()
+                    .is_some()
+            {
+                KernelValidationFailure::InvalidComponent
+            } else {
+                KernelValidationFailure::Compilation
+            };
+            KernelValidationError { kind, source }
+        })?;
+        let pre = production_linker(&engine, true, true)
+            .and_then(|linker| validate_command(&component, &linker, true))
+            .map_err(|source| KernelValidationError {
+                kind: KernelValidationFailure::Compatibility,
+                source,
+            })?;
+        Ok(Self {
+            pre,
+            engine,
+            runtime_cid: crate::routing_key::derive(wasm),
+        })
+    }
+
+    pub fn runtime_cid(&self) -> cid::Cid {
+        self.runtime_cid
+    }
+}
+
+fn check_component_size(bytes: &[u8]) -> Result<()> {
+    anyhow::ensure!(
+        bytes.len() <= crate::sched::MAX_COMPONENT_BYTES,
+        "component exceeds the fuel segment size bound: {} bytes, maximum {}",
+        bytes.len(),
+        crate::sched::MAX_COMPONENT_BYTES
+    );
+    Ok(())
+}
+
 fn install_host_return_fuel_hook(store: &mut Store<ComponentRunStates>) {
     store.call_hook_async(FuelCallHook);
 }
@@ -1246,6 +1401,7 @@ fn install_epoch_fuel_callback(store: &mut Store<ComponentRunStates>) {
 pub enum Program {
     Bytes(Vec<u8>),
     Precompiled(Arc<Component>),
+    ValidatedKernel(Arc<ValidatedKernel>),
 }
 
 /// Builder for constructing one Cell's host-side process representation.
@@ -1537,13 +1693,7 @@ impl Proc {
             fail_after_filesystem_setup,
         } = init;
         if let Program::Bytes(bytes) = &program {
-            if bytes.len() > crate::sched::MAX_COMPONENT_BYTES {
-                return Err(anyhow!(
-                    "component exceeds the fuel segment size bound: {} bytes, maximum {}",
-                    bytes.len(),
-                    crate::sched::MAX_COMPONENT_BYTES
-                ));
-            }
+            check_component_size(bytes)?;
         }
         let cache_mode = cache_mode.map(Arc::new);
         let (cid_tree, kernel_ready_gate) = match mode {
@@ -1568,19 +1718,16 @@ impl Proc {
         let engine = runtime_engine.engine();
         let epoch_clock = runtime_engine.subscribe();
         let opened_epoch = epoch_clock.current_epoch();
-        let mut linker = Linker::new(&engine);
-        add_p3_wasi_to_linker(&mut linker)?;
-        crate::p3::add_transport_to_linker(&mut linker)?;
-        add_routing_key_to_linker(&mut linker)?;
-        if kernel_ready_gate.is_some() {
-            add_pid0_readiness_to_linker(&mut linker)?;
-        }
-
-        // Override filesystem bindings when CidTree or cache is active.
-        // CidTree mode: ALL filesystem ops resolve through the virtual tree.
-        // Cache-only mode: only `/ipfs/` paths are intercepted.
-        if cid_tree.is_some() || cache_mode.is_some() {
-            crate::fs_intercept::override_p3_filesystem_linker(&mut linker)?;
+        let kernel = kernel_ready_gate.is_some();
+        if let Program::ValidatedKernel(validated) = &program {
+            anyhow::ensure!(
+                kernel,
+                "a validated kernel requires kernel construction mode"
+            );
+            anyhow::ensure!(
+                wasmtime::Engine::same(&engine, &validated.engine),
+                "validated kernel belongs to a different runtime engine"
+            );
         }
 
         // Prepare environment variables as key-value pairs
@@ -1688,41 +1835,52 @@ impl Proc {
         // Instantiate it as a normal component. The canonical engine has
         // Wasmtime's optional persistent cache configured, so this path stays
         // portable while reusing host-local compiled code when available.
-        let component = match program {
-            Program::Precompiled(component) => {
-                tracing::debug!("Using precompiled guest component");
-                component
-            }
-            Program::Bytes(bytecode) => {
-                let start = std::time::Instant::now();
-                let compiled = crate::engine::compile_component(&engine, &bytecode)?;
-                tracing::debug!(
-                    elapsed_ms = start.elapsed().as_millis(),
-                    "Guest component ready"
+        let pre = match program {
+            Program::ValidatedKernel(validated) => validated.pre.clone(),
+            program => {
+                let component = match program {
+                    Program::Precompiled(component) => {
+                        tracing::debug!("Using precompiled guest component");
+                        component
+                    }
+                    Program::Bytes(bytecode) => {
+                        let start = std::time::Instant::now();
+                        let compiled = crate::engine::compile_component(&engine, &bytecode)?;
+                        tracing::debug!(
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "Guest component ready"
+                        );
+                        Arc::new(compiled)
+                    }
+                    Program::ValidatedKernel(_) => unreachable!("validated kernel handled above"),
+                };
+                let component_type = component.component_type();
+                tracing::trace!(
+                    imports = component_type.imports(&engine).len(),
+                    exports = component_type.exports(&engine).len(),
+                    "Guest component type summary"
                 );
-                Arc::new(compiled)
+                for (name, item) in component_type.imports(&engine) {
+                    tracing::trace!(name, item = ?item, "Guest component import");
+                }
+                for (name, item) in component_type.exports(&engine) {
+                    tracing::trace!(name, item = ?item, "Guest component export");
+                }
+
+                let pre_start = std::time::Instant::now();
+                let linker = production_linker(
+                    &engine,
+                    kernel,
+                    kernel || store.data().cache_mode.is_some(),
+                )?;
+                let pre = validate_command(&component, &linker, kernel)?;
+                tracing::trace!(
+                    elapsed_ms = pre_start.elapsed().as_millis(),
+                    "Guest component pre-instantiated"
+                );
+                pre
             }
         };
-        let component_type = component.component_type();
-        tracing::trace!(
-            imports = component_type.imports(&engine).len(),
-            exports = component_type.exports(&engine).len(),
-            "Guest component type summary"
-        );
-        for (name, item) in component_type.imports(&engine) {
-            tracing::trace!(name, item = ?item, "Guest component import");
-        }
-        for (name, item) in component_type.exports(&engine) {
-            tracing::trace!(name, item = ?item, "Guest component export");
-        }
-
-        let pre_start = std::time::Instant::now();
-        let pre_instance = linker.instantiate_pre(&component)?;
-        let pre = WasiCliCommandPre::new(pre_instance)?;
-        tracing::trace!(
-            elapsed_ms = pre_start.elapsed().as_millis(),
-            "Guest component pre-instantiated"
-        );
 
         Ok(Self { pre, store })
     }
@@ -3022,6 +3180,384 @@ mod tests {
             .validate(true)
             .encode()
             .expect("encode private PID0 component")
+    }
+
+    fn kernel_fixture(transport: &str, readiness: &str, command: bool, start: bool) -> Vec<u8> {
+        let run = if command {
+            r#"
+            (func $run async (result (result))
+                (canon lift (core func $instance "run") async))
+            (instance (export (interface "wasi:cli/run@0.3.0"))
+                (export "run" (func $run)))
+            "#
+        } else {
+            ""
+        };
+        wat::parse_str(format!(
+            r#"(component
+                {transport}
+                {readiness}
+                (core module $module
+                    (func $trap unreachable)
+                    {}
+                    (func (export "run") unreachable))
+                (core instance $instance (instantiate $module))
+                {run})"#,
+            if start { "(start $trap)" } else { "" },
+        ))
+        .expect("kernel fixture WAT")
+    }
+
+    const KERNEL_TRANSPORT_IMPORT: &str = r#"
+        (import "wetware:transport/connection@0.2.0" (instance
+            (type $error (variant (case "failed" string)))
+            (export "transport-error" (type $transport-error (eq $error)))
+            (export "open" (func (param "outgoing" (stream u8))
+                (result (tuple (stream u8) (future (result (error $transport-error)))))))))
+    "#;
+
+    const KERNEL_READINESS_IMPORT: &str = r#"
+        (import "wetware:kernel-runtime/readiness@1.0.0" (instance
+            (type $error (enum "stale-generation"))
+            (export "ready-error" (type $ready-error (eq $error)))
+            (export "kernel-ready" (func (result (result (error $ready-error)))))))
+    "#;
+
+    fn prepare_kernel_fixture(bytes: &[u8]) -> Result<()> {
+        let (engine, _publisher) = crate::engine::runtime_engine()?;
+        ValidatedKernel::compile(&engine, bytes)?;
+        Ok(())
+    }
+
+    #[test]
+    fn static_kernel_validation_requires_imported_members() {
+        for (transport, readiness, required) in [
+            ("", KERNEL_READINESS_IMPORT, "open"),
+            (
+                r#"(import "wetware:transport/connection@0.2.0" (instance))"#,
+                KERNEL_READINESS_IMPORT,
+                "open",
+            ),
+            (
+                r#"(import "wetware:transport/connection@0.2.0" (instance
+                    (type $error (variant (case "failed" string)))
+                    (export "transport-error" (type (eq $error)))))"#,
+                KERNEL_READINESS_IMPORT,
+                "open",
+            ),
+            (KERNEL_TRANSPORT_IMPORT, "", "kernel-ready"),
+            (
+                KERNEL_TRANSPORT_IMPORT,
+                r#"(import "wetware:kernel-runtime/readiness@1.0.0" (instance))"#,
+                "kernel-ready",
+            ),
+            (
+                KERNEL_TRANSPORT_IMPORT,
+                r#"(import "wetware:kernel-runtime/readiness@1.0.0" (instance
+                    (type $error (enum "stale-generation"))
+                    (export "ready-error" (type (eq $error)))))"#,
+                "kernel-ready",
+            ),
+            (
+                r#"(import "wetware:transport/connection@0.2.0" (instance
+                    (export "open" (type (sub resource)))))"#,
+                KERNEL_READINESS_IMPORT,
+                "open",
+            ),
+        ] {
+            let bytes = kernel_fixture(transport, readiness, true, false);
+            let error = prepare_kernel_fixture(&bytes)
+                .expect_err("a missing function must not satisfy the kernel contract");
+            let failure = error.downcast_ref::<KernelValidationError>().unwrap();
+            assert_eq!(failure.kind(), KernelValidationFailure::Compatibility);
+            assert!(format!("{error:#}").contains(required), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn static_kernel_validation_checks_required_function_signatures() {
+        for (transport, readiness, required) in [
+            (
+                r#"(import "wetware:transport/connection@0.2.0" (instance
+                    (export "open" (func))))"#,
+                KERNEL_READINESS_IMPORT,
+                "open",
+            ),
+            (
+                KERNEL_TRANSPORT_IMPORT,
+                r#"(import "wetware:kernel-runtime/readiness@1.0.0" (instance
+                    (export "kernel-ready" (func))))"#,
+                "kernel-ready",
+            ),
+        ] {
+            let bytes = kernel_fixture(transport, readiness, true, false);
+            let error = prepare_kernel_fixture(&bytes).expect_err("wrong required function type");
+            let failure = error.downcast_ref::<KernelValidationError>().unwrap();
+            assert_eq!(failure.kind(), KernelValidationFailure::Compatibility);
+            assert!(format!("{error:#}").contains(required), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn static_kernel_validation_requires_native_command_and_supported_imports() {
+        let no_command = kernel_fixture(
+            KERNEL_TRANSPORT_IMPORT,
+            KERNEL_READINESS_IMPORT,
+            false,
+            false,
+        );
+        let unsupported = kernel_fixture(
+            &format!(
+                r#"{KERNEL_TRANSPORT_IMPORT}
+                    (import "unsupported:host/api@1.0.0" (instance (export "call" (func))))"#,
+            ),
+            KERNEL_READINESS_IMPORT,
+            true,
+            false,
+        );
+        for (bytes, message) in [
+            (no_command, "wasi:cli/run"),
+            (unsupported, "unsupported:host/api"),
+        ] {
+            let error = prepare_kernel_fixture(&bytes).expect_err("incompatible kernel");
+            let failure = error.downcast_ref::<KernelValidationError>().unwrap();
+            assert_eq!(failure.kind(), KernelValidationFailure::Compatibility);
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn static_kernel_validation_does_not_execute_start_and_binds_exact_bytes() {
+        let bytes = kernel_fixture(KERNEL_TRANSPORT_IMPORT, KERNEL_READINESS_IMPORT, true, true);
+        let (engine, _publisher) = crate::engine::runtime_engine().unwrap();
+        let validated = ValidatedKernel::compile(&engine, &bytes)
+            .expect("static preparation must not run the trapping start function");
+        assert_eq!(validated.runtime_cid(), crate::routing_key::derive(&bytes));
+    }
+
+    #[test]
+    fn static_kernel_validation_preserves_ordinary_cell_import_contract() {
+        let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+        let engine = runtime.engine();
+        let bytes = wat::parse_str(P3_NOOP_COMMAND).unwrap();
+        let component = crate::engine::compile_component(&engine, &bytes).unwrap();
+        let linker = production_linker(&engine, false, false).unwrap();
+        validate_command(&component, &linker, false)
+            .expect("ordinary P3 command has no kernel-only import requirements");
+        assert_eq!(
+            ValidatedKernel::compile(&runtime, &bytes)
+                .err()
+                .unwrap()
+                .kind(),
+            KernelValidationFailure::Compatibility,
+        );
+    }
+
+    #[test]
+    fn static_kernel_validation_classifies_invalid_bytes_and_enforces_size_limit() {
+        let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+        let module = wat::parse_str("(module)").unwrap();
+        let failure = ValidatedKernel::compile(&runtime, &module).err().unwrap();
+        assert_eq!(
+            failure.kind(),
+            KernelValidationFailure::InvalidComponent,
+            "{failure:#}"
+        );
+        assert_eq!(
+            ValidatedKernel::compile(&runtime, b"not a component")
+                .err()
+                .unwrap()
+                .kind(),
+            KernelValidationFailure::InvalidComponent,
+        );
+        assert_eq!(
+            ValidatedKernel::compile(&runtime, &vec![0; crate::sched::MAX_COMPONENT_BYTES + 1])
+                .err()
+                .unwrap()
+                .kind(),
+            KernelValidationFailure::SizeLimit,
+        );
+    }
+
+    fn pad_component(mut bytes: Vec<u8>, target: usize) -> Vec<u8> {
+        // An empty-name custom section changes exact byte identity but leaves
+        // component semantics intact. Account for the section-length LEB.
+        let mut payload_len = target - bytes.len() - 2;
+        let header = loop {
+            let mut remaining = payload_len;
+            let mut header = vec![0];
+            loop {
+                let byte = (remaining & 0x7f) as u8;
+                remaining >>= 7;
+                header.push(byte | if remaining == 0 { 0 } else { 0x80 });
+                if remaining == 0 {
+                    break;
+                }
+            }
+            let actual = bytes.len() + header.len() + payload_len;
+            if actual == target {
+                break header;
+            }
+            payload_len -= actual - target;
+        };
+        bytes.extend(header);
+        bytes.resize(target, 0);
+        bytes
+    }
+
+    #[test]
+    fn static_kernel_validation_accepts_exactly_eight_mib() {
+        let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+        let bytes = pad_component(
+            kernel_fixture(
+                KERNEL_TRANSPORT_IMPORT,
+                KERNEL_READINESS_IMPORT,
+                true,
+                false,
+            ),
+            crate::sched::MAX_COMPONENT_BYTES,
+        );
+        assert_eq!(bytes.len(), 8 * 1024 * 1024);
+        let validated = ValidatedKernel::compile(&runtime, &bytes).unwrap();
+        assert_eq!(validated.runtime_cid(), crate::routing_key::derive(&bytes));
+    }
+
+    #[test]
+    #[ignore = "requires WW_KERNEL_VALIDATION_FIXTURE and an isolated WW_CWASM_DIR"]
+    fn measure_packaged_kernel_validation() {
+        let fixture = std::env::var("WW_KERNEL_VALIDATION_FIXTURE").expect("packaged PID0 fixture");
+        let wasm = std::fs::read(fixture).unwrap();
+        let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+        let near_limit = pad_component(wasm.clone(), crate::sched::MAX_COMPONENT_BYTES);
+        for (name, bytes) in [
+            ("packaged", &wasm),
+            ("near-limit-custom-section", &near_limit),
+        ] {
+            for temperature in ["cold", "warm"] {
+                let start = std::time::Instant::now();
+                let validated = ValidatedKernel::compile(&runtime, bytes).unwrap();
+                eprintln!(
+                    "kernel-validation {name} {temperature} bytes={} elapsed_ms={} cid={} cache={:?}",
+                    bytes.len(),
+                    start.elapsed().as_millis(),
+                    validated.runtime_cid(),
+                    crate::engine::wasmtime_cache_metrics().snapshot(),
+                );
+                drop(validated);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn validated_kernel_cannot_be_used_by_an_ordinary_cell() {
+        let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+        let bytes = kernel_fixture(
+            KERNEL_TRANSPORT_IMPORT,
+            KERNEL_READINESS_IMPORT,
+            true,
+            false,
+        );
+        let validated = ValidatedKernel::compile(&runtime, &bytes).unwrap();
+        let (builder, _handles) = Builder::ordinary(
+            Program::ValidatedKernel(Arc::new(validated)),
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+            FilesystemOwnership::test(),
+        );
+        let error = builder
+            .with_runtime_engine(runtime)
+            .build()
+            .await
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("requires kernel construction mode"));
+    }
+
+    fn kernel_test_builder(
+        program: Program,
+    ) -> (Builder, tempfile::TempDir, Arc<authority::KernelReadyGate>) {
+        let staging = tempfile::tempdir().unwrap();
+        let filesystem = FilesystemOwnership::test();
+        let cid = crate::routing_key::derive(b"unused test root");
+        let tree = Arc::new(crate::vfs::CidTree::new(
+            cid,
+            ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+            staging.path().to_owned(),
+            Arc::clone(filesystem.resources.host()),
+            filesystem.scope.clone(),
+        ));
+        let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(authority::Epoch {
+            seq: 1,
+            head: cid.to_bytes(),
+            root: Some(cid),
+        });
+        let gate = Arc::new(authority::KernelReadyGate::new(epoch_rx));
+        let (builder, _handles) = Builder::kernel(
+            program,
+            tokio::io::empty(),
+            tokio::io::sink(),
+            tokio::io::sink(),
+            tree,
+            Arc::clone(&gate),
+            filesystem,
+        );
+        (builder, staging, gate)
+    }
+
+    #[tokio::test]
+    async fn kernel_builder_bytes_and_precompiled_enforce_the_shared_contract() {
+        let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+        let bytes = wat::parse_str(P3_NOOP_COMMAND).unwrap();
+        let compiled = crate::engine::compile_component(&runtime.engine(), &bytes).unwrap();
+        for program in [
+            Program::Bytes(bytes),
+            Program::Precompiled(Arc::new(compiled)),
+        ] {
+            let (builder, _staging, _gate) = kernel_test_builder(program);
+            let completion = builder.filesystem_completion();
+            let error = builder
+                .with_runtime_engine(runtime.clone())
+                .build()
+                .await
+                .err()
+                .unwrap();
+            assert!(format!("{error:#}")
+                .contains("must import function wetware:transport/connection@0.2.0#open"));
+            assert_eq!(completion.wait().await, Ok(()));
+        }
+    }
+
+    #[tokio::test]
+    async fn validated_kernel_builder_reuses_preparation_without_committing_readiness() {
+        let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+        let bytes = wat::parse_str(include_str!("../tests/fixtures/kernel-command.wat")).unwrap();
+        let validated = Arc::new(ValidatedKernel::compile(&runtime, &bytes).unwrap());
+        let (builder, _staging, gate) = kernel_test_builder(Program::ValidatedKernel(validated));
+        let completion = builder.filesystem_completion();
+        let proc = builder.with_runtime_engine(runtime).build().await.unwrap();
+        assert!(!gate.is_ready());
+        proc.run().await.unwrap();
+        assert!(!gate.is_ready());
+        assert_eq!(completion.wait().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn validated_kernel_builder_rejects_a_different_engine() {
+        let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+        let (other, _other_publisher) = crate::engine::runtime_engine().unwrap();
+        let bytes = wat::parse_str(include_str!("../tests/fixtures/kernel-command.wat")).unwrap();
+        let validated = Arc::new(ValidatedKernel::compile(&runtime, &bytes).unwrap());
+        let (builder, _staging, _gate) = kernel_test_builder(Program::ValidatedKernel(validated));
+        let error = builder
+            .with_runtime_engine(other)
+            .build()
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("different runtime engine"));
     }
 
     #[test]

@@ -24,6 +24,8 @@ dirs = { workspace = true }
 cap-std = "4.0"
 wasmtime = { workspace = true, features = ["call-hook"] }
 wasmtime-wasi = { version = "=48.0.1", default-features = false, features = ["p3"] }
+# Match the pinned Wasmtime parser so validation errors retain their type.
+wasmparser = { version = "=0.254.0", default-features = false, features = ["std"] }
 tempfile = { workspace = true }
 rustix = { version = "1.1", features = ["fs"] }
 ipld-dagpb = "=0.2.2"
