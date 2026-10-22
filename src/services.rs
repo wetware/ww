@@ -25,6 +25,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use cell::sched::EPOCH_TICK_MS;
 use tokio::sync::{mpsc, watch};
+use tracing::Instrument;
 
 #[cfg(test)]
 pub(crate) fn test_filesystem_resources() -> Arc<cache::HostResources> {
@@ -523,13 +524,12 @@ fn worker_loop(
                         let cancelled = rpc::local_tasks::shutdown_token();
                         let handle = tokio::task::spawn_local(async move {
                             let _guard = guard;
-                            let _span = span.entered();
                             tokio::select! {
                                 biased;
                                 _ = cancelled.cancelled() => false,
                                 _ = (factory)(cell_shutdown) => true,
                             }
-                        });
+                        }.instrument(span));
                         // Monitor the cell task for panics and send exit code.
                         let cell_name_log = cell_name.clone();
                         cells.spawn_local(async move {
@@ -1546,3 +1546,7 @@ mod tests {
         drop(shutdown_tx);
     }
 }
+
+#[cfg(test)]
+#[path = "services_tracing_tests.rs"]
+mod tracing_tests;
