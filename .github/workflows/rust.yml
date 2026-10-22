@@ -348,8 +348,8 @@ jobs:
           target/stream-lifecycle-probe/wasm32-wasip3/release/stream_lifecycle_probe.wasm
         retention-days: 1
 
-  test:
-    name: Test
+  test-host:
+    name: Test host
     needs: [build, build-wasm]
     runs-on: ubuntu-latest
     steps:
@@ -476,12 +476,47 @@ jobs:
         fi
         cat proof.stdout
 
+  test-stdlib:
+    name: Test standalone standard library
+    # Native unit tests do not consume the host build or WASM artifacts.
+    needs: lockfiles
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        submodules: recursive
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - uses: ./.github/actions/setup-capnp
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: stdlib
+        workspaces: |
+          crates/wagi-guest -> target
+          std/kernel -> target
+          std/status -> target
+
     - name: Run standalone standard-library tests
-      if: ${{ always() }}
       run: |
         cargo test --locked --manifest-path crates/wagi-guest/Cargo.toml
         cargo test --locked --manifest-path std/kernel/Cargo.toml
         cargo test --locked --manifest-path std/status/Cargo.toml
+
+  test:
+    # Preserve the required branch-protection check for both test suites.
+    name: Test
+    needs: [test-host, test-stdlib]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+    - name: Require both test suites to pass
+      env:
+        HOST_RESULT: ${{ needs.test-host.result }}
+        STDLIB_RESULT: ${{ needs.test-stdlib.result }}
+      run: test "$HOST_RESULT" = success && test "$STDLIB_RESULT" = success
 
   build-architecture-map:
     name: Build architecture map
