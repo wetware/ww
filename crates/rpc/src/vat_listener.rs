@@ -19,6 +19,7 @@ use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use futures::StreamExt;
+use tracing::Instrument;
 
 use crate::{inbound_connection_budget, terminal_login_timeout, ConnectionBudget};
 use authority::system_capnp;
@@ -116,16 +117,16 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                         };
                         let cap = bootstrap_cap.clone();
                         let protocol = protocol_name.clone();
+                        let handle_span = tracing::info_span!(
+                            "vat.handle",
+                            service = protocol.as_str(),
+                        );
                         tokio::task::spawn_local(async move {
                             let _permit = permit;
-                            let _handle_span = tracing::info_span!(
-                                "vat.handle",
-                                service = protocol.as_str(),
-                            ).entered();
                             if let Err(e) = handle_vat_connection_serve(cap, stream, &protocol).await {
                                 tracing::error!("vat service connection error: {e}");
                             }
-                        });
+                        }.instrument(handle_span));
                     }
                     _ = epoch_rx.changed() => {
                         if epoch_rx.borrow().seq != issued_seq {
@@ -229,12 +230,12 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                             auth_capnp::opaque_session::Owned,
                         > = capnp_rpc::new_client(terminal);
                         let protocol = protocol_name.clone();
+                        let handle_span = tracing::info_span!(
+                            "vat.authenticated.handle",
+                            service = protocol.as_str(),
+                        );
                         tokio::task::spawn_local(async move {
                             let _permit = permit;
-                            let _handle_span = tracing::info_span!(
-                                "vat.authenticated.handle",
-                                service = protocol.as_str(),
-                            ).entered();
                             match handle_authenticated_vat_connection(
                                 terminal.client,
                                 stream,
@@ -254,7 +255,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                                     );
                                 }
                             }
-                        });
+                        }.instrument(handle_span));
                     }
                     _ = epoch_rx.changed() => {
                         if epoch_rx.borrow().seq != issued_seq {
