@@ -102,7 +102,10 @@ fi
 for payload in fhs/boot/kernel.wasm fhs/bin/status.wasm \
   bin/ww/linux/x86_64/ww bin/ww/linux/aarch64/ww \
   bin/ww/macos/aarch64/ww bin/ww/macos/x86_64/ww bin/ww/linux/musl-x86_64/ww; do
-  [ -f "$REMOTE_RELEASE_TREE/$payload" ] && [ ! -L "$REMOTE_RELEASE_TREE/$payload" ] && [ -s "$REMOTE_RELEASE_TREE/$payload" ] || { echo "ERROR: missing, empty, or symlink $payload" >&2; exit 1; }
+  if [ ! -f "$REMOTE_RELEASE_TREE/$payload" ] || [ -L "$REMOTE_RELEASE_TREE/$payload" ] || [ ! -s "$REMOTE_RELEASE_TREE/$payload" ]; then
+    echo "ERROR: missing, empty, or symlink $payload" >&2
+    exit 1
+  fi
   awk -v path="$payload" '$2 == path && length($1) == 64 { found++ } END { exit found != 1 }' \
     "$REMOTE_RELEASE_TREE/CHECKSUMS.txt" || { echo "ERROR: missing checksum for $payload" >&2; exit 1; }
 done

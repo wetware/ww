@@ -19,12 +19,19 @@ fhs="$artifacts/wasm-artifacts/target/fhs"
 "$validator" verify "$kernel" "$status" "$fhs"
 for entry in linux-x86_64:linux/x86_64 linux-aarch64:linux/aarch64 macos-aarch64:macos/aarch64 macos-x86_64:macos/x86_64 linux-musl-x86_64:linux/musl-x86_64; do
   artifact="$artifacts/ww-${entry%%:*}"
-  [ -f "$artifact/ww" ] && [ ! -L "$artifact/ww" ] && [ -s "$artifact/ww" ] || { echo "Missing, empty, or symlink Host: $artifact/ww" >&2; exit 1; }
-  [ -f "$artifact/REVISION" ] && [ ! -L "$artifact/REVISION" ] \
-    && [ "$(cat "$artifact/REVISION")" = "$revision" ] \
-    || { echo "Stale or missing source revision: $artifact" >&2; exit 1; }
-  [ -f "$artifact/SHA256SUMS" ] && [ ! -L "$artifact/SHA256SUMS" ] \
-    || { echo "Missing Host checksum receipt: $artifact" >&2; exit 1; }
+  if [ ! -f "$artifact/ww" ] || [ -L "$artifact/ww" ] || [ ! -s "$artifact/ww" ]; then
+    echo "Missing, empty, or symlink Host: $artifact/ww" >&2
+    exit 1
+  fi
+  if [ ! -f "$artifact/REVISION" ] || [ -L "$artifact/REVISION" ] \
+    || [ "$(cat "$artifact/REVISION")" != "$revision" ]; then
+    echo "Stale or missing source revision: $artifact" >&2
+    exit 1
+  fi
+  if [ ! -f "$artifact/SHA256SUMS" ] || [ -L "$artifact/SHA256SUMS" ]; then
+    echo "Missing Host checksum receipt: $artifact" >&2
+    exit 1
+  fi
   expected="$(awk 'NR == 1 && NF == 2 && $2 == "ww" && length($1) == 64 && $1 !~ /[^0-9a-f]/ { hash=$1 } END { if (NR != 1 || hash == "") exit 1; print hash }' "$artifact/SHA256SUMS")"
   actual="$(checksum "$artifact/ww" | awk '{print $1}')"
   [ "$actual" = "$expected" ] || { echo "Host checksum mismatch: $artifact" >&2; exit 1; }
