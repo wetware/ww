@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Canonical FHS packaging and installation (#735 Landing 2 of 3).**
+  Packages include canonical kernel and status components. Fresh installation
+  validates payloads, preserves private state, and carries the selected Kubo API
+  endpoint into generated services. Container and release packaging use the same
+  canonical FHS. CI gates publication on package, installation, and boot checks.
+  Existing active PID0 selection remains unchanged.
 - **Shared kernel preparation and generation identity (#735 Landing 1 of 3).**
   The library verifies immutable kernel-file selection against an explicit FHS
   root and shares native P3 static kernel validation. Current kernel identity

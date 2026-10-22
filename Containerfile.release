@@ -1,15 +1,20 @@
-# Minimal runtime container from pre-built binaries.
-# Used by release.yml — builds from artifacts produced by build-binaries matrix.
-# For local development builds, use the full Containerfile instead.
-#
-# Usage: docker buildx build --platform linux/amd64,linux/arm64 \
-#          -f Containerfile.release -t wetware:latest .
+# Artifact runtime. Supply canonical fhs/ and ww-amd64 / ww-arm64.
+# The cc runtime supports both GNU release targets and the x86_64 musl binary.
+FROM busybox:1.37 AS home
+RUN mkdir -p /home/ww/.ww && chown -R 1000:1000 /home/ww
 
-FROM gcr.io/distroless/static-debian12
+FROM gcr.io/distroless/cc-debian13
 
 ARG TARGETARCH
 
 COPY ww-${TARGETARCH} /usr/local/bin/ww
+COPY fhs/ /usr/share/wetware/kernel/
+
+COPY --from=home --chown=1000:1000 /home/ww/ /home/ww/
+ENV HOME=/home/ww
+WORKDIR /home/ww
+# A whole-home volume cannot hide the immutable FHS under /usr/share.
+VOLUME ["/home/ww"]
 
 USER 1000:1000
 EXPOSE 2025 2026 2080

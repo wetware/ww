@@ -53,7 +53,6 @@ log() {
 cleanup() {
   best_effort_k exec "$POD" -- rm -rf "$POD_RELEASE_TREE" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
 
 repo_stat_size() {
   best_effort_k exec "$POD" -- sh -c 'if command -v timeout >/dev/null 2>&1; then timeout 30 ipfs repo stat --size-only; else ipfs repo stat --size-only; fi' 2>/dev/null \
@@ -97,6 +96,21 @@ if [ ! -d "$REMOTE_RELEASE_TREE" ]; then
   echo "ERROR: release tree is missing on VPS: $REMOTE_RELEASE_TREE" >&2
   exit 1
 fi
+
+# Reject incomplete or changed mandatory payloads before the first remote call.
+[ -s "$REMOTE_RELEASE_TREE/CHECKSUMS.txt" ] || { echo 'ERROR: missing release checksums' >&2; exit 1; }
+for payload in fhs/boot/kernel.wasm fhs/bin/status.wasm \
+  bin/ww/linux/x86_64/ww bin/ww/linux/aarch64/ww \
+  bin/ww/macos/aarch64/ww bin/ww/macos/x86_64/ww bin/ww/linux/musl-x86_64/ww; do
+  if [ ! -f "$REMOTE_RELEASE_TREE/$payload" ] || [ -L "$REMOTE_RELEASE_TREE/$payload" ] || [ ! -s "$REMOTE_RELEASE_TREE/$payload" ]; then
+    echo "ERROR: missing, empty, or symlink $payload" >&2
+    exit 1
+  fi
+  awk -v path="$payload" '$2 == path && length($1) == 64 { found++ } END { exit found != 1 }' \
+    "$REMOTE_RELEASE_TREE/CHECKSUMS.txt" || { echo "ERROR: missing checksum for $payload" >&2; exit 1; }
+done
+(cd "$REMOTE_RELEASE_TREE" && sha256sum --check --strict CHECKSUMS.txt)
+trap cleanup EXIT
 
 log "collecting repo stat before publish (best effort)"
 repo_stat_before="$(repo_stat_size)"

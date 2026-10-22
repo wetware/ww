@@ -41,6 +41,10 @@ EOF
 
 cat >"$BIN_DIR/rustc" <<'EOF'
 #!/usr/bin/env bash
+if [[ " $* " == *' --print sysroot '* ]]; then
+  echo /mock/rust
+  exit 0
+fi
 echo 'rustc 1.100.0-nightly'
 echo 'LLVM version: 23.1.0'
 EOF

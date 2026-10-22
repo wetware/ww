@@ -102,7 +102,10 @@ fn main() {
     for wasm_path in &embedded_wasm {
         let full = manifest_path.join(wasm_path);
         println!("cargo:rerun-if-changed={}", full.display());
-        if !full.exists() {
+        if !fs::symlink_metadata(&full)
+            .map(|metadata| metadata.file_type().is_file() && metadata.len() > 0)
+            .unwrap_or(false)
+        {
             missing.push(*wasm_path);
         }
     }
@@ -118,7 +121,10 @@ fn main() {
     // break tests that check file existence to decide whether to skip).
     for wasm_path in &embedded_wasm {
         let full = manifest_path.join(wasm_path);
-        if full.exists() && fs::metadata(&full).map(|m| m.len() > 0).unwrap_or(false) {
+        if fs::symlink_metadata(&full)
+            .map(|metadata| metadata.file_type().is_file() && metadata.len() > 0)
+            .unwrap_or(false)
+        {
             // Convert path to a valid cfg identifier: replace / and . with _
             let flag = wasm_path.replace(['/', '.'], "_");
             println!("cargo:rustc-cfg=has_wasm_{flag}");
@@ -127,7 +133,7 @@ fn main() {
     if !missing.is_empty() {
         let profile = env::var("PROFILE").unwrap_or_default();
         let msg = format!(
-            "Missing WASM files for embedding:\n{}\n\nRun `make std` to build them.",
+            "Missing, empty, or non-regular WASM files for embedding:\n{}\n\nRun `make std` to build them.",
             missing
                 .iter()
                 .map(|p| format!("  {p}"))

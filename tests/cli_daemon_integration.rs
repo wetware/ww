@@ -13,6 +13,11 @@ fn ww_bin() -> PathBuf {
 
 fn ww_command(home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(ww_bin());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("WW_") {
+            command.env_remove(key);
+        }
+    }
     command
         .args(args)
         .env("HOME", home)
@@ -67,7 +72,7 @@ fn image_arguments(arguments: &[String]) -> Vec<&str> {
 
     while index < arguments.len() {
         match arguments[index].as_str() {
-            "--listen" | "--identity" | "--http-listen" | "--namespace-root"
+            "--listen" | "--identity" | "--http-listen" | "--namespace-root" | "--ipfs-url"
             | "--ipns-routing-url" => {
                 index += 2;
             }
@@ -82,14 +87,94 @@ fn image_arguments(arguments: &[String]) -> Vec<&str> {
     images
 }
 
-#[cfg(unix)]
-fn embedded_images_hash() -> String {
-    let mut hasher = blake3::Hasher::new();
-    for path in ["std/kernel/bin/main.wasm", "std/status/bin/status.wasm"] {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
-        hasher.update(&std::fs::read(path).unwrap_or_default());
+fn install_managed(home: &Path) -> String {
+    let payload = tempfile::tempdir().expect("staged canonical payload");
+    for (source, destination) in [
+        ("std/kernel/bin/main.wasm", "boot/kernel.wasm"),
+        ("std/status/bin/status.wasm", "bin/status.wasm"),
+    ] {
+        let destination = payload.path().join(destination);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(source),
+            destination,
+        )
+        .expect("build canonical WASM payloads with make std before CLI integration tests");
     }
-    hasher.finalize().to_hex().to_string()
+    // This fake covers only Kubo's directory-import boundary. Static WASM
+    // validation and all filesystem operations still use the real Host.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let importer = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0u8; 8192];
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            if attempt == 0 {
+                assert!(request.contains("/routing/v1/ipns/not-an-ipns-name"));
+                write!(
+                    stream,
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            assert!(request.contains("filename=\"bin/main.wasm\""));
+            assert!(request.contains("filename=\"bin/status.wasm\""));
+            assert!(!request.contains("filename=\"boot/kernel.wasm\""));
+            let body = "{\"Name\":\"\",\"Hash\":\"bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye\",\"Size\":\"0\"}\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    let output = ww_command(
+        home,
+        &[
+            "perform",
+            "install",
+            "--payload",
+            payload.path().to_str().unwrap(),
+        ],
+    )
+    .env("IPFS_API", &endpoint)
+    .env("IPFS_ROUTING_API", &endpoint)
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "managed installation failed: {}",
+        stderr_text(&output)
+    );
+    importer.join().unwrap();
+    endpoint
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
@@ -134,6 +219,7 @@ fn daemon_install_writes_service_with_listen_args() {
     }
 
     let home = tempfile::tempdir().expect("temp home");
+    install_managed(home.path());
     let output = run_ww(
         home.path(),
         &[
@@ -218,23 +304,14 @@ fn daemon_install_freezes_explicit_local_mounts_against_invocation_cwd() {
 
 #[cfg(unix)]
 #[test]
-fn perform_update_restarts_for_service_definition_change_only() {
+fn perform_update_refuses_custom_service_and_skips_unchanged_restart() {
     if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
         eprintln!("SKIP: daemon service writer only supports macOS/Linux");
         return;
     }
 
     let home = tempfile::tempdir().expect("temp home");
-    let install = run_ww(home.path(), &["daemon", "install"]);
-    assert!(
-        install.status.success(),
-        "daemon install failed: {}",
-        stderr_text(&install)
-    );
-
-    let ww_dir = home.path().join(".ww");
-    std::fs::write(ww_dir.join(".last-std-cid"), embedded_images_hash())
-        .expect("write current image marker");
+    let routing_url = install_managed(home.path());
 
     let service_path = if cfg!(target_os = "macos") {
         home.path().join("Library/LaunchAgents/io.wetware.ww.plist")
@@ -276,35 +353,30 @@ fn perform_update_restarts_for_service_definition_change_only() {
     let service_command_log = home.path().join("service-manager.log");
 
     let stale_update = ww_command(home.path(), &["perform", "update"])
+        .env("IPFS_API", &routing_url)
+        .env("IPFS_ROUTING_API", &routing_url)
         .env("PATH", &path)
         .env("WW_TEST_SERVICE_COMMAND_LOG", &service_command_log)
         .output()
         .expect("run update with stale service definition");
     assert!(
-        stale_update.status.success(),
-        "perform update failed: {}",
-        stderr_text(&stale_update)
+        !stale_update.status.success(),
+        "custom service must require manual review"
     );
+    assert!(stderr_text(&stale_update).contains("custom installation"));
     assert_eq!(
-        std::fs::read(&service_path).expect("read rewritten service definition"),
-        expected_service,
-        "perform update should replace the stale service definition"
+        std::fs::read(&service_path).unwrap(),
+        b"stale service mounted the entire .ww directory\n"
     );
-
-    let restart_commands = std::fs::read_to_string(&service_command_log)
-        .expect("service restart should invoke the service-manager stub");
-    if cfg!(target_os = "macos") {
-        assert!(restart_commands
-            .lines()
-            .any(|line| line.starts_with("load ")));
-    } else {
-        assert!(restart_commands
-            .lines()
-            .any(|line| line == "--user restart ww"));
-    }
-
-    std::fs::write(&service_command_log, "").expect("clear service-manager log");
+    assert!(
+        !service_command_log.exists(),
+        "refusal must not activate services"
+    );
+    std::fs::write(&service_path, &expected_service).unwrap();
+    std::fs::write(&service_command_log, "").unwrap();
     let unchanged_update = ww_command(home.path(), &["perform", "update"])
+        .env("IPFS_API", &routing_url)
+        .env("IPFS_ROUTING_API", &routing_url)
         .env("PATH", &path)
         .env("WW_TEST_SERVICE_COMMAND_LOG", &service_command_log)
         .output()
@@ -336,11 +408,11 @@ async fn default_daemon_import_excludes_private_host_state() {
     }
 
     let home = tempfile::tempdir().expect("temp home");
+    install_managed(home.path());
     let ww_dir = home.path().join(".ww");
     let fhs_dir = ww_dir.join("fhs");
     std::fs::create_dir_all(fhs_dir.join("svc")).expect("publishable FHS tree");
-    std::fs::write(ww_dir.join("identity"), b"PRIVATE_HOST_IDENTITY_SENTINEL")
-        .expect("identity fixture");
+    let identity_sentinel = std::fs::read_to_string(ww_dir.join("identity")).unwrap();
     std::fs::create_dir_all(ww_dir.join("ipns/follow")).expect("follower state directory");
     std::fs::create_dir_all(ww_dir.join("ipns/publish")).expect("publisher state directory");
     std::fs::write(
@@ -420,10 +492,7 @@ async fn default_daemon_import_excludes_private_host_state() {
         "intended deployable file missing from import request: {request}"
     );
     assert!(!request.contains("filename=\"identity\""), "{request}");
-    assert!(
-        !request.contains("PRIVATE_HOST_IDENTITY_SENTINEL"),
-        "{request}"
-    );
+    assert!(!request.contains(&identity_sentinel), "{request}");
     assert!(
         !request.contains("filename=\"ipns/follow/name.record\""),
         "{request}"

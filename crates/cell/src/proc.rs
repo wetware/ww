@@ -1235,6 +1235,20 @@ fn check_component_size(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Statically validate an ordinary command with the production child linker.
+/// This does not instantiate guest code or grant filesystem/transport authority.
+pub fn validate_component(
+    runtime_engine: &crate::engine::RuntimeEngine,
+    wasm: &[u8],
+) -> Result<()> {
+    check_component_size(wasm)?;
+    let engine = runtime_engine.engine();
+    let component = crate::engine::compile_component(&engine, wasm)?;
+    let linker = production_linker(&engine, false, true)?;
+    validate_command(&component, &linker, false)?;
+    Ok(())
+}
+
 fn install_host_return_fuel_hook(store: &mut Store<ComponentRunStates>) {
     store.call_hook_async(FuelCallHook);
 }

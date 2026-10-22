@@ -1,14 +1,17 @@
-# Artifact-based deploy container. No Rust compilation.
-# Binary and WASM are pre-built by CI and COPYed in.
-# For local development builds, use the full Containerfile instead.
-#
-# Image layout: the kernel cell layer is under /usr/share/wetware/.
-#   kernel/bin/main.wasm   — pid0 entrypoint
+# Artifact runtime. Supply canonical fhs/ and the statically linked Linux Host.
+FROM busybox:1.37 AS home
+RUN mkdir -p /home/ww/.ww && chown -R 1000:1000 /home/ww
 
 FROM gcr.io/distroless/static-debian12
 
 COPY ww /usr/local/bin/ww
-COPY wetware/ /usr/share/wetware/
+COPY fhs/ /usr/share/wetware/kernel/
+
+COPY --from=home --chown=1000:1000 /home/ww/ /home/ww/
+ENV HOME=/home/ww
+WORKDIR /home/ww
+# A whole-home volume cannot hide the immutable FHS under /usr/share.
+VOLUME ["/home/ww"]
 
 USER 1000:1000
 EXPOSE 2025 2026 2080

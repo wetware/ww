@@ -1,11 +1,17 @@
 # Build artifacts
 target/
+artifacts/
+release-tree/
+deploy-context/
+tested-image.tar
 
 # Git (commit hash passed via --build-arg WW_BUILD_GIT_SHA)
 .git/
 
-# Local workspace state
+# Local workspace and private Host/Kubo state
 .context/
+**/.ww/
+**/.ipfs/
 
 # CI/CD
 .github/

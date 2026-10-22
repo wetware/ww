@@ -22,6 +22,8 @@ pub(super) struct DaemonServiceConfig {
     pub images: Vec<PathBuf>,
     /// Address (`host:port`) for the WAGI HTTP server. `None` disables WAGI.
     pub http_listen: Option<String>,
+    /// Kubo HTTP API endpoint resolved during service installation.
+    pub ipfs_url: String,
     /// Kubo Gateway listener that exposes HTTP Routing V1.
     pub ipns_routing_url: String,
 }
@@ -52,18 +54,17 @@ pub(super) async fn daemon_install(
     // 1. Resolve identity path — default to ~/.ww/identity.
     let key_path = identity.unwrap_or_else(|| ww_dir.join("identity"));
 
-    // Generate key if it doesn't exist.
-    if !key_path.exists() {
-        let sk = ww::keys::generate()?;
-        ww::keys::save(&sk, &key_path)?;
-
-        if !quiet {
-            let kp = ww::keys::to_libp2p(&sk)?;
-            eprintln!("Generated new identity: {}", key_path.display());
-            eprintln!("  Peer ID:     {}", kp.public().to_peer_id());
-        }
-    } else if !quiet {
-        eprintln!("Using existing identity: {}", key_path.display());
+    let generated = super::installation::ensure_identity(&key_path)?;
+    if !quiet {
+        eprintln!(
+            "{} identity: {}",
+            if generated {
+                "Generated"
+            } else {
+                "Using existing"
+            },
+            key_path.display()
+        );
     }
 
     // 2. Build service config directly from CLI/defaults.
@@ -97,6 +98,7 @@ pub(super) async fn daemon_install(
         namespace_roots,
         images: image_layers,
         http_listen: Some("127.0.0.1:2080".to_string()),
+        ipfs_url: std::env::var("IPFS_API").unwrap_or_else(|_| "http://localhost:5001".into()),
         ipns_routing_url,
     };
 
@@ -105,47 +107,35 @@ pub(super) async fn daemon_install(
     write_service_file(&ww_bin, &config, &home, quiet)
 }
 
-/// Materialize the install-owned FHS layer outside the private host-state tree.
-///
-/// Release binaries carry the status component. The current install script
-/// also writes `~/.ww/std/status/bin/status.wasm`, used when embedded bytes
-/// are absent.
+/// Reuse the explicitly installed payload; embedded seeds never replace it.
 pub(super) fn refresh_default_fhs(ww_dir: &Path) -> Result<(PathBuf, bool)> {
-    let fhs_dir = ww_dir.join("fhs");
-    let bin_dir = fhs_dir.join("bin");
-    let mut changed = !bin_dir.exists();
-    std::fs::create_dir_all(&bin_dir).context("create ~/.ww/fhs/bin")?;
+    super::installation::installed_fhs(ww_dir)?;
+    Ok((ww_dir.join("fhs"), false))
+}
 
-    let status_path = bin_dir.join("status.wasm");
-    let legacy_status_path = ww_dir.join("std/status/bin/status.wasm");
-    let status_bytes = if !super::EMBEDDED_STATUS.is_empty() {
-        Some(super::EMBEDDED_STATUS.to_vec())
+/// Render the service without modifying the installation.
+pub(super) fn render_service(
+    ww_bin: &Path,
+    config: &DaemonServiceConfig,
+    home: &Path,
+) -> Result<(PathBuf, String)> {
+    let identity = config
+        .identity
+        .to_str()
+        .context("identity path is non-UTF-8")?;
+    if cfg!(target_os = "macos") {
+        Ok((
+            home.join("Library/LaunchAgents/io.wetware.ww.plist"),
+            render_launchd_plist(ww_bin, config, home, identity),
+        ))
+    } else if cfg!(target_os = "linux") {
+        Ok((
+            home.join(".config/systemd/user/ww.service"),
+            render_systemd_unit(ww_bin, config, identity),
+        ))
     } else {
-        match std::fs::read(&legacy_status_path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("read {}", legacy_status_path.display()));
-            }
-        }
-    };
-    if let Some(status_bytes) = status_bytes {
-        let current = match std::fs::read(&status_path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(error).with_context(|| format!("read {}", status_path.display()));
-            }
-        };
-        if current.as_deref() != Some(status_bytes.as_slice()) {
-            std::fs::write(&status_path, status_bytes)
-                .context("write ~/.ww/fhs/bin/status.wasm")?;
-            changed = true;
-        }
+        bail!("unsupported platform; only macOS and Linux are supported")
     }
-
-    Ok((fhs_dir, changed))
 }
 
 /// Remove the platform service file.
@@ -228,41 +218,63 @@ pub(super) fn write_launchd_plist(
 
     let log_dir = home.join(".ww/logs");
     std::fs::create_dir_all(&log_dir).context("create ~/.ww/logs")?;
-    let log_path = log_dir.join("ww.log");
 
-    // Build ProgramArguments array entries.
-    let mut args = vec![
-        format!("        <string>{}</string>", ww_bin.display()),
-        "        <string>run</string>".to_string(),
-    ];
-    for addr in &config.listen {
-        args.push("        <string>--listen</string>".to_string());
-        args.push(format!("        <string>{addr}</string>"));
-    }
-    // Identity as a --identity flag (host-side only, not a guest mount).
-    args.push("        <string>--identity</string>".to_string());
-    args.push(format!("        <string>{identity_path}</string>"));
-    args.push("        <string>--ipns-routing-url</string>".to_string());
-    args.push(format!(
-        "        <string>{}</string>",
-        config.ipns_routing_url
-    ));
-    // WAGI HTTP listen addr (engagement starter kit: status endpoint on :2080).
-    if let Some(ref addr) = config.http_listen {
-        args.push("        <string>--http-listen</string>".to_string());
-        args.push(format!("        <string>{addr}</string>"));
-    }
-    // Namespace configuration is host state, not an image mount.
-    for root in &config.namespace_roots {
-        args.push("        <string>--namespace-root</string>".to_string());
-        args.push(format!("        <string>{}</string>", root.display()));
-    }
-    // Image layers (root mounts).
-    for img in &config.images {
-        args.push(format!("        <string>{}</string>", img.display()));
+    let plist = render_launchd_plist(ww_bin, config, home, identity_path);
+
+    let changed = service_definition_differs(&plist_path, plist.as_bytes())?;
+    std::fs::write(&plist_path, plist)
+        .with_context(|| format!("write plist: {}", plist_path.display()))?;
+    if !quiet {
+        eprintln!("Wrote service: {}", plist_path.display());
+        eprintln!();
+        eprintln!("Activate with:");
+        eprintln!("  launchctl load {}", plist_path.display());
     }
 
-    let plist = format!(
+    Ok(changed)
+}
+
+/// Write a Linux systemd user unit.
+pub(super) fn write_systemd_unit(
+    ww_bin: &Path,
+    config: &DaemonServiceConfig,
+    home: &Path,
+    identity_path: &str,
+    quiet: bool,
+) -> Result<bool> {
+    let unit_dir = home.join(".config/systemd/user");
+    std::fs::create_dir_all(&unit_dir).context("create ~/.config/systemd/user")?;
+
+    let unit_path = unit_dir.join("ww.service");
+
+    let unit = render_systemd_unit(ww_bin, config, identity_path);
+
+    let changed = service_definition_differs(&unit_path, unit.as_bytes())?;
+    std::fs::write(&unit_path, unit)
+        .with_context(|| format!("write unit: {}", unit_path.display()))?;
+    if !quiet {
+        eprintln!("Wrote service: {}", unit_path.display());
+        eprintln!();
+        eprintln!("Activate with:");
+        eprintln!("  systemctl --user enable --now ww");
+    }
+
+    Ok(changed)
+}
+
+fn render_launchd_plist(
+    ww_bin: &Path,
+    config: &DaemonServiceConfig,
+    home: &Path,
+    identity_path: &str,
+) -> String {
+    let log_path = home.join(".ww/logs/ww.log");
+    let args = service_argv(ww_bin, config, identity_path)
+        .iter()
+        .map(|arg| format!("        <string>{}</string>", xml_text(arg)))
+        .collect::<Vec<_>>();
+
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -291,69 +303,18 @@ pub(super) fn write_launchd_plist(
 </plist>
 "#,
         args = args.join("\n"),
-        log = log_path.display(),
-    );
-
-    let changed = service_definition_differs(&plist_path, plist.as_bytes())?;
-    std::fs::write(&plist_path, plist)
-        .with_context(|| format!("write plist: {}", plist_path.display()))?;
-    if !quiet {
-        eprintln!("Wrote service: {}", plist_path.display());
-        eprintln!();
-        eprintln!("Activate with:");
-        eprintln!("  launchctl load {}", plist_path.display());
-    }
-
-    Ok(changed)
+        log = xml_text(&log_path.display().to_string()),
+    )
 }
 
-/// Write a Linux systemd user unit.
-pub(super) fn write_systemd_unit(
-    ww_bin: &Path,
-    config: &DaemonServiceConfig,
-    home: &Path,
-    identity_path: &str,
-    quiet: bool,
-) -> Result<bool> {
-    let unit_dir = home.join(".config/systemd/user");
-    std::fs::create_dir_all(&unit_dir).context("create ~/.config/systemd/user")?;
-
-    let unit_path = unit_dir.join("ww.service");
-
-    // Build positional args: image layers only (identity is a flag, not a mount).
-    let mut positional = Vec::new();
-    for img in &config.images {
-        positional.push(img.display().to_string());
-    }
-
-    let listen_args: String = config
-        .listen
+fn render_systemd_unit(ww_bin: &Path, config: &DaemonServiceConfig, identity_path: &str) -> String {
+    let exec_start = service_argv(ww_bin, config, identity_path)
         .iter()
-        .map(|a| format!("--listen {a}"))
+        .map(|arg| systemd_argument(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    let http_listen_arg = match &config.http_listen {
-        Some(addr) => format!(" --http-listen {addr}"),
-        None => String::new(),
-    };
-    let namespace_args = config
-        .namespace_roots
-        .iter()
-        .map(|root| format!("--namespace-root {}", root.display()))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let exec_start = format!(
-        "{} run {} --identity {} --ipns-routing-url {}{} {} {}",
-        ww_bin.display(),
-        listen_args,
-        identity_path,
-        config.ipns_routing_url,
-        http_listen_arg,
-        namespace_args,
-        positional.join(" "),
-    );
 
-    let unit = format!(
+    format!(
         "[Unit]\n\
          Description=Wetware daemon\n\
          After=network-online.target\n\
@@ -367,17 +328,121 @@ pub(super) fn write_systemd_unit(
          \n\
          [Install]\n\
          WantedBy=default.target\n"
-    );
+    )
+}
 
-    let changed = service_definition_differs(&unit_path, unit.as_bytes())?;
-    std::fs::write(&unit_path, unit)
-        .with_context(|| format!("write unit: {}", unit_path.display()))?;
-    if !quiet {
-        eprintln!("Wrote service: {}", unit_path.display());
-        eprintln!();
-        eprintln!("Activate with:");
-        eprintln!("  systemctl --user enable --now ww");
+fn service_argv(ww_bin: &Path, config: &DaemonServiceConfig, identity_path: &str) -> Vec<String> {
+    let mut args = vec![ww_bin.display().to_string(), "run".into()];
+    for addr in &config.listen {
+        args.extend(["--listen".into(), addr.clone()]);
+    }
+    args.extend([
+        "--identity".into(),
+        identity_path.into(),
+        "--ipfs-url".into(),
+        config.ipfs_url.clone(),
+        "--ipns-routing-url".into(),
+        config.ipns_routing_url.clone(),
+    ]);
+    if let Some(addr) = &config.http_listen {
+        args.extend(["--http-listen".into(), addr.clone()]);
+    }
+    for root in &config.namespace_roots {
+        args.extend(["--namespace-root".into(), root.display().to_string()]);
+    }
+    args.extend(config.images.iter().map(|path| path.display().to_string()));
+    args
+}
+
+fn xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn systemd_argument(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"/:._-".contains(&c))
+    {
+        return value.into();
+    }
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+        .replace('%', "%%")
+        .replace('$', "$$");
+    format!("\"{escaped}\"")
+}
+
+#[cfg(test)]
+mod rendering_tests {
+    use super::*;
+
+    fn config() -> DaemonServiceConfig {
+        DaemonServiceConfig {
+            listen: default_listen(),
+            identity: PathBuf::from("/home/a b&c/identity"),
+            namespace_roots: vec![PathBuf::from("/home/a b&c/.ww")],
+            images: vec![PathBuf::from("/home/a b&c/.ww/fhs")],
+            http_listen: Some("127.0.0.1:2080".into()),
+            ipfs_url: "http://localhost:5001".into(),
+            ipns_routing_url: "http://localhost:8080".into(),
+        }
     }
 
-    Ok(changed)
+    #[test]
+    fn service_renderers_preserve_nondefault_api_and_escape_endpoint_characters() {
+        let mut config = config();
+        config.ipfs_url = "http://127.0.0.1:45001/api?x=%20&y=$value".into();
+        let binary = Path::new("/home/user/.ww/bin/ww");
+        let identity = "/home/user/.ww/identity";
+        let argv = service_argv(binary, &config, identity);
+        assert_eq!(argv.iter().filter(|arg| *arg == "--ipfs-url").count(), 1);
+        let endpoint = argv.iter().position(|arg| arg == "--ipfs-url").unwrap() + 1;
+        assert_eq!(argv[endpoint], "http://127.0.0.1:45001/api?x=%20&y=$value");
+        let launchd = render_launchd_plist(binary, &config, Path::new("/home/user"), identity);
+        assert!(launchd.contains("<string>http://127.0.0.1:45001/api?x=%20&amp;y=$value</string>"));
+        let systemd = render_systemd_unit(binary, &config, identity);
+        assert!(systemd.contains(r#"--ipfs-url "http://127.0.0.1:45001/api?x=%%20&y=$$value""#));
+    }
+
+    #[test]
+    fn launchd_escapes_paths_without_changing_argument_boundaries() {
+        let config = config();
+        let rendered = render_launchd_plist(
+            Path::new("/home/a b&c/.ww/bin/ww"),
+            &config,
+            Path::new("/home/a b&c"),
+            "/home/a b&c/identity",
+        );
+        assert!(rendered.contains(
+            "<string>--ipfs-url</string>\n        <string>http://localhost:5001</string>"
+        ));
+        assert!(rendered.contains("<string>/home/a b&amp;c/.ww/bin/ww</string>"));
+        assert!(rendered.contains("<string>/home/a b&amp;c/.ww/fhs</string>"));
+        assert!(!rendered.contains("a b&c"));
+    }
+
+    #[test]
+    fn systemd_quotes_paths_and_escapes_expansion_characters() {
+        let config = config();
+        let rendered = render_systemd_unit(
+            Path::new("/home/a b%$/.ww/bin/ww"),
+            &config,
+            "/home/a b&c/identity",
+        );
+        assert!(rendered.contains("ExecStart=\"/home/a b%%$$/.ww/bin/ww\" run"));
+        assert!(rendered.contains("--identity \"/home/a b&c/identity\""));
+        assert!(rendered.contains("--ipfs-url http://localhost:5001"));
+        assert!(rendered.contains("--namespace-root \"/home/a b&c/.ww\""));
+        assert!(rendered.contains("\"/home/a b&c/.ww/fhs\""));
+    }
 }

@@ -93,19 +93,34 @@ grep -Fq 'fetch-depth: 0' <<<"$publish_job" \
 grep -Fq 'scripts/check_release_ancestry.sh' "$WORKFLOW" \
   || fail "workflow must enforce Git ancestry before publishing IPNS"
 # shellcheck disable=SC2016
-grep -Fq 'echo "${{ github.sha }}" > "$STAGE/REVISION"' "$WORKFLOW" \
+grep -Fq 'printf '"'"'%s\n'"'"' "$revision" > "$stage/REVISION"' "$ROOT_DIR/scripts/assemble_release.sh" \
   || fail "published release trees must record their Git revision"
 grep -Fq "WW_RELEASE_EXPECTED_CURRENT='\$CURRENT_RELEASE'" "$WORKFLOW" \
   || fail "workflow must pass the observed IPNS release into the remote compare-and-set check"
 exact_key_matches="$(grep -Fc "awk '\\\$2 == \\\"ww-release\\\" { print \\\$1; exit }'" "$WORKFLOW")"
-[ "$exact_key_matches" -eq 2 ] \
-  || fail "workflow must select the ww-release key exactly in both read paths"
+[ "$exact_key_matches" -eq 1 ] \
+  || fail "workflow must select the ww-release key exactly in the current-release read path"
 
 grep -Fq 'ipfs add --pin=false -r --cid-version=1 -Q' "$MAKEFILE" \
   || fail "publish-std must disable implicit ipfs add pinning"
-grep -Fq 'ipfs add --pin=false -rQ --cid-version=1' "$MAKEFILE" \
+LOCAL_PUBLISH_SCRIPT="$ROOT_DIR/scripts/publish_local_release.sh"
+bash -n "$LOCAL_PUBLISH_SCRIPT"
+grep -Fq 'ipfs add --pin=false -rQ --cid-version=1' "$LOCAL_PUBLISH_SCRIPT" \
   || fail "publish must disable implicit ipfs add pinning"
 grep -Fq "ipfs pin add \"\$\$CID\"" "$MAKEFILE" \
   || fail "Makefile durable publish paths must pin explicitly"
+grep -Fq 'scripts/publish_local_release.sh' "$MAKEFILE" \
+  || fail "local publishing must use the canonical package publisher"
+grep -Fq 'tests/test_install.py --binary target/release/ww' "$MAKEFILE" \
+  || fail "local publishing must validate installation before publication"
+grep -Fq 'tests/test_installed_boot.sh target/release/ww' "$MAKEFILE" \
+  || fail "local publishing must validate installed boot before publication"
+grep -Fq 'scripts/check_release_ancestry.sh' "$LOCAL_PUBLISH_SCRIPT" \
+  || fail "local release-name changes must check source ancestry"
+grep -Fq 'WW_RELEASE_EXPECTED_CURRENT' "$LOCAL_PUBLISH_SCRIPT" \
+  || fail "local release-name changes must check the expected current release"
+if grep -Fq 'rsync -a --exclude .git' "$MAKEFILE"; then
+  fail "publishing must not copy the source tree or private state"
+fi
 
 echo "PASS: IPFS release publish checks"
