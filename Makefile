@@ -266,8 +266,8 @@ test-wasm: std examples authority-probe routing-key-probe stream-lifecycle-probe
 
 # --- Run ---------------------------------------------------------------------
 
-run-kernel: kernel status
-	cargo run --locked -- run ./std/status
+run-kernel: fhs
+	cargo run --locked -- run --fhs-root "$(CURDIR)/target/fhs"
 
 # --- Clean -------------------------------------------------------------------
 

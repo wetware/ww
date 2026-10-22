@@ -248,7 +248,7 @@ pub(super) async fn install(
         listen: super::daemon_cmd::default_listen(),
         identity: identity_path.clone(),
         namespace_roots: vec![ww_dir.clone()],
-        images: vec![ww_dir.join("fhs")],
+        images: Vec::new(),
         http_listen: Some("127.0.0.1:2080".into()),
         ipfs_url: std::env::var("IPFS_API").unwrap_or_else(|_| "http://localhost:5001".into()),
         ipns_routing_url: std::env::var("IPFS_ROUTING_API")

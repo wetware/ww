@@ -5,15 +5,13 @@ cd "$(dirname "$0")/.."
 fail() { echo "FAIL: $*" >&2; exit 1; }
 for recipe in Containerfile Containerfile.deploy Containerfile.release; do
   grep -Fq 'ENV HOME=/home/ww' "$recipe" || fail "$recipe lacks explicit HOME"
+  grep -Fq 'ENV WW_FHS_ROOT=/usr/share/wetware/kernel' "$recipe" || fail "$recipe lacks installed FHS configuration"
+  grep -Fq 'CMD ["run"]' "$recipe" || fail "$recipe lacks installed-state startup"
   grep -Fq 'USER 1000:1000' "$recipe" || fail "$recipe lacks non-root UID/GID"
   grep -Fq '/usr/share/wetware/kernel/' "$recipe" || fail "$recipe lacks canonical FHS"
   grep -Fq 'VOLUME ["/home/ww"]' "$recipe" || fail "$recipe lacks private-state volume"
   grep -Fq -- '--chown=1000:1000' "$recipe" || fail "$recipe lacks writable HOME"
 done
-for recipe in Containerfile Containerfile.deploy; do
-  grep -Fq 'CMD ["run", "/usr/share/wetware/kernel"]' "$recipe" || fail "$recipe changed active CMD"
-done
-! grep -q '^CMD ' Containerfile.release || fail 'release recipe changed caller-owned CMD'
 grep -Fq 'cargo run --locked --example stage_fhs -- stage' Containerfile || fail 'source recipe bypasses staging'
 ! grep -Eq '^[[:space:]]*(&& )?make (std|host|fhs)|build_wasip3_component' Containerfile || fail 'source recipe rebuilds canonical components'
 grep -Fq 'container-build: fhs' Makefile || fail 'source build lacks canonical producer prerequisite'

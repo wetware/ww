@@ -7,12 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **FHS-selected PID0 boot (#735 Landing 3 of 3).** Bare `ww run` boots
+  `/boot/kernel.wasm` from installed state without importing the current directory.
+  `--fhs-root` and `WW_FHS_ROOT` configure the baseline. Each deployment freezes
+  that baseline below Stem, namespaces, and explicit CLI mounts. Kernel and
+  configuration overrides remain frozen across Stem updates. Valid kernel-less
+  images inherit the baseline kernel; invalid selected kernels leave the epoch
+  unready until a valid replacement arrives. Kernel identity describes the active
+  effective root, and Host PeerId persists across replacements. Generated services
+  and all container recipes use installed-state startup. `--kernel` and
+  `WW_KERNEL` now fail with instructions to use targeted mounts.
 - **Canonical FHS packaging and installation (#735 Landing 2 of 3).**
   Packages include canonical kernel and status components. Fresh installation
   validates payloads, preserves private state, and carries the selected Kubo API
   endpoint into generated services. Container and release packaging use the same
   canonical FHS. CI gates publication on package, installation, and boot checks.
-  Existing active PID0 selection remains unchanged.
 - **Shared kernel preparation and generation identity (#735 Landing 1 of 3).**
   The library verifies immutable kernel-file selection against an explicit FHS
   root and shares native P3 static kernel validation. Current kernel identity
@@ -20,8 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   one physically outstanding compilation per Deployment and retains only the
   latest pending target. Logical cancellation is immediate; superseded native
   work can continue and holds admission until physical completion. Native
-  completion and shutdown latency have no hard upper bound. Existing boot
-  selection and packaging remain unchanged.
+  completion and shutdown latency have no hard upper bound.
 - **CLI targeted mounts and immutable Stem replay (#734 Landing C).**
   `ww run` accepts ordered `source[:/guest/target]` operations, including local
   files and directories. Startup captures all local sources once, verifies and
@@ -75,10 +83,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - **Mount sources are explicit (#734 Landing C).** `ww run` no longer defaults
   to CWD or searches `~/.ww` for missing relative sources. Local names require
-  `./`, `/`, or `~/`; bare operands must be complete CIDs. Zero mount arguments
-  require namespace configuration supplying an image or an authoritative Stem.
-  An empty namespace root fails before Host startup or Kubo waiting. Installed
-  default boot remains deferred to #735; PID0 selectors and `--ws-url` remain.
+  `./`, `/`, or `~/`; bare operands must be complete CIDs. An empty namespace
+  root cannot supply an image; startup needs a baseline, another image, or Stem.
+  Bare startup now uses
+  the installed-state contract described above. `--ws-url` remains supported.
 - **Removed unsupported entry paths and reconciled guidance (#683 Landing 8).**
   The inert `--epoch-drain-secs` option now fails CLI parsing. Public
   `LocalAnnouncer` and `LocalProviderRouting::announcer()` are removed;

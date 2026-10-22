@@ -7,14 +7,17 @@ master is therefore a release build, not a production deployment.
 ## Runtime deployment lifecycle
 
 The host-side `deployment` module owns runtime deployment transitions. A
-deployment combines an optional authoritative Stem head with ordered
-`FrozenMount` operations. Namespace root operations precede explicit CLI
-operations. CLI operations therefore retain highest composition precedence.
+deployment combines a frozen installed FHS baseline, an optional authoritative
+Stem head, frozen namespace images, and ordered CLI `FrozenMount` operations.
+This order applies from lowest to highest priority to every guest path.
 Directory targets merge recursively; other collisions use the later source.
 
 Before deployment starts, the CLI captures all local sources in one admitted
 batch, then publishes and verifies the snapshots. Source CIDs, targets, and
 retained source-root identities transfer to deployment before preparation.
+The installed baseline uses the same capture and retention machinery and counts
+toward the existing operation limit. Only its FHS directory enters the snapshot;
+private identity, namespace credentials, records, watermarks, and logs stay outside.
 Every epoch replays those same operations. Local paths and successfully frozen
 names are never read again during retry, speculation, or replacement.
 
@@ -29,10 +32,23 @@ For a replacement, deployment publishes the new local epoch with `root: None`
 before root preparation. This publication revokes old authority. Deployment
 then prepares a `PreparedRoot` while the old `kernel::Generation` terminates.
 Preparation pins the head, applies the frozen operations, pins the effective
-root, and pre-warms the root without changing `CidTree`.
+root, and pre-warms the root without changing `CidTree`. Preparation selects
+`/boot/kernel.wasm` against that explicit effective CID, verifies its bytes, and
+statically validates the component with the canonical Wasmtime engine.
+`PreparedKernel` carries the effective root, source-file CID, runtime CID, and
+validated component alongside the prepared root's head and retention ownership.
+Preparation does not execute PID0 or publish active identity.
+
 Typed `CompositionError` failures, including target obstruction, leave the
 accepted epoch unrooted. A later valid head can recover using the same frozen
-operations. Transport failures retain their distinct retry policy.
+operations. Missing or invalid selected paths, symlinks, malformed or incompatible
+components, and oversize components are deterministic preparation failures.
+Unavailable content and transport failures retain bounded retry. Unexpected
+internal errors remain fatal. No failure selects embedded or previous bytes.
+
+A valid head without `/boot/kernel.wasm` can inherit the installed kernel through
+ordinary composition. Invalid or unavailable heads cannot become baseline-only
+deployments. Baseline inheritance has no automatic expiration.
 
 Deployment drains queued Source updates after preparation and teardown. A
 newer update supersedes the prepared root. If the prepared root remains current,
@@ -40,6 +56,17 @@ deployment waits for old PID0 to stop, calls `CidTree::swap_root`, and publishes
 `root: Some(...)` without an intervening await. The CLI then requests the next
 ordinary generation through deployment. The CLI retains interactive behavior,
 exit codes, signals, and teardown-timeout process policy.
+
+Generation construction uses the prepared component for the same effective root.
+The final admission fence rejects superseded candidates before guest launch or
+current identity publication. `/version` does not report a prior kernel as current
+while the epoch is unrooted. Runtime CID, source-file CID, effective root CID, and
+authority epoch identify different objects. The persistent Host PeerId remains
+unchanged. Repeated kernel bytes do not preserve prior authority or readiness.
+
+Native compilation can continue after logical cancellation. The cancelled worker
+retains its physical compilation permit until completion; obsolete results cannot
+activate a deployment. No subprocess compiler or thread termination is used.
 
 Deployment tracks frozen, active, preparation-attempt, and failed-unpin pin
 ownership. Its protected set includes every frozen source and retained source
@@ -146,9 +173,11 @@ published and the installer has migrated to that distribution path.
 
 ## Default host IPNS publication
 
-`ww perform install` creates `~/.ww/identity`. `ww perform update` derives the
-default IPNS name from that key, writes the name and immutable bootstrap CID to
-`~/.ww/etc/ns/ww`, and renders the daemon with `--ipns-routing-url`. The
+`ww perform install` creates `~/.ww/identity` and `~/.ww/etc/ns/ww` when absent.
+The default namespace contains the IPNS name derived from that key and an
+immutable bootstrap CID. `ww perform update` preserves identity, reuses that
+namespace unless its bootstrap is absent, and renders the daemon with explicit
+`--ipfs-url` and `--ipns-routing-url` values. The
 running daemon signs the configured bootstrap CID before namespace resolution.
 If initial publication has a temporary failure, the daemon uses the immutable
 bootstrap for that boot and retries publication in the background.
@@ -231,17 +260,18 @@ runtime.
 
 ## Runtime layers
 
-The production image contains one core layer:
+The packaged container FHS supplies the installed baseline:
 
 ```text
 /usr/share/wetware/kernel/
-  bin/main.wasm
+  boot/kernel.wasm
   bin/status.wasm
 ```
 
-`ww run` merges root layers left-to-right. Optional IPNS application content
-comes first; the kernel layer follows so application content cannot replace
-pid0 or the image-owned status route.
+All three container recipes set `WW_FHS_ROOT=/usr/share/wetware/kernel` and
+default to `ww run`. The baseline stays outside the writable HOME volume.
+Stem, namespace, and explicit CLI content can override baseline paths through
+the same composition rules. Explicit CLI operations remain highest across epochs.
 
 The Rust pid0 directly installs the image-owned `/status` composition.
 
@@ -268,7 +298,7 @@ localhost-only admin plane on `127.0.0.1:2026` is the process control surface:
 
 - `/healthz` confirms the admin server is accepting requests.
 - `/readyz` reports whether the runtime has reached its serving phase.
-- `/version` reports source and embedded-artifact provenance plus degraded
+- `/version` reports source and current generation kernel provenance plus degraded
   cache state.
 - `/metrics` exposes host/runtime counters.
 

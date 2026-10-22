@@ -146,7 +146,8 @@ Host → Kernel → Children.  The host is deliberately simple (it's
 the sandbox).  The kernel is the policy engine.  Children get only
 what pid0 hands them.
 
-The Rust kernel in `std/kernel` is the active PID0 implementation.
+The packaged default is the Rust kernel in `std/kernel`. Each epoch selects
+PID0 from `/boot/kernel.wasm` in its final effective FHS.
 
 ### The Membrane
 

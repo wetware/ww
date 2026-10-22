@@ -4,14 +4,17 @@ Each wetware image follows a minimal FHS convention:
 
 ```
 <image>/
+  boot/
+    kernel.wasm        # PID0 component, required in the final effective FHS
   bin/
     <name>.wasm        # named application component
     status.wasm        # status component used by the shipped Rust PID0
   svc/                 # optional application content; not composed automatically
 ```
 
-The Host selects PID0 independently from the effective application root. The
-shipped Rust PID0 consumes only `bin/status.wasm` from that root. An
+The Host selects PID0 from `boot/kernel.wasm` in the effective application root.
+An overlay can omit that path and inherit the installed baseline's kernel.
+The shipped Rust PID0 consumes `bin/status.wasm` from the same root. An
 application-specific composition selects its own component paths. The shipped
 Rust PID0 does not automatically load components produced by `ww build`.
 
@@ -104,14 +107,22 @@ importer described above remains separate.
 
 An `/ipns/...` mount resolves once and freezes the selected immutable CID.
 It is distinct from `--ipns-stem`, which follows signed changes and replaces
-the active deployment generation. Each generation applies the original ordered
-CLI operations after the authoritative head and namespace images. CLI operations
+the active deployment generation. Each generation applies the installed baseline,
+authoritative head, namespace images, and original ordered CLI operations. CLI operations
 keep highest precedence, including when their source paths change or disappear.
 
-`ww run` does not mount CWD implicitly or search `~/.ww` for source paths.
-Without explicit mounts, startup requires namespace configuration supplying an
-image or an authoritative Stem. Mounting `/boot/kernel.wasm` does not select
-PID0: `--kernel`, `WW_KERNEL`, and the embedded-kernel default remain unchanged.
+Bare `ww run` captures the installed `~/.ww/fhs` baseline, independently of CWD.
+`--fhs-root` or `WW_FHS_ROOT` selects another baseline directory. Explicit mounts
+remain higher-priority operations even when they name `~/.ww/fhs` themselves.
+The Host selects PID0 exclusively from `/boot/kernel.wasm` in the effective root.
+`--kernel` and `WW_KERNEL` are rejected.
+
+A valid image that omits the kernel can inherit the installed path through
+ordinary composition. A selected symlink, wrong type, malformed or incompatible
+component, oversized file, or corrupt block fails preparation. Missing or
+unavailable selected content never triggers an alternate-kernel fallback.
+The effective root CID, source-file CID, runtime CID, and authority epoch remain
+distinct identities. The persistent Host PeerId does not depend on kernel bytes.
 
 ## Installed host layout
 
@@ -128,11 +139,13 @@ the local image root:
     follow/*.record      # durable signed follower ordering floors
     publish/*.record     # durable signed records for the default publisher
   fhs/                   # publishable local image root
+    boot/kernel.wasm     # PID0 selected through effective-root composition
     bin/status.wasm      # status component used by the shipped Rust PID0
 ```
 
-The generated service recursively imports only `~/.ww/fhs` and explicit image
-arguments. The service reads `~/.ww/etc/ns` through a separate host-only
+The generated service captures `~/.ww/fhs` as its lowest-priority baseline and
+preserves explicit image arguments as CLI overlays. The service reads
+`~/.ww/etc/ns` through a separate host-only
 configuration argument. The service does not mount `~/.ww` as an image.
 
 Put intentional local image content under `~/.ww/fhs`, or pass an explicit
@@ -148,7 +161,8 @@ head is updated:
 1. The Atom Source reads the chain tip.
 2. It reads `Atom.head()` at `tip - confirmation_depth`.
 3. Deployment advances its host-local epoch and publishes `root: None`.
-4. Deployment terminates PID0 while it prepares the head plus frozen layers.
+4. Deployment terminates PID0 while it composes the baseline, head, and frozen
+   layers and validates the kernel selected from the resulting root.
 5. Deployment waits for teardown, swaps `CidTree`, publishes the rooted epoch,
    and starts the replacement.
 

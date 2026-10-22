@@ -18,12 +18,15 @@ use rand::Rng;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
-use crate::cell::image::{compose_mounts, CompositionError, FrozenMount};
+use crate::cell::image::{
+    compose_mounts, inspect_source, select_kernel_file, CompositionError, FrozenMount, GuestTarget,
+};
 use crate::cell::vfs::CidTree;
 use crate::ipfs::cid_identity::decode_cid;
 use crate::kernel;
 use crate::services::{ExecutorPool, SpawnRequest};
 use crate::stem::{Head, InvalidHead, Source, Update};
+use cell::engine::RuntimeEngine;
 
 mod retained_pinner;
 pub use retained_pinner::RetainedPinner;
@@ -167,6 +170,7 @@ impl PinSet {
 pub struct PreparedRoot {
     head: Option<Head>,
     effective: Cid,
+    kernel: kernel::PreparedKernel,
     pins: PinSet,
 }
 
@@ -191,8 +195,12 @@ enum Prewarm<'a> {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_root(
     head: Option<Head>,
+    installed_baseline: Option<&FrozenMount>,
+    runtime_engine: &RuntimeEngine,
+    compilation: &kernel::Compilation,
     frozen_mounts: &[FrozenMount],
     ipfs_client: &crate::ipfs::HttpClient,
     prewarm: Prewarm<'_>,
@@ -214,7 +222,7 @@ async fn prepare_root(
     if *cancel.borrow() {
         anyhow::bail!("deployment preparation cancelled");
     }
-    if head.is_none() && frozen_mounts.is_empty() {
+    if head.is_none() && installed_baseline.is_none() && frozen_mounts.is_empty() {
         return Err(PermanentPreparationError(
             "deployment has neither a Stem head nor configured root layers".to_owned(),
         )
@@ -222,14 +230,22 @@ async fn prepare_root(
     }
 
     let boot_client = crate::ipfs::BootClient::one_attempt(ipfs_client.clone(), OPERATION_TIMEOUT);
+    // The installed baseline is lower than the head. Namespace and positional
+    // operations retain their frozen order above both roots.
+    let mut operations = Vec::new();
+    let initial_root = if let Some(baseline) = installed_baseline {
+        if let Some(head) = &head {
+            let source = inspect_source(head.cid, &boot_client, cancel).await?;
+            operations.push(FrozenMount::new(source, GuestTarget::root())?);
+        }
+        Some(baseline.source().cid())
+    } else {
+        head.as_ref().map(|head| head.cid)
+    };
+    operations.extend_from_slice(frozen_mounts);
     let effective = bounded(
         "effective-root merge",
-        compose_mounts(
-            head.as_ref().map(|head| head.cid),
-            frozen_mounts,
-            &boot_client,
-            cancel,
-        ),
+        compose_mounts(initial_root, &operations, &boot_client, cancel),
     )
     .await
     .context("composing effective deployment root")?;
@@ -259,11 +275,31 @@ async fn prepare_root(
     bounded("effective-root prewarm", tree.pre_warm(&effective))
         .await
         .context("pre-warming effective deployment root")?;
+    let file = select_kernel_file(effective, &boot_client, cancel)
+        .await
+        .context("selecting /boot/kernel.wasm from effective deployment root")?;
+    let kernel = tokio::select! {
+        biased;
+        _ = preparation_cancelled(cancel) => anyhow::bail!("deployment preparation cancelled"),
+        result = kernel::PreparedKernel::prepare(file, compilation, runtime_engine.clone()) => result?,
+    };
     Ok(PreparedRoot {
         head,
         effective,
+        kernel,
         pins: std::mem::take(pins),
     })
+}
+
+async fn preparation_cancelled(cancel: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancel.borrow_and_update() {
+            return;
+        }
+        if cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 struct PreparationOutput {
@@ -271,8 +307,12 @@ struct PreparationOutput {
     pins: PinSet,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_root_owned(
     head: Head,
+    installed_baseline: Option<FrozenMount>,
+    runtime_engine: RuntimeEngine,
+    compilation: kernel::Compilation,
     frozen_mounts: Vec<FrozenMount>,
     ipfs_client: crate::ipfs::HttpClient,
     cid_tree: Arc<CidTree>,
@@ -281,6 +321,9 @@ async fn prepare_root_owned(
 ) -> PreparationOutput {
     let result = prepare_root(
         Some(head),
+        installed_baseline.as_ref(),
+        &runtime_engine,
+        &compilation,
         &frozen_mounts,
         &ipfs_client,
         Prewarm::Existing(&cid_tree),
@@ -384,6 +427,10 @@ async fn next_source_update(source_rx: &mut mpsc::Receiver<SourceMessage>) -> Re
 
 /// Inputs used to establish deployment epoch zero.
 pub struct Config {
+    /// Frozen installed FHS root, below Stem, namespaces, and CLI operations.
+    pub installed_baseline: Option<FrozenMount>,
+    /// The same engine used by the ExecutorPool and every generation.
+    pub runtime_engine: RuntimeEngine,
     pub source: Option<Box<dyn Source>>,
     /// Latest observed Atom `HeadUpdated` CID bytes. These values are advisory only.
     pub candidates: Option<watch::Receiver<Option<Vec<u8>>>>,
@@ -401,7 +448,6 @@ pub struct Config {
 /// Inputs shared by all kernel generations in one host process.
 pub struct KernelLauncher<'a> {
     executor_pool: &'a ExecutorPool,
-    artifact: kernel::Artifact,
     identity_state: kernel::IdentityState,
     readiness_gate: Arc<authority::KernelReadyGate>,
     bootstrap: kernel::Bootstrap,
@@ -412,7 +458,6 @@ pub struct KernelLauncher<'a> {
 impl<'a> KernelLauncher<'a> {
     pub fn new(
         executor_pool: &'a ExecutorPool,
-        artifact: kernel::Artifact,
         identity_state: kernel::IdentityState,
         readiness_gate: Arc<authority::KernelReadyGate>,
         bootstrap: kernel::Bootstrap,
@@ -421,7 +466,6 @@ impl<'a> KernelLauncher<'a> {
     ) -> Self {
         Self {
             executor_pool,
-            artifact,
             identity_state,
             readiness_gate,
             bootstrap,
@@ -435,7 +479,7 @@ impl<'a> KernelLauncher<'a> {
         epoch: Epoch,
         epoch_rx: watch::Receiver<Epoch>,
         cid_tree: Arc<CidTree>,
-        compilation: kernel::Compilation,
+        prepared: kernel::PreparedKernel,
     ) -> Result<RunningGeneration> {
         let root = epoch
             .root
@@ -446,7 +490,7 @@ impl<'a> KernelLauncher<'a> {
         let (admitted_tx, admitted_rx) = oneshot::channel();
         let result_epoch_rx = epoch_rx.clone();
         let generation = kernel::Generation::new(
-            self.artifact.clone(),
+            prepared,
             kernel::Root::new(*root, cid_tree),
             EpochGuard {
                 issued_seq: epoch.seq,
@@ -458,7 +502,6 @@ impl<'a> KernelLauncher<'a> {
             self.runtime_inputs.clone(),
             self.stdio,
             terminate_rx,
-            compilation,
             kernel::LaunchAdmission {
                 constructed: constructed_tx,
                 admitted: admitted_rx,
@@ -568,6 +611,9 @@ impl Target {
 /// The single owner of deployment transitions for one host process.
 pub struct Deployment {
     compilation: kernel::Compilation,
+    runtime_engine: RuntimeEngine,
+    installed_baseline: Option<FrozenMount>,
+    active_kernel: kernel::PreparedKernel,
     epoch_tx: watch::Sender<Epoch>,
     epoch_rx: watch::Receiver<Epoch>,
     epoch_seq: u64,
@@ -598,7 +644,7 @@ impl Deployment {
         }
         // Resolution has already acknowledged retention. Repeating pin/add
         // would not create another owner and must not authorize later unpinning.
-        for mount in &frozen_mounts {
+        for mount in config.installed_baseline.iter().chain(frozen_mounts.iter()) {
             if !frozen_pins.contains(&mount.source().cid()) {
                 return Err(PermanentPreparationError(format!(
                     "frozen mount source {} has no acknowledged retention",
@@ -607,7 +653,11 @@ impl Deployment {
                 .into());
             }
         }
-        if frozen_mounts.len() + usize::from(config.source.is_some()) > 128 {
+        if frozen_mounts.len()
+            + usize::from(config.source.is_some())
+            + usize::from(config.installed_baseline.is_some())
+            > 128
+        {
             return Err(CompositionError::ResourceLimit(
                 "deployment source operation limit exceeded",
             )
@@ -629,6 +679,9 @@ impl Deployment {
         });
 
         let state = BootstrapState {
+            installed_baseline: config.installed_baseline,
+            runtime_engine: config.runtime_engine,
+            compilation: kernel::Compilation::default(),
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
@@ -669,6 +722,9 @@ impl Deployment {
         let (cancel, cancel_rx) = watch::channel(false);
         let task = tokio::spawn(prepare_root_owned(
             candidate.head.clone(),
+            self.installed_baseline.clone(),
+            self.runtime_engine.clone(),
+            self.compilation.clone(),
             self.frozen_mounts.clone(),
             self.ipfs_client.clone(),
             self.cid_tree.clone(),
@@ -834,7 +890,7 @@ impl Deployment {
             epoch,
             self.epoch_rx.clone(),
             self.cid_tree.clone(),
-            self.compilation.clone(),
+            self.active_kernel.clone(),
         ) {
             Ok(running) => running,
             Err(error) => {
@@ -1325,6 +1381,9 @@ impl Deployment {
                 Update(Update),
                 TimedOut,
             }
+            let installed_baseline = self.installed_baseline.clone();
+            let runtime_engine = self.runtime_engine.clone();
+            let compilation = self.compilation.clone();
             let frozen_mounts = self.frozen_mounts.clone();
             let ipfs_client = self.ipfs_client.clone();
             let cid_tree = self.cid_tree.clone();
@@ -1392,6 +1451,9 @@ impl Deployment {
                 let (_cancel, mut cancel_rx) = watch::channel(false);
                 let preparation = prepare_root(
                     head,
+                    installed_baseline.as_ref(),
+                    &runtime_engine,
+                    &compilation,
                     &frozen_mounts,
                     &ipfs_client,
                     Prewarm::Existing(&cid_tree),
@@ -1562,8 +1624,10 @@ impl Deployment {
         let PreparedRoot {
             head,
             effective,
+            kernel,
             pins,
         } = prepared;
+        self.active_kernel = kernel;
         self.cid_tree.swap_root(effective);
         self.epoch_tx.send_replace(Epoch {
             seq: self.epoch_seq,
@@ -1638,6 +1702,9 @@ impl Drop for Deployment {
 }
 
 struct BootstrapState {
+    installed_baseline: Option<FrozenMount>,
+    runtime_engine: RuntimeEngine,
+    compilation: kernel::Compilation,
     epoch_tx: watch::Sender<Epoch>,
     epoch_rx: watch::Receiver<Epoch>,
     epoch_seq: u64,
@@ -1681,6 +1748,9 @@ impl BootstrapState {
                 let (_cancel, mut cancel_rx) = watch::channel(false);
                 let preparation = prepare_root(
                     head,
+                    self.installed_baseline.as_ref(),
+                    &self.runtime_engine,
+                    &self.compilation,
                     &self.frozen_mounts,
                     &self.ipfs_client,
                     Prewarm::Bootstrap {
@@ -1756,6 +1826,9 @@ impl BootstrapState {
                     });
                     info!(seq = self.epoch_seq, root = %prepared.effective, "Boot deployment root activated");
                     return Ok(Deployment {
+                        installed_baseline: self.installed_baseline,
+                        runtime_engine: self.runtime_engine,
+                        active_kernel: prepared.kernel,
                         epoch_tx: self.epoch_tx,
                         epoch_rx: self.epoch_rx,
                         epoch_seq: self.epoch_seq,
@@ -1769,7 +1842,7 @@ impl BootstrapState {
                         source_task: self.source_task,
                         candidate_rx: self.candidate_rx,
                         candidate_initialized: false,
-                        compilation: kernel::Compilation::default(),
+                        compilation: self.compilation,
                         speculation: None,
                     });
                 }
@@ -1972,7 +2045,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    const ROOT: &str = "bafybeiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf354";
+    const PREPARATION_REQUESTS: [&str; 9] = [
+        "/api/v0/pin/add",
+        "/api/v0/block/get",
+        "/api/v0/block/get",
+        "/api/v0/dag/import",
+        "/api/v0/ls",
+        "/api/v0/block/get",
+        "/api/v0/block/get",
+        "/api/v0/block/get",
+        "/api/v0/block/get",
+    ];
+    const ROOT: &str = "bafybeidpy7qr6ny6gz7tjqnj4kfnr6inigfle3boepq6afg6uzuc5h4tf4";
 
     async fn frozen_root(cid: &str) -> FrozenMount {
         let (client, _, _requests, shutdown, server) = recording_kubo().await;
@@ -2146,6 +2230,8 @@ mod tests {
         let observer = epoch_rx.clone();
         let result = Deployment::bootstrap(
             Config {
+                installed_baseline: None,
+                runtime_engine: kernel::test_support::runtime(),
                 source: None,
                 candidates: None,
                 frozen_mounts: vec![mount],
@@ -2207,6 +2293,9 @@ mod tests {
         let (_cancel_tx, mut cancel) = watch::channel(false);
         let result = prepare_root(
             None,
+            None,
+            &kernel::test_support::runtime(),
+            &kernel::Compilation::default(),
             &[],
             &client,
             Prewarm::Bootstrap {
@@ -2228,6 +2317,9 @@ mod tests {
             Some(Head {
                 cid: ROOT.parse().unwrap(),
             }),
+            None,
+            &kernel::test_support::runtime(),
+            &kernel::Compilation::default(),
             &[],
             &client,
             Prewarm::Bootstrap {
@@ -2262,11 +2354,17 @@ mod tests {
             for (index, expected) in [
                 "/api/v0/pin/add",
                 "/api/v0/block/get",
-                "/api/v0/dag/import",
-                "/api/v0/ls",
                 "/api/v0/block/get",
                 "/api/v0/dag/import",
                 "/api/v0/ls",
+                "/api/v0/block/get",
+                "/api/v0/block/get",
+                "/api/v0/dag/import",
+                "/api/v0/ls",
+                "/api/v0/block/get",
+                "/api/v0/block/get",
+                "/api/v0/block/get",
+                "/api/v0/block/get",
             ]
             .into_iter()
             .enumerate()
@@ -2277,7 +2375,7 @@ mod tests {
                     request.lines().next().unwrap().contains(expected),
                     "{request}"
                 );
-                if index == 3 {
+                if index == 4 {
                     stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy").await.unwrap();
                 } else {
                     respond(&mut stream, &request).await;
@@ -2294,6 +2392,9 @@ mod tests {
         };
         let error = prepare_root(
             Some(head.clone()),
+            None,
+            &kernel::test_support::runtime(),
+            &kernel::Compilation::default(),
             &[],
             &client,
             Prewarm::Bootstrap {
@@ -2315,6 +2416,9 @@ mod tests {
         );
         let prepared = prepare_root(
             Some(head.clone()),
+            None,
+            &kernel::test_support::runtime(),
+            &kernel::Compilation::default(),
             &[],
             &client,
             Prewarm::Bootstrap {
@@ -2350,6 +2454,7 @@ mod tests {
             for (index, (expected, expected_cid)) in [
                 ("/api/v0/pin/add", Some(old_head)),
                 ("/api/v0/block/get", Some(old_head)),
+                ("/api/v0/block/get", Some(KERNEL_BLOCKS[0].0)),
                 ("/api/v0/block/get", Some(frozen)),
                 ("/api/v0/dag/import", None),
                 ("/api/v0/ls", Some(old_effective)),
@@ -2357,9 +2462,14 @@ mod tests {
                 ("/api/v0/pin/rm", Some(old_effective)),
                 ("/api/v0/pin/add", Some(next_root)),
                 ("/api/v0/block/get", Some(next_root)),
+                ("/api/v0/block/get", Some(KERNEL_BLOCKS[0].0)),
                 ("/api/v0/block/get", Some(frozen)),
                 ("/api/v0/dag/import", None),
                 ("/api/v0/ls", Some(frozen)),
+                ("/api/v0/block/get", Some(frozen)),
+                ("/api/v0/block/get", Some(KERNEL_BLOCKS[0].0)),
+                ("/api/v0/block/get", Some(KERNEL_BLOCKS[1].0)),
+                ("/api/v0/block/get", Some(KERNEL_BLOCKS[1].0)),
             ]
             .into_iter()
             .enumerate()
@@ -2378,7 +2488,7 @@ mod tests {
                 if let Some(expected_cid) = expected_cid {
                     assert!(path.contains(expected_cid), "wrong CID for {path}");
                 }
-                if index == 4 {
+                if index == 5 {
                     stalled = Some(stream);
                     request_tx.send(path).unwrap();
                     continue;
@@ -2400,6 +2510,9 @@ mod tests {
         let (source_tx, source_rx) = mpsc::channel(2);
         let staging = tempfile::tempdir().unwrap();
         let state = BootstrapState {
+            installed_baseline: None,
+            runtime_engine: kernel::test_support::runtime(),
+            compilation: kernel::Compilation::default(),
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
@@ -2418,7 +2531,7 @@ mod tests {
             candidate_rx: None,
         };
         let bootstrap = tokio::spawn(state.prepare());
-        for _ in 0..5 {
+        for _ in 0..6 {
             next_request(&mut requests).await;
         }
         assert_eq!(
@@ -2465,52 +2578,20 @@ mod tests {
         server.await.unwrap();
     }
 
-    // Empty UnixFS directories with absent mtime, mtime=1, and mtime=2.
-    // Each literal CID is SHA-256 over its corresponding DAG-PB block.
+    // SHA-256 UnixFS fixtures include a statically valid P3 boot kernel.
     const DIRECTORY_BLOCKS: [(&str, &[u8]); 3] = [
-        (ROOT, &[10, 2, 8, 1]),
-        (
-            "bafybeic4h4hllpsarpi4d625bbnaotinfzn7j632pyt7snfgfnhgnn7che",
-            &[10, 6, 8, 1, 66, 2, 8, 1],
-        ),
-        (
-            "bafybeifq3dpjepjc33voodbyxlw3ckwcu3ijoypxwjpieuab6wysui5pxa",
-            &[10, 6, 8, 1, 66, 2, 8, 2],
-        ),
+        kernel::test_support::BLOCKS[0],
+        kernel::test_support::BLOCKS[1],
+        kernel::test_support::BLOCKS[2],
     ];
-
-    // `base` plus `overlay` composes to `root`; all three CIDs are distinct.
     const COMPOSED_DIRECTORY_BLOCKS: [(&str, &[u8]); 3] = [
-        (
-            "bafybeigwirijl6q5hdcjccnta3lcdqsdr2ekbyxcymmjpyfte3fbqixtzm",
-            &[
-                18, 46, 10, 36, 1, 85, 18, 32, 202, 230, 98, 23, 47, 212, 80, 187, 12, 215, 16,
-                167, 105, 7, 156, 5, 191, 197, 216, 227, 94, 250, 101, 118, 237, 199, 208, 55, 122,
-                253, 212, 162, 18, 4, 107, 101, 101, 112, 24, 4, 18, 48, 10, 36, 1, 85, 18, 32,
-                203, 160, 107, 87, 54, 250, 246, 126, 84, 176, 123, 86, 30, 174, 148, 57, 94, 119,
-                76, 81, 122, 125, 145, 10, 84, 54, 158, 18, 99, 204, 251, 212, 18, 6, 116, 97, 114,
-                103, 101, 116, 24, 3, 10, 2, 8, 1,
-            ],
-        ),
-        (
-            "bafybeif3tic4aa357o2xytajngtd2gpqd5zzhkwucqqdii5kvinktiocdq",
-            &[
-                18, 48, 10, 36, 1, 85, 18, 32, 17, 80, 122, 14, 47, 94, 105, 213, 223, 164, 10, 98,
-                161, 189, 123, 110, 229, 126, 107, 205, 133, 198, 124, 155, 132, 49, 179, 111, 255,
-                33, 196, 55, 18, 6, 116, 97, 114, 103, 101, 116, 24, 3, 10, 2, 8, 1,
-            ],
-        ),
-        (
-            "bafybeie3kszxzyrguzhcirx6ytd6akzq6o5l6hbxrjobikiefnoim2n6wi",
-            &[
-                18, 46, 10, 36, 1, 85, 18, 32, 202, 230, 98, 23, 47, 212, 80, 187, 12, 215, 16,
-                167, 105, 7, 156, 5, 191, 197, 216, 227, 94, 250, 101, 118, 237, 199, 208, 55, 122,
-                253, 212, 162, 18, 4, 107, 101, 101, 112, 24, 4, 18, 48, 10, 36, 1, 85, 18, 32, 17,
-                80, 122, 14, 47, 94, 105, 213, 223, 164, 10, 98, 161, 189, 123, 110, 229, 126, 107,
-                205, 133, 198, 124, 155, 132, 49, 179, 111, 255, 33, 196, 55, 18, 6, 116, 97, 114,
-                103, 101, 116, 24, 3, 10, 2, 8, 1,
-            ],
-        ),
+        kernel::test_support::BLOCKS[3],
+        kernel::test_support::BLOCKS[4],
+        kernel::test_support::BLOCKS[5],
+    ];
+    const KERNEL_BLOCKS: [(&str, &[u8]); 2] = [
+        kernel::test_support::BLOCKS[6],
+        kernel::test_support::BLOCKS[7],
     ];
 
     struct KuboRequest {
@@ -2568,17 +2649,15 @@ mod tests {
             .nth(1)
             .unwrap();
         let body = if path.starts_with("/api/v0/block/get") {
-            DIRECTORY_BLOCKS
+            kernel::test_support::BLOCKS
                 .iter()
-                .chain(COMPOSED_DIRECTORY_BLOCKS.iter())
                 .find(|(cid, _)| path.contains(cid))
                 .expect("known fixture block")
                 .1
                 .to_vec()
         } else if path.starts_with("/api/v0/dag/import") {
-            let root = DIRECTORY_BLOCKS
+            let root = kernel::test_support::BLOCKS
                 .iter()
-                .chain(COMPOSED_DIRECTORY_BLOCKS.iter())
                 .find_map(|(root, _)| {
                     let cid = root.parse::<cid::Cid>().unwrap().to_bytes();
                     request
@@ -2614,12 +2693,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for expected in [
-                "/api/v0/pin/add",
-                "/api/v0/block/get",
-                "/api/v0/dag/import",
-                "/api/v0/ls",
-            ] {
+            for expected in PREPARATION_REQUESTS {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 assert!(
@@ -2695,6 +2769,9 @@ mod tests {
             root: Some(OLD_ROOT.parse().unwrap()),
         });
         let deployment = Deployment {
+            installed_baseline: None,
+            runtime_engine: kernel::test_support::runtime(),
+            active_kernel: kernel::test_support::prepared(ROOT),
             epoch_tx,
             epoch_rx: epoch_rx.clone(),
             epoch_seq: 0,
@@ -2810,7 +2887,7 @@ mod tests {
         assert_eq!(epoch_rx.borrow().head, head.bytes());
         assert_eq!(epoch_rx.borrow().root, Some(head.cid));
         assert_eq!(*tree.root_cid(), head.cid);
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 9);
         assert!(deployment
             .replace_queued_before_launch()
             .await
@@ -2862,7 +2939,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for expected in ["/api/v0/block/get", "/api/v0/dag/import", "/api/v0/ls"] {
+            for expected in &PREPARATION_REQUESTS[1..] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 assert!(
@@ -2876,6 +2953,8 @@ mod tests {
         let staging = tempfile::tempdir().unwrap();
         let deployment = Deployment::bootstrap(
             Config {
+                installed_baseline: None,
+                runtime_engine: kernel::test_support::runtime(),
                 source: None,
                 candidates: None,
                 frozen_mounts: vec![frozen_root(ROOT).await],
@@ -2918,6 +2997,8 @@ mod tests {
 
         let deployment = Deployment::bootstrap(
             Config {
+                installed_baseline: None,
+                runtime_engine: kernel::test_support::runtime(),
                 source: Some(Box::new(source)),
                 candidates: None,
                 frozen_mounts: Vec::new(),
@@ -2958,6 +3039,8 @@ mod tests {
 
         let deployment = Deployment::bootstrap(
             Config {
+                installed_baseline: None,
+                runtime_engine: kernel::test_support::runtime(),
                 source: Some(Box::new(source)),
                 candidates: None,
                 frozen_mounts: Vec::new(),
@@ -2998,6 +3081,9 @@ mod tests {
         };
         let (epoch_tx, epoch_rx) = watch::channel(initial.clone());
         let mut deployment = Deployment {
+            installed_baseline: None,
+            runtime_engine: kernel::test_support::runtime(),
+            active_kernel: kernel::test_support::prepared(ROOT),
             epoch_tx,
             epoch_rx,
             epoch_seq: u64::MAX,
@@ -3046,6 +3132,9 @@ mod tests {
             root: None,
         });
         let mut deployment = Deployment {
+            installed_baseline: None,
+            runtime_engine: kernel::test_support::runtime(),
+            active_kernel: kernel::test_support::prepared(ROOT),
             epoch_tx,
             epoch_rx,
             epoch_seq: 3,
@@ -3065,6 +3154,7 @@ mod tests {
         let prepared = PreparedRoot {
             head: None,
             effective: DIRECTORY_BLOCKS[2].0.parse().unwrap(),
+            kernel: kernel::test_support::prepared(DIRECTORY_BLOCKS[2].0),
             pins: PinSet::default(),
         };
 
@@ -3093,6 +3183,9 @@ mod tests {
             Some(Head {
                 cid: ROOT.parse().unwrap(),
             }),
+            None,
+            &kernel::test_support::runtime(),
+            &kernel::Compilation::default(),
             &[],
             &client,
             Prewarm::Existing(&tree),
@@ -3104,6 +3197,160 @@ mod tests {
 
         assert_eq!(*prepared.effective(), ROOT.parse::<Cid>().unwrap());
         assert_eq!(tree.root_cid().as_ref(), &OLD_ROOT.parse::<Cid>().unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn installed_baseline_is_below_head_and_frozen_operations() {
+        let baseline = frozen_root(COMPOSED_DIRECTORY_BLOCKS[0].0).await;
+        let head = Head {
+            cid: COMPOSED_DIRECTORY_BLOCKS[1].0.parse().unwrap(),
+        };
+        let (client, _, _requests, shutdown, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let tree = Arc::new(CidTree::new(
+            OLD_ROOT.parse().unwrap(),
+            client.clone(),
+            staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
+        ));
+        let runtime = kernel::test_support::runtime();
+        let compilation = kernel::Compilation::default();
+        let (_cancel, mut cancel) = watch::channel(false);
+        for (mounts, expected) in [
+            (Vec::new(), COMPOSED_DIRECTORY_BLOCKS[2].0),
+            (vec![baseline.clone()], COMPOSED_DIRECTORY_BLOCKS[0].0),
+        ] {
+            let prepared = prepare_root(
+                Some(head.clone()),
+                Some(&baseline),
+                &runtime,
+                &compilation,
+                &mounts,
+                &client,
+                Prewarm::Existing(&tree),
+                &mut PinSet::default(),
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+            assert_eq!(prepared.effective, expected.parse::<Cid>().unwrap());
+            assert_eq!(prepared.kernel.effective_root(), prepared.effective);
+            assert_eq!(
+                prepared.kernel.source_file(),
+                KERNEL_BLOCKS[1].0.parse::<Cid>().unwrap()
+            );
+            assert_eq!(
+                prepared.kernel.runtime_cid(),
+                kernel::runtime_cid(KERNEL_BLOCKS[1].1)
+            );
+        }
+        assert_eq!(*tree.root_cid(), OLD_ROOT.parse::<Cid>().unwrap());
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn head_inherits_missing_kernel_but_invalid_selected_kernel_never_falls_back() {
+        let baseline = frozen_root(ROOT).await;
+        let (client, _, _requests, shutdown, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let tree = Arc::new(CidTree::new(
+            OLD_ROOT.parse().unwrap(),
+            client.clone(),
+            staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
+        ));
+        let runtime = kernel::test_support::runtime();
+        let compilation = kernel::Compilation::default();
+        let (_cancel, mut cancel) = watch::channel(false);
+        let inherited = prepare_root(
+            Some(Head {
+                cid: kernel::test_support::EMPTY_ROOT.parse().unwrap(),
+            }),
+            Some(&baseline),
+            &runtime,
+            &compilation,
+            &[],
+            &client,
+            Prewarm::Existing(&tree),
+            &mut PinSet::default(),
+            &mut cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(inherited.effective, ROOT.parse::<Cid>().unwrap());
+        let mut pins = PinSet::default();
+        let invalid = prepare_root(
+            Some(Head {
+                cid: kernel::test_support::INVALID_ROOT.parse().unwrap(),
+            }),
+            Some(&baseline),
+            &runtime,
+            &compilation,
+            &[],
+            &client,
+            Prewarm::Existing(&tree),
+            &mut pins,
+            &mut cancel,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(classify_failure(&invalid), FailureClass::Permanent);
+        assert!(invalid
+            .downcast_ref::<cell::proc::KernelValidationError>()
+            .is_some());
+        assert!(pins.contains(&kernel::test_support::INVALID_ROOT.parse().unwrap()));
+        assert_eq!(*tree.root_cid(), OLD_ROOT.parse::<Cid>().unwrap());
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_preparation_does_not_wait_for_obsolete_native_compilation() {
+        let (client, _, mut requests, shutdown, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let tree = Arc::new(CidTree::new(
+            OLD_ROOT.parse().unwrap(),
+            client.clone(),
+            staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
+        ));
+        let compilation = kernel::Compilation::default();
+        let (release, native) = compilation.hold_for_test().await;
+        let (cancel, receiver) = watch::channel(false);
+        let preparation = tokio::spawn(prepare_root_owned(
+            Head {
+                cid: ROOT.parse().unwrap(),
+            },
+            None,
+            kernel::test_support::runtime(),
+            compilation,
+            Vec::new(),
+            client,
+            tree,
+            PinSet::default(),
+            receiver,
+        ));
+        for expected in PREPARATION_REQUESTS {
+            assert!(next_request(&mut requests).await.starts_with(expected));
+        }
+        tokio::task::yield_now().await;
+        assert!(!preparation.is_finished());
+        cancel.send_replace(true);
+        let output = tokio::time::timeout(Duration::from_secs(2), preparation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.result.is_err());
+        assert!(output.pins.contains(&ROOT.parse().unwrap()));
+        assert!(!native.is_finished());
+        release.send(()).unwrap();
+        native.await.unwrap();
+        shutdown.send(()).unwrap();
         server.await.unwrap();
     }
 
@@ -3132,12 +3379,7 @@ mod tests {
             deployment.speculation.as_ref(),
             Some(Speculation::Ready { .. })
         ));
-        for expected in [
-            "/api/v0/pin/add",
-            "/api/v0/block/get",
-            "/api/v0/dag/import",
-            "/api/v0/ls",
-        ] {
+        for expected in PREPARATION_REQUESTS {
             let request = next_request(&mut requests).await;
             assert!(request.starts_with(expected), "{request}");
         }
@@ -3168,7 +3410,7 @@ mod tests {
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
         assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
         assert_eq!(deployment.current_epoch().root, Some(ROOT.parse().unwrap()));
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 9);
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
     }
@@ -3202,12 +3444,7 @@ mod tests {
             deployment.speculation.as_ref(),
             Some(Speculation::Ready { .. })
         ));
-        for expected in [
-            "/api/v0/pin/add",
-            "/api/v0/block/get",
-            "/api/v0/dag/import",
-            "/api/v0/ls",
-        ] {
+        for expected in PREPARATION_REQUESTS {
             let request = next_request(&mut requests).await;
             assert!(request.starts_with(expected), "{request}");
         }
@@ -3247,7 +3484,7 @@ mod tests {
         };
 
         assert!(matches!(outcome, Outcome::Authoritative { epoch: 0, .. }));
-        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(calls.load(Ordering::SeqCst), 10);
 
         let (running, _result_tx, _terminate_rx) = test_running_generation();
         {
@@ -3260,7 +3497,7 @@ mod tests {
             }
         }
         assert!(deployment.speculation.is_none());
-        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(calls.load(Ordering::SeqCst), 10);
 
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
@@ -3276,7 +3513,7 @@ mod tests {
         let (release_first_tx, release_first_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let mut release_first_rx = Some(release_first_rx);
-            for index in 1..=4 {
+            for index in 1..=9 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 let path = request
@@ -3327,7 +3564,7 @@ mod tests {
             assert!(terminate_rx.has_changed().unwrap());
 
             release_first_tx.send(()).unwrap();
-            for expected in ["/api/v0/block/get", "/api/v0/dag/import", "/api/v0/ls"] {
+            for expected in &PREPARATION_REQUESTS[1..] {
                 let request = tokio::select! {
                     _ = &mut transition => panic!("replacement activated before teardown"),
                     request = next_request(&mut requests) => request,
@@ -3341,7 +3578,7 @@ mod tests {
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
         assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 9);
         server.await.unwrap();
     }
 
@@ -3384,12 +3621,7 @@ mod tests {
                 .send(SourceMessage::Update(Update::Head(head)))
                 .await
                 .unwrap();
-            for expected in [
-                "/api/v0/pin/add",
-                "/api/v0/block/get",
-                "/api/v0/dag/import",
-                "/api/v0/ls",
-            ] {
+            for expected in PREPARATION_REQUESTS {
                 let request = tokio::select! {
                     _ = &mut transition => panic!("replacement activated before teardown"),
                     request = next_request(&mut requests) => request,
@@ -3416,7 +3648,7 @@ mod tests {
             test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
         let (running, result_tx, terminate_rx) = test_running_generation();
         let speculative = Head {
-            cid: "bafybeic4h4hllpsarpi4d625bbnaotinfzn7j632pyt7snfgfnhgnn7che"
+            cid: "bafybeiaawn3jm4eczk7dirhcgbvqacymijqipbx4z33rumc2ab6aggvm5u"
                 .parse()
                 .unwrap(),
         };
@@ -3428,7 +3660,7 @@ mod tests {
             let transition = deployment.await_generation(running);
             tokio::pin!(transition);
             candidate_tx.send_replace(Some(speculative.bytes()));
-            for _ in 0..4 {
+            for _ in 0..9 {
                 tokio::select! {
                     _ = &mut transition => panic!("speculation changed kernel outcome"),
                     _ = next_request(&mut requests) => {}
@@ -3457,18 +3689,13 @@ mod tests {
             };
             assert!(unpin.starts_with("/api/v0/pin/rm"), "{unpin}");
             assert!(unpin.contains(&speculative.cid.to_string()), "{unpin}");
-            for expected in [
-                "/api/v0/pin/add",
-                "/api/v0/block/get",
-                "/api/v0/dag/import",
-                "/api/v0/ls",
-            ] {
+            for expected in PREPARATION_REQUESTS {
                 let request = tokio::select! {
                     _ = &mut transition => panic!("replacement activated before teardown"),
                     request = next_request(&mut requests) => request,
                 };
                 assert!(request.starts_with(expected), "{request}");
-                if expected != "/api/v0/dag/import" {
+                if expected == "/api/v0/pin/add" || expected == "/api/v0/ls" {
                     assert!(request.contains(ROOT), "{request}");
                 }
             }
@@ -3478,7 +3705,7 @@ mod tests {
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
         assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
-        assert_eq!(calls.load(Ordering::SeqCst), 9);
+        assert_eq!(calls.load(Ordering::SeqCst), 19);
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
     }
@@ -3491,7 +3718,7 @@ mod tests {
         let server_calls = calls.clone();
         let (request_tx, mut requests) = mpsc::unbounded_channel();
         let server = tokio::spawn(async move {
-            for index in 1..=7 {
+            for index in 1..=12 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 let path = request
@@ -3546,12 +3773,7 @@ mod tests {
                 .send(SourceMessage::Update(Update::Head(head)))
                 .await
                 .unwrap();
-            for expected in [
-                "/api/v0/pin/add",
-                "/api/v0/block/get",
-                "/api/v0/dag/import",
-                "/api/v0/ls",
-            ] {
+            for expected in PREPARATION_REQUESTS {
                 let request = tokio::select! {
                     _ = &mut transition => panic!("replacement activated before teardown"),
                     request = next_request(&mut requests) => request,
@@ -3564,7 +3786,7 @@ mod tests {
 
         assert!(matches!(outcome, Outcome::Replaced { new_epoch: 1, .. }));
         assert_eq!(tree.root_cid().as_ref(), &ROOT.parse::<Cid>().unwrap());
-        assert_eq!(calls.load(Ordering::SeqCst), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 12);
         server.await.unwrap();
     }
 
@@ -3578,7 +3800,7 @@ mod tests {
         let (release_first_tx, release_first_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let mut release_first_rx = Some(release_first_rx);
-            for index in 1..=7 {
+            for index in 1..=12 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 let path = request
@@ -3603,12 +3825,12 @@ mod tests {
             test_deployment(client, staging.path().to_owned(), source_rx, candidate_rx);
         let (running, result_tx, terminate_rx) = test_running_generation();
         let first = Head {
-            cid: "bafybeic4h4hllpsarpi4d625bbnaotinfzn7j632pyt7snfgfnhgnn7che"
+            cid: "bafybeiaawn3jm4eczk7dirhcgbvqacymijqipbx4z33rumc2ab6aggvm5u"
                 .parse()
                 .unwrap(),
         };
         let intermediate = Head {
-            cid: "bafybeifq3dpjepjc33voodbyxlw3ckwcu3ijoypxwjpieuab6wysui5pxa"
+            cid: "bafybeiciecrmnoeowo36v5qcgxveqq72i4ap4daubts3g2uxj7ad7lripy"
                 .parse()
                 .unwrap(),
         };
@@ -3636,18 +3858,13 @@ mod tests {
             };
             assert!(old_unpin.starts_with("/api/v0/pin/rm"), "{old_unpin}");
             assert!(old_unpin.contains(&first.cid.to_string()), "{old_unpin}");
-            for expected in [
-                "/api/v0/pin/add",
-                "/api/v0/block/get",
-                "/api/v0/dag/import",
-                "/api/v0/ls",
-            ] {
+            for expected in PREPARATION_REQUESTS {
                 let request = tokio::select! {
                     _ = &mut transition => panic!("candidate changed kernel outcome"),
                     request = next_request(&mut requests) => request,
                 };
                 assert!(request.starts_with(expected), "{request}");
-                if expected != "/api/v0/dag/import" {
+                if expected == "/api/v0/pin/add" || expected == "/api/v0/ls" {
                     assert!(request.contains(ROOT), "{request}");
                 }
             }
@@ -3671,7 +3888,7 @@ mod tests {
         let newest_unpin = next_request(&mut requests).await;
         assert!(newest_unpin.starts_with("/api/v0/pin/rm"), "{newest_unpin}");
         assert!(newest_unpin.contains(ROOT), "{newest_unpin}");
-        assert_eq!(calls.load(Ordering::SeqCst), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 12);
         server.await.unwrap();
     }
 
@@ -3681,12 +3898,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (prepared_tx, prepared_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
-            for expected in [
-                "/api/v0/pin/add",
-                "/api/v0/block/get",
-                "/api/v0/dag/import",
-                "/api/v0/ls",
-            ] {
+            for expected in PREPARATION_REQUESTS {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 assert!(
@@ -3713,6 +3925,9 @@ mod tests {
         });
         let (_source_tx, source_rx) = mpsc::channel(1);
         let mut deployment = Deployment {
+            installed_baseline: None,
+            runtime_engine: kernel::test_support::runtime(),
+            active_kernel: kernel::test_support::prepared(ROOT),
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
@@ -3803,6 +4018,9 @@ mod tests {
             cid: ROOT.parse().unwrap(),
         };
         let mut deployment = Deployment {
+            installed_baseline: None,
+            runtime_engine: kernel::test_support::runtime(),
+            active_kernel: kernel::test_support::prepared(ROOT),
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
@@ -3821,6 +4039,7 @@ mod tests {
                 prepared: PreparedRoot {
                     head: Some(head.clone()),
                     effective: head.cid,
+                    kernel: kernel::test_support::prepared(&(head.cid).to_string()),
                     pins: PinSet::default(),
                 },
                 expires_at: tokio::time::Instant::now() + SPECULATIVE_RETENTION,
@@ -3912,6 +4131,7 @@ mod tests {
             prepared: PreparedRoot {
                 head: Some(head.clone()),
                 effective: head.cid,
+                kernel: kernel::test_support::prepared(&(head.cid).to_string()),
                 pins: PinSet::default(),
             },
             expires_at: tokio::time::Instant::now() + SPECULATIVE_RETENTION,
@@ -3979,6 +4199,9 @@ mod tests {
         let mut epoch_observer = epoch_rx.clone();
         let (source_tx, source_rx) = mpsc::channel(2);
         let mut deployment = Deployment {
+            installed_baseline: None,
+            runtime_engine: kernel::test_support::runtime(),
+            active_kernel: kernel::test_support::prepared(ROOT),
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
@@ -4112,6 +4335,8 @@ mod tests {
         let staging = tempfile::tempdir().unwrap();
         let mut deployment = Deployment::bootstrap(
             Config {
+                installed_baseline: None,
+                runtime_engine: kernel::test_support::runtime(),
                 source: Some(Box::new(source)),
                 candidates: None,
                 frozen_mounts: Vec::new(),
@@ -4187,6 +4412,9 @@ mod tests {
         });
         let (source_tx, source_rx) = mpsc::channel(1);
         let mut deployment = Deployment {
+            installed_baseline: None,
+            runtime_engine: kernel::test_support::runtime(),
+            active_kernel: kernel::test_support::prepared(ROOT),
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
@@ -4299,6 +4527,9 @@ mod tests {
             root: Some(OLD_ROOT.parse().unwrap()),
         });
         let mut deployment = Deployment {
+            installed_baseline: None,
+            runtime_engine: kernel::test_support::runtime(),
+            active_kernel: kernel::test_support::prepared(ROOT),
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,
@@ -4319,6 +4550,7 @@ mod tests {
                         cid: ROOT.parse().unwrap(),
                     }),
                     effective: ROOT.parse().unwrap(),
+                    kernel: kernel::test_support::prepared(ROOT),
                     pins: PinSet {
                         cids: vec![ROOT.parse().unwrap()],
                     },
@@ -4348,6 +4580,9 @@ mod tests {
         ));
         let (epoch_tx, epoch_rx) = watch::channel(Epoch::zero());
         let mut deployment = Deployment {
+            installed_baseline: None,
+            runtime_engine: kernel::test_support::runtime(),
+            active_kernel: kernel::test_support::prepared(ROOT),
             epoch_tx,
             epoch_rx,
             epoch_seq: 0,

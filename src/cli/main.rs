@@ -17,16 +17,12 @@ mod ns_cmd;
 mod p3_toolchain;
 
 use ww::cell::image;
-#[cfg(test)]
-use ww::cell::loaders::EmbeddedLoader;
 use ww::host;
 use ww::ipfs;
 
-// Embedded WASM blobs — compiled into the binary so standard cells work
-// without requiring `make std` on the user's machine.
+// Embedded installation seeds. Runtime PID0 selection reads the effective FHS.
 // build.rs sets cfg flags (has_wasm_*) when each file exists and is non-empty.
-// In debug/test builds without `make std`, these are empty slices and the
-// EmbeddedLoader gracefully falls through to the next loader in the chain.
+// Debug builds without canonical assets need an explicit installation payload.
 #[cfg(has_wasm_std_kernel_bin_main_wasm)]
 const EMBEDDED_KERNEL: &[u8] = include_bytes!("../../std/kernel/bin/main.wasm");
 #[cfg(not(has_wasm_std_kernel_bin_main_wasm))]
@@ -36,22 +32,6 @@ const EMBEDDED_KERNEL: &[u8] = b"";
 const EMBEDDED_STATUS: &[u8] = include_bytes!("../../std/status/bin/status.wasm");
 #[cfg(not(has_wasm_std_status_bin_status_wasm))]
 const EMBEDDED_STATUS: &[u8] = b"";
-
-/// Build the standard embedded loader with all bundled WASM images.
-#[cfg(test)]
-fn embedded_loader() -> EmbeddedLoader {
-    let mut loader = EmbeddedLoader::new();
-    // Important: do NOT register empty placeholders. If an empty blob is
-    // inserted, EmbeddedLoader "wins" path resolution and masks downstream
-    // loaders (HostPath/IPFS), causing zero-byte WASM loads.
-    if !EMBEDDED_KERNEL.is_empty() {
-        loader = loader.insert("bin/main.wasm", EMBEDDED_KERNEL);
-    }
-    if !EMBEDDED_STATUS.is_empty() {
-        loader = loader.insert("bin/status.wasm", EMBEDDED_STATUS);
-    }
-    loader
-}
 
 /// Return the configured local admin listener, or `None` for the explicit
 /// opt-out sentinel. Keep this normalization separate from socket parsing so
@@ -119,9 +99,14 @@ enum Commands {
     ///   ww run ./kernel.wasm:/boot/kernel.wasm
     ///   ww run /ipfs/<directory-cid>
     Run {
-        /// Ordered source[:/guest/target] mounts. No default source.
+        /// Ordered source[:/guest/target] mounts above the installed FHS and Stem.
         #[arg(value_name = "MOUNT")]
         mounts: Vec<String>,
+
+        /// Installed FHS directory, frozen below Stem, namespaces, and CLI mounts.
+        /// Defaults to $HOME/.ww/fhs. Must be an absolute path or ~/path.
+        #[arg(long, env = "WW_FHS_ROOT", value_name = "PATH")]
+        fhs_root: Option<PathBuf>,
 
         /// Host-only roots whose `etc/ns` directories configure namespace layers.
         #[arg(long, value_name = "PATH", hide = true)]
@@ -143,10 +128,9 @@ enum Commands {
         #[arg(long)]
         wasm_debug: bool,
 
-        /// Select pid0 by local path, CID, or explicit file:/cid:/embedded: prefix.
-        /// CLI overrides WW_KERNEL; absent both, the embedded kernel is used.
-        #[arg(long, value_name = "PATH|CID")]
-        kernel: Option<String>,
+        /// Rejected legacy selector; use a positional /boot/kernel.wasm mount.
+        #[arg(long = "kernel", hide = true, value_name = "PATH|CID")]
+        obsolete_kernel: Option<String>,
 
         /// Path to an Ed25519 identity file (host-side only; not a guest mount).
         /// Works well with direnv: `export WW_IDENTITY=~/.ww/identity` in .envrc.
@@ -739,10 +723,11 @@ impl Commands {
             Commands::Build { path } => Self::build(path).await,
             Commands::Run {
                 mounts: mount_args,
-                namespace_root,
+                mut namespace_root,
+                fhs_root,
                 listen,
                 wasm_debug,
-                kernel,
+                obsolete_kernel,
                 identity,
                 insecure_ephemeral,
                 stem,
@@ -758,6 +743,14 @@ impl Commands {
                 with_http_admin,
                 ipfs_url,
             } => {
+                anyhow::ensure!(
+                    obsolete_kernel.is_none() && std::env::var_os("WW_KERNEL").is_none(),
+                    "--kernel and WW_KERNEL are no longer supported. Mount the kernel in the effective FHS: \
+                     ww run ./kernel.wasm:/boot/kernel.wasm or \
+                     ww run /ipfs/<CID>:/boot/kernel.wasm."
+                );
+                let home = dirs::home_dir();
+                let installed_baseline = Self::installed_baseline_mount(fhs_root, home.as_deref())?;
                 let mut mounts = ww::cell::mount::parse_args(&mount_args)?;
                 let invocation_cwd = std::env::current_dir().context("read invocation CWD")?;
                 ww::cell::mount::freeze_local_paths(
@@ -765,13 +758,17 @@ impl Commands {
                     &invocation_cwd,
                     dirs::home_dir().as_deref(),
                 )?;
-                let env_kernel = match std::env::var("WW_KERNEL") {
-                    Ok(value) => Some(value),
-                    Err(std::env::VarError::NotPresent) => None,
-                    Err(error) => return Err(anyhow::anyhow!("failed to read WW_KERNEL: {error}")),
-                };
-                let kernel_source =
-                    ww::kernel::select_kernel_source(kernel.as_deref(), env_kernel.as_deref())?;
+                // Bare installed-state startup discovers only host configuration.
+                // Explicit source invocations preserve their existing namespace scan roots.
+                if mounts.is_empty()
+                    && namespace_root.is_empty()
+                    && stem.is_none()
+                    && ipns_stem.is_none()
+                {
+                    if let Some(home) = &home {
+                        namespace_root.push(home.join(".ww"));
+                    }
+                }
                 // Identity is passed separately — NOT as a mount.
                 // The host reads it to create the signing key for the Membrane.
                 // It must never enter the merged FHS tree (which is preopened
@@ -788,12 +785,12 @@ impl Commands {
                 };
                 Self::run_with_mounts(
                     mounts,
+                    installed_baseline,
                     namespace_root,
                     identity_path,
                     insecure_ephemeral,
                     listen,
                     wasm_debug,
-                    kernel_source,
                     stem,
                     ipns_stem,
                     ipns_routing_url,
@@ -1265,11 +1262,69 @@ system::export!({iface_name}Guest);
         }
     }
 
-    /// Require an explicit image or authoritative source before starting Host services.
+    /// Discover the publishable baseline without importing private installation state.
+    fn installed_baseline_mount(
+        configured: Option<PathBuf>,
+        home: Option<&Path>,
+    ) -> Result<Option<ww::cell::mount::Mount>> {
+        let explicit = configured.is_some();
+        let Some(mut path) = configured.or_else(|| home.map(|home| home.join(".ww/fhs"))) else {
+            return Ok(None);
+        };
+        if let Ok(relative) = path.strip_prefix("~") {
+            path = home
+                .context("HOME is required for a ~/ FHS root")?
+                .join(relative);
+        }
+        anyhow::ensure!(
+            path.is_absolute(),
+            "--fhs-root / WW_FHS_ROOT must be an absolute FHS directory: {}",
+            path.display()
+        );
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if !explicit && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("inspect installed FHS {}; install a canonical FHS or set --fhs-root to an existing directory", path.display())),
+        };
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "installed FHS must be a directory without symlink traversal: {}",
+            path.display()
+        );
+        if let Some(home) = home {
+            let root = path
+                .canonicalize()
+                .context("resolve installed FHS for private-state check")?;
+            let home = home
+                .canonicalize()
+                .context("resolve HOME for private-state check")?;
+            let private = home.join(".ww");
+            let private = match private.canonicalize() {
+                Ok(private) => private,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => private,
+                Err(error) => return Err(error).context("resolve private installation directory"),
+            };
+            anyhow::ensure!(
+                !private.starts_with(&root),
+                "installed FHS must not contain private installation state: {}",
+                path.display()
+            );
+        }
+        Ok(Some(ww::cell::mount::Mount {
+            source: path
+                .to_str()
+                .context("installed FHS path is not UTF-8")?
+                .to_owned(),
+            target: image::GuestTarget::root(),
+        }))
+    }
+
+    /// Require an installed baseline, explicit image, or authoritative source before Host services.
     fn startup_namespaces(
         mounts: &[ww::cell::mount::Mount],
         namespace_roots: &[PathBuf],
         authoritative_source: bool,
+        installed_baseline: bool,
     ) -> Result<Vec<ww::ns::NamespaceConfig>> {
         image::validate_mounts_virtual(mounts)?;
         // Metadata preflight keeps invalid local input actionable during a
@@ -1311,15 +1366,19 @@ system::export!({iface_name}Guest);
             }
         }
         anyhow::ensure!(
-            mounts.len() + namespace_images + usize::from(authoritative_source)
+            mounts.len() + namespace_images + usize::from(authoritative_source) + usize::from(installed_baseline)
                 <= ww::cell::mount::MAX_MOUNT_OPERATIONS,
-            "mount operation limit exceeded (including namespace images and authoritative head)"
+            "mount operation limit exceeded (including installed baseline, namespace images, and authoritative head)"
         );
-        if mounts.is_empty() && namespace_images == 0 && !authoritative_source {
+        if mounts.is_empty()
+            && namespace_images == 0
+            && !authoritative_source
+            && !installed_baseline
+        {
             bail!(
-                "No explicit image source or authoritative Stem configured. \
-                 Pass an explicit source (for example, `ww run .`), \
-                 a namespace root containing an image, --stem, or --ipns-stem."
+                "No installed FHS, explicit image source, or authoritative Stem configured. \
+                 Install the canonical FHS, set --fhs-root, or pass a complete explicit source \
+                 (for example, `ww run .`), a namespace root, --stem, or --ipns-stem."
             );
         }
         Ok(configs)
@@ -1367,12 +1426,12 @@ system::export!({iface_name}Guest);
     #[allow(clippy::too_many_arguments)]
     async fn run_with_mounts(
         mounts: Vec<ww::cell::mount::Mount>,
+        installed_baseline: Option<ww::cell::mount::Mount>,
         namespace_roots: Vec<PathBuf>,
         identity: Option<PathBuf>,
         insecure_ephemeral: bool,
         listen: Vec<Multiaddr>,
         wasm_debug: bool,
-        kernel_source: ww::kernel::Source,
         stem: Option<String>,
         ipns_stem: Option<String>,
         ipns_routing_url: String,
@@ -1393,7 +1452,12 @@ system::export!({iface_name}Guest);
             .transpose()
             .context("parse --ipns-stem")?;
         let authoritative_source = stem_contract.is_some() || ipns_stem_name.is_some();
-        let ns_configs = Self::startup_namespaces(&mounts, &namespace_roots, authoritative_source)?;
+        let ns_configs = Self::startup_namespaces(
+            &mounts,
+            &namespace_roots,
+            authoritative_source,
+            installed_baseline.is_some(),
+        )?;
 
         let (filesystem_owner, filesystem_resources) = cache::HostFsOwner::start(
             tokio::runtime::Handle::current(),
@@ -1447,7 +1511,7 @@ system::export!({iface_name}Guest);
             oci_image_id: std::env::var("WW_OCI_IMAGE_ID")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            kernel_identity: ww::kernel::IdentityState::pending(&kernel_source, epoch_rx.clone()),
+            kernel_identity: ww::kernel::IdentityState::pending(epoch_rx.clone()),
         };
         let kernel_identity = version_info.kernel_identity.clone();
 
@@ -1516,27 +1580,10 @@ system::export!({iface_name}Guest);
                 return Err(service_exit_error(service_exit));
             }
         }
-        runtime_status.set_phase("resolving-kernel");
-        let resolved_kernel = kernel_source
-            .resolve(ipfs_client.clone(), EMBEDDED_KERNEL)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to resolve kernel source '{}'",
-                    kernel_source.record()
-                )
-            })?;
-        let resolved_identity = resolved_kernel.identity();
-        tracing::info!(
-            kernel_source = %resolved_kernel.source.log_value(),
-            kernel_cid = %resolved_identity.cid,
-            source_cid = ?resolved_identity.source_cid,
-            bytes = resolved_identity.size,
-            "Kernel source resolved"
-        );
         runtime_status.set_phase("resolving-configuration");
 
-        let mut all_mounts: Vec<ww::cell::mount::Mount> = Vec::new();
+        let has_baseline = installed_baseline.is_some();
+        let mut all_mounts: Vec<ww::cell::mount::Mount> = installed_baseline.into_iter().collect();
         // The installed `ww` namespace uses the host identity as its default
         // IPNS signer. Publish before namespace resolution so a newly migrated
         // name exists before Kubo resolves it. The republisher then becomes
@@ -1668,7 +1715,8 @@ system::export!({iface_name}Guest);
         };
         drop(mount_resolution);
         drop(mount_transaction);
-        let frozen_mounts = resolved_mounts.mounts;
+        let mut frozen_mounts = resolved_mounts.mounts;
+        let installed_baseline = has_baseline.then(|| frozen_mounts.remove(0));
         let retained_source_roots = resolved_mounts.retained_roots;
         retained_startup_roots.clone_from(&retained_source_roots);
         let staging_setup = filesystem_resources.try_cleanup_transaction(
@@ -1872,6 +1920,8 @@ system::export!({iface_name}Guest);
         let deployment_config = ww::deployment::Config {
             source: stem_source,
             candidates: candidate_rx,
+            installed_baseline,
+            runtime_engine: executor_pool.runtime_engine(),
             frozen_mounts,
             retained_source_roots,
             ipfs_client: ipfs_client.clone(),
@@ -1938,7 +1988,6 @@ system::export!({iface_name}Guest);
         }
         let kernel_launcher = ww::deployment::KernelLauncher::new(
             executor_pool,
-            resolved_kernel,
             kernel_identity,
             kernel_ready_gate,
             kernel_bootstrap,
@@ -2562,41 +2611,37 @@ mod tests {
         assert!(mounts.is_empty());
     }
 
-    #[tokio::test]
-    async fn run_without_image_fails_before_identity_or_kubo() {
-        let cli = Cli::try_parse_from(["ww", "run", "--ipfs-url", "http://127.0.0.1:1"]).unwrap();
-        let error = cli.command.run().await.unwrap_err();
-        assert!(
-            error.to_string().contains("No explicit image source"),
-            "{error:#}"
-        );
+    #[test]
+    fn startup_without_installed_or_explicit_sources_fails() {
+        let error = Commands::startup_namespaces(&[], &[], false, false).unwrap_err();
+        assert!(error.to_string().contains("No installed FHS"), "{error:#}");
     }
 
     #[test]
     fn startup_requires_an_actual_namespace_image() {
         let root = tempfile::tempdir().unwrap();
         let roots = vec![root.path().to_path_buf()];
-        assert!(Commands::startup_namespaces(&[], &roots, false).is_err());
+        assert!(Commands::startup_namespaces(&[], &roots, false, false).is_err());
         std::fs::create_dir_all(root.path().join("etc/ns")).unwrap();
         std::fs::write(root.path().join("etc/ns/empty"), "# no image\n").unwrap();
-        assert!(Commands::startup_namespaces(&[], &roots, false).is_err());
+        assert!(Commands::startup_namespaces(&[], &roots, false, false).is_err());
         std::fs::write(
             root.path().join("etc/ns/ww"),
             "bootstrap=bafkreigh2akiscaildcw453gm7nmiv5df6b5u3rtmw3klhyxqqzkjureme\n",
         )
         .unwrap();
-        assert!(Commands::startup_namespaces(&[], &roots, false).is_ok());
+        assert!(Commands::startup_namespaces(&[], &roots, false, false).is_ok());
     }
 
     #[test]
     fn startup_accepts_stem_or_explicit_targeted_source() {
-        assert!(Commands::startup_namespaces(&[], &[], true).is_ok());
+        assert!(Commands::startup_namespaces(&[], &[], true, false).is_ok());
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("config");
         std::fs::write(&file, b"configuration").unwrap();
         let mounts =
             ww::cell::mount::parse_args(&[format!("{}:/etc/myapp", file.display())]).unwrap();
-        assert!(Commands::startup_namespaces(&mounts, &[], false).is_ok());
+        assert!(Commands::startup_namespaces(&mounts, &[], false, false).is_ok());
     }
 
     #[tokio::test]
@@ -2629,7 +2674,7 @@ mod tests {
         std::os::unix::fs::symlink(root.path(), &link).unwrap();
         let mounts =
             ww::cell::mount::parse_args(&[format!("{}:/etc/app", link.display())]).unwrap();
-        let error = Commands::startup_namespaces(&mounts, &[], false).unwrap_err();
+        let error = Commands::startup_namespaces(&mounts, &[], false, false).unwrap_err();
         assert!(
             error.to_string().contains("symlinks are not allowed"),
             "{error:#}"
@@ -2642,10 +2687,59 @@ mod tests {
         let mut mounts =
             ww::cell::mount::parse_args(&vec![format!("{}:/etc/app", root.path().display()); 128])
                 .unwrap();
-        assert!(Commands::startup_namespaces(&mounts, &[], false).is_ok());
-        assert!(Commands::startup_namespaces(&mounts, &[], true).is_err());
+        assert!(Commands::startup_namespaces(&mounts, &[], false, false).is_ok());
+        assert!(Commands::startup_namespaces(&mounts, &[], true, false).is_err());
         mounts.pop();
-        assert!(Commands::startup_namespaces(&mounts, &[], true).is_ok());
+        assert!(Commands::startup_namespaces(&mounts, &[], true, false).is_ok());
+        assert!(Commands::startup_namespaces(&mounts, &[], true, true).is_err());
+        mounts.pop();
+        assert!(Commands::startup_namespaces(&mounts, &[], true, true).is_ok());
+    }
+
+    #[test]
+    fn baseline_discovery_uses_only_the_installed_fhs() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(Commands::installed_baseline_mount(None, Some(home.path()))
+            .unwrap()
+            .is_none());
+        let fhs = home.path().join(".ww/fhs");
+        std::fs::create_dir_all(&fhs).unwrap();
+        std::fs::write(home.path().join(".ww/identity"), b"private").unwrap();
+        let baseline = Commands::installed_baseline_mount(None, Some(home.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline.source, fhs.to_str().unwrap());
+        assert!(baseline.is_root());
+        assert!(Commands::startup_namespaces(&[], &[], false, true).is_ok());
+        assert!(
+            Commands::installed_baseline_mount(Some(fhs.join("missing")), Some(home.path()))
+                .is_err()
+        );
+        assert!(Commands::installed_baseline_mount(
+            Some(PathBuf::from("relative")),
+            Some(home.path())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn baseline_rejects_private_ancestors_after_path_normalization() {
+        let home = tempfile::tempdir().unwrap();
+        let fhs = home.path().join(".ww/fhs");
+        std::fs::create_dir_all(&fhs).unwrap();
+        let error = Commands::installed_baseline_mount(Some(fhs.join("..")), Some(home.path()))
+            .unwrap_err();
+        assert!(error.to_string().contains("private installation state"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_rejects_a_symlink_root() {
+        let home = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".ww")).unwrap();
+        std::os::unix::fs::symlink(source.path(), home.path().join(".ww/fhs")).unwrap();
+        assert!(Commands::installed_baseline_mount(None, Some(home.path())).is_err());
     }
 
     #[test]
@@ -2655,11 +2749,11 @@ mod tests {
         std::fs::write(root.path().join("etc/ns/invalid"), "bootstrap=not-a-cid\n").unwrap();
         let mounts =
             ww::cell::mount::parse_args(&[format!("{}:/etc/app", root.path().display())]).unwrap();
-        assert!(Commands::startup_namespaces(&mounts, &[], false)
+        assert!(Commands::startup_namespaces(&mounts, &[], false, false)
             .unwrap()
             .is_empty());
         let mounts = ww::cell::mount::parse_args(&[root.path().display().to_string()]).unwrap();
-        assert!(Commands::startup_namespaces(&mounts, &[], false).is_err());
+        assert!(Commands::startup_namespaces(&mounts, &[], false, false).is_err());
     }
 
     fn parse_run_admin_addr(args: &[&str]) -> String {
@@ -2714,27 +2808,24 @@ mod tests {
     }
 
     #[test]
-    fn run_cli_accepts_explicit_kernel_source() {
+    fn run_cli_accepts_explicit_fhs_root_without_changing_mount_priority() {
         let command = Cli::try_parse_from([
             "ww",
             "run",
-            "./std/status",
-            "--kernel",
-            "cid:bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a",
+            "./override:/boot/kernel.wasm",
+            "--fhs-root",
+            "/opt/wetware/fhs",
         ])
-        .expect("parse --kernel")
+        .unwrap()
         .command;
-
-        match command {
-            Commands::Run { mounts, kernel, .. } => {
-                assert_eq!(mounts, vec!["./std/status"]);
-                assert_eq!(
-                    kernel.as_deref(),
-                    Some("cid:bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a")
-                );
-            }
-            _ => panic!("expected run command"),
-        }
+        let Commands::Run {
+            mounts, fhs_root, ..
+        } = command
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(mounts, ["./override:/boot/kernel.wasm"]);
+        assert_eq!(fhs_root, Some(PathBuf::from("/opt/wetware/fhs")));
     }
 
     #[test]
@@ -2853,31 +2944,6 @@ mod tests {
         )
         .expect_err("a warm-cache check still requires an enabled cache");
         assert!(format!("{error:#}").contains("state=disabled"));
-    }
-
-    #[test]
-    fn test_embedded_loader_does_not_shadow_with_empty_kernel_blob() {
-        use ww::cell::Loader;
-
-        let loader = embedded_loader();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let result = rt.block_on(loader.load("/ipfs/example/bin/main.wasm"));
-
-        if EMBEDDED_KERNEL.is_empty() {
-            assert!(
-                result.is_err(),
-                "embedded loader should not resolve bin/main.wasm when kernel blob is absent"
-            );
-        } else {
-            let bytes = result.expect("expected embedded kernel bytes");
-            assert!(
-                !bytes.is_empty(),
-                "embedded kernel resolution returned empty bytes"
-            );
-        }
     }
 
     // ── Daemon service-file writer tests ──────────────────────────────

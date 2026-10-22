@@ -39,7 +39,7 @@ class HostInstall(unittest.TestCase):
                                else ".config/systemd/user/ww.service")
         text = service.read_text()
         self.assertIn(str(self.destination), text)
-        self.assertIn(str(self.home / ".ww/fhs"), text)
+        self.assertNotIn(str(self.home / ".ww/fhs"), text)
         self.assertIn("--namespace-root", text)
         self.assertNotIn(str(self.binary), text) if self.binary != self.destination else None
         result = subprocess.run([str(self.destination), "--version"], env=self.env, capture_output=True)
@@ -243,7 +243,7 @@ class HostInstall(unittest.TestCase):
             service = self.home / "Library/LaunchAgents/io.wetware.ww.plist"
             argv = plistlib.loads(service.read_bytes())["ProgramArguments"]
             self.assertEqual(argv[0], str(self.destination))
-            self.assertIn(str(self.home / ".ww/fhs"), argv)
+            self.assertNotIn(str(self.home / ".ww/fhs"), argv)
             self.assertIn(str(self.home / ".ww/identity"), argv)
 
     def test_custom_systemd_dropin_refuses_before_writes(self):

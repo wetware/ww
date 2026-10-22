@@ -28,8 +28,9 @@ The `WW_CELL_MODE` envvar identifies application plumbing:
 | `http` | CGI env vars + stdin/stdout | WAGI (CGI for WASM) |
 | absent | process input/output | process-local P3 RPC transport; PID0 receives a `Membrane` |
 
-The trusted PID0 implementation is `std/kernel`, which is embedded in `ww` by
-default. PID0 uses the granted P3 transport for Cap'n Proto RPC. PID0 receives
+The packaged PID0 implementation is `std/kernel`. For each epoch, the Host selects
+`/boot/kernel.wasm` from the final effective FHS. Embedded bytes seed installation
+only. PID0 uses the granted P3 transport for Cap'n Proto RPC. PID0 receives
 the broad process-local root `Membrane`. Each ordinary child receives the
 parent-selected `Membrane` supplied to its spawn or listener registration.
 
@@ -50,8 +51,9 @@ Key abstractions:
   Host terminates the old PID0, prepares the effective root, and starts a fresh
   PID0 for the new generation.
   Repeated child grafts cannot recover omitted authority.
-- **FHS images**: layers are stacked with per-file union.  Later
-  layers override earlier ones.
+- **FHS images**: installed baseline, authoritative Stem head, frozen namespace
+  images, then frozen CLI operations. Later layers override earlier ones;
+  directories merge recursively. Invalid selected kernels fail preparation.
 - **Cap'n Proto RPC**: bidirectional -- both host and guest can serve
   and consume capabilities.
 - **Network transport**: authenticated vat services use
@@ -84,11 +86,11 @@ Grant authoring must prefer an image-bound Executor over Runtime, scoped Signer
 over Identity, Finder without Announcer when observation is sufficient, and a
 capability protocol over bearer tokens in args/env.
 
-Quick start:
+Quick start with Kubo running and an installed identity:
 ```
 rustup toolchain install nightly-2026-08-30 --component rust-src
 make
-cargo run -- run --http-listen 127.0.0.1:2080 ./std/status
+cargo run --locked -- run --fhs-root "$PWD/target/fhs" --http-listen 127.0.0.1:2080
 curl http://127.0.0.1:2080/status
 ```
 

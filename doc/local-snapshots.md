@@ -1,7 +1,10 @@
 # Local mount snapshots
 
-`ww run` captures local mount sources once before deployment. Ordered immutable
-source CIDs and guest targets replay unchanged across authoritative Stem epochs.
+`ww run` captures the installed FHS baseline and local mount sources once before
+deployment. Ordered immutable source CIDs and guest targets replay unchanged
+across authoritative Stem epochs. The baseline stays below Stem, namespaces,
+and explicit CLI operations. An explicit mount naming the baseline directory
+still retains its position among CLI operations.
 `ww push` retains its separate importer and publication contract.
 
 ## Capture
@@ -11,7 +14,8 @@ source CIDs and guest targets replay unchanged across authoritative Stem epochs.
 source is published. No identity, key, namespace, or adjacent `~/.ww` discovery
 occurs. Explicitly selecting private content still imports that content.
 The CLI constructs absolute requests from invocation-time CWD before starting
-capture. Explicit `~/` sources expand once; no `~/.ww` fallback occurs.
+capture. Explicit `~/` sources expand once. Installed-state startup selects only
+`~/.ww/fhs` or the configured FHS root; it never selects the private `~/.ww` root.
 
 One blocking worker uses descriptor-relative `rustix` opens. Every source
 component and included descendant rejects symlinks. Directory opens require
@@ -99,7 +103,7 @@ they are not an exact process RSS limit.
 | Verification nodes / work visits | 100,000 / 1,000,000 |
 | CAR acknowledgement response | Existing 64 KiB limit |
 
-Immutable/named sources and the authoritative head count against the same
+The installed baseline, immutable/named sources, and authoritative head count against the same
 128-operation envelope. Composer additionally checks target depth plus
 source DAG height. A captured payload can fit 64 MiB while its imported DAG
 exceeds verification or composition bounds; that batch fails before activation.

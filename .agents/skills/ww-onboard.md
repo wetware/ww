@@ -33,7 +33,7 @@ Tell them how to get started:
 ```
 git clone https://github.com/wetware/ww.git && cd ww
 make all
-ww perform install
+./target/release/ww perform install
 ```
 
 **Linux (pre-built binary):**
@@ -44,8 +44,9 @@ sudo mv ww-linux-x86_64 /usr/local/bin/ww
 ww perform install
 ```
 
-`ww perform install` creates `~/.ww`, generates an identity,
-and registers the background daemon. It prints next steps.
+Both paths require Kubo. Installation validates the kernel/status FHS, preserves
+existing identity, and registers the background daemon. It prints the service
+activation command without starting it. See `doc/installation.md` for setup.
 
 ### If installed
 

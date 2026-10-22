@@ -9,9 +9,9 @@ use tokio::sync::Semaphore;
 
 /// One physical compilation slot for one Deployment's successive generations.
 ///
-/// Deployment serializes generations and cancels the old generation's waiter
-/// before starting its replacement. Thus only its latest generation can wait
-/// here. There is no job queue or completed-component cache in this owner.
+/// Deployment cancels superseded preparation waiters before admitting newer
+/// candidates. The native worker retains this slot until compilation returns.
+/// This owner has no job queue or completed-component cache.
 #[derive(Clone)]
 pub struct Compilation {
     admission: Arc<Semaphore>,
@@ -26,6 +26,26 @@ impl Default for Compilation {
 }
 
 impl Compilation {
+    #[cfg(test)]
+    pub(crate) async fn hold_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+        let compilation = self.clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            compilation
+                .run(move || {
+                    entered.send(()).unwrap();
+                    let _ = blocked.recv();
+                })
+                .await
+                .unwrap();
+        });
+        ready.await.unwrap();
+        (release, task)
+    }
+
     /// Compile and statically validate with the exact production kernel linker.
     ///
     /// Canceling this future cancels admission or result waiting. Wasmtime's
