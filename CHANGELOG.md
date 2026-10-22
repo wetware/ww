@@ -48,6 +48,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   errors report deterministic composition failures.
 
 ### Fixed
+- **Cell async spans retain correct task attribution (#751).** Executor workers
+  enter each Cell span only while polling or dropping its future. Concurrent
+  Cells retain their executor parent without leaking spans into unrelated tasks.
 - **RPC async spans retain correct task attribution (#751).** VAT handlers,
   stream supervisors, and stream pumps enter their spans only while polling or
   dropping futures. Handler spans retain their accept context without leaking
