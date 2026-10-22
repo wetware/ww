@@ -15,6 +15,7 @@ use std::future::pending;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::{inbound_connection_budget, ConnectionBudget, ConnectionPermit};
 use authority::system_capnp;
@@ -124,11 +125,11 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
                         let membrane = membrane.clone();
                         let connection_guard = guard.clone();
                         let connection_cancellation = cancellation.child_token();
+                        let handle_span = tracing::info_span!(
+                            "stream.handle",
+                            protocol = protocol.as_str(),
+                        );
                         supervisors.push(tokio::task::spawn_local(async move {
-                            let _handle_span = tracing::info_span!(
-                                "stream.handle",
-                                protocol = protocol.as_str(),
-                            ).entered();
                             let supervisor = AcceptedConnectionSupervisor {
                                 executor,
                                 membrane,
@@ -142,7 +143,7 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
                             if let Err(e) = supervisor.run().await {
                                 tracing::error!("Stream cell connection error: {e}");
                             }
-                        }));
+                        }.instrument(handle_span)));
                     }
                     completed = supervisors.next(), if !supervisors.is_empty() => {
                         if let Some(Err(error)) = completed {
@@ -575,11 +576,11 @@ impl OutputPumpOutcome {
 }
 
 /// Read from the libp2p stream and write to the cell's stdin.
+#[tracing::instrument(name = "stream.pump_in", skip_all)]
 pub(crate) async fn pump_stream_to_stdin(
     mut reader: impl futures::io::AsyncRead + Unpin,
     stdin: system_capnp::byte_stream::Client,
 ) -> InputPumpOutcome {
-    let _span = tracing::info_span!("stream.pump_in").entered();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         match reader.read(&mut buf).await {
@@ -604,11 +605,11 @@ pub(crate) async fn pump_stream_to_stdin(
 }
 
 /// Read from the cell's stdout and write to the libp2p stream.
+#[tracing::instrument(name = "stream.pump_out", skip_all)]
 pub(crate) async fn pump_stdout_to_stream(
     stdout: system_capnp::byte_stream::Client,
     mut writer: impl futures::io::AsyncWrite + Unpin,
 ) -> OutputPumpOutcome {
-    let _span = tracing::info_span!("stream.pump_out").entered();
     loop {
         let mut req = stdout.read_request();
         req.get().set_max_bytes(64 * 1024);

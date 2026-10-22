@@ -40,6 +40,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   errors report deterministic composition failures.
 
 ### Fixed
+- **RPC async spans retain correct task attribution (#751).** VAT handlers,
+  stream supervisors, and stream pumps enter their spans only while polling or
+  dropping futures. Handler spans retain their accept context without leaking
+  into unrelated tasks.
 - **Atom head reads decode Solidity return parameters correctly.** Standard
   `(uint64, bytes)` responses preserve both the sequence and CID bytes.
 - **Evicted CID staging generations are reclaimed after their final content

@@ -18,6 +18,9 @@ pub mod vat_client;
 pub mod vat_dial;
 pub mod vat_listener;
 
+#[cfg(test)]
+mod tracing_tests;
+
 pub use connection_budget::{
     inbound_connection_budget, parse_inbound_connection_limit, parse_terminal_login_timeout,
     terminal_login_timeout, ConnectionBudget, ConnectionLimitReached, ConnectionPermit,
