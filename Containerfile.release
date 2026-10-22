@@ -12,6 +12,7 @@ COPY fhs/ /usr/share/wetware/kernel/
 
 COPY --from=home --chown=1000:1000 /home/ww/ /home/ww/
 ENV HOME=/home/ww
+ENV WW_FHS_ROOT=/usr/share/wetware/kernel
 WORKDIR /home/ww
 # A whole-home volume cannot hide the immutable FHS under /usr/share.
 VOLUME ["/home/ww"]
@@ -20,3 +21,4 @@ USER 1000:1000
 EXPOSE 2025 2026 2080
 
 ENTRYPOINT ["/usr/local/bin/ww"]
+CMD ["run"]

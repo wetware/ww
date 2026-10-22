@@ -62,6 +62,7 @@ COPY --from=builder /out/ww /usr/local/bin/ww
 COPY --from=builder /out/fhs/ /usr/share/wetware/kernel/
 COPY --from=builder --chown=1000:1000 /out/home/ /home/ww/
 ENV HOME=/home/ww
+ENV WW_FHS_ROOT=/usr/share/wetware/kernel
 WORKDIR /home/ww
 VOLUME ["/home/ww"]
 
@@ -69,4 +70,4 @@ USER 1000:1000
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/ww"]
-CMD ["run", "/usr/share/wetware/kernel"]
+CMD ["run"]

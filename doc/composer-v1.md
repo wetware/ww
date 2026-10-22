@@ -1,8 +1,8 @@
 # Wetware Composer v1
 
 For the mount-specific local capture and publication library, see
-[Local mount snapshots](local-snapshots.md). CLI/deployment integration remains
-in #734 Landing C.
+[Local mount snapshots](local-snapshots.md). CLI and deployment replay use these
+same frozen operations across authoritative epochs.
 
 `cell::image::COMPOSER_PROFILE` identifies `wetware-composer-v1`. For accepted
 inputs, the same ordered layer CIDs and this profile produce the same root CID.
@@ -43,14 +43,16 @@ directory collisions. Target depth plus full source height, including file
 chunk links, must fit the existing depth bound. Path traversal, directory
 copying, and encoding consume the same work, node, and byte budgets.
 
-`dag_merge_cids` remains the root-only adapter. Public CLI mounts and deployment
-epoch replay still use their existing root-only behavior. These library APIs do
-not enable targeted CLI mounts or change PID0 selection.
+`dag_merge_cids` remains the root-only adapter. Public CLI mounts support targeted
+files and directories. Deployment uses the installed baseline as the lowest
+layer, then the authoritative head, frozen namespace images, and frozen CLI
+operations. Baseline and head each count toward the operation bound. Kernel
+selection reads `/boot/kernel.wasm` from the composed effective root; Composer
+has no kernel-specific precedence rule.
 
 Deterministic input and composition failures carry `CompositionError`, available
 through `anyhow::Error::downcast_ref`. Transport, cancellation, and publication
-errors retain their existing error chains. No deployment error classification
-changes in this landing.
+errors retain their existing error chains.
 
 ## Data flow
 

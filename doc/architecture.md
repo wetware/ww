@@ -50,10 +50,32 @@ authority.
 
 ## Boot and child creation
 
-`ww run` resolves image layers and starts the host services. The Host selects
-trusted PID0 through `KernelSource`: `--kernel` takes precedence over
-`WW_KERNEL`, and the default is the embedded `std/kernel` `main` component.
-The Host↔PID0 ABI is version 3; no ABI-v2 compatibility shim exists.
+`ww run` freezes the installed FHS baseline and local mount sources once.
+Deployment composes baseline, authoritative Stem head, namespace images, and CLI
+operations in that order. Deployment then selects `/boot/kernel.wasm` against
+the explicit effective root CID. The prepared result carries the verified file,
+exact component bytes, byte-derived runtime identity, and static validation.
+The same prepared root and kernel enter generation construction.
+
+Kernel selection verifies UnixFS blocks and rejects symlinks, unsupported types,
+invalid traversal, and logical components larger than 8 MiB. Static validation
+uses the canonical Wasmtime engine and shared native P3 validator. The validator
+requires transport `open`, readiness `kernel-ready`, and native command exports.
+Preparation does not execute guest code, grant root authority, or publish current
+identity. Structural validation does not prove runtime graft or readiness.
+
+An accepted epoch revokes previous authority before replacement preparation.
+Old PID0 and filesystem ownership finish teardown before replacement activation.
+Final launch admission rejects superseded candidates. Current kernel identity
+belongs to the admitted generation and disappears while the epoch is unrooted.
+The Host's persistent libp2p PeerId remains independent of kernel replacement.
+Identical kernel bytes can reuse compilation results without reusing authority
+or readiness. Logical cancellation releases a compilation waiter; a native
+compiler retains its physical admission until completion.
+
+`--kernel` and `WW_KERNEL` are rejected. Embedded WASM is an installation seed,
+not a runtime source. A valid image can inherit a missing kernel from the
+baseline through composition. Invalid selected content never triggers fallback.
 
 The Rust PID0 follows one straight-line sequence for each generation:
 
@@ -298,6 +320,7 @@ The image root visible to pid0 follows the FHS convention:
 
 ```
 <image>/
+  boot/kernel.wasm  # PID0 selected by the Host from this effective root
   bin/<name>.wasm   # application component produced by ww build
   bin/status.wasm   # status component loaded by the shipped Rust PID0
 ```

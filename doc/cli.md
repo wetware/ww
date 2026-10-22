@@ -68,10 +68,18 @@ With `:target`, the source is overlaid at that guest path.
 Directory targets merge recursively; files and other type replacements use the later source.
 Operations keep argument order, including repeated and overlapping targets.
 Local sources use `.`, `./path`, `/absolute/path`, or `~/path`. Bare names must
-be complete CIDs; use `./name` to select a local name. No implicit CWD mount
-or `~/.ww` source fallback exists. With no mounts, startup requires a namespace
-configuration that supplies an image or an authoritative `--stem`/`--ipns-stem`.
-An empty `--namespace-root` does not supply an image.
+be complete CIDs; use `./name` to select a local name. Bare `ww run` uses the
+installed FHS at `~/.ww/fhs`, independently of CWD. `--fhs-root` or `WW_FHS_ROOT`
+selects a different baseline directory. The Host never imports the private
+`~/.ww` directory as its baseline. Without a usable installation, explicit
+sources must supply a complete bootable FHS.
+
+Every epoch composes installed baseline, authoritative Stem head, frozen namespace
+images, and frozen CLI operations in that order. PID0 comes exclusively from
+`/boot/kernel.wasm` in the resulting root. A valid head without that path can
+inherit the installed kernel through ordinary directory composition. Invalid or
+unavailable heads cannot become baseline-only deployments. Invalid selected
+kernels fail without falling back to installed, embedded, or previous bytes.
 
 Targets must be absolute and canonical: no trailing slash, repeated slash, `.`,
 `..`, or control characters. Root mounts require directories. Files require an
@@ -93,7 +101,7 @@ See [local snapshots](local-snapshots.md) for exclusions, limits, and failure be
 | `--http-listen <ADDR>` | none | Enable WAGI HTTP server (e.g. `127.0.0.1:2080`) |
 | `--http-dial <HOST>` | none | Allow outbound HTTP to host. Repeatable. Supports exact hosts, `*.example.com`, or `*`. Without this flag, `network.http.dialer` is null. |
 | `--with-http-admin <ADDR>` | `127.0.0.1:2026` | Local HTTP admin endpoint (`/healthz`, `/readyz`, `/version`, `/metrics`, `/host/id`, `/host/addrs`); set `off` to disable (case-insensitive). Also reads `WW_HTTP_ADMIN`. A non-loopback address exposes unauthenticated host diagnostics. |
-| `--kernel <PATH\|CID>` | embedded kernel | Select PID0 separately from mounted content. CLI overrides `WW_KERNEL`. |
+| `--fhs-root <PATH>` | `~/.ww/fhs` | Installed baseline directory, captured once below Stem, namespace, and CLI content. Requires an absolute path or `~/path`. Also reads `WW_FHS_ROOT`. |
 | `--wasm-debug` | off | Enable WASM debug info for guest processes |
 | `--executor-threads <N>` | `0` | Executor worker threads (0 = auto-detect, one per CPU core) |
 | `--runtime-cache-policy` | `shared` | `shared`: same WASM bytes share Executor. `isolated`: always fresh. |
@@ -108,6 +116,9 @@ See [local snapshots](local-snapshots.md) for exclusions, limits, and failure be
 ### Examples
 
 ```sh
+# Installed state, independent of current directory
+ww run
+
 # Dev mode (current directory)
 ww run .
 
@@ -126,7 +137,7 @@ ww run /ipfs/QmHash...
 # Targeted local file and directory snapshots
 ww run ./kernel.wasm:/boot/kernel.wasm ./config:/etc/myapp
 
-# Targeted immutable file (PID0 selection remains separate)
+# Select PID0 through an immutable file override
 ww run /ipfs/<file-cid>:/boot/kernel.wasm
 
 # Atom-backed deployment lifecycle
@@ -135,6 +146,11 @@ ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 # IPNS-backed deployment lifecycle
 ww run --ipns-stem k51qzi5uqu5... --ipns-routing-url http://localhost:8080
 ```
+
+`--kernel` and `WW_KERNEL` are obsolete and cause an error. Replace either
+selector with `./kernel.wasm:/boot/kernel.wasm` or
+`/ipfs/<file-cid>:/boot/kernel.wasm`. Embedded payloads seed installation only.
+Files under `/bin` do not execute merely because they are present.
 
 The IPNS Stem accepts canonical Base36 names, legacy base58 Peer IDs, and
 `/ipns/`-prefixed forms. It is not an `/ipns/...` image mount. The Stem follows
@@ -157,6 +173,7 @@ RPC listener and does not serve this path. Wetware does not fall back to Kubo's
 | Variable | Set by | Description |
 |----------|--------|-------------|
 | `WW_IDENTITY` | user | Default identity file path |
+| `WW_FHS_ROOT` | user | Installed FHS baseline directory; accepts an absolute path or `~/path` |
 | `WW_TTY` | host | Set to `1` when stdin is a terminal (triggers interactive shell mode) |
 | `WW_CELL_MODE` | host | Cell transport mode: `vat`, `raw`, `http`, or absent (kernel) |
 | `IPFS_API` | user | Default IPFS HTTP API endpoint |
@@ -249,30 +266,34 @@ Effectful operations that mutate state beyond the current directory.
 
 Bootstrap `~/.ww` and the daemon.
 
-Idempotent: re-running skips completed steps, retries failed ones.
+Validates the payload and managed-file ownership before replacing files.
+Reruns preserve existing identity and refresh only owned managed files.
 
 1. Creates `~/.ww` directory structure
 2. Generates `~/.ww/identity` if missing
 3. Derives the host Peer ID and default Base36 IPNS name from that identity
-4. Writes the default namespace bootstrap and derived IPNS name
-5. Registers the background daemon (launchd/systemd)
+4. Installs the validated kernel and status components under `~/.ww/fhs`
+5. Refreshes the default namespace when payloads change or its bootstrap is absent
+6. Registers the background daemon (launchd/systemd) and prints its activation command
 
 The command does not create a Kubo `"ww"` signing key. Kubo never receives the
-Wetware identity.
+Wetware identity. Installation does not start the service. See
+[installation and recovery](installation.md) for activation and ownership rules.
 
 ### ww perform update
 
-Refresh embedded images, the default namespace, and the daemon definition.
+Revalidate the installed payload and refresh the managed installation.
 
 ```sh
 ww perform update
 ```
 
-The command keeps `~/.ww/identity`, rewrites the default namespace with the
-IPNS name derived from that identity, and passes the Routing V1 URL to the
-daemon. If Kubo is running without Routing V1, the command returns an error
-that includes the required Kubo configuration. The daemon signs and publishes
-the namespace record when it starts.
+The command preserves `~/.ww/identity` and reuses the default namespace unless
+its bootstrap is absent.
+Installed payloads take precedence over embedded installation seeds. Generated
+services retain the selected Kubo API and Routing V1 URLs. If files changed, the
+command attempts to restart the service; otherwise it leaves the service running.
+The daemon signs and publishes the configured default namespace when it starts.
 
 ### ww perform upgrade
 
@@ -306,6 +327,11 @@ ww daemon install [--identity PATH] [--listen MULTIADDR ...] [--images PATH...] 
 `--ipns-routing-url` defaults to `http://localhost:8080` and reads
 `IPFS_ROUTING_API`. Generated launchd and systemd definitions preserve the
 selected value.
+
+`IPFS_API` supplies the install-time Kubo endpoint. The generated service records
+it as `--ipfs-url`, so startup does not depend on inheriting that variable.
+Without `--images`, the service uses the installed FHS baseline and reads
+`~/.ww/etc/ns` through a separate host-only configuration argument.
 
 ### ww daemon uninstall
 

@@ -14,8 +14,8 @@
       "title": "The `ww` command",
       "subtitle": "Starts and controls a Wetware node.",
       "files": ["src/cli/main.rs", "src/cli/daemon_cmd.rs"],
-      "what": "The CLI parses `ww run`, `ww shell`, `ww perform`, namespace, and daemon commands. `ww run` selects configured root layers or one authoritative Atom/IPNS Stem, starts host services, and applies process and operator policy to deployment outcomes.",
-      "built": "The binary lives at `src/cli/main.rs`. It combines `clap` command parsing with image loaders and the host runtime. `src/cli/daemon_cmd.rs` preserves host-only identity, namespace, and Routing V1 configuration in generated services. Deployment owns generation transitions; the CLI retains terminal behavior and process exit policy."
+      "what": "The CLI parses `ww run`, `ww shell`, `ww perform`, namespace, and daemon commands. Bare `ww run` captures the installed FHS independently of CWD. The CLI freezes namespace images and positional operations, starts host services, and applies process and operator policy to deployment outcomes.",
+      "built": "The binary lives at `src/cli/main.rs`. It uses the existing immutable capture and composition machinery. `src/cli/daemon_cmd.rs` preserves host-only identity, namespace, Kubo API, and Routing V1 configuration in generated services. Deployment owns generation transitions; the CLI retains terminal behavior and process exit policy."
     },
     {
       "key": "loader",
@@ -27,11 +27,11 @@
       "h": 62,
       "z": 36,
       "group": "THE HOST",
-      "title": "Image loaders",
-      "subtitle": "Resolve code and files into an image root.",
-      "files": ["crates/cell/src/loaders.rs"],
-      "what": "Image loaders resolve local directories, embedded images, and IPFS paths. The selected image provides pid0, cell binaries, and configuration in an FHS-shaped tree.",
-      "built": "`HostPathLoader`, `EmbeddedLoader`, `IpfsLoader`, and `ChainLoader` provide the source selection. The loader boundary keeps cell execution independent from where the bytes came from."
+      "title": "Immutable FHS composition",
+      "subtitle": "Compose frozen sources into one effective root.",
+      "files": ["crates/cell/src/image.rs", "crates/cell/src/image/composer.rs", "crates/cell/src/mount.rs"],
+      "what": "Composer applies the installed baseline, authoritative Stem head, frozen namespace images, and frozen positional CLI operations in that order. Directory collisions merge recursively. Every epoch reuses the same captured local sources and CLI precedence.",
+      "built": "`FrozenMount` pairs an inspected immutable source with a guest target. `compose_mounts` validates and composes the ordered sources using the existing SHA-256 profile and resource limits. Private installation state stays outside the captured FHS."
     },
     {
       "key": "host",
@@ -62,8 +62,8 @@
       "title": "Deployment lifecycle",
       "subtitle": "Turns optional Stem state into one rooted kernel generation.",
       "files": ["src/stem/mod.rs", "src/stem/atom.rs", "src/stem/ipns.rs", "src/deployment/mod.rs", "crates/atom/src/indexer.rs", "crates/authority/src/epoch.rs"],
-      "what": "Deployment may prepare one advisory Atom event candidate without changing authority. Finalized Atom or locally verified IPNS Source updates allocate epochs, revoke old authority, activate `CidTree`, and replace pid0. Signed IPNS expiry produces the same authoritative invalid-head transition.",
-      "built": "`src/stem` defines the backend-neutral Source contract, the Atom finalized-depth adapter, and the IPNS signed-record adapter with a durable ordering floor and EOL deadline. The Atom indexer supplies lossy advisory candidates. `src/deployment` owns preparation, retry, supersession, pin ownership, activation, and generation coordination. `crates/authority` enforces the resulting local epoch."
+      "what": "Deployment prepares one coherent effective root and verified kernel. Advisory Atom preparation grants no authority. Authoritative Source updates allocate epochs and revoke old authority before replacement preparation. Invalid selected kernels leave the epoch unrooted and unready; later valid heads can recover.",
+      "built": "`src/stem` defines the Atom finalized-depth and signed IPNS adapters. `src/deployment` owns preparation, retry, supersession, retention, teardown, activation, and final launch admission. The prepared kernel comes from `/boot/kernel.wasm` at the explicit effective root. Old PID0 and filesystem ownership finish teardown before replacement activation. `crates/authority` enforces the local epoch."
     },
     {
       "key": "kernel",
@@ -77,9 +77,9 @@
       "group": "THE AUTHORITY PATH",
       "title": "Trusted pid0 kernel",
       "subtitle": "The initial recipient of the root Membrane and root authority.",
-      "files": ["std/kernel/src/lib.rs", "src/kernel.rs"],
+      "files": ["std/kernel/src/lib.rs", "src/kernel.rs", "src/kernel/preparation.rs"],
       "what": "Pid0 receives the process-local root `Membrane`. The default Rust implementation grafts its typed authority once, installs `/status` with a narrow child `Membrane`, and commits readiness for its captured epoch.",
-      "built": "`src/kernel.rs` resolves pid0 bytes and records their CID. `std/kernel/src/lib.rs` reads `peerId`, `stat`, `network.http.listener`, and `runtime` from the graft. The private `kernel-ready` import is installed only for pid0."
+      "built": "`PreparedKernel` binds verified bytes, source-file CID, effective root, runtime CID, and static validation. `src/kernel.rs` launches that component and owns generation-bound identity. The persistent Host PeerId remains unchanged across kernel replacements. `std/kernel/src/lib.rs` reads its granted authority and commits the private `kernel-ready` import."
     },
     {
       "key": "status",

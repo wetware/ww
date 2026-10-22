@@ -96,6 +96,37 @@ fn status_variant(base: &[u8], tag: &[u8]) -> (Vec<u8>, cid::Cid) {
     (bytes, cid)
 }
 
+/// Change an executed guest log literal without changing component lengths.
+/// A custom section changes identity but cannot prove which PID0 executed.
+fn kernel_variant(tag: char) -> Vec<u8> {
+    let mut bytes = required_artifact(KERNEL_WASM_PATH);
+    let original = b"committed readiness";
+    let marker = format!("kernel-{tag} readiness!");
+    assert_eq!(marker.len(), original.len());
+    let positions: Vec<_> = bytes
+        .windows(original.len())
+        .enumerate()
+        .filter_map(|(index, value)| (value == original).then_some(index))
+        .collect();
+    assert_eq!(
+        positions.len(),
+        1,
+        "kernel readiness literal must be unique"
+    );
+    bytes[positions[0]..positions[0] + original.len()].copy_from_slice(marker.as_bytes());
+    bytes
+}
+
+fn seed_installed_kernel(home: &Path) {
+    let boot = home.join(".ww/fhs/boot");
+    std::fs::create_dir_all(&boot).expect("create installed boot directory");
+    std::fs::write(
+        boot.join("kernel.wasm"),
+        required_artifact(KERNEL_WASM_PATH),
+    )
+    .expect("seed installed kernel");
+}
+
 async fn unused_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -113,8 +144,8 @@ struct RunningNode {
 
 struct NodeOptions {
     mounts: Vec<String>,
-    kernel_cli: Option<String>,
-    kernel_env: Option<String>,
+    installed_baseline: bool,
+    cwd: Option<PathBuf>,
     http_addr: Option<SocketAddr>,
     listen_addr: Option<SocketAddr>,
     identity_path: Option<PathBuf>,
@@ -131,11 +162,11 @@ struct StemOptions {
 }
 
 impl NodeOptions {
-    fn embedded(http_addr: Option<SocketAddr>) -> Self {
+    fn installed(http_addr: Option<SocketAddr>) -> Self {
         Self {
             mounts: vec![STATUS_LAYER.to_string()],
-            kernel_cli: None,
-            kernel_env: None,
+            installed_baseline: true,
+            cwd: None,
             http_addr,
             listen_addr: None,
             identity_path: None,
@@ -154,6 +185,12 @@ impl RunningNode {
         kubo_addr: SocketAddr,
         options: &NodeOptions,
     ) -> Self {
+        // macOS exposes /var through a symlink. The installed-source contract
+        // accepts physical directories, so isolate HOME at its physical path.
+        let home = home.canonicalize().expect("canonicalize isolated HOME");
+        if options.installed_baseline {
+            seed_installed_kernel(&home);
+        }
         // Both host tracing and guest stderr must share one file description:
         // lifecycle ordering assertions are invalid if independently captured
         // streams are concatenated after the process exits.
@@ -177,14 +214,10 @@ impl RunningNode {
         if let Some(http_addr) = options.http_addr {
             command.arg("--http-listen").arg(http_addr.to_string());
         }
-        if let Some(kernel) = options.kernel_cli.as_ref() {
-            command.arg("--kernel").arg(kernel);
+        if let Some(cwd) = &options.cwd {
+            command.current_dir(cwd);
         }
-        if let Some(kernel) = options.kernel_env.as_ref() {
-            command.env("WW_KERNEL", kernel);
-        } else {
-            command.env_remove("WW_KERNEL");
-        }
+        command.env_remove("WW_KERNEL").env_remove("WW_FHS_ROOT");
         if let Some(identity_path) = options.identity_path.as_ref() {
             command.arg("--identity").arg(identity_path);
         }
@@ -205,7 +238,7 @@ impl RunningNode {
         }
 
         command
-            .env("HOME", home)
+            .env("HOME", &home)
             // Captured logs are asserted as plain text; CI may force ANSI colors.
             .env("NO_COLOR", "1")
             .env("WW_KUBO_WAIT_MAX_SECS", "30")
@@ -299,6 +332,76 @@ async fn version(client: &reqwest::Client, admin_addr: SocketAddr) -> Value {
         .json()
         .await
         .expect("parse /version JSON")
+}
+
+async fn assert_kernel_epoch(
+    client: &reqwest::Client,
+    admin_addr: SocketAddr,
+    kubo_addr: SocketAddr,
+    node: &RunningNode,
+    seq: u64,
+    kernel: &[u8],
+) -> Value {
+    let root = activated_root(node, seq);
+    let source = immutable_path_cid(client, kubo_addr, &root, "boot/kernel.wasm").await;
+    let identity = version(client, admin_addr).await;
+    assert_eq!(identity["kernel_epoch_seq"], seq);
+    assert_eq!(identity["kernel_effective_root"], root.to_string());
+    // Kubo resolve canonicalizes DAG-PB CIDv0 links to CIDv1. The selector
+    // retains the exact source link, so compare their codec and multihash.
+    let selected: cid::Cid = identity["kernel_source_cid"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(selected.codec(), source.codec());
+    assert_eq!(selected.hash(), source.hash());
+    assert_eq!(
+        identity["kernel_source"],
+        format!("/ipfs/{root}/boot/kernel.wasm")
+    );
+    assert_eq!(
+        identity["kernel_cid"],
+        ww::kernel::runtime_cid(kernel).to_string()
+    );
+    assert_eq!(
+        identity["kernel_wasm_blake3"],
+        blake3::hash(kernel).to_hex().to_string()
+    );
+    let bytes = kubo_call(
+        client,
+        kubo_addr,
+        "cat",
+        &[("arg", &format!("/ipfs/{source}"))],
+    )
+    .await
+    .bytes()
+    .await
+    .unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        kernel,
+        "selected file must contain the executing kernel bytes"
+    );
+    identity
+}
+
+async fn assert_persistent_peer(client: &reqwest::Client, http_addr: SocketAddr, peer: PeerId) {
+    let status: Value = client
+        .get(format!("http://{http_addr}/status"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        status["peer_id"],
+        peer.to_string(),
+        "kernel replacement changed Host PeerId"
+    );
 }
 
 async fn assert_status_route(client: &reqwest::Client, http_addr: SocketAddr, node: &RunningNode) {
@@ -510,10 +613,15 @@ enum ProxyControl {
     Gate {
         reached: tokio::sync::mpsc::Sender<()>,
         release: watch::Receiver<bool>,
+        block: bool,
+    },
+    CorruptBlock {
+        attempts: Arc<AtomicUsize>,
     },
     FailMergeUntil {
         attempts: Arc<AtomicUsize>,
         release: watch::Receiver<bool>,
+        status: StatusCode,
     },
 }
 
@@ -529,7 +637,16 @@ async fn forward_controlled_kubo(
             // Composition reads DAG-PB file headers through block/get before
             // PID0 starts. Gate the later content read to preserve this test's
             // PID0-result race boundary.
-            ProxyControl::Gate { reached, release } if uri.contains("/api/v0/cat") => {
+            ProxyControl::Gate {
+                reached,
+                release,
+                block,
+            } if uri.contains(if *block {
+                "/api/v0/block/get"
+            } else {
+                "/api/v0/cat"
+            }) =>
+            {
                 let _ = reached.send(()).await;
                 while !*release.borrow() {
                     if release.changed().await.is_err() {
@@ -538,13 +655,27 @@ async fn forward_controlled_kubo(
                 }
             }
             ProxyControl::Gate { .. } => {}
-            ProxyControl::FailMergeUntil { attempts, release }
-                if uri.contains("/api/v0/block/get") && !*release.borrow() =>
-            {
+            ProxyControl::CorruptBlock { attempts } if uri.contains("/api/v0/block/get") => {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 return Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .body(Body::from("content is not available yet"))
+                    .status(StatusCode::OK)
+                    .body(Body::from("corrupted selected kernel block"))
+                    .unwrap();
+            }
+            ProxyControl::CorruptBlock { .. } => {}
+            ProxyControl::FailMergeUntil {
+                attempts,
+                release,
+                status,
+            } if uri.contains("/api/v0/block/get") && !*release.borrow() => {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                return Response::builder()
+                    .status(*status)
+                    .body(Body::from(if *status == StatusCode::INTERNAL_SERVER_ERROR {
+                        r#"{"Message":"block was not found locally (offline)","Code":0,"Type":"error"}"#
+                    } else {
+                        "content is not available yet"
+                    }))
                     .expect("build transient Kubo response");
             }
             ProxyControl::FailMergeUntil { .. } => {}
@@ -629,6 +760,19 @@ fn start_gated_kubo_proxy(
     tokio::sync::mpsc::Receiver<()>,
     watch::Sender<bool>,
 ) {
+    start_gated_kubo_proxy_for(listener, target, path_fragment, false)
+}
+
+fn start_gated_kubo_proxy_for(
+    listener: TcpListener,
+    target: SocketAddr,
+    path_fragment: impl Into<String>,
+    block: bool,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Receiver<()>,
+    watch::Sender<bool>,
+) {
     let (reached_tx, reached_rx) = tokio::sync::mpsc::channel(4);
     let (release_tx, release_rx) = watch::channel(false);
     let proxy = ControlledKuboProxy {
@@ -638,6 +782,7 @@ fn start_gated_kubo_proxy(
         control: ProxyControl::Gate {
             reached: reached_tx,
             release: release_rx,
+            block,
         },
     };
     let app = Router::new()
@@ -651,10 +796,48 @@ fn start_gated_kubo_proxy(
     (task, reached_rx, release_tx)
 }
 
+fn start_corrupt_block_kubo_proxy(
+    listener: TcpListener,
+    target: SocketAddr,
+    path_fragment: String,
+) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let proxy = ControlledKuboProxy {
+        client: reqwest::Client::new(),
+        target,
+        path_fragment,
+        control: ProxyControl::CorruptBlock {
+            attempts: Arc::clone(&attempts),
+        },
+    };
+    let app = Router::new()
+        .fallback(forward_controlled_kubo)
+        .with_state(proxy);
+    (
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }),
+        attempts,
+    )
+}
+
 fn start_failing_merge_kubo_proxy(
     listener: TcpListener,
     target: SocketAddr,
     head_cid: impl Into<String>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    Arc<AtomicUsize>,
+    watch::Sender<bool>,
+) {
+    start_failing_block_kubo_proxy(listener, target, head_cid, StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn start_failing_block_kubo_proxy(
+    listener: TcpListener,
+    target: SocketAddr,
+    head_cid: impl Into<String>,
+    status: StatusCode,
 ) -> (
     tokio::task::JoinHandle<()>,
     Arc<AtomicUsize>,
@@ -669,6 +852,7 @@ fn start_failing_merge_kubo_proxy(
         control: ProxyControl::FailMergeUntil {
             attempts: Arc::clone(&attempts),
             release: release_rx,
+            status,
         },
     };
     let app = Router::new()
@@ -689,8 +873,23 @@ struct EpochRoot {
 
 impl EpochRoot {
     async fn valid(ipfs: &ww::ipfs::HttpClient, status_wasm: &[u8], generation: u64) -> Self {
+        Self::with_kernel(
+            ipfs,
+            status_wasm,
+            &required_artifact(KERNEL_WASM_PATH),
+            generation,
+        )
+        .await
+    }
+
+    async fn with_kernel(
+        ipfs: &ww::ipfs::HttpClient,
+        status_wasm: &[u8],
+        kernel: &[u8],
+        generation: u64,
+    ) -> Self {
         let marker = format!("epoch-{generation}\n").into_bytes();
-        Self::build(ipfs, status_wasm, marker).await
+        Self::build(ipfs, status_wasm, kernel, marker).await
     }
 
     /// A deployment root whose production status policy requires
@@ -699,6 +898,12 @@ impl EpochRoot {
     async fn missing_status(ipfs: &ww::ipfs::HttpClient, generation: u64) -> Self {
         let marker = format!("epoch-{generation}-missing-status\n").into_bytes();
         let directory = tempfile::tempdir().expect("create missing-status root");
+        std::fs::create_dir(directory.path().join("boot")).unwrap();
+        std::fs::write(
+            directory.path().join("boot/kernel.wasm"),
+            required_artifact(KERNEL_WASM_PATH),
+        )
+        .unwrap();
         std::fs::write(directory.path().join("delay.txt"), &marker)
             .expect("write missing-status delay marker");
         std::fs::write(directory.path().join("generation.txt"), &marker)
@@ -715,8 +920,15 @@ impl EpochRoot {
         }
     }
 
-    async fn build(ipfs: &ww::ipfs::HttpClient, status_wasm: &[u8], marker: Vec<u8>) -> Self {
+    async fn build(
+        ipfs: &ww::ipfs::HttpClient,
+        status_wasm: &[u8],
+        kernel: &[u8],
+        marker: Vec<u8>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("create epoch content root");
+        std::fs::create_dir(directory.path().join("boot")).unwrap();
+        std::fs::write(directory.path().join("boot/kernel.wasm"), kernel).unwrap();
         let bin = directory.path().join("bin");
         std::fs::create_dir_all(&bin).expect("create epoch bin directory");
         std::fs::write(bin.join("status.wasm"), status_wasm).expect("write epoch status component");
@@ -772,7 +984,7 @@ fn epoch_node_options(
     identity_path: PathBuf,
     atom: &AtomFixture,
 ) -> NodeOptions {
-    let mut options = NodeOptions::embedded(Some(http_addr));
+    let mut options = NodeOptions::installed(Some(http_addr));
     // This non-conflicting user layer must remain present after every epoch.
     options.mounts = vec!["./doc".to_owned()];
     options.listen_addr = Some(listen_addr);
@@ -980,6 +1192,50 @@ async fn kubo_pin_is_present(
         .is_ok_and(|response| response.status().is_success())
 }
 
+/// Compute the local-file snapshot CID without creating an independent pin.
+async fn unuploaded_file_cid(client: &reqwest::Client, kubo: SocketAddr, bytes: &[u8]) -> cid::Cid {
+    let result: Value = client
+        .post(format!("http://{kubo}/api/v0/add"))
+        .query(&[
+            ("only-hash", "true"),
+            ("pin", "false"),
+            ("cid-version", "1"),
+            ("hash", "sha2-256"),
+            ("raw-leaves", "true"),
+            ("chunker", "size-262144"),
+            ("trickle", "false"),
+            ("wrap-with-directory", "false"),
+            ("inline", "false"),
+            ("preserve-mode", "false"),
+            ("preserve-mtime", "false"),
+        ])
+        .multipart(reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(bytes.to_vec()).file_name("source"),
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    result["Hash"].as_str().unwrap().parse().unwrap()
+}
+
+async fn checked_gc(client: &reqwest::Client, kubo: SocketAddr) {
+    let body = kubo_call(client, kubo, "repo/gc", &[])
+        .await
+        .text()
+        .await
+        .unwrap();
+    for line in body.lines().filter(|line| !line.is_empty()) {
+        let event: Value = serde_json::from_str(line).expect("valid Kubo GC event");
+        assert!(event.get("Error").is_none(), "Kubo GC failed: {event}");
+    }
+}
+
 async fn wait_for_pin_release(client: &reqwest::Client, kubo_addr: SocketAddr, cid: &cid::Cid) {
     let deadline = Instant::now() + INVALIDATION_TIMEOUT;
     while kubo_pin_is_present(client, kubo_addr, cid).await {
@@ -1024,6 +1280,42 @@ async fn immutable_path_cid(
         .expect("immutable resolved path")
         .parse()
         .expect("resolved CID")
+}
+
+/// Find the data block containing the executed marker. Composition can
+/// inspect the file header first; only verified file reads need this leaf.
+async fn selected_marker_block(
+    client: &reqwest::Client,
+    kubo: SocketAddr,
+    root: &cid::Cid,
+    marker: &str,
+) -> cid::Cid {
+    let file = immutable_path_cid(client, kubo, root, "boot/kernel.wasm").await;
+    let mut pending = vec![file];
+    while let Some(block) = pending.pop() {
+        let bytes = kubo_call(client, kubo, "block/get", &[("arg", &block.to_string())])
+            .await
+            .bytes()
+            .await
+            .unwrap();
+        if bytes
+            .windows(marker.len())
+            .any(|value| value == marker.as_bytes())
+        {
+            return block;
+        }
+        if block.codec() == 0x70 {
+            let dag: Value = kubo_call(client, kubo, "dag/get", &[("arg", &block.to_string())])
+                .await
+                .json()
+                .await
+                .unwrap();
+            for link in dag["Links"].as_array().unwrap() {
+                pending.push(link["Hash"]["/"].as_str().unwrap().parse().unwrap());
+            }
+        }
+    }
+    panic!("kernel marker has no isolated data leaf: {marker}");
 }
 
 async fn directory_data(
@@ -1075,14 +1367,26 @@ async fn targeted_epoch_root(
     generation: u64,
     obstruct: bool,
 ) -> EpochRoot {
-    let mut root = EpochRoot::valid(ipfs, status, generation).await;
+    let kernel = kernel_variant(if generation == 10 { 'A' } else { 'B' });
+    let mut root = EpochRoot::with_kernel(ipfs, status, &kernel, generation).await;
     let directory = root._directory.path();
     if obstruct {
         std::fs::write(directory.join("etc"), b"strict ancestor obstruction").unwrap();
     } else {
         std::fs::create_dir_all(directory.join("etc/app")).unwrap();
-        std::fs::write(directory.join("etc/app/config"), b"authoritative conflict").unwrap();
+        std::fs::write(
+            directory.join("etc/app/config.toml"),
+            b"authoritative conflict",
+        )
+        .unwrap();
         std::fs::write(directory.join("etc/app/unrelated"), generation.to_string()).unwrap();
+        std::fs::create_dir_all(directory.join("etc/overlay")).unwrap();
+        std::fs::write(directory.join("etc/overlay/overlap"), b"head overlap").unwrap();
+        std::fs::write(
+            directory.join("etc/overlay/unrelated"),
+            generation.to_string(),
+        )
+        .unwrap();
     }
     let imported = ipfs.add_dir(directory).await.unwrap();
     let mfs = format!("/landing-c-{}-{generation}", std::process::id());
@@ -1095,7 +1399,12 @@ async fn targeted_epoch_root(
     )
     .await;
     if !obstruct {
-        for (suffix, mode) in [("/etc/app", "700"), ("/etc", "750"), ("", "755")] {
+        for (suffix, mode) in [
+            ("/etc/overlay", "705"),
+            ("/etc/app", "700"),
+            ("/etc", "750"),
+            ("", "755"),
+        ] {
             let path = format!("{mfs}{suffix}");
             kubo_call(
                 client,
@@ -1137,7 +1446,7 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
     tokio::task::LocalSet::new().run_until(async {
         let _guard = e2e_lock().await;
         let status = required_artifact(STATUS_WASM_PATH);
-        let kernel = required_artifact(KERNEL_WASM_PATH);
+        let kernel = kernel_variant('X');
         let (overlay_status, overlay_status_cid) = status_variant(&status, b"frozen-cli-overlay");
         let (kubo_addr, client) = require_kubo().await;
         let backend_version: Value = kubo_call(&client, kubo_addr, "version", &[]).await.json().await.unwrap();
@@ -1158,53 +1467,89 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
         std::fs::write(source.join("hidden"), hidden_bytes).unwrap();
         // Hash-only requests neither upload nor pin the hidden source. The
         // deployment is therefore the only owner that can retain this CID.
-        let hidden_hash: Value = client.post(format!("http://{kubo_addr}/api/v0/add"))
-            .query(&[("only-hash", "true"), ("pin", "false"), ("cid-version", "1"), ("hash", "sha2-256"), ("raw-leaves", "true"), ("chunker", "size-262144"), ("trickle", "false"), ("wrap-with-directory", "false"), ("inline", "false"), ("preserve-mode", "false"), ("preserve-mtime", "false")])
-            .multipart(reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(hidden_bytes.to_vec()).file_name("source")))
-            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
-        let hidden_cid: cid::Cid = hidden_hash["Hash"].as_str().unwrap().parse().unwrap();
+        let hidden_cid = unuploaded_file_cid(&client, kubo_addr, hidden_bytes).await;
         assert!(!kubo_pin_is_present(&client, kubo_addr, &hidden_cid).await, "hidden source must have no preexisting owner");
         std::fs::write(source.join("config"), b"original frozen config").unwrap();
         std::fs::write(source.join("status.wasm"), &overlay_status).unwrap();
-        std::fs::write(source.join("kernel.wasm"), b"ordinary image bytes, not PID0").unwrap();
+        std::fs::write(source.join("kernel.wasm"), &kernel).unwrap();
         std::fs::create_dir_all(source.join("directory/empty")).unwrap();
         std::fs::write(source.join("directory/.gitignore"), b"targeted inclusion").unwrap();
+        std::fs::write(source.join("directory/overlap"), b"frozen directory overlap").unwrap();
+        // Local captures omit metadata. An explicit immutable directory mount
+        // supplies distinguishable target mode/mtime for the Composer contract.
+        let overlay_mfs = format!("/landing3-overlay-{}", std::process::id());
+        kubo_call(&client, kubo_addr, "files/mkdir", &[("arg", &format!("{overlay_mfs}/empty")), ("parents", "true")]).await;
+        for name in [".gitignore", "overlap"] {
+            client.post(format!("http://{kubo_addr}/api/v0/files/write"))
+                .query(&[("arg", format!("{overlay_mfs}/{name}")), ("create", "true".to_owned())])
+                .multipart(reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(std::fs::read(source.join("directory").join(name)).unwrap()).file_name(name.to_owned())))
+                .send().await.unwrap().error_for_status().unwrap();
+        }
+        kubo_call(&client, kubo_addr, "files/chmod", &[("arg", "711"), ("arg", &overlay_mfs)]).await;
+        kubo_call(&client, kubo_addr, "files/touch", &[("arg", &overlay_mfs), ("mtime", "4242")]).await;
+        let overlay_stat: Value = kubo_call(&client, kubo_addr, "files/stat", &[("arg", &overlay_mfs)]).await.json().await.unwrap();
+        let overlay_cid: cid::Cid = overlay_stat["Hash"].as_str().unwrap().parse().unwrap();
+        kubo_call(&client, kubo_addr, "pin/add", &[("arg", &overlay_cid.to_string())]).await;
+        kubo_call(&client, kubo_addr, "files/rm", &[("arg", &overlay_mfs), ("recursive", "true")]).await;
+        let overlay_metadata = directory_data(&client, kubo_addr, &overlay_cid, "").await;
+        assert_ne!(overlay_metadata, directory_data(&client, kubo_addr, &h0.cid, "etc/overlay").await);
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let (proxy_task, mut replacement_reached, replacement_release) =
+            start_gated_kubo_proxy_for(proxy_listener, kubo_addr, h1.cid.to_string(), true);
         let home = tempfile::tempdir().unwrap();
-        let (_, identity_path, _) = persistent_identity(home.path());
+        let (_, identity_path, peer_id) = persistent_identity(home.path());
+        std::fs::create_dir_all(home.path().join(".ww/fhs")).unwrap();
+        std::fs::write(home.path().join(".ww/fhs/installed-marker"), b"frozen baseline").unwrap();
         let admin_addr = unused_addr().await;
         let http_addr = unused_addr().await;
         let listen_addr = unused_addr().await;
         let mut options = epoch_node_options(&h0, http_addr, listen_addr, identity_path, &atom);
         options.mounts = [
-            ("hidden", "/etc/app/config"),
-            ("config", "/etc/app/config"),
-            ("directory", "/etc/overlay"),
+            ("hidden", "/etc/app/config.toml"),
+            ("config", "/etc/app/config.toml"),
             ("status.wasm", "/bin/status.wasm"),
             ("kernel.wasm", "/boot/kernel.wasm"),
         ].map(|(name, target)| format!("{}:{target}", source.join(name).display())).to_vec();
-        options.kernel_cli = Some(format!("file:{}", Path::new(KERNEL_WASM_PATH).canonicalize().unwrap().display()));
-        let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+        options.mounts.push(format!("/ipfs/{overlay_cid}:/etc/overlay"));
+        let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
         let ready_url = format!("http://{admin_addr}/readyz");
         wait_for_ready(&client, &ready_url, &mut node).await;
         assert_status_cell(&client, http_addr, &overlay_status_cid, &node).await;
         let initial_root = activated_root(&node, 0);
-        let initial_identity = version(&client, admin_addr).await;
+        wait_for_log(&mut node, "kernel-X readiness!", "").await;
+        assert_persistent_peer(&client, http_addr, peer_id).await;
+        let initial_identity = assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &kernel).await;
         assert_eq!(initial_identity["kernel_epoch_seq"], 0);
         assert_eq!(initial_identity["kernel_effective_root"], initial_root.to_string());
-        let frozen_config = immutable_path_cid(&client, kubo_addr, &initial_root, "etc/app/config").await;
-        let frozen_directory = immutable_path_cid(&client, kubo_addr, &initial_root, "etc/overlay").await;
+        let frozen_config = immutable_path_cid(&client, kubo_addr, &initial_root, "etc/app/config.toml").await;
+        let frozen_directory_entry = immutable_path_cid(&client, kubo_addr, &initial_root, "etc/overlay/overlap").await;
         let frozen_status = immutable_path_cid(&client, kubo_addr, &initial_root, "bin/status.wasm").await;
         let frozen_kernel = immutable_path_cid(&client, kubo_addr, &initial_root, "boot/kernel.wasm").await;
+        assert_eq!(directory_data(&client, kubo_addr, &initial_root, "etc/overlay").await, overlay_metadata);
         let initial_etc_data = directory_data(&client, kubo_addr, &h0.cid, "etc").await;
         // Mutation then deletion distinguishes frozen-byte replay from either
         // rereading changed bytes or relying on the source path still existing.
         std::fs::write(source.join("config"), b"changed after freeze").unwrap();
         std::fs::write(source.join("status.wasm"), b"invalid after freeze").unwrap();
+        std::fs::write(source.join("kernel.wasm"), b"invalid after freeze").unwrap();
         sources.close().unwrap();
+        std::fs::write(home.path().join(".ww/fhs/installed-marker"), b"changed after freeze").unwrap();
+        std::fs::remove_dir_all(home.path().join(".ww/fhs")).unwrap();
         let mut evidence = Vec::new();
         for (seq, head) in [(1, &h1), (2, &obstructed), (3, &recovered)] {
             atom.set_head(&head.cid).await;
             wait_for_log(&mut node, "Advancing deployment epoch", &format!("seq={seq}")).await;
+            if seq == 1 {
+                tokio::time::timeout(INVALIDATION_TIMEOUT, replacement_reached.recv()).await
+                    .expect("valid replacement did not reach its preparation gate").expect("replacement gate closed");
+                wait_for_log(&mut node, "unregistered HTTP route", "/status").await;
+                assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node).await;
+                assert_eq!(count_log_lines(&node.logs(), "kernel-X readiness!"), 1, "cached kernel reused prior readiness");
+                assert_eq!(count_log_lines_with(&node.logs(), "Deployment root activated", "seq=1"), 0);
+                println!("LANDING3_B_REVOKED={}", serde_json::json!({"epoch": seq, "blocked_head": h1.cid.to_string(), "identity": version(&client, admin_addr).await}));
+                replacement_release.send(true).unwrap();
+            }
             if seq == 2 {
                 wait_for_log(&mut node, "Authoritative Stem update selected an invalid deployment head", "").await;
                 assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node).await;
@@ -1216,7 +1561,7 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
             assert_status_cell(&client, http_addr, &overlay_status_cid, &node).await;
             let effective = activated_root(&node, seq);
             assert_ne!(effective, initial_root);
-            for (path, expected) in [("etc/app/config", frozen_config), ("etc/overlay", frozen_directory), ("bin/status.wasm", frozen_status), ("boot/kernel.wasm", frozen_kernel)] {
+            for (path, expected) in [("etc/app/config.toml", frozen_config), ("bin/status.wasm", frozen_status), ("boot/kernel.wasm", frozen_kernel)] {
                 assert_eq!(immutable_path_cid(&client, kubo_addr, &effective, path).await, expected);
                 assert!(kubo_pin_is_present(&client, kubo_addr, &expected).await, "frozen source pin lost: {expected}");
             }
@@ -1224,28 +1569,39 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
                 assert_eq!(directory_data(&client, kubo_addr, &effective, path).await, directory_data(&client, kubo_addr, &head.cid, path).await, "ancestor metadata at {path}");
             }
             assert_ne!(directory_data(&client, kubo_addr, &effective, "etc").await, initial_etc_data);
+            assert_ne!(overlay_metadata, directory_data(&client, kubo_addr, &head.cid, "etc/overlay").await);
+            assert_eq!(directory_data(&client, kubo_addr, &effective, "etc/overlay").await, overlay_metadata, "CLI target directory metadata must win wholesale");
             let root_path = format!("/ipfs/{effective}");
-            assert_eq!(ipfs.cat(&format!("{root_path}/etc/app/config")).await.unwrap(), b"original frozen config");
+            assert_eq!(ipfs.cat(&format!("{root_path}/etc/app/config.toml")).await.unwrap(), b"original frozen config");
             assert_eq!(ipfs.cat(&format!("{root_path}/etc/overlay/.gitignore")).await.unwrap(), b"targeted inclusion");
             assert!(ipfs.ls(&format!("{root_path}/etc/overlay/empty")).await.unwrap().is_empty());
             assert_eq!(ipfs.cat(&format!("{root_path}/generation.txt")).await.unwrap(), format!("epoch-{}\n", if seq == 1 { 11 } else { 13 }).as_bytes());
-            let identity = version(&client, admin_addr).await;
+            assert_eq!(immutable_path_cid(&client, kubo_addr, &effective, "etc/overlay/overlap").await, frozen_directory_entry);
+            assert_eq!(ipfs.cat(&format!("{root_path}/etc/overlay/overlap")).await.unwrap(), b"frozen directory overlap");
+            assert_eq!(ipfs.cat(&format!("{root_path}/etc/overlay/unrelated")).await.unwrap(), if seq == 1 { b"11" } else { b"13" });
+            assert_eq!(ipfs.cat(&format!("{root_path}/installed-marker")).await.unwrap(), b"frozen baseline");
+            assert!(ipfs.ls(&format!("{root_path}/.ww")).await.is_err(), "private state leaked into FHS");
+            assert_persistent_peer(&client, http_addr, peer_id).await;
+            let identity = assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, seq, &kernel).await;
+            assert_eq!(count_log_lines(&node.logs(), "kernel-X readiness!"), if seq == 1 { 2 } else { 3 });
+            assert!(!node.logs().contains("kernel-A readiness!") && !node.logs().contains("kernel-B readiness!"));
             assert_eq!(identity["kernel_cid"], ww::kernel::runtime_cid(&kernel).to_string());
             assert_eq!(identity["kernel_epoch_seq"], seq);
             assert_eq!(identity["kernel_effective_root"], effective.to_string());
             assert_eq!(identity["kernel_cid"], initial_identity["kernel_cid"]);
-            assert_eq!(ipfs.cat(&format!("{root_path}/boot/kernel.wasm")).await.unwrap(), b"ordinary image bytes, not PID0");
+            assert_eq!(ipfs.cat(&format!("{root_path}/boot/kernel.wasm")).await.unwrap(), kernel);
             assert!(kubo_pin_is_present(&client, kubo_addr, &effective).await);
             assert!(kubo_pin_is_present(&client, kubo_addr, &hidden_cid).await, "overwritten source must remain frozen");
             let gc = kubo_call(&client, kubo_addr, "repo/gc", &[]).await;
             let gc_body = gc.text().await.unwrap();
             assert!(!gc_body.contains("\"Error\""), "GC failed: {gc_body}");
-            assert_eq!(ipfs.cat(&format!("{root_path}/etc/app/config")).await.unwrap(), b"original frozen config");
+            assert_eq!(ipfs.cat(&format!("{root_path}/etc/app/config.toml")).await.unwrap(), b"original frozen config");
             assert_eq!(ipfs.cat(&format!("/ipfs/{hidden_cid}")).await.unwrap(), hidden_bytes);
             assert_status_cell(&client, http_addr, &overlay_status_cid, &node).await;
-            evidence.push(serde_json::json!({"seq": seq, "head": head.cid.to_string(), "effective": effective.to_string(), "frozen_config": frozen_config.to_string(), "hidden_source": hidden_cid.to_string(), "frozen_directory": frozen_directory.to_string(), "frozen_status": frozen_status.to_string(), "frozen_kernel": frozen_kernel.to_string()}));
+            evidence.push(serde_json::json!({"seq": seq, "head": head.cid.to_string(), "effective": effective.to_string(), "frozen_config": frozen_config.to_string(), "hidden_source": hidden_cid.to_string(), "frozen_directory_entry": frozen_directory_entry.to_string(), "frozen_status": frozen_status.to_string(), "frozen_kernel": frozen_kernel.to_string()}));
         }
         println!("LANDING_C_EPOCH_EVIDENCE={}", serde_json::to_string(&evidence).unwrap());
+        proxy_task.abort();
     }).await;
 }
 
@@ -1270,9 +1626,9 @@ mod rust_lifecycle {
             .expect("bind delayed Kubo proxy");
         let proxy_addr = proxy_listener.local_addr().expect("read proxy address");
         let home = tempfile::tempdir().expect("create isolated HOME");
-        let options = NodeOptions::embedded(Some(http_addr));
+        let options = NodeOptions::installed(Some(http_addr));
         let kernel_wasm = required_artifact(KERNEL_WASM_PATH);
-        let kernel_source = "embedded:main";
+        let kernel_source = "/boot/kernel.wasm";
         let mut node = RunningNode::spawn(home.path(), admin_addr, proxy_addr, &options);
 
         let health_url = format!("http://{admin_addr}/healthz");
@@ -1298,7 +1654,13 @@ mod rust_lifecycle {
         assert_eq!(ready["phase"], "ready");
 
         let identity = version(&client, admin_addr).await;
-        assert_eq!(identity["kernel_source"], kernel_source);
+        assert_eq!(
+            identity["kernel_source"],
+            format!(
+                "/ipfs/{}/boot/kernel.wasm",
+                identity["kernel_effective_root"].as_str().unwrap()
+            )
+        );
         assert_eq!(
             identity["kernel_cid"],
             ww::kernel::runtime_cid(&kernel_wasm).to_string()
@@ -1352,7 +1714,7 @@ mod rust_lifecycle {
             let admin_addr = unused_addr().await;
             let http_addr = unused_addr().await;
             let home = tempfile::tempdir().expect("create isolated HOME");
-            let mut options = NodeOptions::embedded(Some(http_addr));
+            let mut options = NodeOptions::installed(Some(http_addr));
             options.mounts = vec![image.path().canonicalize().unwrap().display().to_string()];
             let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
             let (exit, _samples) =
@@ -1383,8 +1745,10 @@ mod rust_lifecycle {
         assert_ne!(cid_a, cid_b);
         let (kubo_addr, client) = require_kubo().await;
         let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
-        let epoch1 = EpochRoot::valid(&ipfs, &variant_a, 1).await;
-        let epoch2 = EpochRoot::valid(&ipfs, &variant_b, 2).await;
+        let kernel_a = kernel_variant('A');
+        let kernel_b = kernel_variant('B');
+        let epoch1 = EpochRoot::with_kernel(&ipfs, &variant_a, &kernel_a, 1).await;
+        let epoch2 = EpochRoot::with_kernel(&ipfs, &variant_b, &kernel_b, 2).await;
         let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
         let first = atom.set_head(&epoch1.cid).await;
 
@@ -1392,7 +1756,7 @@ mod rust_lifecycle {
         let http_addr = unused_addr().await;
         let listen_addr = unused_addr().await;
         let home = tempfile::tempdir().expect("create isolated epoch HOME");
-        let (_signing_key, identity_path, _peer_id) = persistent_identity(home.path());
+        let (_signing_key, identity_path, peer_id) = persistent_identity(home.path());
         let mut options = epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
         // An authoritative head is sufficient; no implicit CWD layer is needed.
         options.mounts.clear();
@@ -1401,7 +1765,10 @@ mod rust_lifecycle {
 
         wait_for_ready(&client, &ready_url, &mut node).await;
         assert_status_cell(&client, http_addr, &cid_a, &node).await;
-        assert_eq!(activated_root(&node, 0), epoch1.cid);
+        wait_for_log(&mut node, "kernel-A readiness!", "").await;
+        let initial_identity =
+            assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &kernel_a).await;
+        assert_persistent_peer(&client, http_addr, peer_id).await;
 
         let second = atom.set_head(&epoch2.cid).await;
         assert!(
@@ -1440,6 +1807,15 @@ mod rust_lifecycle {
         let recovered = wait_for_ready(&client, &ready_url, &mut node).await;
         assert_eq!(recovered["phase"], "ready");
         assert_status_cell(&client, http_addr, &cid_b, &node).await;
+        wait_for_log(&mut node, "kernel-B readiness!", "").await;
+        let final_identity =
+            assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 1, &kernel_b).await;
+        assert_ne!(initial_identity["kernel_cid"], final_identity["kernel_cid"]);
+        assert_persistent_peer(&client, http_addr, peer_id).await;
+        println!(
+            "LANDING3_A={}",
+            serde_json::json!({"before": initial_identity, "after": final_identity, "peer_id": peer_id.to_string()})
+        );
         wait_for_pin_release(&client, kubo_addr, &epoch1.cid).await;
         assert!(
             node.try_wait().is_none(),
@@ -1685,177 +2061,215 @@ mod rust_lifecycle {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_kernel_path_reaches_ready_and_cli_overrides_env() {
+async fn local_targeted_kernel_mount_executes_selected_bytes() {
     let _guard = e2e_lock().await;
-    let embedded_kernel = required_artifact(KERNEL_WASM_PATH);
-    required_artifact(STATUS_WASM_PATH);
-    let embedded_cid = ww::kernel::runtime_cid(&embedded_kernel);
-    let mut selected_kernel = embedded_kernel.clone();
-    append_custom_section(
-        &mut selected_kernel,
-        b"ww.test.distinct-kernel",
-        b"pr2-path-source",
-    );
-    let selected_cid = ww::kernel::runtime_cid(&selected_kernel);
-    assert_ne!(
-        selected_cid, embedded_cid,
-        "test fixture must differ from the embedded kernel"
-    );
-    let selected_file = tempfile::NamedTempFile::new().expect("create distinct pid0 component");
-    std::fs::write(selected_file.path(), &selected_kernel).expect("write distinct pid0 component");
-    let kernel_path = selected_file
-        .path()
-        .canonicalize()
-        .expect("canonicalize distinct pid0 component");
+    let selected = kernel_variant('X');
+    let selected_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(selected_file.path(), &selected).unwrap();
+    let kernel_path = selected_file.path().canonicalize().unwrap();
     let (kubo_addr, client) = require_kubo().await;
     let admin_addr = unused_addr().await;
     let http_addr = unused_addr().await;
-    let home = tempfile::tempdir().expect("create isolated HOME");
-    let mut options = NodeOptions::embedded(Some(http_addr));
-    options.kernel_cli = Some(format!("file:{}", kernel_path.display()));
-    options.kernel_env = Some("file:/definitely/missing/env-kernel.wasm".to_string());
+    let home = tempfile::tempdir().unwrap();
+    let mut options = NodeOptions::installed(Some(http_addr));
+    options
+        .mounts
+        .push(format!("{}:/boot/kernel.wasm", kernel_path.display()));
     let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
-
-    let ready = wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
-    assert_eq!(ready["ready"], true);
-    let identity = version(&client, admin_addr).await;
-    assert_eq!(
-        identity["kernel_source"],
-        format!("file:{}", kernel_path.display())
-    );
-    assert_eq!(identity["kernel_cid"], selected_cid.to_string());
-    assert_ne!(identity["kernel_cid"], embedded_cid.to_string());
-    assert_eq!(
-        identity["kernel_wasm_blake3"],
-        blake3::hash(&selected_kernel).to_hex().to_string()
-    );
+    wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
+    wait_for_log(&mut node, "kernel-X readiness!", "").await;
+    assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &selected).await;
     assert_status_route(&client, http_addr, &node).await;
-
     node.close_stdin();
-    let exit = node.wait(EXIT_TIMEOUT).await;
-    let logs = node.logs();
-    assert_eq!(exit.code(), Some(0), "unexpected host exit\n{logs}");
-    assert!(
-        logs.contains("Kernel source resolved")
-            && logs.contains(&kernel_path.display().to_string()),
-        "kernel resolution logs must identify the selected path\n{logs}"
-    );
-    assert!(
-        !logs.contains("kernel_source=embedded:main"),
-        "explicit path selection must not fall back to embedded pid0\n{logs}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn env_kernel_path_overrides_embedded_and_no_http_reaches_ready() {
-    let _guard = e2e_lock().await;
-    let kernel_wasm = required_artifact(KERNEL_WASM_PATH);
-    required_artifact(STATUS_WASM_PATH);
-    let kernel_path = Path::new(KERNEL_WASM_PATH)
-        .canonicalize()
-        .expect("canonicalize kernel artifact");
-    let (kubo_addr, client) = require_kubo().await;
-    let admin_addr = unused_addr().await;
-    let home = tempfile::tempdir().expect("create isolated HOME");
-    let mut options = NodeOptions::embedded(None);
-    options.kernel_env = Some(format!("file:{}", kernel_path.display()));
-    let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
-
-    let ready = wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
-    assert_eq!(ready["ready"], true);
-    let identity = version(&client, admin_addr).await;
     assert_eq!(
-        identity["kernel_source"],
-        format!("file:{}", kernel_path.display())
-    );
-    assert_eq!(
-        identity["kernel_cid"],
-        ww::kernel::runtime_cid(&kernel_wasm).to_string()
-    );
-
-    node.close_stdin();
-    let exit = node.wait(EXIT_TIMEOUT).await;
-    assert_eq!(
-        exit.code(),
+        node.wait(EXIT_TIMEOUT).await.code(),
         Some(0),
-        "unexpected host exit\n{}",
+        "{}",
         node.logs()
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kubo_cid_kernel_reaches_ready_and_reports_source_and_runtime_cids() {
+async fn bare_installed_boot_from_unrelated_cwd_does_not_import_cwd_or_private_state() {
     let _guard = e2e_lock().await;
-    let kernel_wasm = required_artifact(KERNEL_WASM_PATH);
-    required_artifact(STATUS_WASM_PATH);
+    let kernel = required_artifact(KERNEL_WASM_PATH);
+    let (kubo_addr, client) = require_kubo().await;
+    let admin_addr = unused_addr().await;
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(cwd.path().join("cwd-secret"), b"must stay local").unwrap();
+    let (_, identity_path, _) = persistent_identity(home.path());
+    let private_identity = std::fs::read(&identity_path).unwrap();
+    let mut options = NodeOptions::installed(None);
+    options.mounts.clear();
+    options.cwd = Some(cwd.path().canonicalize().unwrap());
+    let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+    wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
+    assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &kernel).await;
+    let root = activated_root(&node, 0);
+    let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
+    for path in ["cwd-secret", ".ww", "identity", "bin"] {
+        assert!(
+            ipfs.ls(&format!("/ipfs/{root}/{path}")).await.is_err(),
+            "unexpected imported {path}"
+        );
+    }
+    assert_eq!(std::fs::read(identity_path).unwrap(), private_identity);
+    node.close_stdin();
+    assert_eq!(
+        node.wait(EXIT_TIMEOUT).await.code(),
+        Some(0),
+        "{}",
+        node.logs()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_dot_boots_complete_source_without_installation() {
+    let _guard = e2e_lock().await;
+    let selected = kernel_variant('A');
+    let (kubo_addr, client) = require_kubo().await;
+    let image = tempfile::tempdir().unwrap();
+    std::fs::create_dir(image.path().join("boot")).unwrap();
+    std::fs::write(image.path().join("boot/kernel.wasm"), &selected).unwrap();
+    std::fs::write(image.path().join("explicit-marker"), b"explicit source").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let admin_addr = unused_addr().await;
+    let mut options = NodeOptions::installed(None);
+    options.installed_baseline = false;
+    options.mounts = vec![".".to_owned()];
+    options.cwd = Some(image.path().canonicalize().unwrap());
+    let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+    wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
+    wait_for_log(&mut node, "kernel-A readiness!", "").await;
+    assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &selected).await;
+    let root = activated_root(&node, 0);
+    assert_eq!(
+        ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"))
+            .cat(&format!("/ipfs/{root}/explicit-marker"))
+            .await
+            .unwrap(),
+        b"explicit source"
+    );
+    node.close_stdin();
+    assert_eq!(
+        node.wait(EXIT_TIMEOUT).await.code(),
+        Some(0),
+        "{}",
+        node.logs()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kubo_targeted_kernel_mount_reports_verified_source_and_runtime_identity() {
+    let _guard = e2e_lock().await;
+    let selected = kernel_variant('B');
     let (kubo_addr, client) = require_kubo().await;
     let source_cid = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"))
-        .add_bytes(&kernel_wasm)
+        .add_bytes(&selected)
         .await
-        .expect("add pid0 bytes to the CI-pinned Kubo");
+        .unwrap();
     let admin_addr = unused_addr().await;
     let http_addr = unused_addr().await;
-    let home = tempfile::tempdir().expect("create isolated HOME");
-    let mut options = NodeOptions::embedded(Some(http_addr));
-    options.kernel_cli = Some(format!("cid:{source_cid}"));
+    let home = tempfile::tempdir().unwrap();
+    let mut options = NodeOptions::installed(Some(http_addr));
+    options
+        .mounts
+        .push(format!("/ipfs/{source_cid}:/boot/kernel.wasm"));
     let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
-
-    let ready = wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
-    assert_eq!(ready["ready"], true);
-    let identity = version(&client, admin_addr).await;
-    assert_eq!(identity["kernel_source"], format!("cid:{source_cid}"));
+    wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
+    wait_for_log(&mut node, "kernel-B readiness!", "").await;
+    let identity = assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &selected).await;
     assert_eq!(identity["kernel_source_cid"], source_cid);
-    assert_eq!(
-        identity["kernel_cid"],
-        ww::kernel::runtime_cid(&kernel_wasm).to_string()
-    );
     assert_status_route(&client, http_addr, &node).await;
-
     node.close_stdin();
-    let exit = node.wait(EXIT_TIMEOUT).await;
     assert_eq!(
-        exit.code(),
+        node.wait(EXIT_TIMEOUT).await.code(),
         Some(0),
-        "unexpected host exit\n{}",
+        "{}",
         node.logs()
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn incompatible_path_selected_component_fails_clearly() {
-    let _guard = e2e_lock().await;
-    required_artifact(STATUS_WASM_PATH);
-    let (kubo_addr, _client) = require_kubo().await;
-    let bad_kernel = tempfile::NamedTempFile::new().expect("create invalid pid0 component");
-    std::fs::write(bad_kernel.path(), b"not a WebAssembly component")
-        .expect("write invalid pid0 component");
-    let admin_addr = unused_addr().await;
-    let home = tempfile::tempdir().expect("create isolated HOME");
-    let mut options = NodeOptions::embedded(None);
-    options.kernel_cli = Some(format!("file:{}", bad_kernel.path().display()));
-    let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+#[test]
+fn obsolete_kernel_selectors_fail_with_actionable_diagnostics() {
+    for selector in ["--kernel", "WW_KERNEL"] {
+        let home = tempfile::tempdir().unwrap();
+        let mut command = Command::new(ww_bin());
+        command
+            .arg("run")
+            .env("HOME", home.path())
+            .env_remove("WW_FHS_ROOT")
+            .env_remove("WW_KERNEL");
+        if selector == "--kernel" {
+            command.args(["--kernel", "obsolete.wasm"]);
+        } else {
+            command.env("WW_KERNEL", "obsolete.wasm");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            !output.status.success(),
+            "obsolete selector silently accepted"
+        );
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostic.contains(selector), "{diagnostic}");
+        assert!(
+            diagnostic.contains("/boot/kernel.wasm"),
+            "migration path absent: {diagnostic}"
+        );
+    }
+}
 
-    let exit = node.wait(EXIT_TIMEOUT).await;
-    let logs = node.logs();
-    assert_eq!(
-        exit.code(),
-        Some(1),
-        "invalid pid0 must fail closed\n{logs}"
-    );
-    assert!(
-        logs.contains("failed to parse WebAssembly module")
-            || logs.contains("failed to compile")
-            || logs.contains("magic header"),
-        "failure must name component compilation/parsing\n{logs}"
-    );
-    assert!(
-        !logs.contains("kernel_source=embedded:main"),
-        "explicit invalid path must not fall back to embedded pid0\n{logs}"
-    );
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_selected_kernel_fails_without_installed_or_embedded_fallback() {
+    let _guard = e2e_lock().await;
+    let (kubo_addr, client) = require_kubo().await;
+    let incompatible = wat::parse_str("(component)").unwrap();
+    for (case, bytes) in [
+        ("malformed", b"not a WebAssembly component".to_vec()),
+        ("incompatible", incompatible),
+        ("oversized", vec![0; 8 * 1024 * 1024 + 1]),
+    ] {
+        let bad_kernel = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(bad_kernel.path(), bytes).unwrap();
+        let admin_addr = unused_addr().await;
+        let home = tempfile::tempdir().unwrap();
+        let mut options = NodeOptions::installed(None);
+        options.mounts.push(format!(
+            "{}:/boot/kernel.wasm",
+            bad_kernel.path().canonicalize().unwrap().display()
+        ));
+        let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
+        let (exit, _) = wait_for_exit_without_readiness(&client, admin_addr, &mut node).await;
+        let logs = node.logs();
+        assert!(!exit.success(), "{case} selected kernel booted\n{logs}");
+        assert!(
+            logs.contains("kernel"),
+            "kernel failure not identified: {logs}"
+        );
+        assert!(
+            !logs.contains("committed readiness"),
+            "{case} fell back to installed kernel\n{logs}"
+        );
+        assert!(
+            !logs.contains("Loaded selected kernel artifact"),
+            "{case} reached PID0 generation construction\n{logs}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn host_transient_epoch_preparation_recovers_without_restoring_old_generation() {
+    selected_block_failure_driver(StatusCode::SERVICE_UNAVAILABLE).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_selected_block_retries_without_fallback_and_later_recovers() {
+    // Kubo v0.33.0 reports an absent offline block with HTTP 500, not 404.
+    selected_block_failure_driver(StatusCode::INTERNAL_SERVER_ERROR).await;
+}
+
+async fn selected_block_failure_driver(status: StatusCode) {
     tokio::task::LocalSet::new()
         .run_until(async {
             let _guard = e2e_lock().await;
@@ -1864,15 +2278,23 @@ async fn host_transient_epoch_preparation_recovers_without_restoring_old_generat
             let (variant_b, cid_b) = status_variant(&status_wasm, b"transient-b");
             let (kubo_addr, client) = require_kubo().await;
             let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
-            let epoch1 = EpochRoot::valid(&ipfs, &variant_a, 1).await;
-            let epoch2 = EpochRoot::valid(&ipfs, &variant_b, 2).await;
+            let kernel_a = kernel_variant('A');
+            let kernel_b = kernel_variant('B');
+            let epoch1 = EpochRoot::with_kernel(&ipfs, &variant_a, &kernel_a, 1).await;
+            let epoch2 = EpochRoot::with_kernel(&ipfs, &variant_b, &kernel_b, 2).await;
+            let selected_block =
+                selected_marker_block(&client, kubo_addr, &epoch2.cid, "kernel-B readiness!").await;
             let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
             atom.set_head(&epoch1.cid).await;
 
             let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let proxy_addr = proxy_listener.local_addr().unwrap();
-            let (proxy_task, attempts, release_tx) =
-                start_failing_merge_kubo_proxy(proxy_listener, kubo_addr, epoch2.cid.to_string());
+            let (proxy_task, attempts, release_tx) = start_failing_block_kubo_proxy(
+                proxy_listener,
+                kubo_addr,
+                selected_block.to_string(),
+                status,
+            );
             let admin_addr = unused_addr().await;
             let http_addr = unused_addr().await;
             let listen_addr = unused_addr().await;
@@ -1880,6 +2302,12 @@ async fn host_transient_epoch_preparation_recovers_without_restoring_old_generat
             let (_, identity_path, _) = persistent_identity(home.path());
             let mut options =
                 epoch_node_options(&epoch1, http_addr, listen_addr, identity_path, &atom);
+            let hidden_file = tempfile::NamedTempFile::new().unwrap();
+            let hidden_bytes = format!("hidden retained source during retry: {}", hidden_file.path().display()).into_bytes();
+            std::fs::write(hidden_file.path(), &hidden_bytes).unwrap();
+            let hidden_cid = unuploaded_file_cid(&client, kubo_addr, &hidden_bytes).await;
+            assert!(!kubo_pin_is_present(&client, kubo_addr, &hidden_cid).await, "hidden source already had a pin owner");
+            options.mounts.push(format!("{}:/frozen-marker", hidden_file.path().canonicalize().unwrap().display()));
             let frozen_file = tempfile::NamedTempFile::new().unwrap();
             std::fs::write(frozen_file.path(), b"frozen during retry and supersession").unwrap();
             options.mounts.push(format!(
@@ -1893,6 +2321,9 @@ async fn host_transient_epoch_preparation_recovers_without_restoring_old_generat
             let initial_root = activated_root(&node, 0);
             let frozen_cid =
                 immutable_path_cid(&client, kubo_addr, &initial_root, "frozen-marker").await;
+            assert_ne!(frozen_cid, hidden_cid, "hidden source must be overwritten in the initial root");
+            assert!(kubo_pin_is_present(&client, kubo_addr, &hidden_cid).await);
+            hidden_file.close().unwrap();
             frozen_file.close().unwrap();
             atom.set_head(&epoch2.cid).await;
             wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
@@ -1919,20 +2350,33 @@ async fn host_transient_epoch_preparation_recovers_without_restoring_old_generat
             }
             assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node).await;
 
+            // The hidden source is absent from every effective root. Its own
+            // frozen-source pin must retain its blocks throughout unrooted retries.
+            assert!(kubo_pin_is_present(&client, kubo_addr, &hidden_cid).await);
+            checked_gc(&client, kubo_addr).await;
+            assert_eq!(ipfs.cat(&format!("/ipfs/{hidden_cid}")).await.unwrap(), hidden_bytes);
+            assert!(kubo_pin_is_present(&client, kubo_addr, &hidden_cid).await);
+            assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node).await;
+            println!("LANDING3_H_RETRY_RETENTION={}", serde_json::json!({"failure_status": status.as_u16(), "epoch": 1, "hidden_source": hidden_cid.to_string(), "old_effective": initial_root.to_string(), "identity": version(&client, admin_addr).await}));
+            assert!(!node.logs().contains("kernel-B readiness!"));
+            assert_eq!(
+                count_log_lines(&node.logs(), "kernel-A readiness!"),
+                1,
+                "previous kernel restarted during retry"
+            );
             release_tx.send(true).unwrap();
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert_status_cell(&client, http_addr, &cid_b, &node).await;
+            wait_for_log(&mut node, "kernel-B readiness!", "").await;
+            assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 1, &kernel_b).await;
             let final_root = activated_root(&node, 1);
             assert_eq!(
                 immutable_path_cid(&client, kubo_addr, &final_root, "frozen-marker").await,
                 frozen_cid
             );
             assert!(kubo_pin_is_present(&client, kubo_addr, &frozen_cid).await);
-            kubo_call(&client, kubo_addr, "repo/gc", &[])
-                .await
-                .bytes()
-                .await
-                .unwrap();
+            checked_gc(&client, kubo_addr).await;
+            assert_eq!(ipfs.cat(&format!("/ipfs/{hidden_cid}")).await.unwrap(), hidden_bytes);
             assert_eq!(
                 ipfs.cat(&format!("/ipfs/{final_root}/frozen-marker"))
                     .await
@@ -2152,4 +2596,150 @@ async fn superseded_pending_generation_converges_to_the_newer_epoch() {
             proxy_task.abort();
         })
         .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_and_corrupted_selected_kernels_close_identity_until_valid_head_recovers() {
+    tokio::task::LocalSet::new().run_until(async {
+        let _guard = e2e_lock().await;
+        let status = required_artifact(STATUS_WASM_PATH);
+        let kernel_a = kernel_variant('A');
+        let kernel_b = kernel_variant('B');
+        let kernel_x = kernel_variant('X');
+        let (kubo, client) = require_kubo().await;
+        let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo}"));
+        let initial = EpochRoot::with_kernel(&ipfs, &status, &kernel_a, 40).await;
+        let invalid = EpochRoot::with_kernel(&ipfs, &status, b"invalid selected kernel", 41).await;
+        let valid = EpochRoot::with_kernel(&ipfs, &status, &kernel_b, 42).await;
+        let corrupt = EpochRoot::with_kernel(&ipfs, &status, &kernel_x, 43).await;
+        let final_head = EpochRoot::with_kernel(&ipfs, &status, &kernel_a, 44).await;
+        let block = selected_marker_block(&client, kubo, &corrupt.cid, "kernel-X readiness!").await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (proxy, corrupt_attempts) = start_corrupt_block_kubo_proxy(listener, kubo, block.to_string());
+        let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
+        atom.set_head(&initial.cid).await;
+        let home = tempfile::tempdir().unwrap();
+        let (_, identity_path, peer) = persistent_identity(home.path());
+        let admin = unused_addr().await;
+        let http = unused_addr().await;
+        let options = epoch_node_options(&initial, http, unused_addr().await, identity_path, &atom);
+        let mut node = RunningNode::spawn(home.path(), admin, proxy_addr, &options);
+        let ready = format!("http://{admin}/readyz");
+        wait_for_ready(&client, &ready, &mut node).await;
+        assert_kernel_epoch(&client, admin, kubo, &node, 0, &kernel_a).await;
+        for (seq, rejected, recovered, expected) in [(1, &invalid, &valid, &kernel_b), (3, &corrupt, &final_head, &kernel_a)] {
+            atom.set_head(&rejected.cid).await;
+            wait_for_log(&mut node, "Advancing deployment epoch", &format!("seq={seq}")).await;
+            let deadline = Instant::now() + INVALIDATION_TIMEOUT;
+            while count_log_lines(&node.logs(), "Authoritative Stem update selected an invalid deployment head") < if seq == 1 { 1 } else { 2 } {
+                assert!(Instant::now() < deadline, "invalid selected kernel was not rejected\n{}", node.logs());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            for _ in 0..3 {
+                assert_unready_and_old_generation_dead(&client, admin, http, &mut node).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(count_log_lines_with(&node.logs(), "Deployment root activated", &format!("seq={seq}")), 0);
+            assert!(!node.logs().contains("kernel-X readiness!"), "corrupted bytes launched PID0");
+            assert!(!node.logs().contains("committed readiness"), "installed baseline became a fallback");
+            atom.set_head(&recovered.cid).await;
+            wait_for_log(&mut node, "Advancing deployment epoch", &format!("seq={}", seq + 1)).await;
+            wait_for_ready(&client, &ready, &mut node).await;
+            let identity = assert_kernel_epoch(&client, admin, kubo, &node, seq + 1, expected).await;
+            assert_persistent_peer(&client, http, peer).await;
+            println!("LANDING3_F_H={}", serde_json::json!({"rejected_epoch": seq, "rejected_head": rejected.cid.to_string(), "recovered": identity, "peer_id": peer.to_string()}));
+        }
+        assert!(corrupt_attempts.load(Ordering::SeqCst) > 0);
+        assert_eq!(count_log_lines(&node.logs(), "kernel-A readiness!"), 2);
+        assert_eq!(count_log_lines(&node.logs(), "kernel-B readiness!"), 1);
+        proxy.abort();
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn superseded_selected_kernel_read_never_launches_obsolete_pid0() {
+    tokio::task::LocalSet::new().run_until(async {
+        let _guard = e2e_lock().await;
+        let status = required_artifact(STATUS_WASM_PATH);
+        let kernel_a = kernel_variant('A');
+        let kernel_b = kernel_variant('B');
+        let kernel_x = kernel_variant('X');
+        let (kubo, client) = require_kubo().await;
+        let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo}"));
+        let initial = EpochRoot::with_kernel(&ipfs, &status, &kernel_a, 50).await;
+        let obsolete = EpochRoot::with_kernel(&ipfs, &status, &kernel_b, 51).await;
+        let newest = EpochRoot::with_kernel(&ipfs, &status, &kernel_x, 52).await;
+        let block = selected_marker_block(&client, kubo, &obsolete.cid, "kernel-B readiness!").await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (proxy, mut reached, release) = start_gated_kubo_proxy_for(listener, kubo, block.to_string(), true);
+        let atom = AtomFixture::start(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
+        atom.set_head(&initial.cid).await;
+        let home = tempfile::tempdir().unwrap();
+        let (_, identity_path, peer) = persistent_identity(home.path());
+        let admin = unused_addr().await;
+        let http = unused_addr().await;
+        let options = epoch_node_options(&initial, http, unused_addr().await, identity_path, &atom);
+        let mut node = RunningNode::spawn(home.path(), admin, proxy_addr, &options);
+        let ready = format!("http://{admin}/readyz");
+        wait_for_ready(&client, &ready, &mut node).await;
+        wait_for_log(&mut node, "kernel-A readiness!", "").await;
+        atom.set_head(&obsolete.cid).await;
+        wait_for_log(&mut node, "Advancing deployment epoch", "seq=1").await;
+        tokio::time::timeout(INVALIDATION_TIMEOUT, reached.recv()).await
+            .expect("obsolete preparation did not request selected leaf").expect("selected leaf gate closed");
+        assert_unready_and_old_generation_dead(&client, admin, http, &mut node).await;
+        atom.set_head(&newest.cid).await;
+        wait_for_log(&mut node, "Advancing deployment epoch", "seq=2").await;
+        // A blocked obsolete request must not prevent a newer epoch from becoming ready.
+        wait_for_ready(&client, &ready, &mut node).await;
+        wait_for_log(&mut node, "kernel-X readiness!", "").await;
+        let identity = assert_kernel_epoch(&client, admin, kubo, &node, 2, &kernel_x).await;
+        assert_persistent_peer(&client, http, peer).await;
+        release.send(true).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let logs = node.logs();
+        assert!(!logs.contains("kernel-B readiness!"), "obsolete guest executed\n{logs}");
+        assert_eq!(count_log_lines_with(&logs, "Deployment root activated", "seq=1"), 0);
+        assert_eq!(version(&client, admin).await["kernel_epoch_seq"], 2);
+        println!("LANDING3_G={}", serde_json::json!({"blocked_leaf": block.to_string(), "obsolete": obsolete.cid.to_string(), "accepted": identity, "peer_id": peer.to_string()}));
+        proxy.abort();
+    }).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_or_wrong_type_selected_kernel_has_no_implicit_fallback() {
+    let _guard = e2e_lock().await;
+    let (kubo, client) = require_kubo().await;
+    for kind in ["missing", "directory", "symlink"] {
+        let home = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("marker"), b"valid image").unwrap();
+        if kind == "directory" {
+            std::fs::create_dir_all(source.path().join("boot/kernel.wasm")).unwrap();
+        } else if kind == "symlink" {
+            std::fs::create_dir(source.path().join("boot")).unwrap();
+            std::fs::write(
+                source.path().join("boot/real-kernel"),
+                required_artifact(KERNEL_WASM_PATH),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("real-kernel", source.path().join("boot/kernel.wasm"))
+                .unwrap();
+        }
+        let mut options = NodeOptions::installed(None);
+        options.installed_baseline = false;
+        options.mounts = vec![source.path().canonicalize().unwrap().display().to_string()];
+        let admin = unused_addr().await;
+        let mut node = RunningNode::spawn(home.path(), admin, kubo, &options);
+        let (exit, _) = wait_for_exit_without_readiness(&client, admin, &mut node).await;
+        assert!(
+            !exit.success(),
+            "incomplete source started\n{}",
+            node.logs()
+        );
+        assert!(!node.logs().contains("committed readiness"));
+    }
 }

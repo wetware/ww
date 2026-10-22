@@ -9,7 +9,8 @@ Source: https://github.com/wetware/ww
 ## Quick reference
 
 ```
-ww run .                          # boot node from current dir
+ww run                            # boot the installed FHS, independently of CWD
+ww run .                          # explicitly overlay the current directory
 ww run /ipfs/QmHash               # boot from IPFS CID
 ww run . --listen /ip4/0.0.0.0/tcp/2025  # libp2p swarm listener
 ww run . --http-listen 0.0.0.0:2080   # WAGI HTTP endpoint
@@ -50,8 +51,8 @@ the guest which separate application plumbing the Host configured:
 
 ## Architecture (three layers)
 
-- **Host** (`ww` binary): libp2p swarm, loads kernel WASM, serves Membrane.
-- **Kernel** (pid0): the embedded Rust kernel calls `membrane.graft()`, receives typed authority, and installs `/status`.
+- **Host** (`ww` binary): libp2p swarm, selects `/boot/kernel.wasm` from each epoch's effective FHS, serves Membrane.
+- **Kernel** (pid0): the packaged Rust kernel calls `membrane.graft()`, receives typed authority, and installs `/status`.
 - **Children**: spawned with parent-selected narrow `Membrane` implementations.
 
 ## Capabilities after graft
@@ -64,7 +65,10 @@ Identity, IPFS, and application-defined extras.
 Every positional arg to `ww run` is a mount: `source[:target]`.
 Without `:target`, source mounts at `/` (image layer).
 With `:target`, source overlays that guest path.
-Layers stack with per-file union; later layers win.
+Precedence is installed baseline, Stem head, frozen namespace images, then
+frozen CLI operations. Later layers win; directories merge recursively.
+`--fhs-root` or `WW_FHS_ROOT` selects the baseline. `--kernel` and `WW_KERNEL`
+are rejected; use a targeted `/boot/kernel.wasm` mount.
 
 ```
 ww run ./images/app ./config:/etc/myapp ~/data:/var/data
@@ -83,9 +87,9 @@ ww run ./images/app ./config:/etc/myapp ~/data:/var/data
 ```sh
 ww init myapp                 # scaffold
 cd myapp && ww build          # compile to WASM
-ww run .                      # test locally
+ww run .                      # mount the image; selected PID0 controls execution
 ww push . --ipfs-url http://localhost:5001   # publish to IPFS
-ww run /ipfs/<CID>            # run from content-addressed image
+ww run /ipfs/<CID>            # mount the immutable image
 ```
 
 ## More info

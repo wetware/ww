@@ -1,82 +1,24 @@
-//! Host-side kernel source selection, resolution, and runtime identity.
+//! Host-side prepared kernel generations and runtime identity.
 
-use std::fmt;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use authority::EpochGuard;
 use cid::Cid;
 use ed25519_dalek::SigningKey;
 use tokio::io::{stderr, stdout, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
-use crate::cell::loaders::{HostPathLoader, IpfsLoader};
-use crate::cell::{Builder, Loader, Program};
+use crate::cell::{Builder, Program};
 use crate::host::SwarmCommand;
 use crate::services::CompileRequest;
 
 mod compilation;
 pub use compilation::Compilation;
 mod preparation;
+#[cfg(test)]
+pub(crate) use preparation::test_support;
 pub use preparation::PreparedKernel;
-
-/// Source selected for the pid0 component.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Source {
-    Path(PathBuf),
-    Cid(Cid),
-    Embedded(&'static str),
-}
-
-/// Stable, owned description of a selected source for logs and `/version`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SourceRecord {
-    Path { original: String },
-    Cid { original: String },
-    Embedded { original: String },
-}
-
-impl fmt::Display for SourceRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Path { original } => write!(f, "file:{original}"),
-            Self::Cid { original } => write!(f, "cid:{original}"),
-            Self::Embedded { original } => write!(f, "embedded:{original}"),
-        }
-    }
-}
-
-impl SourceRecord {
-    /// Bound structured log fields without changing the exact source retained
-    /// for `/version` and diagnostics.
-    pub fn log_value(&self) -> String {
-        let value = self.to_string();
-        if value.len() <= 512 {
-            value
-        } else {
-            format!("<kernel source omitted: {} bytes>", value.len())
-        }
-    }
-}
-
-/// Resolution metadata retained for diagnostics.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Metadata {
-    pub size: usize,
-    pub source_cid: Option<Cid>,
-    pub load_duration: Duration,
-}
-
-/// Exact pid0 bytes and their loaded-byte runtime identity.
-#[derive(Clone, Debug)]
-pub struct Artifact {
-    pub bytes: Vec<u8>,
-    pub cid: Cid,
-    pub source: SourceRecord,
-    pub metadata: Metadata,
-}
 
 /// Whether PID0 owns an interactive terminal for this invocation.
 ///
@@ -86,18 +28,6 @@ pub fn is_interactive() -> bool {
     use std::io::IsTerminal;
 
     std::io::stdin().is_terminal() || std::env::var("WW_TTY").is_ok()
-}
-
-impl Artifact {
-    pub fn identity(&self) -> Identity {
-        Identity {
-            cid: self.cid.to_string(),
-            source: self.source.to_string(),
-            wasm_blake3: blake3::hash(&self.bytes).to_hex().to_string(),
-            source_cid: self.metadata.source_cid.as_ref().map(ToString::to_string),
-            size: self.metadata.size,
-        }
-    }
 }
 
 /// Content identity computed during preparation, before a generation runs.
@@ -129,22 +59,20 @@ struct PublishedIdentity {
 /// Reads hide any snapshot that no longer matches the authoritative epoch.
 #[derive(Clone, Debug)]
 pub struct IdentityState {
-    requested_source: String,
     epoch_rx: watch::Receiver<authority::Epoch>,
     current: Arc<Mutex<Option<PublishedIdentity>>>,
 }
 
 impl IdentityState {
-    pub fn pending(source: &Source, epoch_rx: watch::Receiver<authority::Epoch>) -> Self {
+    pub fn pending(epoch_rx: watch::Receiver<authority::Epoch>) -> Self {
         Self {
-            requested_source: source.record().to_string(),
             epoch_rx,
             current: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn pending_source(&self) -> String {
-        format!("<pending: {}>", self.requested_source)
+        "<pending: /boot/kernel.wasm>".to_owned()
     }
 
     pub fn get(&self) -> Option<RunningIdentity> {
@@ -238,143 +166,6 @@ impl serde::Serialize for IdentityState {
         S: serde::Serializer,
     {
         serde::Serialize::serialize(&self.get(), serializer)
-    }
-}
-
-impl Source {
-    /// Parse the documented bare or explicit source syntax.
-    pub fn parse(input: &str) -> Result<Self> {
-        if input.is_empty() {
-            bail!("kernel source must not be empty");
-        }
-
-        if let Some(path) = input.strip_prefix("file:") {
-            if path.is_empty() {
-                bail!("explicit file: kernel source requires a path");
-            }
-            return Ok(Self::Path(PathBuf::from(path)));
-        }
-
-        if let Some(value) = input.strip_prefix("cid:") {
-            if value.is_empty() {
-                bail!("explicit cid: kernel source requires a CID");
-            }
-            return value
-                .parse()
-                .map(Self::Cid)
-                .with_context(|| format!("invalid explicit kernel CID '{value}'"));
-        }
-
-        if let Some(name) = input.strip_prefix("embedded:") {
-            return match name {
-                "main" => Ok(Self::Embedded("main")),
-                "" => bail!("explicit embedded: kernel source requires a name"),
-                other => bail!("unknown embedded kernel '{other}' (available: main)"),
-            };
-        }
-
-        match input.parse::<Cid>() {
-            Ok(cid) => Ok(Self::Cid(cid)),
-            Err(_) => Ok(Self::Path(PathBuf::from(input))),
-        }
-    }
-
-    pub fn record(&self) -> SourceRecord {
-        match self {
-            Self::Path(path) => SourceRecord::Path {
-                original: path.display().to_string(),
-            },
-            Self::Cid(cid) => SourceRecord::Cid {
-                original: cid.to_string(),
-            },
-            Self::Embedded(name) => SourceRecord::Embedded {
-                original: (*name).to_string(),
-            },
-        }
-    }
-
-    /// Resolve this source exactly once. Explicit sources never fall back.
-    pub async fn resolve(
-        &self,
-        ipfs_client: crate::ipfs::HttpClient,
-        embedded_main: &'static [u8],
-    ) -> Result<Artifact> {
-        let started = Instant::now();
-        let (bytes, source_cid) = match self {
-            Self::Path(path) => {
-                let metadata = tokio::fs::metadata(path)
-                    .await
-                    .with_context(|| format!("kernel file '{}' does not exist", path.display()))?;
-                if !metadata.is_file() {
-                    bail!("kernel path '{}' is not a regular file", path.display());
-                }
-                let loader = HostPathLoader;
-                let path = path
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("kernel path is not valid UTF-8"))?;
-                (
-                    loader
-                        .load(path)
-                        .await
-                        .with_context(|| format!("failed to load kernel file '{path}'"))?,
-                    None,
-                )
-            }
-            Self::Cid(source_cid) => {
-                let path = format!("/ipfs/{source_cid}");
-                let loader = IpfsLoader::new(ipfs_client);
-                (
-                    loader.load(&path).await.with_context(|| {
-                        format!("failed to load requested kernel CID {source_cid} from Kubo")
-                    })?,
-                    Some(source_cid.to_owned()),
-                )
-            }
-            Self::Embedded("main") => {
-                if embedded_main.is_empty() {
-                    bail!("embedded kernel 'main' is missing or empty; run `make std`");
-                }
-                (embedded_main.to_vec(), None)
-            }
-            Self::Embedded(name) => bail!("unknown embedded kernel '{name}'"),
-        };
-
-        if bytes.is_empty() {
-            bail!("resolved kernel '{}' is empty", self.record());
-        }
-
-        let cid = runtime_cid(&bytes);
-        if let Some(source_cid) = source_cid.as_ref() {
-            validate_source_cid(source_cid, &cid)?;
-        }
-
-        Ok(Artifact {
-            metadata: Metadata {
-                size: bytes.len(),
-                source_cid,
-                load_duration: started.elapsed(),
-            },
-            bytes,
-            cid,
-            source: self.record(),
-        })
-    }
-}
-
-fn validate_source_cid(source_cid: &Cid, runtime_cid: &Cid) -> Result<()> {
-    if source_cid.codec() == 0x55 && source_cid.hash().code() == 0x1e && source_cid != runtime_cid {
-        bail!(
-            "raw BLAKE3 kernel CID mismatch: requested {source_cid}, loaded bytes identify as {runtime_cid}"
-        );
-    }
-    Ok(())
-}
-
-/// CLI wins over environment; absent selectors retain the embedded default.
-pub fn select_kernel_source(cli: Option<&str>, env: Option<&str>) -> Result<Source> {
-    match cli.or(env) {
-        Some(value) => Source::parse(value),
-        None => Ok(Source::Embedded("main")),
     }
 }
 
@@ -511,7 +302,7 @@ pub struct LaunchAdmission {
 
 /// Host-owned lifecycle of one kernel Cell within one deployment epoch.
 pub struct Generation {
-    artifact: Artifact,
+    prepared: PreparedKernel,
     root: Root,
     guard: EpochGuard,
     identity_state: IdentityState,
@@ -521,7 +312,6 @@ pub struct Generation {
     stdio: Stdio,
     terminate_rx: watch::Receiver<()>,
     filesystem_ownership: cell::FilesystemOwnership,
-    compilation: Compilation,
     admission: LaunchAdmission,
 }
 
@@ -544,7 +334,7 @@ impl Drop for GenerationCleanup {
 impl Generation {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        artifact: Artifact,
+        prepared: PreparedKernel,
         root: Root,
         guard: EpochGuard,
         identity_state: IdentityState,
@@ -553,7 +343,6 @@ impl Generation {
         runtime_inputs: RuntimeInputs,
         stdio: Stdio,
         terminate_rx: watch::Receiver<()>,
-        compilation: Compilation,
         admission: LaunchAdmission,
     ) -> Result<Self, cache::AdmissionError> {
         let filesystem_resources = cache::CellResources::new(
@@ -562,7 +351,7 @@ impl Generation {
         );
         let filesystem_ownership = cell::FilesystemOwnership::try_new(filesystem_resources)?;
         Ok(Self {
-            artifact,
+            prepared,
             root,
             guard,
             identity_state,
@@ -572,7 +361,6 @@ impl Generation {
             stdio,
             terminate_rx,
             filesystem_ownership,
-            compilation,
             admission,
         })
     }
@@ -587,7 +375,7 @@ impl Generation {
     /// its generation-scoped registration lifetime.
     pub async fn run(self) -> Result<Outcome> {
         let Self {
-            artifact,
+            prepared,
             root,
             guard,
             identity_state,
@@ -597,7 +385,6 @@ impl Generation {
             stdio,
             mut terminate_rx,
             filesystem_ownership,
-            compilation,
             admission,
         } = self;
 
@@ -610,30 +397,22 @@ impl Generation {
         }
         crate::config::init_tracing();
 
+        anyhow::ensure!(
+            prepared.effective_root() == root.cid,
+            "prepared kernel belongs to a different effective root"
+        );
+        let identity = prepared.identity();
         tracing::info!(
-            kernel_source = %artifact.source.log_value(),
-            kernel_cid = %artifact.cid,
-            source_cid = ?artifact.metadata.source_cid,
-            bytes = artifact.metadata.size,
-            load_ms = artifact.metadata.load_duration.as_millis(),
-            embedded = matches!(artifact.source, SourceRecord::Embedded { .. }),
+            kernel_source = %identity.source,
+            kernel_cid = %identity.cid,
+            source_cid = %prepared.source_file(),
+            bytes = identity.size,
             "Loaded selected kernel artifact"
         );
-
-        let identity = artifact.identity();
-        let guest_env = prepare_guest_env(&root.path, &artifact.cid);
-        let prepared = tokio::select! {
-            biased;
-            _ = terminate_rx.changed() => return Ok(Outcome::Terminated),
-            _ = generation_revoked(&guard, root.cid) => return Ok(Outcome::Terminated),
-            prepared = compilation.prepare(runtime_inputs.runtime_engine.clone(), artifact.bytes) => prepared?,
-        };
-        if prepared.runtime_cid() != artifact.cid {
-            bail!("prepared kernel content identity differs from the selected artifact");
-        }
+        let guest_env = prepare_guest_env(&root.path, &prepared.runtime_cid());
         let stdin = kernel_stdin(stdio);
         let (mut builder, mut handles) = Builder::kernel(
-            Program::ValidatedKernel(prepared),
+            Program::ValidatedKernel(prepared.validated()),
             stdin,
             stdout(),
             stderr(),
@@ -867,6 +646,7 @@ fn map_join_outcome(joined: Result<Result<()>, tokio::task::JoinError>) -> Outco
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     const TEST_CID: &str = "bafkr4if3s6yv23hd3hgfvftj2g2uwdrqazv53p36p5lqyy7n77d5t5p54a";
 
@@ -888,8 +668,7 @@ mod tests {
                     head: vec![],
                     root: Some(root),
                 });
-                let identity_state =
-                    IdentityState::pending(&Source::Embedded("main"), epoch_rx.clone());
+                let identity_state = IdentityState::pending(epoch_rx.clone());
                 let (_terminate_tx, terminate_rx) = watch::channel(());
                 let identity = identity_state
                     .publish(test_identity(), 1, root, &terminate_rx)
@@ -937,180 +716,14 @@ mod tests {
             .await;
     }
 
-    #[test]
-    fn selector_precedence_is_cli_then_env_then_embedded() {
-        assert_eq!(
-            select_kernel_source(Some("file:/cli.wasm"), Some("file:/env.wasm")).unwrap(),
-            Source::Path(PathBuf::from("/cli.wasm"))
-        );
-        assert_eq!(
-            select_kernel_source(None, Some("file:/env.wasm")).unwrap(),
-            Source::Path(PathBuf::from("/env.wasm"))
-        );
-        assert_eq!(
-            select_kernel_source(None, None).unwrap(),
-            Source::Embedded("main")
-        );
-    }
-
-    #[test]
-    fn explicit_prefixes_override_cid_path_ambiguity() {
-        assert_eq!(
-            Source::parse(&format!("file:{TEST_CID}")).unwrap(),
-            Source::Path(PathBuf::from(TEST_CID))
-        );
-        assert!(matches!(
-            Source::parse(&format!("cid:{TEST_CID}")).unwrap(),
-            Source::Cid(_)
-        ));
-        assert!(matches!(Source::parse(TEST_CID).unwrap(), Source::Cid(_)));
-        assert_eq!(
-            Source::parse("not-a-cid.wasm").unwrap(),
-            Source::Path(PathBuf::from("not-a-cid.wasm"))
-        );
-        assert_eq!(
-            Source::parse(" file with spaces.wasm ").unwrap(),
-            Source::Path(PathBuf::from(" file with spaces.wasm "))
-        );
-    }
-
-    #[tokio::test]
-    async fn local_file_resolution_reports_loaded_byte_identity() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), b"kernel bytes").unwrap();
-        let source = Source::Path(file.path().to_owned());
-        let resolved = source
-            .resolve(
-                crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
-                b"unused",
-            )
-            .await
-            .unwrap();
-        assert_eq!(resolved.bytes, b"kernel bytes");
-        assert_eq!(resolved.cid, runtime_cid(b"kernel bytes"));
-        assert_eq!(resolved.metadata.size, 12);
-        assert_eq!(resolved.metadata.source_cid, None);
-    }
-
-    #[tokio::test]
-    async fn missing_and_directory_paths_fail_with_named_errors() {
-        let missing = Source::Path(PathBuf::from("/definitely/missing/kernel.wasm"));
-        let error = missing
-            .resolve(
-                crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
-                b"unused",
-            )
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("does not exist"));
-
-        let directory = tempfile::tempdir().unwrap();
-        let error = Source::Path(directory.path().to_owned())
-            .resolve(
-                crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
-                b"unused",
-            )
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("not a regular file"));
-    }
-
-    #[tokio::test]
-    async fn empty_kernel_file_fails_with_named_error() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let error = Source::Path(file.path().to_owned())
-            .resolve(
-                crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
-                b"unused",
-            )
-            .await
-            .unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("resolved kernel"), "{message}");
-        assert!(message.contains("is empty"), "{message}");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn unreadable_kernel_file_fails_with_named_error() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("unreadable.wasm");
-        std::fs::write(&path, b"kernel").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = Source::Path(path.clone())
-            .resolve(
-                crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
-                b"unused",
-            )
-            .await;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let error = result.expect_err("unreadable kernel file must fail");
-        let message = format!("{error:#}");
-        assert!(message.contains("failed to load kernel file"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn explicit_cid_failure_does_not_fall_back_to_embedded() {
-        let source = Source::parse(&format!("cid:{TEST_CID}")).unwrap();
-        let error = source
-            .resolve(
-                crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
-                b"valid embedded bytes that must not be selected",
-            )
-            .await
-            .unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("requested kernel CID"), "{message}");
-        assert!(message.contains(TEST_CID), "{message}");
-    }
-
-    #[test]
-    fn raw_blake3_source_cid_mismatch_fails_closed() {
-        let requested = runtime_cid(b"requested content");
-        let loaded = runtime_cid(b"different loaded content");
-        let error = validate_source_cid(&requested, &loaded).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("CID mismatch"), "{message}");
-        assert!(message.contains(&requested.to_string()), "{message}");
-        assert!(message.contains(&loaded.to_string()), "{message}");
-    }
-
-    #[test]
-    fn parser_errors_name_explicit_interpretation() {
-        let cid_error = Source::parse("cid:not-a-cid").unwrap_err().to_string();
-        assert!(cid_error.contains("explicit kernel CID"), "{cid_error}");
-
-        let file_error = Source::parse("file:").unwrap_err().to_string();
-        assert!(file_error.contains("file:"), "{file_error}");
-    }
-
-    #[tokio::test]
-    async fn embedded_resolution_fails_closed_when_artifact_is_missing() {
-        let error = Source::Embedded("main")
-            .resolve(
-                crate::ipfs::HttpClient::new("http://127.0.0.1:1".into()),
-                b"",
-            )
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("missing or empty"));
-    }
-
     fn test_identity() -> Identity {
-        let source = Source::Embedded("main");
-        Artifact {
-            bytes: b"kernel".to_vec(),
-            cid: runtime_cid(b"kernel"),
-            source: source.record(),
-            metadata: Metadata {
-                size: 6,
-                source_cid: Some(TEST_CID.parse().unwrap()),
-                load_duration: Duration::ZERO,
-            },
+        Identity {
+            cid: runtime_cid(b"kernel").to_string(),
+            source: "/ipfs/root/boot/kernel.wasm".to_owned(),
+            wasm_blake3: blake3::hash(b"kernel").to_hex().to_string(),
+            source_cid: Some(TEST_CID.to_owned()),
+            size: 6,
         }
-        .identity()
     }
 
     fn test_epoch(seq: u64, root: Option<Cid>) -> authority::Epoch {
@@ -1130,11 +743,10 @@ mod tests {
         admit_tx: tokio::sync::oneshot::Sender<()>,
     }
 
-    async fn test_generation(bytes: Vec<u8>, staging_dir: PathBuf) -> TestGeneration {
-        let root_cid = runtime_cid(b"generation root");
+    async fn test_generation(staging_dir: PathBuf) -> TestGeneration {
+        let root_cid = test_support::ROOT.parse().unwrap();
         let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root_cid)));
-        let source = Source::Embedded("main");
-        let identity_state = IdentityState::pending(&source, epoch_rx.clone());
+        let identity_state = IdentityState::pending(epoch_rx.clone());
         let readiness_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
         let client = crate::ipfs::HttpClient::new("http://127.0.0.1:1".into());
         let resources = crate::services::test_filesystem_resources();
@@ -1154,24 +766,14 @@ mod tests {
             .await
             .unwrap(),
         );
-        let (runtime_engine, _publisher) = cell::engine::runtime_engine().unwrap();
+        let runtime_engine = test_support::runtime();
         let (compile_tx, _compile_rx) = mpsc::channel(1);
         let (swarm_cmd_tx, _swarm_cmd_rx) = mpsc::channel(1);
         let (terminate_tx, terminate_rx) = watch::channel(());
         let (constructed_tx, constructed_rx) = tokio::sync::oneshot::channel();
         let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
-        let artifact = Artifact {
-            cid: runtime_cid(&bytes),
-            metadata: Metadata {
-                size: bytes.len(),
-                source_cid: None,
-                load_duration: Duration::ZERO,
-            },
-            bytes,
-            source: source.record(),
-        };
         let generation = Generation::new(
-            artifact,
+            test_support::prepared(test_support::ROOT),
             Root::new(root_cid, tree),
             EpochGuard {
                 issued_seq: 1,
@@ -1196,7 +798,6 @@ mod tests {
             ),
             Stdio::Closed,
             terminate_rx,
-            Compilation::default(),
             LaunchAdmission {
                 constructed: constructed_tx,
                 admitted: admit_rx,
@@ -1213,29 +814,6 @@ mod tests {
         }
     }
 
-    fn valid_kernel_bytes() -> Vec<u8> {
-        wat::parse_str(include_str!(
-            "../crates/cell/tests/fixtures/kernel-command.wat"
-        ))
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn invalid_kernel_generation_never_publishes_identity() {
-        let staging = tempfile::tempdir().unwrap();
-        let TestGeneration {
-            generation,
-            identity,
-            epoch_tx: _epoch_tx,
-            terminate_tx: _terminate_tx,
-            ..
-        } = test_generation(b"invalid component".to_vec(), staging.path().to_owned()).await;
-        let completion = generation.filesystem_completion();
-        assert!(generation.run().await.is_err());
-        completion.wait().await.unwrap();
-        assert!(identity.get().is_none());
-    }
-
     #[tokio::test]
     async fn generation_rejects_identity_from_an_unrelated_epoch_channel() {
         tokio::task::LocalSet::new()
@@ -1248,11 +826,10 @@ mod tests {
                     terminate_tx: _terminate_tx,
                     constructed_rx: _constructed_rx,
                     admit_tx,
-                } = test_generation(valid_kernel_bytes(), staging.path().to_owned()).await;
+                } = test_generation(staging.path().to_owned()).await;
                 let (_unrelated_tx, unrelated_rx) =
                     watch::channel(generation.guard.receiver.borrow().clone());
-                let unrelated_identity =
-                    IdentityState::pending(&Source::Embedded("main"), unrelated_rx);
+                let unrelated_identity = IdentityState::pending(unrelated_rx);
                 generation.identity_state = unrelated_identity.clone();
                 let completion = generation.filesystem_completion();
                 admit_tx.send(()).unwrap();
@@ -1282,7 +859,7 @@ mod tests {
                     epoch_tx: _epoch_tx,
                     terminate_tx: _terminate_tx,
                     ..
-                } = test_generation(valid_kernel_bytes(), staging_file.path().to_owned()).await;
+                } = test_generation(staging_file.path().to_owned()).await;
                 let completion = generation.filesystem_completion();
                 let error = generation.run().await.unwrap_err();
                 assert!(
@@ -1307,7 +884,7 @@ mod tests {
                     terminate_tx: _terminate_tx,
                     constructed_rx,
                     admit_tx,
-                } = test_generation(valid_kernel_bytes(), staging.path().to_owned()).await;
+                } = test_generation(staging.path().to_owned()).await;
                 let completion = generation.filesystem_completion();
                 let worker = tokio::task::spawn_local(generation.run());
                 constructed_rx.await.unwrap();
@@ -1318,41 +895,6 @@ mod tests {
                 assert!(identity.get().is_none());
             })
             .await;
-    }
-
-    #[tokio::test]
-    async fn generation_supersession_during_compile_admission_does_not_wait_for_native_worker() {
-        let staging = tempfile::tempdir().unwrap();
-        let TestGeneration {
-            generation,
-            identity,
-            epoch_tx,
-            terminate_tx: _terminate_tx,
-            ..
-        } = test_generation(valid_kernel_bytes(), staging.path().to_owned()).await;
-        let compiler = generation.compilation.clone();
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let native_worker = tokio::spawn(async move {
-            compiler
-                .run(move || {
-                    entered_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                })
-                .await
-                .unwrap();
-        });
-        entered_rx.await.unwrap();
-        let completion = generation.filesystem_completion();
-        let mut run = Box::pin(generation.run());
-        assert!(futures::poll!(run.as_mut()).is_pending());
-        epoch_tx.send_replace(test_epoch(2, None));
-        assert_eq!(run.await.unwrap(), Outcome::Terminated);
-        completion.wait().await.unwrap();
-        assert!(identity.get().is_none());
-        assert!(!native_worker.is_finished());
-        release_tx.send(()).unwrap();
-        native_worker.await.unwrap();
     }
 
     #[tokio::test]
@@ -1371,7 +913,7 @@ mod tests {
                         terminate_tx: _terminate_tx,
                         constructed_rx,
                         admit_tx,
-                    } = test_generation(valid_kernel_bytes(), staging.path().to_owned()).await;
+                    } = test_generation(staging.path().to_owned()).await;
                     let completion = generation.filesystem_completion();
                     let ready = generation.readiness_gate.clone();
                     let worker = tokio::task::spawn_local(generation.run());
@@ -1401,7 +943,7 @@ mod tests {
                     terminate_tx: _terminate_tx,
                     constructed_rx,
                     admit_tx: _admit_tx,
-                } = test_generation(valid_kernel_bytes(), staging.path().to_owned()).await;
+                } = test_generation(staging.path().to_owned()).await;
                 let completion = generation.filesystem_completion();
                 let worker = tokio::task::spawn_local(generation.run());
                 constructed_rx.await.unwrap();
@@ -1418,9 +960,9 @@ mod tests {
     fn identity_admission_checks_epoch_root_and_termination() {
         let root = runtime_cid(b"root");
         let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1, None));
-        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let state = IdentityState::pending(epoch_rx);
         let (terminate_tx, terminate_rx) = watch::channel(());
-        assert_eq!(state.pending_source(), "<pending: embedded:main>");
+        assert_eq!(state.pending_source(), "<pending: /boot/kernel.wasm>");
         assert!(state.get().is_none());
         assert!(state
             .publish(test_identity(), 1, root, &terminate_rx)
@@ -1452,7 +994,7 @@ mod tests {
     fn identity_hides_unrooted_and_mismatched_epochs_before_cleanup() {
         let root = runtime_cid(b"root");
         let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
-        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let state = IdentityState::pending(epoch_rx);
         let (_terminate_tx, terminate_rx) = watch::channel(());
         let _identity = state
             .publish(test_identity(), 1, root, &terminate_rx)
@@ -1482,7 +1024,7 @@ mod tests {
     fn same_kernel_bytes_receive_new_epoch_and_old_cleanup_cannot_clear_them() {
         let root = runtime_cid(b"root");
         let (epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
-        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let state = IdentityState::pending(epoch_rx);
         let (_terminate_tx, terminate_rx) = watch::channel(());
         let old = state
             .publish(test_identity(), 1, root, &terminate_rx)
@@ -1504,7 +1046,7 @@ mod tests {
     fn identity_cleanup_uses_generation_owner_even_when_epoch_and_bytes_match() {
         let root = runtime_cid(b"root");
         let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
-        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let state = IdentityState::pending(epoch_rx);
         let (_terminate_tx, terminate_rx) = watch::channel(());
         let old = state
             .publish(test_identity(), 1, root, &terminate_rx)
@@ -1522,7 +1064,7 @@ mod tests {
     async fn identity_clears_when_enqueued_execution_exits_immediately() {
         let root = runtime_cid(b"root");
         let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
-        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let state = IdentityState::pending(epoch_rx);
         let (_terminate_tx, terminate_rx) = watch::channel(());
         let worker_state = state.clone();
         tokio::spawn(async move {
@@ -1540,7 +1082,7 @@ mod tests {
     async fn identity_clears_after_panic_and_abort() {
         let root = runtime_cid(b"root");
         let (_epoch_tx, epoch_rx) = watch::channel(test_epoch(1, Some(root)));
-        let state = IdentityState::pending(&Source::Embedded("main"), epoch_rx);
+        let state = IdentityState::pending(epoch_rx);
         let (_terminate_tx, terminate_rx) = watch::channel(());
         let worker_state = state.clone();
         let worker_terminate_rx = terminate_rx.clone();

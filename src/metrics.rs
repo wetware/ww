@@ -625,8 +625,7 @@ mod tests {
             root: None,
         });
         let kernel_ready_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
-        let source = crate::kernel::Source::Embedded("main");
-        let kernel_identity = crate::kernel::IdentityState::pending(&source, epoch_rx);
+        let kernel_identity = crate::kernel::IdentityState::pending(epoch_rx);
         AdminState {
             peer_id: "12D3KooWTestPeerId".to_string(),
             network_state: rpc::NetworkState::new(),
@@ -747,14 +746,11 @@ mod tests {
             head: Vec::new(),
             root: Some(root),
         });
-        state.version_info.kernel_identity = crate::kernel::IdentityState::pending(
-            &crate::kernel::Source::Embedded("main"),
-            epoch_rx,
-        );
+        state.version_info.kernel_identity = crate::kernel::IdentityState::pending(epoch_rx);
         let _identity = state.version_info.kernel_identity.publish_for_test(
             crate::kernel::Identity {
                 cid: "kernel-cid".to_string(),
-                source: "embedded:main".to_string(),
+                source: "/ipfs/root/boot/kernel.wasm".to_string(),
                 wasm_blake3: "kernel".to_string(),
                 source_cid: None,
                 size: 42,
@@ -771,7 +767,7 @@ mod tests {
         assert_eq!(value["git_sha"], "0123456789abcdef");
         assert_eq!(value["oci_image_id"], "sha256:image");
         assert_eq!(value["kernel_cid"], "kernel-cid");
-        assert_eq!(value["kernel_source"], "embedded:main");
+        assert_eq!(value["kernel_source"], "/ipfs/root/boot/kernel.wasm");
         assert_eq!(value["kernel_wasm_blake3"], "kernel");
         assert_eq!(value["kernel_size"], 42);
         assert_eq!(value["kernel_epoch_seq"], 2);
@@ -807,10 +803,8 @@ mod tests {
     #[tokio::test]
     async fn version_remains_available_while_kernel_identity_is_pending() {
         let mut state = test_state();
-        state.version_info.kernel_identity = crate::kernel::IdentityState::pending(
-            &crate::kernel::Source::Path("/tmp/pid0.wasm".into()),
-            tokio::sync::watch::channel(Epoch::zero()).1,
-        );
+        state.version_info.kernel_identity =
+            crate::kernel::IdentityState::pending(tokio::sync::watch::channel(Epoch::zero()).1);
         let response = version_handler(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -821,7 +815,7 @@ mod tests {
         assert_eq!(value["kernel_wasm_blake3"], serde_json::Value::Null);
         assert_eq!(value["kernel_epoch_seq"], serde_json::Value::Null);
         assert_eq!(value["kernel_effective_root"], serde_json::Value::Null);
-        assert_eq!(value["kernel_source"], "<pending: file:/tmp/pid0.wasm>");
+        assert_eq!(value["kernel_source"], "<pending: /boot/kernel.wasm>");
     }
 
     #[test]

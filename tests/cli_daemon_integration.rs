@@ -447,7 +447,10 @@ async fn default_daemon_import_excludes_private_host_state() {
         .unwrap_or_else(|error| panic!("failed reading {}: {error}", service_path.display()));
     let arguments = service_arguments(&service);
     let images = image_arguments(&arguments);
-    assert_eq!(images, [fhs_dir.to_str().expect("UTF-8 test path")]);
+    assert!(
+        images.is_empty(),
+        "default FHS must not become a positional override"
+    );
     assert!(
         arguments.windows(2).any(|pair| {
             pair[0] == "--namespace-root" && pair[1] == ww_dir.to_str().expect("UTF-8 test path")
@@ -477,7 +480,7 @@ async fn default_daemon_import_excludes_private_host_state() {
 
     let client = ww::ipfs::HttpClient::new(format!("http://{address}"));
     let root = client
-        .add_dir(Path::new(images[0]))
+        .add_dir(&fhs_dir)
         .await
         .expect("import daemon FHS root");
     assert_eq!(
@@ -532,7 +535,7 @@ async fn bare_run_from_private_cwd_fails_without_contacting_kubo() {
         .expect("bare startup must fail before waiting for dependencies")
         .unwrap();
     assert!(!output.status.success());
-    assert!(stderr_text(&output).contains("No explicit image source"));
+    assert!(stderr_text(&output).contains("No installed FHS"));
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
             .await
@@ -542,4 +545,37 @@ async fn bare_run_from_private_cwd_fails_without_contacting_kubo() {
         !home.path().join(".ww").exists(),
         "bare startup must not initialize Host state"
     );
+}
+
+#[test]
+fn obsolete_kernel_selectors_fail_before_startup() {
+    let home = tempfile::tempdir().unwrap();
+    for environment in [false, true] {
+        let mut command = ww_command(home.path(), &["run"]);
+        if environment {
+            command.env("WW_KERNEL", "embedded:main");
+        } else {
+            command.args(["--kernel", "embedded:main"]);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let error = stderr_text(&output);
+        assert!(error.contains("/boot/kernel.wasm"), "{error}");
+        assert!(error.contains("no longer supported"), "{error}");
+        assert!(!home.path().join(".ww").exists());
+    }
+}
+
+#[test]
+fn configured_fhs_rejects_private_installation_roots() {
+    let home = tempfile::tempdir().unwrap();
+    let private = home.path().join(".ww");
+    std::fs::create_dir(&private).unwrap();
+    for root in [home.path(), private.as_path()] {
+        let output = run_ww(home.path(), &["run", "--fhs-root", root.to_str().unwrap()]);
+        assert!(!output.status.success());
+        let error = stderr_text(&output);
+        assert!(error.contains("private installation state"), "{error}");
+        assert!(!private.join("identity").exists());
+    }
 }

@@ -75,8 +75,8 @@ pub(super) async fn daemon_install(
     };
 
     let (namespace_roots, image_layers) = if images.is_empty() {
-        let (fhs_dir, _) = refresh_default_fhs(&ww_dir)?;
-        (vec![ww_dir.clone()], vec![fhs_dir])
+        refresh_default_fhs(&ww_dir)?;
+        (vec![ww_dir.clone()], Vec::new())
     } else {
         let images = image_mounts
             .into_iter()

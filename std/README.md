@@ -7,7 +7,7 @@
 | Path | Role |
 |------|------|
 | `system/` | Async guest session SDK -- adapts the granted P3 transport, constructs `RpcSystem`, and composes one root Future. Only RPC guests link it. |
-| `kernel/` | Rust kernel (pid0) -- directly installs the shipped `/status` composition. The host embeds and publishes this component. |
+| `kernel/` | Rust kernel (pid0) -- directly installs the shipped `/status` composition. Packaged at `fhs/boot/kernel.wasm`; embedded bytes seed installation only. |
 | `status/` | Standard `/status` guest component loaded by Rust PID0 with a narrow `Membrane` containing `peerId` and `Stat`. |
 
 ## Convention

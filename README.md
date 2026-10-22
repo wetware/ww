@@ -72,8 +72,8 @@ make                              # build everything (host + std + examples)
 
 Guest builds use the pinned native P3 toolchain. `ww doctor` reports missing
 WASI SDK, `component-ld`, or `wasm-tools` dependencies. Current `ww run` boot
-requires [Kubo](https://docs.ipfs.tech/install/), including local-image boot with
-embedded PID0. Kubo provides the image/content backend; Composer merges image
+requires [Kubo](https://docs.ipfs.tech/install/), including installed and local-image
+boot. Kubo provides the image/content backend; Composer merges image
 directories in-process, and provider routing uses Wetware's own swarm. Guest
 compilation and pure/unit tests do not require a running Kubo daemon. See
 [deployment startup requirements](doc/deployment.md).
@@ -84,7 +84,8 @@ Repository builds use committed Cargo lockfiles. See the
 ### Run a node
 
 ```bash
-ww run .                                # boot a node from current dir
+ww run                                  # boot the installed FHS
+ww run .                                # explicitly overlay the current directory
 ```
 
 ### Build the example cells
@@ -103,12 +104,16 @@ examples.
 Mounts use `source[:/guest/target]`, for example `ww run ./config:/etc/myapp`.
 Local sources freeze once at startup; Stem updates reuse those exact snapshots.
 Use explicit local paths (`./app`, `/path`, or `~/app`). Bare `ww run` does not
-mount CWD or select installed state; pass an image or configure a Stem.
+mount CWD. It uses the installed FHS at `~/.ww/fhs`; `--fhs-root` selects another
+baseline directory.
 
 `ww run` starts a libp2p node on port 2025 and merges any [image layers](doc/images.md)
-into a virtual FHS filesystem. The Host selects trusted PID0 independently
-through `KernelSource`: `--kernel` takes precedence over `WW_KERNEL`, and the
-default is embedded `std/kernel`. `ww build` places the application component at
+into a virtual FHS filesystem. Precedence, from lowest to highest, is installed
+baseline, authoritative Stem head, frozen namespace images, then frozen CLI
+operations. The Host selects PID0 from `/boot/kernel.wasm` in that exact effective
+root for every epoch. Invalid selected kernels fail without an alternate-kernel
+fallback. `--kernel` and `WW_KERNEL` are rejected; use a targeted mount instead.
+`ww build` places the application component at
 `bin/<project-directory>.wasm`. `ww push` imports that image tree and reports its
 IPFS directory-root CID. The Host does not use the application component as PID0
 input. See the [image lifecycle](doc/images.md#build-and-publication).

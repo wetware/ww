@@ -90,14 +90,26 @@ All three Containerfiles place the canonical FHS at
 `/usr/share/wetware/kernel`, outside writable `HOME=/home/ww`. Runtime UID/GID
 is `1000:1000`. An empty named HOME volume receives the image's owned home
 structure. A bind-mounted HOME must supply writable directories with that
-ownership. A read-only root also requires writable `/tmp` and HOME. The default
-startup remains `run /usr/share/wetware/kernel`; `Containerfile.release` retains
-its caller-supplied command contract.
+ownership. A read-only root also requires writable `/tmp` and HOME. All three
+images set `WW_FHS_ROOT=/usr/share/wetware/kernel` and default to `run`.
+The configured FHS is the lowest composition layer, including after Stem updates.
 
-## Current startup boundary
+## Installed startup
 
-The Host still selects PID0 through `--kernel`, then `WW_KERNEL`, then its
-embedded/default kernel. Generated services retain their positional FHS mount.
-The installed `boot/kernel.wasm` does not yet select PID0. Namespace, Stem and
-CLI precedence remain unchanged. Activating an installed FHS baseline and
-selecting PID0 from the effective root belong to Landing 3.
+Bare `ww run` captures `~/.ww/fhs` once and never imports the invocation CWD.
+Use `--fhs-root <directory>` or `WW_FHS_ROOT` for another baseline directory.
+Explicit `ww run .` captures the requested directory as a higher-priority overlay.
+Generated services use installed-state startup and retain their explicit
+`--namespace-root` and install-time `--ipfs-url`, including nondefault endpoints.
+
+Every accepted epoch composes baseline, Stem head, namespace images, and CLI
+operations in that order. The Host verifies and statically validates
+`/boot/kernel.wasm` from the final effective root before launch. A valid image
+without a kernel can inherit the baseline kernel. Invalid selected content
+cannot trigger an embedded or previous-kernel fallback.
+
+Runtime preparation does not modify the installation. Local edits take effect
+only on a later Host invocation. Private identity and IPNS state remain outside
+the captured FHS. The persistent Host PeerId remains unchanged across kernel
+replacements. `--kernel` and `WW_KERNEL` cause an actionable error; replace them
+with an explicit targeted mount. Historical selector migration is unsupported.
