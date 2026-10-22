@@ -1,33 +1,26 @@
 #!/usr/bin/env bash
-# Static checks for the production image's status-cell packaging contract.
-
+# Static complement to test_container_boot.sh (which executes real images).
 set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-WORKFLOW="$ROOT_DIR/.github/workflows/rust.yml"
-
-fail() {
-  echo "FAIL: $*" >&2
-  exit 1
-}
-
-line_number() {
-  local pattern="$1"
-  awk -v pat="$pattern" 'index($0, pat) { print NR; exit }' "$WORKFLOW"
-}
-
-bash -n "$0"
-
-grep -Fq 'mkdir -p wetware/kernel/bin' "$WORKFLOW" \
-  || fail "deploy context must create the kernel bin directory"
-grep -Fq 'cp wasm/std/status/bin/status.wasm wetware/kernel/bin/status.wasm' "$WORKFLOW" \
-  || fail "deploy context must package the status WASM"
-if grep -Fq 'etc/init.d' "$WORKFLOW"; then
-  fail "deploy context must not package legacy init.d scripts"
-fi
-
-if grep -Fq './ww compile' "$WORKFLOW" || grep -Fq 'cwasm/' "$WORKFLOW"; then
-  fail "deploy context must contain portable WASM only"
-fi
-
-echo "PASS: deploy context packages the status route without native artifacts"
+cd "$(dirname "$0")/.."
+fail() { echo "FAIL: $*" >&2; exit 1; }
+for recipe in Containerfile Containerfile.deploy Containerfile.release; do
+  grep -Fq 'ENV HOME=/home/ww' "$recipe" || fail "$recipe lacks explicit HOME"
+  grep -Fq 'USER 1000:1000' "$recipe" || fail "$recipe lacks non-root UID/GID"
+  grep -Fq '/usr/share/wetware/kernel/' "$recipe" || fail "$recipe lacks canonical FHS"
+  grep -Fq 'VOLUME ["/home/ww"]' "$recipe" || fail "$recipe lacks private-state volume"
+  grep -Fq -- '--chown=1000:1000' "$recipe" || fail "$recipe lacks writable HOME"
+done
+for recipe in Containerfile Containerfile.deploy; do
+  grep -Fq 'CMD ["run", "/usr/share/wetware/kernel"]' "$recipe" || fail "$recipe changed active CMD"
+done
+! grep -q '^CMD ' Containerfile.release || fail 'release recipe changed caller-owned CMD'
+grep -Fq 'cargo run --locked --example stage_fhs -- stage' Containerfile || fail 'source recipe bypasses staging'
+! grep -Eq '^[[:space:]]*(&& )?make (std|host|fhs)|build_wasip3_component' Containerfile || fail 'source recipe rebuilds canonical components'
+grep -Fq 'container-build: fhs' Makefile || fail 'source build lacks canonical producer prerequisite'
+grep -Fq 'cp release-tree/fhs/boot/kernel.wasm std/kernel/bin/main.wasm' .github/workflows/rust.yml || fail 'CI source context lacks canonical kernel'
+grep -Fq 'cp release-tree/fhs/bin/status.wasm std/status/bin/status.wasm' .github/workflows/rust.yml || fail 'CI source context lacks canonical status'
+grep -Fq 'COPY fhs/ /usr/share/wetware/kernel/' Containerfile.deploy || fail 'deploy recipe bypasses staging'
+grep -Fq 'COPY fhs/ /usr/share/wetware/kernel/' Containerfile.release || fail 'release recipe bypasses staging'
+grep -Fq '**/.ww/' .dockerignore || fail 'Host private state enters build context'
+grep -Fq '**/.ipfs/' .dockerignore || fail 'Kubo private state enters build context'
+echo 'PASS: all recipes use canonical FHS outside writable HOME'

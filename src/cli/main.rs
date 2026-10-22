@@ -12,6 +12,7 @@ use libp2p::Multiaddr;
 
 mod daemon_cmd;
 mod doctor_cmd;
+mod installation;
 mod ns_cmd;
 mod p3_toolchain;
 
@@ -393,7 +394,17 @@ enum PerformAction {
     ///   2. Generate Ed25519 identity at ~/.ww/identity (if missing)
     ///   3. Register background daemon (launchd/systemd)
     ///   4. Print summary with next steps
-    Install,
+    Install {
+        /// Canonical FHS directory containing boot/kernel.wasm and bin/status.wasm.
+        #[arg(long)]
+        payload: Option<PathBuf>,
+        /// Final executable path (defaults to ~/.ww/bin/ww).
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        /// Validate payload and destination ownership without writing files.
+        #[arg(long)]
+        check: bool,
+    },
 
     /// Remove the wetware daemon and optionally ~/.ww.
     ///
@@ -413,12 +424,7 @@ enum PerformAction {
     ///   4. Restart daemon
     Update,
 
-    /// Self-update the ww binary via IPNS.
-    ///
-    /// Resolves /ipns/releases.wetware.run/Cargo.toml to check for a
-    /// newer version, then fetches the platform binary and atomically
-    /// replaces the running executable, then runs `update` to refresh
-    /// WASM images and daemon configuration.
+    /// Disabled until verified Host upgrades are implemented. Use the installer.
     Upgrade {
         /// IPFS HTTP API endpoint.
         #[arg(long, default_value = "http://localhost:5001", env = "IPFS_API")]
@@ -835,7 +841,13 @@ impl Commands {
             Commands::Push { path, ipfs_url } => Self::push(path, ipfs_url).await,
             Commands::Keygen { output } => Self::keygen(output).await,
             Commands::Perform { action } => match action {
-                PerformAction::Install => Self::perform_install().await,
+                PerformAction::Install {
+                    payload,
+                    executable,
+                    check,
+                } => installation::install(payload, executable, check)
+                    .await
+                    .map(|_| ()),
                 PerformAction::Uninstall => Self::perform_uninstall().await,
                 PerformAction::Update => Self::perform_update().await,
                 PerformAction::Upgrade { ipfs_url } => Self::perform_upgrade(ipfs_url).await,
@@ -2188,298 +2200,20 @@ system::export!({iface_name}Guest);
         bail!("unsupported platform; only macOS and Linux are supported")
     }
 
-    /// Refresh WASM images and the daemon service file
-    /// to match the current binary. Safe to run repeatedly.
+    /// Revalidate installed payload and refresh managed files through the installer.
+    #[allow(clippy::unused_async)]
     async fn perform_update() -> Result<()> {
-        use indicatif::{ProgressBar, ProgressStyle};
-        use std::time::Duration;
-
-        let spin = || {
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::default_spinner()
-                    .template("  \u{2699} {msg}")
-                    .expect("valid template"),
-            );
-            pb.enable_steady_tick(Duration::from_millis(80));
-            pb
-        };
-        let done = |msg: String| println!("  \u{2713} {msg}");
-        let skip = |msg: String| println!("  \u{00b7} {msg}");
-        let fail = |msg: String| println!("  \u{2717} {msg}");
-
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let ww_dir = home.join(".ww");
-
-        if !ww_dir.exists() {
-            bail!("~/.ww does not exist. Run `ww perform install` first.");
+        if !installation::install(None, None, false).await? {
+            println!("Daemon restart (nothing changed)");
+            return Ok(());
         }
-        let identity_path = ww_dir.join("identity");
-        let identity_path_string = identity_path
-            .to_str()
-            .context("~/.ww/identity path is non-UTF-8")?;
-        let host_key = ww::keys::load(identity_path_string)?;
-        let host_peer_id = ww::keys::to_libp2p(&host_key)?.public().to_peer_id();
-        let default_ipns_name = ww::ipns::canonical_name(host_peer_id);
-
-        // Ensure subdirectories exist (may be missing if created by older version).
-        for sub in &["bin", "etc/ns", "logs"] {
-            let dir = ww_dir.join(sub);
-            if !dir.exists() {
-                std::fs::create_dir_all(&dir)?;
-            }
+        let home = dirs::home_dir().context("cannot determine HOME")?;
+        match Self::restart_user_daemon(&home) {
+            Some(true) => Ok(()),
+            _ => bail!(
+                "installation updated; start the daemon with the activation command printed above"
+            ),
         }
-
-        // ── WASM images (embedded check) ─────────────────────────────
-        // Embedded WASM blobs are served by EmbeddedLoader at runtime.
-        // We no longer write them to disk; just check if they're present
-        // in the binary to decide whether to republish the std namespace.
-        // Keep the embedded kernel's artifact name. PID0 selection does not
-        // require bin/main.wasm in the application image.
-        let embedded_cells: &[(&str, &[u8])] = &[
-            ("main.wasm", EMBEDDED_KERNEL),
-            ("status.wasm", EMBEDDED_STATUS),
-        ];
-        let images_ok = embedded_cells.iter().all(|(_, bytes)| !bytes.is_empty());
-        // Detect changes by hashing embedded blobs against last-published CID.
-        let any_images_changed = {
-            let cid_marker = ww_dir.join(".last-std-cid");
-            let current_hash = {
-                let mut hasher = blake3::Hasher::new();
-                for (_, bytes) in embedded_cells {
-                    hasher.update(bytes);
-                }
-                hasher.finalize().to_hex().to_string()
-            };
-            let changed = std::fs::read_to_string(&cid_marker)
-                .map(|prev| prev.trim() != current_hash)
-                .unwrap_or(true);
-            if changed {
-                let _ = std::fs::write(&cid_marker, &current_hash);
-            }
-            changed
-        };
-        if !images_ok {
-            skip("WASM images (not embedded, build from source)".into());
-        } else if any_images_changed {
-            done("WASM images (updated)".into());
-        } else {
-            skip("WASM images (unchanged)".into());
-        }
-
-        // ── Standard namespace indexing (if images changed + Kubo running) ──
-        let ipfs_client = ipfs::HttpClient::new("http://localhost:5001".into());
-        let kubo_ok = ipfs_client.kubo_info().await.is_ok();
-        if kubo_ok {
-            let routing_url = std::env::var("IPFS_ROUTING_API")
-                .unwrap_or_else(|_| "http://localhost:8080".to_string());
-            ww::ipns::RoutingClient::new(routing_url)?
-                .probe()
-                .await
-                .context(
-                    "Kubo HTTP Routing V1 is required for default IPNS publication; run `ipfs config --json Gateway.ExposeRoutingAPI true`, restart Kubo, and set IPFS_ROUTING_API when the Gateway is not http://localhost:8080",
-                )?;
-        }
-        let namespace_identity_changed;
-
-        {
-            let ns_path = ww_dir.join("etc/ns/ww");
-            let std_cid = ww::namespace::WW_STD_CID;
-
-            let mut config = if ns_path.exists() {
-                let content = std::fs::read_to_string(&ns_path)?;
-                ww::ns::NamespaceConfig::parse("ww", &content)
-            } else {
-                ww::ns::NamespaceConfig {
-                    name: "ww".to_string(),
-                    ipns: String::new(),
-                    bootstrap: std_cid.to_string(),
-                }
-            };
-            namespace_identity_changed = config.ipns != default_ipns_name;
-            config.ipns.clone_from(&default_ipns_name);
-
-            if kubo_ok && images_ok && any_images_changed {
-                let sp = spin();
-                sp.set_message("Indexing standard namespace...");
-
-                let tmp = tempfile::TempDir::new()?;
-                let tree = tmp.path();
-                let bin_dir = tree.join("bin");
-                std::fs::create_dir_all(&bin_dir)?;
-
-                // Write WASM cells to bin/ (flat layout).
-                for (wasm_name, bytes) in embedded_cells {
-                    if !bytes.is_empty() {
-                        std::fs::write(bin_dir.join(wasm_name), bytes)?;
-                    }
-                }
-
-                match ipfs_client.add_dir(tree).await {
-                    Ok(cid) => {
-                        let ipfs_path = format!("/ipfs/{cid}");
-                        config.bootstrap = ipfs_path.clone();
-                        let _ = ipfs_client.pin_add(&ipfs_path).await;
-                        sp.finish_and_clear();
-                        done(format!("Standard namespace ({ipfs_path})"));
-                    }
-                    Err(e) => {
-                        sp.finish_and_clear();
-                        fail(format!("Standard namespace ({e})"));
-                    }
-                }
-            } else if !kubo_ok {
-                skip("Standard namespace (Kubo not running)".into());
-            } else if !any_images_changed {
-                skip("Standard namespace (images unchanged)".into());
-            }
-
-            config.write_to(&ns_path)?;
-            if !config.bootstrap.is_empty() {
-                let detail = if !config.ipns.is_empty() {
-                    format!("ipns={}", config.ipns)
-                } else {
-                    format!("bootstrap={}", config.bootstrap)
-                };
-                done(format!("Namespace ww ({detail})"));
-            }
-        }
-
-        // ── Install-owned FHS + daemon service file (unconditional) ──
-        let (_, install_layer_changed) = daemon_cmd::refresh_default_fhs(&ww_dir)?;
-        // Empty images select ~/.ww/fhs and read ~/.ww/etc/ns through the
-        // separate host-only namespace root.
-        let ipns_routing_url = std::env::var("IPFS_ROUTING_API")
-            .unwrap_or_else(|_| "http://localhost:8080".to_string());
-        let service_definition_changed = Self::daemon_install(
-            Some(identity_path),
-            Vec::new(),
-            Vec::new(),
-            ipns_routing_url,
-            true,
-        )
-        .await?;
-        done("Background daemon".into());
-
-        // ── Restart daemon when deployed content or its boundary changed ─
-        if !any_images_changed
-            && !install_layer_changed
-            && !service_definition_changed
-            && !namespace_identity_changed
-        {
-            skip("Daemon restart (nothing changed)".into());
-        } else {
-            match Self::restart_user_daemon(&home) {
-                Some(true) => done("Daemon restarted".into()),
-                Some(false) => {
-                    if cfg!(target_os = "macos") {
-                        let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
-                        bail!(
-                            "updated namespace was not published because the daemon could not restart; try: launchctl load {}",
-                            plist_path.display()
-                        );
-                    } else {
-                        bail!(
-                            "updated namespace was not published because the daemon could not restart; try: systemctl --user restart ww"
-                        );
-                    }
-                }
-                None => bail!(
-                    "updated namespace was not published because no daemon service file was available"
-                ),
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Bootstrap the ~/.ww user layer and daemon.
-    ///
-    /// If ~/.ww already exists, delegates directly to `perform_update`.
-    /// Otherwise performs first-time bootstrap then calls `perform_update`.
-    async fn perform_install() -> Result<()> {
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let ww_dir = home.join(".ww");
-
-        // Already bootstrapped — just refresh.
-        if ww_dir.exists() {
-            return Self::perform_update().await;
-        }
-
-        // ── Cold start: first-time bootstrap ─────────────────────────
-        let done = |msg: String| println!("  \u{2713} {msg}");
-
-        // ── Directories ──────────────────────────────────────────────
-        let subdirs = ["bin", "etc/ns", "logs"];
-        for sub in &subdirs {
-            let dir = ww_dir.join(sub);
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("Failed to create {}", dir.display()))?;
-        }
-        done("Directories".into());
-
-        // ── Symlink binary to ~/.ww/bin/ww ──────────────────────────
-        let current_exe =
-            std::env::current_exe().context("Cannot determine path of running binary")?;
-        let current_exe = current_exe
-            .canonicalize()
-            .unwrap_or_else(|_| current_exe.clone());
-        let symlink_path = ww_dir.join("bin/ww");
-        let _ = std::fs::remove_file(&symlink_path);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&current_exe, &symlink_path).with_context(|| {
-            format!(
-                "symlink {} -> {}",
-                symlink_path.display(),
-                current_exe.display()
-            )
-        })?;
-        done(format!("Binary symlink ({})", symlink_path.display()));
-
-        // ── Identity ─────────────────────────────────────────────────
-        let identity_path = ww_dir.join("identity");
-        let sk = ww::keys::generate()?;
-        ww::keys::save(&sk, &identity_path)?;
-        let kp = ww::keys::to_libp2p(&sk)?;
-        let peer_id = kp.public().to_peer_id();
-        done(format!("Identity ({peer_id})"));
-        done(format!(
-            "Default IPNS name ({})",
-            ww::ipns::canonical_name(peer_id)
-        ));
-
-        // ── Update: WASM images, stdlib, daemon ─────────────────────
-        Self::perform_update().await?;
-
-        // ── PATH + summary ───────────────────────────────────────────
-        let ww_bin_dir = ww_dir.join("bin");
-        let in_path = std::env::var("PATH")
-            .unwrap_or_default()
-            .split(':')
-            .any(|p| std::path::Path::new(p) == ww_bin_dir);
-
-        println!();
-        println!("\u{2697}\u{fe0f}  Next steps:");
-        println!();
-        if !in_path {
-            let shell = std::env::var("SHELL").unwrap_or_default();
-            if shell.ends_with("/fish") {
-                println!("  fish_add_path {}", ww_bin_dir.display());
-            } else {
-                println!("  export PATH=\"{}:$PATH\"", ww_bin_dir.display());
-            }
-        }
-        // The cold-install entry point (scripts/install.sh) probes the
-        // status endpoint after this command returns; it owns the
-        // "wait for daemon, then point at curl" UX. Here we just print
-        // the URL — `ww perform install` may also be invoked manually
-        // outside the install script, in which case the user can hit
-        // /status whenever the daemon is up.
-        println!("  curl http://localhost:2080/status");
-        println!();
-        println!("  Uninstall:  ww perform uninstall");
-
-        Ok(())
     }
 
     /// Remove the wetware daemon and optionally ~/.ww.
@@ -2621,179 +2355,10 @@ system::export!({iface_name}Guest);
         )
     }
 
-    /// Self-update the ww binary via IPNS.
-    async fn perform_upgrade(ipfs_url: String) -> Result<()> {
-        let ipfs_client = ipfs::HttpClient::new(ipfs_url);
-
-        // 1. Resolve IPNS to get latest release tree.
-        eprintln!("Resolving /ipns/releases.wetware.run ...");
-        let resolved = ipfs_client
-            .name_resolve("/ipns/releases.wetware.run")
-            .await
-            .context(
-                "IPNS resolution failed.\n\
-                 \n\
-                 Make sure Kubo is running (`ipfs daemon`) and connected to the DHT.\n\
-                 If IPNS is slow, try again — DHT resolution can take 10-60s on a fresh node.",
-            )?;
-        let base = resolved.trim_end_matches('/');
-
-        // 2. Fetch VERSION file (one line: "x.y.z").
-        let version_path = format!("{base}/VERSION");
-        eprintln!("Checking latest version ...");
-        let version_bytes = ipfs_client
-            .cat(&version_path)
-            .await
-            .context("Failed to fetch VERSION from IPFS release")?;
-        let remote_version = String::from_utf8(version_bytes)
-            .context("VERSION is not valid UTF-8")?
-            .trim()
-            .to_string();
-
-        // 3. Compare with running version.
-        let current_version = env!("CARGO_PKG_VERSION");
-        if remote_version == current_version {
-            println!("Already up to date ({current_version}).");
-            return Ok(());
-        }
-
-        eprintln!("Upgrade available: {current_version} -> {remote_version}");
-
-        // 4. Detect platform.
-        let os = match std::env::consts::OS {
-            "linux" => "linux",
-            "macos" => "macos",
-            os => bail!("Unsupported OS for upgrade: {os}"),
-        };
-        let arch = match std::env::consts::ARCH {
-            "x86_64" => "x86_64",
-            "aarch64" => "aarch64",
-            arch => bail!("Unsupported architecture for upgrade: {arch}"),
-        };
-
-        // 5. Fetch binary.
-        let binary_path = format!("{base}/bin/ww/{os}/{arch}/ww");
-        eprintln!("Fetching {binary_path} ...");
-        let binary = ipfs_client
-            .cat(&binary_path)
-            .await
-            .with_context(|| format!("Failed to fetch binary for {os}/{arch}"))?;
-
-        // 6. Fetch and verify checksums.
-        let checksums_path = format!("{base}/CHECKSUMS.txt");
-        let checksums_bytes = ipfs_client
-            .cat(&checksums_path)
-            .await
-            .context("Failed to fetch CHECKSUMS.txt")?;
-        let checksums =
-            String::from_utf8(checksums_bytes).context("CHECKSUMS.txt is not valid UTF-8")?;
-
-        Self::verify_checksum(&binary, &format!("bin/ww/{os}/{arch}/ww"), &checksums)
-            .context("Checksum verification failed — aborting upgrade")?;
-
-        // 7. Atomic replace of current binary.
-        let current_exe =
-            std::env::current_exe().context("Cannot determine path of running binary")?;
-        let current_exe = current_exe
-            .canonicalize()
-            .unwrap_or_else(|_| current_exe.clone());
-        let old_exe = current_exe.with_extension("old");
-
-        // On Linux, rename the running binary first (rename(2) works on
-        // running binaries — the old inode stays alive until the process
-        // exits). On macOS this also works fine.
-        std::fs::rename(&current_exe, &old_exe).with_context(|| {
-            format!(
-                "Failed to rename {} to {}.\n\
-                 \n\
-                 If permission denied, try: sudo ww perform upgrade",
-                current_exe.display(),
-                old_exe.display()
-            )
-        })?;
-
-        if let Err(e) = std::fs::write(&current_exe, &binary) {
-            // Restore old binary on failure.
-            let _ = std::fs::rename(&old_exe, &current_exe);
-            return Err(e).context("Failed to write new binary — old binary restored");
-        }
-
-        // chmod +x
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o755);
-            std::fs::set_permissions(&current_exe, perms)
-                .context("Failed to set executable permissions on new binary")?;
-        }
-
-        // Clean up old binary (best-effort; on Linux the running process
-        // still holds the inode, but the directory entry is removed).
-        let _ = std::fs::remove_file(&old_exe);
-
-        // Re-symlink ~/.ww/bin/ww to the new binary location.
-        if let Some(home) = dirs::home_dir() {
-            let symlink_path = home.join(".ww/bin/ww");
-            if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
-                let _ = std::fs::remove_file(&symlink_path);
-                #[cfg(unix)]
-                let _ = std::os::unix::fs::symlink(&current_exe, &symlink_path);
-            }
-        }
-
-        println!("Upgraded ww to {remote_version}. Running update...");
-        println!();
-        Self::perform_update().await
-    }
-
-    /// Verify a binary against CHECKSUMS.txt (blake3 or sha256).
-    fn verify_checksum(binary: &[u8], filename: &str, checksums: &str) -> Result<()> {
-        // CHECKSUMS.txt format (produced by b3sum and sha256sum):
-        //   <hash>  <filename>
-        // Try blake3 first (above the "# sha256" separator), then sha256.
-        for line in checksums.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            // Split on whitespace: "<hash>  <file>" or "<hash> <file>"
-            let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
-            if parts.len() != 2 {
-                continue;
-            }
-            let expected_hash = parts[0];
-            let file = parts[1].trim();
-            if file != filename {
-                continue;
-            }
-
-            // Determine hash type by length: blake3 = 64 hex chars, sha256 = 64 hex chars.
-            // Both are 64 hex chars, so try blake3 first.
-            let actual_hash = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(binary);
-                hasher.finalize().to_hex().to_string()
-            };
-
-            if actual_hash == expected_hash {
-                eprintln!("Checksum OK (blake3)");
-                return Ok(());
-            }
-
-            // Try sha256.
-            // sha256 is not in deps; blake3 match above should cover it.
-            // If blake3 didn't match, report mismatch.
-            bail!(
-                "Checksum mismatch for {filename}:\n  expected: {expected_hash}\n  got:      {actual_hash}\n\
-                 \n\
-                 The downloaded binary may be corrupted. Aborting upgrade."
-            );
-        }
-
-        bail!(
-            "No checksum found for {filename} in CHECKSUMS.txt.\n\
-             Cannot verify integrity — aborting upgrade."
-        )
+    /// Refuse before network access or filesystem changes.
+    #[allow(clippy::unused_async)]
+    async fn perform_upgrade(_ipfs_url: String) -> Result<()> {
+        bail!("Native self-upgrade is disabled until verified Host upgrades are available. Use the current installer to install the complete Host and FHS package.")
     }
 
     /// List configured namespaces from ~/.ww/etc/ns/.
@@ -3333,6 +2898,7 @@ mod tests {
             namespace_roots: vec![PathBuf::from("/tmp/host-state")],
             images: Vec::new(),
             http_listen: Some(addr.to_string()),
+            ipfs_url: "http://localhost:5001".to_string(),
             ipns_routing_url: "http://localhost:8080".to_string(),
         }
     }
@@ -3344,6 +2910,7 @@ mod tests {
             namespace_roots: Vec::new(),
             images: Vec::new(),
             http_listen: None,
+            ipfs_url: "http://localhost:5001".to_string(),
             ipns_routing_url: "http://localhost:8080".to_string(),
         }
     }
@@ -3459,30 +3026,14 @@ mod tests {
     }
 
     #[test]
-    fn default_fhs_materializes_status_once() {
-        let home = tempfile::tempdir().expect("temp home");
+    fn default_fhs_refuses_unowned_legacy_status() {
+        let home = tempfile::tempdir().unwrap();
         let ww_dir = home.path().join(".ww");
-        let legacy_status = b"legacy status component";
-        let legacy_path = ww_dir.join("std/status/bin/status.wasm");
-        std::fs::create_dir_all(legacy_path.parent().expect("legacy status parent"))
-            .expect("create legacy status parent");
-        std::fs::write(&legacy_path, legacy_status).expect("write legacy status");
-
-        let (fhs_dir, changed) =
-            daemon_cmd::refresh_default_fhs(&ww_dir).expect("materialize default FHS");
-        assert!(changed);
-        let expected = if EMBEDDED_STATUS.is_empty() {
-            legacy_status.as_slice()
-        } else {
-            EMBEDDED_STATUS
-        };
-        assert_eq!(
-            std::fs::read(fhs_dir.join("bin/status.wasm")).expect("read installed status"),
-            expected
-        );
-
-        let (_, changed) =
-            daemon_cmd::refresh_default_fhs(&ww_dir).expect("refresh unchanged default FHS");
-        assert!(!changed);
+        let path = ww_dir.join("std/status/bin/status.wasm");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"custom legacy status").unwrap();
+        assert!(daemon_cmd::refresh_default_fhs(&ww_dir).is_err());
+        assert!(!ww_dir.join("fhs").exists());
+        assert_eq!(std::fs::read(path).unwrap(), b"custom legacy status");
     }
 }

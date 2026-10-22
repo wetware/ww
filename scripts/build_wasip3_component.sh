@@ -155,7 +155,16 @@ if ! rustc "+$NIGHTLY" --version --verbose | grep -qx "LLVM version: $EXPECTED_L
   exit 1
 fi
 
+# Panic locations and file!() strings survive release stripping. Normalize the
+# checkout, dependency cache and exact pinned sysroot to omit builder-local paths.
+# Distribution consumers reuse one canonical build; independent native compiler
+# runs are not assumed to produce identical function ordering or component bytes.
+cargo_home_path="${CARGO_HOME:-$HOME/.cargo}"
+rust_sysroot="$(rustc "+$NIGHTLY" --print sysroot)"
 encoded_flags="-Clink-arg=--wasm-ld-path=$wasm_ld"$'\x1f'"-Lnative=$p3_lib"
+encoded_flags+=$'\x1f'"--remap-path-prefix=$repo_root=/wetware"
+encoded_flags+=$'\x1f'"--remap-path-prefix=$cargo_home_path=/cargo"
+encoded_flags+=$'\x1f'"--remap-path-prefix=$rust_sysroot=/rust"
 cargo_args=(
   "+$NIGHTLY"
   build

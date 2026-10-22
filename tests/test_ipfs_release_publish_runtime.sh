@@ -15,13 +15,12 @@ fail() {
 }
 
 mkdir -p "$TEST_DIR/bin" "$TEST_DIR/release"
-printf 'fixture\n' > "$TEST_DIR/release/VERSION"
-
 FAKE_KUBECTL="$TEST_DIR/bin/kubectl"
 cat > "$FAKE_KUBECTL" <<'FAKE_KUBECTL_SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
+printf 'call\n' >> "$FAKE_ALL_CALL_LOG"
 args="$*"
 case "$args" in
   *"ipfs repo stat --size-only"*)
@@ -74,6 +73,22 @@ run_publish() {
   rm -rf "$TEST_DIR/release"
   mkdir -p "$TEST_DIR/release"
   printf 'fixture\n' > "$TEST_DIR/release/VERSION"
+for payload in fhs/boot/kernel.wasm fhs/bin/status.wasm \
+  bin/ww/linux/x86_64/ww bin/ww/linux/aarch64/ww \
+  bin/ww/macos/aarch64/ww bin/ww/macos/x86_64/ww bin/ww/linux/musl-x86_64/ww; do
+  mkdir -p "$TEST_DIR/release/$(dirname "$payload")"
+  printf 'fixture\n' > "$TEST_DIR/release/$payload"
+done
+(cd "$TEST_DIR/release" && find fhs bin -type f | sort | xargs shasum -a 256) > "$TEST_DIR/release/CHECKSUMS.txt"
+
+  case "${FAKE_PAYLOAD_DAMAGE:-}" in
+    missing) rm "$TEST_DIR/release/fhs/boot/kernel.wasm" ;;
+    empty) : > "$TEST_DIR/release/fhs/bin/status.wasm" ;;
+    symlink) mv "$TEST_DIR/release/fhs/boot/kernel.wasm" "$TEST_DIR/kernel.wasm"; ln -s "$TEST_DIR/kernel.wasm" "$TEST_DIR/release/fhs/boot/kernel.wasm" ;;
+    corrupt) printf 'corrupt\n' > "$TEST_DIR/release/bin/ww/linux/x86_64/ww" ;;
+    unchecked) sed '/fhs\/boot\/kernel.wasm/d' "$TEST_DIR/release/CHECKSUMS.txt" > "$TEST_DIR/checksums.next"; mv "$TEST_DIR/checksums.next" "$TEST_DIR/release/CHECKSUMS.txt" ;;
+  esac
+  : > "$TEST_DIR/all-calls"
   : > "$TEST_DIR/calls"
   PATH="$TEST_DIR/bin:$PATH" \
     POD=ipfs-test \
@@ -83,6 +98,7 @@ run_publish() {
     FAKE_CURRENT_RELEASE="$current" \
     FAKE_CANDIDATE_CID="$candidate" \
     FAKE_CALL_LOG="$TEST_DIR/calls" \
+    FAKE_ALL_CALL_LOG="$TEST_DIR/all-calls" \
     "$PUBLISH_SCRIPT" >"$output_file" 2>&1
 }
 
@@ -110,5 +126,12 @@ grep -Fq "expected /ipfs/bexpected, found /ipfs/bother" "$TEST_DIR/mismatch.out"
   || fail "compare-and-set mismatch must explain the conflicting pointers"
 [ ! -s "$TEST_DIR/calls" ] \
   || fail "compare-and-set mismatch must not invoke ipfs name publish"
+
+for damage in missing empty corrupt unchecked symlink; do
+  if FAKE_PAYLOAD_DAMAGE="$damage" run_publish /ipfs/bexpected /ipfs/bexpected bcandidate "$TEST_DIR/$damage.out"; then
+    fail "$damage mandatory payload must fail"
+  fi
+  [ ! -s "$TEST_DIR/all-calls" ] || fail "$damage payload reached remote mutation"
+done
 
 echo "PASS: IPFS release publish runtime checks"

@@ -59,7 +59,10 @@ jobs:
             - 'Cargo.lock'
             - 'build.rs'
             - 'Containerfile*'
+            - '.dockerignore'
             - 'Makefile'
+            - 'scripts/**'
+            - 'tests/**'
             - '.github/workflows/**'
             - '.github/actions/**'
           architecture_map:
@@ -133,8 +136,9 @@ jobs:
         bash tests/test_deploy_context.sh
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
+        bash -n scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh
+          shellcheck scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
         fi
 
   fuzz-corpus:
@@ -335,12 +339,19 @@ jobs:
     - name: Build and validate first-party P3 components
       run: make test-wasm
 
+    - name: Stage and validate canonical FHS
+      run: |
+        make package-check
+        bash tests/test_release_package.sh target/debug/examples/stage_fhs target/fhs
+
     - uses: actions/upload-artifact@v7
       with:
         name: wasm-artifacts
         path: |
           std/kernel/bin/main.wasm
           std/status/bin/status.wasm
+          target/fhs/
+          target/debug/examples/stage_fhs
           examples/*/bin/
           target/native-p3-fixture/wasm32-wasip3/release/native_p3_fixture.wasm
           target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
@@ -371,19 +382,7 @@ jobs:
         # limits on the unauthenticated `releases/latest` API call.
         version: v1.7.1
 
-    - name: Install IPFS (Kubo)
-      run: |
-        KUBO_VERSION="v0.33.0"
-        KUBO_ARCHIVE="kubo_${KUBO_VERSION}_linux-amd64.tar.gz"
-        KUBO_ARCHIVE_PATH="$RUNNER_TEMP/$KUBO_ARCHIVE"
-        curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
-          "https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}/${KUBO_ARCHIVE}" \
-          --output "$KUBO_ARCHIVE_PATH"
-        echo "6551acf9be99f98bb4c853a0b22004f2703f0cb13f34111e863d77aa10032ead2c89eb9a8d6fccb4da11011e8d29a8cb251bd3e6651fdbaa3209e3b1bfb5e4f4  $KUBO_ARCHIVE_PATH" \
-          | sha512sum --check --strict
-        tar -xzf "$KUBO_ARCHIVE_PATH"
-        sudo mv kubo/ipfs /usr/local/bin/
-        rm -rf kubo
+    - uses: ./.github/actions/setup-kubo
 
     - name: Start IPFS daemon
       run: |
@@ -439,6 +438,13 @@ jobs:
         WW_USE_PREBUILT_AUTHORITY_PROBE: "1"
         # Reuse compiled WASM across fresh engines within this job.
         WW_CWASM_DIR: ${{ runner.temp }}/ww-cwasm
+
+    - name: Validate actual packaged installation and startup
+      run: |
+        cargo build --locked
+        WW_TEST_BINARY=target/debug/ww WW_TEST_FHS=target/fhs python3 tests/test_host_install.py
+        python3 tests/test_install.py --binary target/debug/ww --fhs target/fhs
+        bash tests/test_installed_boot.sh target/debug/ww target/fhs
 
     - name: Smoke-test Chess authority proof command
       run: |
@@ -629,7 +635,14 @@ jobs:
     - name: Package binary
       run: |
         mkdir -p ${{ matrix.bin_path }}
+        test -s target/fhs/boot/kernel.wasm
+        test -s target/fhs/bin/status.wasm
+        cmp std/kernel/bin/main.wasm target/fhs/boot/kernel.wasm
+        cmp std/status/bin/status.wasm target/fhs/bin/status.wasm
         cp target/${{ matrix.target }}/release/ww ${{ matrix.bin_path }}/ww
+        cp -R target/fhs ${{ matrix.bin_path }}/fhs
+        printf '%s\n' "${{ github.sha }}" > ${{ matrix.bin_path }}/REVISION
+        (cd ${{ matrix.bin_path }} && shasum -a 256 ww > SHA256SUMS)
 
     - name: Verify static linking
       if: ${{ matrix.install_musl }}
@@ -638,84 +651,96 @@ jobs:
     - uses: actions/upload-artifact@v7
       with:
         name: ${{ matrix.artifact }}
-        path: ${{ matrix.bin_path }}/ww
+        path: ${{ matrix.bin_path }}/
+        retention-days: 1
+
+  validate-release:
+    name: Validate release packages and container boot
+    if: >-
+      github.ref == 'refs/heads/master'
+      && (github.event_name == 'workflow_dispatch'
+          || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true')
+    needs: [changes, test, build-binaries, build-wasm]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - uses: ./.github/actions/setup-kubo
+    - uses: actions/download-artifact@v8
+      with:
+        path: artifacts
+    - name: Validate and assemble all five platform packages
+      run: |
+        chmod +x artifacts/wasm-artifacts/target/debug/examples/stage_fhs
+        bash scripts/assemble_release.sh artifacts release-tree "${{ github.sha }}"
+        chmod +x artifacts/ww-linux-musl-x86_64/ww
+        WW_TEST_BINARY=artifacts/ww-linux-musl-x86_64/ww WW_TEST_FHS=release-tree/fhs python3 tests/test_host_install.py
+        python3 tests/test_install.py --binary artifacts/ww-linux-musl-x86_64/ww --fhs release-tree/fhs
+    - name: Build and boot artifact containers
+      run: |
+        mkdir deploy-context
+        cp artifacts/ww-linux-musl-x86_64/ww deploy-context/ww
+        cp artifacts/ww-linux-x86_64/ww deploy-context/ww-amd64
+        chmod +x deploy-context/ww-amd64
+        cp -R release-tree/fhs deploy-context/fhs
+        docker build -f Containerfile.deploy -t ww-validated:deploy deploy-context
+        bash tests/test_container_boot.sh ww-validated:deploy release-tree/fhs
+        docker build --build-arg TARGETARCH=amd64 -f Containerfile.release -t ww-validated:release deploy-context
+        bash tests/test_container_boot.sh ww-validated:release release-tree/fhs release
+    - name: Build and boot source container
+      run: |
+        mkdir -p std/kernel/bin std/status/bin
+        cp release-tree/fhs/boot/kernel.wasm std/kernel/bin/main.wasm
+        cp release-tree/fhs/bin/status.wasm std/status/bin/status.wasm
+        docker build --build-arg WW_BUILD_GIT_SHA="${{ github.sha }}" -f Containerfile -t ww-validated:source .
+        bash tests/test_container_boot.sh ww-validated:source release-tree/fhs
+    - name: Save tested image and release tree
+      run: docker save ww-validated:deploy -o tested-image.tar
+    - uses: actions/upload-artifact@v7
+      with:
+        name: validated-release
+        path: |
+          release-tree/
+          tested-image.tar
         retention-days: 1
 
   release_image:
     name: Build and publish ww-master image
     if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'push' && github.ref == 'refs/heads/master'
-          && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
-    needs: [changes, fmt, clippy, solidity, build, build-binaries]
+      !cancelled() && github.ref == 'refs/heads/master'
+      && needs.test.result == 'success' && needs.validate-release.result == 'success'
+      && (github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'push' && github.ref == 'refs/heads/master'
+              && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true')))
+    needs: [changes, test, validate-release]
     runs-on: ubuntu-latest
     environment: master
     permissions:
       contents: read
       packages: write
-
     steps:
-    - uses: actions/checkout@v5
-
     - uses: actions/download-artifact@v8
       with:
-        name: ww-linux-musl-x86_64
-        path: deploy-context
-
-    - uses: actions/download-artifact@v8
-      with:
-        name: wasm-artifacts
-        path: deploy-context/wasm
-
-    - name: Assemble deploy context
-      run: |
-        cd deploy-context
-        chmod +x ww
-
-        # Kernel image layout matching the production k8s manifest.
-        mkdir -p wetware/kernel/bin
-
-        # Kernel layer: the pid0 entrypoint and status component both live
-        # at the merged root. The Rust kernel registers /status at boot.
-        cp wasm/std/kernel/bin/main.wasm wetware/kernel/bin/main.wasm
-        cp wasm/std/status/bin/status.wasm wetware/kernel/bin/status.wasm
-
-        cp ../Containerfile.deploy Containerfile
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v4
-
+        name: validated-release
+    - name: Load the tested image
+      run: docker load -i tested-image.tar
     - name: Login to GHCR
       uses: docker/login-action@v4
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Build and push
-      uses: docker/build-push-action@v7
-      with:
-        context: deploy-context
-        file: deploy-context/Containerfile
-        push: true
-        tags: |
-          ghcr.io/wetware/ww:master
-          ghcr.io/wetware/ww:master-${{ github.sha }}
-
+    - name: Push the tested image
+      run: |
+        docker tag ww-validated:deploy ghcr.io/wetware/ww:master-${{ github.sha }}
+        docker tag ww-validated:deploy ghcr.io/wetware/ww:master
+        docker push ghcr.io/wetware/ww:master-${{ github.sha }}
+        docker push ghcr.io/wetware/ww:master
     - name: Wait for image to be pullable from GHCR
       env:
         IMAGE: ghcr.io/wetware/ww:master-${{ github.sha }}
       run: |
-        # docker/build-push-action returns when the manifest is pushed, but
-        # GHCR's read replicas can lag behind. Confirm the SHA tag is
-        # inspectable before an operator promotes its immutable digest.
-        echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
         for i in 1 2 3 4 5; do
-          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
-            echo "Image $IMAGE is pullable"
-            exit 0
-          fi
-          echo "Image not yet visible (attempt $i), retrying..."
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then exit 0; fi
           sleep $((i * 5))
         done
         echo "ERROR: image $IMAGE never appeared in GHCR"
@@ -723,12 +748,15 @@ jobs:
 
   publish:
     name: Publish to IPFS
-    needs: [changes, test, build-binaries, build-wasm, release_image]
-    # Run even if build-binaries was skipped (std-only change).
+    needs: [changes, test, validate-release, release_image]
+    # Both publication paths consume the same validated artifact set.
     # IPFS publication is independent of manual infrastructure promotion for
     # this POC. The published release may therefore lead or lag production.
     if: >-
-      !failure() && !cancelled()
+      !cancelled() && github.ref == 'refs/heads/master'
+      && needs.test.result == 'success'
+      && needs.validate-release.result == 'success'
+      && needs.release_image.result == 'success'
       && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'
           || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
@@ -742,38 +770,11 @@ jobs:
 
     - uses: actions/download-artifact@v8
       with:
-        name: wasm-artifacts
-        path: artifacts/wasm-artifacts
-
-    # Download binary artifacts (only available when host lane ran)
-    - uses: actions/download-artifact@v8
-      if: needs.changes.outputs.host == 'true' || github.event_name == 'workflow_dispatch'
-      with:
-        name: ww-linux-x86_64
-        path: artifacts/ww-linux-x86_64
-
-    - uses: actions/download-artifact@v8
-      if: needs.changes.outputs.host == 'true' || github.event_name == 'workflow_dispatch'
-      with:
-        name: ww-linux-aarch64
-        path: artifacts/ww-linux-aarch64
-
-    - uses: actions/download-artifact@v8
-      if: needs.changes.outputs.host == 'true' || github.event_name == 'workflow_dispatch'
-      with:
-        name: ww-macos-aarch64
-        path: artifacts/ww-macos-aarch64
-
-    - uses: actions/download-artifact@v8
-      if: needs.changes.outputs.host == 'true' || github.event_name == 'workflow_dispatch'
-      with:
-        name: ww-macos-x86_64
-        path: artifacts/ww-macos-x86_64
+        name: validated-release
 
     - name: Publish to IPFS via VPS
       env:
         SSH_CMD: ssh -i ~/.ssh/deploy_key -o ServerAliveInterval=30 -o ServerAliveCountMax=10
-        HOST_CHANGED: ${{ needs.changes.outputs.host }}
       run: |
         # Set up SSH
         mkdir -p ~/.ssh
@@ -858,125 +859,19 @@ jobs:
             ;;
         esac
 
-        # Assemble clean release tree (artifacts only, no source code)
-        STAGE=/tmp/release-tree
-        mkdir -p "$STAGE/bin/ww/linux/x86_64" "$STAGE/bin/ww/linux/aarch64"
-        mkdir -p "$STAGE/bin/ww/macos/aarch64" "$STAGE/bin/ww/macos/x86_64"
-
-        # VERSION
-        grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/' > "$STAGE/VERSION"
-        echo "${{ github.sha }}" > "$STAGE/REVISION"
-
-        # Changelog
-        cp CHANGELOG.md "$STAGE/"
-
-        # WASM cells (flat under bin/)
-        # Keep the kernel's release artifact name. PID0 selection is independent
-        # of the application image; other cells retain their component names.
-        cp artifacts/wasm-artifacts/std/kernel/bin/main.wasm   "$STAGE/bin/main.wasm"
-        cp artifacts/wasm-artifacts/std/status/bin/status.wasm "$STAGE/bin/status.wasm"
-
-        # Example WASM cells (flat, for reference / convenience).
-        for example_dir in artifacts/wasm-artifacts/examples/*/bin; do
-          if [ -d "$example_dir" ]; then
-            name=$(basename "$(dirname "$example_dir")")
-            cp "$example_dir"/*.wasm "$STAGE/bin/${name}.wasm" 2>/dev/null || true
-          fi
+        # This is the exact tree validated before either publication job.
+        STAGE="$PWD/release-tree"
+        test "$(cat "$STAGE/REVISION")" = "${{ github.sha }}"
+        (cd "$STAGE" && sha256sum --check --strict CHECKSUMS.txt)
+        for payload in fhs/boot/kernel.wasm fhs/bin/status.wasm; do
+          test -s "$STAGE/$payload"
         done
-
-        # Per-example binary subtrees keep each reference WASM component
-        # available under `/examples/<name>/bin/`.
-        for example_dir in artifacts/wasm-artifacts/examples/*/bin; do
-          if [ -d "$example_dir" ]; then
-            name=$(basename "$(dirname "$example_dir")")
-            mkdir -p "$STAGE/examples/$name/bin"
-            cp "$example_dir"/*.wasm "$STAGE/examples/$name/bin/" 2>/dev/null || true
-          fi
+        for platform in linux/x86_64 linux/aarch64 macos/aarch64 macos/x86_64 linux/musl-x86_64; do
+          test -s "$STAGE/bin/ww/$platform/ww"
         done
-        # Host binaries: from CI artifacts if host lane ran, else from previous IPNS
-        if [ "$HOST_CHANGED" = "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          echo "Using fresh binaries from build matrix"
-          cp artifacts/ww-linux-x86_64/ww   "$STAGE/bin/ww/linux/x86_64/ww"
-          cp artifacts/ww-linux-aarch64/ww   "$STAGE/bin/ww/linux/aarch64/ww"
-          cp artifacts/ww-macos-aarch64/ww   "$STAGE/bin/ww/macos/aarch64/ww"
-          cp artifacts/ww-macos-x86_64/ww    "$STAGE/bin/ww/macos/x86_64/ww"
-        else
-          echo "Host unchanged — fetching previous binaries from IPNS"
-          # Fetch into staging files and replace the release tree only once
-          # every platform is present. A pod may turn over while this branch
-          # runs, so each bounded attempt selects a fresh healthy daemon.
-          fetch_previous_binaries() {
-            local attempt platform prev fetched
-            for attempt in 1 2 3; do
-              if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
-                echo "Previous-release fetch attempt $attempt could not find a non-terminating Ready IPFS daemon pod"
-              elif ! prev=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs name resolve /ipns/\$(kubectl exec $POD -- ipfs key list -l | awk '\$2 == \"ww-release\" { print \$1; exit }')"); then
-                echo "Previous-release fetch attempt $attempt could not resolve the IPNS release through $POD"
-              elif [ -z "$prev" ]; then
-                echo "Previous-release fetch attempt $attempt resolved an empty IPNS release through $POD"
-              else
-                fetched=true
-                for platform in linux/x86_64 linux/aarch64 macos/aarch64 macos/x86_64; do
-                  rm -f "$STAGE/bin/ww/$platform/ww.next"
-                  if ! $SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs cat $prev/bin/ww/$platform/ww" > "$STAGE/bin/ww/$platform/ww.next"; then
-                    echo "Previous-release fetch attempt $attempt failed for $platform from $prev through $POD"
-                    fetched=false
-                    break
-                  fi
-                  chmod +x "$STAGE/bin/ww/$platform/ww.next"
-                done
-                if [ "$fetched" = true ]; then
-                  for platform in linux/x86_64 linux/aarch64 macos/aarch64 macos/x86_64; do
-                    mv "$STAGE/bin/ww/$platform/ww.next" "$STAGE/bin/ww/$platform/ww"
-                  done
-                  echo "Fetched previous binaries from $prev through $POD"
-                  return 0
-                fi
-              fi
-
-              for platform in linux/x86_64 linux/aarch64 macos/aarch64 macos/x86_64; do
-                rm -f "$STAGE/bin/ww/$platform/ww.next"
-              done
-              if [ "$attempt" -lt 3 ]; then
-                backoff=$((attempt * 20))
-                echo "Previous-release fetch attempt $attempt failed; retrying in ${backoff}s..."
-                sleep "$backoff"
-              fi
-            done
-            return 1
-          }
-
-          if ! fetch_previous_binaries; then
-            echo "ERROR: could not fetch every previous-release binary — refusing to publish a partial tree"
-            exit 1
-          fi
-        fi
-
-        # Sanity check: every platform binary must exist and be non-empty.
-        # Catches silent truncation from `ipfs cat` and missing matrix outputs.
-        for platform in linux/x86_64 linux/aarch64 macos/aarch64 macos/x86_64; do
-          if [ ! -s "$STAGE/bin/ww/$platform/ww" ]; then
-            echo "ERROR: $STAGE/bin/ww/$platform/ww is missing or empty"
-            exit 1
-          fi
-        done
-
-        # Checksums (host binaries only)
-        # Section headers must match what install.sh expects (grep "^# sha256").
-        cd "$STAGE"
-        {
-          echo "# sha256"
-          find bin/ww/ -type f | sort | xargs sha256sum
-          echo ""
-          if command -v b3sum >/dev/null 2>&1; then
-            echo "# blake3"
-            find bin/ww/ -type f | sort | xargs b3sum
-          fi
-        } > CHECKSUMS.txt
-        cd -
 
         # Rsync release tree to VPS
-        rsync -a -e "$SSH_CMD" "$STAGE/" ${{ secrets.VPS_SSH }}:/tmp/ww-release-tree/
+        rsync -a --delete -e "$SSH_CMD" "$STAGE/" ${{ secrets.VPS_SSH }}:/tmp/ww-release-tree/
 
         # kubectl cp into pod, ipfs add with implicit pinning disabled,
         # explicitly pin the new root, publish IPNS, then prune only stale
@@ -1001,6 +896,8 @@ jobs:
             echo "Publish attempt $attempt could not find a non-terminating Ready IPFS daemon pod"
           else
             echo "Publishing through IPFS pod: $POD"
+            # SSH_CMD intentionally expands to the command and its fixed options.
+            # shellcheck disable=SC2086
             if timeout 12m $SSH_CMD ${{ secrets.VPS_SSH }} "
               set -e
               chmod +x /tmp/ww-ipfs-publish-release.sh

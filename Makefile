@@ -5,6 +5,7 @@
 
 P3_BUILD := scripts/build_wasip3_component.sh
 P3_TARGET_DIR ?= $(CURDIR)/target/wasip3
+FHS_DIR ?= target/fhs
 
 P3_CLI_ENV := --allow-import wasi:cli/environment@0.3.0 --allow-import wasi:cli/exit@0.3.0
 P3_CLI_TYPES := --allow-import wasi:cli/types@0.3.0
@@ -27,12 +28,14 @@ P3_READINESS := --allow-import wetware:kernel-runtime/readiness@1.0.0
 .PHONY: p3-chess p3-counter p3-discovery p3-echo p3-oracle p3-snap-hello-rs
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
+.PHONY: fhs verify-fhs package-check
 
-all: std try-publish-std examples host
+all: try-publish-std examples
+	$(MAKE) host
 
 # --- Host --------------------------------------------------------------------
 
-host:
+host: fhs
 	cargo build --release --locked
 
 test-deps:
@@ -86,6 +89,18 @@ routing-key-probe:
 # --- Std components ----------------------------------------------------------
 
 std: kernel status
+
+# Explicit dependencies also apply to direct `make host` and parallel builds.
+# Every consumer receives these exact validated bytes, not a home-directory copy.
+fhs: std
+	cargo run --locked --example stage_fhs -- stage std/kernel/bin/main.wasm std/status/bin/status.wasm $(FHS_DIR)
+
+verify-fhs:
+	cargo run --locked --example stage_fhs -- verify std/kernel/bin/main.wasm std/status/bin/status.wasm $(FHS_DIR)
+
+package-check: fhs
+	cargo test --locked --test canonical_package -- --include-ignored
+	python3 tests/test_build_payloads.py
 
 kernel:
 	$(P3_BUILD) \
@@ -208,12 +223,12 @@ IPNS_KEY ?=
 # the build continues without a CID (HostPathLoader fallback).
 # Default IPNS publication is host-owned and runs through `ww perform update`
 # plus the daemon republisher. This build target only imports the tree.
-try-publish-std: std
+try-publish-std: fhs
 	@$(MAKE) publish-std 2>/dev/null \
 		&& echo "  std namespace published to IPFS (host IPNS publish is daemon-owned)" \
 		|| echo "  std namespace publish skipped (Kubo not running)"
 
-publish-std: std
+publish-std: fhs
 	@echo "Assembling std namespace tree..."
 	$(eval STD_TREE := $(shell mktemp -d))
 	@mkdir -p $(STD_TREE)/kernel/bin
@@ -231,47 +246,17 @@ publish-std: std
 	@echo "CID written to target/std-namespace.cid"
 
 # --- Publish release tree to IPFS --------------------------------------------
-# Local equivalent of CI publish-ipfs. Publishes the repo working tree
-# (minus .git/target) with your local binary at bin/{os}/{arch}/ww.
-# Updates IPNS at releases.wetware.run if ww-release key exists.
-#
-# Usage:
-#   make publish          # publish tree + durable local pin + IPNS update
-#   make publish SKIP_PIN=1  # publish tree only (no durable pin)
-#
-# Local durable publishes do not prune old pins; remove obsolete local pins
-# manually when they are no longer needed.
-
+# Publish only the validated local Host and canonical FHS. This never copies
+# the working tree or installation/private state into the release.
+# RELEASE_ARTIFACTS must contain all five Host targets and canonical WASM.
+# Name updates require WW_RELEASE_EXPECTED_CURRENT=/ipfs/<cid>; SKIP_PIN=1
+# imports a content-addressed package without changing the release name.
 SKIP_PIN ?=
 
-publish: host
-	@echo "Assembling release tree..."
-	$(eval RELEASE_TREE := $(shell mktemp -d))
-	@rsync -a --exclude .git --exclude target . "$(RELEASE_TREE)/"
-	@mkdir -p "$(RELEASE_TREE)/bin/$$(uname -s | tr A-Z a-z)/$$(uname -m)"
-	@cp target/release/ww "$(RELEASE_TREE)/bin/$$(uname -s | tr A-Z a-z)/$$(uname -m)/ww"
-	@cd "$(RELEASE_TREE)" && { \
-		echo "# sha256"; \
-		find bin/ -type f | sort | xargs shasum -a 256; \
-		echo ""; \
-		if command -v b3sum >/dev/null 2>&1; then \
-			echo "# blake3"; \
-			find bin/ -type f | sort | xargs b3sum; \
-		fi; \
-	} > CHECKSUMS.txt
-	@echo "Publishing to IPFS..."
-	@CID=$$(ipfs add --pin=false -rQ --cid-version=1 "$(RELEASE_TREE)") && \
-		echo "  CID: $$CID" && \
-		echo "$$CID" > target/release.cid && \
-		if [ -z "$(SKIP_PIN)" ] && ipfs key list | grep -q ww-release 2>/dev/null; then \
-			echo "Pinning and publishing to IPNS..." && \
-			ipfs pin add "$$CID" && \
-			ipfs name publish --key=ww-release /ipfs/$$CID; \
-		else \
-			echo "  (skip pin/IPNS — no ww-release key or SKIP_PIN set)"; \
-		fi
-	@rm -rf "$(RELEASE_TREE)"
-	@echo "Done. CID written to target/release.cid"
+publish: host package-check
+	python3 tests/test_install.py --binary target/release/ww --fhs $(FHS_DIR)
+	bash tests/test_installed_boot.sh target/release/ww $(FHS_DIR)
+	SKIP_PIN="$(SKIP_PIN)" bash scripts/publish_local_release.sh target/release/ww $(FHS_DIR)
 
 # --- Test WASM components ----------------------------------------------------
 # Build every first-party component and verify its P3 command architecture.
@@ -308,7 +293,7 @@ agent-skills:
 CONTAINER_ENGINE ?= podman
 CONTAINER_TAG    ?= wetware:latest
 
-container-build:
+container-build: fhs
 	$(CONTAINER_ENGINE) build \
 		--build-arg WW_BUILD_GIT_SHA=$$(git rev-parse HEAD) \
 		-t $(CONTAINER_TAG) .

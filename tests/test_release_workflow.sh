@@ -55,14 +55,14 @@ grep -Fq "github.event_name == 'workflow_dispatch'" <<<"$release_job" \
   || fail "image-release job must remain reachable via workflow dispatch"
 grep -Fq "github.event_name == 'push' && github.ref == 'refs/heads/master'" <<<"$release_job" \
   || fail "image-release job must remain reachable on master pushes"
-grep -Fq 'push: true' <<<"$release_job" \
+grep -Fq 'docker push ghcr.io/wetware/ww:master' <<<"$release_job" \
   || fail "image-release job must push the published image"
 grep -Fq 'ghcr.io/wetware/ww:master' <<<"$release_job" \
   || fail "image-release job must retain the master image tag"
 grep -Fq "ghcr.io/wetware/ww:master-\${{ github.sha }}" <<<"$release_job" \
   || fail "image-release job must retain the commit-addressable image tag"
 
-grep -Fq 'needs: [changes, test, build-binaries, build-wasm, release_image]' "$WORKFLOW" \
+grep -Fq 'needs: [changes, test, validate-release, release_image]' "$WORKFLOW" \
   || fail "IPFS publication must wait for the image build, not a deployment"
 grep -Fq 'name: Publish to IPFS' "$WORKFLOW" \
   || fail "workflow must retain IPFS publication"
@@ -91,12 +91,19 @@ publish_retry_selection="$({
 })"
 grep -Fq "$pod_selection" <<<"$publish_retry_selection" \
   || fail "IPFS publisher must reselect a Ready daemon pod before each publish retry"
-grep -Fq 'fetch_previous_binaries()' "$WORKFLOW" \
-  || fail "IPFS publisher must retry prior-release binary staging"
-grep -Fq 'if ! fetch_previous_binaries; then' "$WORKFLOW" \
-  || fail "IPFS publisher must fail closed when prior-release staging cannot complete"
-staged_binary="\"\$STAGE/bin/ww/\$platform/ww.next\""
-grep -Fq "$staged_binary" "$WORKFLOW" \
-  || fail "IPFS publisher must stage prior-release binaries atomically"
+if grep -Fq 'fetch_previous_binaries' "$WORKFLOW"; then
+  fail "std-only releases must consume the current run's Host binaries"
+fi
+for condition in "needs.test.result == 'success'" "needs.validate-release.result == 'success'"; do
+  grep -Fq "$condition" <<<"$release_job" || fail "GHCR must fail closed on $condition"
+done
+grep -Fq "needs.release_image.result == 'success'" "$WORKFLOW" || fail 'IPFS must fail closed on image validation'
+grep -Fq 'name: Validate actual packaged installation and startup' "$WORKFLOW" || fail 'installer boot validation missing'
+grep -Fq 'bash tests/test_container_boot.sh ww-validated:deploy' "$WORKFLOW" || fail 'deploy boot gate missing'
+grep -Fq 'bash tests/test_container_boot.sh ww-validated:release' "$WORKFLOW" || fail 'release boot gate missing'
+grep -Fq 'bash tests/test_container_boot.sh ww-validated:source' "$WORKFLOW" || fail 'source boot gate missing'
+grep -Fq 'docker load -i tested-image.tar' <<<"$release_job" || fail 'GHCR must publish the tested image'
+grep -Fq "            - 'scripts/**'" "$WORKFLOW" || fail 'installer-only changes must trigger release validation'
+grep -Fq 'linux/musl-x86_64' "$WORKFLOW" || fail 'IPFS must include fifth Host target'
 
 echo "PASS: ww release workflow builds images without directly deploying ww-master"

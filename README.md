@@ -21,6 +21,7 @@ model running inside the cell.
 
 ```sh
 curl -sSL https://wetware.run/install | sh
+# Run the platform service activation command printed by the installer.
 curl http://localhost:2080/status
 ```
 
@@ -53,6 +54,13 @@ narrow `Membrane` containing only `peerId` and `Stat`.
 ```bash
 curl -sSL https://wetware.run/install | sh
 ```
+
+The installer verifies and installs the Host plus `fhs/boot/kernel.wasm` and
+`fhs/bin/status.wasm`. It creates identity only when absent and prints the
+platform service activation command. Installation does not start the service.
+See [installation and recovery](doc/installation.md) for manual activation,
+managed-file ownership, and incomplete-install recovery. `ww perform upgrade`
+is disabled; use the current installer for Host replacement.
 
 Or build from source:
 
