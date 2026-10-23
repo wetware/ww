@@ -85,7 +85,7 @@ blake3 = { workspace = true }
 libp2p = { workspace = true, features = ["tokio", "tcp", "noise", "yamux", "macros", "identify", "rsa", "request-response", "ed25519", "kad", "autonat", "relay", "dcutr", "quic"] }
 ipfs = { path = "crates/ipfs" }
 clap = { version = "4.5.51", features = ["derive", "env"] }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 nix = { version = "0.30.1", features = ["socket"] }
 wasmtime = { workspace = true, features = ["call-hook"] }
 capnp = { workspace = true }

@@ -520,7 +520,8 @@ fn worker_loop(
                             counts: cell_counts.clone(),
                             worker_id: id,
                         };
-                        let span = tracing::info_span!("cell", name = %cell_name);
+                        // JSON reserves span.name; retain name for existing filters.
+                        let span = tracing::info_span!("cell", name = %cell_name, cell_name = %cell_name);
                         let cancelled = rpc::local_tasks::shutdown_token();
                         let handle = tokio::task::spawn_local(async move {
                             let _guard = guard;

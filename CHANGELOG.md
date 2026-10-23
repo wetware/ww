@@ -16,6 +16,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a check because CID-based pins do not establish exclusive ownership. Shared
   kernel validation now checks the command export's async signature before
   instantiation. Passing a check does not establish runtime readiness.
+- **Structured Host logs (#751).** Host diagnostics now use stderr, preserving
+  stdout for command results. Interactive stderr selects compact colored logs;
+  redirected stderr selects JSON Lines with typed fields and current-span context.
+  `WW_LOG_FORMAT=auto|compact|json` overrides format selection, and nonempty
+  `NO_COLOR` disables color. Existing `RUST_LOG` directives and internal crate
+  coverage remain supported, with `warn` on a terminal and `info` otherwise.
 - **FHS-selected PID0 boot (#735 Landing 3 of 3).** Bare `ww run` boots
   `/boot/kernel.wasm` from installed state without importing the current directory.
   `--fhs-root` and `WW_FHS_ROOT` configure the baseline. Each deployment freezes

@@ -111,9 +111,12 @@ The default is `current_thread`. We pick it because:
 - A single-threaded runtime composes naturally with `LocalSet`, which is
   required for cell drivers (`wasmtime::Store`) and Cap'n Proto RPC
   systems (the generated client types are `!Send`).
-- Tracing spans entered with `_span.entered()` only stay attached
-  to the thread that entered them. A current-thread runtime keeps
-  every task in that one span without manual `Instrument`-ing.
+- A service span entered outside `Runtime::block_on` can label the whole
+  current thread. This ambient label does not provide task-specific attribution:
+  concurrent futures still interleave on a `current_thread` runtime or `LocalSet`.
+  Attach task-specific spans to futures with `tracing::Instrument`; do not hold
+  an entered guard across `.await`. Separately spawned tasks require explicit
+  propagation; `ManagedRpc` worker propagation remains a follow-up to #751.
 - Shutdown is straightforward: dropping the `Runtime` joins exactly
   what that subsystem started.
 
