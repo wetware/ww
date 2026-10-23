@@ -63,6 +63,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   errors report deterministic composition failures.
 
 ### Fixed
+- **Metrics exposition correctness (#750, first landing).** `/metrics` omits
+  seven unsupported ARC cache and stream samples instead of reporting zeros.
+  Metric metadata and public registry interfaces remain available. Live Wasmtime
+  state and counters remain exposed and have real HTTP compilation/cache tests.
+  Documentation now identifies unavailable fuel and RPC measurements.
 - **Cell async spans retain correct task attribution (#751).** Executor workers
   enter each Cell span only while polling or dropping its future. Concurrent
   Cells retain their executor parent without leaking spans into unrelated tasks.
