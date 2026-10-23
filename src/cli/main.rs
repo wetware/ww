@@ -12,6 +12,7 @@ use libp2p::Multiaddr;
 
 mod daemon_cmd;
 mod doctor_cmd;
+mod image_cmd;
 mod installation;
 mod ns_cmd;
 mod p3_toolchain;
@@ -65,6 +66,11 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// Statically validate composed images without executing guest code.
+    Image {
+        #[command(subcommand)]
+        action: image_cmd::ImageAction,
+    },
     /// Initialize a new typed cell guest project.
     ///
     /// Scaffolds a complete Rust project for a Wetware guest with
@@ -719,6 +725,7 @@ fn atom_advisory_candidates(
 impl Commands {
     async fn run(self) -> Result<()> {
         match self {
+            Commands::Image { action } => action.run().await,
             Commands::Init { name } => Self::init(name).await,
             Commands::Build { path } => Self::build(path).await,
             Commands::Run {
@@ -749,26 +756,12 @@ impl Commands {
                      ww run ./kernel.wasm:/boot/kernel.wasm or \
                      ww run /ipfs/<CID>:/boot/kernel.wasm."
                 );
-                let home = dirs::home_dir();
-                let installed_baseline = Self::installed_baseline_mount(fhs_root, home.as_deref())?;
-                let mut mounts = ww::cell::mount::parse_args(&mount_args)?;
-                let invocation_cwd = std::env::current_dir().context("read invocation CWD")?;
-                ww::cell::mount::freeze_local_paths(
-                    &mut mounts,
-                    &invocation_cwd,
-                    dirs::home_dir().as_deref(),
+                let (installed_baseline, mounts) = Self::startup_mounts(
+                    &mount_args,
+                    fhs_root,
+                    &mut namespace_root,
+                    stem.is_some() || ipns_stem.is_some(),
                 )?;
-                // Bare installed-state startup discovers only host configuration.
-                // Explicit source invocations preserve their existing namespace scan roots.
-                if mounts.is_empty()
-                    && namespace_root.is_empty()
-                    && stem.is_none()
-                    && ipns_stem.is_none()
-                {
-                    if let Some(home) = &home {
-                        namespace_root.push(home.join(".ww"));
-                    }
-                }
                 // Identity is passed separately — NOT as a mount.
                 // The host reads it to create the signing key for the Membrane.
                 // It must never enter the merged FHS tree (which is preopened
@@ -1260,6 +1253,29 @@ system::export!({iface_name}Guest);
                  Pass --identity <path> or use --insecure-ephemeral (insecure)."
             )
         }
+    }
+
+    /// Shared invocation-time source selection for run and image check.
+    fn startup_mounts(
+        mount_args: &[String],
+        fhs_root: Option<PathBuf>,
+        namespace_roots: &mut Vec<PathBuf>,
+        authoritative_source: bool,
+    ) -> Result<(Option<ww::cell::mount::Mount>, Vec<ww::cell::mount::Mount>)> {
+        let home = dirs::home_dir();
+        let baseline = Self::installed_baseline_mount(fhs_root, home.as_deref())?;
+        let mut mounts = ww::cell::mount::parse_args(mount_args)?;
+        ww::cell::mount::freeze_local_paths(
+            &mut mounts,
+            &std::env::current_dir().context("read invocation CWD")?,
+            home.as_deref(),
+        )?;
+        if mounts.is_empty() && namespace_roots.is_empty() && !authoritative_source {
+            if let Some(home) = home {
+                namespace_roots.push(home.join(".ww"));
+            }
+        }
+        Ok((baseline, mounts))
     }
 
     /// Discover the publishable baseline without importing private installation state.

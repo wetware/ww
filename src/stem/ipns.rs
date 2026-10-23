@@ -56,6 +56,7 @@ pub struct Source {
     config: Config,
     routing: RoutingClient,
     store: RecordStore,
+    persist_observations: bool,
     floor: Option<SignedRecord>,
     last_update: Option<Update>,
     authoritative: bool,
@@ -78,6 +79,7 @@ impl Source {
             config,
             routing,
             store,
+            persist_observations: true,
             floor,
             last_update: None,
             authoritative: false,
@@ -85,6 +87,22 @@ impl Source {
             next_fetch: tokio::time::Instant::now(),
             retry_delay,
         })
+    }
+
+    /// Resolve the same initial update as boot without writing follower state.
+    ///
+    /// An unexpired persisted watermark takes precedence over the network.
+    /// Otherwise, one network observation must pass the normal signature,
+    /// expiry, ordering, and equivocation checks. An expired watermark remains
+    /// an ordering floor. Invalid signed targets remain [`Update::InvalidHead`];
+    /// callers must reject them rather than substitute another deployment.
+    ///
+    /// The returned update is a one-time observation: no subsequent refresh or
+    /// expiry notification runs, and no watermark advances on disk.
+    pub async fn snapshot(config: Config) -> Result<Update> {
+        let mut source = Self::new(config)?;
+        source.persist_observations = false;
+        source.current().await
     }
 
     pub fn watermark_path(&self) -> &std::path::Path {
@@ -172,7 +190,8 @@ impl Source {
     /// Validate and apply one fetched raw record.
     ///
     /// `Some(update)` is returned only for a meaningful authoritative state
-    /// change. Persistence completes before memory changes or update delivery.
+    /// change. For a following source, persistence completes before memory
+    /// changes or update delivery. A one-shot snapshot leaves disk unchanged.
     fn observe(&mut self, raw: Vec<u8>) -> Result<Option<Update>> {
         let candidate = SignedRecord::decode(self.config.name, raw)
             .context("reject malformed or cryptographically invalid IPNS observation")?;
@@ -221,7 +240,9 @@ impl Source {
 
         // There is no cancellation point from durable persistence through the
         // state update and return to the Source caller.
-        self.store.persist(candidate.raw())?;
+        if self.persist_observations {
+            self.store.persist(candidate.raw())?;
+        }
         self.floor = Some(candidate);
         self.authoritative = true;
         self.last_update = Some(update.clone());
@@ -475,6 +496,128 @@ mod tests {
         );
         stream.write_all(header.as_bytes()).await.unwrap();
         stream.write_all(body).await.unwrap();
+    }
+
+    async fn snapshot_server(records: Vec<Vec<u8>>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for record in records {
+                for (status, body) in [("400 Bad Request", Vec::new()), ("200 OK", record)] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request).await.unwrap();
+                    response(&mut stream, status, &body).await;
+                }
+            }
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn snapshot_matches_boot_without_creating_follower_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let keypair = Keypair::generate_ed25519();
+        let record = signed(&keypair, test_cid(1), 3, ChronoDuration::hours(1));
+        let (url, server) = snapshot_server(vec![record.clone(), record]).await;
+        let config = Config::new(keypair.public().to_peer_id(), url, directory.path().into());
+
+        let checked = Source::snapshot(config.clone()).await.unwrap();
+        assert_eq!(checked, Update::Head(Head { cid: test_cid(1) }));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        let mut boot = Source::new(config).unwrap();
+        assert_eq!(boot.current().await.unwrap(), checked);
+        assert!(boot.watermark_path().exists());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_matches_boot_persisted_head_without_network() {
+        let directory = tempfile::tempdir().unwrap();
+        let keypair = Keypair::generate_ed25519();
+        let mut initial = source(&keypair, directory.path());
+        let record = signed(&keypair, test_cid(1), 3, ChronoDuration::hours(1));
+        initial.observe(record.clone()).unwrap();
+
+        let checked = Source::snapshot(initial.config.clone()).await.unwrap();
+        let mut boot = source(&keypair, directory.path());
+        assert_eq!(checked, Update::Head(Head { cid: test_cid(1) }));
+        assert_eq!(boot.current().await.unwrap(), checked);
+        assert_eq!(std::fs::read(boot.watermark_path()).unwrap(), record);
+    }
+
+    #[tokio::test]
+    async fn snapshot_preserves_expired_floor_and_rejects_rollback_or_equivocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let keypair = Keypair::generate_ed25519();
+        let original = source(&keypair, directory.path());
+        let floor = signed(&keypair, test_cid(1), 9, ChronoDuration::seconds(-1));
+        original.store.persist(&floor).unwrap();
+        for (cid, sequence, accepted) in [
+            (test_cid(2), 8, false),
+            (test_cid(2), 9, false),
+            (test_cid(2), 10, true),
+        ] {
+            let record = signed(&keypair, cid, sequence, ChronoDuration::hours(1));
+            let (url, server) = snapshot_server(vec![record.clone(), record]).await;
+            let config = Config::new(keypair.public().to_peer_id(), url, directory.path().into());
+            let checked = Source::snapshot(config.clone()).await;
+            assert_eq!(std::fs::read(original.watermark_path()).unwrap(), floor);
+            let boot = Source::new(config).unwrap().current().await;
+            if accepted {
+                assert_eq!(checked.unwrap(), Update::Head(Head { cid }));
+                assert_eq!(boot.unwrap(), Update::Head(Head { cid }));
+            } else {
+                assert!(checked.is_err());
+                assert!(boot.is_err());
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_preserves_invalid_head_without_persisting_network_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let keypair = Keypair::generate_ed25519();
+        let selected = "/ipns/not-a-deployment";
+        let record = Record::new(
+            &keypair,
+            selected,
+            Utc::now() + ChronoDuration::hours(1),
+            1,
+            RECORD_TTL,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let (url, server) = snapshot_server(vec![record.clone()]).await;
+        let config = Config::new(keypair.public().to_peer_id(), url, directory.path().into());
+        let checked = Source::snapshot(config.clone()).await.unwrap();
+        let Update::InvalidHead(invalid) = &checked else {
+            panic!("invalid authoritative head must not fall back to a deployment");
+        };
+        assert_eq!(invalid.selected, selected.as_bytes());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        server.await.unwrap();
+
+        let boot = Source::new(config.clone()).unwrap();
+        boot.store.persist(&record).unwrap();
+        assert_eq!(Source::snapshot(config).await.unwrap(), checked);
+        assert_eq!(std::fs::read(boot.watermark_path()).unwrap(), record);
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_corrupt_watermark_without_replacing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let keypair = Keypair::generate_ed25519();
+        let initial = source(&keypair, directory.path());
+        initial.store.persist(b"corrupt").unwrap();
+
+        let error = Source::snapshot(initial.config.clone()).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("persisted IPNS follower watermark"));
+        assert_eq!(std::fs::read(initial.watermark_path()).unwrap(), b"corrupt");
     }
 
     #[tokio::test(start_paused = true)]

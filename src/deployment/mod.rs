@@ -6,7 +6,6 @@
 //! operator policy.
 
 use std::collections::HashSet;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,10 +17,9 @@ use rand::Rng;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
-use crate::cell::image::{
-    compose_mounts, inspect_source, select_kernel_file, CompositionError, FrozenMount, GuestTarget,
-};
+use crate::cell::image::{CompositionError, FrozenMount};
 use crate::cell::vfs::CidTree;
+use crate::image::{bounded, OperationTimeout, PermanentPreparationError, OPERATION_TIMEOUT};
 use crate::ipfs::cid_identity::decode_cid;
 use crate::kernel;
 use crate::services::{ExecutorPool, SpawnRequest};
@@ -31,7 +29,6 @@ use cell::engine::RuntimeEngine;
 mod retained_pinner;
 pub use retained_pinner::RetainedPinner;
 
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 const RETRY_JITTER_MAX: Duration = Duration::from_millis(500);
@@ -46,36 +43,6 @@ enum FailureClass {
     Permanent,
     Unknown,
 }
-
-#[derive(Debug)]
-struct OperationTimeout {
-    operation: &'static str,
-    timeout: Duration,
-}
-
-impl std::fmt::Display for OperationTimeout {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "deployment operation {} made no progress within {}s",
-            self.operation,
-            self.timeout.as_secs_f64()
-        )
-    }
-}
-
-impl std::error::Error for OperationTimeout {}
-
-#[derive(Debug)]
-struct PermanentPreparationError(String);
-
-impl std::fmt::Display for PermanentPreparationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for PermanentPreparationError {}
 
 fn classify_failure(error: &anyhow::Error) -> FailureClass {
     if let Some(selection) = error.downcast_ref::<cell::image::KernelFileError>() {
@@ -126,15 +93,6 @@ fn classify_failure(error: &anyhow::Error) -> FailureClass {
     } else {
         FailureClass::Unknown
     }
-}
-
-async fn bounded<T>(operation: &'static str, future: impl Future<Output = Result<T>>) -> Result<T> {
-    tokio::time::timeout(OPERATION_TIMEOUT, future)
-        .await
-        .map_err(|_| OperationTimeout {
-            operation,
-            timeout: OPERATION_TIMEOUT,
-        })?
 }
 
 fn retry_delay(current: &mut Duration) -> Duration {
@@ -222,33 +180,15 @@ async fn prepare_root(
     if *cancel.borrow() {
         anyhow::bail!("deployment preparation cancelled");
     }
-    if head.is_none() && installed_baseline.is_none() && frozen_mounts.is_empty() {
-        return Err(PermanentPreparationError(
-            "deployment has neither a Stem head nor configured root layers".to_owned(),
-        )
-        .into());
-    }
-
     let boot_client = crate::ipfs::BootClient::one_attempt(ipfs_client.clone(), OPERATION_TIMEOUT);
-    // The installed baseline is lower than the head. Namespace and positional
-    // operations retain their frozen order above both roots.
-    let mut operations = Vec::new();
-    let initial_root = if let Some(baseline) = installed_baseline {
-        if let Some(head) = &head {
-            let source = inspect_source(head.cid, &boot_client, cancel).await?;
-            operations.push(FrozenMount::new(source, GuestTarget::root())?);
-        }
-        Some(baseline.source().cid())
-    } else {
-        head.as_ref().map(|head| head.cid)
-    };
-    operations.extend_from_slice(frozen_mounts);
-    let effective = bounded(
-        "effective-root merge",
-        compose_mounts(initial_root, &operations, &boot_client, cancel),
+    let effective = crate::image::compose_root(
+        head.as_ref().map(|head| head.cid),
+        installed_baseline,
+        frozen_mounts,
+        &boot_client,
+        cancel,
     )
-    .await
-    .context("composing effective deployment root")?;
+    .await?;
     pins.insert(effective);
 
     if *cancel.borrow() {
@@ -275,31 +215,20 @@ async fn prepare_root(
     bounded("effective-root prewarm", tree.pre_warm(&effective))
         .await
         .context("pre-warming effective deployment root")?;
-    let file = select_kernel_file(effective, &boot_client, cancel)
-        .await
-        .context("selecting /boot/kernel.wasm from effective deployment root")?;
-    let kernel = tokio::select! {
-        biased;
-        _ = preparation_cancelled(cancel) => anyhow::bail!("deployment preparation cancelled"),
-        result = kernel::PreparedKernel::prepare(file, compilation, runtime_engine.clone()) => result?,
-    };
+    let kernel = crate::image::prepare_kernel(
+        effective,
+        &boot_client,
+        runtime_engine.clone(),
+        compilation,
+        cancel,
+    )
+    .await?;
     Ok(PreparedRoot {
         head,
         effective,
         kernel,
         pins: std::mem::take(pins),
     })
-}
-
-async fn preparation_cancelled(cancel: &mut watch::Receiver<bool>) {
-    loop {
-        if *cancel.borrow_and_update() {
-            return;
-        }
-        if cancel.changed().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
 }
 
 struct PreparationOutput {
@@ -3200,6 +3129,682 @@ mod tests {
         server.await.unwrap();
     }
 
+    // Catches divergent composition, kernel selection, and validation between
+    // standalone image preparation and deployment's actual preparation path.
+    #[tokio::test]
+    async fn standalone_and_boot_preparation_agree_on_frozen_roots() {
+        let (client, _, _requests, shutdown, server) = recording_kubo().await;
+        let staging = tempfile::tempdir().unwrap();
+        let tree = Arc::new(CidTree::new(
+            OLD_ROOT.parse().unwrap(),
+            client.clone(),
+            staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
+        ));
+        let boot_client = crate::ipfs::BootClient::one_attempt(client.clone(), OPERATION_TIMEOUT);
+        let runtime = kernel::test_support::runtime();
+        let compilation = kernel::Compilation::default();
+        let (_cancel, mut cancel) = watch::channel(false);
+        for (root, expected_failure) in [
+            (ROOT, None),
+            (kernel::test_support::EMPTY_ROOT, Some("missing")),
+            (kernel::test_support::INVALID_ROOT, Some("invalid")),
+        ] {
+            let root = root.parse::<Cid>().unwrap();
+            let boot = prepare_root(
+                Some(Head { cid: root }),
+                None,
+                &runtime,
+                &compilation,
+                &[],
+                &client,
+                Prewarm::Existing(&tree),
+                &mut PinSet::default(),
+                &mut cancel,
+            )
+            .await;
+            let standalone = async {
+                let effective =
+                    crate::image::compose_root(Some(root), None, &[], &boot_client, &mut cancel)
+                        .await?;
+                crate::image::prepare_kernel(
+                    effective,
+                    &boot_client,
+                    runtime.clone(),
+                    &compilation,
+                    &mut cancel,
+                )
+                .await
+            }
+            .await;
+            match expected_failure {
+                None => {
+                    let boot = boot.unwrap();
+                    let standalone = standalone.unwrap();
+                    assert_eq!(standalone.effective_root(), root);
+                    assert_eq!(standalone.effective_root(), boot.effective);
+                    assert_eq!(standalone.source_file(), boot.kernel.source_file());
+                    assert_eq!(standalone.runtime_cid(), boot.kernel.runtime_cid());
+                    assert_eq!(
+                        standalone.source_file(),
+                        KERNEL_BLOCKS[1].0.parse::<Cid>().unwrap()
+                    );
+                }
+                Some(kind) => {
+                    let boot = boot.unwrap_err();
+                    let standalone = standalone.unwrap_err();
+                    assert_eq!(classify_failure(&boot), FailureClass::Permanent);
+                    assert_eq!(classify_failure(&standalone), FailureClass::Permanent);
+                    if kind == "missing" {
+                        for error in [&boot, &standalone] {
+                            assert_eq!(
+                                error
+                                    .downcast_ref::<cell::image::KernelFileError>()
+                                    .unwrap()
+                                    .kind(),
+                                cell::image::KernelFileFailure::MissingPath
+                            );
+                        }
+                    } else {
+                        for error in [&boot, &standalone] {
+                            assert!(error
+                                .downcast_ref::<cell::proc::KernelValidationError>()
+                                .is_some());
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(*tree.root_cid(), OLD_ROOT.parse::<Cid>().unwrap());
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    // Small deterministic UnixFS fixtures let the two production entry points
+    // consume identical bytes. Backend faults are injected below HTTP; this is
+    // not a substitute for the real Kubo pin/import/GC integration fixtures.
+    #[derive(Clone, Default)]
+    struct PreparationBlocks(std::collections::HashMap<Cid, Vec<u8>>);
+
+    impl PreparationBlocks {
+        fn varint(mut value: u64, bytes: &mut Vec<u8>) {
+            while value >= 128 {
+                bytes.push(value as u8 | 0x80);
+                value >>= 7;
+            }
+            bytes.push(value as u8);
+        }
+
+        fn field(tag: u8, value: &[u8], bytes: &mut Vec<u8>) {
+            bytes.push(tag);
+            Self::varint(value.len() as u64, bytes);
+            bytes.extend_from_slice(value);
+        }
+
+        fn block(&mut self, codec: u64, bytes: Vec<u8>) -> (Cid, u64) {
+            use sha2::{Digest, Sha256};
+            let cid = Cid::new_v1(
+                codec,
+                cid::multihash::Multihash::wrap(0x12, &Sha256::digest(&bytes)).unwrap(),
+            );
+            let size = bytes.len() as u64;
+            self.0.insert(cid, bytes);
+            (cid, size)
+        }
+
+        fn pb(&mut self, metadata: &[u8], links: &[(&str, (Cid, u64))]) -> (Cid, u64) {
+            let mut bytes = Vec::new();
+            let mut descendants = 0;
+            for (name, (cid, size)) in links {
+                let mut link = Vec::new();
+                Self::field(10, &cid.to_bytes(), &mut link);
+                Self::field(18, name.as_bytes(), &mut link);
+                link.push(24);
+                Self::varint(*size, &mut link);
+                Self::field(18, &link, &mut bytes);
+                descendants += size;
+            }
+            Self::field(10, metadata, &mut bytes);
+            let (cid, size) = self.block(0x70, bytes);
+            (cid, size + descendants)
+        }
+
+        fn directory(&mut self, links: &[(&str, (Cid, u64))]) -> (Cid, u64) {
+            self.pb(&[8, 1], links)
+        }
+
+        fn root(&mut self, kernel: (Cid, u64)) -> Cid {
+            let boot = self.directory(&[("kernel.wasm", kernel)]);
+            self.directory(&[("boot", boot)]).0
+        }
+
+        fn kernel(bytes: Vec<u8>) -> (Self, Cid, Cid) {
+            let mut blocks = Self::default();
+            let file = blocks.block(0x55, bytes);
+            let root = blocks.root(file);
+            (blocks, root, file.0)
+        }
+
+        async fn serve(
+            self,
+            root: Cid,
+        ) -> (
+            crate::ipfs::HttpClient,
+            oneshot::Sender<()>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (shutdown, mut stop) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                loop {
+                    let accepted = tokio::select! {
+                        result = listener.accept() => result.unwrap(),
+                        _ = &mut stop => return,
+                    };
+                    let (mut stream, _) = accepted;
+                    let request = read_request(&mut stream).await;
+                    let path = request
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap();
+                    let (status, body) = if path.starts_with("/api/v0/block/get") {
+                        let value = path
+                            .split("arg=")
+                            .nth(1)
+                            .unwrap()
+                            .split('&')
+                            .next()
+                            .unwrap();
+                        let cid = value.parse::<Cid>().unwrap();
+                        match self.0.get(&cid) {
+                            Some(bytes) => ("200 OK", bytes.clone()),
+                            None => (
+                                "500 Internal Server Error",
+                                br#"{"Message":"block unavailable","Code":0,"Type":"error"}"#
+                                    .to_vec(),
+                            ),
+                        }
+                    } else if path.starts_with("/api/v0/dag/import") {
+                        assert!(request
+                            .bytes
+                            .windows(root.to_bytes().len())
+                            .any(|part| part == root.to_bytes()));
+                        ("200 OK", serde_json::json!({"Root":{"Cid":{"/":root.to_string()},"PinErrorMsg":""}}).to_string().into_bytes())
+                    } else if path.starts_with("/api/v0/ls") {
+                        ("200 OK", br#"{"Objects":[{"Links":[]}]}"#.to_vec())
+                    } else {
+                        assert!(
+                            path.starts_with("/api/v0/pin/add"),
+                            "unexpected endpoint {path}"
+                        );
+                        ("200 OK", b"{}".to_vec())
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(header.as_bytes()).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                }
+            });
+            (
+                crate::ipfs::HttpClient::new(format!("http://{address}")),
+                shutdown,
+                task,
+            )
+        }
+    }
+
+    // Match the accepted production fixture's import declarations. These WAT
+    // variants change only the member/type being challenged, and a trapping
+    // start proves both preparation paths stop before guest instantiation.
+    fn preparation_component(transport: &str, readiness: &str, command: &str) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(component
+            {transport}
+            {readiness}
+            (core module $module
+                (func $start unreachable)
+                (start $start)
+                (func (export "run") unreachable))
+            (core instance $instance (instantiate $module))
+            {command})"#
+        ))
+        .unwrap()
+    }
+
+    const PREPARATION_TRANSPORT: &str = r#"
+        (import "wetware:transport/connection@0.2.0" (instance
+            (type $error (variant (case "failed" string)))
+            (export "transport-error" (type $transport-error (eq $error)))
+            (export "open" (func (param "outgoing" (stream u8))
+                (result (tuple (stream u8) (future (result (error $transport-error)))))))))"#;
+    const PREPARATION_READINESS: &str = r#"
+        (import "wetware:kernel-runtime/readiness@1.0.0" (instance
+            (type $error (enum "stale-generation"))
+            (export "ready-error" (type $ready-error (eq $error)))
+            (export "kernel-ready" (func (result (result (error $ready-error)))))))"#;
+    const PREPARATION_COMMAND: &str = r#"
+        (func $run async (result (result))
+            (canon lift (core func $instance "run") async))
+        (instance (export (interface "wasi:cli/run@0.3.0"))
+            (export "run" (func $run)))"#;
+
+    #[derive(Clone, Copy, Debug)]
+    enum PreparationExpectation {
+        Valid(Cid),
+        InvalidDag(&'static str),
+        InvalidFile(&'static str),
+        Unavailable,
+        InvalidComponent,
+        Compatibility(&'static str),
+    }
+
+    #[tokio::test]
+    async fn standalone_and_boot_agree_on_dag_faults_and_p3_contracts() {
+        use PreparationExpectation::*;
+        let valid = preparation_component(
+            PREPARATION_TRANSPORT,
+            PREPARATION_READINESS,
+            PREPARATION_COMMAND,
+        );
+        let (valid_blocks, valid_root, valid_file) = PreparationBlocks::kernel(valid.clone());
+        let mut cases = vec![(
+            "trapping-start",
+            valid_blocks.clone(),
+            valid_root,
+            Valid(valid_file),
+        )];
+        for (name, transport, readiness, command, member) in [
+            (
+                "missing-open",
+                r#"(import "wetware:transport/connection@0.2.0" (instance))"#,
+                PREPARATION_READINESS,
+                PREPARATION_COMMAND,
+                "open",
+            ),
+            (
+                "missing-ready",
+                PREPARATION_TRANSPORT,
+                r#"(import "wetware:kernel-runtime/readiness@1.0.0" (instance))"#,
+                PREPARATION_COMMAND,
+                "kernel-ready",
+            ),
+            (
+                "wrong-open-type",
+                r#"(import "wetware:transport/connection@0.2.0" (instance (export "open" (func))))"#,
+                PREPARATION_READINESS,
+                PREPARATION_COMMAND,
+                "open",
+            ),
+            (
+                "wrong-ready-type",
+                PREPARATION_TRANSPORT,
+                r#"(import "wetware:kernel-runtime/readiness@1.0.0" (instance (export "kernel-ready" (func))))"#,
+                PREPARATION_COMMAND,
+                "kernel-ready",
+            ),
+            (
+                "missing-command",
+                PREPARATION_TRANSPORT,
+                PREPARATION_READINESS,
+                "",
+                "wasi:cli/run",
+            ),
+            (
+                "wrong-command-result",
+                PREPARATION_TRANSPORT,
+                PREPARATION_READINESS,
+                r#"(func $run async (result u32) (canon lift (core func $instance "run") async)) (instance (export (interface "wasi:cli/run@0.3.0")) (export "run" (func $run)))"#,
+                "signature",
+            ),
+            (
+                "wrong-command-type",
+                PREPARATION_TRANSPORT,
+                PREPARATION_READINESS,
+                r#"(func $run (canon lift (core func $instance "run"))) (instance (export (interface "wasi:cli/run@0.3.0")) (export "run" (func $run)))"#,
+                "run",
+            ),
+        ] {
+            let bytes = preparation_component(transport, readiness, command);
+            let (blocks, root, _) = PreparationBlocks::kernel(bytes);
+            cases.push((name, blocks, root, Compatibility(member)));
+        }
+        for (name, bytes) in [
+            ("invalid-component", b"not wasm".to_vec()),
+            ("core-module", wat::parse_str("(module)").unwrap()),
+        ] {
+            let (blocks, root, _) = PreparationBlocks::kernel(bytes);
+            cases.push((name, blocks, root, InvalidComponent));
+        }
+        let mut corrupted = valid_blocks.clone();
+        corrupted.0.get_mut(&valid_file).unwrap()[0] ^= 1;
+        cases.push(("corrupt-raw", corrupted, valid_root, InvalidFile("CID")));
+        let mut corrupted = valid_blocks.clone();
+        corrupted.0.get_mut(&valid_root).unwrap()[0] ^= 1;
+        cases.push(("corrupt-dagpb", corrupted, valid_root, InvalidDag("CID")));
+        for (name, missing) in [
+            ("missing-file-block", valid_file),
+            ("missing-directory-block", valid_root),
+        ] {
+            let mut missing_blocks = valid_blocks.clone();
+            missing_blocks.0.remove(&missing);
+            cases.push((name, missing_blocks, valid_root, Unavailable));
+        }
+        for (name, metadata) in [("hamt", vec![8, 5]), ("malformed-unixfs", vec![0xff])] {
+            let mut blocks = PreparationBlocks::default();
+            let root = blocks.pb(&metadata, &[]).0;
+            cases.push((
+                name,
+                blocks,
+                root,
+                InvalidDag(if name == "hamt" { "HAMT" } else { "malformed" }),
+            ));
+        }
+        let mut blocks = PreparationBlocks::default();
+        let root = blocks.block(0x70, vec![0x12, 0xff]).0;
+        cases.push(("malformed-dagpb", blocks, root, InvalidDag("malformed")));
+        for name in [
+            "directory-kernel",
+            "symlink-kernel",
+            "symlink-ancestor",
+            "file-ancestor",
+        ] {
+            let mut blocks = PreparationBlocks::default();
+            let entry = match name {
+                "directory-kernel" => blocks.directory(&[]),
+                "file-ancestor" => blocks.block(0x55, b"file".to_vec()),
+                _ => blocks.pb(&[8, 4, 18, 1, b'x'], &[]),
+            };
+            let root = if name.ends_with("ancestor") {
+                blocks.directory(&[("boot", entry)]).0
+            } else {
+                blocks.root(entry)
+            };
+            cases.push((
+                name,
+                blocks,
+                root,
+                InvalidFile(if name.ends_with("ancestor") {
+                    "ancestor"
+                } else if name == "symlink-kernel" {
+                    "symlink"
+                } else {
+                    "not a regular file"
+                }),
+            ));
+        }
+        let mut blocks = PreparationBlocks::default();
+        let chunk = blocks.block(0x55, vec![0; 1024 * 1024]);
+        let mut metadata = vec![8, 2, 24];
+        PreparationBlocks::varint(9 * chunk.1, &mut metadata);
+        for _ in 0..9 {
+            metadata.push(32);
+            PreparationBlocks::varint(chunk.1, &mut metadata);
+        }
+        let file = blocks.pb(&metadata, &vec![("", chunk); 9]);
+        let root = blocks.root(file);
+        cases.push((
+            "repeated-chunks-over-logical-limit",
+            blocks,
+            root,
+            InvalidFile("8 MiB"),
+        ));
+
+        let runtime = kernel::test_support::runtime();
+        let compilation = kernel::Compilation::default();
+        for (name, blocks, root, expected) in cases {
+            let (client, shutdown, server) = blocks.serve(root).await;
+            let boot_client =
+                crate::ipfs::BootClient::one_attempt(client.clone(), OPERATION_TIMEOUT);
+            let staging = tempfile::tempdir().unwrap();
+            let tree = Arc::new(CidTree::new(
+                OLD_ROOT.parse().unwrap(),
+                client.clone(),
+                staging.path().into(),
+                test_filesystem_host(),
+                test_filesystem_scope(),
+            ));
+            let (_cancel, mut cancel) = watch::channel(false);
+            let boot = prepare_root(
+                Some(Head { cid: root }),
+                None,
+                &runtime,
+                &compilation,
+                &[],
+                &client,
+                Prewarm::Existing(&tree),
+                &mut PinSet::default(),
+                &mut cancel,
+            )
+            .await
+            .map(|prepared| prepared.kernel);
+            let standalone = async {
+                let effective =
+                    crate::image::compose_root(Some(root), None, &[], &boot_client, &mut cancel)
+                        .await?;
+                crate::image::prepare_kernel(
+                    effective,
+                    &boot_client,
+                    runtime.clone(),
+                    &compilation,
+                    &mut cancel,
+                )
+                .await
+            }
+            .await;
+            match expected {
+                Valid(file) => {
+                    let boot = boot.unwrap_or_else(|error| panic!("{name} boot: {error:#}"));
+                    let standalone =
+                        standalone.unwrap_or_else(|error| panic!("{name} check: {error:#}"));
+                    assert_eq!(boot.effective_root(), root, "{name}");
+                    assert_eq!(standalone.effective_root(), root, "{name}");
+                    assert_eq!(boot.source_file(), file, "{name}");
+                    assert_eq!(standalone.source_file(), file, "{name}");
+                    assert_eq!(boot.runtime_cid(), kernel::runtime_cid(&valid), "{name}");
+                    assert_eq!(standalone.runtime_cid(), boot.runtime_cid(), "{name}");
+                }
+                _ => {
+                    for (entrypoint, result) in [("boot", boot), ("check", standalone)] {
+                        let error = result.expect_err(name);
+                        let diagnostic = format!("{error:#}");
+                        let context = format!("{name} {entrypoint}: {diagnostic}");
+                        assert_eq!(
+                            classify_failure(&error),
+                            if matches!(expected, Unavailable) {
+                                FailureClass::Transient
+                            } else {
+                                FailureClass::Permanent
+                            },
+                            "{context}"
+                        );
+                        match expected {
+                            InvalidDag(message) => {
+                                assert!(
+                                    error.downcast_ref::<CompositionError>().is_some(),
+                                    "{context}"
+                                );
+                                assert!(diagnostic.contains(message), "{context}");
+                            }
+                            InvalidFile(message) => {
+                                assert_eq!(
+                                    error
+                                        .downcast_ref::<cell::image::KernelFileError>()
+                                        .unwrap()
+                                        .kind(),
+                                    cell::image::KernelFileFailure::InvalidSource,
+                                    "{context}"
+                                );
+                                assert!(diagnostic.contains(message), "{context}");
+                            }
+                            InvalidComponent => assert_eq!(
+                                error
+                                    .downcast_ref::<cell::proc::KernelValidationError>()
+                                    .unwrap()
+                                    .kind(),
+                                cell::proc::KernelValidationFailure::InvalidComponent,
+                                "{context}"
+                            ),
+                            Compatibility(message) => {
+                                assert_eq!(
+                                    error
+                                        .downcast_ref::<cell::proc::KernelValidationError>()
+                                        .unwrap()
+                                        .kind(),
+                                    cell::proc::KernelValidationFailure::Compatibility,
+                                    "{context}"
+                                );
+                                assert!(diagnostic.contains(message), "{context}");
+                            }
+                            Unavailable => {}
+                            Valid(_) => unreachable!(),
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                *tree.root_cid(),
+                OLD_ROOT.parse::<Cid>().unwrap(),
+                "{name}: preparation activated the root"
+            );
+            shutdown.send(()).unwrap();
+            server.await.unwrap();
+            eprintln!("preparation-equivalence {name}: {expected:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_and_boot_reject_the_same_obstructed_or_excessive_layers() {
+        use crate::cell::image::GuestTarget;
+
+        let baseline = frozen_root(ROOT).await;
+        let (client, _, _requests, shutdown, server) = recording_kubo().await;
+        let boot_client = crate::ipfs::BootClient::one_attempt(client.clone(), OPERATION_TIMEOUT);
+        let (_cancel, mut cancel) = watch::channel(false);
+        let source = crate::cell::image::inspect_source(
+            KERNEL_BLOCKS[1].0.parse().unwrap(),
+            &boot_client,
+            &mut cancel,
+        )
+        .await
+        .unwrap();
+        let obstructed = vec![
+            FrozenMount::new(source.clone(), GuestTarget::new("/boot").unwrap()).unwrap(),
+            FrozenMount::new(source, GuestTarget::new("/boot/kernel.wasm").unwrap()).unwrap(),
+        ];
+        let staging = tempfile::tempdir().unwrap();
+        let tree = Arc::new(CidTree::new(
+            OLD_ROOT.parse().unwrap(),
+            client.clone(),
+            staging.path().to_owned(),
+            test_filesystem_host(),
+            test_filesystem_scope(),
+        ));
+        let runtime = kernel::test_support::runtime();
+        let compilation = kernel::Compilation::default();
+        for (head, baseline, mounts, expected) in [
+            (None, None, vec![], "empty"),
+            (
+                Some(KERNEL_BLOCKS[1].0.parse().unwrap()),
+                Some(&baseline),
+                vec![],
+                "source",
+            ),
+            (None, Some(&baseline), obstructed, "obstruction"),
+            (
+                None,
+                None,
+                vec![baseline.clone(); cell::mount::MAX_MOUNT_OPERATIONS + 1],
+                "limit",
+            ),
+        ] {
+            let boot = prepare_root(
+                head.map(|cid| Head { cid }),
+                baseline,
+                &runtime,
+                &compilation,
+                &mounts,
+                &client,
+                Prewarm::Existing(&tree),
+                &mut PinSet::default(),
+                &mut cancel,
+            )
+            .await
+            .unwrap_err();
+            let standalone =
+                crate::image::compose_root(head, baseline, &mounts, &boot_client, &mut cancel)
+                    .await
+                    .unwrap_err();
+            for error in [&boot, &standalone] {
+                assert_eq!(
+                    classify_failure(error),
+                    FailureClass::Permanent,
+                    "{expected}: {error:#}"
+                );
+                match expected {
+                    "empty" => assert!(error.downcast_ref::<PermanentPreparationError>().is_some()),
+                    "obstruction" => assert!(matches!(
+                        error.downcast_ref::<CompositionError>(),
+                        Some(CompositionError::TargetObstruction { .. })
+                    )),
+                    "limit" => assert!(matches!(
+                        error.downcast_ref::<CompositionError>(),
+                        Some(CompositionError::ResourceLimit(_))
+                    )),
+                    "source" => assert!(error.downcast_ref::<CompositionError>().is_some()),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        assert_eq!(*tree.root_cid(), OLD_ROOT.parse::<Cid>().unwrap());
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn standalone_preparation_cancellation_preserves_native_worker() {
+        let (client, _, mut requests, shutdown, server) = recording_kubo().await;
+        let client = crate::ipfs::BootClient::one_attempt(client, OPERATION_TIMEOUT);
+        let compilation = kernel::Compilation::default();
+        let (release, native) = compilation.hold_for_test().await;
+        let (cancel, mut receiver) = watch::channel(false);
+        let preparation = tokio::spawn(async move {
+            crate::image::prepare_kernel(
+                ROOT.parse().unwrap(),
+                &client,
+                kernel::test_support::runtime(),
+                &compilation,
+                &mut receiver,
+            )
+            .await
+        });
+        for _ in 0..4 {
+            assert!(next_request(&mut requests)
+                .await
+                .starts_with("/api/v0/block/get"));
+        }
+        tokio::task::yield_now().await;
+        assert!(!preparation.is_finished());
+        cancel.send_replace(true);
+        let error = tokio::time::timeout(Duration::from_secs(2), preparation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
+        assert!(!native.is_finished());
+        release.send(()).unwrap();
+        native.await.unwrap();
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn installed_baseline_is_below_head_and_frozen_operations() {
         let baseline = frozen_root(COMPOSED_DIRECTORY_BLOCKS[0].0).await;
@@ -3235,6 +3840,35 @@ mod tests {
             )
             .await
             .unwrap();
+            let boot_client =
+                crate::ipfs::BootClient::one_attempt(client.clone(), OPERATION_TIMEOUT);
+            let standalone_root = crate::image::compose_root(
+                Some(head.cid),
+                Some(&baseline),
+                &mounts,
+                &boot_client,
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+            let standalone_kernel = crate::image::prepare_kernel(
+                standalone_root,
+                &boot_client,
+                runtime.clone(),
+                &compilation,
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+            assert_eq!(standalone_root, prepared.effective);
+            assert_eq!(
+                standalone_kernel.source_file(),
+                prepared.kernel.source_file()
+            );
+            assert_eq!(
+                standalone_kernel.runtime_cid(),
+                prepared.kernel.runtime_cid()
+            );
             assert_eq!(prepared.effective, expected.parse::<Cid>().unwrap());
             assert_eq!(prepared.kernel.effective_root(), prepared.effective);
             assert_eq!(

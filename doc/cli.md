@@ -184,6 +184,118 @@ RPC listener and does not serve this path. Wetware does not fall back to Kubo's
 | `WW_OCI_IMAGE_ID` | operator | Optional immutable OCI image identity reported by `/version`. Deployment verification uses Kubernetes `pod.status.imageID` as the authority. |
 | `RUST_LOG` | user | Host-side tracing verbosity |
 
+## ww image check
+
+Check whether the effective FHS satisfies the current Host's static PID0 boot
+requirements without starting a deployment.
+
+```sh
+ww image check [OPTIONS] [SOURCE[:TARGET] ...]
+```
+
+The command uses the `ww run` mount parser, source capture, composition, and
+kernel preparation. Precedence is installed baseline, authoritative Stem head,
+frozen namespace images, then positional CLI mounts. Arguments retain their
+order. Bare `ww image check` uses installed/configured startup state without
+implicitly mounting CWD. Explicit local paths and immutable `/ipfs/<CID>`
+sources follow the same path, symlink, target, and resource rules as `ww run`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fhs-root <PATH>` | `~/.ww/fhs` | Installed baseline directory; also reads `WW_FHS_ROOT`. |
+| `--namespace-root <PATH>` | startup defaults | Host-only root containing `etc/ns` configuration; repeatable. |
+| `--identity <PATH>` | `~/.ww/identity` | Identify a host-owned `ww` namespace; also reads `WW_IDENTITY`. Read only when publisher ownership must be determined. |
+| `--stem <ADDR>` | none | Read one finalized-depth Atom head; conflicts with `--ipns-stem`. |
+| `--ipns-stem <NAME>` | none | Read one verified IPNS head; conflicts with `--stem`. |
+| `--ipns-routing-url <URL>` | `http://localhost:8080` | Routing V1 endpoint; also reads `IPFS_ROUTING_API`. |
+| `--rpc-url <URL>` | `http://127.0.0.1:8545` | Atom JSON-RPC endpoint. |
+| `--confirmation-depth <N>` | `6` | Depth used to read the Atom head. |
+| `--ipfs-url <URL>` | `http://localhost:5001` | Kubo API endpoint; also reads `IPFS_API`. |
+| `--json` | off | Print the complete successful result as JSON. |
+
+```sh
+# Check installed startup state
+ww image check
+
+# Check a complete local image or targeted overrides
+ww image check ./image
+ww image check ./kernel.wasm:/boot/kernel.wasm ./config:/etc/myapp
+
+# Check immutable content and report identities as JSON
+ww image check /ipfs/<directory-cid> --json
+ww image check /ipfs/<file-cid>:/boot/kernel.wasm
+
+# Check the composition for one authoritative head
+ww image check --stem 0x1234...abcd --rpc-url http://127.0.0.1:8545
+ww image check --ipns-stem <name> --ipns-routing-url http://localhost:8080
+```
+
+Success reports the effective root CID, kernel source-file CID, exact-byte
+kernel runtime CID, `wetware-composer-v1` profile, SHA-256 composition hash,
+static validation result, and completed stages. The source-file CID identifies
+the UnixFS file. The runtime CID identifies the verified WASM bytes using
+CIDv1/raw/BLAKE3-256; it is not the Composer hash profile.
+
+JSON fields are `effective_root`, `kernel_source`, `kernel_runtime`,
+`composer_profile`, `hash_algorithm`, `static_validation`, `stages`, and
+`retained_roots`. `hash_algorithm` is `sha2-256`; `static_validation` is `PASS`
+on success. `stages` lists `source-resolution`, `filesystem-composition`,
+`kernel-selection`, `verified-component-bytes`, and
+`production-p3-static-validation`. Exit status is zero only after all validation
+stages succeed.
+Failures produce a nonzero exit status and identify the failing stage; partial
+results are not successful checks.
+
+The check resolves and verifies sources, composes the effective FHS, selects
+`/boot/kernel.wasm`, verifies its UnixFS bytes and size, compiles the component,
+and validates the production P3 imports, exports, transport, readiness, and
+static command linker. A missing or invalid requested head fails without
+substituting an installed-baseline-only image.
+
+Unlike `ww run`, the check reads one authoritative head and does not follow
+later changes. IPNS checks read the persisted ordering floor without advancing
+it. An unexpired persisted IPNS head takes precedence over a network fetch,
+matching initial boot selection. A later boot can observe a different head or
+changed local content.
+
+Authoritative-head lookup has a 30-second deadline. Namespace resolution uses
+boot's existing per-name deadlines and bootstrap fallback. If a
+configured namespace still has no resolved source, the check fails instead of
+reporting a partial image. `ww run` can continue in a degraded state or retry
+while following a Stem. These availability differences do not change static
+validation of identical frozen inputs.
+
+For a `ww` namespace with a Peer ID and bootstrap CID, the check reads the Host
+identity to determine publisher ownership. If the Host owns that name, the
+resolved namespace must already match the configured bootstrap. Otherwise the
+check fails because `ww run` would publish the bootstrap before resolution.
+The check does not perform that publication. Use explicit immutable mounts when
+the required publisher state is unavailable.
+
+The command is non-executing, but it is not read-only. It can retrieve remote
+immutable content, import local snapshots, insert Kubo blocks, publish composition
+CARs, acquire recursive pins, write the Wasmtime compilation cache, and create
+temporary local files. It does not publish namespace/IPNS state, instantiate
+PID0, execute guest start functions or `/bin` files, grant root Membrane
+authority, advance deployment epochs, commit readiness, or start runtime services.
+
+Kubo pins are CID-based and do not identify independent owners. The check
+therefore retains Kubo pins, including acknowledged source and effective-root
+pins, rather than issuing compensating unpins. `retained_roots` reports known
+retained roots; interrupted or uncertain publication can leave additional pins
+or blocks. Existing owners keep their content. Operator cleanup requires
+separate knowledge that no owner needs the content.
+
+Capture and composition use the existing [snapshot limits](local-snapshots.md#bounds)
+and [Composer limits](composer-v1.md#supported-inputs-and-limits). Cancellation
+waits for local capture cleanup; a blocked filesystem syscall has no hard
+cancellation deadline. Cancellation does not roll back Kubo imports or pins.
+There is no offline mode: missing blocks can trigger remote retrieval.
+
+A passing check establishes static compatibility only. It does not establish
+guest startup, root graft, readiness, routes, Cap'n Proto semantics, or application
+behavior. Use runtime readiness and application checks after starting the Host.
+
 ## `ww healthcheck`
 
 Probe the admin endpoint without relying on shell tools. This is suitable for

@@ -1124,9 +1124,29 @@ fn validate_command(
             anyhow::ensure!(present, "kernel must import function {interface}#{member}");
         }
     }
-    // Presence alone does not check function signatures. The production linker
-    // checks every requested type; CommandPre checks the native P3 command ABI.
-    Ok(WasiCliCommandPre::new(linker.instantiate_pre(component)?)?)
+    // The production linker checks import types. CommandPre only looks up
+    // nested export indices; its generated load() checks types after guest
+    // instantiation. Front-load that check for PID0 without creating a Store.
+    let pre = linker.instantiate_pre(component)?;
+    if kernel {
+        let engine = component.engine();
+        let ty = component.component_type();
+        let Some(ComponentItem::ComponentInstance(command)) = ty
+            .get_export(engine, "wasi:cli/run@0.3.0")
+            .map(|item| item.ty)
+        else {
+            anyhow::bail!("kernel must export instance wasi:cli/run@0.3.0");
+        };
+        let Some(ComponentItem::ComponentFunc(run)) =
+            command.get_export(engine, "run").map(|item| item.ty)
+        else {
+            anyhow::bail!("kernel must export function wasi:cli/run@0.3.0#run");
+        };
+        anyhow::ensure!(run.async_(), "wasi:cli/run@0.3.0#run must be async");
+        run.typecheck::<(), (std::result::Result<(), ()>,)>(&pre.instance_type())
+            .map_err(|error| anyhow!("wasi:cli/run@0.3.0#run signature: {error:#}"))?;
+    }
+    Ok(WasiCliCommandPre::new(pre)?)
 }
 
 /// Stage at which static kernel preparation failed.

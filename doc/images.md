@@ -69,6 +69,29 @@ Push neither creates a deployment nor updates Atom or IPNS.
 the responsibility of the selected PID0 or application composition. Publication
 alone does not make the shipped Rust PID0 launch `bin/greeter.wasm`.
 
+## Check an effective image
+
+`ww image check [SOURCE[:TARGET] ...]` composes and statically validates the same
+effective image that boot preparation uses. It reports the effective root,
+selected kernel file, and exact-byte runtime identities without executing PID0.
+
+```sh
+ww image check
+ww image check ./kernel.wasm:/boot/kernel.wasm ./config:/etc/myapp
+ww image check /ipfs/<directory-cid> --json
+```
+
+The installed baseline remains the lowest layer. A valid image without a kernel
+can inherit the baseline kernel. Invalid heads and invalid selected kernels
+fail without substitution. An authoritative Stem check observes one head;
+continuous following remains a `ww run` behavior.
+
+Checks can retrieve content and write snapshots, Kubo blocks, pins, and compiled
+cache artifacts. Kubo pins remain after checking because the backend does not
+distinguish independent owners. Passing does not prove runtime readiness or
+application behavior. See the [command reference](cli.md#ww-image-check) for
+options, output, cancellation, and retention limits.
+
 ## Rust PID0 boot flow
 
 The shipped Rust PID0 reads `bin/status.wasm`, loads the component, registers

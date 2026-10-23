@@ -28,6 +28,7 @@ ww run . --stem 0xAddr --rpc-url http://... --ws-url ws://...
 | `ww init NAME` | Scaffold a new cell guest project |
 | `ww build [PATH]` | Compile a native `wasm32-wasip3` component into `bin/` |
 | `ww run [MOUNT...]` | Boot a node; mounts are `source[:target]` |
+| `ww image check [MOUNT...]` | Check static PID0 compatibility without guest execution; imports content and retains Kubo pins |
 | `ww push [PATH]` | Snapshot FHS tree to IPFS, optionally update on-chain HEAD |
 | `ww keygen` | Generate Ed25519 identity (prints to stdout) |
 | `ww doctor` | Check dev environment (Rust, wasm target, Kubo) |
