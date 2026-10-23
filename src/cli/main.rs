@@ -1480,7 +1480,7 @@ system::export!({iface_name}Guest);
         let deployment_scope = lifecycle.0.clone();
         deployment_lifecycle_slot = Some(lifecycle);
 
-        ww::config::init_tracing_to_stderr(false);
+        ww::config::init_tracing();
 
         let ipfs_client = ipfs::HttpClient::new(ipfs_url);
 
