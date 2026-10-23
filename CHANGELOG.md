@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **ExecutorPool metrics (#752).** `/metrics` reports occupied task slots, spawn
+  admission outcomes, and completion, cancellation, and panic counts with fixed
+  labels. Counters persist across pool teardown; occupied slots return to zero.
 - **Static image checking (#736).** `ww image check` shares boot's mount
   resolution, filesystem composition, kernel selection, and production P3
   validation without executing guest code or starting deployment services.
