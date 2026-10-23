@@ -1520,10 +1520,6 @@ system::export!({iface_name}Guest);
         };
         let kernel_identity = version_info.kernel_identity.clone();
 
-        let fuel_registry = ww::metrics::new_fuel_registry();
-        let rpc_metrics = ww::metrics::new_rpc_metrics();
-        let cache_metrics = ww::metrics::new_cache_metrics();
-        let stream_metrics = ww::metrics::new_stream_metrics();
         let wasmtime_cache_metrics = ww::cell::engine::wasmtime_cache_metrics();
 
         // Bind before spawning so an unavailable control-plane port is a
@@ -1547,10 +1543,6 @@ system::export!({iface_name}Guest);
                     runtime_status: runtime_status.clone(),
                     kernel_ready_gate: kernel_ready_gate.clone(),
                     route_registry: route_registry.clone(),
-                    fuel_registry: fuel_registry.clone(),
-                    rpc_metrics: rpc_metrics.clone(),
-                    cache_metrics: cache_metrics.clone(),
-                    stream_metrics: stream_metrics.clone(),
                     wasmtime_cache_metrics: wasmtime_cache_metrics.clone(),
                 },
             )?;

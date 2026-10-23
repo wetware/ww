@@ -72,6 +72,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   errors report deterministic composition failures.
 
 ### Fixed
+- **Metrics foundation cleanup (#750).** Removed unused fuel, RPC, ARC cache,
+  and stream registries and their eleven HELP/TYPE declarations. `/metrics`
+  exposes only the four live Wasmtime families. Real CLI Host coverage verifies
+  that kernel/status compilation changes the admin endpoint's counters.
+  Producer-specific instrumentation remains in #260, #752, and #754.
 - **Metrics exposition correctness (#750, first landing).** `/metrics` omits
   seven unsupported ARC cache and stream samples instead of reporting zeros.
   Metric metadata and public registry interfaces remain available. Live Wasmtime

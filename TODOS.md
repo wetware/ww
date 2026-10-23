@@ -145,10 +145,10 @@ usable by trusted FHS configuration or a future Warrant/ICME adapter.
 ## Metrics-over-WAGI cell
 **What:** A `Cell::http("/metrics")` that exposes executor pool stats (cell counts per worker, spawn channel depth, compilation cache hit rate) as Prometheus-format metrics over the WAGI HTTP path.
 **Why:** Operators need visibility into runtime health without attaching a debugger. Standard Prometheus scraping works with existing monitoring stacks.
-**Context:** MetricsService already serves `/metrics` on `--metrics-addr`. This TODO is about a *WAGI cell* that serves metrics over the HTTP capability path, complementing the admin metrics endpoint. The executor pool exposes `cell_counts` and `worker_count()` already.
+**Context:** `AdminService` serves four live Wasmtime metric families at `/metrics` on `--with-http-admin`. This TODO proposes a WAGI view of supported collectors. `ExecutorPool` tracks private per-worker `cell_counts` and exposes `worker_count()`; #752 owns executor-pool and fuel instrumentation.
 **Effort:** S
 **Priority:** P3
-**Depends on:** CompilationService (for cache hit/miss stats)
+**Depends on:** #752 for executor-pool instrumentation; reuse `WasmtimeCacheMetrics` for persistent-cache observations. `CompilationService` does not expose service-cache hit/miss counters.
 
 ## Worker health monitoring / heartbeats
 **What:** Each executor worker thread emits periodic heartbeat timestamps. A monitor checks for stale workers (no heartbeat in N seconds) and logs warnings.

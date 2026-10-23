@@ -244,6 +244,7 @@ impl RunningNode {
             .env("NO_COLOR", "1")
             .env("WW_KUBO_WAIT_MAX_SECS", "30")
             .env("WW_CWASM_DIR", home.join("cwasm"))
+            .env_remove("WW_CWASM_CACHE_MAX_BYTES")
             .env_remove("WW_IDENTITY")
             .env_remove("WW_HTTP_ADMIN")
             .env_remove("IPFS_API")
@@ -1612,6 +1613,37 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
 mod rust_lifecycle {
     use super::*;
 
+    async fn host_metrics(
+        client: &reqwest::Client,
+        admin_addr: SocketAddr,
+    ) -> std::collections::BTreeMap<String, u64> {
+        let response = client
+            .get(format!("http://{admin_addr}/metrics"))
+            .send()
+            .await
+            .expect("scrape normally assembled Host")
+            .error_for_status()
+            .expect("Host /metrics must succeed");
+        assert_eq!(
+            response.headers()[reqwest::header::CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = response.text().await.expect("read Host metrics");
+        let samples: std::collections::BTreeMap<_, _> = body
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| {
+                let (name, value) = line.split_once(' ').expect("metric sample");
+                (
+                    name.to_owned(),
+                    value.parse::<u64>().expect("integer sample"),
+                )
+            })
+            .collect();
+        assert_eq!(samples["ww_wasmtime_cache_state{state=\"enabled\"}"], 1);
+        samples
+    }
+
     async fn tty_stdin_and_status_route_driver() {
         let _guard = e2e_lock().await;
         let status_wasm = required_artifact(STATUS_WASM_PATH);
@@ -1649,6 +1681,20 @@ mod rust_lifecycle {
             format!("<pending: {kernel_source}>")
         );
 
+        // The CLI has assembled AdminService and Host, but no component can
+        // compile while Kubo is gated. Observe the real producer's initial state.
+        let initial_metrics = host_metrics(&client, admin_addr).await;
+        for counter in [
+            "ww_wasmtime_cache_hits_total",
+            "ww_wasmtime_cache_stores_total",
+            "ww_wasmtime_component_compilations_total",
+        ] {
+            assert_eq!(
+                initial_metrics[counter], 0,
+                "counter before Host boot: {counter}"
+            );
+        }
+
         let proxy_task = start_kubo_proxy(proxy_listener, kubo_addr);
         let ready = wait_for_ready(&client, &ready_url, &mut node).await;
         assert_eq!(ready["ready"], true);
@@ -1681,6 +1727,24 @@ mod rust_lifecycle {
             &node,
         )
         .await;
+
+        // Boot and the status request compile real components in this child
+        // process. The CLI's collector must expose those same observations.
+        let running_metrics = host_metrics(&client, admin_addr).await;
+        assert!(
+            running_metrics["ww_wasmtime_component_compilations_total"]
+                > initial_metrics["ww_wasmtime_component_compilations_total"],
+            "real Host compilation did not change /metrics"
+        );
+        assert!(
+            running_metrics["ww_wasmtime_cache_stores_total"]
+                > initial_metrics["ww_wasmtime_cache_stores_total"],
+            "real Host compilation did not populate its private Wasmtime cache"
+        );
+        println!(
+            "HOST_METRICS_EVIDENCE={}",
+            serde_json::json!({ "before_boot": initial_metrics, "after_status": running_metrics })
+        );
 
         node.write_stdin(b"p3-input-resume-probe\n");
         wait_for_log(&mut node, "terminal input", "received").await;

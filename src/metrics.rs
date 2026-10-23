@@ -5,12 +5,9 @@
 //! and host identity/address/NAT information at `GET /host/id`,
 //! `GET /host/addrs`, and `GET /host/nat`.
 //!
-//! Wasmtime cache metrics read the live process-wide engine factory. Fuel and
-//! RPC registries have no production writers. Cache and stream registries are
-//! placeholders: their metadata is retained, but their samples are omitted
-//! until production collectors are connected.
+//! Wasmtime cache metrics read the live process-wide engine factory. Only
+//! families with production collectors are declared and exposed.
 
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
@@ -86,157 +83,6 @@ impl RuntimeStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Per-cell fuel snapshot
-// ---------------------------------------------------------------------------
-
-/// A per-cell fuel snapshot accepted by the metrics scrape handler.
-/// No production code currently publishes these snapshots.
-#[derive(Clone, Debug)]
-pub struct CellFuelSnapshot {
-    /// Fuel remaining in the current epoch budget.
-    pub remaining: u64,
-    /// Cumulative fuel consumed over the cell's lifetime.
-    pub consumed_total: u64,
-}
-
-/// Shared registry of per-cell fuel snapshots.
-///
-/// Keys are caller-supplied cell identifiers. The metrics handler reads this
-/// registry, but neither the epoch callback nor fuel accounting updates it.
-pub type FuelRegistry = Arc<RwLock<HashMap<String, CellFuelSnapshot>>>;
-
-/// Create a new, empty fuel registry.
-pub fn new_fuel_registry() -> FuelRegistry {
-    Arc::new(RwLock::new(HashMap::new()))
-}
-
-// ---------------------------------------------------------------------------
-// RPC latency histogram (Prometheus classic histogram)
-// ---------------------------------------------------------------------------
-
-/// Fixed-bucket Prometheus histogram for RPC call latency.
-/// Constant memory: 9 bucket counters + sum + count per method.
-#[derive(Clone, Debug)]
-pub struct LatencyHistogram {
-    /// (le_boundary, count) pairs. Last entry is +Inf.
-    buckets: [(f64, u64); 9],
-    sum: f64,
-    count: u64,
-}
-
-const HISTOGRAM_BOUNDARIES: [f64; 8] = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
-
-impl LatencyHistogram {
-    fn new() -> Self {
-        let mut buckets = [(0.0, 0u64); 9];
-        for (i, &le) in HISTOGRAM_BOUNDARIES.iter().enumerate() {
-            buckets[i].0 = le;
-        }
-        buckets[8].0 = f64::INFINITY; // +Inf bucket
-        Self {
-            buckets,
-            sum: 0.0,
-            count: 0,
-        }
-    }
-
-    /// Record an observation (duration in seconds).
-    pub fn observe(&mut self, value: f64) {
-        self.sum += value;
-        self.count += 1;
-        for bucket in &mut self.buckets {
-            if value <= bucket.0 {
-                bucket.1 += 1;
-            }
-        }
-    }
-}
-
-/// Per-method RPC metrics: call counts + latency histograms.
-/// Production RPC paths do not currently update this registry.
-pub struct RpcMetrics {
-    pub histograms: HashMap<String, LatencyHistogram>,
-    pub calls_total: HashMap<String, u64>,
-}
-
-impl RpcMetrics {
-    fn new() -> Self {
-        Self {
-            histograms: HashMap::new(),
-            calls_total: HashMap::new(),
-        }
-    }
-
-    /// Record an RPC call with its duration in seconds.
-    pub fn observe(&mut self, method: &str, duration_secs: f64) {
-        *self.calls_total.entry(method.to_string()).or_insert(0) += 1;
-        self.histograms
-            .entry(method.to_string())
-            .or_insert_with(LatencyHistogram::new)
-            .observe(duration_secs);
-    }
-}
-
-pub type RpcMetricsRegistry = Arc<RwLock<RpcMetrics>>;
-
-/// Create a new, empty RPC metrics registry.
-pub fn new_rpc_metrics() -> RpcMetricsRegistry {
-    Arc::new(RwLock::new(RpcMetrics::new()))
-}
-
-/// Placeholder ARC cache counters and gauges, retained for future wiring (#260).
-/// These values are not connected to `PinsetCache` and are not exposed as samples.
-pub struct CacheMetrics {
-    pub hits: u64,
-    pub misses: u64,
-    pub evictions: u64,
-    pub weight_bytes: u64,
-    pub entries: u64,
-}
-
-impl CacheMetrics {
-    fn new() -> Self {
-        Self {
-            hits: 0,
-            misses: 0,
-            evictions: 0,
-            weight_bytes: 0,
-            entries: 0,
-        }
-    }
-}
-
-pub type CacheMetricsRegistry = Arc<RwLock<CacheMetrics>>;
-
-/// Create a new, empty cache metrics registry.
-pub fn new_cache_metrics() -> CacheMetricsRegistry {
-    Arc::new(RwLock::new(CacheMetrics::new()))
-}
-
-/// Placeholder stream pump counters, retained for future wiring (#754).
-/// These values have no production writer and are not exposed as samples.
-pub struct StreamMetrics {
-    pub bytes_pumped_total: u64,
-    pub pump_ops_total: u64,
-}
-
-impl StreamMetrics {
-    fn new() -> Self {
-        Self {
-            bytes_pumped_total: 0,
-            pump_ops_total: 0,
-        }
-    }
-}
-
-pub type StreamMetricsRegistry = Arc<RwLock<StreamMetrics>>;
-
-/// Create a new, empty stream metrics registry.
-pub fn new_stream_metrics() -> StreamMetricsRegistry {
-    Arc::new(RwLock::new(StreamMetrics::new()))
-}
-
-// ---------------------------------------------------------------------------
 // Metrics HTTP handler
 // ---------------------------------------------------------------------------
 
@@ -249,96 +95,13 @@ struct AdminState {
     runtime_status: RuntimeStatus,
     kernel_ready_gate: Arc<authority::KernelReadyGate>,
     route_registry: Option<rpc::dispatch::RouteRegistry>,
-    fuel_registry: FuelRegistry,
-    rpc_metrics: RpcMetricsRegistry,
     wasmtime_cache_metrics: WasmtimeCacheMetrics,
 }
 
 /// Render all metrics in Prometheus text exposition format.
 fn render_metrics(state: &AdminState) -> String {
-    let mut out = String::with_capacity(2048);
-
-    // ---- Per-cell fuel metrics (no production writer) ----
-
-    out.push_str("# HELP ww_cell_fuel_remaining Per-cell remaining fuel budget.\n");
-    out.push_str("# TYPE ww_cell_fuel_remaining gauge\n");
-
-    out.push_str("# HELP ww_cell_fuel_consumed_total Per-cell cumulative fuel consumed.\n");
-    out.push_str("# TYPE ww_cell_fuel_consumed_total counter\n");
-
-    if let Ok(registry) = state.fuel_registry.read() {
-        for (cell_id, snap) in registry.iter() {
-            out.push_str(&format!(
-                "ww_cell_fuel_remaining{{cell_id=\"{}\"}} {}\n",
-                cell_id, snap.remaining,
-            ));
-            out.push_str(&format!(
-                "ww_cell_fuel_consumed_total{{cell_id=\"{}\"}} {}\n",
-                cell_id, snap.consumed_total,
-            ));
-        }
-    }
-
-    // ---- RPC metrics ----
-
-    out.push_str("# HELP ww_rpc_calls_total Total RPC calls by method.\n");
-    out.push_str("# TYPE ww_rpc_calls_total counter\n");
-
-    out.push_str("# HELP ww_rpc_duration_seconds RPC call latency.\n");
-    out.push_str("# TYPE ww_rpc_duration_seconds histogram\n");
-
-    if let Ok(rpc) = state.rpc_metrics.read() {
-        for (method, count) in &rpc.calls_total {
-            out.push_str(&format!(
-                "ww_rpc_calls_total{{method=\"{method}\"}} {count}\n",
-            ));
-        }
-        for (method, hist) in &rpc.histograms {
-            for &(le, count) in &hist.buckets {
-                let le_str = if le.is_infinite() {
-                    "+Inf".to_string()
-                } else {
-                    format!("{le}")
-                };
-                out.push_str(&format!(
-                    "ww_rpc_duration_seconds_bucket{{method=\"{method}\",le=\"{le_str}\"}} {count}\n",
-                ));
-            }
-            out.push_str(&format!(
-                "ww_rpc_duration_seconds_sum{{method=\"{method}\"}} {}\n",
-                hist.sum,
-            ));
-            out.push_str(&format!(
-                "ww_rpc_duration_seconds_count{{method=\"{method}\"}} {}\n",
-                hist.count,
-            ));
-        }
-    }
-
-    // ---- Cache metadata only: no production collector is connected ----
-
-    out.push_str("# HELP ww_cache_hits_total ARC cache hits.\n");
-    out.push_str("# TYPE ww_cache_hits_total counter\n");
-    out.push_str("# HELP ww_cache_misses_total ARC cache misses.\n");
-    out.push_str("# TYPE ww_cache_misses_total counter\n");
-    out.push_str("# HELP ww_cache_evictions_total ARC cache evictions.\n");
-    out.push_str("# TYPE ww_cache_evictions_total counter\n");
-    out.push_str("# HELP ww_cache_weight_bytes Current ARC cache weight in bytes.\n");
-    out.push_str("# TYPE ww_cache_weight_bytes gauge\n");
-    out.push_str("# HELP ww_cache_entries Current ARC cache entry count.\n");
-    out.push_str("# TYPE ww_cache_entries gauge\n");
-
+    let mut out = String::with_capacity(1024);
     render_wasmtime_cache_metrics(&mut out, &state.wasmtime_cache_metrics.snapshot());
-
-    // ---- Stream metadata only: no production collector is connected ----
-
-    out.push_str(
-        "# HELP ww_stream_bytes_pumped_total Total bytes pumped through stream listeners.\n",
-    );
-    out.push_str("# TYPE ww_stream_bytes_pumped_total counter\n");
-    out.push_str("# HELP ww_stream_pump_ops_total Total pump read/write cycles.\n");
-    out.push_str("# TYPE ww_stream_pump_ops_total counter\n");
-
     out
 }
 
@@ -537,12 +300,6 @@ pub struct AdminService {
     pub kernel_ready_gate: Arc<authority::KernelReadyGate>,
     /// When WAGI serving is enabled, readiness also requires a live route.
     pub route_registry: Option<rpc::dispatch::RouteRegistry>,
-    pub fuel_registry: FuelRegistry,
-    pub rpc_metrics: RpcMetricsRegistry,
-    /// Retained for API compatibility; no collector is connected or scraped.
-    pub cache_metrics: CacheMetricsRegistry,
-    /// Retained for API compatibility; no collector is connected or scraped.
-    pub stream_metrics: StreamMetricsRegistry,
     pub wasmtime_cache_metrics: WasmtimeCacheMetrics,
 }
 
@@ -561,8 +318,6 @@ impl crate::services::Service for AdminService {
                 runtime_status: self.runtime_status,
                 kernel_ready_gate: self.kernel_ready_gate,
                 route_registry: self.route_registry,
-                fuel_registry: self.fuel_registry,
-                rpc_metrics: self.rpc_metrics,
                 wasmtime_cache_metrics: self.wasmtime_cache_metrics,
             };
 
@@ -620,8 +375,6 @@ mod tests {
             runtime_status: RuntimeStatus::starting(),
             kernel_ready_gate,
             route_registry: None,
-            fuel_registry: new_fuel_registry(),
-            rpc_metrics: new_rpc_metrics(),
             wasmtime_cache_metrics: crate::cell::engine::wasmtime_cache_metrics(),
         }
     }
@@ -800,83 +553,32 @@ mod tests {
     }
 
     #[test]
-    fn render_empty_registry() {
-        let state = test_state();
-        let output = render_metrics(&state);
-        assert!(output.contains("# TYPE ww_cell_fuel_remaining gauge"));
-        assert!(output.contains("# TYPE ww_cell_fuel_consumed_total counter"));
-        assert!(output.contains("# TYPE ww_rpc_calls_total counter"));
-        assert!(output.contains("# TYPE ww_rpc_duration_seconds histogram"));
-        assert!(output.contains("# TYPE ww_cache_hits_total counter"));
-        assert!(output.contains("# TYPE ww_stream_bytes_pumped_total counter"));
-        // No data lines when registries are empty.
-        assert!(!output.contains("cell_id="));
-        assert!(!output.contains("method="));
-        for line in output.lines().filter(|line| !line.starts_with('#')) {
+    fn renders_only_live_metric_families() {
+        let output = render_metrics(&test_state());
+        for prefix in ["ww_cell_fuel_", "ww_rpc_", "ww_cache_", "ww_stream_"] {
             assert!(
-                !line.starts_with("ww_cache_") && !line.starts_with("ww_stream_"),
-                "unsupported measurement: {line}"
+                !output.contains(prefix),
+                "obsolete metric declaration: {prefix}"
             );
         }
-    }
-
-    #[test]
-    fn render_with_cells() {
-        let state = test_state();
-        {
-            let mut map = state.fuel_registry.write().unwrap();
-            map.insert(
-                "kernel".into(),
-                CellFuelSnapshot {
-                    remaining: 500_000,
-                    consumed_total: 1_200_000,
-                },
-            );
-            map.insert(
-                "worker-1".into(),
-                CellFuelSnapshot {
-                    remaining: 0,
-                    consumed_total: 5_000_000,
-                },
-            );
-        }
-        let output = render_metrics(&state);
-        assert!(output.contains("ww_cell_fuel_remaining{cell_id=\"kernel\"} 500000"));
-        assert!(output.contains("ww_cell_fuel_consumed_total{cell_id=\"kernel\"} 1200000"));
-        assert!(output.contains("ww_cell_fuel_remaining{cell_id=\"worker-1\"} 0"));
-        assert!(output.contains("ww_cell_fuel_consumed_total{cell_id=\"worker-1\"} 5000000"));
-    }
-
-    #[test]
-    fn render_rpc_histogram() {
-        let state = test_state();
-        {
-            let mut rpc = state.rpc_metrics.write().unwrap();
-            rpc.observe("stat.snapshot", 0.005);
-            rpc.observe("stat.snapshot", 0.050);
-        }
-        let output = render_metrics(&state);
-        // 0.005s falls in le=0.005 bucket (<=)
-        assert!(output
-            .contains("ww_rpc_duration_seconds_bucket{method=\"stat.snapshot\",le=\"0.005\"} 1"));
-        // 0.050s falls in le=0.05 bucket
-        assert!(output
-            .contains("ww_rpc_duration_seconds_bucket{method=\"stat.snapshot\",le=\"0.05\"} 2"));
-        // +Inf always has all observations
-        assert!(output
-            .contains("ww_rpc_duration_seconds_bucket{method=\"stat.snapshot\",le=\"+Inf\"} 2"));
-        assert!(output.contains("ww_rpc_duration_seconds_count{method=\"stat.snapshot\"} 2"));
-        assert!(output.contains("ww_rpc_calls_total{method=\"stat.snapshot\"} 2"));
-    }
-
-    #[test]
-    fn render_rpc_histogram_empty() {
-        let state = test_state();
-        let output = render_metrics(&state);
-        assert!(output.contains("# HELP ww_rpc_duration_seconds"));
-        assert!(output.contains("# TYPE ww_rpc_duration_seconds histogram"));
-        // No bucket lines when no observations
-        assert!(!output.contains("ww_rpc_duration_seconds_bucket"));
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.starts_with("# HELP "))
+                .count(),
+            4
+        );
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.starts_with("# TYPE "))
+                .count(),
+            4
+        );
+        assert_eq!(
+            output.lines().filter(|line| !line.starts_with('#')).count(),
+            6
+        );
     }
 
     #[test]

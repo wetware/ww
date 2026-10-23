@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::TcpListener;
 use std::process::Command;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cell::engine::{
@@ -13,10 +13,7 @@ use cell::engine::{
     CWASM_CACHE_MAX_BYTES_ENV, CWASM_DIR_ENV,
 };
 use tokio::sync::watch;
-use ww::metrics::{
-    new_cache_metrics, new_fuel_registry, new_rpc_metrics, new_stream_metrics, AdminService,
-    RuntimeStatus, VersionInfo,
-};
+use ww::metrics::{AdminService, RuntimeStatus, VersionInfo};
 use ww::services::Service;
 
 const PROBE_MODE: &str = "WW_METRICS_HTTP_TEST_MODE";
@@ -35,11 +32,6 @@ fn disabled_cache_http_counts_attempts_without_hits_or_stores() {
 #[test]
 fn fallback_cache_http_counts_attempts_without_hits_or_stores() {
     run_probe("fallback", false);
-}
-
-#[test]
-fn poisoned_registries_do_not_break_live_http_collection() {
-    run_probe("poisoned", false);
 }
 
 /// Run unchanged on either side of the exposition fix:
@@ -71,7 +63,7 @@ fn run_probe(mode: &str, measure: bool) {
         "fallback" => {
             command.env(CWASM_DIR_ENV, invalid_directory);
         }
-        "disabled" | "poisoned" => {}
+        "disabled" => {}
         _ => panic!("unknown mode {mode}"),
     }
     if measure {
@@ -101,21 +93,11 @@ struct Admin {
 }
 
 impl Admin {
-    fn start(poisoned: bool) -> Self {
+    fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/metrics", listener.local_addr().unwrap());
         let (_epoch_tx, epoch_rx) = watch::channel(authority::Epoch::zero());
-        let fuel = new_fuel_registry();
-        let rpc = new_rpc_metrics();
-        let cache = new_cache_metrics();
-        let stream = new_stream_metrics();
-        if poisoned {
-            poison(&fuel);
-            poison(&rpc);
-            poison(&cache);
-            poison(&stream);
-        }
         let service = AdminService {
             listener,
             peer_id: "metrics-http-test".into(),
@@ -128,10 +110,6 @@ impl Admin {
             runtime_status: RuntimeStatus::starting(),
             kernel_ready_gate: Arc::new(authority::KernelReadyGate::new(epoch_rx)),
             route_registry: None,
-            fuel_registry: fuel,
-            rpc_metrics: rpc,
-            cache_metrics: cache,
-            stream_metrics: stream,
             wasmtime_cache_metrics: wasmtime_cache_metrics(),
         };
         let (shutdown, shutdown_rx) = watch::channel(());
@@ -157,16 +135,6 @@ impl Drop for Admin {
                 .expect("admin service");
         }
     }
-}
-
-fn poison<T>(registry: &Arc<RwLock<T>>) {
-    // Deliberate failure injection only; no fabricated producer observations.
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = registry.write().unwrap();
-        panic!("intentional registry poisoning");
-    }))
-    .is_err());
-    assert!(registry.is_poisoned());
 }
 
 #[derive(Debug)]
@@ -217,17 +185,6 @@ impl Scrape {
         }
         assert_eq!(helps, types.keys().cloned().collect());
         let expected_types = [
-            ("ww_cell_fuel_remaining", "gauge"),
-            ("ww_cell_fuel_consumed_total", "counter"),
-            ("ww_rpc_calls_total", "counter"),
-            ("ww_rpc_duration_seconds", "histogram"),
-            ("ww_cache_hits_total", "counter"),
-            ("ww_cache_misses_total", "counter"),
-            ("ww_cache_evictions_total", "counter"),
-            ("ww_cache_weight_bytes", "gauge"),
-            ("ww_cache_entries", "gauge"),
-            ("ww_stream_bytes_pumped_total", "counter"),
-            ("ww_stream_pump_ops_total", "counter"),
             ("ww_wasmtime_cache_state", "gauge"),
             ("ww_wasmtime_cache_hits_total", "counter"),
             ("ww_wasmtime_cache_stores_total", "counter"),
@@ -356,7 +313,7 @@ async fn repeat_scrapes(
 fn metrics_http_probe() {
     let mode = std::env::var(PROBE_MODE).expect("run a public metrics_http test");
     let measure = std::env::var_os(MEASURE).is_some();
-    let admin = Admin::start(mode == "poisoned");
+    let admin = Admin::start();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -369,12 +326,7 @@ fn metrics_http_probe() {
             .unwrap();
         let metrics = wasmtime_cache_metrics();
         let initial = metrics.snapshot();
-        let expected_state = if mode == "poisoned" {
-            "disabled"
-        } else {
-            mode.as_str()
-        };
-        assert_eq!(initial.state.as_str(), expected_state);
+        assert_eq!(initial.state.as_str(), mode);
         assert_eq!(
             (initial.hits, initial.stores, initial.component_compilations),
             (0, 0, 0)
@@ -408,13 +360,9 @@ fn metrics_http_probe() {
         populated.assert_snapshot(failed);
         repeat_scrapes(&client, &admin, &mode, "after_compile", measure).await;
 
-        // Measurement mode also works against the unfixed baseline, recording
-        // its unsupported samples without accepting them in the contract tests.
-        if !measure {
-            empty.assert_unsupported_absent();
-            populated.assert_unsupported_absent();
-            empty.assert_live_families_contiguous();
-            populated.assert_live_families_contiguous();
-        }
+        empty.assert_unsupported_absent();
+        populated.assert_unsupported_absent();
+        empty.assert_live_families_contiguous();
+        populated.assert_live_families_contiguous();
     });
 }
