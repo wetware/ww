@@ -5,9 +5,10 @@
 //! and host identity/address/NAT information at `GET /host/id`,
 //! `GET /host/addrs`, and `GET /host/nat`.
 //!
-//! Fuel metrics (`ww_cell_fuel_remaining`, `ww_cell_fuel_consumed_total`)
-//! are live from host-side [`FuelEstimator`] state.  Auction-specific
-//! metrics.
+//! Wasmtime cache metrics read the live process-wide engine factory. Fuel and
+//! RPC registries have no production writers. Cache and stream registries are
+//! placeholders: their metadata is retained, but their samples are omitted
+//! until production collectors are connected.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -88,8 +89,8 @@ impl RuntimeStatus {
 // Per-cell fuel snapshot
 // ---------------------------------------------------------------------------
 
-/// A point-in-time snapshot of a cell's fuel state, published by the epoch
-/// callback and consumed by the metrics scrape handler.
+/// A per-cell fuel snapshot accepted by the metrics scrape handler.
+/// No production code currently publishes these snapshots.
 #[derive(Clone, Debug)]
 pub struct CellFuelSnapshot {
     /// Fuel remaining in the current epoch budget.
@@ -100,8 +101,8 @@ pub struct CellFuelSnapshot {
 
 /// Shared registry of per-cell fuel snapshots.
 ///
-/// Keys are cell identifiers (e.g. "kernel", or a CID-derived name for
-/// spawned children).  The epoch callback writes; the metrics handler reads.
+/// Keys are caller-supplied cell identifiers. The metrics handler reads this
+/// registry, but neither the epoch callback nor fuel accounting updates it.
 pub type FuelRegistry = Arc<RwLock<HashMap<String, CellFuelSnapshot>>>;
 
 /// Create a new, empty fuel registry.
@@ -110,7 +111,7 @@ pub fn new_fuel_registry() -> FuelRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// RPC latency histogram (Prometheus native format)
+// RPC latency histogram (Prometheus classic histogram)
 // ---------------------------------------------------------------------------
 
 /// Fixed-bucket Prometheus histogram for RPC call latency.
@@ -152,6 +153,7 @@ impl LatencyHistogram {
 }
 
 /// Per-method RPC metrics: call counts + latency histograms.
+/// Production RPC paths do not currently update this registry.
 pub struct RpcMetrics {
     pub histograms: HashMap<String, LatencyHistogram>,
     pub calls_total: HashMap<String, u64>,
@@ -182,7 +184,8 @@ pub fn new_rpc_metrics() -> RpcMetricsRegistry {
     Arc::new(RwLock::new(RpcMetrics::new()))
 }
 
-/// Cache hit/miss/eviction counters + current state gauges.
+/// Placeholder ARC cache counters and gauges, retained for future wiring (#260).
+/// These values are not connected to `PinsetCache` and are not exposed as samples.
 pub struct CacheMetrics {
     pub hits: u64,
     pub misses: u64,
@@ -210,7 +213,8 @@ pub fn new_cache_metrics() -> CacheMetricsRegistry {
     Arc::new(RwLock::new(CacheMetrics::new()))
 }
 
-/// Stream pump throughput counters.
+/// Placeholder stream pump counters, retained for future wiring (#754).
+/// These values have no production writer and are not exposed as samples.
 pub struct StreamMetrics {
     pub bytes_pumped_total: u64,
     pub pump_ops_total: u64,
@@ -247,8 +251,6 @@ struct AdminState {
     route_registry: Option<rpc::dispatch::RouteRegistry>,
     fuel_registry: FuelRegistry,
     rpc_metrics: RpcMetricsRegistry,
-    cache_metrics: CacheMetricsRegistry,
-    stream_metrics: StreamMetricsRegistry,
     wasmtime_cache_metrics: WasmtimeCacheMetrics,
 }
 
@@ -256,7 +258,7 @@ struct AdminState {
 fn render_metrics(state: &AdminState) -> String {
     let mut out = String::with_capacity(2048);
 
-    // ---- Per-cell fuel metrics (Phase 1: live) ----
+    // ---- Per-cell fuel metrics (no production writer) ----
 
     out.push_str("# HELP ww_cell_fuel_remaining Per-cell remaining fuel budget.\n");
     out.push_str("# TYPE ww_cell_fuel_remaining gauge\n");
@@ -313,7 +315,7 @@ fn render_metrics(state: &AdminState) -> String {
         }
     }
 
-    // ---- Cache metrics ----
+    // ---- Cache metadata only: no production collector is connected ----
 
     out.push_str("# HELP ww_cache_hits_total ARC cache hits.\n");
     out.push_str("# TYPE ww_cache_hits_total counter\n");
@@ -326,17 +328,9 @@ fn render_metrics(state: &AdminState) -> String {
     out.push_str("# HELP ww_cache_entries Current ARC cache entry count.\n");
     out.push_str("# TYPE ww_cache_entries gauge\n");
 
-    if let Ok(cache) = state.cache_metrics.read() {
-        out.push_str(&format!("ww_cache_hits_total {}\n", cache.hits));
-        out.push_str(&format!("ww_cache_misses_total {}\n", cache.misses));
-        out.push_str(&format!("ww_cache_evictions_total {}\n", cache.evictions));
-        out.push_str(&format!("ww_cache_weight_bytes {}\n", cache.weight_bytes));
-        out.push_str(&format!("ww_cache_entries {}\n", cache.entries));
-    }
-
     render_wasmtime_cache_metrics(&mut out, &state.wasmtime_cache_metrics.snapshot());
 
-    // ---- Stream metrics ----
+    // ---- Stream metadata only: no production collector is connected ----
 
     out.push_str(
         "# HELP ww_stream_bytes_pumped_total Total bytes pumped through stream listeners.\n",
@@ -344,17 +338,6 @@ fn render_metrics(state: &AdminState) -> String {
     out.push_str("# TYPE ww_stream_bytes_pumped_total counter\n");
     out.push_str("# HELP ww_stream_pump_ops_total Total pump read/write cycles.\n");
     out.push_str("# TYPE ww_stream_pump_ops_total counter\n");
-
-    if let Ok(stream) = state.stream_metrics.read() {
-        out.push_str(&format!(
-            "ww_stream_bytes_pumped_total {}\n",
-            stream.bytes_pumped_total,
-        ));
-        out.push_str(&format!(
-            "ww_stream_pump_ops_total {}\n",
-            stream.pump_ops_total,
-        ));
-    }
 
     out
 }
@@ -378,15 +361,15 @@ fn render_wasmtime_cache_metrics(out: &mut String, snapshot: &WasmtimeCacheSnaps
         "# HELP ww_wasmtime_cache_hits_total Successful Wasmtime compilation cache loads.\n",
     );
     out.push_str("# TYPE ww_wasmtime_cache_hits_total counter\n");
+    out.push_str(&format!("ww_wasmtime_cache_hits_total {}\n", snapshot.hits));
     out.push_str("# HELP ww_wasmtime_cache_stores_total Successful Wasmtime compilation cache stores; this is not a lookup-miss count.\n");
     out.push_str("# TYPE ww_wasmtime_cache_stores_total counter\n");
-    out.push_str("# HELP ww_wasmtime_component_compilations_total Calls to ww's canonical Component::from_binary path; persistent-cache hits are included.\n");
-    out.push_str("# TYPE ww_wasmtime_component_compilations_total counter\n");
-    out.push_str(&format!("ww_wasmtime_cache_hits_total {}\n", snapshot.hits));
     out.push_str(&format!(
         "ww_wasmtime_cache_stores_total {}\n",
         snapshot.stores
     ));
+    out.push_str("# HELP ww_wasmtime_component_compilations_total Calls to ww's canonical Component::from_binary path; persistent-cache hits and failed attempts are included.\n");
+    out.push_str("# TYPE ww_wasmtime_component_compilations_total counter\n");
     out.push_str(&format!(
         "ww_wasmtime_component_compilations_total {}\n",
         snapshot.component_compilations
@@ -556,7 +539,9 @@ pub struct AdminService {
     pub route_registry: Option<rpc::dispatch::RouteRegistry>,
     pub fuel_registry: FuelRegistry,
     pub rpc_metrics: RpcMetricsRegistry,
+    /// Retained for API compatibility; no collector is connected or scraped.
     pub cache_metrics: CacheMetricsRegistry,
+    /// Retained for API compatibility; no collector is connected or scraped.
     pub stream_metrics: StreamMetricsRegistry,
     pub wasmtime_cache_metrics: WasmtimeCacheMetrics,
 }
@@ -578,8 +563,6 @@ impl crate::services::Service for AdminService {
                 route_registry: self.route_registry,
                 fuel_registry: self.fuel_registry,
                 rpc_metrics: self.rpc_metrics,
-                cache_metrics: self.cache_metrics,
-                stream_metrics: self.stream_metrics,
                 wasmtime_cache_metrics: self.wasmtime_cache_metrics,
             };
 
@@ -639,8 +622,6 @@ mod tests {
             route_registry: None,
             fuel_registry: new_fuel_registry(),
             rpc_metrics: new_rpc_metrics(),
-            cache_metrics: new_cache_metrics(),
-            stream_metrics: new_stream_metrics(),
             wasmtime_cache_metrics: crate::cell::engine::wasmtime_cache_metrics(),
         }
     }
@@ -831,6 +812,12 @@ mod tests {
         // No data lines when registries are empty.
         assert!(!output.contains("cell_id="));
         assert!(!output.contains("method="));
+        for line in output.lines().filter(|line| !line.starts_with('#')) {
+            assert!(
+                !line.starts_with("ww_cache_") && !line.starts_with("ww_stream_"),
+                "unsupported measurement: {line}"
+            );
+        }
     }
 
     #[test]
@@ -893,25 +880,6 @@ mod tests {
     }
 
     #[test]
-    fn render_cache_metrics() {
-        let state = test_state();
-        {
-            let mut cache = state.cache_metrics.write().unwrap();
-            cache.hits = 42;
-            cache.misses = 7;
-            cache.evictions = 3;
-            cache.weight_bytes = 1_048_576;
-            cache.entries = 100;
-        }
-        let output = render_metrics(&state);
-        assert!(output.contains("ww_cache_hits_total 42"));
-        assert!(output.contains("ww_cache_misses_total 7"));
-        assert!(output.contains("ww_cache_evictions_total 3"));
-        assert!(output.contains("ww_cache_weight_bytes 1048576"));
-        assert!(output.contains("ww_cache_entries 100"));
-    }
-
-    #[test]
     fn renders_wasmtime_cache_metrics() {
         let mut output = String::new();
         render_wasmtime_cache_metrics(
@@ -932,16 +900,17 @@ mod tests {
     }
 
     #[test]
-    fn render_stream_metrics() {
-        let state = test_state();
-        {
-            let mut stream = state.stream_metrics.write().unwrap();
-            stream.bytes_pumped_total = 1_000_000;
-            stream.pump_ops_total = 500;
+    fn live_wasmtime_families_are_contiguous() {
+        let output = render_metrics(&test_state());
+        let mut current_family = "";
+        for line in output.lines() {
+            if let Some(help) = line.strip_prefix("# HELP ") {
+                current_family = help.split_whitespace().next().unwrap();
+            } else if line.starts_with("ww_wasmtime_") {
+                let name = line.split(['{', ' ']).next().unwrap();
+                assert_eq!(name, current_family, "interleaved family: {line}");
+            }
         }
-        let output = render_metrics(&state);
-        assert!(output.contains("ww_stream_bytes_pumped_total 1000000"));
-        assert!(output.contains("ww_stream_pump_ops_total 500"));
     }
 
     #[test]
