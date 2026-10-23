@@ -319,32 +319,32 @@ families use the process-wide Wasmtime engine factory:
 | `ww_wasmtime_component_compilations_total` | Calls to the canonical component compilation API, including cache hits and failed attempts. |
 
 The counters cover canonical engines in this process and reset when the process
-restarts. Scraping reads a snapshot; it does not compile components or scan the
-cache directory. The snapshot reads counters separately and is not a transaction
-across concurrent compilations. Disabled and fallback cache states legitimately
-report zero hits and stores. A later write failure can leave the initialization
-state `enabled`; #609 owns reporting those failures.
+restarts. Scraping reads atomic counters without metric registry locks; it does
+not compile components or scan the cache directory. The snapshot reads counters
+separately and is not a transaction across concurrent compilations. Disabled and
+fallback cache states legitimately report zero hits and stores. A later write
+failure can leave the initialization state `enabled`;
+[#609](https://github.com/wetware/ww/issues/609) owns reporting those failures.
 
-The following families retain HELP/TYPE metadata but have no production
-collectors connected. Missing samples mean unavailable measurements, not zero
-activity:
+The endpoint exports exactly six series: three cache-state samples and three
+unlabelled counters. Metric names, HELP text, and label values are static. The
+renderer accepts no dynamic label or HELP text that requires escaping. Cell
+identifiers, RPC methods, paths, peer IDs, and CIDs do not become metric labels.
 
-- ARC cache: `ww_cache_hits_total`, `ww_cache_misses_total`,
-  `ww_cache_evictions_total`, `ww_cache_weight_bytes`, and `ww_cache_entries`.
-  #260 owns the connection to `PinsetCache` statistics.
-- Stream pumps: `ww_stream_bytes_pumped_total` and `ww_stream_pump_ops_total`.
-  #754 owns producer instrumentation. The renderer omits these samples and ARC
-  samples even if callers modify the retained placeholder registries.
-- Fuel: `ww_cell_fuel_remaining` and `ww_cell_fuel_consumed_total`.
-  The epoch callback does not publish to `FuelRegistry`. #752 owns fuel and
-  scheduler instrumentation.
-- RPC: `ww_rpc_calls_total` and `ww_rpc_duration_seconds`.
-  Production RPC paths do not update `RpcMetricsRegistry`; #754 owns that work.
+Fuel, RPC, ARC cache, and stream metrics have no production collectors. The
+endpoint omits their samples and HELP/TYPE declarations, and the runtime contains
+no placeholder registries for these metrics. Their absence means unavailable
+measurements, not zero activity. Producer-specific work owns future collection:
 
-Fuel and RPC registries remain available to callers. Empty or poisoned
-registries omit their samples. Their dynamic labels, histogram input validation,
-snapshot locking, and lifetime bounds need review before production wiring.
-#750 tracks that remaining collection work and its operation-to-HTTP validation.
+- [#260](https://github.com/wetware/ww/issues/260): live `PinsetCache` hits,
+  misses, evictions, cached weight, and entry count.
+- [#752](https://github.com/wetware/ww/issues/752): fuel and scheduler metrics
+  with bounded aggregation and explicit fuel-authority semantics.
+- [#754](https://github.com/wetware/ww/issues/754): RPC durations and outcomes,
+  stream activity, and other protocol/host metrics with bounded labels.
+
+Those implementations must establish producer semantics, counter lifetimes,
+label bounds, and operation-to-HTTP coverage before exposing new families.
 
 ### Kubo startup availability
 
