@@ -217,7 +217,7 @@ impl RunningNode {
         if let Some(cwd) = &options.cwd {
             command.current_dir(cwd);
         }
-        command.env_remove("WW_KERNEL").env_remove("WW_FHS_ROOT");
+        command.env_remove("WW_FHS_ROOT");
         if let Some(identity_path) = options.identity_path.as_ref() {
             command.arg("--identity").arg(identity_path);
         }
@@ -2190,35 +2190,6 @@ async fn kubo_targeted_kernel_mount_reports_verified_source_and_runtime_identity
         "{}",
         node.logs()
     );
-}
-
-#[test]
-fn obsolete_kernel_selectors_fail_with_actionable_diagnostics() {
-    for selector in ["--kernel", "WW_KERNEL"] {
-        let home = tempfile::tempdir().unwrap();
-        let mut command = Command::new(ww_bin());
-        command
-            .arg("run")
-            .env("HOME", home.path())
-            .env_remove("WW_FHS_ROOT")
-            .env_remove("WW_KERNEL");
-        if selector == "--kernel" {
-            command.args(["--kernel", "obsolete.wasm"]);
-        } else {
-            command.env("WW_KERNEL", "obsolete.wasm");
-        }
-        let output = command.output().unwrap();
-        assert!(
-            !output.status.success(),
-            "obsolete selector silently accepted"
-        );
-        let diagnostic = String::from_utf8_lossy(&output.stderr);
-        assert!(diagnostic.contains(selector), "{diagnostic}");
-        assert!(
-            diagnostic.contains("/boot/kernel.wasm"),
-            "migration path absent: {diagnostic}"
-        );
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

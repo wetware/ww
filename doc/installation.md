@@ -118,5 +118,4 @@ cannot trigger an embedded or previous-kernel fallback.
 Runtime preparation does not modify the installation. Local edits take effect
 only on a later Host invocation. Private identity and IPNS state remain outside
 the captured FHS. The persistent Host PeerId remains unchanged across kernel
-replacements. `--kernel` and `WW_KERNEL` cause an actionable error; replace them
-with an explicit targeted mount. Historical selector migration is unsupported.
+replacements.

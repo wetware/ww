@@ -110,7 +110,6 @@ esac
         service = services[0].read_text()
         self.assertIn(str(self.home / '.ww/bin/ww'), service)
         self.assertNotIn(str(self.home / '.ww/fhs'), service)
-        self.assertNotIn('--kernel', service)
         self.assertNotIn('ww-install.', service)
 
     def test_missing_payloads_and_checksums_do_not_replace(self):

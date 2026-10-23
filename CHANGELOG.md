@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+- Obsolete kernel-selector migration handling and tests for retired CLI flags
+  and routing identifiers. `--kernel` now receives Clap's ordinary unknown-argument
+  error; `WW_KERNEL` has no effect. PID0 selection still uses `/boot/kernel.wasm`
+  and rejects invalid selected content without fallback.
+- The explicit stdout tracing initializer and unused synchronous WAGI response
+  helpers. Host callers use `init_tracing`; finite WAGI handlers continue to await
+  `respond_bytes_async` for output completion.
+
 ### Added
 - **Static image checking (#736).** `ww image check` shares boot's mount
   resolution, filesystem composition, kernel selection, and production P3

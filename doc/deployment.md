@@ -199,9 +199,8 @@ not publish that name.
 
 The default publisher no longer creates or uses Kubo's `"ww"` signing key.
 An old `"ww"` key can remain in the Kubo keystore, but Wetware ignores it.
-Kubo never needs `~/.ww/identity`. The legacy guest `Routing.publish` method is
-removed. Provider `Finder` and `Announcer` capabilities do not resolve or
-publish IPNS records and do not receive host signing authority.
+Kubo never needs `~/.ww/identity`. Provider `Finder` and `Announcer` capabilities
+do not resolve or publish IPNS records and do not receive host signing authority.
 
 Kubo 0.33 requires this one-time operator configuration:
 

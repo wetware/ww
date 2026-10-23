@@ -168,7 +168,6 @@ fn command_format(
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("RUST_LOG", "info")
         .env_remove("WW_FHS_ROOT")
-        .env_remove("WW_KERNEL")
         .env_remove("WW_IDENTITY")
         .env_remove("IPFS_ROUTING_API")
         .stdin(Stdio::null())
