@@ -96,6 +96,13 @@ The configured FHS is the lowest composition layer, including after Stem updates
 
 ## Installed startup
 
+Run `ww image check` to validate installed/configured image composition and
+PID0 static compatibility before startup. Use the service's `--fhs-root`,
+`--namespace-root`, and `--ipfs-url` values when the service overrides defaults.
+The check does not install or restart services. It can import content and retain
+Kubo pins; see [image check](cli.md#ww-image-check). A passing check does not
+replace runtime readiness checks.
+
 Bare `ww run` captures `~/.ww/fhs` once and never imports the invocation CWD.
 Use `--fhs-root <directory>` or `WW_FHS_ROOT` for another baseline directory.
 Explicit `ww run .` captures the requested directory as a higher-priority overlay.

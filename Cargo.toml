@@ -114,6 +114,7 @@ name = "ww"
 path = "src/cli/main.rs"
 
 [dev-dependencies]
+sha2 = "0.10"
 membrane = { package = "wetware-membrane", path = "crates/membrane" }
 cell = { path = "crates/cell", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }

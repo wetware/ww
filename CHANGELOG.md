@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Static image checking (#736).** `ww image check` shares boot's mount
+  resolution, filesystem composition, kernel selection, and production P3
+  validation without executing guest code or starting deployment services.
+  Human-readable and JSON output distinguish the effective root, kernel file,
+  and runtime identities. Checks support installed baselines, local and immutable
+  mounts, and one-time configured heads. Kubo imports and pins can remain after
+  a check because CID-based pins do not establish exclusive ownership. Shared
+  kernel validation now checks the command export's async signature before
+  instantiation. Passing a check does not establish runtime readiness.
 - **Structured Host logs (#751).** Host diagnostics now use stderr, preserving
   stdout for command results. Interactive stderr selects compact colored logs;
   redirected stderr selects JSON Lines with typed fields and current-span context.

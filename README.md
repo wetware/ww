@@ -85,6 +85,7 @@ Repository builds use committed Cargo lockfiles. See the
 
 ```bash
 ww run                                  # boot the installed FHS
+ww image check                          # validate static PID0 compatibility
 ww run .                                # explicitly overlay the current directory
 ```
 
