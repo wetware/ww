@@ -138,7 +138,6 @@ Bare `ww run` captures the installed `~/.ww/fhs` baseline, independently of CWD.
 `--fhs-root` or `WW_FHS_ROOT` selects another baseline directory. Explicit mounts
 remain higher-priority operations even when they name `~/.ww/fhs` themselves.
 The Host selects PID0 exclusively from `/boot/kernel.wasm` in the effective root.
-`--kernel` and `WW_KERNEL` are rejected.
 
 A valid image that omits the kernel can inherit the installed path through
 ordinary composition. A selected symlink, wrong type, malformed or incompatible

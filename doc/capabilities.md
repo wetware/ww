@@ -160,10 +160,8 @@ records already distributed to other peers expire naturally. Provider routing
 exchanges provider records; it does not read content bytes.
 
 No current guest capability provides persistent content mutation or IPNS
-publication. The removed broad `Routing` interface formerly contained
-`mkdir`, `writeFile`, `remove`, `resolve`, and `publish`. WASI `/tmp` remains
-private and ephemeral. Read-only image and `/ipfs` access do not acquire the
-removed CID-transform semantics.
+publication. WASI `/tmp` remains private and ephemeral. Image and `/ipfs`
+access are read-only.
 
 ## Local mount snapshots
 

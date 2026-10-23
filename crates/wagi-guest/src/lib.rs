@@ -121,38 +121,6 @@ pub fn body_string() -> String {
     String::from_utf8(body()).unwrap_or_default()
 }
 
-/// Write a CGI response to buffered stdout without completion acknowledgement.
-///
-/// Formats the Status line, headers, and body per RFC 3875.
-/// This compatibility helper does not report write or flush failures. A finite
-/// WASI P3 handler must use [`respond_bytes_async`] and await its result.
-/// ```ignore
-/// wagi::respond(200, &[("Content-Type", "text/plain")], "hello");
-/// ```
-pub fn respond(status: u16, headers: &[(&str, &str)], body: &str) {
-    print!("Status: {status} {}\r\n", reason_phrase(status));
-    for (k, v) in headers {
-        print!("{k}: {v}\r\n");
-    }
-    print!("\r\n{body}");
-}
-
-/// Write a CGI response with a byte body without completion acknowledgement.
-///
-/// This compatibility helper does not report write or flush failures. A finite
-/// WASI P3 handler must use [`respond_bytes_async`] and await its result.
-pub fn respond_bytes(status: u16, headers: &[(&str, &str)], body: &[u8]) {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = write!(out, "Status: {status} {}\r\n", reason_phrase(status));
-    for (k, v) in headers {
-        let _ = write!(out, "{k}: {v}\r\n");
-    }
-    let _ = write!(out, "\r\n");
-    let _ = out.write_all(body);
-    let _ = out.flush();
-}
-
 /// Write a CGI response and await P3 stdout completion.
 ///
 /// Success means that P3 stdout accepted every response byte and the configured

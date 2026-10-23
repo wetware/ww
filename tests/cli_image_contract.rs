@@ -220,41 +220,6 @@ async fn push_rejects_missing_components_before_contacting_kubo() {
 }
 
 #[tokio::test]
-async fn push_rejects_removed_atom_options_before_contacting_kubo() {
-    let image = tempfile::tempdir().unwrap();
-    write(image.path(), "bin/probe.wasm", b"component");
-    for (flag, value) in [
-        ("--stem", "0x1111111111111111111111111111111111111111"),
-        ("--rpc-url", "http://127.0.0.1:8545"),
-        ("--private-key", "0x01"),
-    ] {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let output = tokio::time::timeout(
-            Duration::from_secs(10),
-            ww().arg("push")
-                .arg(image.path())
-                .args(["--ipfs-url", &url, flag, value])
-                .output(),
-        )
-        .await
-        .expect("removed options must fail before contacting Kubo")
-        .unwrap();
-        assert_eq!(output.status.code(), Some(2));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("unexpected argument") && stderr.contains(flag),
-            "{stderr}"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), listener.accept())
-                .await
-                .is_err()
-        );
-    }
-}
-
-#[tokio::test]
 async fn push_propagates_kubo_failure_without_reporting_publication() {
     let image = tempfile::tempdir().unwrap();
     write(image.path(), "bin/probe.wasm", b"component");

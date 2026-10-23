@@ -81,7 +81,6 @@ def main():
                 argv = shlex.split(command)
             assert argv[0] == str(installed), argv
             assert str(home / '.ww/fhs') not in argv, argv
-            assert '--kernel' not in argv, argv
             assert argv.count('--ipfs-url') == 1, f'generated service must carry --ipfs-url: {argv}'
             assert argv[argv.index('--ipfs-url') + 1] == kubo['IPFS_API'], argv
             print(f'PASS: generated {services[0].suffix} endpoint {kubo["IPFS_API"]}', flush=True)
