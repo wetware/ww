@@ -239,7 +239,8 @@ impl RunningNode {
 
         command
             .env("HOME", &home)
-            // Captured logs are asserted as plain text; CI may force ANSI colors.
+            // Lifecycle assertions parse compact fields without ANSI escapes.
+            .env("WW_LOG_FORMAT", "compact")
             .env("NO_COLOR", "1")
             .env("WW_KUBO_WAIT_MAX_SECS", "30")
             .env("WW_CWASM_DIR", home.join("cwasm"))

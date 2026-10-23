@@ -183,6 +183,45 @@ RPC listener and does not serve this path. Wetware does not fall back to Kubo's
 | `WW_CWASM_CACHE_MAX_BYTES` | operator | Wasmtime cache cleanup threshold in bytes (default: `335544320`). This is a soft limit, so leave filesystem headroom. |
 | `WW_OCI_IMAGE_ID` | operator | Optional immutable OCI image identity reported by `/version`. Deployment verification uses Kubernetes `pod.status.imageID` as the authority. |
 | `RUST_LOG` | user | Host-side tracing verbosity |
+| `WW_LOG_FORMAT` | user | Host log format: `auto` (default), `compact`, or `json` |
+| `NO_COLOR` | user | A nonempty value disables ANSI color in Host logs |
+
+### Host logging
+
+Host diagnostics go to stderr, leaving stdout for command results. With
+`WW_LOG_FORMAT=auto`, an interactive **stderr** selects compact structured text;
+redirected stderr selects newline-delimited JSON. Redirecting stdout alone does
+not change the format. `compact` and `json` override format selection without
+changing filtering. Compact output uses ANSI only on a terminal when `NO_COLOR`
+is absent or empty. JSON never adds ANSI color.
+
+Without a valid `RUST_LOG`, internal targets (`ww`, `atom`, `cache`, `cell`, `ipfs`,
+`membrane`, `rpc`, `stem`) default to `warn` on a terminal and `info` when stderr
+is redirected. A valid `RUST_LOG` replaces these defaults, including target and
+span-field directives. For example:
+
+```sh
+WW_LOG_FORMAT=json RUST_LOG=ww=debug,rpc=info ww run 2>host.jsonl
+NO_COLOR=1 WW_LOG_FORMAT=compact ww run
+```
+
+Each JSON line contains `timestamp`, `level`, `target`, and `fields`. Event
+messages appear in `fields.message`; native numeric and boolean fields retain
+their JSON types. When available, `span` contains the current span's name and
+fields. The formatter reserves `span.name` for the span name (`cell` for a Cell
+span); use `span.cell_name` for the Cell identity. The legacy `name` field remains
+available to span-field filters. Ancestor spans are not repeated in a `spans`
+list. Filtering can remove span context, and separately spawned tasks need
+explicit span propagation.
+
+Unknown, empty, or non-Unicode `WW_LOG_FORMAT` values fall back to `auto` and
+produce a warning, subject to `RUST_LOG`. The warning does not echo the value.
+Existing event error fields retain their recorded diagnostic representation;
+the formatter does not add or redact application fields. Call sites must avoid
+recording secrets or opaque capability payloads.
+
+This policy covers Host tracing. Interactive shell rendering, progress output,
+and child stderr keep their existing behavior (child-output ownership: #155).
 
 ## `ww healthcheck`
 

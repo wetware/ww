@@ -6,6 +6,7 @@ use std::task::Poll;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id};
 use tracing::{Event, Subscriber};
+use tracing_subscriber::fmt::writer::{MakeWriter, MutexGuardWriter};
 use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
@@ -45,6 +46,17 @@ struct Trace {
 
 #[derive(Clone)]
 struct Capture(Arc<Mutex<Trace>>);
+
+#[derive(Clone, Default)]
+struct JsonOutput(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> MakeWriter<'a> for JsonOutput {
+    type Writer = MutexGuardWriter<'a, Vec<u8>>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.0.make_writer()
+    }
+}
 
 impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: LayerContext<'_, S>) {
@@ -184,13 +196,22 @@ fn expect_signal(signals: &std::sync::mpsc::Receiver<Signal>, expected: Signal) 
 fn exercise_cells(cancel: bool) {
     let trace = Arc::new(Mutex::new(Trace::default()));
     let capture = Capture(trace.clone());
+    let json_output = JsonOutput::default();
+    let json_writer = json_output.clone();
     let (requests_tx, requests_rx) = mpsc::channel(2);
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     // Match ExecutorPool admission accounting without introducing another worker.
     let counts = Arc::new(vec![AtomicUsize::new(0)]);
     let worker_counts = counts.clone();
     let worker = std::thread::spawn(move || {
-        let subscriber = tracing_subscriber::registry().with(capture);
+        let subscriber = tracing_subscriber::registry().with(capture).with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_ansi(false)
+                .with_current_span(true)
+                .with_span_list(false)
+                .with_writer(json_writer),
+        );
         tracing::subscriber::with_default(subscriber, || {
             worker_loop(0, requests_rx, shutdown_rx, worker_counts, None).unwrap();
             tracing::info!(probe = "after_worker", owner = "none");
@@ -309,6 +330,28 @@ fn exercise_cells(cancel: bool) {
     let mut unrelated = vec!["unrelated"; if cancel { 3 } else { 5 }];
     unrelated.push("after_worker");
     assert_eq!(observed["none"], unrelated);
+
+    // JSON reserves span.name for metadata. Cell identity must survive parsing
+    // for real worker events, including cancellation-time destructor events.
+    let json = json_output.0.lock().unwrap();
+    let events: Vec<serde_json::Value> = std::str::from_utf8(&json)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), trace.events.len());
+    for event in &events {
+        match event["fields"]["owner"].as_str() {
+            Some("first" | "second") => {
+                assert_eq!(event["span"]["name"], "cell");
+                assert_eq!(
+                    event["span"]["cell_name"], event["fields"]["owner"],
+                    "JSON lost Cell identity: {event}"
+                );
+            }
+            _ => assert!(event["span"].get("cell_name").is_none()),
+        }
+    }
 }
 
 #[test]
