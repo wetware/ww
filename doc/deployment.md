@@ -299,7 +299,7 @@ localhost-only admin plane on `127.0.0.1:2026` is the process control surface:
 - `/readyz` reports whether the runtime has reached its serving phase.
 - `/version` reports source and current generation kernel provenance plus degraded
   cache state.
-- `/metrics` exposes live Wasmtime cache state and counters. See the collection
+- `/metrics` exposes live Wasmtime cache and ExecutorPool metrics. See the collection
   policy below for measurements that are not yet available.
 
 Keep the admin listener on loopback unless an authenticated network boundary
@@ -307,8 +307,8 @@ is added; these endpoints are intentionally unauthenticated.
 
 ### Metrics collection policy
 
-`GET /metrics` serves Prometheus text format 0.0.4. The four live metric
-families use the process-wide Wasmtime engine factory:
+`GET /metrics` serves Prometheus text format 0.0.4. Four metric families
+use the process-wide Wasmtime engine factory:
 
 | Family | Meaning |
 | --- | --- |
@@ -325,10 +325,50 @@ fallback cache states legitimately report zero hits and stores. A later write
 failure can leave the initialization state `enabled`;
 [#609](https://github.com/wetware/ww/issues/609) owns reporting those failures.
 
-The endpoint exports exactly six series: three cache-state samples and three
-unlabelled counters. Metric names, HELP text, and label values are static. The
-renderer accepts no dynamic label or HELP text that requires escaping. Cell
-identifiers, RPC methods, paths, peer IDs, and CIDs do not become metric labels.
+Three additional families use the Host's live ExecutorPool collector:
+
+| Family | Type and meaning |
+| --- | --- |
+| `ww_executor_cell_slots` | Gauge: current admitted task slots, including queued requests and running executor futures, summed across workers. |
+| `ww_executor_spawn_admissions_total` | Counter with `outcome="accepted"`, `"full"`, or `"closed"`: successful admission or rejection by the selected worker's bounded channel. |
+| `ww_executor_cell_terminations_total` | Counter with `outcome="completed"`, `"cancelled"`, or `"panicked"`: one terminal outcome per admitted task slot. |
+
+The Host creates the collector before starting its admin endpoint. Executor
+samples start at zero before the pool exists. The same collector receives live
+pool events. Counters accumulate for that Host instance, survive pool teardown,
+and reset with a new Host instance. Occupancy returns to zero after all pool
+workers join. A scrape reads separate atomics; concurrent operations can make
+samples disagree temporarily. Scraping does not mutate collection state.
+
+`completed` means the factory future returned `()`. The future can handle a guest
+error internally, so this outcome does not establish guest success. `cancelled`
+means an admitted request or future was dropped before completion, including
+queued requests discarded during shutdown. `panicked` means the started task
+unwound. These outcomes do not change guest cancellation or result delivery.
+Only executor-admitted root tasks occupy these slots. Child Cells launched
+locally through `OwnedChildLifecycle` do not submit a new pool admission.
+
+Admission failure describes the selected worker's channel. A full channel does
+not establish that every worker is full. Occupancy does not distinguish runnable
+work, guest I/O waits, or one-shot epoch suspension. These metrics do not detect
+blocked workers.
+
+Metric slot guards track queue and task ownership independently of the scheduler's
+existing `cell_counts`. Those counters can retain stale values after immediate
+completion or discarded queued requests. This landing preserves worker assignment;
+it does not use those counters as a public gauge.
+
+The endpoint exports exactly 13 series: six Wasmtime samples and seven executor
+samples. Metric names, HELP text, and label values are static. The renderer accepts
+no dynamic label or HELP text that requires escaping. Cell identifiers, task names,
+RPC methods, paths, peer IDs, and CIDs do not become metric labels. Response size
+is bounded by fixed text and integer widths, regardless of Cell churn.
+
+Collection adds atomic updates at admission and terminal boundaries. It adds no
+per-poll, fuel-hook, or epoch-tick collection. The existing test-only
+`FuelObserver` remains separate from production metrics. See the
+[executor measurement report](measurements/executor-metrics.md) for the baseline,
+performance budget, operation-to-HTTP evidence, and remaining #752 slices.
 
 Fuel, RPC, ARC cache, and stream metrics have no production collectors. The
 endpoint omits their samples and HELP/TYPE declarations, and the runtime contains
@@ -337,8 +377,9 @@ measurements, not zero activity. Producer-specific work owns future collection:
 
 - [#260](https://github.com/wetware/ww/issues/260): live `PinsetCache` hits,
   misses, evictions, cached weight, and entry count.
-- [#752](https://github.com/wetware/ww/issues/752): fuel and scheduler metrics
-  with bounded aggregation and explicit fuel-authority semantics.
+- [#752](https://github.com/wetware/ww/issues/752): fuel decisions, consumption,
+  authority ledgers, latency, and sampled diagnostics remain after this executor
+  admission and occupancy slice.
 - [#754](https://github.com/wetware/ww/issues/754): RPC durations and outcomes,
   stream activity, and other protocol/host metrics with bounded labels.
 

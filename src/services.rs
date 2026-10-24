@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -261,6 +261,97 @@ pub struct SpawnRequest {
     pub result_tx: Option<tokio::sync::oneshot::Sender<Result<i32>>>,
 }
 
+/// Bounded aggregate metrics for executor-admitted Cell task lifetimes.
+///
+/// Create one collector per Host and retain it across pool teardown. Counters
+/// remain cumulative for that collector; occupied slots return to zero when all
+/// admitted requests and tasks are dropped. Child Cells spawned directly on a
+/// worker's LocalSet do not pass through ExecutorPool admission.
+#[derive(Clone, Debug, Default)]
+pub struct ExecutorMetrics {
+    inner: Arc<ExecutorMetricsInner>,
+}
+
+#[derive(Debug, Default)]
+struct ExecutorMetricsInner {
+    occupied: AtomicUsize,
+    accepted: AtomicU64,
+    full: AtomicU64,
+    closed: AtomicU64,
+    completed: AtomicU64,
+    cancelled: AtomicU64,
+    panicked: AtomicU64,
+}
+
+/// A relaxed snapshot of one Host's executor metrics.
+///
+/// Individual fields are atomic; concurrent admission or retirement can occur
+/// between field reads. Completion means the admitted `Future<Output = ()>`
+/// returned, not that the guest reported a successful exit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecutorSnapshot {
+    pub occupied: usize,
+    pub accepted: u64,
+    pub full: u64,
+    pub closed: u64,
+    pub completed: u64,
+    pub cancelled: u64,
+    pub panicked: u64,
+}
+
+impl ExecutorMetrics {
+    pub fn snapshot(&self) -> ExecutorSnapshot {
+        ExecutorSnapshot {
+            occupied: self.inner.occupied.load(Ordering::Relaxed),
+            accepted: self.inner.accepted.load(Ordering::Relaxed),
+            full: self.inner.full.load(Ordering::Relaxed),
+            closed: self.inner.closed.load(Ordering::Relaxed),
+            completed: self.inner.completed.load(Ordering::Relaxed),
+            cancelled: self.inner.cancelled.load(Ordering::Relaxed),
+            panicked: self.inner.panicked.load(Ordering::Relaxed),
+        }
+    }
+
+    fn admit(&self) -> ExecutorSlotGuard {
+        self.inner.occupied.fetch_add(1, Ordering::Relaxed);
+        self.inner.accepted.fetch_add(1, Ordering::Relaxed);
+        ExecutorSlotGuard {
+            metrics: self.clone(),
+            started: false,
+            completed: false,
+        }
+    }
+}
+
+/// Owns instrumentation from channel admission through task retirement.
+/// This state does not participate in worker assignment or cancellation.
+struct ExecutorSlotGuard {
+    metrics: ExecutorMetrics,
+    started: bool,
+    completed: bool,
+}
+
+impl Drop for ExecutorSlotGuard {
+    fn drop(&mut self) {
+        let inner = &self.metrics.inner;
+        let outcome = if self.completed {
+            &inner.completed
+        } else if self.started && std::thread::panicking() {
+            &inner.panicked
+        } else {
+            // Includes queued requests dropped before the worker starts them.
+            &inner.cancelled
+        };
+        outcome.fetch_add(1, Ordering::Relaxed);
+        inner.occupied.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct AdmittedSpawn {
+    request: SpawnRequest,
+    metrics_guard: ExecutorSlotGuard,
+}
+
 /// Pool of executor worker threads for M:N cell scheduling.
 ///
 /// Each worker is an OS thread with a `current_thread` tokio runtime and a
@@ -271,7 +362,7 @@ pub struct SpawnRequest {
 const SPAWN_CHANNEL_DEPTH: usize = 64;
 
 pub struct ExecutorPool {
-    senders: Vec<mpsc::Sender<SpawnRequest>>,
+    senders: Vec<mpsc::Sender<AdmittedSpawn>>,
     threads: Vec<Option<JoinHandle<Result<()>>>>,
     cell_counts: Arc<Vec<AtomicUsize>>,
     next: AtomicUsize,
@@ -279,6 +370,7 @@ pub struct ExecutorPool {
     /// all cells on a worker respond to `increment_epoch()` on the same engine.
     runtime_engine: cell::engine::RuntimeEngine,
     filesystem_resources: Arc<cache::HostResources>,
+    metrics: ExecutorMetrics,
 }
 
 impl ExecutorPool {
@@ -290,6 +382,21 @@ impl ExecutorPool {
         n: usize,
         shutdown: watch::Receiver<()>,
         filesystem_resources: Arc<cache::HostResources>,
+    ) -> Result<Self> {
+        Self::try_new_with_metrics(
+            n,
+            shutdown,
+            filesystem_resources,
+            ExecutorMetrics::default(),
+        )
+    }
+
+    /// Create a pool connected to the Host's existing executor collector.
+    pub fn try_new_with_metrics(
+        n: usize,
+        shutdown: watch::Receiver<()>,
+        filesystem_resources: Arc<cache::HostResources>,
+        metrics: ExecutorMetrics,
     ) -> Result<Self> {
         let n = if n == 0 {
             std::thread::available_parallelism()
@@ -336,6 +443,7 @@ impl ExecutorPool {
             next: AtomicUsize::new(0),
             runtime_engine,
             filesystem_resources,
+            metrics,
         })
     }
 
@@ -353,7 +461,7 @@ impl ExecutorPool {
     /// Submit a cell to the pool using least-loaded assignment.
     ///
     /// Returns `Err` if the chosen worker's channel is full or closed.
-    /// Uses `try_send` to avoid deadlock when a cell on worker N spawns
+    /// Uses nonblocking admission to avoid deadlock when a cell on worker N spawns
     /// a child that routes back to the same worker.
     pub fn spawn(&self, request: SpawnRequest) -> Result<(), SpawnRequest> {
         let n = self.senders.len();
@@ -377,15 +485,34 @@ impl ExecutorPool {
             best = self.next.fetch_add(1, Ordering::Relaxed) % n;
         }
 
-        match self.senders[best].try_send(request) {
-            Ok(()) => {
+        // Reserve the same channel capacity as try_send before publishing the
+        // metrics guard. A worker can complete immediately after publication.
+        // Keep scheduler cell_counts updates in their existing order: their
+        // historical accounting is separate from the metrics-only slot owner.
+        match self.senders[best].try_reserve() {
+            Ok(permit) => {
+                let metrics_guard = self.metrics.admit();
+                permit.send(AdmittedSpawn {
+                    request,
+                    metrics_guard,
+                });
                 self.cell_counts[best].fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Full(r) | mpsc::error::TrySendError::Closed(r)) => {
-                Err(r)
+            Err(mpsc::error::TrySendError::Full(())) => {
+                self.metrics.inner.full.fetch_add(1, Ordering::Relaxed);
+                Err(request)
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                self.metrics.inner.closed.fetch_add(1, Ordering::Relaxed);
+                Err(request)
             }
         }
+    }
+
+    /// Live collector for this pool; retaining it does not retain the workers.
+    pub fn metrics(&self) -> ExecutorMetrics {
+        self.metrics.clone()
     }
 
     /// Number of worker threads in the pool.
@@ -475,7 +602,7 @@ impl Drop for CellCountGuard {
 /// old-epoch work before they open the new allowance.
 fn worker_loop(
     id: usize,
-    rx: mpsc::Receiver<SpawnRequest>,
+    rx: mpsc::Receiver<AdmittedSpawn>,
     shutdown: watch::Receiver<()>,
     cell_counts: Arc<Vec<AtomicUsize>>,
     epoch_publisher: Option<cell::engine::EpochPublisher>,
@@ -511,7 +638,7 @@ fn worker_loop(
             tokio::select! {
                 _ = cells.join_next(), if !cells.is_empty() => {},
                 req = rx.recv() => match req {
-                    Some(spawn_req) => {
+                    Some(AdmittedSpawn { request: spawn_req, metrics_guard }) => {
                         let cell_name = spawn_req.name;
                         let factory = spawn_req.factory;
                         let result_tx = spawn_req.result_tx;
@@ -525,11 +652,15 @@ fn worker_loop(
                         let cancelled = rpc::local_tasks::shutdown_token();
                         let handle = tokio::task::spawn_local(async move {
                             let _guard = guard;
-                            tokio::select! {
+                            let mut metrics_guard = metrics_guard;
+                            metrics_guard.started = true;
+                            let completed = tokio::select! {
                                 biased;
                                 _ = cancelled.cancelled() => false,
                                 _ = (factory)(cell_shutdown) => true,
-                            }
+                            };
+                            metrics_guard.completed = completed;
+                            completed
                         }.instrument(span));
                         // Monitor the cell task for panics and send exit code.
                         let cell_name_log = cell_name.clone();
@@ -1551,3 +1682,7 @@ mod tests {
 #[cfg(test)]
 #[path = "services_tracing_tests.rs"]
 mod tracing_tests;
+
+#[cfg(test)]
+#[path = "services_metrics_tests.rs"]
+mod metrics_tests;

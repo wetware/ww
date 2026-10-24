@@ -202,6 +202,7 @@ fn exercise_cells(cancel: bool) {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     // Match ExecutorPool admission accounting without introducing another worker.
     let counts = Arc::new(vec![AtomicUsize::new(0)]);
+    let metrics = ExecutorMetrics::default();
     let worker_counts = counts.clone();
     let worker = std::thread::spawn(move || {
         let subscriber = tracing_subscriber::registry().with(capture).with(
@@ -223,14 +224,24 @@ fn exercise_cells(cancel: bool) {
     let (second, second_tx, second_result) = request("second", signals_tx, None);
 
     counts[0].fetch_add(1, Ordering::Relaxed);
-    assert!(requests_tx.blocking_send(first).is_ok());
+    assert!(requests_tx
+        .blocking_send(AdmittedSpawn {
+            request: first,
+            metrics_guard: metrics.admit(),
+        })
+        .is_ok());
     expect_signal(&signals_rx, ("first", "suspended"));
     unrelated_tx.send(()).unwrap();
     expect_signal(&signals_rx, ("none", "unrelated"));
 
     // Admission while first is suspended also checks the second span's parent.
     counts[0].fetch_add(1, Ordering::Relaxed);
-    assert!(requests_tx.blocking_send(second).is_ok());
+    assert!(requests_tx
+        .blocking_send(AdmittedSpawn {
+            request: second,
+            metrics_guard: metrics.admit(),
+        })
+        .is_ok());
     expect_signal(&signals_rx, ("second", "suspended"));
     for (name, commands) in [("first", &first_tx), ("second", &second_tx)] {
         commands.send(Command::Resume).unwrap();

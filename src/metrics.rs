@@ -8,12 +8,14 @@
 //! Wasmtime cache metrics read the live process-wide engine factory. Only
 //! families with production collectors are declared and exposed.
 
+use std::fmt::Write as _;
 use std::sync::{Arc, RwLock};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use tokio::sync::watch;
 
 use crate::cell::engine::{WasmtimeCacheMetrics, WasmtimeCacheSnapshot, WasmtimeCacheState};
+use crate::services::{ExecutorMetrics, ExecutorSnapshot};
 
 /// Immutable build and artifact identity exposed by `GET /version`.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -96,12 +98,14 @@ struct AdminState {
     kernel_ready_gate: Arc<authority::KernelReadyGate>,
     route_registry: Option<rpc::dispatch::RouteRegistry>,
     wasmtime_cache_metrics: WasmtimeCacheMetrics,
+    executor_metrics: ExecutorMetrics,
 }
 
 /// Render all metrics in Prometheus text exposition format.
 fn render_metrics(state: &AdminState) -> String {
-    let mut out = String::with_capacity(1024);
+    let mut out = String::with_capacity(2048);
     render_wasmtime_cache_metrics(&mut out, &state.wasmtime_cache_metrics.snapshot());
+    render_executor_metrics(&mut out, state.executor_metrics.snapshot());
     out
 }
 
@@ -137,6 +141,40 @@ fn render_wasmtime_cache_metrics(out: &mut String, snapshot: &WasmtimeCacheSnaps
         "ww_wasmtime_component_compilations_total {}\n",
         snapshot.component_compilations
     ));
+}
+
+/// The label sets are fixed. Counters span the Host's collector lifetime and
+/// remain available after executor teardown; occupancy returns to zero.
+fn render_executor_metrics(out: &mut String, snapshot: ExecutorSnapshot) {
+    out.push_str("# HELP ww_executor_cell_slots Executor-admitted Cell task slots, queued or running, across all workers.\n");
+    out.push_str("# TYPE ww_executor_cell_slots gauge\n");
+    writeln!(out, "ww_executor_cell_slots {}", snapshot.occupied).unwrap();
+    out.push_str("# HELP ww_executor_spawn_admissions_total Spawn attempts by admission outcome over this Host lifetime.\n");
+    out.push_str("# TYPE ww_executor_spawn_admissions_total counter\n");
+    for (outcome, value) in [
+        ("accepted", snapshot.accepted),
+        ("full", snapshot.full),
+        ("closed", snapshot.closed),
+    ] {
+        writeln!(
+            out,
+            "ww_executor_spawn_admissions_total{{outcome=\"{outcome}\"}} {value}"
+        )
+        .unwrap();
+    }
+    out.push_str("# HELP ww_executor_cell_terminations_total Admitted task lifetimes ended by executor outcome over this Host lifetime; completed means the factory future returned, not guest success.\n");
+    out.push_str("# TYPE ww_executor_cell_terminations_total counter\n");
+    for (outcome, value) in [
+        ("completed", snapshot.completed),
+        ("cancelled", snapshot.cancelled),
+        ("panicked", snapshot.panicked),
+    ] {
+        writeln!(
+            out,
+            "ww_executor_cell_terminations_total{{outcome=\"{outcome}\"}} {value}"
+        )
+        .unwrap();
+    }
 }
 
 /// `GET /metrics` handler.
@@ -301,6 +339,8 @@ pub struct AdminService {
     /// When WAGI serving is enabled, readiness also requires a live route.
     pub route_registry: Option<rpc::dispatch::RouteRegistry>,
     pub wasmtime_cache_metrics: WasmtimeCacheMetrics,
+    /// The same collector supplied to the Host executor pool.
+    pub executor_metrics: ExecutorMetrics,
 }
 
 impl crate::services::Service for AdminService {
@@ -319,6 +359,7 @@ impl crate::services::Service for AdminService {
                 kernel_ready_gate: self.kernel_ready_gate,
                 route_registry: self.route_registry,
                 wasmtime_cache_metrics: self.wasmtime_cache_metrics,
+                executor_metrics: self.executor_metrics,
             };
 
             let app = Router::new()
@@ -376,6 +417,7 @@ mod tests {
             kernel_ready_gate,
             route_registry: None,
             wasmtime_cache_metrics: crate::cell::engine::wasmtime_cache_metrics(),
+            executor_metrics: ExecutorMetrics::default(),
         }
     }
 
@@ -566,18 +608,18 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("# HELP "))
                 .count(),
-            4
+            7
         );
         assert_eq!(
             output
                 .lines()
                 .filter(|line| line.starts_with("# TYPE "))
                 .count(),
-            4
+            7
         );
         assert_eq!(
             output.lines().filter(|line| !line.starts_with('#')).count(),
-            6
+            13
         );
     }
 

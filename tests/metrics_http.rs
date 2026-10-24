@@ -1,6 +1,8 @@
-//! Real admin HTTP scrapes against the process-global Wasmtime producer.
+//! Real admin HTTP scrapes against the Wasmtime and ExecutorPool producers.
 //! Each cache policy runs in a subprocess because EngineFactory reads env once.
 #![cfg(not(target_arch = "wasm32"))]
+
+mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::TcpListener;
@@ -12,9 +14,9 @@ use cell::engine::{
     compile_component, wasm_engine, wasmtime_cache_metrics, WasmtimeCacheSnapshot,
     CWASM_CACHE_MAX_BYTES_ENV, CWASM_DIR_ENV,
 };
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use ww::metrics::{AdminService, RuntimeStatus, VersionInfo};
-use ww::services::Service;
+use ww::services::{ExecutorMetrics, ExecutorPool, Service, SpawnFactory, SpawnRequest};
 
 const PROBE_MODE: &str = "WW_METRICS_HTTP_TEST_MODE";
 const MEASURE: &str = "WW_METRICS_HTTP_TEST_MEASURE";
@@ -94,6 +96,10 @@ struct Admin {
 
 impl Admin {
     fn start() -> Self {
+        Self::with_executor_metrics(ExecutorMetrics::default())
+    }
+
+    fn with_executor_metrics(executor_metrics: ExecutorMetrics) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/metrics", listener.local_addr().unwrap());
@@ -111,6 +117,7 @@ impl Admin {
             kernel_ready_gate: Arc::new(authority::KernelReadyGate::new(epoch_rx)),
             route_registry: None,
             wasmtime_cache_metrics: wasmtime_cache_metrics(),
+            executor_metrics,
         };
         let (shutdown, shutdown_rx) = watch::channel(());
         let (done_tx, done) = std::sync::mpsc::channel();
@@ -163,7 +170,7 @@ impl Scrape {
                 assert!(matches!(kind, "gauge" | "counter" | "histogram"));
                 assert!(types.insert(name.to_owned(), kind.to_owned()).is_none());
             } else {
-                // The live producer has integer samples and one bounded label.
+                // The live producers have integer samples and bounded labels.
                 // This is a parser for this endpoint's live subset, not a general
                 // Prometheus parser for future fuel/RPC observations.
                 let (identity, value) = line.split_once(' ').expect("sample value");
@@ -171,10 +178,21 @@ impl Scrape {
                 assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
                 assert!(types.contains_key(name), "sample without TYPE: {line}");
                 if identity.contains('{') {
-                    assert_eq!(name, "ww_wasmtime_cache_state");
-                    assert!(["enabled", "disabled", "fallback"]
+                    let (label, values): (&str, &[&str]) = match name {
+                        "ww_wasmtime_cache_state" => {
+                            ("state", &["enabled", "disabled", "fallback"])
+                        }
+                        "ww_executor_spawn_admissions_total" => {
+                            ("outcome", &["accepted", "full", "closed"])
+                        }
+                        "ww_executor_cell_terminations_total" => {
+                            ("outcome", &["completed", "cancelled", "panicked"])
+                        }
+                        _ => panic!("unsupported metric labels: {identity}"),
+                    };
+                    assert!(values
                         .iter()
-                        .any(|state| { identity == format!("{name}{{state=\"{state}\"}}") }));
+                        .any(|value| { identity == format!("{name}{{{label}=\"{value}\"}}") }));
                 }
                 let value: u64 = value.parse().expect("nonnegative integer sample");
                 assert!(
@@ -189,6 +207,9 @@ impl Scrape {
             ("ww_wasmtime_cache_hits_total", "counter"),
             ("ww_wasmtime_cache_stores_total", "counter"),
             ("ww_wasmtime_component_compilations_total", "counter"),
+            ("ww_executor_cell_slots", "gauge"),
+            ("ww_executor_spawn_admissions_total", "counter"),
+            ("ww_executor_cell_terminations_total", "counter"),
         ]
         .into_iter()
         .map(|(name, kind)| (name.to_owned(), kind.to_owned()))
@@ -219,14 +240,40 @@ impl Scrape {
         );
     }
 
+    fn assert_executor(&self, occupied: u64, admissions: [u64; 3], terminations: [u64; 3]) {
+        assert_eq!(self.samples["ww_executor_cell_slots"], occupied);
+        for (outcome, expected) in ["accepted", "full", "closed"].into_iter().zip(admissions) {
+            assert_eq!(
+                self.samples
+                    [&format!("ww_executor_spawn_admissions_total{{outcome=\"{outcome}\"}}")],
+                expected,
+                "{outcome} admissions"
+            );
+        }
+        for (outcome, expected) in ["completed", "cancelled", "panicked"]
+            .into_iter()
+            .zip(terminations)
+        {
+            assert_eq!(
+                self.samples
+                    [&format!("ww_executor_cell_terminations_total{{outcome=\"{outcome}\"}}")],
+                expected,
+                "{outcome} terminations"
+            );
+        }
+        self.assert_unsupported_absent();
+        self.assert_live_families_contiguous();
+    }
+
     fn assert_unsupported_absent(&self) {
         for name in self.samples.keys() {
             assert!(
-                name.starts_with("ww_wasmtime_"),
+                name.starts_with("ww_wasmtime_") || name.starts_with("ww_executor_"),
                 "unsupported sample exposed: {name}"
             );
         }
-        assert_eq!(self.samples.len(), 6);
+        assert_eq!(self.samples.len(), 13);
+        assert!(self.body.len() < 4096, "unbounded metrics response");
     }
 
     fn assert_live_families_contiguous(&self) {
@@ -238,9 +285,6 @@ impl Scrape {
                 .or_else(|| line.strip_prefix("# TYPE "))
                 .unwrap_or(line);
             let name = content.split([' ', '{']).next().unwrap();
-            if !name.starts_with("ww_wasmtime_") {
-                continue;
-            }
             if current != Some(name) {
                 assert!(
                     seen.insert(name),
@@ -263,6 +307,193 @@ async fn scrape(client: &reqwest::Client, admin: &Admin) -> Scrape {
     let body = response.text().await.expect("metrics body");
     let elapsed = start.elapsed();
     Scrape::parse(body, elapsed)
+}
+
+type CellResult = oneshot::Receiver<anyhow::Result<i32>>;
+
+fn submit(pool: &ExecutorPool, name: &str, factory: SpawnFactory) -> CellResult {
+    let (result_tx, result) = oneshot::channel();
+    assert!(
+        pool.spawn(SpawnRequest {
+            name: name.into(),
+            factory,
+            result_tx: Some(result_tx),
+        })
+        .is_ok(),
+        "admit {name}"
+    );
+    result
+}
+
+fn held_cell(
+    pool: &ExecutorPool,
+    name: &str,
+) -> (oneshot::Sender<()>, oneshot::Receiver<()>, CellResult) {
+    let (release, released) = oneshot::channel();
+    let (started_tx, started) = oneshot::channel();
+    let result = submit(
+        pool,
+        name,
+        Box::new(move |_| {
+            Box::pin(async move {
+                started_tx.send(()).unwrap();
+                let _ = released.await;
+            })
+        }),
+    );
+    (release, started, result)
+}
+
+async fn cell_result(result: CellResult) -> anyhow::Result<i32> {
+    tokio::time::timeout(Duration::from_secs(5), result)
+        .await
+        .expect("Cell termination deadline")
+        .expect("Cell result sender")
+}
+
+#[tokio::test]
+async fn executor_http_tracks_operations_and_retains_counters_after_teardown() {
+    let metrics = ExecutorMetrics::default();
+    let admin = Admin::with_executor_metrics(metrics.clone());
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let (shutdown, shutdown_rx) = watch::channel(());
+    let pool = ExecutorPool::try_new_with_metrics(
+        2,
+        shutdown_rx,
+        support::filesystem_resources(),
+        metrics,
+    )
+    .unwrap();
+    scrape(&client, &admin)
+        .await
+        .assert_executor(0, [0, 0, 0], [0, 0, 0]);
+
+    // Both futures stay live, so least-loaded assignment occupies both workers.
+    let (complete, started, completed) = held_cell(&pool, "private-cell-name-complete");
+    let (cancel_one_release, cancel_one_started, cancelled_one) =
+        held_cell(&pool, "private-cell-name-cancel-one");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        started.await.unwrap();
+        cancel_one_started.await.unwrap();
+    })
+    .await
+    .expect("both workers started their Cells");
+    let occupied = scrape(&client, &admin).await;
+    occupied.assert_executor(2, [2, 0, 0], [0, 0, 0]);
+    assert!(!occupied.body.contains("private-cell-name"));
+
+    complete.send(()).unwrap();
+    assert_eq!(cell_result(completed).await.unwrap(), 0);
+    scrape(&client, &admin)
+        .await
+        .assert_executor(1, [2, 0, 0], [1, 0, 0]);
+
+    let panicked = submit(
+        &pool,
+        "private-cell-name-panic",
+        Box::new(|_| Box::pin(async { panic!("intentional metrics probe panic") })),
+    );
+    assert!(cell_result(panicked).await.is_err());
+    scrape(&client, &admin)
+        .await
+        .assert_executor(1, [3, 0, 0], [1, 0, 1]);
+
+    let (cancel_two_release, cancel_two_started, cancelled_two) =
+        held_cell(&pool, "private-cell-name-cancel-two");
+    tokio::time::timeout(Duration::from_secs(5), cancel_two_started)
+        .await
+        .expect("second worker started a replacement Cell")
+        .unwrap();
+    shutdown.send(()).unwrap();
+    assert!(cell_result(cancelled_one).await.is_err());
+    assert!(cell_result(cancelled_two).await.is_err());
+    // Each worker closes its admission channel before cancelling its Cell.
+    // These result acknowledgements establish that both channels are closed.
+    assert!(pool
+        .spawn(SpawnRequest {
+            name: "private-cell-name-rejected".into(),
+            factory: Box::new(|_| Box::pin(async {})),
+            result_tx: None,
+        })
+        .is_err());
+    pool.shutdown_and_join().await;
+    drop((cancel_one_release, cancel_two_release));
+
+    let stopped = scrape(&client, &admin).await;
+    stopped.assert_executor(0, [4, 0, 1], [1, 2, 1]);
+    for _ in 0..8 {
+        assert_eq!(scrape(&client, &admin).await.body, stopped.body);
+    }
+    println!(
+        "EXECUTOR_HTTP_EVIDENCE={}",
+        serde_json::json!({"occupied": occupied.samples, "after_teardown": stopped.samples,
+            "body_bytes": stopped.body.len()})
+    );
+}
+
+#[tokio::test]
+async fn executor_http_counts_full_admission_and_cancels_queued_slots() {
+    let metrics = ExecutorMetrics::default();
+    let admin = Admin::with_executor_metrics(metrics.clone());
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let (shutdown, shutdown_rx) = watch::channel(());
+    let pool = ExecutorPool::try_new_with_metrics(
+        1,
+        shutdown_rx,
+        support::filesystem_resources(),
+        metrics,
+    )
+    .unwrap();
+    let (started_tx, started) = oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let blocked = submit(
+        &pool,
+        "private-cell-name-blocked",
+        Box::new(move |_| {
+            started_tx.send(()).unwrap();
+            // Hold the worker thread before it can dequeue another request.
+            // The deadline also bounds cleanup if an earlier assertion fails.
+            released.recv_timeout(Duration::from_secs(10)).unwrap();
+            Box::pin(std::future::pending())
+        }),
+    );
+    tokio::time::timeout(Duration::from_secs(5), started)
+        .await
+        .expect("worker entered the blocking factory")
+        .unwrap();
+    let mut accepted = 1;
+    loop {
+        let request = SpawnRequest {
+            name: format!("private-queued-cell-{accepted}"),
+            factory: Box::new(|_| Box::pin(std::future::pending())),
+            result_tx: None,
+        };
+        if pool.spawn(request).is_err() {
+            break;
+        }
+        accepted += 1;
+        assert!(accepted < 1024, "spawn queue must remain bounded");
+    }
+    assert!(accepted > 1, "test must exercise queued requests");
+    let queued = scrape(&client, &admin).await;
+    queued.assert_executor(accepted, [accepted, 1, 0], [0, 0, 0]);
+    assert!(!queued.body.contains("private-"));
+
+    shutdown.send(()).unwrap();
+    release.send(()).unwrap();
+    assert!(cell_result(blocked).await.is_err());
+    pool.shutdown_and_join().await;
+    scrape(&client, &admin)
+        .await
+        .assert_executor(0, [accepted, 1, 0], [0, accepted, 0]);
 }
 
 async fn repeat_scrapes(
@@ -333,6 +564,7 @@ fn metrics_http_probe() {
         );
         let empty = scrape(&client, &admin).await;
         empty.assert_snapshot(initial);
+        empty.assert_executor(0, [0, 0, 0], [0, 0, 0]);
         repeat_scrapes(&client, &admin, &mode, "before_compile", measure).await;
 
         let wasm = wat::parse_str("(component)").unwrap();
