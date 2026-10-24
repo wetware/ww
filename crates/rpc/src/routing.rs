@@ -589,8 +589,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_routing_interface_id_is_rejected_by_new_capabilities() {
-        const LEGACY_ROUTING_INTERFACE_ID: u64 = 0xa7c3_e8f1_d4b2_9065;
+    async fn finder_and_announcer_reject_each_others_interface() {
+        use capnp::traits::HasTypeId;
 
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -601,22 +601,28 @@ mod tests {
                     receiver: epoch_rx,
                 };
                 let finder = bootstrap_finder(FinderImpl::new(swarm_tx.clone(), guard.clone()));
-                let announcer = bootstrap_announcer(AnnouncerImpl::new(swarm_tx, guard));
+                let announcer = bootstrap_announcer(AnnouncerImpl::new(swarm_tx.clone(), guard));
 
-                for client in [finder.client, announcer.client] {
+                for (client, interface_id) in [
+                    (finder.client, routing_capnp::announcer::Client::TYPE_ID),
+                    (announcer.client, routing_capnp::finder::Client::TYPE_ID),
+                ] {
                     let request = client
                         .new_call::<capnp::any_pointer::Owned, capnp::any_pointer::Owned>(
-                            LEGACY_ROUTING_INTERFACE_ID,
+                            interface_id,
                             0,
                             None,
                         );
                     let error = match request.send().promise.await {
-                        Ok(_) => panic!("legacy Routing interface ID resolved"),
+                        Ok(_) => panic!("routing capability accepted the other interface"),
                         Err(error) => error,
                     };
                     assert_eq!(error.kind, capnp::ErrorKind::Unimplemented);
+                    assert!(matches!(
+                        swarm_rx.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
                 }
-                assert!(swarm_rx.try_recv().is_err());
             })
             .await;
     }

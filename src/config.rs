@@ -43,67 +43,45 @@ fn default_filter(level: &str) -> String {
 /// Compact text uses ANSI only on a terminal with absent or empty `NO_COLOR`.
 /// JSON contains typed event fields and the current span, without the span list.
 ///
-/// `stderr` selects stderr when true, stdout when false. Host callers use
-/// [`init_tracing`] to preserve stdout for command results; the explicit stdout
-/// option remains available for existing library callers.
-///
-/// Attempts to initialize a global `tracing_subscriber` (no-op if already set).
-pub fn init_tracing_to_stderr(stderr: bool) {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::io::IsTerminal;
-        if stderr {
-            init_with_writer(std::io::stderr, std::io::stderr().is_terminal());
-        } else {
-            init_with_writer(std::io::stdout, std::io::stdout().is_terminal());
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn init_with_writer<W>(writer: W, is_terminal: bool)
-where
-    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
-{
-    use std::env::VarError;
-
-    let level = if is_terminal { "warn" } else { "info" };
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter(level)));
-    let (json, invalid_format) = match std::env::var("WW_LOG_FORMAT").as_deref() {
-        Ok("compact") => (false, false),
-        Ok("json") => (true, false),
-        Ok("auto") | Err(VarError::NotPresent) => (!is_terminal, false),
-        _ => (!is_terminal, true),
-    };
-    let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer)
-        .with_env_filter(filter);
-    let initialized = if json {
-        subscriber
-            .json()
-            .with_ansi(false)
-            .with_current_span(true)
-            .with_span_list(false)
-            .try_init()
-    } else {
-        subscriber
-            .compact()
-            .with_ansi(is_terminal && !no_color)
-            .try_init()
-    };
-    // Do not emit additional diagnostics through a subscriber owned by a caller.
-    if initialized.is_ok() && invalid_format {
-        tracing::warn!("invalid WW_LOG_FORMAT; expected auto, compact, or json; using auto");
-    }
-}
-
-/// Initialize Host tracing on stderr using [`init_tracing_to_stderr`]'s policy.
-///
+/// Host diagnostics use stderr, preserving stdout for command results.
 /// Attempts to initialize a global `tracing_subscriber` (no-op if already set).
 pub fn init_tracing() {
-    init_tracing_to_stderr(true);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::{env::VarError, io::IsTerminal};
+
+        let is_terminal = std::io::stderr().is_terminal();
+        let level = if is_terminal { "warn" } else { "info" };
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter(level)));
+        let (json, invalid_format) = match std::env::var("WW_LOG_FORMAT").as_deref() {
+            Ok("compact") => (false, false),
+            Ok("json") => (true, false),
+            Ok("auto") | Err(VarError::NotPresent) => (!is_terminal, false),
+            _ => (!is_terminal, true),
+        };
+        let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter);
+        let initialized = if json {
+            subscriber
+                .json()
+                .with_ansi(false)
+                .with_current_span(true)
+                .with_span_list(false)
+                .try_init()
+        } else {
+            subscriber
+                .compact()
+                .with_ansi(is_terminal && !no_color)
+                .try_init()
+        };
+        // Do not emit additional diagnostics through a subscriber owned by a caller.
+        if initialized.is_ok() && invalid_format {
+            tracing::warn!("invalid WW_LOG_FORMAT; expected auto, compact, or json; using auto");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -126,7 +104,7 @@ mod tests {
     }
 
     /// A typo or stray character in `INTERNAL_CRATES` would otherwise blow up
-    /// at runtime when `init_tracing_to_stderr` is called.
+    /// at runtime when `init_tracing` is called.
     #[test]
     fn default_filter_parses_as_env_filter() {
         for level in ["info", "warn", "debug", "trace"] {

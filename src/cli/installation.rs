@@ -16,7 +16,7 @@ struct Ownership {
 
 fn incompatible(path: &Path) -> anyhow::Error {
     anyhow::anyhow!(
-        "Existing custom installation is incompatible at {}. Back up your configuration and reinstall using the current installer. Custom --kernel/WW_KERNEL service settings must be reviewed manually.",
+        "Existing custom installation is incompatible at {}. Back up your configuration and reinstall using the current installer.",
         path.display()
     )
 }
