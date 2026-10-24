@@ -134,10 +134,6 @@ enum Commands {
         #[arg(long)]
         wasm_debug: bool,
 
-        /// Rejected legacy selector; use a positional /boot/kernel.wasm mount.
-        #[arg(long = "kernel", hide = true, value_name = "PATH|CID")]
-        obsolete_kernel: Option<String>,
-
         /// Path to an Ed25519 identity file (host-side only; not a guest mount).
         /// Works well with direnv: `export WW_IDENTITY=~/.ww/identity` in .envrc.
         #[arg(long, env = "WW_IDENTITY", value_name = "PATH")]
@@ -734,7 +730,6 @@ impl Commands {
                 fhs_root,
                 listen,
                 wasm_debug,
-                obsolete_kernel,
                 identity,
                 insecure_ephemeral,
                 stem,
@@ -750,12 +745,6 @@ impl Commands {
                 with_http_admin,
                 ipfs_url,
             } => {
-                anyhow::ensure!(
-                    obsolete_kernel.is_none() && std::env::var_os("WW_KERNEL").is_none(),
-                    "--kernel and WW_KERNEL are no longer supported. Mount the kernel in the effective FHS: \
-                     ww run ./kernel.wasm:/boot/kernel.wasm or \
-                     ww run /ipfs/<CID>:/boot/kernel.wasm."
-                );
                 let (installed_baseline, mounts) = Self::startup_mounts(
                     &mount_args,
                     fhs_root,
@@ -2782,17 +2771,6 @@ mod tests {
     #[test]
     fn run_admin_defaults_to_localhost() {
         assert_eq!(parse_run_admin_addr(&["ww", "run"]), "127.0.0.1:2026");
-    }
-
-    #[test]
-    fn run_rejects_removed_epoch_drain_option() {
-        for value in ["0", "1"] {
-            let error = Cli::try_parse_from(["ww", "run", "--epoch-drain-secs", value])
-                .err()
-                .expect("removed drain option must fail during parsing");
-            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-            assert!(error.to_string().contains("--epoch-drain-secs"));
-        }
     }
 
     #[test]

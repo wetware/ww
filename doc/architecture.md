@@ -73,8 +73,7 @@ Identical kernel bytes can reuse compilation results without reusing authority
 or readiness. Logical cancellation releases a compilation waiter; a native
 compiler retains its physical admission until completion.
 
-`--kernel` and `WW_KERNEL` are rejected. Embedded WASM is an installation seed,
-not a runtime source. A valid image can inherit a missing kernel from the
+Embedded WASM seeds installation. A valid image can inherit a missing kernel from the
 baseline through composition. Invalid selected content never triggers fallback.
 
 The Rust PID0 follows one straight-line sequence for each generation:

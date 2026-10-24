@@ -125,12 +125,7 @@ fn capture_os(terminal: bool, env: &[(&str, &std::ffi::OsStr)]) -> Capture {
         capture.stdout,
         capture.stderr
     );
-    if !env
-        .iter()
-        .any(|(key, value)| *key == "WW_LOG_TEST_PROBE" && *value == "legacy_stdout")
-    {
-        capture.assert_stdout_reserved();
-    }
+    capture.assert_stdout_reserved();
     capture
 }
 
@@ -411,31 +406,6 @@ fn invalid_format_falls_back_to_auto_without_echoing_value() {
 }
 
 #[test]
-fn legacy_explicit_stderr_initializer_uses_same_output_policy() {
-    capture(false, &[("WW_LOG_TEST_PROBE", "legacy_stderr")]).json();
-}
-
-#[test]
-fn legacy_explicit_stdout_initializer_preserves_stdout_destination() {
-    let capture = capture(false, &[("WW_LOG_TEST_PROBE", "legacy_stdout")]);
-    assert!(capture.stderr.is_empty(), "{}", capture.stderr);
-    assert!(capture.stdout.contains(STDOUT_MARKER), "{}", capture.stdout);
-    let events: Vec<Value> = capture
-        .stdout
-        .lines()
-        .filter(|line| line.starts_with('{'))
-        .map(|line| serde_json::from_str(line).expect("stdout log is valid JSON"))
-        .collect();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event["fields"]["message"] == "native-event")
-            .count(),
-        1
-    );
-}
-
-#[test]
 fn existing_subscriber_ignores_invalid_format_without_warning() {
     let capture = capture(
         false,
@@ -558,11 +528,7 @@ fn logging_probe() {
             .unwrap();
     }
     for _ in 0..2 {
-        match std::env::var("WW_LOG_TEST_PROBE").as_deref() {
-            Ok("legacy_stderr") => ww::config::init_tracing_to_stderr(true),
-            Ok("legacy_stdout") => ww::config::init_tracing_to_stderr(false),
-            _ => ww::config::init_tracing(),
-        }
+        ww::config::init_tracing();
     }
     println!("{STDOUT_MARKER}");
     let error = io::Error::other("probe failed\nuseful detail");

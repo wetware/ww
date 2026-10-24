@@ -527,7 +527,7 @@ async fn bare_run_from_private_cwd_fails_without_contacting_kubo() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let mut command = ww_command(home.path(), &["run", "--ipfs-url", &url]);
-    command.current_dir(&private).env_remove("WW_KERNEL");
+    command.current_dir(&private);
     let mut command = tokio::process::Command::from(command);
     command.kill_on_drop(true);
     let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
@@ -545,25 +545,6 @@ async fn bare_run_from_private_cwd_fails_without_contacting_kubo() {
         !home.path().join(".ww").exists(),
         "bare startup must not initialize Host state"
     );
-}
-
-#[test]
-fn obsolete_kernel_selectors_fail_before_startup() {
-    let home = tempfile::tempdir().unwrap();
-    for environment in [false, true] {
-        let mut command = ww_command(home.path(), &["run"]);
-        if environment {
-            command.env("WW_KERNEL", "embedded:main");
-        } else {
-            command.args(["--kernel", "embedded:main"]);
-        }
-        let output = command.output().unwrap();
-        assert!(!output.status.success());
-        let error = stderr_text(&output);
-        assert!(error.contains("/boot/kernel.wasm"), "{error}");
-        assert!(error.contains("no longer supported"), "{error}");
-        assert!(!home.path().join(".ww").exists());
-    }
 }
 
 #[test]

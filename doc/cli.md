@@ -147,9 +147,7 @@ ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 ww run --ipns-stem k51qzi5uqu5... --ipns-routing-url http://localhost:8080
 ```
 
-`--kernel` and `WW_KERNEL` are obsolete and cause an error. Replace either
-selector with `./kernel.wasm:/boot/kernel.wasm` or
-`/ipfs/<file-cid>:/boot/kernel.wasm`. Embedded payloads seed installation only.
+Embedded payloads seed installation only.
 Files under `/bin` do not execute merely because they are present.
 
 The IPNS Stem accepts canonical Base36 names, legacy base58 Peer IDs, and

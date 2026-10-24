@@ -113,7 +113,6 @@ Thin wrapper (~100 lines, zero deps beyond std):
 - `wagi::method()`, `wagi::path()`, `wagi::query()`, `wagi::header(name)`
 - `wagi::body()`, `wagi::body_string()`
 - `wagi::respond_bytes_async(status, headers, body)` for finite P3 handlers
-- `wagi::respond` and `wagi::respond_bytes` as unacknowledged compatibility helpers
 
 `respond_bytes_async` builds one contiguous CGI response. Success means that P3
 stdout accepted all bytes and the host writer flush completed. The boundary

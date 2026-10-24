@@ -113,7 +113,7 @@ into a virtual FHS filesystem. Precedence, from lowest to highest, is installed
 baseline, authoritative Stem head, frozen namespace images, then frozen CLI
 operations. The Host selects PID0 from `/boot/kernel.wasm` in that exact effective
 root for every epoch. Invalid selected kernels fail without an alternate-kernel
-fallback. `--kernel` and `WW_KERNEL` are rejected; use a targeted mount instead.
+fallback.
 `ww build` places the application component at
 `bin/<project-directory>.wasm`. `ww push` imports that image tree and reports its
 IPFS directory-root CID. The Host does not use the application component as PID0
