@@ -1629,6 +1629,10 @@ mod rust_lifecycle {
             "text/plain; version=0.0.4; charset=utf-8"
         );
         let body = response.text().await.expect("read Host metrics");
+        assert!(
+            body.len() < 4096,
+            "Host metrics response must remain bounded"
+        );
         let samples: std::collections::BTreeMap<_, _> = body
             .lines()
             .filter(|line| !line.starts_with('#'))
@@ -1641,6 +1645,11 @@ mod rust_lifecycle {
             })
             .collect();
         assert_eq!(samples["ww_wasmtime_cache_state{state=\"enabled\"}"], 1);
+        assert_eq!(
+            samples.len(),
+            13,
+            "Host must expose only bounded live series"
+        );
         samples
     }
 
@@ -1688,6 +1697,13 @@ mod rust_lifecycle {
             "ww_wasmtime_cache_hits_total",
             "ww_wasmtime_cache_stores_total",
             "ww_wasmtime_component_compilations_total",
+            "ww_executor_cell_slots",
+            "ww_executor_spawn_admissions_total{outcome=\"accepted\"}",
+            "ww_executor_spawn_admissions_total{outcome=\"full\"}",
+            "ww_executor_spawn_admissions_total{outcome=\"closed\"}",
+            "ww_executor_cell_terminations_total{outcome=\"completed\"}",
+            "ww_executor_cell_terminations_total{outcome=\"cancelled\"}",
+            "ww_executor_cell_terminations_total{outcome=\"panicked\"}",
         ] {
             assert_eq!(
                 initial_metrics[counter], 0,
@@ -1741,6 +1757,22 @@ mod rust_lifecycle {
                 > initial_metrics["ww_wasmtime_cache_stores_total"],
             "real Host compilation did not populate its private Wasmtime cache"
         );
+        // PID0 occupies one ExecutorPool slot. The status Cell runs inside
+        // that slot through the child launcher, not a second pool admission.
+        assert_eq!(running_metrics["ww_executor_cell_slots"], 1);
+        assert_eq!(
+            running_metrics["ww_executor_spawn_admissions_total{outcome=\"accepted\"}"], 1,
+            "the CLI must register the same collector used by ExecutorPool"
+        );
+        for sample in [
+            "ww_executor_spawn_admissions_total{outcome=\"full\"}",
+            "ww_executor_spawn_admissions_total{outcome=\"closed\"}",
+            "ww_executor_cell_terminations_total{outcome=\"completed\"}",
+            "ww_executor_cell_terminations_total{outcome=\"cancelled\"}",
+            "ww_executor_cell_terminations_total{outcome=\"panicked\"}",
+        ] {
+            assert_eq!(running_metrics[sample], 0, "running Host: {sample}");
+        }
         println!(
             "HOST_METRICS_EVIDENCE={}",
             serde_json::json!({ "before_boot": initial_metrics, "after_status": running_metrics })
