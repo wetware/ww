@@ -662,8 +662,12 @@ async fn executor_http_tracks_operations_and_retains_counters_after_teardown() {
 
     let stopped = scrape(&client, &admin).await;
     stopped.assert_executor(0, [4, 0, 1], [1, 2, 1]);
+    // Concurrent P3 tests can change the process-wide compilation counters.
+    // This pool's executor counters must retain their exact terminal values.
     for _ in 0..8 {
-        assert_eq!(scrape(&client, &admin).await.body, stopped.body);
+        scrape(&client, &admin)
+            .await
+            .assert_executor(0, [4, 0, 1], [1, 2, 1]);
     }
     println!(
         "EXECUTOR_HTTP_EVIDENCE={}",
