@@ -284,19 +284,77 @@ policies are `scheduled` and `oneshot`; the fixed decisions are `grant`,
 The Host creates the collector before starting its admin service. Its
 `RuntimeEngine` shares the collector with PID0 and launcher-created children.
 Admin retains the collector after Cells and executor workers terminate. A
-separate Host collector starts from zero. Snapshots load six relaxed atomic
-counters independently; a scrape is not a transaction across all series.
+separate Host collector starts from zero. Snapshots load the decision and
+settled-consumption counters independently with relaxed atomics; a scrape is
+not a transaction across all series.
 
-Only successfully applied outcomes increment counters. `current_decision()`,
+Only successfully applied outcomes increment decision counters. `current_decision()`,
 settlement proposals, epoch notifications and `FuelObserver` do not publish
-production counts. The installers retain their existing estimator mutation
+production decision counts. The installers retain their existing estimator mutation
 order even if a Wasmtime call fails. A failed installation adds no grant count.
 
 These counters count decisions, not fuel units. Desired `quantum`, effective
 `authority_grant`, physical `authority_grant + YIELD_RESERVE`, and one-shot
-ledgers remain distinct. Consumption and distribution metrics are deferred.
+ledgers remain distinct. Quantum and distribution metrics are deferred.
 See [the measurement report](../measurements/fuel-decisions.md) for the
 performance budget and reproduction commands.
+
+## Settled fuel consumption metrics
+
+`ww_fuel_settled_units_total{policy}` counts physical fuel units accounted for
+by `FuelEstimator::settle_and_decide()`. The fixed policies are `scheduled`
+and `oneshot`. Both series appear at zero before execution and share the
+Host-lifetime `FuelMetrics` collector with the decision counters.
+
+`settle_and_apply_fuel_boundary()` records each settlement immediately after
+the estimator computes its physical delta:
+
+```
+consumed = physical_installed.saturating_sub(current_fuel)
+```
+
+Recording precedes epoch opening and decision application. The consumption
+therefore remains counted if a pending epoch supersedes the decision, a
+one-shot Cell suspends, or decision application fails.
+
+The authoritative settlement boundaries are:
+
+- A marked `ReturningFromHost` after a linked import returns.
+- A confirmed async fuel return when the authority grant ends or a later
+  epoch must open.
+- Successful executable instantiation when start-function fuel remains
+  unsettled.
+
+Grant installation, reserve installation, `current_decision()`, epoch
+notification, and intermediate cooperative yield rearming do not record
+consumption. Reobserving unchanged physical fuel without a new installation
+has a zero delta.
+
+Settled physical fuel differs from the decrease in an authority ledger.
+Reserve consumption from inter-checkpoint overshoot contributes to the full
+physical delta. Each one-shot ledger subtracts that delta with saturation.
+For example, settling 10,500 units against 25,000 total and 10,000 epoch
+authority leaves 14,500 total and zero epoch authority. The counter increases
+by 10,500, although the epoch ledger decreases by only 10,000.
+
+No separate reserve-overshoot counter is exported. Settled consumption already
+includes overshoot. An aggregate consumption counter cannot reconstruct
+per-Cell ledger saturation. Unspent physical fuel, including `YIELD_RESERVE`,
+is not consumption or additional authority. Desired EWMA `quantum` and the
+effective authority grant remain separate quantities.
+
+The counter does not measure CPU time, wall-clock time, or all executed fuel.
+`Proc::run` does not settle a command's remaining fuel when the command
+returns. Successful command tails, command errors or traps, instantiation
+errors or timeouts, cancellation, and Store teardown can leave physical fuel
+unsettled. Termination does not add a final settlement or restore authority.
+A zero-budget initial rejection occurs before executable instantiation and
+adds no consumption. Counts already recorded survive Cell and executor
+teardown.
+
+The [settlement measurement report](../measurements/fuel-settlement.md) records
+the candidate's validation and performance results. The four-worker host-return
+regression exceeded the acceptance budget and blocked publication.
 
 ## Constants
 

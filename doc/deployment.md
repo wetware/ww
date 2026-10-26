@@ -299,7 +299,8 @@ localhost-only admin plane on `127.0.0.1:2026` is the process control surface:
 - `/readyz` reports whether the runtime has reached its serving phase.
 - `/version` reports source and current generation kernel provenance plus degraded
   cache state.
-- `/metrics` exposes live Wasmtime cache, ExecutorPool, and applied fuel-decision metrics. See the collection
+- `/metrics` exposes live Wasmtime cache, ExecutorPool, applied fuel decisions,
+  and settled fuel consumption. See the collection
   policy below for measurements that are not yet available.
 
 Keep the admin listener on loopback unless an authenticated network boundary
@@ -375,31 +376,63 @@ while suspended do not invent applied outcomes. Physical `YIELD_RESERVE` fuel
 does not constitute guest authority. Snapshots read separate relaxed atomics
 and are not transactional across concurrent decisions.
 
-The endpoint exports exactly 19 series: six Wasmtime samples, seven executor
-samples, and six fuel samples. Metric names, HELP text, and label values are static. The renderer accepts
+`ww_fuel_settled_units_total{policy}` counts physical fuel units accounted for
+at authoritative settlement boundaries. Its two fixed policy labels are
+`scheduled` and `oneshot`; both series appear at zero before execution. The
+counter shares the Host's `FuelMetrics` collector and retains counts after
+Cell and executor teardown.
+
+Settlement occurs at marked host returns, confirmed fuel returns that end
+authority or open a later epoch, and successful instantiation with unsettled
+start-function work. Recording precedes decision application, so subsequent
+suspension, supersession, or application failure does not discard consumption.
+Grant installation, physical reserve installation, epoch notification, and
+intermediate cooperative yields do not add consumption.
+
+The counter includes physical reserve consumed by inter-checkpoint overshoot.
+It does not equal the decrease in either one-shot ledger, because each ledger
+uses saturating subtraction. No separate overshoot counter is exported;
+aggregate consumption cannot reconstruct per-Cell ledger saturation.
+
+Settled fuel is not CPU time, wall-clock time, or all executed fuel. Successful
+command tails, command errors or traps, instantiation errors or timeouts,
+cancellation, and Store teardown can leave physical consumption unsettled.
+The runtime adds no termination settlement. Initial zero-budget rejection
+adds no consumption.
+
+The endpoint exports exactly 21 series: six Wasmtime samples, seven executor
+samples, six fuel-decision samples, and two settled-consumption samples.
+Metric names, HELP text, and label values are static. The renderer accepts
 no dynamic label or HELP text that requires escaping. Cell identifiers, task names,
 RPC methods, paths, peer IDs, and CIDs do not become metric labels. Response size
 is bounded by fixed text and integer widths, regardless of Cell churn.
 
 Collection adds atomic updates at executor admission and terminal boundaries,
-and at applied fuel decisions. Epoch notification alone does not record a fuel
-decision. The existing test-only
+at applied fuel decisions, and at authoritative fuel settlement boundaries.
+Epoch notification alone does not record a fuel decision or consumption.
+The existing test-only
 `FuelObserver` remains separate from production metrics. See the
 [executor measurement report](measurements/executor-metrics.md) for the baseline,
 performance budget, and operation-to-HTTP evidence for executor collection.
 The [fuel scheduling reference](designs/fuel-scheduling.md#applied-decision-metrics)
-defines applied fuel outcomes; the [fuel measurement report](measurements/fuel-decisions.md)
-records their performance budget, results, and reproduction commands.
+defines applied fuel outcomes and
+[settled-consumption semantics](designs/fuel-scheduling.md#settled-fuel-consumption-metrics);
+the [decision measurement report](measurements/fuel-decisions.md) and
+[settlement measurement report](measurements/fuel-settlement.md)
+record their performance budgets, results, and reproduction commands.
+The settlement candidate exceeded its four-worker hot-path budget and remains
+unpublished pending resolution of that regression.
 
-Fuel consumption/distribution, RPC, ARC cache, and stream metrics have no production collectors. The
+Fuel quantum/distribution, RPC, ARC cache, and stream metrics have no production collectors. The
 endpoint omits their samples and HELP/TYPE declarations, and the runtime contains
 no placeholder registries for these metrics. Their absence means unavailable
 measurements, not zero activity. Producer-specific work owns future collection:
 
 - [#260](https://github.com/wetware/ww/issues/260): live `PinsetCache` hits,
   misses, evictions, cached weight, and entry count.
-- [#752](https://github.com/wetware/ww/issues/752): fuel consumption, authority
-  ledgers, desired-versus-applied quantum visibility, latency, and sampled diagnostics.
+- [#752](https://github.com/wetware/ww/issues/752): authority ledgers,
+  desired-versus-applied quantum and physical fuel visibility, latency, and
+  sampled diagnostics.
 - [#754](https://github.com/wetware/ww/issues/754): RPC durations and outcomes,
   stream activity, and other protocol/host metrics with bounded labels.
 

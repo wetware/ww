@@ -1647,7 +1647,7 @@ mod rust_lifecycle {
         assert_eq!(samples["ww_wasmtime_cache_state{state=\"enabled\"}"], 1);
         assert_eq!(
             samples.len(),
-            19,
+            21,
             "Host must expose only bounded live series"
         );
         samples
@@ -1710,6 +1710,8 @@ mod rust_lifecycle {
             "ww_fuel_decisions_total{policy=\"oneshot\",decision=\"grant\"}",
             "ww_fuel_decisions_total{policy=\"oneshot\",decision=\"suspend\"}",
             "ww_fuel_decisions_total{policy=\"oneshot\",decision=\"exhausted\"}",
+            "ww_fuel_settled_units_total{policy=\"scheduled\"}",
+            "ww_fuel_settled_units_total{policy=\"oneshot\"}",
         ] {
             assert_eq!(
                 initial_metrics[counter], 0,
@@ -1744,6 +1746,8 @@ mod rust_lifecycle {
         // so this request does not probe a PID0-served capability.
         let boot_metrics = host_metrics(&client, admin_addr).await;
         let grants = "ww_fuel_decisions_total{policy=\"scheduled\",decision=\"grant\"}";
+        let settled = "ww_fuel_settled_units_total{policy=\"scheduled\"}";
+        assert!(boot_metrics[settled] > 0, "PID0 did not settle fuel");
         assert!(
             boot_metrics[grants] > 0,
             "PID0 did not publish installed grants"
@@ -1759,6 +1763,10 @@ mod rust_lifecycle {
         // Boot and the status request compile real components in this child
         // process. The CLI's collector must expose those same observations.
         let running_metrics = host_metrics(&client, admin_addr).await;
+        assert!(
+            running_metrics[settled] > boot_metrics[settled],
+            "status execution did not publish settled fuel through the Host collector"
+        );
         assert!(
             running_metrics[grants] > boot_metrics[grants],
             "status execution did not publish installed grants through the Host collector"

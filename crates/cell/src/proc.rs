@@ -1347,6 +1347,12 @@ async fn settle_and_apply_fuel_boundary(
         .data_mut()
         .fuel_estimator
         .settle_and_decide(remaining, boundary);
+    // Settlement is committed even if epoch opening supersedes this decision
+    // or its application later suspends, fails, or is cancelled.
+    let state = ctx.data();
+    state
+        .fuel_metrics
+        .record_settled(state.fuel_estimator.policy(), update.consumed);
     let host_calls_this_epoch = ctx.data().fuel_estimator.host_calls_this_epoch;
     let opened_epoch = ctx.data_mut().open_latest_epoch();
     if opened_epoch.is_some() {
@@ -4244,6 +4250,10 @@ mod tests {
                 exhausted: 0,
             }
         );
+        assert_eq!(
+            metrics.snapshot().oneshot_settled_units,
+            first_updates[0].consumed
+        );
         assert!(first_updates[0].consumed >= EPOCH_BUDGET);
         assert!(
             observer.slice_boundaries.load(Ordering::Relaxed) >= 2,
@@ -4274,6 +4284,7 @@ mod tests {
         );
         assert!(updates[1].consumed > 0, "start tail was not charged");
         let consumed: u64 = updates.iter().map(|update| update.consumed).sum();
+        assert_eq!(metrics.snapshot().oneshot_settled_units, consumed);
         assert!(consumed > EPOCH_BUDGET, "start work was under-counted");
         assert!(
             consumed < TOTAL_BUDGET,
@@ -4818,6 +4829,385 @@ mod tests {
             .expect("suspended Cell cancellation exceeded timeout")
             .expect_err("aborted suspended Cell must return JoinError");
         assert!(error.is_cancelled());
+    }
+
+    /// Test-local ledger values, independent of the aggregate collector.
+    fn oneshot_ledgers(estimator: &FuelEstimator) -> (u64, u64) {
+        (
+            estimator.total_remaining.expect("one-shot total ledger"),
+            estimator.epoch_remaining.expect("one-shot epoch ledger"),
+        )
+    }
+
+    #[test]
+    fn fuel_conservation_physical_settlement_saturates_each_ledger_once() {
+        // total, epoch, grant, physical consumption, remaining ledgers, decision.
+        for (total, epoch, grant, consumed, after, decision) in [
+            (
+                25_000,
+                10_000,
+                10_000,
+                0,
+                (25_000, 10_000),
+                FuelDecision::Grant(10_000),
+            ),
+            (
+                25_000,
+                10_000,
+                10_000,
+                4_000,
+                (21_000, 6_000),
+                FuelDecision::Grant(6_000),
+            ),
+            (
+                25_000,
+                10_000,
+                10_000,
+                10_000,
+                (15_000, 0),
+                FuelDecision::Suspend,
+            ),
+            (
+                25_000,
+                10_000,
+                10_000,
+                10_500,
+                (14_500, 0),
+                FuelDecision::Suspend,
+            ),
+            (
+                1_337,
+                10_000,
+                1_337,
+                1_837,
+                (0, 8_163),
+                FuelDecision::Exhausted,
+            ),
+            (1_337, 1_337, 1_337, 1_837, (0, 0), FuelDecision::Exhausted),
+        ] {
+            let mut estimator = FuelEstimator::new_oneshot(total, epoch, 0);
+            let before = oneshot_ledgers(&estimator);
+            assert_eq!(before, (total, epoch));
+            assert_eq!(estimator.current_decision(), FuelDecision::Grant(grant));
+            let slice = estimator.install_authority_grant(grant);
+            assert_eq!(slice.physical, grant + YIELD_RESERVE);
+            assert_eq!(
+                oneshot_ledgers(&estimator),
+                before,
+                "installation debited authority"
+            );
+
+            let remaining = slice.physical - consumed;
+            let update = estimator.settle_and_decide(remaining, FuelBoundary::Slice);
+            assert_eq!(update.consumed, consumed);
+            assert_eq!(oneshot_ledgers(&estimator), after);
+            assert_eq!(before.0 - after.0, consumed.min(before.0));
+            assert_eq!(before.1 - after.1, consumed.min(before.1));
+            assert_eq!(update.decision, decision);
+            assert_eq!(estimator.physical_installed, remaining);
+            assert_eq!(estimator.authority_grant, 0);
+
+            // Reobserving the same physical value cannot debit either ledger.
+            let repeated = estimator.settle_and_decide(remaining, FuelBoundary::Slice);
+            assert_eq!(repeated.consumed, 0);
+            assert_eq!(oneshot_ledgers(&estimator), after);
+        }
+    }
+
+    #[test]
+    fn fuel_conservation_partial_grants_and_epoch_reset_preserve_total() {
+        let mut estimator = FuelEstimator::new_oneshot(11_337, 10_000, 0);
+        assert_eq!(oneshot_ledgers(&estimator), (11_337, 10_000));
+        estimator.install_authority_grant(10_000);
+        let update = estimator.settle_and_decide(YIELD_RESERVE + 6_000, FuelBoundary::HostReturn);
+        assert_eq!(update.consumed, 4_000);
+        assert_eq!(oneshot_ledgers(&estimator), (7_337, 6_000));
+        assert_eq!(update.decision, FuelDecision::Grant(6_000));
+        assert!(6_000 < estimator.quantum);
+        estimator.install_authority_grant(6_000);
+        assert_eq!(oneshot_ledgers(&estimator), (7_337, 6_000));
+        let update = estimator.settle_and_decide(YIELD_RESERVE, FuelBoundary::Slice);
+        assert_eq!(update.consumed, 6_000);
+        assert_eq!(oneshot_ledgers(&estimator), (1_337, 0));
+        assert_eq!(update.decision, FuelDecision::Suspend);
+        estimator.open_epoch();
+        assert_eq!(oneshot_ledgers(&estimator), (1_337, 10_000));
+        assert_eq!(estimator.current_decision(), FuelDecision::Grant(1_337));
+        assert!(1_337 < estimator.quantum);
+        estimator.install_authority_grant(1_337);
+        let update = estimator.settle_and_decide(YIELD_RESERVE, FuelBoundary::Slice);
+        assert_eq!(update.consumed, 1_337);
+        assert_eq!(oneshot_ledgers(&estimator), (0, 8_663));
+        assert_eq!(update.decision, FuelDecision::Exhausted);
+        estimator.open_epoch();
+        assert_eq!(oneshot_ledgers(&estimator), (0, 10_000));
+        assert_eq!(estimator.current_decision(), FuelDecision::Exhausted);
+    }
+
+    #[tokio::test]
+    async fn fuel_settlement_coalesced_epochs_record_old_consumption_before_new_grant() {
+        let (runtime, mut publisher) = crate::engine::runtime_engine().unwrap();
+        let metrics = runtime.fuel_metrics();
+        let mut store = fuel_metrics_store(&runtime, FuelEstimator::new_oneshot(25_000, 10_000, 0));
+        let before = oneshot_ledgers(&store.data().fuel_estimator);
+        install_fuel_slice_in_store(&mut store, 10_000).unwrap();
+        assert_eq!(oneshot_ledgers(&store.data().fuel_estimator), before);
+        assert_eq!(metrics.snapshot().oneshot_settled_units, 0);
+        store.set_fuel(YIELD_RESERVE - 500).unwrap();
+        for _ in 0..3 {
+            let epoch = publisher.tick();
+            store.data_mut().note_epoch_callback(epoch);
+        }
+        assert_eq!(oneshot_ledgers(&store.data().fuel_estimator), before);
+        assert_eq!(metrics.snapshot().oneshot_settled_units, 0);
+        settle_and_apply_fuel_boundary(
+            &mut store.as_context_mut(),
+            YIELD_RESERVE - 500,
+            FuelBoundary::Slice,
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.data().opened_epoch, 3);
+        assert_eq!(store.data().pending_epoch, None);
+        assert_eq!(
+            oneshot_ledgers(&store.data().fuel_estimator),
+            (14_500, 10_000)
+        );
+        assert_eq!(store.data().fuel_estimator.authority_grant, 10_000);
+        let settled = metrics.snapshot();
+        assert_eq!(settled.oneshot_settled_units, 10_500);
+        assert_eq!(settled.scheduled_settled_units, 0);
+        assert_eq!(
+            settled.oneshot.suspend, 0,
+            "new epoch supersedes provisional suspension"
+        );
+        assert_eq!(settled.oneshot.grant, 2);
+        assert_eq!(store.data_mut().open_latest_epoch(), None);
+        let remaining = store.get_fuel().unwrap();
+        settle_and_apply_fuel_boundary(
+            &mut store.as_context_mut(),
+            remaining,
+            FuelBoundary::HostReturn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            oneshot_ledgers(&store.data().fuel_estimator),
+            (14_500, 10_000)
+        );
+        assert_eq!(metrics.snapshot().oneshot_settled_units, 10_500);
+        drop(store);
+        drop(runtime);
+        assert_eq!(metrics.snapshot().oneshot_settled_units, 10_500);
+    }
+
+    #[tokio::test]
+    async fn fuel_settlement_wait_cancellation_and_closed_clock_preserve_debits() {
+        for close_clock in [false, true] {
+            let (runtime, publisher) = crate::engine::runtime_engine().unwrap();
+            let metrics = runtime.fuel_metrics();
+            let mut store =
+                fuel_metrics_store(&runtime, FuelEstimator::new_oneshot(25_000, 10_000, 0));
+            install_fuel_slice_in_store(&mut store, 10_000).unwrap();
+            assert_eq!(
+                oneshot_ledgers(&store.data().fuel_estimator),
+                (25_000, 10_000)
+            );
+            store.set_fuel(YIELD_RESERVE).unwrap();
+            {
+                let mut context = store.as_context_mut();
+                let mut settlement = Box::pin(settle_and_apply_fuel_boundary(
+                    &mut context,
+                    YIELD_RESERVE,
+                    FuelBoundary::Slice,
+                ));
+                for _ in 0..4 {
+                    assert!(fuel_metrics_poll(settlement.as_mut()).is_pending());
+                    assert_eq!(metrics.snapshot().oneshot_settled_units, 10_000);
+                }
+                if close_clock {
+                    drop(publisher);
+                    let error = settlement
+                        .await
+                        .expect_err("closed clock must reject resumption");
+                    assert!(error.to_string().contains("epoch clock closed"));
+                } else {
+                    // Dropping this suspended future models cancellation before a new grant.
+                    drop(settlement);
+                    drop(publisher);
+                }
+            }
+            assert_eq!(oneshot_ledgers(&store.data().fuel_estimator), (15_000, 0));
+            assert_eq!(
+                store.data().fuel_estimator.current_decision(),
+                FuelDecision::Suspend
+            );
+            assert_eq!(store.data().fuel_estimator.authority_grant, 0);
+            let settled = metrics.snapshot();
+            assert_eq!(settled.oneshot_settled_units, 10_000);
+            assert_eq!(settled.oneshot.grant, 1);
+            assert_eq!(settled.oneshot.exhausted, 0);
+            drop(store);
+            drop(runtime);
+            assert_eq!(metrics.snapshot(), settled);
+        }
+    }
+
+    #[tokio::test]
+    async fn fuel_settlement_intermediate_yields_and_unsettled_drop_do_not_record() {
+        let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+        let metrics = runtime.fuel_metrics();
+        let mut store = fuel_metrics_store(&runtime, FuelEstimator::new(25_000));
+        install_fuel_slice_in_store(&mut store, 25_000).unwrap();
+        store.set_fuel(YIELD_RESERVE + 15_000).unwrap();
+        for _ in 0..3 {
+            FuelCallHook
+                .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
+                .await
+                .unwrap();
+            assert_eq!(metrics.snapshot().scheduled_settled_units, 0);
+        }
+        store.set_fuel(YIELD_RESERVE).unwrap();
+        FuelCallHook
+            .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
+            .await
+            .unwrap();
+        assert_eq!(metrics.snapshot().scheduled_settled_units, 25_000);
+        for _ in 0..3 {
+            FuelCallHook
+                .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
+                .await
+                .unwrap();
+            assert_eq!(metrics.snapshot().scheduled_settled_units, 25_000);
+        }
+        // Execute a returning function below the next settlement boundary.
+        // Its physical tail remains observable in the Store after return.
+        store.set_epoch_deadline(1);
+        install_host_return_fuel_hook(&mut store);
+        let module = wasmtime::Module::new(
+            &runtime.engine(),
+            "(module (func (export \"run\") (result i32) i32.const 7))",
+        )
+        .unwrap();
+        let instance = wasmtime::Linker::new(&runtime.engine())
+            .instantiate_async(&mut store, &module)
+            .await
+            .unwrap();
+        let run = instance
+            .get_typed_func::<(), i32>(&mut store, "run")
+            .unwrap();
+        let physical = store.get_fuel().unwrap();
+        assert_eq!(run.call_async(&mut store, ()).await.unwrap(), 7);
+        let remaining = store.get_fuel().unwrap();
+        assert!(
+            remaining < physical,
+            "returning function did not consume physical fuel"
+        );
+        assert!(store
+            .data()
+            .fuel_estimator
+            .has_unsettled_consumption(remaining));
+        drop(store);
+        drop(runtime);
+        assert_eq!(metrics.snapshot().scheduled_settled_units, 25_000);
+        assert_eq!(metrics.snapshot().oneshot_settled_units, 0);
+    }
+
+    #[tokio::test]
+    async fn fuel_settlement_terminal_overshoot_counts_physical_units_not_capped_debit() {
+        let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+        let metrics = runtime.fuel_metrics();
+        let mut store = fuel_metrics_store(&runtime, FuelEstimator::new_oneshot(1_337, 1_337, 0));
+        install_fuel_slice_in_store(&mut store, 1_337).unwrap();
+        let before = oneshot_ledgers(&store.data().fuel_estimator);
+        assert_eq!(before, (1_337, 1_337));
+        store.set_fuel(YIELD_RESERVE - 500).unwrap();
+        let error = settle_and_apply_fuel_boundary(
+            &mut store.as_context_mut(),
+            YIELD_RESERVE - 500,
+            FuelBoundary::Slice,
+        )
+        .await
+        .expect_err("overshoot exhausts total authority");
+        assert!(error
+            .to_string()
+            .contains("one-shot total fuel authority exhausted"));
+        assert_eq!(oneshot_ledgers(&store.data().fuel_estimator), (0, 0));
+        assert_eq!(metrics.snapshot().oneshot_settled_units, 1_837);
+        assert_eq!(metrics.snapshot().oneshot.exhausted, 1);
+        let settled = metrics.snapshot();
+        drop(store);
+        assert_eq!(metrics.snapshot(), settled);
+    }
+
+    #[tokio::test]
+    async fn fuel_settlement_failed_grant_application_keeps_recorded_consumption() {
+        let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+        let metrics = runtime.fuel_metrics();
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(false);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let mut estimator = FuelEstimator::new_oneshot(25_000, 10_000, 0);
+        // Controlled pre-settlement state. This engine rejects the subsequent
+        // grant, allowing the test to isolate settlement from application.
+        estimator.install_authority_grant(10_000);
+        let mut store = Store::new(
+            &engine,
+            component_test_state_with_runtime(estimator, None, &runtime),
+        );
+        assert_eq!(
+            oneshot_ledgers(&store.data().fuel_estimator),
+            (25_000, 10_000)
+        );
+        let error = settle_and_apply_fuel_boundary(
+            &mut store.as_context_mut(),
+            YIELD_RESERVE + 9_000,
+            FuelBoundary::HostReturn,
+        )
+        .await
+        .expect_err("disabled fuel rejects the next grant");
+        assert!(error.to_string().contains("fuel is not configured"));
+        assert_eq!(
+            oneshot_ledgers(&store.data().fuel_estimator),
+            (24_000, 9_000)
+        );
+        assert_eq!(metrics.snapshot().oneshot_settled_units, 1_000);
+        assert_eq!(metrics.snapshot().oneshot.grant, 0);
+        let settled = metrics.snapshot();
+        drop(store);
+        assert_eq!(metrics.snapshot(), settled);
+    }
+
+    #[tokio::test]
+    async fn fuel_settlement_zero_budget_and_start_trap_do_not_fabricate_consumption() {
+        for total in [0, 1_000] {
+            let (runtime, _publisher) = crate::engine::runtime_engine().unwrap();
+            let metrics = runtime.fuel_metrics();
+            let proc = fuel_metrics_process(
+                runtime,
+                FuelEstimator::new_oneshot(total, 10_000, 0),
+                P3_TRAPPING_START_COMMAND,
+                FuelObserver::default(),
+            )
+            .await;
+            assert_eq!(
+                oneshot_ledgers(&proc.store.data().fuel_estimator),
+                (total, 10_000)
+            );
+            assert_eq!(metrics.snapshot().oneshot_settled_units, 0);
+            let error = proc
+                .run()
+                .await
+                .expect_err("zero budget or start trap must terminate");
+            let message = format!("{error:#}");
+            if total == 0 {
+                assert!(message.contains("one-shot total fuel authority exhausted"));
+                assert!(!message.contains("unreachable"));
+            } else {
+                assert!(message.contains("unreachable"));
+            }
+            assert_eq!(metrics.snapshot().oneshot_settled_units, 0);
+        }
     }
 
     // =========================================================================
