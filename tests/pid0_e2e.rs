@@ -1647,7 +1647,7 @@ mod rust_lifecycle {
         assert_eq!(samples["ww_wasmtime_cache_state{state=\"enabled\"}"], 1);
         assert_eq!(
             samples.len(),
-            13,
+            19,
             "Host must expose only bounded live series"
         );
         samples
@@ -1704,6 +1704,12 @@ mod rust_lifecycle {
             "ww_executor_cell_terminations_total{outcome=\"completed\"}",
             "ww_executor_cell_terminations_total{outcome=\"cancelled\"}",
             "ww_executor_cell_terminations_total{outcome=\"panicked\"}",
+            "ww_fuel_decisions_total{policy=\"scheduled\",decision=\"grant\"}",
+            "ww_fuel_decisions_total{policy=\"scheduled\",decision=\"suspend\"}",
+            "ww_fuel_decisions_total{policy=\"scheduled\",decision=\"exhausted\"}",
+            "ww_fuel_decisions_total{policy=\"oneshot\",decision=\"grant\"}",
+            "ww_fuel_decisions_total{policy=\"oneshot\",decision=\"suspend\"}",
+            "ww_fuel_decisions_total{policy=\"oneshot\",decision=\"exhausted\"}",
         ] {
             assert_eq!(
                 initial_metrics[counter], 0,
@@ -1736,6 +1742,12 @@ mod rust_lifecycle {
         // `/status` exercises the host HttpListener registration and a
         // separate status Cell. Production PID0 exports no guest bootstrap,
         // so this request does not probe a PID0-served capability.
+        let boot_metrics = host_metrics(&client, admin_addr).await;
+        let grants = "ww_fuel_decisions_total{policy=\"scheduled\",decision=\"grant\"}";
+        assert!(
+            boot_metrics[grants] > 0,
+            "PID0 did not publish installed grants"
+        );
         assert_status_cell(
             &client,
             http_addr,
@@ -1747,6 +1759,10 @@ mod rust_lifecycle {
         // Boot and the status request compile real components in this child
         // process. The CLI's collector must expose those same observations.
         let running_metrics = host_metrics(&client, admin_addr).await;
+        assert!(
+            running_metrics[grants] > boot_metrics[grants],
+            "status execution did not publish installed grants through the Host collector"
+        );
         assert!(
             running_metrics["ww_wasmtime_component_compilations_total"]
                 > initial_metrics["ww_wasmtime_component_compilations_total"],

@@ -398,6 +398,23 @@ impl ExecutorPool {
         filesystem_resources: Arc<cache::HostResources>,
         metrics: ExecutorMetrics,
     ) -> Result<Self> {
+        Self::try_new_with_collectors(
+            n,
+            shutdown,
+            filesystem_resources,
+            metrics,
+            cell::metrics::FuelMetrics::default(),
+        )
+    }
+
+    /// Connect executor and fuel events to collectors retained by the Host.
+    pub fn try_new_with_collectors(
+        n: usize,
+        shutdown: watch::Receiver<()>,
+        filesystem_resources: Arc<cache::HostResources>,
+        metrics: ExecutorMetrics,
+        fuel_metrics: cell::metrics::FuelMetrics,
+    ) -> Result<Self> {
         let n = if n == 0 {
             std::thread::available_parallelism()
                 .map(|p| p.get())
@@ -408,8 +425,9 @@ impl ExecutorPool {
 
         // Create one Engine and one published epoch clock for the pool. Every
         // Store callback records transitions from this paired clock.
-        let (runtime_engine, epoch_publisher) = cell::engine::runtime_engine()
-            .map_err(|e| anyhow::anyhow!("failed to create shared wasmtime engine: {e}"))?;
+        let (runtime_engine, epoch_publisher) =
+            cell::engine::runtime_engine_with_fuel_metrics(fuel_metrics)
+                .map_err(|e| anyhow::anyhow!("failed to create shared wasmtime engine: {e}"))?;
         let mut epoch_publisher = Some(epoch_publisher);
 
         let mut senders = Vec::with_capacity(n);

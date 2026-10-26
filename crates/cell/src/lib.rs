@@ -10,6 +10,7 @@ pub mod engine;
 pub mod fs_intercept;
 pub mod image;
 pub mod loaders;
+pub mod metrics;
 pub mod mount;
 pub mod p3;
 pub mod proc;
