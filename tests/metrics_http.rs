@@ -14,6 +14,7 @@ use cell::engine::{
     compile_component, wasm_engine, wasmtime_cache_metrics, WasmtimeCacheSnapshot,
     CWASM_CACHE_MAX_BYTES_ENV, CWASM_DIR_ENV,
 };
+use cell::metrics::FuelMetrics;
 use tokio::sync::{oneshot, watch};
 use ww::metrics::{AdminService, RuntimeStatus, VersionInfo};
 use ww::services::{ExecutorMetrics, ExecutorPool, Service, SpawnFactory, SpawnRequest};
@@ -100,6 +101,10 @@ impl Admin {
     }
 
     fn with_executor_metrics(executor_metrics: ExecutorMetrics) -> Self {
+        Self::with_metrics(executor_metrics, FuelMetrics::default())
+    }
+
+    fn with_metrics(executor_metrics: ExecutorMetrics, fuel_metrics: FuelMetrics) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/metrics", listener.local_addr().unwrap());
@@ -118,6 +123,7 @@ impl Admin {
             route_registry: None,
             wasmtime_cache_metrics: wasmtime_cache_metrics(),
             executor_metrics,
+            fuel_metrics,
         };
         let (shutdown, shutdown_rx) = watch::channel(());
         let (done_tx, done) = std::sync::mpsc::channel();
@@ -152,6 +158,21 @@ struct Scrape {
 }
 
 impl Scrape {
+    fn fuel(&self, policy: &str, decision: &str) -> u64 {
+        self.samples
+            [&format!("ww_fuel_decisions_total{{policy=\"{policy}\",decision=\"{decision}\"}}")]
+    }
+
+    fn assert_fuel_unchanged(&self, previous: &Self) {
+        for policy in ["scheduled", "oneshot"] {
+            for decision in ["grant", "suspend", "exhausted"] {
+                assert_eq!(self.fuel(policy, decision), previous.fuel(policy, decision));
+            }
+        }
+        self.assert_unsupported_absent();
+        self.assert_live_families_contiguous();
+    }
+
     fn parse(body: String, http_elapsed: Duration) -> Self {
         assert!(
             body.ends_with('\n'),
@@ -178,21 +199,35 @@ impl Scrape {
                 assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
                 assert!(types.contains_key(name), "sample without TYPE: {line}");
                 if identity.contains('{') {
-                    let (label, values): (&str, &[&str]) = match name {
-                        "ww_wasmtime_cache_state" => {
-                            ("state", &["enabled", "disabled", "fallback"])
-                        }
-                        "ww_executor_spawn_admissions_total" => {
-                            ("outcome", &["accepted", "full", "closed"])
-                        }
-                        "ww_executor_cell_terminations_total" => {
-                            ("outcome", &["completed", "cancelled", "panicked"])
-                        }
-                        _ => panic!("unsupported metric labels: {identity}"),
-                    };
-                    assert!(values
-                        .iter()
-                        .any(|value| { identity == format!("{name}{{{label}=\"{value}\"}}") }));
+                    if name == "ww_fuel_decisions_total" {
+                        assert!(
+                            ["scheduled", "oneshot"].iter().any(|policy| {
+                                ["grant", "suspend", "exhausted"].iter().any(|decision| {
+                                    identity
+                                        == format!(
+                                            "{name}{{policy=\"{policy}\",decision=\"{decision}\"}}"
+                                        )
+                                })
+                            }),
+                            "unsupported fuel labels: {identity}"
+                        );
+                    } else {
+                        let (label, values): (&str, &[&str]) = match name {
+                            "ww_wasmtime_cache_state" => {
+                                ("state", &["enabled", "disabled", "fallback"])
+                            }
+                            "ww_executor_spawn_admissions_total" => {
+                                ("outcome", &["accepted", "full", "closed"])
+                            }
+                            "ww_executor_cell_terminations_total" => {
+                                ("outcome", &["completed", "cancelled", "panicked"])
+                            }
+                            _ => panic!("unsupported metric labels: {identity}"),
+                        };
+                        assert!(values
+                            .iter()
+                            .any(|value| { identity == format!("{name}{{{label}=\"{value}\"}}") }));
+                    }
                 }
                 let value: u64 = value.parse().expect("nonnegative integer sample");
                 assert!(
@@ -210,6 +245,7 @@ impl Scrape {
             ("ww_executor_cell_slots", "gauge"),
             ("ww_executor_spawn_admissions_total", "counter"),
             ("ww_executor_cell_terminations_total", "counter"),
+            ("ww_fuel_decisions_total", "counter"),
         ]
         .into_iter()
         .map(|(name, kind)| (name.to_owned(), kind.to_owned()))
@@ -268,11 +304,13 @@ impl Scrape {
     fn assert_unsupported_absent(&self) {
         for name in self.samples.keys() {
             assert!(
-                name.starts_with("ww_wasmtime_") || name.starts_with("ww_executor_"),
+                name.starts_with("ww_wasmtime_")
+                    || name.starts_with("ww_executor_")
+                    || name.starts_with("ww_fuel_decisions_total{"),
                 "unsupported sample exposed: {name}"
             );
         }
-        assert_eq!(self.samples.len(), 13);
+        assert_eq!(self.samples.len(), 19);
         assert!(self.body.len() < 4096, "unbounded metrics response");
     }
 
@@ -352,6 +390,205 @@ async fn cell_result(result: CellResult) -> anyhow::Result<i32> {
 }
 
 #[tokio::test]
+async fn fuel_http_tracks_real_p3_grants_suspension_exhaustion_and_retains_history() {
+    use cell::proc::{FuelEstimator, FuelObserver};
+    let fuel = FuelMetrics::default();
+    let admin = Admin::with_metrics(ExecutorMetrics::default(), fuel.clone());
+    let other_admin = Admin::start();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let initial = scrape(&client, &admin).await;
+    for policy in ["scheduled", "oneshot"] {
+        for decision in ["grant", "suspend", "exhausted"] {
+            assert_eq!(initial.fuel(policy, decision), 0);
+        }
+    }
+    let (engine, mut publisher) = cell::engine::runtime_engine_with_fuel_metrics(fuel).unwrap();
+    let wasm = wat::parse_str(include_str!("fixtures/spinning-component.wat")).unwrap();
+    let scheduled_wasm = wat::parse_str(
+        r#"(component
+        (core func $return (canon task.return (result (result))))
+        (core module $noop
+            (import "" "return" (func $return (param i32)))
+            (func (export "run") i32.const 0 call $return))
+        (core instance $i (instantiate $noop (with "" (instance (export "return" (func $return))))))
+        (func $run async (result (result)) (canon lift (core func $i "run") async))
+        (instance (export (interface "wasi:cli/run@0.3.0")) (export "run" (func $run))))"#,
+    )
+    .unwrap();
+    let (builder, _handles) = cell::Builder::ordinary(
+        cell::Program::Bytes(scheduled_wasm),
+        tokio::io::empty(),
+        tokio::io::sink(),
+        tokio::io::sink(),
+        support::filesystem_ownership(),
+    );
+    let proc = builder
+        .with_runtime_engine(engine.clone())
+        .build()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), proc.run())
+        .await
+        .unwrap()
+        .unwrap();
+    let after_scheduled = scrape(&client, &admin).await;
+    assert!(after_scheduled.fuel("scheduled", "grant") >= 1);
+    assert_eq!(after_scheduled.fuel("scheduled", "suspend"), 0);
+    assert_eq!(after_scheduled.fuel("scheduled", "exhausted"), 0);
+
+    let observer = FuelObserver::default();
+    let (builder, _handles) = cell::Builder::ordinary(
+        cell::Program::Bytes(wasm),
+        tokio::io::empty(),
+        tokio::io::sink(),
+        tokio::io::sink(),
+        support::filesystem_ownership(),
+    );
+    let proc = builder
+        .with_runtime_engine(engine.clone())
+        .with_fuel_estimator(FuelEstimator::new_oneshot(25_000, 10_000, 0))
+        .with_fuel_observer(observer.clone())
+        .build()
+        .await
+        .unwrap();
+    let task = tokio::spawn(proc.run());
+    tokio::time::timeout(Duration::from_secs(5), observer.wait_for_suspension(1))
+        .await
+        .unwrap();
+    let first_wait = scrape(&client, &admin).await;
+    assert_eq!(first_wait.fuel("oneshot", "suspend"), 1);
+    assert!(first_wait.fuel("oneshot", "grant") >= 1);
+    assert_eq!(first_wait.fuel("oneshot", "exhausted"), 0);
+    publisher.tick();
+    tokio::time::timeout(Duration::from_secs(5), observer.wait_for_suspension(2))
+        .await
+        .unwrap();
+    let second_wait = scrape(&client, &admin).await;
+    assert_eq!(second_wait.fuel("oneshot", "suspend"), 2);
+    assert!(second_wait.fuel("oneshot", "grant") > first_wait.fuel("oneshot", "grant"));
+    publisher.tick();
+    let error = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("one-shot total fuel authority exhausted"));
+    let terminal = scrape(&client, &admin).await;
+    assert_eq!(terminal.fuel("oneshot", "exhausted"), 1);
+    assert_eq!(terminal.fuel("oneshot", "suspend"), 2);
+    assert!(terminal.fuel("oneshot", "grant") > second_wait.fuel("oneshot", "grant"));
+    drop(engine);
+    drop(publisher);
+    scrape(&client, &admin)
+        .await
+        .assert_fuel_unchanged(&terminal);
+    let independent = scrape(&client, &other_admin).await;
+    for policy in ["scheduled", "oneshot"] {
+        for decision in ["grant", "suspend", "exhausted"] {
+            assert_eq!(
+                independent.fuel(policy, decision),
+                0,
+                "independent Host collector"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn fuel_http_runtime_spawn_uses_pool_collector_across_child_and_pool_teardown() {
+    struct EmptyMembrane;
+    impl ww::system_capnp::membrane::Server for EmptyMembrane {}
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let fuel = FuelMetrics::default();
+            let executor_metrics = ExecutorMetrics::default();
+            let admin = Admin::with_metrics(executor_metrics.clone(), fuel.clone());
+            let (_shutdown, shutdown_rx) = watch::channel(());
+            let pool = ExecutorPool::try_new_with_collectors(
+                1,
+                shutdown_rx,
+                support::filesystem_resources(),
+                executor_metrics,
+                fuel,
+            )
+            .unwrap();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let runtime = ww::launcher::create_runtime_client(
+                false,
+                authority::EpochGuard::fixed(authority::Epoch::zero()),
+                pool.runtime_engine(),
+                None,
+                rpc::CachePolicy::Isolated,
+                support::filesystem_resources(),
+            );
+            let mut load = runtime.load_request();
+            load.get().set_wasm(
+                &wat::parse_str(include_str!("fixtures/spinning-component.wat")).unwrap(),
+            );
+            let executor = load
+                .send()
+                .promise
+                .await
+                .unwrap()
+                .get()
+                .unwrap()
+                .get_executor()
+                .unwrap();
+            for budget in [1, 0] {
+                let mut spawn = executor.spawn_request();
+                spawn
+                    .get()
+                    .set_membrane(capnp_rpc::new_client(EmptyMembrane));
+                spawn
+                    .get()
+                    .init_fuel_policy()
+                    .init_oneshot()
+                    .set_total_budget(budget);
+                let process = spawn
+                    .send()
+                    .promise
+                    .await
+                    .unwrap()
+                    .get()
+                    .unwrap()
+                    .get_process()
+                    .unwrap();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    process.wait_request().send().promise,
+                )
+                .await
+                .expect("spawned child termination")
+                .expect("process wait");
+                assert_ne!(result.get().unwrap().get_exit_code(), 0);
+            }
+            let terminal = scrape(&client, &admin).await;
+            assert_eq!(terminal.fuel("oneshot", "grant"), 1);
+            assert_eq!(terminal.fuel("oneshot", "exhausted"), 2);
+            assert_eq!(terminal.fuel("oneshot", "suspend"), 0);
+            assert_eq!(terminal.fuel("scheduled", "grant"), 0);
+            // These children use the launcher directly and consume no pool admission.
+            terminal.assert_executor(0, [0, 0, 0], [0, 0, 0]);
+            drop(executor);
+            drop(runtime);
+            pool.shutdown_and_join().await;
+            scrape(&client, &admin)
+                .await
+                .assert_fuel_unchanged(&terminal);
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn executor_http_tracks_operations_and_retains_counters_after_teardown() {
     let metrics = ExecutorMetrics::default();
     let admin = Admin::with_executor_metrics(metrics.clone());
@@ -425,8 +662,12 @@ async fn executor_http_tracks_operations_and_retains_counters_after_teardown() {
 
     let stopped = scrape(&client, &admin).await;
     stopped.assert_executor(0, [4, 0, 1], [1, 2, 1]);
+    // Concurrent P3 tests can change the process-wide compilation counters.
+    // This pool's executor counters must retain their exact terminal values.
     for _ in 0..8 {
-        assert_eq!(scrape(&client, &admin).await.body, stopped.body);
+        scrape(&client, &admin)
+            .await
+            .assert_executor(0, [4, 0, 1], [1, 2, 1]);
     }
     println!(
         "EXECUTOR_HTTP_EVIDENCE={}",

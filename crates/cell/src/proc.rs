@@ -50,6 +50,7 @@ mod routing_key_runtime {
 // authority. Scheduled-cell exhaustion and yielding remain separate concerns.
 // ---------------------------------------------------------------------------
 
+use crate::metrics::{FuelMetrics, FuelPolicy};
 use crate::sched::{INITIAL_FUEL, MAX_FUEL, MIN_FUEL, RATIO_SCALE, YIELD_INTERVAL, YIELD_RESERVE};
 
 /// Ratio-based EWMA fuel estimator for WASM cells.
@@ -277,6 +278,14 @@ impl FuelObserver {
 }
 
 impl FuelEstimator {
+    fn policy(&self) -> FuelPolicy {
+        if self.total_remaining.is_some() {
+            FuelPolicy::Oneshot
+        } else {
+            FuelPolicy::Scheduled
+        }
+    }
+
     #[must_use]
     pub fn new(initial_quantum: u64) -> Self {
         Self {
@@ -682,6 +691,8 @@ pub struct ComponentRunStates {
     pub(crate) fs_descriptors: crate::fs_intercept::DescriptorContexts,
     /// EWMA estimator and one-shot fuel authority ledgers.
     pub fuel_estimator: FuelEstimator,
+    /// Shared Host-lifetime production counts, independent of test observers.
+    fuel_metrics: FuelMetrics,
     /// Epoch subscription paired with this Store's Wasmtime Engine.
     epoch_clock: crate::engine::EpochSubscription,
     /// Latest epoch sequence whose one-shot allowance this Store opened.
@@ -1371,6 +1382,7 @@ async fn apply_fuel_decision(
     ctx: &mut StoreContextMut<'_, ComponentRunStates>,
     mut decision: FuelDecision,
 ) -> wasmtime::Result<()> {
+    let mut suspended = false;
     loop {
         match decision {
             FuelDecision::Grant(grant) => {
@@ -1378,13 +1390,34 @@ async fn apply_fuel_decision(
                 return Ok(());
             }
             FuelDecision::Exhausted => {
+                let state = ctx.data();
+                state
+                    .fuel_metrics
+                    .record_exhausted(state.fuel_estimator.policy());
                 return Err(wasmtime::Error::msg(
                     "one-shot total fuel authority exhausted",
                 ));
             }
             FuelDecision::Suspend => {
                 if ctx.data_mut().open_latest_epoch().is_none() {
-                    ctx.data_mut().epoch_clock.changed().await.map_err(|_| {
+                    let state = ctx.data_mut();
+                    let policy = state.fuel_estimator.policy();
+                    let metrics = &state.fuel_metrics;
+                    let mut changed = std::pin::pin!(state.epoch_clock.changed());
+                    std::future::poll_fn(|cx| {
+                        // watch::changed can yield before checking its notification
+                        // when Tokio's cooperative budget is empty. Only a real
+                        // epoch wait counts, once across repeated polls/retries.
+                        let has_budget = tokio::task::coop::has_budget_remaining();
+                        let poll = changed.as_mut().poll(cx);
+                        if has_budget && poll.is_pending() && !suspended {
+                            metrics.record_suspend(policy);
+                            suspended = true;
+                        }
+                        poll
+                    })
+                    .await
+                    .map_err(|_| {
                         wasmtime::Error::msg("epoch clock closed while one-shot Cell was suspended")
                     })?;
                     continue;
@@ -1406,6 +1439,10 @@ fn install_fuel_slice_in_context(
         .install_authority_grant(authority);
     ctx.fuel_async_yield_interval(Some(slice.yield_interval))?;
     ctx.set_fuel(slice.physical)?;
+    let state = ctx.data();
+    state
+        .fuel_metrics
+        .record_grant(state.fuel_estimator.policy());
     Ok(())
 }
 
@@ -1419,6 +1456,10 @@ fn install_fuel_slice_in_store(
         .install_authority_grant(authority);
     store.fuel_async_yield_interval(Some(slice.yield_interval))?;
     store.set_fuel(slice.physical)?;
+    let state = store.data();
+    state
+        .fuel_metrics
+        .record_grant(state.fuel_estimator.policy());
     Ok(())
 }
 
@@ -1830,6 +1871,7 @@ impl Proc {
                 cid_tree,
                 fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
                 fuel_estimator,
+                fuel_metrics: runtime_engine.fuel_metrics(),
                 epoch_clock,
                 opened_epoch,
                 pending_epoch: None,
@@ -1930,6 +1972,10 @@ impl Proc {
                 tracing::trace!(grant, "fuel.initial");
             }
             FuelDecision::Exhausted => {
+                let state = self.store.data();
+                state
+                    .fuel_metrics
+                    .record_exhausted(state.fuel_estimator.policy());
                 return Err(anyhow!("one-shot total fuel authority exhausted"));
             }
             FuelDecision::Suspend => {
@@ -2325,6 +2371,7 @@ mod tests {
             cid_tree: None,
             fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
             fuel_estimator,
+            fuel_metrics: runtime_engine.fuel_metrics(),
             epoch_clock,
             opened_epoch,
             pending_epoch: None,
@@ -4140,6 +4187,7 @@ mod tests {
 
         let (runtime_engine, mut publisher) =
             crate::engine::runtime_engine().expect("component runtime engine");
+        let metrics = runtime_engine.fuel_metrics();
         let bytecode =
             wat::parse_str(P3_COUNTED_START_COMMAND).expect("parse P3 counted-start component");
         let observer = FuelObserver::default();
@@ -4188,6 +4236,14 @@ mod tests {
             "start function did not use the normal fuel hook: {first_updates:?}"
         );
         assert_eq!(first_updates[0].decision, FuelDecision::Suspend);
+        assert_eq!(
+            metrics.snapshot().oneshot,
+            crate::metrics::FuelDecisionSnapshot {
+                grant: 1,
+                suspend: 1,
+                exhausted: 0,
+            }
+        );
         assert!(first_updates[0].consumed >= EPOCH_BUDGET);
         assert!(
             observer.slice_boundaries.load(Ordering::Relaxed) >= 2,
@@ -4199,6 +4255,16 @@ mod tests {
             .await
             .expect("counted start function timed out after the next epoch")
             .expect("counted-start command failed");
+
+        assert_eq!(
+            metrics.snapshot().oneshot,
+            crate::metrics::FuelDecisionSnapshot {
+                grant: 3,
+                suspend: 1,
+                exhausted: 0,
+            },
+            "initial, resumed, and post-instantiation grants must reach the collector"
+        );
 
         let updates = observer.updates();
         assert_eq!(
@@ -5172,4 +5238,6 @@ mod tests {
             est.quantum()
         );
     }
+
+    include!("proc_fuel_metrics_tests.rs");
 }

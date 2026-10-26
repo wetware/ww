@@ -1522,6 +1522,7 @@ system::export!({iface_name}Guest);
 
         let wasmtime_cache_metrics = ww::cell::engine::wasmtime_cache_metrics();
         let executor_metrics = ww::services::ExecutorMetrics::default();
+        let fuel_metrics = ww::cell::metrics::FuelMetrics::default();
 
         // Bind before spawning so an unavailable control-plane port is a
         // synchronous startup failure.
@@ -1546,6 +1547,7 @@ system::export!({iface_name}Guest);
                     route_registry: route_registry.clone(),
                     wasmtime_cache_metrics: wasmtime_cache_metrics.clone(),
                     executor_metrics: executor_metrics.clone(),
+                    fuel_metrics: fuel_metrics.clone(),
                 },
             )?;
         }
@@ -1840,11 +1842,12 @@ system::export!({iface_name}Guest);
         let stream_control = swarm_ready.stream_control;
         // Executor pool: M:N cell scheduling across N worker threads.
         executor_pool_slot = Some(
-            ww::services::ExecutorPool::try_new_with_metrics(
+            ww::services::ExecutorPool::try_new_with_collectors(
                 executor_threads,
                 supervisor.shutdown_rx(),
                 std::sync::Arc::clone(&filesystem_resources),
                 executor_metrics,
+                fuel_metrics,
             )
             .context("failed to start executor pool")?,
         );

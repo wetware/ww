@@ -299,7 +299,7 @@ localhost-only admin plane on `127.0.0.1:2026` is the process control surface:
 - `/readyz` reports whether the runtime has reached its serving phase.
 - `/version` reports source and current generation kernel provenance plus degraded
   cache state.
-- `/metrics` exposes live Wasmtime cache and ExecutorPool metrics. See the collection
+- `/metrics` exposes live Wasmtime cache, ExecutorPool, and applied fuel-decision metrics. See the collection
   policy below for measurements that are not yet available.
 
 Keep the admin listener on loopback unless an authenticated network boundary
@@ -358,28 +358,48 @@ existing `cell_counts`. Those counters can retain stale values after immediate
 completion or discarded queued requests. This landing preserves worker assignment;
 it does not use those counters as a public gauge.
 
-The endpoint exports exactly 13 series: six Wasmtime samples and seven executor
-samples. Metric names, HELP text, and label values are static. The renderer accepts
+`ww_fuel_decisions_total{policy,decision}` counts applied fuel decisions over the
+Host collector lifetime. `policy` is exactly `scheduled` or `oneshot`, and
+`decision` is exactly `grant`, `suspend`, or `exhausted`. All six combinations
+appear even when zero. The Host creates this collector before admin startup and
+shares it through its runtime engine with PID0 and every locally spawned Cell.
+Counts survive Cell and pool teardown; a new Host receives a fresh collector.
+
+A grant counts only after both Wasmtime fuel configuration calls succeed,
+including initial grants and grants following one-shot epoch resumption. A
+suspension counts once when a one-shot Cell enters the wait for new epoch
+authority. Exhaustion counts once when execution commits to terminal total
+authority exhaustion, including a zero budget before guest instantiation.
+Provisional or superseded decisions, failed installations, and cancellation
+while suspended do not invent applied outcomes. Physical `YIELD_RESERVE` fuel
+does not constitute guest authority. Snapshots read separate relaxed atomics
+and are not transactional across concurrent decisions.
+
+The endpoint exports exactly 19 series: six Wasmtime samples, seven executor
+samples, and six fuel samples. Metric names, HELP text, and label values are static. The renderer accepts
 no dynamic label or HELP text that requires escaping. Cell identifiers, task names,
 RPC methods, paths, peer IDs, and CIDs do not become metric labels. Response size
 is bounded by fixed text and integer widths, regardless of Cell churn.
 
-Collection adds atomic updates at admission and terminal boundaries. It adds no
-per-poll, fuel-hook, or epoch-tick collection. The existing test-only
+Collection adds atomic updates at executor admission and terminal boundaries,
+and at applied fuel decisions. Epoch notification alone does not record a fuel
+decision. The existing test-only
 `FuelObserver` remains separate from production metrics. See the
 [executor measurement report](measurements/executor-metrics.md) for the baseline,
-performance budget, operation-to-HTTP evidence, and remaining #752 slices.
+performance budget, and operation-to-HTTP evidence for executor collection.
+The [fuel scheduling reference](designs/fuel-scheduling.md#applied-decision-metrics)
+defines applied fuel outcomes; the [fuel measurement report](measurements/fuel-decisions.md)
+records their performance budget, results, and reproduction commands.
 
-Fuel, RPC, ARC cache, and stream metrics have no production collectors. The
+Fuel consumption/distribution, RPC, ARC cache, and stream metrics have no production collectors. The
 endpoint omits their samples and HELP/TYPE declarations, and the runtime contains
 no placeholder registries for these metrics. Their absence means unavailable
 measurements, not zero activity. Producer-specific work owns future collection:
 
 - [#260](https://github.com/wetware/ww/issues/260): live `PinsetCache` hits,
   misses, evictions, cached weight, and entry count.
-- [#752](https://github.com/wetware/ww/issues/752): fuel decisions, consumption,
-  authority ledgers, latency, and sampled diagnostics remain after this executor
-  admission and occupancy slice.
+- [#752](https://github.com/wetware/ww/issues/752): fuel consumption, authority
+  ledgers, desired-versus-applied quantum visibility, latency, and sampled diagnostics.
 - [#754](https://github.com/wetware/ww/issues/754): RPC durations and outcomes,
   stream activity, and other protocol/host metrics with bounded labels.
 

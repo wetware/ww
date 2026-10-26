@@ -16,6 +16,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `respond_bytes_async` for output completion.
 
 ### Added
+- **Applied fuel-decision metrics (#752).** `/metrics` reports successful fuel
+  grants, one-shot epoch suspensions, and terminal authority exhaustion through
+  `ww_fuel_decisions_total{policy,decision}`. Six fixed series include initial
+  and resumed grants and retain counts after Cells terminate. Provisional
+  decisions and failed fuel installations do not increment counters.
 - **ExecutorPool metrics (#752).** `/metrics` reports occupied task slots, spawn
   admission outcomes, and completion, cancellation, and panic counts with fixed
   labels. Counters persist across pool teardown; occupied slots return to zero.

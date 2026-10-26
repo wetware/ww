@@ -61,6 +61,7 @@ pub struct RuntimeEngine {
     engine: Arc<Engine>,
     epoch_rx: watch::Receiver<u64>,
     epoch_sequence: Arc<Mutex<u64>>,
+    fuel_metrics: crate::metrics::FuelMetrics,
 }
 
 /// The sole publisher for one [`RuntimeEngine`]'s epoch clock.
@@ -77,6 +78,11 @@ pub struct EpochSubscription {
 }
 
 impl RuntimeEngine {
+    /// Return the Host collector shared by every Cell using this runtime.
+    pub fn fuel_metrics(&self) -> crate::metrics::FuelMetrics {
+        self.fuel_metrics.clone()
+    }
+
     /// Return the raw Wasmtime engine used for compilation and Store creation.
     pub fn engine(&self) -> Arc<Engine> {
         Arc::clone(&self.engine)
@@ -332,6 +338,13 @@ pub fn wasm_engine() -> wasmtime::Result<Engine> {
 
 /// Build a canonical Wasmtime engine together with its epoch publisher.
 pub fn runtime_engine() -> wasmtime::Result<(RuntimeEngine, EpochPublisher)> {
+    runtime_engine_with_fuel_metrics(crate::metrics::FuelMetrics::default())
+}
+
+/// Build a runtime connected to an existing Host-lifetime fuel collector.
+pub fn runtime_engine_with_fuel_metrics(
+    fuel_metrics: crate::metrics::FuelMetrics,
+) -> wasmtime::Result<(RuntimeEngine, EpochPublisher)> {
     let engine = Arc::new(wasm_engine()?);
     let (epoch_tx, epoch_rx) = watch::channel(0);
     let epoch_sequence = Arc::new(Mutex::new(0));
@@ -340,6 +353,7 @@ pub fn runtime_engine() -> wasmtime::Result<(RuntimeEngine, EpochPublisher)> {
             engine: Arc::clone(&engine),
             epoch_rx,
             epoch_sequence: Arc::clone(&epoch_sequence),
+            fuel_metrics,
         },
         EpochPublisher {
             engine,

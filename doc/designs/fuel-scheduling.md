@@ -261,6 +261,43 @@ ordering does not expose a new allowance before the engine increment completes.
 Dropping worker 0 closes the only watch sender. A suspended Cell then returns a
 runtime error instead of waiting forever.
 
+## Applied decision metrics
+
+`ww_fuel_decisions_total{policy,decision}` exposes six counters. The fixed
+policies are `scheduled` and `oneshot`; the fixed decisions are `grant`,
+`suspend`, and `exhausted`. All six series are present at zero before execution.
+
+- `grant` increments after both `fuel_async_yield_interval()` and `set_fuel()`
+  succeed in a grant installer. This includes initial grants before executable
+  instantiation, post-instantiation settlement, host-return and slice settlement,
+  and grants after one-shot resumption. Intermediate yield rearming does not
+  install new authority and does not count as a grant.
+- `suspend` increments once when the one-shot epoch-change future first returns
+  `Pending` after polling its notification. Tokio cooperative-budget yields,
+  immediately available notifications, repeated polls in the same wait, and
+  proposals replaced before waiting do not increment this counter.
+- `exhausted` increments when `Proc::run` or the application path returns the
+  terminal total-authority exhaustion error. A zero initial total counts before
+  instantiation. Cancellation and a closed epoch clock retain their existing
+  outcomes and do not count as authority exhaustion or resumed grants.
+
+The Host creates the collector before starting its admin service. Its
+`RuntimeEngine` shares the collector with PID0 and launcher-created children.
+Admin retains the collector after Cells and executor workers terminate. A
+separate Host collector starts from zero. Snapshots load six relaxed atomic
+counters independently; a scrape is not a transaction across all series.
+
+Only successfully applied outcomes increment counters. `current_decision()`,
+settlement proposals, epoch notifications and `FuelObserver` do not publish
+production counts. The installers retain their existing estimator mutation
+order even if a Wasmtime call fails. A failed installation adds no grant count.
+
+These counters count decisions, not fuel units. Desired `quantum`, effective
+`authority_grant`, physical `authority_grant + YIELD_RESERVE`, and one-shot
+ledgers remain distinct. Consumption and distribution metrics are deferred.
+See [the measurement report](../measurements/fuel-decisions.md) for the
+performance budget and reproduction commands.
+
 ## Constants
 
 | Name | Value | Rationale |

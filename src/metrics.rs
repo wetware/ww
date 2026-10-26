@@ -15,6 +15,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::ge
 use tokio::sync::watch;
 
 use crate::cell::engine::{WasmtimeCacheMetrics, WasmtimeCacheSnapshot, WasmtimeCacheState};
+use crate::cell::metrics::FuelMetrics;
 use crate::services::{ExecutorMetrics, ExecutorSnapshot};
 
 /// Immutable build and artifact identity exposed by `GET /version`.
@@ -99,6 +100,7 @@ struct AdminState {
     route_registry: Option<rpc::dispatch::RouteRegistry>,
     wasmtime_cache_metrics: WasmtimeCacheMetrics,
     executor_metrics: ExecutorMetrics,
+    fuel_metrics: FuelMetrics,
 }
 
 /// Render all metrics in Prometheus text exposition format.
@@ -106,7 +108,32 @@ fn render_metrics(state: &AdminState) -> String {
     let mut out = String::with_capacity(2048);
     render_wasmtime_cache_metrics(&mut out, &state.wasmtime_cache_metrics.snapshot());
     render_executor_metrics(&mut out, state.executor_metrics.snapshot());
+    render_fuel_metrics(&mut out, &state.fuel_metrics);
     out
+}
+
+fn render_fuel_metrics(out: &mut String, metrics: &FuelMetrics) {
+    let snapshot = metrics.snapshot();
+    out.push_str(
+        "# HELP ww_fuel_decisions_total Applied fuel decisions over this Host lifetime.\n",
+    );
+    out.push_str("# TYPE ww_fuel_decisions_total counter\n");
+    for (policy, counts) in [
+        ("scheduled", snapshot.scheduled),
+        ("oneshot", snapshot.oneshot),
+    ] {
+        for (decision, value) in [
+            ("grant", counts.grant),
+            ("suspend", counts.suspend),
+            ("exhausted", counts.exhausted),
+        ] {
+            writeln!(
+                out,
+                "ww_fuel_decisions_total{{policy=\"{policy}\",decision=\"{decision}\"}} {value}"
+            )
+            .unwrap();
+        }
+    }
 }
 
 fn render_wasmtime_cache_metrics(out: &mut String, snapshot: &WasmtimeCacheSnapshot) {
@@ -341,6 +368,8 @@ pub struct AdminService {
     pub wasmtime_cache_metrics: WasmtimeCacheMetrics,
     /// The same collector supplied to the Host executor pool.
     pub executor_metrics: ExecutorMetrics,
+    /// Shared with the Host runtime engine, including locally spawned Cells.
+    pub fuel_metrics: FuelMetrics,
 }
 
 impl crate::services::Service for AdminService {
@@ -360,6 +389,7 @@ impl crate::services::Service for AdminService {
                 route_registry: self.route_registry,
                 wasmtime_cache_metrics: self.wasmtime_cache_metrics,
                 executor_metrics: self.executor_metrics,
+                fuel_metrics: self.fuel_metrics,
             };
 
             let app = Router::new()
@@ -418,6 +448,7 @@ mod tests {
             route_registry: None,
             wasmtime_cache_metrics: crate::cell::engine::wasmtime_cache_metrics(),
             executor_metrics: ExecutorMetrics::default(),
+            fuel_metrics: FuelMetrics::default(),
         }
     }
 
@@ -608,18 +639,18 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("# HELP "))
                 .count(),
-            7
+            8
         );
         assert_eq!(
             output
                 .lines()
                 .filter(|line| line.starts_with("# TYPE "))
                 .count(),
-            7
+            8
         );
         assert_eq!(
             output.lines().filter(|line| !line.starts_with('#')).count(),
-            13
+            19
         );
     }
 
