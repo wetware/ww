@@ -291,6 +291,7 @@ dependencies = [
  "bytes",
  "cap-std",
  "cid",
+ "crossbeam-utils",
  "dirs",
  "futures",
  "ipfs",
