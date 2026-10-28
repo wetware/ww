@@ -1375,6 +1375,7 @@ dependencies = [
  "capnp",
  "capnp-rpc",
  "cid",
+ "crossbeam-utils",
  "dirs",
  "futures",
  "ipfs",

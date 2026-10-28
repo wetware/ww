@@ -16,6 +16,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `respond_bytes_async` for output completion.
 
 ### Added
+- **Settled fuel consumption (#752).** `/metrics` reports physical fuel units
+  accounted for at settlement boundaries through
+  `ww_fuel_settled_units_total{policy}`. Two fixed series distinguish scheduled
+  and one-shot Cells and retain counts after termination. Counts include reserve
+  overshoot and exclude fuel left unsettled when execution ends. Store-local
+  accumulation publishes every 256 settlements, at epoch and terminal
+  boundaries, and on Store destruction. Live scrapes can lag pending values.
 - **Applied fuel-decision metrics (#752).** `/metrics` reports successful fuel
   grants, one-shot epoch suspensions, and terminal authority exhaustion through
   `ww_fuel_decisions_total{policy,decision}`. Six fixed series include initial

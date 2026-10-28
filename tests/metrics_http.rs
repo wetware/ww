@@ -163,8 +163,13 @@ impl Scrape {
             [&format!("ww_fuel_decisions_total{{policy=\"{policy}\",decision=\"{decision}\"}}")]
     }
 
+    fn settled_fuel(&self, policy: &str) -> u64 {
+        self.samples[&format!("ww_fuel_settled_units_total{{policy=\"{policy}\"}}")]
+    }
+
     fn assert_fuel_unchanged(&self, previous: &Self) {
         for policy in ["scheduled", "oneshot"] {
+            assert_eq!(self.settled_fuel(policy), previous.settled_fuel(policy));
             for decision in ["grant", "suspend", "exhausted"] {
                 assert_eq!(self.fuel(policy, decision), previous.fuel(policy, decision));
             }
@@ -213,6 +218,7 @@ impl Scrape {
                         );
                     } else {
                         let (label, values): (&str, &[&str]) = match name {
+                            "ww_fuel_settled_units_total" => ("policy", &["scheduled", "oneshot"]),
                             "ww_wasmtime_cache_state" => {
                                 ("state", &["enabled", "disabled", "fallback"])
                             }
@@ -246,6 +252,7 @@ impl Scrape {
             ("ww_executor_spawn_admissions_total", "counter"),
             ("ww_executor_cell_terminations_total", "counter"),
             ("ww_fuel_decisions_total", "counter"),
+            ("ww_fuel_settled_units_total", "counter"),
         ]
         .into_iter()
         .map(|(name, kind)| (name.to_owned(), kind.to_owned()))
@@ -306,11 +313,12 @@ impl Scrape {
             assert!(
                 name.starts_with("ww_wasmtime_")
                     || name.starts_with("ww_executor_")
-                    || name.starts_with("ww_fuel_decisions_total{"),
+                    || name.starts_with("ww_fuel_decisions_total{")
+                    || name.starts_with("ww_fuel_settled_units_total{"),
                 "unsupported sample exposed: {name}"
             );
         }
-        assert_eq!(self.samples.len(), 19);
+        assert_eq!(self.samples.len(), 21);
         assert!(self.body.len() < 4096, "unbounded metrics response");
     }
 
@@ -390,6 +398,66 @@ async fn cell_result(result: CellResult) -> anyhow::Result<i32> {
 }
 
 #[tokio::test]
+async fn fuel_http_pending_store_lags_until_cancelled_owner_finishes_teardown() {
+    let fuel = FuelMetrics::default();
+    let admin = Admin::with_metrics(ExecutorMetrics::default(), fuel.clone());
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let (runtime, _publisher) =
+        cell::engine::runtime_engine_with_fuel_metrics(fuel.clone()).unwrap();
+    let wasm = wat::parse_str(include_str!("fixtures/fuel-publication-component.wat")).unwrap();
+    let (builder, _handles) = cell::Builder::ordinary(
+        cell::Program::Bytes(wasm),
+        tokio::io::empty(),
+        tokio::io::sink(),
+        tokio::io::sink(),
+        support::filesystem_ownership(),
+    );
+    let proc = builder.with_runtime_engine(runtime).build().await.unwrap();
+    let task = tokio::spawn(proc.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fuel.snapshot().scheduled.grant < 9 {
+            assert!(
+                !task.is_finished(),
+                "P3 command exited before the pending wait"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("eight marked P3 returns before the pending wait");
+
+    let active = scrape(&client, &admin).await;
+    assert_eq!(active.fuel("scheduled", "grant"), 9);
+    assert_eq!(active.settled_fuel("scheduled"), 0);
+    assert_eq!(active.settled_fuel("oneshot"), 0);
+    assert!(!task.is_finished());
+    // A second scrape with no Store progress still cannot publish local state.
+    scrape(&client, &admin).await.assert_fuel_unchanged(&active);
+
+    task.abort();
+    let error = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled Store teardown deadline")
+        .expect_err("cancelled owner task");
+    assert!(error.is_cancelled());
+    let terminal = scrape(&client, &admin).await;
+    // Eight fixture returns settle 6 * 8 - 2 = 46 units. The pending
+    // wait's tail remains unsettled and contributes nothing during Drop.
+    assert_eq!(terminal.settled_fuel("scheduled"), 46);
+    assert_eq!(terminal.settled_fuel("oneshot"), 0);
+    assert_eq!(terminal.fuel("scheduled", "grant"), 9);
+    assert_eq!(terminal.fuel("scheduled", "suspend"), 0);
+    assert_eq!(terminal.fuel("scheduled", "exhausted"), 0);
+    scrape(&client, &admin)
+        .await
+        .assert_fuel_unchanged(&terminal);
+}
+
+#[tokio::test]
 async fn fuel_http_tracks_real_p3_grants_suspension_exhaustion_and_retains_history() {
     use cell::proc::{FuelEstimator, FuelObserver};
     let fuel = FuelMetrics::default();
@@ -402,6 +470,7 @@ async fn fuel_http_tracks_real_p3_grants_suspension_exhaustion_and_retains_histo
         .unwrap();
     let initial = scrape(&client, &admin).await;
     for policy in ["scheduled", "oneshot"] {
+        assert_eq!(initial.settled_fuel(policy), 0);
         for decision in ["grant", "suspend", "exhausted"] {
             assert_eq!(initial.fuel(policy, decision), 0);
         }
@@ -410,11 +479,21 @@ async fn fuel_http_tracks_real_p3_grants_suspension_exhaustion_and_retains_histo
     let wasm = wat::parse_str(include_str!("fixtures/spinning-component.wat")).unwrap();
     let scheduled_wasm = wat::parse_str(
         r#"(component
+        (import "wasi:clocks/monotonic-clock@0.3.0" (instance $clock
+            (export "now" (func (result u64)))))
+        (core func $now (canon lower (func $clock "now")))
         (core func $return (canon task.return (result (result))))
-        (core module $noop
+        (core module $guest
+            (import "" "now" (func $now (result i64)))
             (import "" "return" (func $return (param i32)))
-            (func (export "run") i32.const 0 call $return))
-        (core instance $i (instantiate $noop (with "" (instance (export "return" (func $return))))))
+            (func (export "run") (local $left i32)
+                i32.const 8 local.set $left
+                (loop $loop
+                    call $now drop
+                    local.get $left i32.const 1 i32.sub local.tee $left br_if $loop)
+                i32.const 0 call $return))
+        (core instance $i (instantiate $guest (with "" (instance
+            (export "now" (func $now)) (export "return" (func $return))))))
         (func $run async (result (result)) (canon lift (core func $i "run") async))
         (instance (export (interface "wasi:cli/run@0.3.0")) (export "run" (func $run))))"#,
     )
@@ -439,6 +518,9 @@ async fn fuel_http_tracks_real_p3_grants_suspension_exhaustion_and_retains_histo
     assert!(after_scheduled.fuel("scheduled", "grant") >= 1);
     assert_eq!(after_scheduled.fuel("scheduled", "suspend"), 0);
     assert_eq!(after_scheduled.fuel("scheduled", "exhausted"), 0);
+    // Each clock call marks a host-return settlement after guest instructions.
+    assert!(after_scheduled.settled_fuel("scheduled") >= 8);
+    assert_eq!(after_scheduled.settled_fuel("oneshot"), 0);
 
     let observer = FuelObserver::default();
     let (builder, _handles) = cell::Builder::ordinary(
@@ -463,6 +545,11 @@ async fn fuel_http_tracks_real_p3_grants_suspension_exhaustion_and_retains_histo
     assert_eq!(first_wait.fuel("oneshot", "suspend"), 1);
     assert!(first_wait.fuel("oneshot", "grant") >= 1);
     assert_eq!(first_wait.fuel("oneshot", "exhausted"), 0);
+    assert!(first_wait.settled_fuel("oneshot") >= 10_000);
+    assert_eq!(
+        first_wait.settled_fuel("scheduled"),
+        after_scheduled.settled_fuel("scheduled")
+    );
     publisher.tick();
     tokio::time::timeout(Duration::from_secs(5), observer.wait_for_suspension(2))
         .await
@@ -470,6 +557,11 @@ async fn fuel_http_tracks_real_p3_grants_suspension_exhaustion_and_retains_histo
     let second_wait = scrape(&client, &admin).await;
     assert_eq!(second_wait.fuel("oneshot", "suspend"), 2);
     assert!(second_wait.fuel("oneshot", "grant") > first_wait.fuel("oneshot", "grant"));
+    assert!(second_wait.settled_fuel("oneshot") > first_wait.settled_fuel("oneshot"));
+    assert_eq!(
+        second_wait.settled_fuel("scheduled"),
+        after_scheduled.settled_fuel("scheduled")
+    );
     publisher.tick();
     let error = tokio::time::timeout(Duration::from_secs(5), task)
         .await
@@ -481,6 +573,13 @@ async fn fuel_http_tracks_real_p3_grants_suspension_exhaustion_and_retains_histo
     assert_eq!(terminal.fuel("oneshot", "exhausted"), 1);
     assert_eq!(terminal.fuel("oneshot", "suspend"), 2);
     assert!(terminal.fuel("oneshot", "grant") > second_wait.fuel("oneshot", "grant"));
+    assert!(terminal.settled_fuel("oneshot") > second_wait.settled_fuel("oneshot"));
+    // Physical checkpoint overshoot can make settled consumption exceed authority.
+    assert!(terminal.settled_fuel("oneshot") >= 25_000);
+    assert_eq!(
+        terminal.settled_fuel("scheduled"),
+        after_scheduled.settled_fuel("scheduled")
+    );
     drop(engine);
     drop(publisher);
     scrape(&client, &admin)
@@ -488,6 +587,11 @@ async fn fuel_http_tracks_real_p3_grants_suspension_exhaustion_and_retains_histo
         .assert_fuel_unchanged(&terminal);
     let independent = scrape(&client, &other_admin).await;
     for policy in ["scheduled", "oneshot"] {
+        assert_eq!(
+            independent.settled_fuel(policy),
+            0,
+            "independent Host collector"
+        );
         for decision in ["grant", "suspend", "exhausted"] {
             assert_eq!(
                 independent.fuel(policy, decision),
@@ -544,6 +648,7 @@ async fn fuel_http_runtime_spawn_uses_pool_collector_across_child_and_pool_teard
                 .get_executor()
                 .unwrap();
             for budget in [1, 0] {
+                let before = scrape(&client, &admin).await;
                 let mut spawn = executor.spawn_request();
                 spawn
                     .get()
@@ -570,12 +675,23 @@ async fn fuel_http_runtime_spawn_uses_pool_collector_across_child_and_pool_teard
                 .expect("spawned child termination")
                 .expect("process wait");
                 assert_ne!(result.get().unwrap().get_exit_code(), 0);
+                let after = scrape(&client, &admin).await;
+                if budget == 0 {
+                    assert_eq!(
+                        after.settled_fuel("oneshot"),
+                        before.settled_fuel("oneshot")
+                    );
+                } else {
+                    assert!(after.settled_fuel("oneshot") > before.settled_fuel("oneshot"));
+                }
             }
             let terminal = scrape(&client, &admin).await;
             assert_eq!(terminal.fuel("oneshot", "grant"), 1);
             assert_eq!(terminal.fuel("oneshot", "exhausted"), 2);
             assert_eq!(terminal.fuel("oneshot", "suspend"), 0);
             assert_eq!(terminal.fuel("scheduled", "grant"), 0);
+            assert_eq!(terminal.settled_fuel("scheduled"), 0);
+            assert!(terminal.settled_fuel("oneshot") > 0);
             // These children use the launcher directly and consume no pool admission.
             terminal.assert_executor(0, [0, 0, 0], [0, 0, 0]);
             drop(executor);
