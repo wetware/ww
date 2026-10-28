@@ -11,6 +11,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
+crossbeam-utils = "0.8"
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 arc-swap = "1"

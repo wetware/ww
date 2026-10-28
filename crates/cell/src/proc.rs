@@ -1877,7 +1877,7 @@ impl Proc {
                 cid_tree,
                 fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
                 fuel_estimator,
-                fuel_metrics: runtime_engine.fuel_metrics(),
+                fuel_metrics: runtime_engine.fuel_metrics().writer(),
                 epoch_clock,
                 opened_epoch,
                 pending_epoch: None,

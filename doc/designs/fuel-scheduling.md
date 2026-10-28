@@ -353,8 +353,55 @@ adds no consumption. Counts already recorded survive Cell and executor
 teardown.
 
 The [settlement measurement report](../measurements/fuel-settlement.md) records
-the candidate's validation and performance results. The four-worker host-return
-regression exceeded the acceptance budget and blocked publication.
+validation and performance results. The original shared-counter implementation
+exceeded the four-worker host-return budget and blocked publication.
+
+### Collector ownership and concurrent snapshots
+
+The selected collector implementation owns 32 fixed settlement shards in one
+Host-lifetime `Arc<FuelCounters>`. Each `CachePadded<[AtomicU64; 2]>` shard holds
+scheduled and one-shot totals. Existing decision counters remain aggregate
+counters in a separate padded bank. The setup-only writer sequence has its
+own padded storage.
+
+During Store construction, `Proc::new` requests a writer from the shared
+RuntimeEngine collector. `FuelMetrics::writer()` chooses
+`next_writer.fetch_add(1, Relaxed) % 32` once and retains that index. Cloning or
+moving the writer between threads preserves the assignment. This distributes
+Store writes; it does not create exclusive worker ownership. Concurrent Stores
+can collide on a shard. Those collisions preserve correctness through ordinary
+atomics but can reduce the performance benefit. Sequence wraparound remains
+bounded by the modulo operation; no registration or reclamation is needed.
+
+Recording a nonzero settlement performs one relaxed `AtomicU64::fetch_add`.
+The hot path performs no allocation, locking, thread-ID lookup, or writer
+selection. No teardown flush or shard reset occurs. The admin collector retains
+settled totals after Cells, RuntimeEngine handles, and executor workers drop.
+An independent Host starts with independent zeroed counters. Storage remains
+bounded regardless of the number of Cells previously created.
+
+A snapshot reads all 32 shards and sums each policy with `wrapping_add`.
+Counts are exact after writers quiesce. Concurrent snapshots combine relaxed
+loads from different instants; they are not atomic ledger snapshots or
+transactions across metric families. Repeated reads by one reader are monotonic
+before overflow. Both atomic increments and aggregate sums use modulo-2^64
+arithmetic, so overflow can break monotonicity. Authority ledgers retain their
+separate saturating subtraction semantics. HTTP still exposes only the two
+fixed policy series, without shard identifiers.
+
+`crossbeam_utils::CachePadded` supplies target-dependent alignment estimates.
+Counting correctness and lifetime do not depend on a particular cache-line
+size or Apple-specific behavior. Unmeasured cache geometry and writer collisions
+remain performance limits. Layout tests assert separation relative to the
+padding type rather than a fixed 128-byte requirement.
+
+The [measurement report](../measurements/fuel-settlement.md#resumed-software-diagnosis--2026-10-28)
+records the controlled destination comparison and its single ABBAABBA follow-up.
+Those results support reducing destination and line sharing on the reproduction
+machine; they do not prove an undocumented coherence protocol. Final corrected
+candidate acceptance remains pending. Linux ARM64 functional tests passed;
+macOS workspace validation stopped on a test-profile mismatch described in the
+measurement report.
 
 ## Constants
 
