@@ -50,7 +50,7 @@ mod routing_key_runtime {
 // authority. Scheduled-cell exhaustion and yielding remain separate concerns.
 // ---------------------------------------------------------------------------
 
-use crate::metrics::{FuelMetrics, FuelPolicy};
+use crate::metrics::{FuelMetricsWriter, FuelPolicy};
 use crate::sched::{INITIAL_FUEL, MAX_FUEL, MIN_FUEL, RATIO_SCALE, YIELD_INTERVAL, YIELD_RESERVE};
 
 /// Ratio-based EWMA fuel estimator for WASM cells.
@@ -692,7 +692,7 @@ pub struct ComponentRunStates {
     /// EWMA estimator and one-shot fuel authority ledgers.
     pub fuel_estimator: FuelEstimator,
     /// Shared Host-lifetime production counts, independent of test observers.
-    fuel_metrics: FuelMetrics,
+    fuel_metrics: FuelMetricsWriter,
     /// Epoch subscription paired with this Store's Wasmtime Engine.
     epoch_clock: crate::engine::EpochSubscription,
     /// Latest epoch sequence whose one-shot allowance this Store opened.
@@ -842,6 +842,7 @@ impl ComponentRunStates {
         }
         self.opened_epoch = epoch;
         self.fuel_estimator.open_epoch();
+        self.fuel_metrics.flush();
         true
     }
 
@@ -1349,7 +1350,7 @@ async fn settle_and_apply_fuel_boundary(
         .settle_and_decide(remaining, boundary);
     // Settlement is committed even if epoch opening supersedes this decision
     // or its application later suspends, fails, or is cancelled.
-    let state = ctx.data();
+    let state = ctx.data_mut();
     state
         .fuel_metrics
         .record_settled(state.fuel_estimator.policy(), update.consumed);
@@ -1396,6 +1397,7 @@ async fn apply_fuel_decision(
                 return Ok(());
             }
             FuelDecision::Exhausted => {
+                ctx.data_mut().fuel_metrics.flush();
                 let state = ctx.data();
                 state
                     .fuel_metrics
@@ -1405,6 +1407,7 @@ async fn apply_fuel_decision(
                 ));
             }
             FuelDecision::Suspend => {
+                ctx.data_mut().fuel_metrics.flush();
                 if ctx.data_mut().open_latest_epoch().is_none() {
                     let state = ctx.data_mut();
                     let policy = state.fuel_estimator.policy();
@@ -2024,6 +2027,7 @@ impl Proc {
             .await
             .map_err(|error| anyhow!("P3 command event loop failed: {error:#}"))?
             .map_err(|error| anyhow!("failed to call `wasi:cli/run`: {error:#}"))?;
+        self.store.data_mut().fuel_metrics.flush();
         result.map_err(|()| anyhow!("guest returned non-zero exit status"))
     }
 }
@@ -2377,7 +2381,7 @@ mod tests {
             cid_tree: None,
             fs_descriptors: crate::fs_intercept::DescriptorContexts::default(),
             fuel_estimator,
-            fuel_metrics: runtime_engine.fuel_metrics(),
+            fuel_metrics: runtime_engine.fuel_metrics().writer(),
             epoch_clock,
             opened_epoch,
             pending_epoch: None,
@@ -5072,13 +5076,14 @@ mod tests {
             .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
             .await
             .unwrap();
-        assert_eq!(metrics.snapshot().scheduled_settled_units, 25_000);
+        // The committed settlement remains local until publication or Drop.
+        assert_eq!(metrics.snapshot().scheduled_settled_units, 0);
         for _ in 0..3 {
             FuelCallHook
                 .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
                 .await
                 .unwrap();
-            assert_eq!(metrics.snapshot().scheduled_settled_units, 25_000);
+            assert_eq!(metrics.snapshot().scheduled_settled_units, 0);
         }
         // Execute a returning function below the next settlement boundary.
         // Its physical tail remains observable in the Store after return.
@@ -5171,11 +5176,11 @@ mod tests {
             oneshot_ledgers(&store.data().fuel_estimator),
             (24_000, 9_000)
         );
+        assert_eq!(metrics.snapshot().oneshot_settled_units, 0);
+        assert_eq!(metrics.snapshot().oneshot.grant, 0);
+        drop(store);
         assert_eq!(metrics.snapshot().oneshot_settled_units, 1_000);
         assert_eq!(metrics.snapshot().oneshot.grant, 0);
-        let settled = metrics.snapshot();
-        drop(store);
-        assert_eq!(metrics.snapshot(), settled);
     }
 
     #[tokio::test]
@@ -5630,4 +5635,5 @@ mod tests {
     }
 
     include!("proc_fuel_metrics_tests.rs");
+    include!("proc_fuel_publication_tests.rs");
 }

@@ -306,16 +306,17 @@ by `FuelEstimator::settle_and_decide()`. The fixed policies are `scheduled`
 and `oneshot`. Both series appear at zero before execution and share the
 Host-lifetime `FuelMetrics` collector with the decision counters.
 
-`settle_and_apply_fuel_boundary()` records each settlement immediately after
-the estimator computes its physical delta:
+`settle_and_apply_fuel_boundary()` accumulates each settlement in its Store
+immediately after the estimator computes its physical delta:
 
 ```
 consumed = physical_installed.saturating_sub(current_fuel)
 ```
 
 Recording precedes epoch opening and decision application. The consumption
-therefore remains counted if a pending epoch supersedes the decision, a
-one-shot Cell suspends, or decision application fails.
+therefore remains owned if a pending epoch supersedes the decision, a
+one-shot Cell suspends, or decision application fails. Publication follows
+the boundaries below; local accumulation does not immediately change a scrape.
 
 The authoritative settlement boundaries are:
 
@@ -356,111 +357,95 @@ The [settlement measurement report](../measurements/fuel-settlement.md) records
 validation and performance results. The original shared-counter implementation
 exceeded the four-worker host-return budget and blocked publication.
 
-### Collector ownership and concurrent snapshots
+### Store ownership and publication
 
-The selected collector implementation owns 32 fixed settlement shards in one
-Host-lifetime `Arc<FuelCounters>`. Each `CachePadded<[AtomicU64; 2]>` shard holds
-scheduled and one-shot totals. Existing decision counters remain aggregate
-counters in a separate padded bank. The setup-only writer sequence has its
-own padded storage.
+`FuelMetrics` owns one Host-lifetime `Arc<FuelCounters>`. The collector has
+six existing decision counters and two settled-fuel counters. The settled
+counters occupy one `CachePadded<[AtomicU64; 2]>` bank separate from the decision
+bank. The collector is cloneable; cloning never copies pending Store values.
 
-During Store construction, `Proc::new` requests a writer from the shared
-RuntimeEngine collector. `FuelMetrics::writer()` chooses
-`next_writer.fetch_add(1, Relaxed) % 32` once and retains that index. Cloning or
-moving the writer between threads preserves the assignment. This distributes
-Store writes; it does not create exclusive worker ownership. Concurrent Stores
-can collide on a shard. Those collisions preserve correctness through ordinary
-atomics but can reduce the performance benefit. Sequence wraparound remains
-bounded by the modulo operation; no registration or reclamation is needed.
+`ComponentRunStates` owns one `FuelMetricsWriter`. This writer is neither
+Clone nor Copy. It holds the collector, two ordinary pending `u64` counters,
+and a bounded settlement-event count. Moving the Store transfers this ownership
+without a worker-identity assumption. At each authoritative settlement, the
+writer adds the physical delta with `wrapping_add` before any await. Between
+publications, this operation uses ordinary integer loads, additions, stores,
+and a threshold check. It performs no shared atomic increment, allocation,
+lock, timestamp, or writer selection. The existing #769 decision increments
+remain immediate shared atomic operations.
 
-Recording a nonzero settlement performs one relaxed `AtomicU64::fetch_add`.
-The hot path performs no allocation, locking, thread-ID lookup, or writer
-selection. No teardown flush or shard reset occurs. The admin collector retains
-settled totals after Cells, RuntimeEngine handles, and executor workers drop.
-An independent Host starts with independent zeroed counters. Storage remains
-bounded regardless of the number of Cells previously created.
+The writer publishes pending amounts at these boundaries:
 
-A snapshot reads all 32 shards and sums each policy with `wrapping_add`.
-Counts are exact after writers quiesce. Concurrent snapshots combine relaxed
-loads from different instants; they are not atomic ledger snapshots or
-transactions across metric families. Repeated reads by one reader are monotonic
-before overflow. Both atomic increments and aggregate sums use modulo-2^64
-arithmetic, so overflow can break monotonicity. Authority ledgers retain their
-separate saturating subtraction semantics. HTTP still exposes only the two
-fixed policy series, without shard identifiers.
+- Every 256 authoritative settlements, including zero-consumption settlements.
+- An epoch opening observed by the Store, after settling the old epoch.
+- Before applying `Suspend` or `Exhausted`.
+- Command completion after the P3 event loop returns an application result.
+- Actual writer destruction as part of Store teardown, including error exits,
+  failed instantiation, and cancellation that destroys the owning `Proc::run`.
 
-`crossbeam_utils::CachePadded` supplies target-dependent alignment estimates.
-Counting correctness and lifetime do not depend on a particular cache-line
-size or Apple-specific behavior. Unmeasured cache geometry and writer collisions
-remain performance limits. Layout tests assert separation relative to the
-padding type rather than a fixed 128-byte requirement.
+`flush(&mut self)` clears both pending counters and resets the event count,
+then adds each nonzero amount to the corresponding Host counter with a relaxed
+atomic operation. Exclusive ownership serializes recording and publication.
+Explicit publication followed by Drop cannot publish the same pending amount
+twice. Publication performs no await, allocation, lock, or fallible operation.
+It never computes another fuel settlement or debits authority.
 
-The [measurement report](../measurements/fuel-settlement.md#resumed-software-diagnosis--2026-10-28)
-records the controlled destination comparison and its single ABBAABBA follow-up.
-Those results support reducing destination and line sharing on the reproduction
-machine; they do not prove an undocumented coherence protocol. Corrected macOS
-CI-profile validation passed 1,337 workspace tests, with zero failures and
-24 ignored, including the previously failing PID0 test with a matching debug
-Host. Focused fuel, collector, native-P3, and strict Clippy checks also passed.
-The earlier release-profile failure remains recorded in the measurement report.
-Linux ARM64 functional tests passed in OrbStack. Linux x86-64 CI was not run
-because publication stopped; no independent Linux performance claim is made.
+A cancellation request alone does not establish publication. Child teardown
+drops its owning process future; PID0 teardown aborts and awaits its owning
+task. These existing paths destroy the Store. Dropping an arbitrary borrowed
+guest-call future does not necessarily destroy the Store. Process abort,
+`mem::forget`, leaks, and other exits without Rust destruction cannot promise
+final local publication. No new cancellation or scheduler machinery is added.
 
-Final performance acceptance stopped after the three initial pairs and the
-single permitted unchanged-code confirmation block. The six-pair four-worker
-marked-return pool adds 56.533955 ns per boundary, above the 25 ns quality
-target. Four of six pairs miss that target; one exceeds the historical 100 ns
-threshold. The single-worker pool adds 2.223960 ns. The complete compute
-four-worker p95 also exceeds its 5% limit at +7.018622%; two HTTP pairs exceed
-the 20 microsecond p95 allowance. The measurement report retains all
-per-pair and pooled distributions, exceptions, and historical results.
+### Freshness, exactness, and bounded storage
 
-The candidate remains unaccepted despite passing local correctness. The
-remaining concurrent overhead has not been assigned to a specific hardware
-mechanism. No further acceptance runs or merge follow this stopped result.
+After a recording operation returns, at most 255 settlement events remain
+unpublished in each live Store. This is an event bound, not a fuel-unit bound
+or a wall-clock deadline. The fixed threshold amortizes a single-policy atomic
+publication over up to 256 settlements. Epoch and terminal publications can
+shorten that interval. An idle Store below threshold has no guaranteed
+wall-clock publication deadline, even if the Host keeps publishing epochs.
 
-### Proposed publication model after the recording diagnostic
+`FuelMetrics::snapshot()` and `/metrics` read only published Host counters.
+They cannot see a live Store's pending integers. Mere writer quiescence does
+not imply exact totals. After all relevant writers flush or complete Store
+destruction, the settled counters equal all committed settlement deltas modulo
+2^64. This guarantee excludes physical fuel left unsettled at termination.
+The admin collector retains published history after Cells, RuntimeEngine
+handles, and executor workers drop. An independent Host starts at zero.
 
-The subsequent authorized within-process diagnostic did not reproduce the
-56.53 ns residual. Four-worker enabled-minus-disabled cycle median contrasts
-were −0.505200 ns and −0.596665 ns. The
-[diagnostic report](../measurements/fuel-settlement.md#within-process-recording-diagnostic--2026-10-28)
-records all observations, order variation, exact-count checks, and the unmeasured
-production caller differences. Production acceptance remains failed.
+Concurrent snapshots load series independently and can combine different
+instants. They are not transactional ledger snapshots. Local additions and
+atomic publications both wrap modulo 2^64; overflow can break monotonicity.
+Authority ledgers retain their separate saturating subtraction semantics.
 
-The next proposed architecture uses exact Store-local ordinary integer counters
-with bounded publication into the existing Host aggregate. This proposal follows
-the preference to avoid shared atomics at every boundary; the diagnostic did
-not prove that batching would fix the residual. No batching implementation exists
-in this candidate.
+Host aggregate storage is fixed: two settled counters, with no shard array or
+writer-assignment sequence. Each live Store adds constant pending state.
+Destroyed Stores leave no registry entries. Scrapes perform two settled-counter
+loads without scanning Stores. `crossbeam_utils::CachePadded` supplies portable,
+target-dependent alignment estimates; correctness does not depend on a cache
+line size or platform-specific instructions. Concurrent publications can collide
+on the same aggregate; relaxed atomic additions preserve modular totals.
 
-Keep the Host collector cloneable and give `ComponentRunStates` a unique,
-non-Clone owner for pending counts. Record each consumed amount after ledger
-settlement and before any await. Publish at a predefined count threshold, reuse
-existing epoch/terminal boundaries where applicable, and flush the remainder
-when the Store is destroyed. An explicit flush followed by `Drop` must publish
-each amount once. Preserve wrapping totals, policy attribution, and exclusion
-of unsettled terminal fuel.
+### Evidence and follow-up
 
-This model changes visibility: an ordinary scrape can omit pending counts from
-an active or idle Store. Quiescent writers alone no longer imply an exact
-aggregate; exactness requires a flush or Store destruction. A count threshold
-does not bound wall-time staleness for an idle Store. Specify that contract
-before implementation; do not silently weaken current snapshot assertions.
-Scrapes would continue reading the fixed atomic aggregate without scanning
-Stores or accessing their mutable pending counters.
+The [measurement report](../measurements/fuel-settlement.md) retains the
+original per-settlement shared-counter rejection, the 32-shard rejection, and
+the controlled recording diagnostic. That diagnostic did not reproduce the
+cross-process residual or establish its cause. Store-local accumulation is an
+architectural candidate with its own correctness and performance acceptance.
+Historical results do not establish acceptance for this design. The Store-local
+campaign on 2026-10-28 also stopped: complete-pool one-worker compute p95 rose
+6.481886%, above the 5% budget, and that exception recurred in both blocks.
+The −18.953125 ns pooled four-worker marked-return median does not override
+the failed compute budget. No PR or merge follows this result.
 
-Batching settlement alone leaves the existing shared grant atomic on each grant.
-Removing all such boundary atomics would also require local decision counters
-and an explicit change to #769's publication freshness. Store ownership covers
-more execution paths than per-worker ownership and reuses existing teardown.
-Keep cumulative fuel exact; sample expensive distributions, traces, and detailed
-diagnostics separately, with bounded storage and payload construction after the
-sampling decision. Validate disabled-path work before claiming negligible cost.
-
-The measurement report specifies cancellation, flush, memory, freshness, and
-portability checks required for a later prototype. None of those future changes
-or measurements is authorized by the completed diagnostic.
+Batching #769 decision counts needs a separate change to their live-visibility
+contract and separate validation. The current change preserves those counts
+and their application boundaries. A later diagnostic facility can sample
+expensive distributions or trace payloads, with selection before timestamp or
+payload construction and bounded buffers. Sampling must not replace exact
+cumulative settled-fuel accounting.
 
 ## Constants
 

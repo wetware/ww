@@ -380,7 +380,17 @@ and are not transactional across concurrent decisions.
 at authoritative settlement boundaries. Its two fixed policy labels are
 `scheduled` and `oneshot`; both series appear at zero before execution. The
 counter shares the Host's `FuelMetrics` collector and retains counts after
-Cell and executor teardown.
+Cell and executor teardown. Each Store accumulates settled amounts locally.
+Publication occurs every 256 settlements, at epoch openings, before suspension
+or exhaustion, at command completion, and on actual Store destruction.
+
+Scrapes include published amounts only. After recording, each live Store can
+hold up to 255 unpublished settlement events. This bounds events, not fuel
+units or elapsed time. An idle Store below the threshold has no wall-clock
+publication deadline. Totals are exact modulo 2^64 after all relevant Stores
+flush or complete destruction; quiescent live Stores can still hold pending
+values. Cancellation requests alone do not establish completed destruction.
+Exits without Rust destruction can lose pending values.
 
 Settlement occurs at marked host returns, confirmed fuel returns that end
 authority or open a later epoch, and successful instantiation with unsettled
@@ -408,7 +418,8 @@ RPC methods, paths, peer IDs, and CIDs do not become metric labels. Response siz
 is bounded by fixed text and integer widths, regardless of Cell churn.
 
 Collection adds atomic updates at executor admission and terminal boundaries,
-at applied fuel decisions, and at authoritative fuel settlement boundaries.
+at applied fuel decisions, and when Stores publish pending settled fuel.
+Settlements between publications update only Store-owned ordinary integers.
 Epoch notification alone does not record a fuel decision or consumption.
 The existing test-only
 `FuelObserver` remains separate from production metrics. See the

@@ -398,6 +398,66 @@ async fn cell_result(result: CellResult) -> anyhow::Result<i32> {
 }
 
 #[tokio::test]
+async fn fuel_http_pending_store_lags_until_cancelled_owner_finishes_teardown() {
+    let fuel = FuelMetrics::default();
+    let admin = Admin::with_metrics(ExecutorMetrics::default(), fuel.clone());
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let (runtime, _publisher) =
+        cell::engine::runtime_engine_with_fuel_metrics(fuel.clone()).unwrap();
+    let wasm = wat::parse_str(include_str!("fixtures/fuel-publication-component.wat")).unwrap();
+    let (builder, _handles) = cell::Builder::ordinary(
+        cell::Program::Bytes(wasm),
+        tokio::io::empty(),
+        tokio::io::sink(),
+        tokio::io::sink(),
+        support::filesystem_ownership(),
+    );
+    let proc = builder.with_runtime_engine(runtime).build().await.unwrap();
+    let task = tokio::spawn(proc.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fuel.snapshot().scheduled.grant < 9 {
+            assert!(
+                !task.is_finished(),
+                "P3 command exited before the pending wait"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("eight marked P3 returns before the pending wait");
+
+    let active = scrape(&client, &admin).await;
+    assert_eq!(active.fuel("scheduled", "grant"), 9);
+    assert_eq!(active.settled_fuel("scheduled"), 0);
+    assert_eq!(active.settled_fuel("oneshot"), 0);
+    assert!(!task.is_finished());
+    // A second scrape with no Store progress still cannot publish local state.
+    scrape(&client, &admin).await.assert_fuel_unchanged(&active);
+
+    task.abort();
+    let error = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled Store teardown deadline")
+        .expect_err("cancelled owner task");
+    assert!(error.is_cancelled());
+    let terminal = scrape(&client, &admin).await;
+    // Eight fixture returns settle 6 * 8 - 2 = 46 units. The pending
+    // wait's tail remains unsettled and contributes nothing during Drop.
+    assert_eq!(terminal.settled_fuel("scheduled"), 46);
+    assert_eq!(terminal.settled_fuel("oneshot"), 0);
+    assert_eq!(terminal.fuel("scheduled", "grant"), 9);
+    assert_eq!(terminal.fuel("scheduled", "suspend"), 0);
+    assert_eq!(terminal.fuel("scheduled", "exhausted"), 0);
+    scrape(&client, &admin)
+        .await
+        .assert_fuel_unchanged(&terminal);
+}
+
+#[tokio::test]
 async fn fuel_http_tracks_real_p3_grants_suspension_exhaustion_and_retains_history() {
     use cell::proc::{FuelEstimator, FuelObserver};
     let fuel = FuelMetrics::default();

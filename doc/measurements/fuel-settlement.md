@@ -1239,3 +1239,392 @@ Production correctness evidence and Linux ARM64 functional results remain
 preserved; this run supplies no Linux performance or x86-64 CI result.
 Stop here with the supported finding and architectural choice. Production
 acceptance and publication remain blocked.
+
+## Store-local accumulation candidate — stopped acceptance — 2026-10-28
+
+**The Store-local candidate passes functional validation but fails performance
+acceptance. Do not push, open a PR, or merge this candidate.** All six allowed
+baseline/candidate pairs completed: three initial pairs and the single declared
+unchanged-code confirmation block. No further measurement block is permitted
+under this protocol.
+
+The complete-pool one-worker scheduled-compute p95 increases **6.481886%**,
+exceeding the unchanged 5% budget. That same metric misses its budget in both
+blocks: pair 2 is +34.189387%, and pair 5 is +10.303720%. Both the pooled-miss
+rule and repeated-exception rule require stopping. The confirmation pool's
+one-worker compute median also rises 3.166325%, above 3%. These failures cannot
+be removed by pooling only favorable runs or by the marked-return result.
+
+The complete-pool four-worker marked-return median difference is **−18.953125 ns**
+per boundary relative to #769. The one-worker difference is −7.979795 ns.
+Negative differences do not establish a speedup or an architecture-independent
+bound. One initial four-worker pair still exceeds the +25 ns target. The
+original shared-counter candidate's +159.70 ns and rejected sharded candidate's
++56.533955 ns remain separate failed campaigns. The prior within-process
+diagnostic did not identify the cause of that cross-process residual; this
+campaign does not establish that cause either.
+
+### Collection and publication contract
+
+Each Store owns a non-Clone `FuelMetricsWriter` with two ordinary pending
+`u64` counters and one settlement-event count. Recording adds the authoritative
+physical delta immediately after estimator settlement and before any await.
+All settlement events count, including zero deltas. Publication occurs at
+256 events, epoch opening, before Suspend/Exhausted, command completion, and
+actual Store destruction. Pending amounts and the event count clear before
+nonzero relaxed atomic additions, so explicit flush followed by Drop cannot
+publish a prior amount twice. Moving a Store transfers pending ownership.
+
+The Host retains two settled aggregate atomics instead of 32 two-counter
+shards, a writer sequence, and a scrape-time shard fold. Scrapes perform two
+settled loads; no Store registry, Store scan, timer, or worker identity exists.
+The decision bank remains separate and #769 decision increments remain
+immediate. `FuelObserver`, authority accounting, scheduling and Wasmtime
+behavior are unchanged.
+
+After recording, each Store holds at most 255 unpublished settlement events.
+This bounds events, not fuel units or wall-clock time. Idle Stores below the
+threshold have no wall-clock publication deadline. `/metrics` reads published
+values only. Exact totals require all relevant writers to flush or complete
+actual destruction; mere quiescence or a cancellation request is insufficient.
+Local and aggregate additions wrap modulo 2^64. Concurrent series loads are
+not transactional. Exits without Rust destruction can lose pending amounts.
+Fuel left unsettled at termination remains excluded; publication does not
+invent a final settlement or debit authority again.
+
+### Fixed protocol and preserved inputs
+
+Evidence directory: `.context/fuel-store-local-20261028/`. `plan.md` declared
+the publication contract before implementation. `protocol.md` fixed the
+measurement rules before collecting any results. Independent review covered the concrete source,
+harness, validator, identities, and final assembly before timing.
+
+- Baseline: `cdf474b4cce0ed99f341d01fd6c3818f64a11d04` (#769).
+- Candidate: preserved HEAD `7f9693ee` plus the reviewed Store-local patch;
+  final candidate patch SHA-256
+  `60ee81b55ffbef692ec66ca6e628e6d03672573f4e7327dcfbb7228b06f248b4`.
+- Apple M5 Max, 18 logical CPUs, 128 GiB memory; macOS ARM64 Darwin 25.6.0.
+- Rust 1.96.0 (`ac68faa20`), LLVM 22.1.2; unchanged committed release profile,
+  resolved dependency versions, guest workloads, and source fixture bytes.
+- The original fuel harness is unchanged, SHA-256
+  `3858b61cffc9bdfb8c0d4675e6fa8a5893915d8427416f2113773c5bf078f6b8`.
+  Both baseline original-workload executables are byte-identical to historical
+  acceptance binaries. Baseline fuel SHA-256 is
+  `8446a7b90d3a281a6c484af3481f0c3e7ff89c13197eeaa70a3bb0ebea127481`;
+  candidate fuel SHA-256 is
+  `a65959c160c9cb611b54d04dec828c4900846c46a8e84d9923a593819b44fd2c`.
+- `frozen-inputs.json` binds 986 files, including source, binaries, scripts,
+  review and correctness evidence. Manifest SHA-256:
+  `b99551cd99691d20e4c7079e9119d2e4bc442692bcf373c6f542e332435e0b50`.
+  Hashes were checked before and after both blocks. Source readback matched
+  all 470 root source files. The final documentation-only rebuild produced
+  byte-identical candidate executables; prior copies and receipts are retained.
+
+Pairs 1–3 use B/C, C/B, B/C order. `confirmation-reason.md` records the initial
+compute p95, marked-return median and short-Store p95 exceptions before pairs
+4–6. Confirmation uses C/B, B/C, C/B. Every side executes original fuel, HTTP,
+then short Stores. Both blocks preserve every process exit and observation.
+No builds, tests, task-owned services, or Linux validation overlapped timing.
+Desktop activity remained uncontrolled and was recorded; no specific source
+of variation was identified.
+
+The original fuel cases retain three warmups and 31 measured samples at one
+and four workers. Four-worker marked-return latency divides slowest-worker
+elapsed by 100,000, never by all workers' combined operations. The new paired
+harness executes 64 prebuilt Stores per worker/sample, each with eight marked
+P3 clock returns. Consuming `Proc::run`, final publication, and Store destruction
+remain inside timing; construction and filesystem-completion waits remain
+outside. The new absolute budgets are +1 microsecond median and +2 microseconds
+p95 per completed Store, supplementing the original compute/I/O/HTTP budgets.
+
+Across 12 side runs/logs, retained data contain 2,976 original fuel sample
+rows, 14,400 individual HTTP scrape observations, 744 measured short-Store
+rows and 72 declared short-Store warmup rows. Short workloads complete
+130,560 Stores in total, 65,280 per side. Every short-Store group validates
+nine scheduled grants per Store and unchanged one-shot/suspend/exhausted
+counts after timing. Each candidate group contributes exactly 46 settled
+scheduled units times its completed Store count, totaling 3,002,880 across
+six candidate processes. These are group totals, not a per-Store tracer. The
+seven-unit unsettled terminal tail remains excluded. No `FuelObserver` runs
+inside timed execution. Every one-shot preflight completes with at least two
+suspensions.
+
+`analysis-three.json`, `analysis-confirmation.json`, and `analysis-six.json`
+retain per-pair, block-pool, complete-pool and individual-worker distributions.
+All statistics below use every declared measured sample and nearest-rank
+p05/p95. Each complete fuel/short pool has 186 samples per side/case; each
+complete HTTP pool has 1,200 observations per side/mode/phase.
+
+### Block pools and every exception
+
+| Pool | Case | Workers | Unit | Median delta | p95 delta | Budget exception |
+| --- | --- | --- | --- | --- | --- | --- |
+| Initial | scheduled_compute | 1 | % | +0.326966 | +8.249558 | p95 >5% |
+| Initial | scheduled_compute | 4 | % | -1.124442 | -0.257902 | — |
+| Initial | scheduled_host_boundaries | 1 | ns/boundary | -6.202500 | -5.693330 | — |
+| Initial | scheduled_host_boundaries | 4 | ns/boundary | -10.039170 | +14.089170 | — |
+| Initial | short_store | 1 | us/Store | -0.770828 | -3.532547 | — |
+| Initial | short_store | 4 | us/Store | -1.033203 | +0.029297 | — |
+| Confirmation | scheduled_compute | 1 | % | +3.166325 | -0.492905 | median >3% |
+| Confirmation | scheduled_compute | 4 | % | +0.386652 | -2.326312 | — |
+| Confirmation | scheduled_host_boundaries | 1 | ns/boundary | -10.795840 | -21.275000 | — |
+| Confirmation | scheduled_host_boundaries | 4 | ns/boundary | -23.359580 | +35.635830 | — |
+| Confirmation | short_store | 1 | us/Store | +0.092453 | +1.180984 | — |
+| Confirmation | short_store | 4 | us/Store | -0.554688 | -5.714844 | — |
+| Complete | scheduled_compute | 1 | % | +1.087521 | +6.481886 | p95 >5% |
+| Complete | scheduled_compute | 4 | % | -0.839899 | -1.147048 | — |
+| Complete | scheduled_host_boundaries | 1 | ns/boundary | -7.979795 | -12.933330 | — |
+| Complete | scheduled_host_boundaries | 4 | ns/boundary | -18.953125 | +23.542910 | — |
+| Complete | short_store | 1 | us/Store | -0.213859 | -1.431000 | — |
+| Complete | short_store | 4 | us/Store | -0.730148 | -2.714844 | — |
+
+Every individual exception is retained below. No unfavorable pair was discarded.
+Absolute ns deltas use each case’s operation: one guest-loop iteration for
+compute, one marked return, one completed short Store, or one HTTP scrape.
+
+| Pair | Case | Workers | Median delta | p95 delta | Exception |
+| --- | --- | --- | --- | --- | --- |
+| 2 | scheduled_compute | 1 | +2.671568% / +0.191865 ns | +34.189387% / +2.519583 ns | p95 >5% |
+| 2 | scheduled_host_boundaries | 4 | +8.488040% / +33.729170 ns | +4.156743% / +21.532500 ns | median >25 ns per boundary |
+| 3 | short_store | 4 | +0.437125% / +87.234375 ns | +19.685408% / +4580.062500 ns | p95 >2000 ns per Store |
+| 5 | scheduled_compute | 1 | +5.981527% / +0.410812 ns | +10.303720% / +0.751406 ns | median >3%; p95 >5% |
+| 6 | http:enabled:before_compile | 0 | +27.528222% / +22166.000000 ns | +20.080934% / +20792.000000 ns | p95 >20000 ns |
+
+### Every original fuel pair
+
+Compute and I/O columns are percentage changes. Marked-return columns are
+added ns per boundary. One-shot latency remains diagnostic, without a new
+latency cap. Per-worker distributions and absolute values remain in the JSON
+analysis; four-worker tables use the slowest worker.
+
+| Pair | Case | Workers | Median delta % | p95 delta % | Median added ns/op | p95 added ns/op |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | oneshot_suspend_resume | 1 | +2.362088 | -1.267107 | +683.145500 | -393.437500 |
+| 1 | oneshot_suspend_resume | 4 | -1.388115 | +0.927764 | -406.271500 | +282.208500 |
+| 1 | scheduled_compute | 1 | -1.361568 | -5.683824 | -0.099865 | -0.453813 |
+| 1 | scheduled_compute | 4 | -0.846436 | +0.312074 | -0.066177 | +0.024792 |
+| 1 | scheduled_host_boundaries | 1 | -3.276631 | +8.751315 | -8.080840 | +22.894170 |
+| 1 | scheduled_host_boundaries | 4 | +4.714560 | +13.681536 | +19.816670 | +67.537930 |
+| 1 | scheduled_io | 1 | +0.035656 | -0.098128 | +410.125000 | -1139.343750 |
+| 1 | scheduled_io | 4 | +0.002605 | +0.028072 | +29.937500 | +325.531250 |
+| 2 | oneshot_suspend_resume | 1 | +0.226421 | +2.033373 | +66.541500 | +618.270500 |
+| 2 | oneshot_suspend_resume | 4 | +0.103874 | -0.260898 | +30.104000 | -80.062500 |
+| 2 | scheduled_compute | 1 | +2.671568 | +34.189387 | +0.191865 | +2.519583 |
+| 2 | scheduled_compute | 4 | -1.446500 | +0.627784 | -0.114531 | +0.050333 |
+| 2 | scheduled_host_boundaries | 1 | -1.866610 | -1.186342 | -4.434590 | -2.945840 |
+| 2 | scheduled_host_boundaries | 4 | +8.488040 | +4.156743 | +33.729170 | +21.532500 |
+| 2 | scheduled_io | 1 | +0.321000 | +0.545948 | +3666.687500 | +6311.187500 |
+| 2 | scheduled_io | 4 | -1.048398 | -0.036054 | -12052.062500 | -416.656250 |
+| 3 | oneshot_suspend_resume | 1 | -0.096352 | +1.021100 | -27.958500 | +309.625000 |
+| 3 | oneshot_suspend_resume | 4 | +0.520157 | +2.750282 | +148.396000 | +816.333500 |
+| 3 | scheduled_compute | 1 | +0.068860 | +0.017412 | +0.005021 | +0.001312 |
+| 3 | scheduled_compute | 4 | -0.883446 | -1.816016 | -0.069677 | -0.147677 |
+| 3 | scheduled_host_boundaries | 1 | -1.187428 | -2.046383 | -2.906660 | -5.223750 |
+| 3 | scheduled_host_boundaries | 4 | -13.591737 | -24.987577 | -58.307080 | -133.467500 |
+| 3 | scheduled_io | 1 | +0.025475 | +0.054691 | +293.000000 | +631.500000 |
+| 3 | scheduled_io | 4 | +0.223708 | +2.909693 | +2563.812500 | +33556.000000 |
+| 4 | oneshot_suspend_resume | 1 | +0.224737 | +0.433927 | +65.729000 | +132.750500 |
+| 4 | oneshot_suspend_resume | 4 | +0.342267 | -1.138762 | +98.396000 | -348.812500 |
+| 4 | scheduled_compute | 1 | -0.675266 | +1.548062 | -0.045688 | +0.108625 |
+| 4 | scheduled_compute | 4 | +1.537629 | -0.800767 | +0.115896 | -0.063364 |
+| 4 | scheduled_host_boundaries | 1 | -2.309183 | -15.806838 | -5.822500 | -47.297090 |
+| 4 | scheduled_host_boundaries | 4 | -6.910897 | +19.086588 | -28.259580 | +86.385420 |
+| 4 | scheduled_io | 1 | +0.031283 | -2.137092 | +358.093750 | -25173.187500 |
+| 4 | scheduled_io | 4 | -0.085741 | +0.444234 | -981.781250 | +5141.906250 |
+| 5 | oneshot_suspend_resume | 1 | +0.448016 | +0.165993 | +131.646000 | +50.875000 |
+| 5 | oneshot_suspend_resume | 4 | -1.743754 | +1.849559 | -510.166500 | +558.895500 |
+| 5 | scheduled_compute | 1 | +5.981527 | +10.303720 | +0.410812 | +0.751406 |
+| 5 | scheduled_compute | 4 | -0.151237 | -11.063887 | -0.011740 | -0.989448 |
+| 5 | scheduled_host_boundaries | 1 | -8.689411 | -7.465785 | -22.503330 | -20.385420 |
+| 5 | scheduled_host_boundaries | 4 | -6.702615 | +1.767061 | -28.552080 | +9.405830 |
+| 5 | scheduled_io | 1 | +0.215596 | +0.231840 | +2472.625000 | +2680.968750 |
+| 5 | scheduled_io | 4 | +0.249221 | +0.180930 | +2854.156250 | +2096.343750 |
+| 6 | oneshot_suspend_resume | 1 | -1.745712 | +0.838140 | -516.000500 | +257.896000 |
+| 6 | oneshot_suspend_resume | 4 | +0.443550 | -1.176472 | +127.458500 | -359.937000 |
+| 6 | scheduled_compute | 1 | -1.121623 | -6.075028 | -0.082240 | -0.482854 |
+| 6 | scheduled_compute | 4 | -0.128347 | +1.476837 | -0.009969 | +0.116958 |
+| 6 | scheduled_host_boundaries | 1 | -1.684909 | -1.951404 | -4.086670 | -4.956250 |
+| 6 | scheduled_host_boundaries | 4 | -5.702563 | +6.041208 | -20.982080 | +24.593330 |
+| 6 | scheduled_io | 1 | +0.067892 | -0.115341 | +779.937500 | -1335.937500 |
+| 6 | scheduled_io | 4 | -0.002382 | -0.306543 | -27.343750 | -3549.468750 |
+
+### Complete original fuel pools
+
+All entries are ns per operation, using each workload’s declared operation count.
+
+| Case | Workers | Baseline median [p05, p95] | Candidate median [p05, p95] |
+| --- | --- | --- | --- |
+| oneshot_suspend_resume | 1 | 29252.177000 [27231.521000, 30648.833500] | 29331.437500 [27693.937500, 30812.041500] |
+| oneshot_suspend_resume | 4 | 28914.864500 [26937.541500, 30317.271000] | 28853.333250 [26986.395500, 30579.104500] |
+| scheduled_compute | 1 | 7.165094 [6.618437, 7.508104] | 7.243016 [6.655198, 7.994771] |
+| scheduled_compute | 4 | 7.832667 [7.455552, 8.076906] | 7.766880 [7.486031, 7.984260] |
+| scheduled_host_boundaries | 1 | 247.292710 [235.287500, 264.045830] | 239.312915 [230.370410, 251.112500] |
+| scheduled_host_boundaries | 4 | 403.035415 [353.942920, 516.003340] | 384.082290 [341.593330, 539.546250] |
+| scheduled_io | 1 | 1147206.375000 [1111113.281250, 1158109.375000] | 1148314.468750 [1111278.625000, 1159067.687500] |
+| scheduled_io | 4 | 1146891.921875 [1137856.781250, 1157901.031250] | 1146763.687500 [1135554.687500, 1159964.843750] |
+
+### Short-lived Stores: completion and destruction included
+
+Deltas are microseconds per Store. The percentage columns remain descriptive.
+
+| Pair/pool | Workers | Baseline median us | Candidate median us | Added median us | Added p95 us | Median % | p95 % |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 13.677078 | 13.617188 | -0.059891 | +1.057937 | -0.437890 | +7.167393 |
+| 1 | 4 | 20.460281 | 19.562500 | -0.897781 | +0.651031 | -4.387922 | +2.860856 |
+| 2 | 1 | 14.992844 | 13.373047 | -1.619797 | -3.730469 | -10.803800 | -18.773964 |
+| 2 | 4 | 22.174484 | 19.193359 | -2.981125 | -8.080719 | -13.443943 | -28.372843 |
+| 3 | 1 | 15.131516 | 13.843094 | -1.288422 | -5.335281 | -8.514824 | -24.548405 |
+| 3 | 4 | 19.956375 | 20.043609 | +0.087234 | +4.580063 | +0.437125 | +19.685408 |
+| 4 | 1 | 14.063797 | 14.205734 | +0.141937 | +1.018891 | +1.009240 | +6.307498 |
+| 4 | 4 | 20.125641 | 20.433594 | +0.307953 | -6.771469 | +1.530153 | -20.771217 |
+| 5 | 1 | 13.572266 | 13.746094 | +0.173828 | -0.153641 | +1.280760 | -0.992105 |
+| 5 | 4 | 19.724609 | 19.154953 | -0.569656 | -1.244125 | -2.888048 | -5.399460 |
+| 6 | 1 | 12.964844 | 13.243484 | +0.278641 | -0.172531 | +2.149202 | -1.148763 |
+| 6 | 4 | 19.833344 | 18.818359 | -1.014984 | -4.320969 | -5.117566 | -17.118489 |
+| pooled | 1 | 13.881508 | 13.667648 | -0.213859 | -1.431000 | -1.540606 | -8.026052 |
+| pooled | 4 | 20.242516 | 19.512367 | -0.730148 | -2.714844 | -3.607004 | -10.392784 |
+
+### Every HTTP pair and complete pools
+
+All 36 pair/mode/phase comparisons add **349 response bytes**, below the
+512-byte cap. Added p95 is in microseconds; the cap is +20 microseconds.
+Pair 6 enabled/before-compile is +20.792 microseconds and remains an exception.
+All complete HTTP pools remain inside the p95 budget.
+
+| Pair/pool | Mode/phase | Baseline p95 us | Candidate p95 us | Added p95 us |
+| --- | --- | --- | --- | --- |
+| 1 | disabled:after_compile | 63.917 | 54.125 | -9.792 |
+| 1 | disabled:before_compile | 70.333 | 74.417 | +4.084 |
+| 1 | enabled:after_compile | 100.500 | 94.583 | -5.917 |
+| 1 | enabled:before_compile | 133.917 | 134.167 | +0.250 |
+| 1 | fallback:after_compile | 52.250 | 49.375 | -2.875 |
+| 1 | fallback:before_compile | 72.000 | 61.667 | -10.333 |
+| 2 | disabled:after_compile | 55.583 | 64.167 | +8.584 |
+| 2 | disabled:before_compile | 67.833 | 71.708 | +3.875 |
+| 2 | enabled:after_compile | 82.166 | 86.000 | +3.834 |
+| 2 | enabled:before_compile | 100.125 | 103.834 | +3.709 |
+| 2 | fallback:after_compile | 83.000 | 49.208 | -33.792 |
+| 2 | fallback:before_compile | 64.667 | 61.458 | -3.209 |
+| 3 | disabled:after_compile | 64.709 | 54.833 | -9.876 |
+| 3 | disabled:before_compile | 66.958 | 63.875 | -3.083 |
+| 3 | enabled:after_compile | 88.667 | 91.250 | +2.583 |
+| 3 | enabled:before_compile | 127.042 | 116.291 | -10.751 |
+| 3 | fallback:after_compile | 56.542 | 47.041 | -9.501 |
+| 3 | fallback:before_compile | 65.208 | 58.625 | -6.583 |
+| 4 | disabled:after_compile | 51.125 | 51.291 | +0.166 |
+| 4 | disabled:before_compile | 79.667 | 82.000 | +2.333 |
+| 4 | enabled:after_compile | 81.292 | 85.959 | +4.667 |
+| 4 | enabled:before_compile | 110.125 | 98.625 | -11.500 |
+| 4 | fallback:after_compile | 69.000 | 56.916 | -12.084 |
+| 4 | fallback:before_compile | 64.666 | 65.667 | +1.001 |
+| 5 | disabled:after_compile | 58.167 | 66.750 | +8.583 |
+| 5 | disabled:before_compile | 74.333 | 74.375 | +0.042 |
+| 5 | enabled:after_compile | 102.750 | 91.458 | -11.292 |
+| 5 | enabled:before_compile | 121.417 | 126.167 | +4.750 |
+| 5 | fallback:after_compile | 50.500 | 49.417 | -1.083 |
+| 5 | fallback:before_compile | 57.542 | 60.791 | +3.249 |
+| 6 | disabled:after_compile | 56.958 | 54.958 | -2.000 |
+| 6 | disabled:before_compile | 93.500 | 76.042 | -17.458 |
+| 6 | enabled:after_compile | 101.250 | 93.000 | -8.250 |
+| 6 | enabled:before_compile | 103.541 | 124.333 | +20.792 |
+| 6 | fallback:after_compile | 49.667 | 48.917 | -0.750 |
+| 6 | fallback:before_compile | 62.916 | 63.417 | +0.501 |
+| pooled | disabled:after_compile | 59.292 | 60.000 | +0.708 |
+| pooled | disabled:before_compile | 80.625 | 74.417 | -6.208 |
+| pooled | enabled:after_compile | 100.791 | 91.792 | -8.999 |
+| pooled | enabled:before_compile | 124.209 | 125.459 | +1.250 |
+| pooled | fallback:after_compile | 60.916 | 49.875 | -11.041 |
+| pooled | fallback:before_compile | 64.666 | 62.333 | -2.333 |
+
+### Generated hot-path work
+
+Independent disassembly compares the retained final ARM64 executables. The
+candidate inserts 14 caller instructions between `settle_and_decide` and the
+existing epoch bookkeeping: six ordinary loads, two ordinary stores, three
+adds, one compare, one conditional branch, and one `data_mut` call. That
+callee is a single `ret`, so the extra call/return pair is real.
+`record_settled` is inlined and its per-event window contains no settled
+atomic, shard lookup, allocation, lock, or timestamp.
+
+The common no-new-epoch path in `open_latest_epoch` also adds one register-pair
+save, one restore, and one MOV; its frame grows from 32 to 48 bytes. These
+extra instructions remain part of the candidate. The threshold branch reaches
+an outlined helper and bounded two-policy `flush` loop. Flush copies and clears
+pending values/count, then uses relaxed `LDADD` for each nonzero policy sum.
+A single-policy Store normally publishes one atomic amount. Empty completion-
+then-Drop flushes still incur bounded stack/loop work but no second settled
+atomic. Store Drop flushes before releasing the collector Arc. The unchanged
+#769 grant `LDADD` remains on each applied grant. No latency is assigned to an
+individual instruction; instruction inspection is not a causal diagnosis of
+the compute p95 result.
+
+### Correctness, independent reviews, portability, and stopped landing
+
+The first local-publication regression test failed against the old writer
+(expected published zero, observed seven), then passed with Store-local
+accumulation. All six collector tests pass: threshold edges including zero
+deltas, policy attribution, flush/Drop, moved ownership/retention, colliding
+writers/concurrent snapshots, and local/shared wrapping with zero wrapped sum.
+Existing ledger-conservation, partial-grant, reserve-overshoot, epoch-coalescing,
+suspension, error, and unsettled-tail tests remain intact or explicitly assert
+the new live-lag/post-Drop distinction.
+
+Four new publication tests pass. Three execute real P3 imports and cover both
+policies waiting after eight committed returns, actual-owner cancellation,
+successful completion, command trap, and failed instantiation after real
+settlement. The fourth moves an actual Store with committed pending values. The command
+fixture settles 46 units; the executable-start variant settles 48. The initial
+incorrect shared 46-unit expectation and its diagnostic remain preserved;
+the corrected test pins the entry-specific first delta and the remaining
+six-unit deltas.
+An actual `/metrics` HTTP test observes nine applied grants with zero published
+settled fuel while a Store waits, observes zero again while idle, aborts and
+awaits its owner, then observes exactly 46 settled units with unchanged decision
+counts. Existing real Host/PID0, runtime-child, ExecutorPool and Wasmtime
+metric tests remain exercised. A fresh real Host/PID0 status request observes
+scheduled published fuel rising from zero before boot to 930,963, alongside
+25 scheduled grants, two component compilations, and one occupied executor
+slot. This is live published fuel, not an exact total of all live Store work.
+
+macOS normal CI-profile validation passed **1,343 workspace tests, zero failed,
+24 ignored**, across 54 executable/doc-test groups. Six normally ignored
+native P3 tests passed explicitly. All 13 validation steps exited zero,
+including strict workspace/all-target Clippy, tracked lockfile checks and
+regression tests, four formatting checks, and `git diff --check`. Required
+Kubo/guest fixtures were present; no prerequisite skip counted as passing.
+The matching fresh debug Host included PID0 race hooks. Raw logs and exact
+counts are in `correctness/`.
+
+Changed-design Linux ARM64 validation passed all five functional groups:
+62 fuel, six collector, two start-function, six explicit native P3, and eight
+HTTP tests, plus three nested HTTP probes. All 476 captured source/fixture
+hashes matched before and after execution. This was OrbStack on the same Apple
+CPU, Rust/Cargo 1.96.1 and LLVM 22.1.2. It establishes functional portability,
+not independent native Linux performance. The container and local Kubo peers
+were stopped after validation. Linux x86-64 CI was not run because performance
+acceptance failed and no PR was opened. Normal required Linux x86-64 CI would
+still be required before any future merge.
+
+`design-review.md` independently assessed ownership/lifecycle before code.
+`implementation-review.md`, `precollection-review.md`, and `assembly-review.md`
+checked final source, coverage, freshness, arithmetic, bounded memory, scrape
+behavior, portability, protocol and generated work. Two current-documentation
+findings and validator receipt checks were resolved before timing. A two-line
+Rust documentation correction after functional validation changes no runtime
+code; its reverse hash check is retained, and release executables rebuilt
+against that final source are byte-identical to the earlier copies.
+
+The final independent review recomputes raw distributions rather than trusting
+the reporting script. Both protocol stop conditions apply to one-worker
+compute p95. `independent-initial-result-check.json`,
+`independent-final-result-check.json`, and `results-review.md` retain that audit.
+No unresolved counting defect was found, but the performance gate remains
+failed. The candidate and all evidence are preserved locally. There is no push,
+PR, merge identifier, deployment, or release promotion for this campaign.
+
+Follow-up: investigate the recurring compute-tail regression in a separately
+authorized bounded experiment. The observed instruction differences are
+concrete investigation inputs, not an established cause. Batching #769 decision
+counters requires a separate live-visibility contract and acceptance review.
+Sample expensive diagnostics separately, before timestamp/payload creation,
+with bounded buffers; keep cumulative settled-fuel totals exact.

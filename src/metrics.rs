@@ -134,7 +134,7 @@ fn render_fuel_metrics(out: &mut String, metrics: &FuelMetrics) {
             .unwrap();
         }
     }
-    out.push_str("# HELP ww_fuel_settled_units_total Physical fuel units accounted for at settlement boundaries over this Host lifetime; excludes unsettled termination tails.\n");
+    out.push_str("# HELP ww_fuel_settled_units_total Published physical fuel units accounted for at settlement boundaries over this Host lifetime; live Stores can have unpublished values; excludes unsettled termination tails.\n");
     out.push_str("# TYPE ww_fuel_settled_units_total counter\n");
     for (policy, value) in [
         ("scheduled", snapshot.scheduled_settled_units),
