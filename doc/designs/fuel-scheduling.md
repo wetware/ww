@@ -419,6 +419,49 @@ The candidate remains unaccepted despite passing local correctness. The
 remaining concurrent overhead has not been assigned to a specific hardware
 mechanism. No further acceptance runs or merge follow this stopped result.
 
+### Proposed publication model after the recording diagnostic
+
+The subsequent authorized within-process diagnostic did not reproduce the
+56.53 ns residual. Four-worker enabled-minus-disabled cycle median contrasts
+were −0.505200 ns and −0.596665 ns. The
+[diagnostic report](../measurements/fuel-settlement.md#within-process-recording-diagnostic--2026-10-28)
+records all observations, order variation, exact-count checks, and the unmeasured
+production caller differences. Production acceptance remains failed.
+
+The next proposed architecture uses exact Store-local ordinary integer counters
+with bounded publication into the existing Host aggregate. This proposal follows
+the preference to avoid shared atomics at every boundary; the diagnostic did
+not prove that batching would fix the residual. No batching implementation exists
+in this candidate.
+
+Keep the Host collector cloneable and give `ComponentRunStates` a unique,
+non-Clone owner for pending counts. Record each consumed amount after ledger
+settlement and before any await. Publish at a predefined count threshold, reuse
+existing epoch/terminal boundaries where applicable, and flush the remainder
+when the Store is destroyed. An explicit flush followed by `Drop` must publish
+each amount once. Preserve wrapping totals, policy attribution, and exclusion
+of unsettled terminal fuel.
+
+This model changes visibility: an ordinary scrape can omit pending counts from
+an active or idle Store. Quiescent writers alone no longer imply an exact
+aggregate; exactness requires a flush or Store destruction. A count threshold
+does not bound wall-time staleness for an idle Store. Specify that contract
+before implementation; do not silently weaken current snapshot assertions.
+Scrapes would continue reading the fixed atomic aggregate without scanning
+Stores or accessing their mutable pending counters.
+
+Batching settlement alone leaves the existing shared grant atomic on each grant.
+Removing all such boundary atomics would also require local decision counters
+and an explicit change to #769's publication freshness. Store ownership covers
+more execution paths than per-worker ownership and reuses existing teardown.
+Keep cumulative fuel exact; sample expensive distributions, traces, and detailed
+diagnostics separately, with bounded storage and payload construction after the
+sampling decision. Validate disabled-path work before claiming negligible cost.
+
+The measurement report specifies cancellation, flush, memory, freshness, and
+portability checks required for a later prototype. None of those future changes
+or measurements is authorized by the completed diagnostic.
+
 ## Constants
 
 | Name | Value | Rationale |

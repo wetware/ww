@@ -12,9 +12,12 @@ shards. Corrected macOS CI-profile validation passed, including the full workspa
 the previously failing PID0 test, focused tests, and strict Clippy. The earlier
 release-profile failure remains recorded below. Final acceptance stopped:
 the corrected candidate adds 56.533955 ns per four-worker marked return in the
-six-pair pool, above the 25 ns quality target. No further runs or merge follow.
+six-pair pool, above the 25 ns quality target. No further acceptance runs or
+merge follow.
 Linux ARM64 functional validation passed. Linux x86-64 CI was not run because
-publication is blocked. All earlier measurements remain historical evidence.
+publication is blocked. A subsequently authorized within-process diagnostic did
+not reproduce the residual; its scope and limits are recorded at the end of this
+report. All earlier measurements remain historical evidence.
 
 ## Acceptance budget, fixed before measurement
 
@@ -960,3 +963,279 @@ acceptance. The single permitted confirmation block is complete; further runs
 are not authorized by this protocol. Publication remains blocked. Linux x86-64
 CI was not executed, and no independent Linux performance claim is made.
 OrbStack ARM64 functional results remain valid within their stated limits.
+
+
+## Within-process recording diagnostic — 2026-10-28
+
+The single authorized collection did **not reproduce the +56.533955 ns
+four-worker residual**. Enabled-minus-disabled slowest-worker median contrasts
+were **−0.505200 ns** and **−0.596665 ns** in the two ABBA cycles. Single-worker
+contrasts were −0.058550 ns and +2.578755 ns. Every individual four-worker cycle
+median contrast lies between −1.359370 ns and +2.921880 ns. The predeclared
+stable/substantial criterion was not met. This does not establish zero recording
+cost, a speedup, a small upper bound, or successful production acceptance.
+
+The original acceptance failure, all six pairs, and both historical and current
+thresholds remain unchanged. This subsequent diagnostic had separate authority
+and did not reopen acceptance. No repeat collection, production modification,
+PMU access, push, PR, merge, or deployment followed.
+
+### Design, frozen inputs, and measurement scope
+
+Evidence is under
+`.context/fuel-settlement-resume/recording-diagnostic-20261028/`.
+The isolated checkout starts at `dea81f4758ab6ae59020e4bce8533d5fd91d254f`.
+The production candidate and original acceptance harness stayed unchanged.
+A separate diagnostic test copied the original harness byte-for-byte, including
+its 100,000-return WAT fixture, then added the comparison entry point.
+
+The design, analyzer, launcher, source patch, executable, and review were frozen
+at 13:50:52 UTC before the sole execution. All **482 frozen input hashes** matched
+after execution. The child exited with status zero. Rust remained 1.96.0,
+LLVM 22.1.2, with the original release profile on the same Apple M5 Max/macOS
+machine. Environment receipts record 18 logical CPUs, 128 GiB memory, and a
+128-byte cache line. No thermal/performance warning was recorded. Desktop
+applications remained active; neither their absence nor a causal explanation
+from their activity is established.
+
+Binary SHA-256:
+`96dcfe106b5f50400941fcf99ecd088fee263040037888f4a41f272c0834543d`.
+Raw-log SHA-256:
+`069f9351f8460652ebadd55b236ff9cd1eab025d83f4af3fa6c5146495318507`.
+
+One process compiled the common guest once. One RuntimeEngine, Host collector,
+and real 10 ms epoch publisher served both groups. Four persistent OS threads
+and their current-thread Tokio runtimes completed eight ABBAABBA batches first;
+a one-worker control then completed the same sequence. A means recording
+enabled; B means disabled. Every batch retained three warmups and 31 measured
+samples. Mode selection occurred during untimed Store preparation.
+
+Each worker retained one writer/shard across all batches. Fresh Stores received
+that same worker's retained writer before timing, preserving the consuming
+`Proc::run` lifecycle rather than reusing guest state. The diagnostic used a
+borrowed execution entry point with the original command body so that terminal
+state could be read after timing. It excluded terminal snapshots, Store
+destruction, and filesystem cleanup from the interval. The original acceptance
+interval included Store destruction. No FuelObserver ran in timed execution.
+
+All **544 sample rows** and **1,360 worker observations** remain available:
+496 measured rows plus 48 predefined warmup rows. Each worker and slowest-worker
+observation uses elapsed nanoseconds divided by 100,000, not aggregate throughput.
+Medians and nearest-rank p05/p95 use all declared measured samples. No measured
+sample was discarded. `protocol.md`, `frozen-inputs.json`, `diagnostic.patch`,
+`run_once.py`, `analysis.py`, `run.log`, and `analysis.json` retain the full method.
+
+### Cycle contrasts and individual workers
+
+Each contrast is the arithmetic mean of the two A batch statistics minus the
+mean of the two B batch statistics in that cycle. Values are ns per boundary.
+These are differences of batch statistics, not paired per-instruction latencies.
+
+| Workers | Cycle | Lane | Added median ns | Added p95 ns |
+| --- | --- | --- | ---: | ---: |
+| 4 | 1 | slowest | -0.505200 | -111.015835 |
+| 4 | 1 | worker_0 | +0.410205 | -102.365625 |
+| 4 | 1 | worker_1 | -0.406660 | -105.922505 |
+| 4 | 1 | worker_2 | +1.580000 | -112.345630 |
+| 4 | 1 | worker_3 | +2.921880 | -109.197290 |
+| 4 | 2 | slowest | -0.596665 | -28.483960 |
+| 4 | 2 | worker_0 | +0.485200 | -28.883335 |
+| 4 | 2 | worker_1 | +0.143955 | -17.468335 |
+| 4 | 2 | worker_2 | -1.359370 | -13.524375 |
+| 4 | 2 | worker_3 | +1.501450 | -19.965625 |
+| 1 | 1 | slowest | -0.058550 | -36.532500 |
+| 1 | 1 | worker_0 | -0.058550 | -36.532500 |
+| 1 | 2 | slowest | +2.578755 | +2.075210 |
+| 1 | 2 | worker_0 | +2.578755 | +2.075210 |
+
+### Every batch and order effects
+
+Values are slowest-worker median [p05, p95] in ns per boundary. The last column
+subtracts the first 15 measured samples' median from the last 16 samples' median.
+Full per-worker batch distributions remain in `analysis.json`.
+
+| Workers | Batch | Mode | Median [p05, p95] | Within-batch median drift ns |
+| --- | --- | --- | ---: | ---: |
+| 4 | 1 | A: enabled | 425.693340 [365.756670, 473.339170] | -0.089590 |
+| 4 | 2 | B: disabled | 399.299580 [350.192080, 534.594170] | +7.987080 |
+| 4 | 3 | B: disabled | 388.503750 [346.871670, 533.213750] | -38.478550 |
+| 4 | 4 | A: enabled | 361.099590 [346.965420, 372.437080] | +3.429170 |
+| 4 | 5 | A: enabled | 347.410420 [336.895420, 376.196660] | -2.430415 |
+| 4 | 6 | B: disabled | 350.874170 [330.215420, 499.148750] | +65.670420 |
+| 4 | 7 | B: disabled | 373.464160 [337.142500, 444.731250] | +16.943745 |
+| 4 | 8 | A: enabled | 375.734580 [347.283750, 510.715420] | -72.472075 |
+| 1 | 1 | A: enabled | 248.987910 [243.750420, 271.671250] | +2.713130 |
+| 1 | 2 | B: disabled | 248.414170 [241.972080, 258.571250] | -6.092505 |
+| 1 | 3 | B: disabled | 257.678340 [248.887920, 378.812920] | +7.767925 |
+| 1 | 4 | A: enabled | 256.987500 [245.590840, 292.647920] | +11.179995 |
+| 1 | 5 | A: enabled | 268.578750 [249.722500, 299.258750] | +1.576875 |
+| 1 | 6 | B: disabled | 257.209580 [243.257090, 279.566670] | -7.281455 |
+| 1 | 7 | B: disabled | 257.057500 [243.511250, 279.006250] | -8.535420 |
+| 1 | 8 | A: enabled | 250.845840 [241.016670, 263.464590] | -5.950415 |
+
+Four-worker A-end minus A-start median changes are −64.593750 ns in cycle 1
+and +28.324160 ns in cycle 2. Adjacent B-batch changes are −10.795830 ns and
++22.589990 ns. Within-batch changes reach −72.472075 ns and +65.670420 ns.
+The same-mode drift is much larger than the approximately −0.5 ns cycle contrast.
+ABBA balances approximately linear drift; it cannot remove arbitrary temporal
+variation. The data do not identify CPU placement, frequency, desktop activity,
+or a particular hardware event as the cause of that variation.
+
+One-worker A-end changes are +7.999590 ns and −17.732910 ns; adjacent B changes
+are +9.264170 ns and −0.152080 ns. The control follows the four-worker group,
+so cross-worker-count comparisons are descriptive rather than simultaneous
+controls for machine state.
+
+The pooled four-worker slowest median is 366.203130 ns enabled versus
+382.595625 ns disabled, a −16.392495 ns difference. Pooled p95 is
+480.832080 versus 483.533750 ns, a −2.701670 ns difference. The one-worker pool
+is 253.104370 versus 254.693125 ns, a −1.588755 ns median difference; pooled p95
+is 285.070830 versus 293.437500 ns, a −8.366670 ns difference. Each pooled mode
+contains 124 measured samples. Pooling is descriptive and cannot override the
+cycle results or convert the negative difference into evidence of a speedup.
+
+### Exact work, settlement, and authority checks
+
+Every execution completed the identical finite guest and preserved the same
+semantic terminal state. Each batch's existing decision counter reported exactly
+100,001 grants multiplied by completed runs. The unchanged fixture and source
+imply one initial grant plus one grant for each of 100,000 marked-return
+settlements per run. Per-Store grant counts were not measured independently;
+no separate timed per-boundary tracer was added.
+
+Every enabled run added exactly 599,998 scheduled settled units to its retained
+shard. Every disabled run added zero. All 16 batch aggregates matched the
+corresponding expected sums, including warmups. Four-worker batches had
+13,600,136 grants and either 81,599,728 settled units or zero. One-worker batches
+had 3,400,034 grants and either 20,399,932 settled units or zero. Across the
+collection, grants totaled 136,001,360 and published settled units totaled
+407,998,640. All suspend, exhausted, and one-shot changes were zero.
+
+All 1,360 terminal snapshots agreed on these semantic fields: installed physical
+fuel 20,000,000; remaining physical fuel 19,999,993; authority grant and quantum
+10,000,000; next yield remaining 19,990,000; EWMA ratio zero; initialized true;
+minimum/maximum quantum 10,000/10,000,000; decision `Grant(10000000)`; no pending
+return from an epoch callback; and `None` for cumulative authority, epoch
+allowance, and epoch limit. The seven-unit unsettled terminal tail remained
+excluded in both modes. This validates scheduled-policy outcomes for this
+fixture, not general one-shot, failure, or cancellation behavior.
+
+Writer addresses and thread identities stayed fixed within each group. The
+four retained destinations occupied distinct 128-byte blocks, separate from
+the shared decision bank. Epoch sequence, pending epoch, and calls since the
+last opened epoch were retained but excluded from semantic equality as declared
+before collection. A wall-clock publisher can place transitions at different
+instructions without changing this scheduled policy's absent authority ledgers.
+
+### Generated code and the cross-process discrepancy
+
+The diagnostic has one compiled `record_settled` routine and one caller in the
+host-return hook. After `settle_and_decide`, both modes call the routine. The
+routine checks consumed units, loads/tests the immutable bool, and returns
+immediately when disabled. Enabled execution additionally loads the shard and
+collector, checks the shard bound, computes the address, and executes
+`LDADD x2, x8, [x8]`. The relaxed atomic returns into `x8`, not the zero register.
+`assembly-review.md`, `caller-assembly.txt`, and `record-settled-assembly.txt`
+record the exact instructions.
+
+The enabled/disabled comparison isolates that conditional body and its
+interactions. It does not measure common call/argument/guard costs, isolate an
+atomic instruction's latency, or identify a coherence mechanism. The bool also
+changes the handle/Store-state layout relative to production, and the compiler
+passes a handle pointer instead of the production leaf's scalar arguments.
+
+Read-only comparison of the retained acceptance binaries found an additional
+concrete difference. The production candidate calls an outlined helper at
+`0x100097aa4` before calling `record_settled` at `0x100097aa8`. That helper loads
+the collector and shard into `x0` and `x1`, then returns. The baseline has neither
+recording call nor helper call. The diagnostic passes the handle directly and
+loads those fields only inside its enabled path. Therefore, the current contrast
+does not measure the production helper-call cost. The caller extracts and
+`instrumented-caller-outlined-load.txt` retain this finding; no latency has been
+assigned to the helper, and it is not a proven explanation of 56.53 ns.
+
+Other observed design differences remain: the original acceptance used two
+binaries/processes, rotated Store assignments through 32 shards, created worker
+threads for each 34-sample case, ran preceding workload cases, and included
+Store destruction. The diagnostic used one common binary/process, four reused
+destinations, longer-lived workers, only the boundary fixture, and untimed
+Store destruction. No additional experiment separated these effects. The
+within-process result narrows the claim: a stable large cost from executing the
+conditional recording body was not demonstrated under these controlled
+conditions. It cannot resolve the original whole-implementation regression.
+
+### Next engineering choice: exact Store-local counters with bounded publication
+
+Recommend specifying an exact Store-owned writer with ordinary integer updates
+and bounded publication into the existing Host aggregate as the next architecture
+candidate. This follows the user's low-overhead preference and existing ownership,
+not a claim that this experiment proved batching will fix the residual. Do not
+implement batching as an established remedy for the failed acceptance result.
+
+`ComponentRunStates` already owns both `FuelEstimator` and the metric handle.
+Settlement has exclusive Store access. Keep the shared collector cloneable, but
+make the Store's pending-counter owner non-Clone. Add each authoritative consumed
+amount once, immediately after ledger settlement and before any await, using
+wrapping ordinary integer arithmetic. Reuse the assigned shard and retained
+Host collector when publishing. No Store registry, per-boundary writer lookup,
+worker identity, extra allocation, or shared synchronization is needed for local
+accumulation. Do not recompute or settle terminal tails.
+
+Specify the publication contract before implementation:
+
+- A fixed threshold K bounds unpublished observations to K−1 per Store after
+  recording. Choose K from the required freshness contract before measuring.
+  Existing epoch openings can supplement the threshold without new timers.
+- Flush before suspension/exhaustion transitions and at command completion;
+  a nonblocking, nonpanicking Store-owned `Drop` flushes any remainder on
+  actual Store destruction. Existing child/PID0 teardown owns that boundary.
+  Dropping a guest-call future alone is not universally Store destruction.
+- Transfer and clear pending amounts under exclusive ownership without an
+  await. An explicit flush followed by Drop must not publish twice. Preserve
+  policy attribution, wrapping totals, and Host lifetime retention.
+- Ordinary scrapes read only the existing atomic aggregate. They may lag an
+  active or idle live Store. **Writer quiescence alone would no longer imply
+  exact snapshots**; exactness requires a flush or Store destruction. An idle
+  Store below threshold has no wall-time publication bound. Preserving the old
+  exact-quiescent snapshot contract or imposing a hard wall-time bound would
+  need an explicit flush protocol or further synchronization.
+- Keep constant state per live Store and the fixed 32-shard Host aggregate.
+  Teardown leaves no retained Store entries, and scrapes do not scan Stores.
+  Process aborts without Rust destruction and leaked Stores cannot promise
+  final local publication.
+
+Batching only settled fuel still leaves `record_grant`'s existing shared atomic
+at every grant. To satisfy the broader goal of avoiding shared atomics at every
+boundary, the same Store-owned writer can also accumulate exact grant/decision
+counts and publish them in bounded batches. That explicitly changes #769's live
+visibility contract and requires separate review; the diagnostic held decision
+updates constant and did not measure the benefit of batching them.
+
+| Alternative | Assessment |
+| --- | --- |
+| Exact Store-local counters plus bounded publication | Preferred ownership model. The Store already serializes updates and supplies teardown. Freshness changes must be explicit. |
+| Per-worker aggregation | Not simpler across the complete API. Pooled children have persistent LocalSets, but Proc/PID0 ownership is not universally tied to one worker. Migration, multiple Hosts, and worker shutdown add contracts. |
+| Sampling detailed observations | Appropriate for expensive distributions, traces, and diagnostics. Keep cumulative settled fuel exact; sampling that total changes its contract. Gate before timestamp/payload construction and use bounded buffers. |
+| Exact counters plus sampled diagnostics | Preferred combination. Exact ordinary local updates serve cumulative totals; optional sampled observations remain a separate, disabled-by-default cost. Inspect generated disabled paths before claiming negligible overhead. |
+
+New evidence needed before selecting an implementation: tests for bounded
+freshness, threshold edges, explicit flush followed by Drop, Store moves,
+colliding publication shards, wrapping totals, completion, instantiation failure,
+and cancellation after committed settlement. Tests must retain the unsettled-tail
+exclusion and distinguish cancellation request from actual Store destruction.
+A subsequent authorized prototype must verify generated hot-path work, disabled
+diagnostic costs, bounded scrape work, and portability, then pass a newly
+authorized unchanged-workload acceptance protocol. The original results cannot
+be reclassified. No such prototype or benchmark campaign was initiated here.
+
+### Independent review and stopped scope
+
+`design-review.md` reviewed the source, frozen analysis, and ARM64 code before
+collection. `results-review.md` independently recomputed raw statistics and
+checked the interpretation. `lifecycle-audit.md` grounds the architectural
+recommendation in existing Store ownership and child/PID0 teardown.
+The collection and all checks above concern the isolated diagnostic only.
+Production correctness evidence and Linux ARM64 functional results remain
+preserved; this run supplies no Linux performance or x86-64 CI result.
+Stop here with the supported finding and architectural choice. Production
+acceptance and publication remain blocked.
