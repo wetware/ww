@@ -398,10 +398,26 @@ padding type rather than a fixed 128-byte requirement.
 The [measurement report](../measurements/fuel-settlement.md#resumed-software-diagnosis--2026-10-28)
 records the controlled destination comparison and its single ABBAABBA follow-up.
 Those results support reducing destination and line sharing on the reproduction
-machine; they do not prove an undocumented coherence protocol. Final corrected
-candidate acceptance remains pending. Linux ARM64 functional tests passed;
-macOS workspace validation stopped on a test-profile mismatch described in the
-measurement report.
+machine; they do not prove an undocumented coherence protocol. Corrected macOS
+CI-profile validation passed 1,337 workspace tests, with zero failures and
+24 ignored, including the previously failing PID0 test with a matching debug
+Host. Focused fuel, collector, native-P3, and strict Clippy checks also passed.
+The earlier release-profile failure remains recorded in the measurement report.
+Linux ARM64 functional tests passed in OrbStack. Linux x86-64 CI was not run
+because publication stopped; no independent Linux performance claim is made.
+
+Final performance acceptance stopped after the three initial pairs and the
+single permitted unchanged-code confirmation block. The six-pair four-worker
+marked-return pool adds 56.533955 ns per boundary, above the 25 ns quality
+target. Four of six pairs miss that target; one exceeds the historical 100 ns
+threshold. The single-worker pool adds 2.223960 ns. The complete compute
+four-worker p95 also exceeds its 5% limit at +7.018622%; two HTTP pairs exceed
+the 20 microsecond p95 allowance. The measurement report retains all
+per-pair and pooled distributions, exceptions, and historical results.
+
+The candidate remains unaccepted despite passing local correctness. The
+remaining concurrent overhead has not been assigned to a specific hardware
+mechanism. No further acceptance runs or merge follow this stopped result.
 
 ## Constants
 
