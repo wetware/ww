@@ -15,6 +15,7 @@ use capnp::capability::Promise;
 use capnp_rpc::pry;
 use tokio::io;
 use tokio::sync::{mpsc, oneshot};
+use tracing::Instrument;
 
 use ::authority::EpochGuard;
 
@@ -30,6 +31,11 @@ use rpc::{
 use rpc::managed_rpc::{ManagedRpc, DISCONNECT_GRACE};
 
 static RPC_EOF_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static NEXT_CHILD_CELL_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+#[path = "launcher_tracing_tests.rs"]
+mod tracing_tests;
 
 /// Number of child RPC disconnects that failed or exceeded their grace.
 ///
@@ -565,7 +571,17 @@ impl system_capnp::executor::Server for ExecutorImpl {
         let fuel_observer = self.fuel_observer.clone();
         let filesystem_resources = Arc::clone(&self.filesystem_resources);
 
-        Promise::from_future(async move {
+        // A spawned child has its own lifetime and identity. Unlike the named
+        // ExecutorPool owner (`cell_name`), each child gets a process-local ID.
+        // The caller caused the spawn but does not own all later child work.
+        let span = tracing::info_span!(
+            parent: None,
+            "cell",
+            cell_id = NEXT_CHILD_CELL_ID.fetch_add(1, Ordering::Relaxed),
+        );
+        span.follows_from(tracing::Span::current());
+        let child_span = span.clone();
+        let future = async move {
             let cell_resources =
                 cache::CellResources::new(filesystem_resources, cache::CellLimits::default());
             let filesystem = cell::FilesystemOwnership::try_new(cell_resources)
@@ -605,11 +621,14 @@ impl system_capnp::executor::Server for ExecutorImpl {
             let filesystem_finalizer = builder
                 .take_filesystem_finalizer()
                 .expect("new child builder owns one filesystem finalizer");
-            tokio::task::spawn_local(rpc::local_tasks::track(async move {
-                if let Err(error) = filesystem_finalizer.run().await {
-                    tracing::error!(%error, "executor: child filesystem finalization failed");
-                }
-            }));
+            tokio::task::spawn_local(
+                rpc::local_tasks::track(async move {
+                    if let Err(error) = filesystem_finalizer.run().await {
+                        tracing::error!(%error, "executor: child filesystem finalization failed");
+                    }
+                })
+                .instrument(child_span.clone()),
+            );
 
             let proc = match builder.build().await {
                 Ok(proc) => proc,
@@ -669,7 +688,8 @@ impl system_capnp::executor::Server for ExecutorImpl {
                     kill_rx,
                     cleanup: Some(cleanup),
                 }
-                .run(),
+                .run()
+                .instrument(child_span),
             );
             let handoff = SpawnHandoffGuard::new(lifecycle_task.abort_handle(), terminate);
 
@@ -689,7 +709,8 @@ impl system_capnp::executor::Server for ExecutorImpl {
             drop(lifecycle_task);
 
             Ok(())
-        })
+        };
+        Promise::from_future(future.instrument(span))
     }
 
     fn bytecode_cid(

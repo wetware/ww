@@ -210,7 +210,11 @@ fields. The formatter reserves `span.name` for the span name (`cell` for a Cell
 span); use `span.cell_name` for the Cell identity. The legacy `name` field remains
 available to span-field filters. Ancestor spans are not repeated in a `spans`
 list. Filtering can remove span context, and separately spawned tasks need
-explicit span propagation.
+explicit span propagation. Ordinary child tasks use numeric `span.cell_id`;
+managed RPC workers use numeric `span.rpc_id`. These IDs are local to one Host
+process. RPC spans describe connections, not the caller that opened them.
+See [async tracing ownership](runtimes.md#async-tracing-ownership) for propagation
+and filtering boundaries.
 
 Unknown, empty, or non-Unicode `WW_LOG_FORMAT` values fall back to `auto` and
 produce a warning, subject to `RUST_LOG`. The warning does not echo the value.
