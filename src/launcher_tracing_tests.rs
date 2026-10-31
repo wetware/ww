@@ -155,6 +155,7 @@ async fn exercise_children(child_span_enabled: bool) {
     let mut started = Vec::new();
     let mut stopped = Vec::new();
     let mut filesystem_snapshots = Vec::new();
+    let mut filesystem_completions = Vec::new();
     for event in events {
         let message = event["fields"]["message"].as_str().unwrap_or_default();
         if message == "unrelated-child-probe" {
@@ -162,8 +163,10 @@ async fn exercise_children(child_span_enabled: bool) {
         }
         let filesystem_snapshot =
             message == "executor: child filesystem ownership after guest exit";
+        let filesystem_completion = message == "executor: child filesystem completion observed";
         if message == "fuel.initial"
             || filesystem_snapshot
+            || filesystem_completion
             || message.starts_with("executor: child process exited")
         {
             let id = if child_span_enabled {
@@ -185,16 +188,26 @@ async fn exercise_children(child_span_enabled: bool) {
                 let value = event["fields"]["filesystem"]
                     .as_str()
                     .expect("filesystem snapshot or explicit read error");
-                assert!(value.len() < 1024, "unbounded snapshot event: {event}");
+                assert!(value.len() < 4096, "unbounded snapshot event: {event}");
                 assert!(
                     value.starts_with("Ok(FsSnapshot {")
                         || matches!(value, "Err(Busy)" | "Err(Unavailable)" | "Err(Poisoned)"),
                     "unexpected snapshot diagnostic: {event}"
                 );
+                if value.starts_with("Ok(FsSnapshot {") {
+                    assert!(value.contains("directory_builds:"), "{event}");
+                }
                 filesystem_snapshots.push(id);
+            } else if filesystem_completion {
+                assert_eq!(event["fields"]["succeeded"], true, "{event}");
+                assert_eq!(filesystem_snapshots.len(), filesystem_completions.len() + 1);
+                assert_eq!(filesystem_snapshots.last(), Some(&id));
+                filesystem_completions.push(id);
             } else {
                 assert_eq!(filesystem_snapshots.len(), stopped.len() + 1);
                 assert_eq!(filesystem_snapshots.last(), Some(&id));
+                assert_eq!(filesystem_completions.len(), stopped.len() + 1);
+                assert_eq!(filesystem_completions.last(), Some(&id));
                 stopped.push(id);
             }
         }
@@ -202,6 +215,7 @@ async fn exercise_children(child_span_enabled: bool) {
     assert_eq!(started.len(), 2);
     assert_eq!(stopped, started);
     assert_eq!(filesystem_snapshots, started);
+    assert_eq!(filesystem_completions, started);
     if child_span_enabled {
         assert_ne!(started[0], started[1]);
     }

@@ -4,6 +4,7 @@ use std::future::Future;
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::time::Instant;
 
@@ -135,6 +136,75 @@ pub enum FsCleanupState {
     Completed,
 }
 
+/// Maximum retained directory-build observations per root, including active work.
+pub const FS_DIRECTORY_BUILD_CAPACITY: usize = 8;
+
+/// Lifetime of the selected directory-build waiter, not of the Cell or P3 call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FsOperationWaiter {
+    Waiting,
+    /// The wrapper returned a result, including a possible execution error.
+    Returned,
+    /// The wrapper was dropped before returning. The backend can still run.
+    Dropped,
+}
+
+/// Evidence from the selected blocking closure. No state implies OS cancellation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FsOperationBackend {
+    /// Submitted to the retained driver; the closure has not entered.
+    Queued,
+    /// The closure entered and has not returned or unwound.
+    Running,
+    Succeeded,
+    Failed,
+    Panicked,
+    /// The closure was destroyed without being invoked.
+    NotExecuted,
+}
+
+/// Lifetime of the existing shared transaction's root receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FsOperationReceipt {
+    /// Includes subsequent serial phases and retained results after backend return.
+    Outstanding,
+    Released,
+}
+
+/// One selected native directory build, identified within this root generation.
+/// No paths, payloads, capability identifiers, or error text are retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FsDirectoryBuildSnapshot {
+    id: u64,
+    waiter: FsOperationWaiter,
+    backend: FsOperationBackend,
+    receipt: FsOperationReceipt,
+}
+
+impl FsDirectoryBuildSnapshot {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+    pub fn waiter(&self) -> FsOperationWaiter {
+        self.waiter
+    }
+    pub fn backend(&self) -> FsOperationBackend {
+        self.backend
+    }
+    pub fn receipt(&self) -> FsOperationReceipt {
+        self.receipt
+    }
+
+    fn reusable(&self) -> bool {
+        self.waiter != FsOperationWaiter::Waiting
+            && !matches!(
+                self.backend,
+                FsOperationBackend::Queued | FsOperationBackend::Running
+            )
+            && self.receipt == FsOperationReceipt::Released
+    }
+}
+
 /// One coherent, detached read of a root's lifecycle. Contains no paths or error text.
 ///
 /// This is a point-in-time observation, not an admission or completion certificate.
@@ -148,6 +218,8 @@ pub struct FsSnapshot {
     outstanding_work: usize,
     cleanup: FsCleanupState,
     failure_recorded: bool,
+    directory_builds: [Option<FsDirectoryBuildSnapshot>; FS_DIRECTORY_BUILD_CAPACITY],
+    omitted_directory_builds: u64,
 }
 
 impl FsSnapshot {
@@ -184,6 +256,21 @@ impl FsSnapshot {
     /// A late failure can differ from the frozen result returned by `FsCompletion::wait`.
     pub fn failure_recorded(&self) -> bool {
         self.failure_recorded
+    }
+
+    /// Bounded selected-operation observations, not a census of all filesystem work.
+    /// Fully retired records can be replaced by subsequent builds. Slot order is
+    /// not chronological; correlate with `id()` and this snapshot's root identity.
+    pub fn directory_builds(
+        &self,
+    ) -> &[Option<FsDirectoryBuildSnapshot>; FS_DIRECTORY_BUILD_CAPACITY] {
+        &self.directory_builds
+    }
+
+    /// Saturating lifetime count of builds omitted due to full slots or exhausted IDs.
+    /// A nonzero value means these records cannot certify absence of active builds.
+    pub fn omitted_directory_builds(&self) -> u64 {
+        self.omitted_directory_builds
     }
 }
 
@@ -231,6 +318,9 @@ struct Lifecycle {
     cleanups: BTreeMap<usize, CleanupEntry>,
     first_failure: Option<FsWorkError>,
     finished: bool,
+    directory_builds: [Option<FsDirectoryBuildSnapshot>; FS_DIRECTORY_BUILD_CAPACITY],
+    next_directory_build: u64,
+    omitted_directory_builds: u64,
 }
 
 pub(crate) struct State {
@@ -266,6 +356,9 @@ impl State {
                 cleanups: BTreeMap::new(),
                 first_failure: None,
                 finished: false,
+                directory_builds: [None; FS_DIRECTORY_BUILD_CAPACITY],
+                next_directory_build: 0,
+                omitted_directory_builds: 0,
             }),
             completion_tx,
             #[cfg(feature = "test-support")]
@@ -299,6 +392,8 @@ impl State {
             outstanding_work: lifecycle.work,
             cleanup,
             failure_recorded: lifecycle.first_failure.is_some(),
+            directory_builds: lifecycle.directory_builds,
+            omitted_directory_builds: lifecycle.omitted_directory_builds,
         })
     }
 
@@ -324,6 +419,7 @@ impl State {
             state: Arc::clone(self),
             active: true,
             cleanup_authorized: cleanup_bearing,
+            diagnostic_slots: AtomicU8::new(0),
         })
     }
 
@@ -580,6 +676,9 @@ pub struct FsWorkToken {
     state: Arc<State>,
     active: bool,
     cleanup_authorized: bool,
+    // Each bit owns one diagnostic slot until this actual receipt is released.
+    // Registration borrows this token and holds the root lifecycle lock.
+    diagnostic_slots: AtomicU8,
 }
 
 impl fmt::Debug for FsWorkToken {
@@ -593,6 +692,46 @@ impl fmt::Debug for FsWorkToken {
 }
 
 impl FsWorkToken {
+    fn observe_directory_build(&self) -> Option<OperationObservation> {
+        let mut lifecycle = self.state.lifecycle.lock().ok()?;
+        let slot = lifecycle
+            .directory_builds
+            .iter()
+            .position(Option::is_none)
+            .or_else(|| {
+                lifecycle
+                    .directory_builds
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, record)| {
+                        record
+                            .filter(FsDirectoryBuildSnapshot::reusable)
+                            .map(|record| (slot, record.id))
+                    })
+                    .min_by_key(|(_, id)| *id)
+                    .map(|(slot, _)| slot)
+            });
+        let id = lifecycle.next_directory_build.checked_add(1);
+        let (Some(slot), Some(id)) = (slot, id) else {
+            lifecycle.omitted_directory_builds =
+                lifecycle.omitted_directory_builds.saturating_add(1);
+            return None;
+        };
+        lifecycle.next_directory_build = id;
+        lifecycle.directory_builds[slot] = Some(FsDirectoryBuildSnapshot {
+            id,
+            waiter: FsOperationWaiter::Waiting,
+            backend: FsOperationBackend::Queued,
+            receipt: FsOperationReceipt::Outstanding,
+        });
+        self.diagnostic_slots.fetch_or(1 << slot, Ordering::Relaxed);
+        Some(OperationObservation {
+            state: Arc::downgrade(&self.state),
+            slot,
+            id,
+        })
+    }
+
     pub(crate) fn cleanup_authorized(&self) -> bool {
         self.cleanup_authorized
     }
@@ -630,10 +769,98 @@ impl Drop for FsWorkToken {
                 .work
                 .checked_sub(1)
                 .expect("filesystem work token underflow");
+            let mut slots = *self.diagnostic_slots.get_mut();
+            while slots != 0 {
+                let slot = slots.trailing_zeros() as usize;
+                if let Some(record) = &mut lifecycle.directory_builds[slot] {
+                    record.receipt = FsOperationReceipt::Released;
+                }
+                slots &= slots - 1;
+            }
             !lifecycle.accepting && lifecycle.work == 0 && !lifecycle.cleanup_started
         };
         if ready {
             self.state.notify_reaper();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OperationObservation {
+    state: Weak<State>,
+    slot: usize,
+    id: u64,
+}
+
+impl OperationObservation {
+    fn update(&self, update: impl FnOnce(&mut FsDirectoryBuildSnapshot)) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Ok(mut lifecycle) = state.lifecycle.lock() else {
+            return;
+        };
+        if let Some(record) = &mut lifecycle.directory_builds[self.slot] {
+            if record.id == self.id {
+                update(record);
+            }
+        }
+    }
+}
+
+struct OperationWaiter(Option<OperationObservation>);
+
+impl OperationWaiter {
+    fn returned(&mut self) {
+        if let Some(observation) = self.0.take() {
+            observation.update(|record| record.waiter = FsOperationWaiter::Returned);
+        }
+    }
+}
+
+impl Drop for OperationWaiter {
+    fn drop(&mut self) {
+        if let Some(observation) = &self.0 {
+            observation.update(|record| record.waiter = FsOperationWaiter::Dropped);
+        }
+    }
+}
+
+struct OperationBackend {
+    observation: Option<OperationObservation>,
+    entered: bool,
+}
+
+impl OperationBackend {
+    fn run<T, E>(mut self, operation: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        self.entered = true;
+        if let Some(observation) = &self.observation {
+            observation.update(|record| record.backend = FsOperationBackend::Running);
+        }
+        let result = operation();
+        if let Some(observation) = self.observation.take() {
+            observation.update(|record| {
+                record.backend = if result.is_ok() {
+                    FsOperationBackend::Succeeded
+                } else {
+                    FsOperationBackend::Failed
+                }
+            });
+        }
+        result
+    }
+}
+
+impl Drop for OperationBackend {
+    fn drop(&mut self) {
+        if let Some(observation) = &self.observation {
+            observation.update(|record| {
+                record.backend = if self.entered {
+                    FsOperationBackend::Panicked
+                } else {
+                    FsOperationBackend::NotExecuted
+                }
+            });
         }
     }
 }
@@ -853,6 +1080,37 @@ impl FsScope {
 }
 
 impl ForegroundTransaction {
+    /// Runs the selected native P3 directory-build slice with bounded lifecycle evidence.
+    /// Uses the existing retained blocking execution and receipt without adding ownership.
+    /// The scope must belong to this transaction to receive observations. Diagnostic
+    /// capacity exhaustion omits observations; it never rejects filesystem execution.
+    pub async fn run_directory_build<T, E, F>(
+        &self,
+        scope: &FsScope,
+        operation: F,
+    ) -> Result<FsResultEnvelope<Result<T, E>>, FsWorkError>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce() -> Result<T, E> + Send + 'static,
+    {
+        let observation = self
+            .work_for(scope)
+            .and_then(FsWorkToken::observe_directory_build);
+        let mut waiter = OperationWaiter(observation.clone());
+        let backend = OperationBackend {
+            observation,
+            entered: false,
+        };
+        let result = self
+            .run_blocking(FilesystemOperation::DirectoryBuild, move || {
+                backend.run(operation)
+            })
+            .await;
+        waiter.returned();
+        result
+    }
+
     /// Runs an admitted, resource-free owner transaction independently of any
     /// waiter. The terminal callback runs only after logical/F/root ownership
     /// has been released, so it can remove an inflight marker and notify
@@ -1079,6 +1337,174 @@ mod tests {
     use crate::{HostFsOwner, HostLimits};
 
     #[tokio::test]
+    async fn directory_observation_exhaustion_and_stale_handles_do_not_change_work() {
+        let (host_owner, host) = HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            HostLimits::new(1, 2, 1).unwrap(),
+        )
+        .unwrap();
+        let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+        let work = scope.try_work().unwrap();
+        let old = work.observe_directory_build().unwrap();
+        // A destroyed, uninvoked closure is evidence of NotExecuted, regardless
+        // of the waiter's state. This does not change ownership admission.
+        drop(OperationBackend {
+            observation: Some(old.clone()),
+            entered: false,
+        });
+        drop(OperationWaiter(Some(old.clone())));
+        drop(work);
+        let retired = completion.try_snapshot().unwrap();
+        let retired = retired.directory_builds()[0].unwrap();
+        assert_eq!(retired.backend(), FsOperationBackend::NotExecuted);
+        assert_eq!(retired.receipt(), FsOperationReceipt::Released);
+
+        // Fill empty slots before forcing reuse of the oldest retired slot.
+        for _ in 1..=FS_DIRECTORY_BUILD_CAPACITY {
+            let work = scope.try_work().unwrap();
+            let observation = work.observe_directory_build().unwrap();
+            observation.update(|record| {
+                record.waiter = FsOperationWaiter::Returned;
+                record.backend = FsOperationBackend::Succeeded;
+            });
+            drop(work);
+        }
+        let current = completion.try_snapshot().unwrap();
+        assert_ne!(current.directory_builds()[0].unwrap().id(), old.id);
+        old.update(|record| record.backend = FsOperationBackend::Failed);
+        assert_eq!(
+            completion.try_snapshot().unwrap().directory_builds(),
+            current.directory_builds()
+        );
+
+        scope.state.lifecycle.lock().unwrap().next_directory_build = u64::MAX;
+        let transaction = host
+            .try_foreground_transaction(host.try_logical_io().unwrap(), &[&scope])
+            .unwrap();
+        assert_eq!(
+            transaction
+                .run_directory_build(&scope, || Ok::<_, ()>(42))
+                .await
+                .unwrap()
+                .into_inner(),
+            Ok(42)
+        );
+        assert_eq!(
+            completion
+                .try_snapshot()
+                .unwrap()
+                .omitted_directory_builds(),
+            1
+        );
+        scope
+            .state
+            .lifecycle
+            .lock()
+            .unwrap()
+            .omitted_directory_builds = u64::MAX;
+        assert_eq!(
+            transaction
+                .run_directory_build(&scope, || Ok::<_, ()>(43))
+                .await
+                .unwrap()
+                .into_inner(),
+            Ok(43)
+        );
+        assert_eq!(
+            completion
+                .try_snapshot()
+                .unwrap()
+                .omitted_directory_builds(),
+            u64::MAX
+        );
+        drop(transaction);
+        drop(owner);
+        finalizer.run().await.unwrap();
+        host_owner.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn waiter_drop_before_backend_execution_does_not_cancel_queued_work() {
+        use std::sync::atomic::AtomicBool;
+        use std::task::Poll;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (host_owner, host) = HostFsOwner::start(
+                tokio::runtime::Handle::current(),
+                HostLimits::new(1, 2, 1).unwrap(),
+            )
+            .unwrap();
+            let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+            let transaction = host
+                .try_foreground_transaction(host.try_logical_io().unwrap(), &[&scope])
+                .unwrap();
+            let ran = Arc::new(AtomicBool::new(false));
+            let witness = Arc::clone(&ran);
+            // An unpolled async call never submitted a backend operation.
+            drop(transaction.run_directory_build(&scope, move || {
+                witness.store(true, Ordering::SeqCst);
+                Ok::<_, ()>(())
+            }));
+            assert!(completion
+                .try_snapshot()
+                .unwrap()
+                .directory_builds()
+                .iter()
+                .all(Option::is_none));
+            assert!(!ran.load(Ordering::SeqCst));
+
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.blocking_recv().unwrap();
+            });
+            entered_rx.await.unwrap();
+            let witness = Arc::clone(&ran);
+            let mut waiter = Box::pin(transaction.run_directory_build(&scope, move || {
+                witness.store(true, Ordering::SeqCst);
+                Ok::<_, ()>(())
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(waiter.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(waiter);
+            drop(transaction);
+            drop(owner);
+            let queued = completion.try_snapshot().unwrap();
+            let build = queued.directory_builds()[0].unwrap();
+            assert_eq!(build.backend(), FsOperationBackend::Queued);
+            assert_eq!(build.waiter(), FsOperationWaiter::Dropped);
+            assert_eq!(build.receipt(), FsOperationReceipt::Outstanding);
+            assert!(!ran.load(Ordering::SeqCst));
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), completion.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            let completed = completion.try_snapshot().unwrap();
+            assert_eq!(
+                completed.directory_builds()[0].unwrap().backend(),
+                FsOperationBackend::Succeeded
+            );
+            assert_eq!(
+                completed.directory_builds()[0].unwrap().receipt(),
+                FsOperationReceipt::Released
+            );
+            assert!(ran.load(Ordering::SeqCst));
+            finalizer.run().await.unwrap();
+            host_owner.shutdown().await.unwrap();
+        });
+    }
+
+    #[tokio::test]
     async fn snapshot_returns_busy_without_waiting_for_lifecycle_lock() {
         let (host_owner, host) = HostFsOwner::start(
             tokio::runtime::Handle::current(),
@@ -1086,12 +1512,20 @@ mod tests {
         )
         .unwrap();
         let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+        let work = scope.try_work().unwrap();
+        let observation = work.observe_directory_build().unwrap();
         {
             let _guard = scope.state.lifecycle.lock().unwrap();
             for _ in 0..128 {
                 assert_eq!(completion.try_snapshot(), Err(FsSnapshotError::Busy));
             }
         }
+        drop(OperationBackend {
+            observation: Some(observation.clone()),
+            entered: false,
+        });
+        drop(OperationWaiter(Some(observation)));
+        drop(work);
         drop(owner);
         finalizer.run().await.unwrap();
         host_owner.shutdown().await.unwrap();
@@ -1118,13 +1552,22 @@ mod tests {
         entered_rx.await.unwrap();
 
         let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+        let work = scope.try_work().unwrap();
+        let observation = work.observe_directory_build().unwrap();
         assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
             let _guard = scope.state.lifecycle.lock().unwrap();
             panic!("deliberate lifecycle poison");
         }))
         .is_err());
         assert_eq!(completion.try_snapshot(), Err(FsSnapshotError::Poisoned));
+        // Diagnostic destructors must not turn poisoned state into a second panic.
+        drop(OperationBackend {
+            observation: Some(observation.clone()),
+            entered: false,
+        });
+        drop(OperationWaiter(Some(observation)));
         scope.state.lifecycle.clear_poison();
+        drop(work);
         release_tx.send(()).unwrap();
         drop(owner);
         finalizer.run().await.unwrap();

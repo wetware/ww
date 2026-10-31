@@ -550,7 +550,7 @@ async fn materialize_resolved_descriptor(
                 let cleanup_hook = tests::take_directory_cleanup_hook();
                 let build_scope = filesystem_scope.clone();
                 transaction
-                    .run_blocking(cache::FilesystemOperation::DirectoryBuild, move || {
+                    .run_directory_build(filesystem_scope, move || {
                         build_directory(
                             staging_root,
                             publish_path,
