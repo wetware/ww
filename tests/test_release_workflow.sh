@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Static regression checks for the manual ww-master promotion boundary.
+# Static regression checks for the publication hold and manual promotion boundary.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-WORKFLOW="$ROOT_DIR/.github/workflows/rust.yml"
+WORKFLOW="${1:-$ROOT_DIR/.github/workflows/rust.yml}"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -97,7 +97,17 @@ fi
 for condition in "needs.test.result == 'success'" "needs.validate-release.result == 'success'"; do
   grep -Fq "$condition" <<<"$release_job" || fail "GHCR must fail closed on $condition"
 done
-grep -Fq "needs.release_image.result == 'success'" "$WORKFLOW" || fail 'IPFS must fail closed on image validation'
+# The hold supersedes the former success-dependent publication condition.
+# Match the job-level condition, not a comment or a step-level `if`.
+publish_condition="$(awk '
+  /^  publish:/ { in_job = 1; next }
+  in_job && /^  [[:alnum:]_-]+:/ { exit }
+  in_job && /^    if:/ { print }
+' "$WORKFLOW")"
+# Match the literal GitHub expression; Bash must not expand it.
+# shellcheck disable=SC2016
+[[ "$publish_condition" == '    if: ${{ false }}' ]] \
+  || fail 'IPFS publish must remain unconditionally disabled for every event'
 grep -Fq 'name: Validate actual packaged installation and startup' "$WORKFLOW" || fail 'installer boot validation missing'
 grep -Fq 'bash tests/test_container_boot.sh ww-validated:deploy' "$WORKFLOW" || fail 'deploy boot gate missing'
 grep -Fq 'bash tests/test_container_boot.sh ww-validated:release' "$WORKFLOW" || fail 'release boot gate missing'
@@ -105,5 +115,77 @@ grep -Fq 'bash tests/test_container_boot.sh ww-validated:source' "$WORKFLOW" || 
 grep -Fq 'docker load -i tested-image.tar' <<<"$release_job" || fail 'GHCR must publish the tested image'
 grep -Fq "            - 'scripts/**'" "$WORKFLOW" || fail 'installer-only changes must trigger release validation'
 grep -Fq 'linux/musl-x86_64' "$WORKFLOW" || fail 'IPFS must include fifth Host target'
+
+# Freeze the existing job-level admission controls during the maintenance hold.
+# This covers ordinary Rust/metrics CI, release validation, GHCR and Pages.
+# YAML/action validation is separate; this check follows the workflow's layout.
+actual_admission="$(awk '
+  /^jobs:/ { in_jobs = 1; next }
+  !in_jobs { next }
+  /^  publish:/ { in_publish = 1; next }
+  /^  [[:alnum:]_-]+:/ { in_publish = 0; print; in_condition = 0; next }
+  in_publish { next }
+  /^    (if|needs):/ { print; in_condition = ($0 == "    if: >-"); next }
+  in_condition && /^      / { print; next }
+  { in_condition = 0 }
+' "$WORKFLOW")"
+expected_admission="$({
+  cat <<'ADMISSION'
+  changes:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/master')
+      || github.event_name == 'workflow_dispatch'
+  lockfiles:
+  test-architecture-map:
+  fmt:
+  fuzz-corpus:
+    needs: lockfiles
+  clippy:
+    needs: lockfiles
+  solidity:
+  build:
+    needs: lockfiles
+  build-wasm:
+    needs: lockfiles
+  test-host:
+    needs: [build, build-wasm]
+  test-stdlib:
+    needs: lockfiles
+  test:
+    needs: [test-host, test-stdlib]
+    if: ${{ always() }}
+  build-architecture-map:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/master'
+          && needs.changes.outputs.architecture_map == 'true')
+    needs: [changes, fmt, clippy, solidity, build, test, test-architecture-map]
+  deploy-architecture-map:
+    if: ${{ needs.build-architecture-map.result == 'success' }}
+    needs: build-architecture-map
+  build-binaries:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/master'
+          && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'))
+    needs: [changes, fmt, clippy, solidity, build, build-wasm]
+  validate-release:
+    if: >-
+      github.ref == 'refs/heads/master'
+      && (github.event_name == 'workflow_dispatch'
+          || needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true')
+    needs: [changes, test, build-binaries, build-wasm]
+  release_image:
+    if: >-
+      !cancelled() && github.ref == 'refs/heads/master'
+      && needs.test.result == 'success' && needs.validate-release.result == 'success'
+      && (github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'push' && github.ref == 'refs/heads/master'
+              && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true')))
+    needs: [changes, test, validate-release]
+ADMISSION
+})"
+[[ "$actual_admission" == "$expected_admission" ]] \
+  || fail 'non-publish job admission controls changed during the publication hold'
 
 echo "PASS: ww release workflow builds images without directly deploying ww-master"

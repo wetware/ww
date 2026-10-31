@@ -142,6 +142,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CGI output.
 
 ### Changed
+- Hold legacy Kubernetes-dependent IPFS release publication during the VPS
+  migration. Current workflow definitions disable the `publish` job; Rust and
+  metrics CI, release validation, and GHCR publication retain their conditions.
+  Historical workflows and existing writers require a separate operational fence.
 - **Mount sources are explicit (#734 Landing C).** `ww run` no longer defaults
   to CWD or searches `~/.ww` for missing relative sources. Local names require
   `./`, `/`, or `~/`; bare operands must be complete CIDs. An empty namespace
