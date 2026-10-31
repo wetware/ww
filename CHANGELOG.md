@@ -16,6 +16,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `respond_bytes_async` for output completion.
 
 ### Added
+- **Wasmtime lifecycle metrics (#777, #753).** `/metrics` reports completed
+  component compilation and executable instantiation outcomes and durations
+  with fixed labels and histogram buckets. Preparation and command execution
+  remain separate; dropped pending instantiations remain unobserved. Existing
+  cache, fuel and executor metrics retain their meanings.
 - **Settled fuel consumption (#752).** `/metrics` reports physical fuel units
   accounted for at settlement boundaries through
   `ww_fuel_settled_units_total{policy}`. Two fixed series distinguish scheduled
