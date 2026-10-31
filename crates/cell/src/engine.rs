@@ -7,6 +7,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use crate::lifecycle::{LifecycleMetrics, Outcome, WasmtimeLifecycleSnapshot};
 
 use tokio::sync::watch;
 use wasmtime::component::Component;
@@ -146,6 +149,14 @@ impl WasmtimeCacheMetrics {
     pub fn snapshot(&self) -> WasmtimeCacheSnapshot {
         self.factory.snapshot()
     }
+
+    /// Completed operations across the same process-wide factory lifetime.
+    pub fn lifecycle_snapshot(&self) -> WasmtimeLifecycleSnapshot {
+        WasmtimeLifecycleSnapshot {
+            compilation: self.factory.compilation.snapshot(),
+            instantiation: self.factory.instantiation.snapshot(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +199,8 @@ struct EngineFactory {
     cache: Option<Cache>,
     state: WasmtimeCacheState,
     component_compilations: AtomicU64,
+    compilation: LifecycleMetrics,
+    instantiation: LifecycleMetrics,
 }
 
 impl EngineFactory {
@@ -218,6 +231,8 @@ impl EngineFactory {
                             cache: Some(cache),
                             state: WasmtimeCacheState::Enabled,
                             component_compilations: AtomicU64::new(0),
+                            compilation: LifecycleMetrics::default(),
+                            instantiation: LifecycleMetrics::default(),
                         }
                     }
                     Err(error) => {
@@ -247,6 +262,8 @@ impl EngineFactory {
             cache: None,
             state,
             component_compilations: AtomicU64::new(0),
+            compilation: LifecycleMetrics::default(),
+            instantiation: LifecycleMetrics::default(),
         }
     }
 
@@ -278,7 +295,17 @@ impl EngineFactory {
 
     fn compile_component(&self, engine: &Engine, wasm: &[u8]) -> wasmtime::Result<Component> {
         self.component_compilations.fetch_add(1, Ordering::Relaxed);
-        Component::from_binary(engine, wasm)
+        let start = Instant::now();
+        let result = Component::from_binary(engine, wasm);
+        self.compilation.record(
+            if result.is_ok() {
+                Outcome::Success
+            } else {
+                Outcome::Error
+            },
+            start.elapsed(),
+        );
+        result
     }
 
     fn snapshot(&self) -> WasmtimeCacheSnapshot {
@@ -373,6 +400,10 @@ pub fn wasmtime_cache_metrics() -> WasmtimeCacheMetrics {
 /// Compile a component through the canonical accounting boundary.
 pub fn compile_component(engine: &Engine, wasm: &[u8]) -> wasmtime::Result<Component> {
     engine_factory().compile_component(engine, wasm)
+}
+
+pub(crate) fn record_instantiation(outcome: Outcome, elapsed: Duration) {
+    engine_factory().instantiation.record(outcome, elapsed);
 }
 
 #[cfg(test)]
@@ -476,6 +507,8 @@ mod tests {
 
         assert_eq!(factory.snapshot().state, WasmtimeCacheState::Disabled);
         assert_eq!(factory.snapshot().component_compilations, 1);
+        assert_eq!(factory.compilation.snapshot().success, 1);
+        assert_eq!(factory.compilation.snapshot().duration.count, 1);
     }
 
     #[test]
@@ -502,6 +535,8 @@ mod tests {
         assert_eq!(snapshot.hits, 1);
         assert_eq!(snapshot.stores, 1);
         assert_eq!(snapshot.component_compilations, 2);
+        assert_eq!(factory.compilation.snapshot().success, 2);
+        assert_eq!(factory.compilation.snapshot().duration.count, 2);
     }
 
     #[test]
@@ -519,6 +554,7 @@ mod tests {
             .compile_component(&engine, &component_bytes())
             .expect("fallback still compiles");
         assert_eq!(factory.snapshot().state, WasmtimeCacheState::Fallback);
+        assert_eq!(factory.compilation.snapshot().success, 1);
     }
 
     #[test]
@@ -547,6 +583,37 @@ mod tests {
                 .files_total_size_soft_limit(),
             max_bytes
         );
+    }
+
+    #[test]
+    fn compilation_errors_and_concurrent_engines_share_retained_history() {
+        let factory = Arc::new(EngineFactory::from_settings(Ok(None)));
+        let metrics = WasmtimeCacheMetrics {
+            factory: factory.clone(),
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let factory = factory.clone();
+                scope.spawn(move || {
+                    let engine = factory.engine().unwrap();
+                    factory
+                        .compile_component(&engine, &component_bytes())
+                        .unwrap();
+                    assert!(factory
+                        .compile_component(&engine, b"invalid component")
+                        .is_err());
+                });
+            }
+        });
+        drop(factory);
+        let snapshot = metrics.lifecycle_snapshot();
+        assert_eq!(metrics.snapshot().component_compilations, 8);
+        assert_eq!(snapshot.compilation.success, 4);
+        assert_eq!(snapshot.compilation.error, 4);
+        assert_eq!(snapshot.compilation.timeout, 0);
+        assert_eq!(snapshot.compilation.duration.count, 8);
+        assert!(snapshot.compilation.duration.sum_nanos > 0);
+        assert_eq!(snapshot.instantiation, Default::default());
     }
 
     #[test]

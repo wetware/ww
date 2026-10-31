@@ -15,6 +15,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::ge
 use tokio::sync::watch;
 
 use crate::cell::engine::{WasmtimeCacheMetrics, WasmtimeCacheSnapshot, WasmtimeCacheState};
+use crate::cell::lifecycle::{WasmtimeLifecycleSnapshot, DURATION_BUCKET_SECONDS};
 use crate::cell::metrics::FuelMetrics;
 use crate::services::{ExecutorMetrics, ExecutorSnapshot};
 
@@ -107,6 +108,7 @@ struct AdminState {
 fn render_metrics(state: &AdminState) -> String {
     let mut out = String::with_capacity(2048);
     render_wasmtime_cache_metrics(&mut out, &state.wasmtime_cache_metrics.snapshot());
+    render_wasmtime_lifecycle_metrics(&mut out, state.wasmtime_cache_metrics.lifecycle_snapshot());
     render_executor_metrics(&mut out, state.executor_metrics.snapshot());
     render_fuel_metrics(&mut out, &state.fuel_metrics);
     out
@@ -145,6 +147,42 @@ fn render_fuel_metrics(out: &mut String, metrics: &FuelMetrics) {
             "ww_fuel_settled_units_total{{policy=\"{policy}\"}} {value}"
         )
         .unwrap();
+    }
+}
+
+fn render_wasmtime_lifecycle_metrics(out: &mut String, snapshot: WasmtimeLifecycleSnapshot) {
+    for (counter, histogram, help, counts, include_timeout) in [
+        (
+            "ww_wasmtime_component_compile_total",
+            "ww_wasmtime_component_compile_duration_seconds",
+            "Returned canonical Component::from_binary operations, including persistent-cache loads",
+            snapshot.compilation,
+            false,
+        ),
+        (
+            "ww_wasmtime_instantiations_total",
+            "ww_wasmtime_instantiation_duration_seconds",
+            "Executable CommandPre instantiations, including start functions; excludes command execution and dropped pending futures",
+            snapshot.instantiation,
+            true,
+        ),
+    ] {
+        writeln!(out, "# HELP {counter} {help} by outcome over this process lifetime.").unwrap();
+        writeln!(out, "# TYPE {counter} counter").unwrap();
+        for (outcome, value) in [("success", counts.success), ("error", counts.error)] {
+            writeln!(out, "{counter}{{outcome=\"{outcome}\"}} {value}").unwrap();
+        }
+        if include_timeout {
+            writeln!(out, "{counter}{{outcome=\"timeout\"}} {}", counts.timeout).unwrap();
+        }
+        writeln!(out, "# HELP {histogram} {help}: elapsed seconds for observed outcomes, including failures.").unwrap();
+        writeln!(out, "# TYPE {histogram} histogram").unwrap();
+        for (bound, count) in DURATION_BUCKET_SECONDS.iter().zip(counts.duration.buckets) {
+            writeln!(out, "{histogram}_bucket{{le=\"{bound}\"}} {count}").unwrap();
+        }
+        writeln!(out, "{histogram}_bucket{{le=\"+Inf\"}} {}", counts.duration.count).unwrap();
+        writeln!(out, "{histogram}_sum {}", counts.duration.sum_nanos as f64 / 1e9).unwrap();
+        writeln!(out, "{histogram}_count {}", counts.duration.count).unwrap();
     }
 }
 
@@ -651,18 +689,18 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("# HELP "))
                 .count(),
-            9
+            13
         );
         assert_eq!(
             output
                 .lines()
                 .filter(|line| line.starts_with("# TYPE "))
                 .count(),
-            9
+            13
         );
         assert_eq!(
             output.lines().filter(|line| !line.starts_with('#')).count(),
-            21
+            50
         );
     }
 
@@ -695,7 +733,12 @@ mod tests {
                 current_family = help.split_whitespace().next().unwrap();
             } else if line.starts_with("ww_wasmtime_") {
                 let name = line.split(['{', ' ']).next().unwrap();
-                assert_eq!(name, current_family, "interleaved family: {line}");
+                let family = name
+                    .strip_suffix("_bucket")
+                    .or_else(|| name.strip_suffix("_sum"))
+                    .or_else(|| name.strip_suffix("_count"))
+                    .unwrap_or(name);
+                assert_eq!(family, current_family, "interleaved family: {line}");
             }
         }
     }
