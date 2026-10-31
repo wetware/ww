@@ -787,13 +787,9 @@ jobs:
     # Both publication paths consume the same validated artifact set.
     # IPFS publication is independent of manual infrastructure promotion for
     # this POC. The published release may therefore lead or lag production.
-    if: >-
-      !cancelled() && github.ref == 'refs/heads/master'
-      && needs.test.result == 'success'
-      && needs.validate-release.result == 'success'
-      && needs.release_image.result == 'success'
-      && (needs.changes.outputs.std == 'true' || needs.changes.outputs.host == 'true'
-          || github.event_name == 'workflow_dispatch')
+    # Maintenance hold for the VPS recast. Historical runs and existing writers
+    # require a separate fence: doc/legacy-publication-hold.md.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
