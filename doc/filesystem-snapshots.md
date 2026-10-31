@@ -101,6 +101,11 @@ wrapper before its first poll submits no work and creates no record. Ordinary
 backend errors set `Failed` without changing existing root-failure semantics.
 Panic handling and root failure recording remain those of `run_blocking`.
 
+Guest cancellation currently does not cancel this selected native backend
+operation. [#785](https://github.com/wetware/ww/issues/785) owns the correctness
+decision and any cancellation changes. This diagnostic observes existing behavior;
+continued execution is not evidence that an independent Host owner needs it.
+
 The pinned Wasmtime `FilesystemOperation` hook exposes admission and final
 opaque-owner release only. A stream session or retained result can outlive a
 backend return. `NativeFsLease` therefore cannot supply these backend phases;
@@ -163,12 +168,15 @@ the reaper releases the cleanup obligation through its separate mutex.
 
 `OwnedChildLifecycle::run_until_shutdown` in `src/launcher.rs` reads the existing
 completion handle after guest exit and before waiting for filesystem cleanup.
-With launcher debug tracing enabled, one event contains the snapshot or explicit
-read error. For example, set `RUST_LOG=ww::launcher=debug` for the host process.
+With launcher trace logging enabled, one event contains the snapshot or explicit
+read error. For example, set `RUST_LOG=ww::launcher=trace` for the host process.
 The tracing macro does not evaluate the read when the callsite is disabled.
 After `wait()` resolves, a second event reports
 `executor: child filesystem completion observed` with `succeeded`. Both events
 inherit the existing Cell correlation span. No polling service is added.
+Both filesystem events use trace level; normal completion emits no additional
+info/debug filesystem event. The typed snapshot remains available on demand.
+Cleanup certification failures retain their existing error event.
 
 The events contain owner-local identity, timestamp, receipt count, typed phases,
 bounded operation records, omission count, and booleans. They contain no paths,

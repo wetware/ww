@@ -19,11 +19,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Native P3 directory-build diagnostics (#780, #753).** Owner-local filesystem
   snapshots distinguish dropped waiters, running or completed native directory
   builds, retained transaction receipts, and cleanup phases. Eight records per
-  root bound storage; omitted observations remain explicit. Launcher debug logs
+  root bound storage; omitted observations remain explicit. Launcher trace logs
   report guest-exit snapshots and the independent filesystem completion result.
 - **Owner-local filesystem snapshots (#779, #756).** Host code can read bounded
   root admission, retained-work counts, cleanup phases, and recorded-failure
-  presence through `FsCompletion`. Launcher debug logs sample this state after
+  presence through `FsCompletion`. Launcher trace logs sample this state after
   guest exit. Reads report contention or unavailable state explicitly; guest
   cancellation does not imply native work or cleanup has completed.
 - **Wasmtime lifecycle metrics (#777, #753).** `/metrics` reports completed

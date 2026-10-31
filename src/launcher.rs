@@ -409,7 +409,7 @@ impl OwnedChildLifecycle {
         let filesystem_completion = self.filesystem_completion.clone();
         // The tracing macro evaluates this bounded read only when enabled.
         // Guest exit can precede native completion; do not infer completion here.
-        tracing::debug!(
+        tracing::trace!(
             filesystem = ?filesystem_completion.try_snapshot(),
             "executor: child filesystem ownership after guest exit"
         );
@@ -422,7 +422,7 @@ impl OwnedChildLifecycle {
                 false
             }
         };
-        tracing::debug!(
+        tracing::trace!(
             succeeded = filesystem_completed,
             "executor: child filesystem completion observed"
         );

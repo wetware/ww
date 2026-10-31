@@ -40,18 +40,23 @@ impl Write for Output {
 
 #[tokio::test(flavor = "current_thread")]
 async fn spawned_children_keep_distinct_identity_through_execution_and_teardown() {
-    exercise_children(true).await;
+    exercise_children(true, true).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn filtered_child_spans_do_not_retain_the_spawn_caller() {
-    exercise_children(false).await;
+    exercise_children(false, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn filesystem_lifecycle_diagnostics_require_trace_filter() {
+    exercise_children(true, false).await;
 }
 
 // Value: protects=bounded filesystem diagnostics before child exit with correct
 // attribution; fails_when=the event/field is absent, late, or retains the caller;
 // why_new=existing assertions covered fuel and exit only; seam=none.
-async fn exercise_children(child_span_enabled: bool) {
+async fn exercise_children(child_span_enabled: bool, launcher_trace_enabled: bool) {
     let output = Output::default();
     let writer = output.clone();
     let layer = tracing_subscriber::fmt::layer()
@@ -60,7 +65,10 @@ async fn exercise_children(child_span_enabled: bool) {
         .with_span_list(true)
         .with_writer(move || writer.clone())
         .with_filter(tracing_subscriber::filter::filter_fn(move |metadata| {
-            child_span_enabled || !(metadata.is_span() && metadata.name() == "cell")
+            (launcher_trace_enabled
+                || metadata.target() != "ww::launcher"
+                || *metadata.level() <= tracing::Level::DEBUG)
+                && (child_span_enabled || !(metadata.is_span() && metadata.name() == "cell"))
         }));
     let links = CausalLinks::default();
     // Both layers must reject disabled child spans, or the capture layer would
@@ -68,7 +76,10 @@ async fn exercise_children(child_span_enabled: bool) {
     let capture = links
         .clone()
         .with_filter(tracing_subscriber::filter::filter_fn(move |metadata| {
-            child_span_enabled || !(metadata.is_span() && metadata.name() == "cell")
+            (launcher_trace_enabled
+                || metadata.target() != "ww::launcher"
+                || *metadata.level() <= tracing::Level::DEBUG)
+                && (child_span_enabled || !(metadata.is_span() && metadata.name() == "cell"))
         }));
     let subscriber = tracing_subscriber::registry().with(layer).with(capture);
     let _subscriber = tracing::subscriber::set_default(subscriber);
@@ -164,6 +175,13 @@ async fn exercise_children(child_span_enabled: bool) {
         let filesystem_snapshot =
             message == "executor: child filesystem ownership after guest exit";
         let filesystem_completion = message == "executor: child filesystem completion observed";
+        if filesystem_snapshot || filesystem_completion {
+            assert!(
+                launcher_trace_enabled,
+                "filesystem diagnostic below trace: {event}"
+            );
+            assert_eq!(event["level"], "TRACE", "{event}");
+        }
         if message == "fuel.initial"
             || filesystem_snapshot
             || filesystem_completion
@@ -204,18 +222,25 @@ async fn exercise_children(child_span_enabled: bool) {
                 assert_eq!(filesystem_snapshots.last(), Some(&id));
                 filesystem_completions.push(id);
             } else {
-                assert_eq!(filesystem_snapshots.len(), stopped.len() + 1);
-                assert_eq!(filesystem_snapshots.last(), Some(&id));
-                assert_eq!(filesystem_completions.len(), stopped.len() + 1);
-                assert_eq!(filesystem_completions.last(), Some(&id));
+                if launcher_trace_enabled {
+                    assert_eq!(filesystem_snapshots.len(), stopped.len() + 1);
+                    assert_eq!(filesystem_snapshots.last(), Some(&id));
+                    assert_eq!(filesystem_completions.len(), stopped.len() + 1);
+                    assert_eq!(filesystem_completions.last(), Some(&id));
+                }
                 stopped.push(id);
             }
         }
     }
     assert_eq!(started.len(), 2);
     assert_eq!(stopped, started);
-    assert_eq!(filesystem_snapshots, started);
-    assert_eq!(filesystem_completions, started);
+    if launcher_trace_enabled {
+        assert_eq!(filesystem_snapshots, started);
+        assert_eq!(filesystem_completions, started);
+    } else {
+        assert!(filesystem_snapshots.is_empty());
+        assert!(filesystem_completions.is_empty());
+    }
     if child_span_enabled {
         assert_ne!(started[0], started[1]);
     }
