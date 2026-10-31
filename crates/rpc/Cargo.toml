@@ -31,5 +31,6 @@ auth = { path = "../guest/auth" }
 authority = { package = "wetware-authority", path = "../authority" }
 
 [dev-dependencies]
+tracing-core = "0.1"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

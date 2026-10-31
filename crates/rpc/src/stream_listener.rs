@@ -143,7 +143,7 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
                             if let Err(e) = supervisor.run().await {
                                 tracing::error!("Stream cell connection error: {e}");
                             }
-                        }.instrument(handle_span)));
+                        }.instrument(handle_span.or_current())));
                     }
                     completed = supervisors.next(), if !supervisors.is_empty() => {
                         if let Some(Err(error)) = completed {

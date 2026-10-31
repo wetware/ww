@@ -5735,6 +5735,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-core",
  "wetware-authority",
  "wetware-membrane",
 ]
