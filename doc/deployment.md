@@ -299,7 +299,7 @@ localhost-only admin plane on `127.0.0.1:2026` is the process control surface:
 - `/readyz` reports whether the runtime has reached its serving phase.
 - `/version` reports source and current generation kernel provenance plus degraded
   cache state.
-- `/metrics` exposes live Wasmtime cache, ExecutorPool, applied fuel decisions,
+- `/metrics` exposes live Wasmtime cache and lifecycle, ExecutorPool, applied fuel decisions,
   and settled fuel consumption. See the collection
   policy below for measurements that are not yet available.
 
@@ -308,7 +308,7 @@ is added; these endpoints are intentionally unauthenticated.
 
 ### Metrics collection policy
 
-`GET /metrics` serves Prometheus text format 0.0.4. Four metric families
+`GET /metrics` serves Prometheus text format 0.0.4. Eight metric families
 use the process-wide Wasmtime engine factory:
 
 | Family | Meaning |
@@ -317,6 +317,10 @@ use the process-wide Wasmtime engine factory:
 | `ww_wasmtime_cache_hits_total` | Successful loads from the persistent compilation cache. |
 | `ww_wasmtime_cache_stores_total` | Successful stores to that cache, not lookup misses or compilation attempts. |
 | `ww_wasmtime_component_compilations_total` | Calls to the canonical component compilation API, including cache hits and failed attempts. |
+| `ww_wasmtime_component_compile_total` | Completed canonical compilations, including persistent-cache loads, with `outcome="success"` or `"error"`. |
+| `ww_wasmtime_component_compile_duration_seconds` | Histogram of wall time inside canonical `Component::from_binary` calls, including errors. |
+| `ww_wasmtime_instantiations_total` | Observed executable `CommandPre::instantiate_async` results in `Proc::run`, with `outcome="success"`, `"error"`, or `"timeout"`. |
+| `ww_wasmtime_instantiation_duration_seconds` | Histogram of wall time through executable instantiation's result or cooperative five-second timeout, including failures. |
 
 The counters cover canonical engines in this process and reset when the process
 restarts. Scraping reads atomic counters without metric registry locks; it does
@@ -325,6 +329,15 @@ separately and is not a transaction across concurrent compilations. Disabled and
 fallback cache states legitimately report zero hits and stores. A later write
 failure can leave the initialization state `enabled`;
 [#609](https://github.com/wetware/ww/issues/609) owns reporting those failures.
+
+Lifecycle observations exclude preparation and command execution; dropped pending
+instantiation futures record neither an outcome nor a duration. Histogram buckets
+are fixed and cumulative, with duration sums in seconds. The
+[lifecycle contract](measurements/wasmtime-lifecycle.md#metrics-contract) defines
+the boundaries, buckets, and snapshot limits. The separate
+[#777 requalification report](measurements/wasmtime-lifecycle-requalification.md)
+records the local release qualification without changing the historical failed
+campaign. Required GitHub CI and final PR review remain release gates.
 
 Three additional families use the Host's live ExecutorPool collector:
 
@@ -410,14 +423,15 @@ cancellation, and Store teardown can leave physical consumption unsettled.
 The runtime adds no termination settlement. Initial zero-budget rejection
 adds no consumption.
 
-The endpoint exports exactly 21 series: six Wasmtime samples, seven executor
+The endpoint exports exactly 50 series: 35 Wasmtime samples, seven executor
 samples, six fuel-decision samples, and two settled-consumption samples.
 Metric names, HELP text, and label values are static. The renderer accepts
 no dynamic label or HELP text that requires escaping. Cell identifiers, task names,
 RPC methods, paths, peer IDs, and CIDs do not become metric labels. Response size
-is bounded by fixed text and integer widths, regardless of Cell churn.
+is bounded by fixed text and bounded numeric representations, regardless of Cell churn.
 
-Collection adds atomic updates at executor admission and terminal boundaries,
+Collection adds atomic updates at completed Wasmtime lifecycle boundaries,
+at executor admission and terminal boundaries,
 at applied fuel decisions, and when Stores publish pending settled fuel.
 Settlements between publications update only Store-owned ordinary integers.
 Epoch notification alone does not record a fuel decision or consumption.
