@@ -10,8 +10,9 @@ pub use arc::{ArcInner, ArcStats};
 pub use bloom::AtomicBloom;
 pub use fs_driver::{HostFsOwner, HostFsStartError};
 pub use fs_work::{
-    CleanupPhase, CleanupRegistration, FilesystemOperation, FsCompletion, FsFinalizer, FsOwner,
-    FsResultEnvelope, FsScope, FsWorkError, FsWorkToken,
+    CleanupPhase, CleanupRegistration, FilesystemOperation, FsCleanupState, FsCompletion,
+    FsFinalizer, FsOwner, FsResultEnvelope, FsRootId, FsScope, FsSnapshot, FsSnapshotError,
+    FsWorkError, FsWorkToken,
 };
 #[cfg(feature = "test-support")]
 pub use fs_work::{FsTestEvent, FsTestStage};

@@ -4,7 +4,8 @@ use std::future::Future;
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, TryLockError, Weak};
+use std::time::Instant;
 
 #[cfg(feature = "test-support")]
 use std::path::PathBuf;
@@ -104,11 +105,110 @@ enum CompletionState {
     Finished(Result<(), FsWorkError>),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RootId {
+/// Opaque root identity, comparable only within one `HostFsOwner` lifetime.
+/// Slot reuse changes the generation. Separate host owners can reuse identities.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FsRootId {
     pub(crate) slot: usize,
     pub(crate) generation: u64,
 }
+
+impl FsRootId {
+    /// Root incarnation, not a snapshot sequence or a process-wide identity.
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+/// Root cleanup phase, derived from the existing ownership state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FsCleanupState {
+    /// Admission remains open or outstanding ownership receipts remain.
+    Pending,
+    /// Admission is closed and no receipts remain; the reaper has not claimed cleanup.
+    Ready,
+    /// The reaper claimed cleanup but has not recorded completion.
+    /// This includes gaps before, between, and after individual callbacks.
+    Running,
+    /// All callbacks returned or unwound and the reaper recorded completion.
+    /// Failures are reported separately. Root capacity might not yet be released.
+    Completed,
+}
+
+/// One coherent, detached read of a root's lifecycle. Contains no paths or error text.
+///
+/// This is a point-in-time observation, not an admission or completion certificate.
+/// Another root, host admission, and resource permits are outside its consistency boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FsSnapshot {
+    root: FsRootId,
+    captured_at: Instant,
+    root_admission_open: bool,
+    cleanup_poisoned: bool,
+    outstanding_work: usize,
+    cleanup: FsCleanupState,
+    failure_recorded: bool,
+}
+
+impl FsSnapshot {
+    pub fn root(&self) -> FsRootId {
+        self.root
+    }
+
+    /// Monotonic capture time in this process. A retained snapshot can be stale.
+    pub fn captured_at(&self) -> Instant {
+        self.captured_at
+    }
+
+    /// Root admission only; host admission and resource limits can reject work independently.
+    pub fn root_admission_open(&self) -> bool {
+        self.root_admission_open
+    }
+
+    /// A recorded cleanup failure poisoned new cleanup-bearing admission.
+    pub fn cleanup_poisoned(&self) -> bool {
+        self.cleanup_poisoned
+    }
+
+    /// Outstanding ownership receipts, including retained results and native work.
+    /// This does not count individual backend operations or cancellation requests.
+    pub fn outstanding_work(&self) -> usize {
+        self.outstanding_work
+    }
+
+    pub fn cleanup(&self) -> FsCleanupState {
+        self.cleanup
+    }
+
+    /// Whether this root recorded a failure. Ordinary I/O errors need not be recorded.
+    /// A late failure can differ from the frozen result returned by `FsCompletion::wait`.
+    pub fn failure_recorded(&self) -> bool {
+        self.failure_recorded
+    }
+}
+
+/// A failed immediate read. No cached or partial snapshot is returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FsSnapshotError {
+    /// Another reader or lifecycle transition holds the root mutex. No wait was queued.
+    Busy,
+    /// The root state was released. This does not assert how the host owner stopped.
+    Unavailable,
+    /// The lifecycle mutex was poisoned; its state cannot be certified.
+    Poisoned,
+}
+
+impl fmt::Display for FsSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Busy => "filesystem snapshot busy",
+            Self::Unavailable => "filesystem snapshot unavailable",
+            Self::Poisoned => "filesystem snapshot poisoned",
+        })
+    }
+}
+
+impl std::error::Error for FsSnapshotError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CleanupId {
@@ -134,7 +234,7 @@ struct Lifecycle {
 }
 
 pub(crate) struct State {
-    id: RootId,
+    id: FsRootId,
     host: Arc<HostResources>,
     reaper: Weak<ReaperInner>,
     obligation: Mutex<Option<CleanupObligation>>,
@@ -146,7 +246,7 @@ pub(crate) struct State {
 
 impl State {
     pub(crate) fn new(
-        id: RootId,
+        id: FsRootId,
         host: Arc<HostResources>,
         reaper: Weak<ReaperInner>,
         obligation: CleanupObligation,
@@ -173,8 +273,33 @@ impl State {
         })
     }
 
-    pub(crate) fn id(&self) -> RootId {
+    pub(crate) fn id(&self) -> FsRootId {
         self.id
+    }
+
+    fn try_snapshot(&self) -> Result<FsSnapshot, FsSnapshotError> {
+        let lifecycle = self.lifecycle.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => FsSnapshotError::Busy,
+            TryLockError::Poisoned(_) => FsSnapshotError::Poisoned,
+        })?;
+        let cleanup = if lifecycle.finished {
+            FsCleanupState::Completed
+        } else if lifecycle.cleanup_started {
+            FsCleanupState::Running
+        } else if !lifecycle.accepting && lifecycle.work == 0 {
+            FsCleanupState::Ready
+        } else {
+            FsCleanupState::Pending
+        };
+        Ok(FsSnapshot {
+            root: self.id,
+            captured_at: Instant::now(),
+            root_admission_open: lifecycle.accepting,
+            cleanup_poisoned: !lifecycle.cleanup_admission,
+            outstanding_work: lifecycle.work,
+            cleanup,
+            failure_recorded: lifecycle.first_failure.is_some(),
+        })
     }
 
     fn try_work(self: &Arc<Self>, cleanup_bearing: bool) -> Result<FsWorkToken, AdmissionError> {
@@ -432,12 +557,13 @@ pub struct FsFinalizer {
 #[derive(Clone)]
 pub struct FsCompletion {
     receiver: watch::Receiver<CompletionState>,
+    state: Weak<State>,
 }
 
 pub(crate) fn new_registered_root(
     state: Arc<State>,
 ) -> (FsScope, FsOwner, FsFinalizer, FsCompletion) {
-    let receiver = state.completion_tx.subscribe();
+    let completion = FsCompletion::new(&state);
     (
         FsScope {
             state: Arc::clone(&state),
@@ -446,7 +572,7 @@ pub(crate) fn new_registered_root(
             state: Arc::clone(&state),
         },
         FsFinalizer { state: Some(state) },
-        FsCompletion { receiver },
+        completion,
     )
 }
 
@@ -889,14 +1015,12 @@ impl FsFinalizer {
             .take()
             .expect("filesystem finalizer already taken");
         let mut guard = FinalizerGuard { state: Some(state) };
-        let result = FsCompletion {
-            receiver: guard
+        let result = FsCompletion::new(
+            guard
                 .state
                 .as_ref()
-                .expect("filesystem finalizer state missing")
-                .completion_tx
-                .subscribe(),
-        }
+                .expect("filesystem finalizer state missing"),
+        )
         .wait()
         .await;
         guard.state = None;
@@ -913,6 +1037,27 @@ impl Drop for FsFinalizer {
 }
 
 impl FsCompletion {
+    fn new(state: &Arc<State>) -> Self {
+        Self {
+            receiver: state.completion_tx.subscribe(),
+            state: Arc::downgrade(state),
+        }
+    }
+
+    /// Read this root once without waiting for a lifecycle lock or accessing a Store.
+    ///
+    /// Each call copies a fixed-size value under one `try_lock`; it does not scan
+    /// roots, enqueue requests, retry, or retain history. The weak reference does
+    /// not keep root ownership alive. Only the call temporarily retains the state.
+    /// No cached fallback is returned on contention or after the state is released.
+    /// Callers that retry must impose their own attempt or time limit.
+    pub fn try_snapshot(&self) -> Result<FsSnapshot, FsSnapshotError> {
+        self.state
+            .upgrade()
+            .ok_or(FsSnapshotError::Unavailable)?
+            .try_snapshot()
+    }
+
     pub async fn wait(&self) -> Result<(), FsWorkError> {
         let mut receiver = self.receiver.clone();
         loop {
@@ -932,6 +1077,60 @@ impl FsCompletion {
 mod tests {
     use super::*;
     use crate::{HostFsOwner, HostLimits};
+
+    #[tokio::test]
+    async fn snapshot_returns_busy_without_waiting_for_lifecycle_lock() {
+        let (host_owner, host) = HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            HostLimits::new(2, 2, 1).unwrap(),
+        )
+        .unwrap();
+        let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+        {
+            let _guard = scope.state.lifecycle.lock().unwrap();
+            for _ in 0..128 {
+                assert_eq!(completion.try_snapshot(), Err(FsSnapshotError::Busy));
+            }
+        }
+        drop(owner);
+        finalizer.run().await.unwrap();
+        host_owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_poison_without_reading_uncertified_state() {
+        let (host_owner, host) = HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            HostLimits::new(2, 2, 2).unwrap(),
+        )
+        .unwrap();
+        // Gate the reaper so it cannot encounter the deliberately poisoned mutex.
+        let (gate, gate_owner, gate_finalizer, _) = host.try_filesystem_scope().unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        gate.own_cleanup(FilesystemOperation::ProcessCleanup, move || {
+            entered_tx.send(()).unwrap();
+            release_rx.blocking_recv().unwrap();
+            Ok(())
+        })
+        .unwrap();
+        drop(gate_owner);
+        entered_rx.await.unwrap();
+
+        let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = scope.state.lifecycle.lock().unwrap();
+            panic!("deliberate lifecycle poison");
+        }))
+        .is_err());
+        assert_eq!(completion.try_snapshot(), Err(FsSnapshotError::Poisoned));
+        scope.state.lifecycle.clear_poison();
+        release_tx.send(()).unwrap();
+        drop(owner);
+        finalizer.run().await.unwrap();
+        gate_finalizer.run().await.unwrap();
+        host_owner.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn stale_cleanup_generation_cannot_remove_reused_slot() {

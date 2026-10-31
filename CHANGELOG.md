@@ -16,6 +16,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `respond_bytes_async` for output completion.
 
 ### Added
+- **Owner-local filesystem snapshots (#779, #756).** Host code can read bounded
+  root admission, retained-work counts, cleanup phases, and recorded-failure
+  presence through `FsCompletion`. Launcher debug logs sample this state after
+  guest exit. Reads report contention or unavailable state explicitly; guest
+  cancellation does not imply native work or cleanup has completed.
 - **Wasmtime lifecycle metrics (#777, #753).** `/metrics` reports completed
   component compilation and executable instantiation outcomes and durations
   with fixed labels and histogram buckets. Preparation and command execution

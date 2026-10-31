@@ -48,6 +48,9 @@ async fn filtered_child_spans_do_not_retain_the_spawn_caller() {
     exercise_children(false).await;
 }
 
+// Value: protects=bounded filesystem diagnostics before child exit with correct
+// attribution; fails_when=the event/field is absent, late, or retains the caller;
+// why_new=existing assertions covered fuel and exit only; seam=none.
 async fn exercise_children(child_span_enabled: bool) {
     let output = Output::default();
     let writer = output.clone();
@@ -151,12 +154,18 @@ async fn exercise_children(child_span_enabled: bool) {
         .collect();
     let mut started = Vec::new();
     let mut stopped = Vec::new();
+    let mut filesystem_snapshots = Vec::new();
     for event in events {
         let message = event["fields"]["message"].as_str().unwrap_or_default();
         if message == "unrelated-child-probe" {
             assert!(event.get("span").is_none(), "{event}");
         }
-        if message == "fuel.initial" || message.starts_with("executor: child process exited") {
+        let filesystem_snapshot =
+            message == "executor: child filesystem ownership after guest exit";
+        if message == "fuel.initial"
+            || filesystem_snapshot
+            || message.starts_with("executor: child process exited")
+        {
             let id = if child_span_enabled {
                 assert_eq!(event["span"]["name"], "cell", "{event}");
                 assert_eq!(event["spans"].as_array().unwrap().len(), 1, "{event}");
@@ -172,13 +181,27 @@ async fn exercise_children(child_span_enabled: bool) {
             };
             if message == "fuel.initial" {
                 started.push(id);
+            } else if filesystem_snapshot {
+                let value = event["fields"]["filesystem"]
+                    .as_str()
+                    .expect("filesystem snapshot or explicit read error");
+                assert!(value.len() < 1024, "unbounded snapshot event: {event}");
+                assert!(
+                    value.starts_with("Ok(FsSnapshot {")
+                        || matches!(value, "Err(Busy)" | "Err(Unavailable)" | "Err(Poisoned)"),
+                    "unexpected snapshot diagnostic: {event}"
+                );
+                filesystem_snapshots.push(id);
             } else {
+                assert_eq!(filesystem_snapshots.len(), stopped.len() + 1);
+                assert_eq!(filesystem_snapshots.last(), Some(&id));
                 stopped.push(id);
             }
         }
     }
     assert_eq!(started.len(), 2);
     assert_eq!(stopped, started);
+    assert_eq!(filesystem_snapshots, started);
     if child_span_enabled {
         assert_ne!(started[0], started[1]);
     }
