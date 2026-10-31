@@ -8,7 +8,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
 
-use crate::fs_work::{RootId, State};
+use crate::fs_work::{FsRootId, State};
 use crate::resources::{
     AdmissionError, AdmissionKind, CleanupActivePermit, CleanupObligation, HostLimits,
     HostResources,
@@ -116,7 +116,7 @@ impl ReaperInner {
             .generation
             .checked_add(1)
             .ok_or_else(|| AdmissionError::new(AdmissionKind::Closed))?;
-        let id = RootId {
+        let id = FsRootId {
             slot: slot_index,
             generation: slot.generation,
         };
@@ -164,7 +164,7 @@ impl ReaperInner {
         )
     }
 
-    fn remove(&self, id: RootId) {
+    fn remove(&self, id: FsRootId) {
         let removed = {
             let mut table = self.table.lock().expect("filesystem root table poisoned");
             let Some(slot) = table.slots.get_mut(id.slot) else {

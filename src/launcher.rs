@@ -407,6 +407,12 @@ impl OwnedChildLifecycle {
         drop(proc_run);
         self.bootstrap_control.clear();
         let filesystem_completion = self.filesystem_completion.clone();
+        // The tracing macro evaluates this bounded read only when enabled.
+        // Guest exit can precede native completion; do not infer completion here.
+        tracing::debug!(
+            filesystem = ?filesystem_completion.try_snapshot(),
+            "executor: child filesystem ownership after guest exit"
+        );
         let (filesystem_result, rpc_terminalization_completed) =
             tokio::join!(filesystem_completion.wait(), self.stop_auxiliary_tasks());
         let filesystem_completed = match filesystem_result {

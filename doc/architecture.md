@@ -110,6 +110,10 @@ ownership and cuts runtime-created transport cycles. See
 contract and gateway admission accounting. Intentional daemon ownership is
 deferred; PID0 retains its separate host ownership root.
 
+Host diagnostics can read a bounded, owner-local filesystem snapshot through
+the existing `FsCompletion` handle. [Filesystem snapshots](filesystem-snapshots.md)
+defines receipt counts, cleanup phases, freshness, and unavailable outcomes.
+
 Each `Membrane` server owns only its delegated references. Repeated `graft()`
 calls return the same authority surface and cannot recover omitted authority.
 Every successful graft includes a non-empty `peerId`; missing or empty metadata
