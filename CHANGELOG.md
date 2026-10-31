@@ -87,6 +87,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   errors report deterministic composition failures.
 
 ### Fixed
+- **Async span ownership (#751).** Managed RPC workers use independent connection
+  spans; ordinary child Cells use independent lifecycle spans. PID0 process and
+  filesystem tasks retain their Cell context. Filtered listener handler spans
+  retain enabled accept context. Correlation IDs remain log/span fields only.
 - **Metrics foundation cleanup (#750).** Removed unused fuel, RPC, ARC cache,
   and stream registries and their eleven HELP/TYPE declarations. `/metrics`
   exposes only the four live Wasmtime families. Real CLI Host coverage verifies
