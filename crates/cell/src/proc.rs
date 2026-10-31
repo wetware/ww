@@ -1999,8 +1999,22 @@ impl Proc {
         )
         .await
         {
-            Ok(result) => result?,
+            Ok(result) => {
+                crate::engine::record_instantiation(
+                    if result.is_ok() {
+                        crate::lifecycle::Outcome::Success
+                    } else {
+                        crate::lifecycle::Outcome::Error
+                    },
+                    start.elapsed(),
+                );
+                result?
+            }
             Err(_) => {
+                crate::engine::record_instantiation(
+                    crate::lifecycle::Outcome::Timeout,
+                    start.elapsed(),
+                );
                 tracing::error!("Guest component instantiation timed out");
                 return Err(anyhow!("guest component instantiation timed out"));
             }
