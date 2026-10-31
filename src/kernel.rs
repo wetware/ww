@@ -8,6 +8,7 @@ use cid::Cid;
 use ed25519_dalek::SigningKey;
 use tokio::io::{stderr, stdout, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
+use tracing::Instrument;
 
 use crate::cell::{Builder, Program};
 use crate::host::SwarmCommand;
@@ -432,9 +433,12 @@ impl Generation {
         let filesystem_finalizer = builder
             .take_filesystem_finalizer()
             .expect("generation filesystem finalizer was already registered");
-        tokio::task::spawn_local(rpc::local_tasks::track(async move {
-            let _ = filesystem_finalizer.run().await;
-        }));
+        tokio::task::spawn_local(
+            rpc::local_tasks::track(async move {
+                let _ = filesystem_finalizer.run().await;
+            })
+            .in_current_span(),
+        );
         let construction = tokio::select! {
             biased;
             _ = terminate_rx.changed() => return Ok(Outcome::Terminated),
@@ -514,7 +518,7 @@ impl Generation {
             registration_scope.receiver(),
         );
 
-        let mut proc_task = tokio::spawn(async move { proc.run().await });
+        let mut proc_task = tokio::spawn(async move { proc.run().await }.in_current_span());
         let mut cleanup = GenerationCleanup {
             proc_abort: proc_task.abort_handle(),
             rpc: rpc_system,
@@ -870,6 +874,75 @@ mod tests {
                 assert!(identity.get().is_none());
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn generation_process_keeps_its_cell_span_across_spawn() {
+        use tracing::Instrument;
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .json()
+            .with_ansi(false)
+            .with_writer(move || Writer(writer.clone()))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let first_dir = tempfile::tempdir().unwrap();
+                let second_dir = tempfile::tempdir().unwrap();
+                let first = test_generation(first_dir.path().to_owned()).await;
+                let second = test_generation(second_dir.path().to_owned()).await;
+                let first_task = tokio::task::spawn_local(
+                    first
+                        .generation
+                        .run()
+                        .instrument(tracing::info_span!("cell", cell_name = "kernel-a")),
+                );
+                let second_task = tokio::task::spawn_local(
+                    second
+                        .generation
+                        .run()
+                        .instrument(tracing::info_span!("cell", cell_name = "kernel-b")),
+                );
+                first.constructed_rx.await.unwrap();
+                second.constructed_rx.await.unwrap();
+                tracing::info!("unrelated-kernel-probe");
+                first.admit_tx.send(()).unwrap();
+                second.admit_tx.send(()).unwrap();
+                assert_eq!(first_task.await.unwrap().unwrap(), Outcome::Exited(0));
+                assert_eq!(second_task.await.unwrap().unwrap(), Outcome::Exited(0));
+            })
+            .await;
+        let events: Vec<serde_json::Value> = String::from_utf8(output.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut owners = Vec::new();
+        for event in events {
+            if event["fields"]["message"] == "unrelated-kernel-probe" {
+                assert!(event.get("span").is_none(), "{event}");
+            }
+            if event["fields"]["message"] == "fuel.initial" {
+                assert_eq!(event["span"]["name"], "cell", "{event}");
+                owners.push(event["span"]["cell_name"].as_str().unwrap().to_owned());
+            }
+        }
+        owners.sort();
+        assert_eq!(owners, ["kernel-a", "kernel-b"]);
     }
 
     #[tokio::test]

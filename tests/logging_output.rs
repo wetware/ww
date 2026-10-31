@@ -25,6 +25,8 @@ impl Capture {
             "native-event",
             "filter-event",
             "cell-event",
+            "rpc-probe",
+            "stream-probe",
             "invalid WW_LOG_FORMAT",
         ] {
             assert!(
@@ -516,6 +518,114 @@ fn existing_subscriber_is_preserved() {
     assert!(serde_json::from_str::<Value>(capture.stderr.lines().next().unwrap()).is_err());
 }
 
+#[test]
+fn interleaved_vat_workers_keep_json_correlation_through_errors_and_teardown() {
+    assert_rpc_correlation(false);
+}
+
+#[test]
+fn filtered_vat_workers_do_not_inherit_the_caller_span() {
+    assert_rpc_correlation(true);
+}
+
+#[test]
+fn stream_handler_keeps_json_context_across_await_and_error() {
+    assert_stream_correlation(false);
+}
+
+#[test]
+fn filtered_stream_handler_error_has_no_invented_context() {
+    assert_stream_correlation(true);
+}
+
+fn assert_stream_correlation(filtered: bool) {
+    // EnvFilter keeps named spans enabled when they affect dynamic filtering,
+    // even with a named `off` directive. Selectively disabled handler spans are
+    // covered by the RPC crate's custom subscriber; here all RPC spans are off.
+    let filter = if filtered {
+        "ww::logging_probe=info,rpc=error"
+    } else {
+        "ww::logging_probe=info,rpc=info"
+    };
+    let events = capture(
+        false,
+        &[("WW_LOG_TEST_PROBE", "stream"), ("RUST_LOG", filter)],
+    )
+    .json();
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["fields"]["message"]
+                == "Stream cell connection error: Failed: controlled stream probe error"
+        })
+        .collect();
+    assert_eq!(errors.len(), 1, "{events:?}");
+    if filtered {
+        assert!(errors[0].get("span").is_none(), "{}", errors[0]);
+    } else {
+        assert_eq!(errors[0]["span"]["name"], "stream.handle");
+        assert_eq!(errors[0]["span"]["protocol"], "json-stream");
+    }
+    let unrelated: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "stream-probe-unrelated")
+        .collect();
+    assert_eq!(unrelated.len(), 2, "{events:?}");
+    for event in unrelated {
+        assert!(event.get("span").is_none(), "{event}");
+    }
+}
+
+fn assert_rpc_correlation(filtered: bool) {
+    let filter = if filtered {
+        "ww::logging_probe=info,rpc::managed_rpc=warn"
+    } else {
+        "ww::logging_probe=info,rpc=info"
+    };
+    let capture = capture(false, &[("WW_LOG_TEST_PROBE", "rpc"), ("RUST_LOG", filter)]);
+    let events = capture.json();
+    let mut ids = Vec::new();
+    for connection in [1, 2] {
+        let mut id = None;
+        for stage in ["before", "after", "drop"] {
+            let matching: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    event["fields"]["message"] == "rpc-probe"
+                        && event["fields"]["connection"] == connection
+                        && event["fields"]["stage"] == stage
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "{events:?}");
+            let event = matching[0];
+            if filtered {
+                assert!(event.get("span").is_none(), "{event}");
+            } else {
+                assert_eq!(event["span"]["name"], "rpc", "{event}");
+                let current = event["span"]["rpc_id"]
+                    .as_u64()
+                    .expect("RPC correlation is a numeric field");
+                assert_ne!(current, 0);
+                assert_eq!(*id.get_or_insert(current), current, "{event}");
+            }
+        }
+        if let Some(id) = id {
+            ids.push(id);
+        }
+    }
+    if !filtered {
+        assert_ne!(ids[0], ids[1], "independent RPC connections share identity");
+    }
+    let unrelated: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "rpc-probe-unrelated")
+        .collect();
+    assert_eq!(unrelated.len(), 2, "{events:?}");
+    for event in unrelated {
+        assert!(event.get("span").is_none(), "{event}");
+    }
+}
+
 /// Invoked only by the parent tests, with an isolated environment and subscriber.
 #[test]
 #[ignore = "subprocess probe"]
@@ -531,6 +641,21 @@ fn logging_probe() {
         ww::config::init_tracing();
     }
     println!("{STDOUT_MARKER}");
+    let probe = std::env::var("WW_LOG_TEST_PROBE");
+    if matches!(probe.as_deref(), Ok("rpc" | "stream")) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+            if probe.as_deref() == Ok("rpc") {
+                rpc_correlation_probe().await;
+            } else {
+                stream_correlation_probe().await;
+            }
+        }));
+        return;
+    }
     let error = io::Error::other("probe failed\nuseful detail");
     tracing::warn!(target: "ww::logging_probe", count = 42u64, active = true,
         text = "line one\nline two", error = &error as &dyn std::error::Error, "native-event");
@@ -565,4 +690,210 @@ async fn emit_cell_event(cell_id: u64) {
     tokio::task::yield_now().await;
     tracing::info!(target: "ww::logging_probe", expected_cell_id = cell_id, "cell-event");
     tracing::warn!(target: "ww::logging_probe", expected_cell_id = cell_id, "cell-event-warning");
+}
+
+struct RpcProbe {
+    connection: u64,
+    started: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::cell::RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl authority::system_capnp::membrane::Server for RpcProbe {
+    async fn graft(
+        self: capnp::capability::Rc<Self>,
+        _: authority::system_capnp::membrane::GraftParams,
+        _: authority::system_capnp::membrane::GraftResults,
+    ) -> capnp::Result<()> {
+        tracing::info!(target: "ww::logging_probe", connection = self.connection,
+            stage = "before", "rpc-probe");
+        self.started.borrow_mut().take().unwrap().send(()).unwrap();
+        let release = self.release.borrow_mut().take().unwrap();
+        release.await.unwrap();
+        tracing::info!(target: "ww::logging_probe", connection = self.connection,
+            stage = "after", "rpc-probe");
+        Err(capnp::Error::failed("controlled RPC probe error".into()))
+    }
+}
+
+impl Drop for RpcProbe {
+    fn drop(&mut self) {
+        tracing::info!(target: "ww::logging_probe", connection = self.connection,
+            stage = "drop", "rpc-probe");
+    }
+}
+
+async fn rpc_correlation_probe() {
+    use authority::system_capnp::membrane;
+    use tokio::sync::oneshot;
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    let mut connections = Vec::new();
+    for connection in [1, 2] {
+        let (started, pending) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let bootstrap: membrane::Client = capnp_rpc::new_client(RpcProbe {
+            connection,
+            started: std::cell::RefCell::new(Some(started)),
+            release: std::cell::RefCell::new(Some(released)),
+        });
+        let (server_stream, client_stream) = tokio::io::duplex(4096);
+        let caller = tracing::info_span!(target: "ww::logging_probe", parent: None,
+            "caller", connection);
+        let server = tokio::task::spawn_local(
+            rpc::vat_listener::handle_vat_connection_serve(
+                bootstrap.client,
+                server_stream.compat(),
+                "logging-probe",
+            )
+            .instrument(caller),
+        );
+        let client = rpc::vat_dial::connect::<_, membrane::Client>(client_stream.compat());
+        let response = client.bootstrap.graft_request().send().promise;
+        // The server sends this only after dispatch reaches the controlled
+        // await. Both RPC workers must be pending before the independent event.
+        pending.await.unwrap();
+        connections.push((release, response, client, server));
+    }
+    tokio::task::spawn_local(async {
+        tracing::info!(target: "ww::logging_probe", "rpc-probe-unrelated");
+    })
+    .await
+    .unwrap();
+    for (release, response, mut client, server) in connections {
+        release.send(()).unwrap();
+        let error = match response.await {
+            Ok(_) => panic!("probe call unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("controlled RPC probe error"));
+        client.driver.shutdown_and_join().await.unwrap().unwrap();
+        server.await.unwrap().unwrap();
+    }
+    tokio::task::spawn_local(async {
+        tracing::info!(target: "ww::logging_probe", "rpc-probe-unrelated");
+    })
+    .await
+    .unwrap();
+}
+
+struct StreamProbe {
+    started: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::cell::RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl authority::system_capnp::executor::Server for StreamProbe {
+    async fn spawn(
+        self: capnp::capability::Rc<Self>,
+        _: authority::system_capnp::executor::SpawnParams,
+        _: authority::system_capnp::executor::SpawnResults,
+    ) -> capnp::Result<()> {
+        self.started.borrow_mut().take().unwrap().send(()).unwrap();
+        let release = self.release.borrow_mut().take().unwrap();
+        release.await.unwrap();
+        Err(capnp::Error::failed("controlled stream probe error".into()))
+    }
+}
+
+fn memory_swarm() -> libp2p::Swarm<libp2p_stream::Behaviour> {
+    use libp2p::Transport;
+    let identity = libp2p::identity::Keypair::generate_ed25519();
+    let transport = libp2p::core::transport::MemoryTransport::default()
+        .upgrade(libp2p::core::upgrade::Version::V1)
+        .authenticate(libp2p::noise::Config::new(&identity).unwrap())
+        .multiplex(libp2p::yamux::Config::default())
+        .boxed();
+    libp2p::Swarm::new(
+        transport,
+        libp2p_stream::Behaviour::new(),
+        identity.public().to_peer_id(),
+        libp2p::swarm::Config::with_tokio_executor()
+            .with_idle_connection_timeout(Duration::from_secs(60)),
+    )
+}
+
+async fn stream_correlation_probe() {
+    use authority::{system_capnp, Epoch, EpochGuard};
+    use futures::{AsyncReadExt, StreamExt};
+    use tokio::sync::{oneshot, watch};
+
+    let mut server = memory_swarm();
+    let server_peer = *server.local_peer_id();
+    let server_control = server.behaviour().new_control();
+    server.listen_on("/memory/0".parse().unwrap()).unwrap();
+    let address = loop {
+        if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } =
+            server.select_next_some().await
+        {
+            break address;
+        }
+    };
+    let mut client = memory_swarm();
+    let mut client_control = client.behaviour().new_control();
+    client.dial(address).unwrap();
+    let server_task =
+        tokio::task::spawn_local(async move { while server.next().await.is_some() {} });
+    while !matches!(
+        client.select_next_some().await,
+        libp2p::swarm::SwarmEvent::ConnectionEstablished { .. }
+    ) {}
+    let client_task =
+        tokio::task::spawn_local(async move { while client.next().await.is_some() {} });
+    let (epoch, receiver) = watch::channel(Epoch {
+        seq: 1,
+        head: vec![],
+        root: None,
+    });
+    let guard = EpochGuard {
+        issued_seq: 1,
+        receiver: receiver.clone(),
+    };
+    let (started, pending) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    let listener: system_capnp::stream_listener::Client = capnp_rpc::new_client(
+        rpc::stream_listener::StreamListenerImpl::new(server_control, guard),
+    );
+    let mut listen = listener.listen_request();
+    listen.get().set_protocol("json-stream");
+    listen
+        .get()
+        .set_membrane(authority::membrane_client(receiver, b"logging-probe"));
+    listen
+        .get()
+        .set_executor(capnp_rpc::new_client(StreamProbe {
+            started: std::cell::RefCell::new(Some(started)),
+            release: std::cell::RefCell::new(Some(released)),
+        }));
+    listen.send().promise.await.unwrap();
+    let mut connection = client_control
+        .open_stream(server_peer, rpc::stream_protocol("json-stream").unwrap())
+        .await
+        .unwrap();
+    pending.await.unwrap();
+    tokio::task::spawn_local(async {
+        tracing::info!(target: "ww::logging_probe", "stream-probe-unrelated");
+    })
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    // EOF follows supervisor error/stream destruction. The error log runs in
+    // the same supervisor poll, before this independent task can resume.
+    let mut output = Vec::new();
+    connection.read_to_end(&mut output).await.unwrap();
+    assert!(output.is_empty());
+    tokio::task::spawn_local(async {
+        tracing::info!(target: "ww::logging_probe", "stream-probe-unrelated");
+    })
+    .await
+    .unwrap();
+    epoch
+        .send(Epoch {
+            seq: 2,
+            head: vec![],
+            root: None,
+        })
+        .unwrap();
+    server_task.abort();
+    client_task.abort();
+    let _ = server_task.await;
+    let _ = client_task.await;
 }

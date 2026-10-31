@@ -116,9 +116,47 @@ The default is `current_thread`. We pick it because:
   concurrent futures still interleave on a `current_thread` runtime or `LocalSet`.
   Attach task-specific spans to futures with `tracing::Instrument`; do not hold
   an entered guard across `.await`. Separately spawned tasks require explicit
-  propagation; `ManagedRpc` worker propagation remains a follow-up to #751.
-- Shutdown is straightforward: dropping the `Runtime` joins exactly
-  what that subsystem started.
+  propagation; the ownership rules below describe the boundaries in this runtime.
+- Each subsystem owns its runtime shutdown. Executor workers explicitly
+  cancel and drain managed local tasks before destroying the `LocalSet` and
+  runtime. Dropping a runtime alone does not certify asynchronous cleanup.
+
+## Async tracing ownership
+
+`tracing::Instrument` enters a future's span during each poll and during drop.
+It exits before the executor polls another task. An entered-span guard is valid
+for the synchronous VAT/stream accept branches, but must not cross an await.
+
+| Boundary | Context |
+| --- | --- |
+| `services::worker_loop` → Cell factory | Existing `cell` span with `cell_name`, parented to the worker's `executor` span. The legacy `name` field remains available to filters. |
+| `Generation::run` → PID0 process and filesystem finalizer | Explicitly retain the generation's current Cell span across the separate tasks. |
+| `ExecutorImpl::spawn` → ordinary child | New root `cell` span with numeric `cell_id`. Construction, process lifecycle, and filesystem finalization share this span. A `follows_from` link records the spawning context. |
+| `ManagedRpc::spawn` → private RPC worker | New root `rpc` span with numeric `rpc_id`. Dispatch, driver failure, and managed teardown share this span. A `follows_from` link records the opening context. |
+| VAT/stream accept → handler/supervisor | Handler span has the synchronous accept span as parent. If the handler span is disabled, explicitly retain the enabled current accept span. |
+| Stream supervisor → input/output pump | Each inline pump future has its own task-aware span, nested under the supervisor. |
+
+RPC connections can outlive their opening call and carry capabilities used by
+many callers. The RPC worker therefore does not retain the opening caller as
+its parent. An event in the RPC driver identifies the connection, not the remote
+caller or the owner of every capability used over that connection. Ordinary
+children likewise have their own identity, rather than the spawning Cell's
+identity. These changes do not change RPC authority, task ownership, cancellation,
+or scheduling.
+
+`cell_id` and `rpc_id` distinguish operations within one Host process. They are
+log/span fields, not Prometheus labels or cross-process trace IDs. The current
+JSON formatter includes only the current span; it does not serialize ancestry
+or `follows_from` links. Nested events can therefore identify a pump or RPC
+without repeating the enclosing Cell's fields. Filtering may remove context;
+an absent span must not be interpreted as a new or shared identity.
+
+Other independently spawned work does not implicitly inherit caller context.
+Service/control loops, executor monitors, cache/filesystem producers, and
+libp2p tasks retain their existing service or operation context, where present.
+The Swarm service's ambient span labels its owning thread, not Tokio worker
+threads. Child stderr identity and final drain remain under #155; this change
+does not attach the child lifecycle span to the stderr reader.
 
 ## SwarmService is the exception
 

@@ -11,10 +11,12 @@ use futures::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 /// Maximum time to flush RPC shutdown after exported ownership is released.
 pub const DISCONNECT_GRACE: Duration = Duration::from_secs(1);
@@ -89,13 +91,21 @@ fn record_failure(
 
 impl ManagedRpc {
     /// Start the existing RPC driver task inside a Tokio LocalSet.
+    ///
+    /// One connection can serve many callers and outlive the opening call.
+    /// Its root span identifies the worker; a causal link records the opening
+    /// context without retaining that context as the worker's parent.
     pub fn spawn<VatId: 'static>(system: ManagedRpcSystem<VatId>) -> Self {
         let ManagedRpcSystem { rpc, bootstrap } = system;
         // Capture before spawning, including before the worker's first poll.
         let disconnector = rpc.get_disconnector();
         let shutdown = crate::local_tasks::shutdown_token();
         let cancelled = shutdown.clone();
-        let task = tokio::task::spawn_local(crate::local_tasks::track(async move {
+        static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
+        let span = tracing::info_span!(parent: None, "rpc",
+            rpc_id = NEXT_RPC_ID.fetch_add(1, Ordering::Relaxed));
+        span.follows_from(tracing::Span::current());
+        let worker = crate::local_tasks::track(async move {
             let rpc = AssertUnwindSafe(rpc).catch_unwind();
             tokio::pin!(rpc);
             let result = tokio::select! {
@@ -146,7 +156,8 @@ impl ManagedRpc {
                 record_failure(&mut first_error, "RPC disconnect grace", result);
             }
             first_error.map_or(Ok(()), Err)
-        }));
+        });
+        let task = tokio::task::spawn_local(worker.instrument(span));
         Self { shutdown, task }
     }
 

@@ -126,7 +126,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                             if let Err(e) = handle_vat_connection_serve(cap, stream, &protocol).await {
                                 tracing::error!("vat service connection error: {e}");
                             }
-                        }.instrument(handle_span));
+                        }.instrument(handle_span.or_current()));
                     }
                     _ = epoch_rx.changed() => {
                         if epoch_rx.borrow().seq != issued_seq {
@@ -255,7 +255,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                                     );
                                 }
                             }
-                        }.instrument(handle_span));
+                        }.instrument(handle_span.or_current()));
                     }
                     _ = epoch_rx.changed() => {
                         if epoch_rx.borrow().seq != issued_seq {

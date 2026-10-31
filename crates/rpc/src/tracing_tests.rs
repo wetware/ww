@@ -15,6 +15,7 @@ use tracing::{Event, Instrument, Metadata, Subscriber};
 #[derive(Clone, Debug)]
 struct SpanRecord {
     name: &'static str,
+    metadata: &'static Metadata<'static>,
     parent: Option<Id>,
     fields: Fields,
 }
@@ -43,12 +44,14 @@ struct TraceState {
     spans: Vec<SpanRecord>,
     entered: Vec<Id>,
     events: Vec<EventRecord>,
+    follows: Vec<(Id, Id)>,
 }
 
 #[derive(Clone)]
 struct Capture {
     state: Arc<Mutex<TraceState>>,
     events: mpsc::UnboundedSender<EventRecord>,
+    filter_handlers: bool,
 }
 
 impl Capture {
@@ -58,6 +61,7 @@ impl Capture {
             Self {
                 state: Arc::default(),
                 events,
+                filter_handlers: false,
             },
             receiver,
         )
@@ -81,6 +85,7 @@ impl Capture {
 impl Subscriber for Capture {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         metadata.target().starts_with("rpc")
+            && !(self.filter_handlers && metadata.is_span() && metadata.name().ends_with(".handle"))
     }
 
     fn new_span(&self, attributes: &Attributes<'_>) -> Id {
@@ -95,17 +100,35 @@ impl Subscriber for Capture {
         attributes.record(&mut fields);
         state.spans.push(SpanRecord {
             name: attributes.metadata().name(),
+            metadata: attributes.metadata(),
             parent,
             fields,
         });
         Id::from_u64(state.spans.len() as u64)
     }
 
+    fn current_span(&self) -> tracing_core::span::Current {
+        let state = self.state.lock().unwrap();
+        match state.entered.last() {
+            Some(id) => tracing_core::span::Current::new(
+                id.clone(),
+                state.spans[id.into_u64() as usize - 1].metadata,
+            ),
+            None => tracing_core::span::Current::none(),
+        }
+    }
+
     fn record(&self, span: &Id, values: &Record<'_>) {
         values.record(&mut self.state.lock().unwrap().spans[span.into_u64() as usize - 1].fields);
     }
 
-    fn record_follows_from(&self, _: &Id, _: &Id) {}
+    fn record_follows_from(&self, span: &Id, follows: &Id) {
+        self.state
+            .lock()
+            .unwrap()
+            .follows
+            .push((span.clone(), follows.clone()));
+    }
 
     fn event(&self, event: &Event<'_>) {
         let mut state = self.state.lock().unwrap();
@@ -329,9 +352,19 @@ impl system_capnp::executor::Server for RejectSpawn {
 
 #[tokio::test]
 async fn tracing_listener_handlers_keep_accept_parents_and_fields() {
+    listener_handlers_keep_accept_context(false).await;
+}
+
+#[tokio::test]
+async fn tracing_filtered_listener_handlers_keep_enabled_accept_context() {
+    listener_handlers_keep_accept_context(true).await;
+}
+
+async fn listener_handlers_keep_accept_context(filter_handlers: bool) {
     use futures::io::AsyncWriteExt as _;
 
-    let (capture, mut events) = Capture::new();
+    let (mut capture, mut events) = Capture::new();
+    capture.filter_handlers = filter_handlers;
     let _subscriber = tracing::subscriber::set_default(capture.clone());
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -429,7 +462,14 @@ async fn tracing_listener_handlers_keep_accept_parents_and_fields() {
                 connection.close().await.unwrap();
                 drop(connection);
                 let event = observed(&mut events, message).await;
-                capture.assert_path(message, &expected);
+                capture.assert_path(
+                    message,
+                    if filter_handlers {
+                        &expected[..1]
+                    } else {
+                        &expected
+                    },
+                );
                 assert_eq!(event.spans[0].fields.0["peer"], client_peer.to_string());
                 assert_eq!(event.spans[0].fields.0["protocol"], protocol.to_string());
                 let field = if expected[1] == "stream.handle" {
@@ -437,10 +477,12 @@ async fn tracing_listener_handlers_keep_accept_parents_and_fields() {
                 } else {
                     "service"
                 };
-                assert_eq!(
-                    event.spans[1].fields.0[field],
-                    protocol.as_ref().rsplit('/').next().unwrap()
-                );
+                if !filter_handlers {
+                    assert_eq!(
+                        event.spans[1].fields.0[field],
+                        protocol.as_ref().rsplit('/').next().unwrap()
+                    );
+                }
                 tokio::task::spawn_local(async {
                     tracing::debug!("unrelated.listener");
                 })
@@ -462,4 +504,106 @@ async fn tracing_listener_handlers_keep_accept_parents_and_fields() {
         .await;
     capture.assert_path("unrelated.listener", &[]);
     assert!(capture.state.lock().unwrap().entered.is_empty());
+}
+
+// The real RpcSystem polls this network driver. Explicit channels keep two
+// independent workers suspended before either can fail or be cancelled.
+struct TraceNetwork(Option<oneshot::Receiver<bool>>);
+
+impl capnp_rpc::VatNetwork<capnp_rpc::rpc_twoparty_capnp::Side> for TraceNetwork {
+    fn connect(
+        &mut self,
+        _: capnp_rpc::rpc_twoparty_capnp::Side,
+    ) -> Option<Box<dyn capnp_rpc::Connection<capnp_rpc::rpc_twoparty_capnp::Side>>> {
+        None
+    }
+
+    fn accept(
+        &mut self,
+    ) -> capnp::capability::Promise<
+        Box<dyn capnp_rpc::Connection<capnp_rpc::rpc_twoparty_capnp::Side>>,
+        capnp::Error,
+    > {
+        capnp::capability::Promise::from_future(std::future::pending())
+    }
+
+    fn drive_until_shutdown(&mut self) -> capnp::capability::Promise<(), capnp::Error> {
+        let release = self.0.take().unwrap();
+        capnp::capability::Promise::from_future(async move {
+            let _drop = DropEvent("rpc.driver.drop");
+            tracing::debug!("rpc.driver.before");
+            let panic = release.await.unwrap();
+            tracing::debug!("rpc.driver.after");
+            assert!(!panic, "injected tracing driver panic");
+            Err(capnp::Error::failed("injected tracing driver error".into()))
+        })
+    }
+}
+
+#[tokio::test]
+async fn tracing_rpc_workers_have_independent_roots_through_error_and_panic() {
+    use crate::managed_rpc::{ManagedRpc, ManagedRpcSystem};
+
+    let (capture, mut events) = Capture::new();
+    let _subscriber = tracing::subscriber::set_default(capture.clone());
+    let mut callers = Vec::new();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut workers = Vec::new();
+            for panic in [false, true] {
+                let (release, resume) = oneshot::channel();
+                let caller = tracing::info_span!(parent: None, "short.caller");
+                callers.push(caller.id().unwrap());
+                let worker = caller.in_scope(|| {
+                    ManagedRpc::spawn(ManagedRpcSystem::new(
+                        Box::new(TraceNetwork(Some(resume))),
+                        None,
+                    ))
+                });
+                drop(caller);
+                let event = observed(&mut events, "rpc.driver.before").await;
+                assert_eq!(
+                    event.spans.len(),
+                    1,
+                    "worker requires its own root: {event:?}"
+                );
+                assert_eq!(event.spans[0].name, "rpc");
+                workers.push((
+                    worker,
+                    release,
+                    panic,
+                    event.spans[0].fields.0["rpc_id"].clone(),
+                ));
+            }
+            assert_ne!(workers[0].3, workers[1].3);
+            tokio::task::spawn_local(async {
+                tracing::debug!("rpc.unrelated");
+            })
+            .await
+            .unwrap();
+            for (worker, release, panic, id) in workers {
+                release.send(panic).unwrap();
+                assert!(worker.await.unwrap().is_err());
+                for message in ["rpc.driver.after", "rpc.driver.drop"] {
+                    let event = observed(&mut events, message).await;
+                    assert_eq!(event.spans.len(), 1);
+                    assert_eq!(event.spans[0].fields.0["rpc_id"], id);
+                }
+            }
+            tracing::debug!("rpc.unrelated");
+        })
+        .await;
+    capture.assert_path("rpc.unrelated", &[]);
+    let state = capture.state.lock().unwrap();
+    assert!(state.entered.is_empty());
+    // Value: protects=causal ownership; fails_when=follows_from is missing or
+    // targets another caller; why_new=JSON omits causal edges; seam=none.
+    assert_eq!(state.follows.len(), callers.len());
+    for ((span, follows), caller) in state.follows.iter().zip(callers) {
+        let source = &state.spans[span.into_u64() as usize - 1];
+        assert_eq!(source.name, "rpc");
+        assert!(source.parent.is_none());
+        assert_eq!(*follows, caller);
+    }
+    assert_ne!(state.follows[0].0, state.follows[1].0);
 }
