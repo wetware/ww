@@ -9,6 +9,7 @@ use async_trait::async_trait;
 pub mod engine;
 pub mod fs_intercept;
 pub mod image;
+pub mod lifecycle;
 pub mod loaders;
 pub mod metrics;
 pub mod mount;

@@ -154,6 +154,7 @@ impl Drop for Admin {
 struct Scrape {
     body: String,
     samples: BTreeMap<String, u64>,
+    duration_sums: BTreeMap<String, f64>,
     http_elapsed: Duration,
 }
 
@@ -184,6 +185,7 @@ impl Scrape {
             "Prometheus text requires a final newline"
         );
         let mut samples = BTreeMap::new();
+        let mut duration_sums = BTreeMap::new();
         let mut types = BTreeMap::new();
         let mut helps = BTreeSet::new();
         for line in body.lines() {
@@ -196,14 +198,26 @@ impl Scrape {
                 assert!(matches!(kind, "gauge" | "counter" | "histogram"));
                 assert!(types.insert(name.to_owned(), kind.to_owned()).is_none());
             } else {
-                // The live producers have integer samples and bounded labels.
-                // This is a parser for this endpoint's live subset, not a general
-                // Prometheus parser for future fuel/RPC observations.
+                // This parser validates the endpoint's fixed families and labels.
+                // Duration sums use seconds; all other samples are integers.
                 let (identity, value) = line.split_once(' ').expect("sample value");
                 let name = identity.split('{').next().unwrap();
                 assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
-                assert!(types.contains_key(name), "sample without TYPE: {line}");
-                if identity.contains('{') {
+                let family = metric_family(name);
+                assert!(types.contains_key(family), "sample without TYPE: {line}");
+                if family != name {
+                    assert_eq!(types[family], "histogram");
+                    if name.ends_with("_bucket") {
+                        assert!(
+                            LIFECYCLE_BUCKETS
+                                .iter()
+                                .any(|bound| { identity == format!("{name}{{le=\"{bound}\"}}") }),
+                            "unsupported histogram labels: {identity}"
+                        );
+                    } else {
+                        assert_eq!(identity, name, "unexpected duration labels");
+                    }
+                } else if identity.contains('{') {
                     if name == "ww_fuel_decisions_total" {
                         assert!(
                             ["scheduled", "oneshot"].iter().any(|policy| {
@@ -218,6 +232,12 @@ impl Scrape {
                         );
                     } else {
                         let (label, values): (&str, &[&str]) = match name {
+                            "ww_wasmtime_component_compile_total" => {
+                                ("outcome", &["success", "error"])
+                            }
+                            "ww_wasmtime_instantiations_total" => {
+                                ("outcome", &["success", "error", "timeout"])
+                            }
                             "ww_fuel_settled_units_total" => ("policy", &["scheduled", "oneshot"]),
                             "ww_wasmtime_cache_state" => {
                                 ("state", &["enabled", "disabled", "fallback"])
@@ -235,6 +255,12 @@ impl Scrape {
                             .any(|value| { identity == format!("{name}{{{label}=\"{value}\"}}") }));
                     }
                 }
+                if name.ends_with("_sum") {
+                    let value: f64 = value.parse().expect("duration sum in seconds");
+                    assert!(value.is_finite() && value >= 0.0);
+                    assert!(duration_sums.insert(identity.to_owned(), value).is_none());
+                    continue;
+                }
                 let value: u64 = value.parse().expect("nonnegative integer sample");
                 assert!(
                     samples.insert(identity.to_owned(), value).is_none(),
@@ -248,6 +274,13 @@ impl Scrape {
             ("ww_wasmtime_cache_hits_total", "counter"),
             ("ww_wasmtime_cache_stores_total", "counter"),
             ("ww_wasmtime_component_compilations_total", "counter"),
+            ("ww_wasmtime_component_compile_total", "counter"),
+            (
+                "ww_wasmtime_component_compile_duration_seconds",
+                "histogram",
+            ),
+            ("ww_wasmtime_instantiations_total", "counter"),
+            ("ww_wasmtime_instantiation_duration_seconds", "histogram"),
             ("ww_executor_cell_slots", "gauge"),
             ("ww_executor_spawn_admissions_total", "counter"),
             ("ww_executor_cell_terminations_total", "counter"),
@@ -261,6 +294,7 @@ impl Scrape {
         Self {
             body,
             samples,
+            duration_sums,
             http_elapsed,
         }
     }
@@ -281,6 +315,57 @@ impl Scrape {
             self.samples["ww_wasmtime_component_compilations_total"],
             snapshot.component_compilations
         );
+    }
+
+    fn assert_lifecycle(&self, compilation: [u64; 2], instantiation: [u64; 3]) {
+        for (name, outcomes) in [
+            (
+                "ww_wasmtime_component_compile_total",
+                compilation.as_slice(),
+            ),
+            ("ww_wasmtime_instantiations_total", instantiation.as_slice()),
+        ] {
+            for (outcome, count) in ["success", "error", "timeout"].into_iter().zip(outcomes) {
+                assert_eq!(
+                    self.samples[&format!("{name}{{outcome=\"{outcome}\"}}")],
+                    *count
+                );
+            }
+        }
+        let snapshot = wasmtime_cache_metrics().lifecycle_snapshot();
+        for (name, expected, duration) in [
+            (
+                "ww_wasmtime_component_compile_duration_seconds",
+                compilation.iter().sum::<u64>(),
+                snapshot.compilation.duration,
+            ),
+            (
+                "ww_wasmtime_instantiation_duration_seconds",
+                instantiation.iter().sum::<u64>(),
+                snapshot.instantiation.duration,
+            ),
+        ] {
+            assert_eq!(self.samples[&format!("{name}_count")], expected);
+            assert_eq!(duration.count, expected);
+            let mut previous = 0;
+            for (bound, count) in LIFECYCLE_BUCKETS.iter().zip(duration.buckets) {
+                let observed = self.samples[&format!("{name}_bucket{{le=\"{bound}\"}}")];
+                assert_eq!(observed, count);
+                assert!(observed >= previous && observed <= expected);
+                previous = observed;
+            }
+            assert_eq!(previous, expected, "+Inf must equal count");
+            let sum = self.duration_sums[&format!("{name}_sum")];
+            assert!((sum - duration.sum_nanos as f64 / 1_000_000_000.0).abs() < 1e-9);
+            if expected == 0 {
+                assert_eq!(sum, 0.0);
+            } else {
+                assert!(
+                    sum > 0.0,
+                    "completed operations must have timed observations"
+                );
+            }
+        }
     }
 
     fn assert_executor(&self, occupied: u64, admissions: [u64; 3], terminations: [u64; 3]) {
@@ -318,8 +403,9 @@ impl Scrape {
                 "unsupported sample exposed: {name}"
             );
         }
-        assert_eq!(self.samples.len(), 21);
-        assert!(self.body.len() < 4096, "unbounded metrics response");
+        assert_eq!(self.samples.len(), 48);
+        assert_eq!(self.duration_sums.len(), 2);
+        assert!(self.body.len() < 8192, "unbounded metrics response");
     }
 
     fn assert_live_families_contiguous(&self) {
@@ -330,7 +416,7 @@ impl Scrape {
                 .strip_prefix("# HELP ")
                 .or_else(|| line.strip_prefix("# TYPE "))
                 .unwrap_or(line);
-            let name = content.split([' ', '{']).next().unwrap();
+            let name = metric_family(content.split([' ', '{']).next().unwrap());
             if current != Some(name) {
                 assert!(
                     seen.insert(name),
@@ -340,6 +426,19 @@ impl Scrape {
             }
         }
     }
+}
+
+const LIFECYCLE_BUCKETS: [&str; 10] = [
+    "0.0001", "0.001", "0.01", "0.1", "0.5", "1", "2", "5", "10", "+Inf",
+];
+
+fn metric_family(name: &str) -> &str {
+    for suffix in ["_bucket", "_count", "_sum"] {
+        if let Some(family) = name.strip_suffix(suffix) {
+            return family;
+        }
+    }
+    name
 }
 
 async fn scrape(client: &reqwest::Client, admin: &Admin) -> Scrape {
@@ -921,6 +1020,7 @@ fn metrics_http_probe() {
         );
         let empty = scrape(&client, &admin).await;
         empty.assert_snapshot(initial);
+        empty.assert_lifecycle([0, 0], [0, 0, 0]);
         empty.assert_executor(0, [0, 0, 0], [0, 0, 0]);
         repeat_scrapes(&client, &admin, &mode, "before_compile", measure).await;
 
@@ -930,7 +1030,9 @@ fn metrics_http_probe() {
         assert_eq!(cold.component_compilations, 1);
         assert_eq!(cold.hits, 0);
         assert_eq!(cold.stores, u64::from(mode == "enabled"));
-        scrape(&client, &admin).await.assert_snapshot(cold);
+        let cold_scrape = scrape(&client, &admin).await;
+        cold_scrape.assert_snapshot(cold);
+        cold_scrape.assert_lifecycle([1, 0], [0, 0, 0]);
 
         // A new engine uses the same process cache; a hit is still an attempt.
         compile_component(&wasm_engine().unwrap(), &wasm).expect("second compilation");
@@ -938,15 +1040,22 @@ fn metrics_http_probe() {
         assert_eq!(warm.component_compilations, 2);
         assert_eq!(warm.hits, u64::from(mode == "enabled"));
         assert_eq!(warm.stores, cold.stores);
-        scrape(&client, &admin).await.assert_snapshot(warm);
+        let warm_scrape = scrape(&client, &admin).await;
+        warm_scrape.assert_snapshot(warm);
+        warm_scrape.assert_lifecycle([2, 0], [0, 0, 0]);
 
+        let before_error_duration = metrics.lifecycle_snapshot().compilation.duration.sum_nanos;
         assert!(compile_component(&wasm_engine().unwrap(), b"not wasm").is_err());
+        assert!(
+            metrics.lifecycle_snapshot().compilation.duration.sum_nanos > before_error_duration
+        );
         let failed = metrics.snapshot();
         assert_eq!(failed.component_compilations, 3);
         assert_eq!((failed.hits, failed.stores), (warm.hits, warm.stores));
         assert_eq!(failed.state, initial.state);
         let populated = scrape(&client, &admin).await;
         populated.assert_snapshot(failed);
+        populated.assert_lifecycle([2, 1], [0, 0, 0]);
         repeat_scrapes(&client, &admin, &mode, "after_compile", measure).await;
 
         empty.assert_unsupported_absent();
@@ -954,4 +1063,418 @@ fn metrics_http_probe() {
         empty.assert_live_families_contiguous();
         populated.assert_live_families_contiguous();
     });
+}
+
+#[test]
+fn lifecycle_http_distinguishes_preparation_instantiation_and_command_execution() {
+    // Global lifecycle totals need a process isolated from other P3 tests.
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "lifecycle_http_probe",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_remove(CWASM_DIR_ENV)
+        .env_remove(CWASM_CACHE_MAX_BYTES_ENV)
+        .spawn()
+        .expect("spawn lifecycle HTTP probe");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "lifecycle HTTP probe failed: {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("lifecycle HTTP probe exceeded 60 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn lifecycle_command(start: &str, exit_status: i32) -> Vec<u8> {
+    wat::parse_str(format!(
+        r#"(component
+          (core func $task-return (canon task.return (result (result))))
+          (core module $command
+            (import "" "task-return" (func $task-return (param i32)))
+            {start}
+            (func (export "run")
+              i32.const {exit_status}
+              call $task-return))
+          (core instance $instance
+            (instantiate $command
+              (with "" (instance (export "task-return" (func $task-return))))))
+          (func $run async (result (result))
+            (canon lift (core func $instance "run") async))
+          (instance (export (interface "wasi:cli/run@0.3.0"))
+            (export "run" (func $run))))"#,
+    ))
+    .unwrap()
+}
+
+fn lifecycle_builder(
+    program: cell::Program,
+    runtime: &cell::engine::RuntimeEngine,
+) -> cell::Builder {
+    let (builder, _handles) = cell::Builder::ordinary(
+        program,
+        tokio::io::empty(),
+        tokio::io::sink(),
+        tokio::io::sink(),
+        support::filesystem_ownership(),
+    );
+    builder.with_runtime_engine(runtime.clone())
+}
+
+async fn wait_for_start_suspension(
+    task: &tokio::task::JoinHandle<anyhow::Result<()>>,
+    fuel: &FuelMetrics,
+    expected: u64,
+) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fuel.snapshot().oneshot.suspend < expected {
+            assert!(!task.is_finished(), "start completed before suspension");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("guest start reached the epoch wait");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "invoked only by the isolated lifecycle HTTP subprocess"]
+async fn lifecycle_http_probe() {
+    use cell::proc::{FuelEstimator, ValidatedKernel};
+    use cell::Program;
+
+    let metrics = wasmtime_cache_metrics();
+    let admin = Admin::start();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let (runtime, publisher) = cell::engine::runtime_engine().unwrap();
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([0, 0], [0, 0, 0]);
+
+    let bytes = lifecycle_command("", 0);
+    let proc = lifecycle_builder(Program::Bytes(bytes.clone()), &runtime)
+        .build()
+        .await
+        .unwrap();
+    // Building compiles and validates imports/exports, but executes no guest start.
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([1, 0], [0, 0, 0]);
+    proc.run().await.unwrap();
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([1, 0], [1, 0, 0]);
+
+    let precompiled = Arc::new(compile_component(&runtime.engine(), &bytes).unwrap());
+    lifecycle_builder(Program::Precompiled(precompiled.clone()), &runtime)
+        .build()
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([2, 0], [2, 0, 0]);
+
+    // Valid binary, missing wasi:cli/run: compilation succeeds, pre-validation fails.
+    assert!(lifecycle_builder(
+        Program::Bytes(wat::parse_str("(component)").unwrap()),
+        &runtime
+    )
+    .build()
+    .await
+    .is_err());
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([3, 0], [2, 0, 0]);
+
+    let trap_bytes = lifecycle_command("(func $start unreachable) (start $start)", 0);
+    let trapped = Arc::new(compile_component(&runtime.engine(), &trap_bytes).unwrap());
+    let proc = lifecycle_builder(Program::Precompiled(trapped.clone()), &runtime)
+        .build()
+        .await
+        .expect("static validation must not execute start");
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([4, 0], [2, 0, 0]);
+    let before_trap = metrics
+        .lifecycle_snapshot()
+        .instantiation
+        .duration
+        .sum_nanos;
+    let error = proc.run().await.expect_err("start must trap");
+    assert!(format!("{error:#}").contains("unreachable"));
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([4, 0], [2, 1, 0]);
+    assert!(
+        metrics
+            .lifecycle_snapshot()
+            .instantiation
+            .duration
+            .sum_nanos
+            > before_trap
+    );
+
+    // Initial authority rejection happens before executable instantiation.
+    let error = lifecycle_builder(Program::Precompiled(trapped), &runtime)
+        .with_fuel_estimator(FuelEstimator::new_oneshot(0, 0, 0))
+        .build()
+        .await
+        .unwrap()
+        .run()
+        .await
+        .expect_err("zero fuel authority");
+    assert!(error
+        .to_string()
+        .contains("one-shot total fuel authority exhausted"));
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([4, 0], [2, 1, 0]);
+
+    let error = lifecycle_builder(Program::Bytes(lifecycle_command("", 1)), &runtime)
+        .build()
+        .await
+        .unwrap()
+        .run()
+        .await
+        .expect_err("nonzero guest exit");
+    assert!(error
+        .to_string()
+        .contains("guest returned non-zero exit status"));
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([5, 0], [3, 1, 0]);
+
+    let kernel_bytes = wat::parse_str(include_str!(
+        "../crates/cell/tests/fixtures/kernel-command.wat"
+    ))
+    .unwrap();
+    let validated = Arc::new(ValidatedKernel::compile(&runtime, &kernel_bytes).unwrap());
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([6, 0], [3, 1, 0]);
+    let staging = tempfile::tempdir().unwrap();
+    let filesystem = support::filesystem_ownership();
+    let cid = cell::routing_key::derive(b"lifecycle test root");
+    let tree = Arc::new(cell::vfs::CidTree::new(
+        cid,
+        ipfs::HttpClient::new("http://127.0.0.1:1".into()),
+        staging.path().to_owned(),
+        Arc::clone(filesystem.test_resources().host()),
+        filesystem.test_scope().clone(),
+    ));
+    let (_epoch_tx, epoch_rx) = watch::channel(authority::Epoch {
+        seq: 1,
+        head: cid.to_bytes(),
+        root: Some(cid),
+    });
+    let gate = Arc::new(authority::KernelReadyGate::new(epoch_rx));
+    let (builder, _handles) = cell::Builder::kernel(
+        Program::ValidatedKernel(validated),
+        tokio::io::empty(),
+        tokio::io::sink(),
+        tokio::io::sink(),
+        tree,
+        gate,
+        filesystem,
+    );
+    let proc = builder
+        .with_runtime_engine(runtime.clone())
+        .build()
+        .await
+        .unwrap();
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([6, 0], [3, 1, 0]);
+    proc.run().await.unwrap();
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([6, 0], [4, 1, 0]);
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let runtime = runtime.clone();
+        let precompiled = precompiled.clone();
+        tasks.spawn(async move {
+            lifecycle_builder(Program::Precompiled(precompiled), &runtime)
+                .build()
+                .await
+                .unwrap()
+                .run()
+                .await
+                .unwrap();
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([6, 0], [8, 1, 0]);
+
+    let counted_start = lifecycle_command(
+        r#"(func $start (local $remaining i32)
+            i32.const 3000 local.set $remaining
+            (loop $spin local.get $remaining i32.const 1 i32.sub
+                local.tee $remaining br_if $spin)) (start $start)"#,
+        0,
+    );
+    let counted_start = Arc::new(compile_component(&runtime.engine(), &counted_start).unwrap());
+    let fuel = runtime.fuel_metrics();
+    let proc = lifecycle_builder(Program::Precompiled(counted_start.clone()), &runtime)
+        .with_fuel_estimator(FuelEstimator::new_oneshot(25_000, 12_500, 0))
+        .build()
+        .await
+        .unwrap();
+    let task = tokio::spawn(proc.run());
+    wait_for_start_suspension(&task, &fuel, 1).await;
+    let suspended = scrape(&client, &admin).await;
+    suspended.assert_lifecycle([7, 0], [8, 1, 0]);
+    let before_cancel = metrics.lifecycle_snapshot();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        metrics.lifecycle_snapshot(),
+        before_cancel,
+        "dropping pending work must not invent an outcome or duration"
+    );
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([7, 0], [8, 1, 0]);
+
+    // Retain the publisher but never tick: instantiation waits for a new epoch.
+    // Use real elapsed time so the duration assertion also verifies seconds units.
+    let proc = lifecycle_builder(Program::Precompiled(counted_start), &runtime)
+        .with_fuel_estimator(FuelEstimator::new_oneshot(25_000, 12_500, 0))
+        .build()
+        .await
+        .unwrap();
+    let task = tokio::spawn(proc.run());
+    wait_for_start_suspension(&task, &fuel, 2).await;
+    scrape(&client, &admin)
+        .await
+        .assert_lifecycle([7, 0], [8, 1, 0]);
+    let error = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("instantiation timeout deadline")
+        .unwrap()
+        .expect_err("start must time out");
+    assert_eq!(error.to_string(), "guest component instantiation timed out");
+    let timed_out = metrics.lifecycle_snapshot();
+    assert!(
+        timed_out.instantiation.duration.sum_nanos - before_cancel.instantiation.duration.sum_nanos
+            >= 5_000_000_000
+    );
+    let terminal = scrape(&client, &admin).await;
+    terminal.assert_lifecycle([7, 0], [8, 1, 1]);
+    terminal.assert_unsupported_absent();
+    terminal.assert_live_families_contiguous();
+
+    drop((runtime, publisher, precompiled));
+    let retained = Admin::start();
+    scrape(&client, &retained)
+        .await
+        .assert_lifecycle([7, 0], [8, 1, 1]);
+    assert_eq!(
+        metrics.lifecycle_snapshot(),
+        timed_out,
+        "engine teardown must retain process totals"
+    );
+    if std::env::var_os("WW_METRICS_HTTP_REQUIRE_COMPILED_P3").is_some() {
+        compiled_p3_lifecycle_http(&client, &admin).await;
+    }
+    println!(
+        "LIFECYCLE_HTTP_EVIDENCE={}",
+        serde_json::json!({
+            "samples": terminal.samples, "duration_sums_seconds": terminal.duration_sums,
+            "body_bytes": terminal.body.len(), "cancelled_pending_observations": 0,
+        })
+    );
+}
+
+/// Opt in with WW_METRICS_HTTP_REQUIRE_COMPILED_P3=1 after `make authority-probe`.
+/// The explicit request fails if the compiled Rust native P3 artifact is missing.
+async fn compiled_p3_lifecycle_http(client: &reqwest::Client, admin: &Admin) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/authority-probe/wasm32-wasip3/release/authority_probe.wasm");
+    let bytes = std::fs::read(&artifact).unwrap_or_else(|error| {
+        panic!(
+            "read compiled P3 fixture {}: {error}; run `make authority-probe`",
+            artifact.display()
+        )
+    });
+    let (runtime, mut publisher) = cell::engine::runtime_engine().unwrap();
+    let (mut stdout_read, stdout_write) = tokio::io::duplex(64 * 1024);
+    let (builder, mut handles) = cell::Builder::ordinary(
+        cell::Program::Bytes(bytes),
+        tokio::io::empty(),
+        stdout_write,
+        tokio::io::sink(),
+        support::filesystem_ownership(),
+    );
+    let mut transport = handles.take_host_stream().unwrap();
+    let proc = builder
+        .with_runtime_engine(runtime)
+        .with_args(vec!["authority-probe".into(), "no-graft".into()])
+        .build()
+        .await
+        .expect("prepare compiled Rust P3 command");
+    scrape(client, admin)
+        .await
+        .assert_lifecycle([8, 0], [8, 1, 1]);
+
+    let guest = async {
+        let run = proc.run();
+        tokio::pin!(run);
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            tokio::select! {
+                result = &mut run => break result,
+                _ = interval.tick() => { publisher.tick(); }
+            }
+        }
+    };
+    let transport_io = async {
+        let mut discarded = Vec::new();
+        transport.read_to_end(&mut discarded).await.unwrap();
+        transport.shutdown().await.unwrap();
+    };
+    let output = async {
+        let mut bytes = Vec::new();
+        stdout_read.read_to_end(&mut bytes).await.unwrap();
+        bytes
+    };
+    let (result, (), output) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(guest, transport_io, output)
+    })
+    .await
+    .expect("compiled P3 command completion deadline");
+    result.expect("compiled Rust P3 command succeeds");
+    let output: serde_json::Value = serde_json::from_slice(&output).expect("native P3 stdout JSON");
+    assert_eq!(output["mode"], "no-graft");
+    assert_eq!(output["ok"], true);
+    let terminal = scrape(client, admin).await;
+    terminal.assert_lifecycle([8, 0], [9, 1, 1]);
+    println!(
+        "COMPILED_P3_LIFECYCLE_HTTP_EVIDENCE={}",
+        serde_json::json!({
+            "artifact": artifact, "guest_stdout": output,
+            "samples": terminal.samples, "duration_sums_seconds": terminal.duration_sums,
+        })
+    );
 }

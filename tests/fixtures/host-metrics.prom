@@ -1,0 +1,76 @@
+# HELP ww_wasmtime_cache_state Wasmtime compilation cache state (one active state has value 1).
+# TYPE ww_wasmtime_cache_state gauge
+ww_wasmtime_cache_state{state="enabled"} 1
+ww_wasmtime_cache_state{state="disabled"} 0
+ww_wasmtime_cache_state{state="fallback"} 0
+# HELP ww_wasmtime_cache_hits_total Successful Wasmtime compilation cache loads.
+# TYPE ww_wasmtime_cache_hits_total counter
+ww_wasmtime_cache_hits_total 1
+# HELP ww_wasmtime_cache_stores_total Successful Wasmtime compilation cache stores; this is not a lookup-miss count.
+# TYPE ww_wasmtime_cache_stores_total counter
+ww_wasmtime_cache_stores_total 1
+# HELP ww_wasmtime_component_compilations_total Calls to ww's canonical Component::from_binary path; persistent-cache hits and failed attempts are included.
+# TYPE ww_wasmtime_component_compilations_total counter
+ww_wasmtime_component_compilations_total 3
+# HELP ww_wasmtime_component_compile_total Returned canonical Component::from_binary operations, including persistent-cache loads by outcome over this process lifetime.
+# TYPE ww_wasmtime_component_compile_total counter
+ww_wasmtime_component_compile_total{outcome="success"} 2
+ww_wasmtime_component_compile_total{outcome="error"} 1
+# HELP ww_wasmtime_component_compile_duration_seconds Returned canonical Component::from_binary operations, including persistent-cache loads: elapsed seconds for observed outcomes, including failures.
+# TYPE ww_wasmtime_component_compile_duration_seconds histogram
+ww_wasmtime_component_compile_duration_seconds_bucket{le="0.0001"} 0
+ww_wasmtime_component_compile_duration_seconds_bucket{le="0.001"} 1
+ww_wasmtime_component_compile_duration_seconds_bucket{le="0.01"} 3
+ww_wasmtime_component_compile_duration_seconds_bucket{le="0.1"} 3
+ww_wasmtime_component_compile_duration_seconds_bucket{le="0.5"} 3
+ww_wasmtime_component_compile_duration_seconds_bucket{le="1"} 3
+ww_wasmtime_component_compile_duration_seconds_bucket{le="2"} 3
+ww_wasmtime_component_compile_duration_seconds_bucket{le="5"} 3
+ww_wasmtime_component_compile_duration_seconds_bucket{le="10"} 3
+ww_wasmtime_component_compile_duration_seconds_bucket{le="+Inf"} 3
+ww_wasmtime_component_compile_duration_seconds_sum 0.005761916
+ww_wasmtime_component_compile_duration_seconds_count 3
+# HELP ww_wasmtime_instantiations_total Executable CommandPre instantiations, including start functions; excludes command execution and dropped pending futures by outcome over this process lifetime.
+# TYPE ww_wasmtime_instantiations_total counter
+ww_wasmtime_instantiations_total{outcome="success"} 0
+ww_wasmtime_instantiations_total{outcome="error"} 0
+ww_wasmtime_instantiations_total{outcome="timeout"} 0
+# HELP ww_wasmtime_instantiation_duration_seconds Executable CommandPre instantiations, including start functions; excludes command execution and dropped pending futures: elapsed seconds for observed outcomes, including failures.
+# TYPE ww_wasmtime_instantiation_duration_seconds histogram
+ww_wasmtime_instantiation_duration_seconds_bucket{le="0.0001"} 0
+ww_wasmtime_instantiation_duration_seconds_bucket{le="0.001"} 0
+ww_wasmtime_instantiation_duration_seconds_bucket{le="0.01"} 0
+ww_wasmtime_instantiation_duration_seconds_bucket{le="0.1"} 0
+ww_wasmtime_instantiation_duration_seconds_bucket{le="0.5"} 0
+ww_wasmtime_instantiation_duration_seconds_bucket{le="1"} 0
+ww_wasmtime_instantiation_duration_seconds_bucket{le="2"} 0
+ww_wasmtime_instantiation_duration_seconds_bucket{le="5"} 0
+ww_wasmtime_instantiation_duration_seconds_bucket{le="10"} 0
+ww_wasmtime_instantiation_duration_seconds_bucket{le="+Inf"} 0
+ww_wasmtime_instantiation_duration_seconds_sum 0
+ww_wasmtime_instantiation_duration_seconds_count 0
+# HELP ww_executor_cell_slots Executor-admitted Cell task slots, queued or running, across all workers.
+# TYPE ww_executor_cell_slots gauge
+ww_executor_cell_slots 0
+# HELP ww_executor_spawn_admissions_total Spawn attempts by admission outcome over this Host lifetime.
+# TYPE ww_executor_spawn_admissions_total counter
+ww_executor_spawn_admissions_total{outcome="accepted"} 0
+ww_executor_spawn_admissions_total{outcome="full"} 0
+ww_executor_spawn_admissions_total{outcome="closed"} 0
+# HELP ww_executor_cell_terminations_total Admitted task lifetimes ended by executor outcome over this Host lifetime; completed means the factory future returned, not guest success.
+# TYPE ww_executor_cell_terminations_total counter
+ww_executor_cell_terminations_total{outcome="completed"} 0
+ww_executor_cell_terminations_total{outcome="cancelled"} 0
+ww_executor_cell_terminations_total{outcome="panicked"} 0
+# HELP ww_fuel_decisions_total Applied fuel decisions over this Host lifetime.
+# TYPE ww_fuel_decisions_total counter
+ww_fuel_decisions_total{policy="scheduled",decision="grant"} 0
+ww_fuel_decisions_total{policy="scheduled",decision="suspend"} 0
+ww_fuel_decisions_total{policy="scheduled",decision="exhausted"} 0
+ww_fuel_decisions_total{policy="oneshot",decision="grant"} 0
+ww_fuel_decisions_total{policy="oneshot",decision="suspend"} 0
+ww_fuel_decisions_total{policy="oneshot",decision="exhausted"} 0
+# HELP ww_fuel_settled_units_total Published physical fuel units accounted for at settlement boundaries over this Host lifetime; live Stores can have unpublished values; excludes unsettled termination tails.
+# TYPE ww_fuel_settled_units_total counter
+ww_fuel_settled_units_total{policy="scheduled"} 0
+ww_fuel_settled_units_total{policy="oneshot"} 0
