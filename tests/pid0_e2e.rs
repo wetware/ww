@@ -1629,28 +1629,196 @@ mod rust_lifecycle {
             "text/plain; version=0.0.4; charset=utf-8"
         );
         let body = response.text().await.expect("read Host metrics");
+        parse_host_metrics(&body)
+    }
+
+    // The fixed HELP/TYPE text is below 3 KiB. Fifty sample lines, each below
+    // 100 bytes even with 20-digit u64 values, keep the full schema below 8 KiB.
+    const MAX_HOST_METRICS_BYTES: usize = 8 * 1024;
+    const DURATION_HISTOGRAMS: [&str; 2] = [
+        "ww_wasmtime_component_compile_duration_seconds",
+        "ww_wasmtime_instantiation_duration_seconds",
+    ];
+    const DURATION_BOUNDS: [&str; 10] = [
+        "0.0001", "0.001", "0.01", "0.1", "0.5", "1", "2", "5", "10", "+Inf",
+    ];
+
+    /// Validate all 50 samples; return the 48 exact integers used by PID0 checks.
+    /// Duration sums are validated separately and never converted to counters.
+    fn parse_host_metrics(body: &str) -> std::collections::BTreeMap<String, u64> {
         assert!(
-            body.len() < 4096,
+            body.len() < MAX_HOST_METRICS_BYTES,
             "Host metrics response must remain bounded"
         );
-        let samples: std::collections::BTreeMap<_, _> = body
+        let mut raw = std::collections::BTreeMap::new();
+        for line in body
             .lines()
-            .filter(|line| !line.starts_with('#'))
-            .map(|line| {
-                let (name, value) = line.split_once(' ').expect("metric sample");
-                (
-                    name.to_owned(),
-                    value.parse::<u64>().expect("integer sample"),
-                )
-            })
-            .collect();
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        {
+            let mut fields = line.split_whitespace();
+            let name = fields.next().expect("metric name");
+            let value = fields.next().expect("metric value");
+            assert!(fields.next().is_none(), "unexpected sample fields: {line}");
+            assert!(
+                raw.insert(name, value).is_none(),
+                "duplicate metric: {name}"
+            );
+        }
+        assert_eq!(raw.len(), 50, "Host must expose exactly 50 fixed samples");
+
+        let mut integer_names: Vec<String> = [
+            "ww_wasmtime_cache_hits_total",
+            "ww_wasmtime_cache_stores_total",
+            "ww_wasmtime_component_compilations_total",
+            "ww_executor_cell_slots",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for (family, label, values) in [
+            (
+                "ww_wasmtime_cache_state",
+                "state",
+                &["enabled", "disabled", "fallback"][..],
+            ),
+            (
+                "ww_executor_spawn_admissions_total",
+                "outcome",
+                &["accepted", "full", "closed"][..],
+            ),
+            (
+                "ww_executor_cell_terminations_total",
+                "outcome",
+                &["completed", "cancelled", "panicked"][..],
+            ),
+            (
+                "ww_wasmtime_component_compile_total",
+                "outcome",
+                &["success", "error"][..],
+            ),
+            (
+                "ww_wasmtime_instantiations_total",
+                "outcome",
+                &["success", "error", "timeout"][..],
+            ),
+        ] {
+            for value in values {
+                integer_names.push(format!("{family}{{{label}=\"{value}\"}}"));
+            }
+        }
+        for policy in ["scheduled", "oneshot"] {
+            integer_names.push(format!(
+                "ww_fuel_settled_units_total{{policy=\"{policy}\"}}"
+            ));
+            for decision in ["grant", "suspend", "exhausted"] {
+                integer_names.push(format!(
+                    "ww_fuel_decisions_total{{policy=\"{policy}\",decision=\"{decision}\"}}"
+                ));
+            }
+        }
+        for histogram in DURATION_HISTOGRAMS {
+            for bound in DURATION_BOUNDS {
+                integer_names.push(format!("{histogram}_bucket{{le=\"{bound}\"}}"));
+            }
+            integer_names.push(format!("{histogram}_count"));
+            let sum_name = format!("{histogram}_sum");
+            let sum = raw
+                .remove(sum_name.as_str())
+                .unwrap_or_else(|| panic!("missing metric: {sum_name}"))
+                .parse::<f64>()
+                .expect("numeric duration sum");
+            // This exporter divides an unsigned nanosecond total by 1e9.
+            // Fractional/exponent notation is valid; negative/nonfinite sums are not.
+            assert!(
+                sum.is_finite() && sum >= 0.0,
+                "invalid duration sum: {sum_name}"
+            );
+        }
+        let mut samples = std::collections::BTreeMap::new();
+        for name in integer_names {
+            let value = raw
+                .remove(name.as_str())
+                .unwrap_or_else(|| panic!("missing metric: {name}"));
+            samples.insert(
+                name,
+                value.parse::<u64>().expect("exact unsigned integer sample"),
+            );
+        }
+        assert!(raw.is_empty(), "unexpected metric series: {raw:?}");
+        for histogram in DURATION_HISTOGRAMS {
+            let mut previous = 0;
+            for bound in DURATION_BOUNDS {
+                let count = samples[&format!("{histogram}_bucket{{le=\"{bound}\"}}")];
+                assert!(count >= previous, "noncumulative histogram: {histogram}");
+                previous = count;
+            }
+            assert_eq!(
+                previous,
+                samples[&format!("{histogram}_count")],
+                "+Inf must equal count: {histogram}"
+            );
+            // Outcome counters and duration totals are loaded independently.
+            // Do not require transactional equality during a live scrape.
+        }
         assert_eq!(samples["ww_wasmtime_cache_state{state=\"enabled\"}"], 1);
-        assert_eq!(
-            samples.len(),
-            21,
-            "Host must expose only bounded live series"
-        );
+        assert_eq!(samples["ww_wasmtime_cache_state{state=\"disabled\"}"], 0);
+        assert_eq!(samples["ww_wasmtime_cache_state{state=\"fallback\"}"], 0);
         samples
+    }
+
+    #[test]
+    fn host_metrics_parser_accepts_complete_schema_without_rounding_counters() {
+        let body = include_str!("fixtures/host-metrics.prom")
+            .replace(
+                "ww_wasmtime_cache_hits_total 1\n",
+                "ww_wasmtime_cache_hits_total 18446744073709551615\n",
+            )
+            .replace("_sum 0.005761916", "_sum 5.761916e-3");
+        let samples = parse_host_metrics(&body);
+        assert_eq!(samples["ww_wasmtime_cache_hits_total"], u64::MAX);
+    }
+
+    #[test]
+    fn host_metrics_parser_rejects_invalid_schema_and_samples() {
+        let body = include_str!("fixtures/host-metrics.prom");
+        let invalid = [
+            body.replace(
+                "ww_wasmtime_cache_hits_total 1\n",
+                "ww_wasmtime_cache_hits_total 1.5\n",
+            ),
+            body.replace(
+                "ww_wasmtime_cache_hits_total 1\n",
+                "ww_wasmtime_cache_hits_total 18446744073709551616\n",
+            ),
+            body.replace(
+                "ww_wasmtime_cache_hits_total 1\n",
+                "ww_wasmtime_cache_hits_total\n",
+            ),
+            body.replace(
+                "ww_wasmtime_cache_hits_total 1\n",
+                "ww_wasmtime_cache_hits_total 1 extra\n",
+            ),
+            body.replace("ww_wasmtime_cache_hits_total 1\n", ""),
+            format!("{body}ww_wasmtime_cache_hits_total 1\n"),
+            format!("{body}unexpected_metric 1\n"),
+            body.replace("ww_wasmtime_cache_hits_total", "unexpected_metric"),
+            body.replace("outcome=\"timeout\"", "outcome=\"unknown\""),
+            body.replace("le=\"0.0001\"", "le=\"0.0002\""),
+            body.replace("le=\"+Inf\"", "le=\"Inf\""),
+            body.replace("_sum 0.005761916", "_sum NaN"),
+            body.replace("_sum 0.005761916", "_sum +Inf"),
+            body.replace("_sum 0.005761916", "_sum -0.5"),
+            body.replace("_sum 0.005761916", "_sum invalid"),
+            body.replace("_count 3", "_count 4"),
+            body.replace("_bucket{le=\"0.01\"} 3", "_bucket{le=\"0.01\"} 0"),
+            format!("{body}#{}", "x".repeat(MAX_HOST_METRICS_BYTES)),
+        ];
+        for (case, invalid) in invalid.iter().enumerate() {
+            assert!(
+                std::panic::catch_unwind(|| parse_host_metrics(invalid)).is_err(),
+                "accepted invalid case {case}"
+            );
+        }
     }
 
     async fn tty_stdin_and_status_route_driver() {
