@@ -233,11 +233,12 @@ async fn exercise_children(child_span_enabled: bool, launcher_trace_enabled: boo
         }
     }
     assert_eq!(started.len(), 2);
-    assert_eq!(stopped, started);
     if launcher_trace_enabled {
+        assert_eq!(stopped, started);
         assert_eq!(filesystem_snapshots, started);
         assert_eq!(filesystem_completions, started);
     } else {
+        assert!(stopped.is_empty());
         assert!(filesystem_snapshots.is_empty());
         assert!(filesystem_completions.is_empty());
     }

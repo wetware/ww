@@ -178,6 +178,12 @@ Both filesystem events use trace level; normal completion emits no additional
 info/debug filesystem event. The typed snapshot remains available on demand.
 Cleanup certification failures retain their existing error event.
 
+These are producer-side fields. The default [Host logging subscriber](logging.md)
+redacts the Debug-formatted snapshot and the non-allowlisted `succeeded` boolean,
+even at TRACE; their uncatalogued messages become `unclassified event (text redacted)`.
+Use the typed `FsCompletion` API to inspect these details. The tracing tests use
+a separate subscriber that retains the producer fields.
+
 The events contain owner-local identity, timestamp, receipt count, typed phases,
 bounded operation records, omission count, and booleans. They contain no paths,
 CIDs, capabilities, or error text.
