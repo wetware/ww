@@ -34,6 +34,10 @@ use rpc::managed_rpc::{ManagedRpc, DISCONNECT_GRACE};
 static RPC_EOF_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static NEXT_CHILD_CELL_ID: AtomicU64 = AtomicU64::new(1);
 
+#[path = "launcher_stderr.rs"]
+mod stderr;
+use stderr::ChildStderr;
+
 #[cfg(test)]
 #[path = "launcher_tracing_tests.rs"]
 mod tracing_tests;
@@ -356,7 +360,7 @@ struct OwnedChildLifecycle {
     proc: Option<Proc>,
     filesystem_completion: cache::FsCompletion,
     rpc_task: Option<ManagedRpc>,
-    stderr_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Option<ChildStderr>,
     membrane: Option<system_capnp::membrane::Client>,
     bootstrap_control: ProcessBootstrapControl,
     kill_rx: tokio::sync::watch::Receiver<bool>,
@@ -417,7 +421,7 @@ impl OwnedChildLifecycle {
             filesystem = ?filesystem_completion.try_snapshot(),
             "executor: child filesystem ownership after guest exit"
         );
-        let (filesystem_result, rpc_terminalization_completed) =
+        let (filesystem_result, auxiliary_terminalization_completed) =
             tokio::join!(filesystem_completion.wait(), self.stop_auxiliary_tasks());
         let filesystem_completed = match filesystem_result {
             Ok(()) => true,
@@ -442,12 +446,12 @@ impl OwnedChildLifecycle {
             exit_code,
             "executor: child process exited"
         );
-        if filesystem_completed && rpc_terminalization_completed {
+        if filesystem_completed && auxiliary_terminalization_completed {
             if let Some(cleanup) = self.cleanup.take() {
                 cleanup.cleaned(exit_code);
             }
         }
-        // A worker lost before managed disconnect returned cannot certify
+        // A worker lost before its terminal return cannot certify
         // teardown. Publisher drop preserves Lost rather than fabricating exit.
     }
 
@@ -455,48 +459,51 @@ impl OwnedChildLifecycle {
         if let Some(task) = self.rpc_task.take() {
             task.shutdown();
         }
-        if let Some(task) = self.stderr_task.take() {
-            task.abort();
-        }
+        drop(self.stderr_task.take());
     }
 
     async fn stop_auxiliary_tasks(&mut self) -> bool {
-        let mut rpc_terminalization_completed = true;
         // Keep handles in the owner across every await so cancellation still
         // reaches them through OwnedChildLifecycle::drop.
-        if let Some(task) = &self.stderr_task {
-            task.abort();
-        }
-        if let Some(task) = self.rpc_task.as_mut() {
-            // Store destruction has closed the guest transport. Explicitly
-            // release connection exports, then join the existing worker within
-            // its one-second grace before publishing backend cleanup.
-            let result = task.shutdown_and_join().await;
-            // Both outer Ok results prove the worker reached its terminal
-            // return point. Inner errors still count as RPC failures; only a
-            // JoinError prevents the owner from certifying cleanup.
-            rpc_terminalization_completed = result.is_ok();
-            if !matches!(result, Ok(Ok(()))) {
-                RPC_EOF_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                let error: &dyn std::error::Error = match &result {
-                    Ok(Err(error)) => error,
-                    Err(error) => error,
-                    Ok(Ok(())) => unreachable!("failure branch"),
-                };
-                tracing::warn!(
-                    event_code = EventCode::RpcCleanupFailed as u16,
-                    timeout_ms = DISCONNECT_GRACE.as_millis() as u64,
-                    error,
-                    "executor: child RPC disconnect failed or exceeded grace"
-                );
+        let stderr = async {
+            match self.stderr_task.as_mut() {
+                Some(task) => task.finish().await,
+                None => true,
             }
-        }
+        };
+        let rpc = async {
+            let mut rpc_terminalization_completed = true;
+            if let Some(task) = self.rpc_task.as_mut() {
+                // Store destruction has closed the guest transport. Explicitly
+                // release connection exports, then join the existing worker within
+                // its one-second grace before publishing backend cleanup.
+                let result = task.shutdown_and_join().await;
+                // Both outer Ok results prove the worker reached its terminal
+                // return point. Inner errors still count as RPC failures; only a
+                // JoinError prevents the owner from certifying cleanup.
+                rpc_terminalization_completed = result.is_ok();
+                if !matches!(result, Ok(Ok(()))) {
+                    RPC_EOF_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    let error: &dyn std::error::Error = match &result {
+                        Ok(Err(error)) => error,
+                        Err(error) => error,
+                        Ok(Ok(())) => unreachable!("failure branch"),
+                    };
+                    tracing::warn!(
+                        event_code = EventCode::RpcCleanupFailed as u16,
+                        timeout_ms = DISCONNECT_GRACE.as_millis() as u64,
+                        error,
+                        "executor: child RPC disconnect failed or exceeded grace"
+                    );
+                }
+            }
+            rpc_terminalization_completed
+        };
+        // Both deadlines start at teardown, independently of the other worker.
+        let (rpc_completed, stderr_completed) = tokio::join!(rpc, stderr);
         self.rpc_task.take();
-        if let Some(task) = self.stderr_task.as_mut() {
-            let _ = task.await;
-        }
         self.stderr_task.take();
-        rpc_terminalization_completed
+        rpc_completed && stderr_completed
     }
 }
 
@@ -602,10 +609,11 @@ impl system_capnp::executor::Server for ExecutorImpl {
         // A spawned child has its own lifetime and identity. Unlike the named
         // ExecutorPool owner (`cell_name`), each child gets a process-local ID.
         // The caller caused the spawn but does not own all later child work.
+        let cell_id = NEXT_CHILD_CELL_ID.fetch_add(1, Ordering::Relaxed);
         let span = tracing::info_span!(
             parent: None,
             "cell",
-            cell_id = NEXT_CHILD_CELL_ID.fetch_add(1, Ordering::Relaxed),
+            cell_id,
         );
         span.follows_from(tracing::Span::current());
         let child_span = span.clone();
@@ -614,7 +622,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
                 cache::CellResources::new(filesystem_resources, cache::CellLimits::default());
             let filesystem = cell::FilesystemOwnership::try_new(cell_resources)
                 .map_err(|error| capnp::Error::overloaded(error.to_string()))?;
-            let (host_stderr, guest_stderr) = io::duplex(64 * 1024);
+            let (host_stderr, guest_stderr) = io::duplex(stderr::PIPE_BYTES);
             let (host_stdin, guest_stdin) = io::duplex(64 * 1024);
             let (host_stdout, guest_stdout) = io::duplex(64 * 1024);
 
@@ -684,15 +692,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
             let (rpc_task, guest_bootstrap) =
                 graft::build_child_membrane_rpc(reader, writer, child_membrane.clone());
 
-            let stderr_task = tokio::task::spawn_local(async move {
-                use tokio::io::AsyncBufReadExt;
-                let reader = tokio::io::BufReader::new(host_stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    // Guest output is untrusted; ordinary logs never render its contents.
-                    tracing::trace!(bytes = line.len(), "guest stderr line redacted");
-                }
-            });
+            let stderr_task = ChildStderr::spawn(host_stderr, cell_id, child_span.clone());
 
             let stdin =
                 capnp_rpc::new_client(ByteStreamImpl::new(host_stdin, StreamMode::WriteOnly));
@@ -1259,10 +1259,25 @@ mod tests {
             let _on_drop = rpc_dropped_tx;
             std::future::pending::<()>().await;
         });
-        let stderr_task = tokio::task::spawn_local(async move {
-            let _on_drop = stderr_dropped_tx;
-            std::future::pending::<()>().await;
-        });
+        struct PendingStderr {
+            _on_drop: oneshot::Sender<()>,
+        }
+        impl tokio::io::AsyncRead for PendingStderr {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+        let stderr_task = ChildStderr::spawn(
+            PendingStderr {
+                _on_drop: stderr_dropped_tx,
+            },
+            0,
+            tracing::Span::none(),
+        );
         let (stream, _) = io::duplex(1);
         let stream: system_capnp::byte_stream::Client =
             capnp_rpc::new_client(ByteStreamImpl::new(stream, StreamMode::ReadOnly));
@@ -1412,13 +1427,29 @@ mod tests {
             .await;
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn owned_child_lifecycle_publishes_cleaned_only_after_full_teardown() {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let output = tracing_tests::Output::default();
+        let writer = output.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (mut lifecycle, process, dropped, tasks_dropped, observer) =
                     lifecycle_loss_fixture();
+                let (stderr_reader, mut stderr_writer) = io::duplex(stderr::PIPE_BYTES);
+                stderr_writer
+                    .write_all(b"final fragment\xff")
+                    .await
+                    .unwrap();
+                lifecycle.stderr_task =
+                    Some(ChildStderr::spawn(stderr_reader, 99, tracing::Span::none()));
                 let wasm = wat::parse_str(
                     r#"
                     (component
@@ -1481,6 +1512,14 @@ mod tests {
                     "RPC join still prevents cleanup acknowledgement"
                 );
                 rpc_release_tx.send(()).unwrap();
+                // RPC may finish, but an open stderr writer must still prevent
+                // cleanup publication. Stay within the one-second drain grace.
+                tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_millis(100)).await;
+                tokio::task::yield_now().await;
+                assert_eq!(observer.state(), rpc::CleanupState::Running);
+                assert!(wait.as_mut().now_or_never().is_none());
+                drop(stderr_writer);
                 owner.await.expect("child teardown owner");
                 for task_dropped in tasks_dropped {
                     assert!(task_dropped.await.is_err());
@@ -1496,6 +1535,18 @@ mod tests {
                 assert_eq!(observer.state(), rpc::CleanupState::Cleaned(0));
             })
             .await;
+        let output = output.0.lock().unwrap();
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let drained = events
+            .iter()
+            .find(|event| event["fields"]["event_code"] == EventCode::CellStderrDrained as u16)
+            .expect("stderr summary precedes cleanup publication");
+        assert_eq!(drained["fields"]["bytes"], b"final fragment\xff".len());
+        assert_eq!(drained["fields"]["cell_id"], 99);
     }
 
     struct PanickingBootstrap;

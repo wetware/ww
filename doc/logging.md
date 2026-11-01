@@ -40,6 +40,11 @@ them. Every recognized event includes numeric `contract_version=1`.
 | 201 | cell | run | failed | process_failed | WARN or ERROR |
 | 202 | cell | teardown | failed | cleanup_failed | ERROR |
 | 203 | cell | terminate | requested | termination_request | TRACE |
+| 204 | cell | drain_stderr | completed | eof | TRACE |
+| 205 | cell | drain_stderr | truncated | drain_deadline | WARN |
+| 206 | cell | drain_stderr | cancelled | owner_dropped | WARN |
+| 207 | cell | drain_stderr | failed | read_failed | WARN |
+| 208 | cell | drain_stderr | failed | worker_lost | WARN |
 | 300 | p3 | instantiate | timed_out | instantiation_deadline | ERROR |
 | 301 | p3 | compile | fallback | cache_unavailable | WARN |
 | 302 | p3 | compile | fallback | cache_configuration_invalid | WARN |
@@ -189,13 +194,70 @@ The audit started at fetched `origin/master` commit
 | `tests/logging_output.rs` | Exercises the installed subscriber in isolated subprocesses, including TTY selection, filtering, and concurrent task attribution. |
 | `tests/pid0_e2e.rs` | Preserves numeric PID0 event-code checks. Route lifecycle checks use registration IDs; effective image identity comes from existing `/version` typed state. |
 
+## Ordinary child stderr
+
+The Host consumes ordinary child stderr as untrusted bytes. It retains no raw
+messages, parses no guest levels or context, and emits no per-line events.
+Structured-looking guest JSON has no authority to create Host events. This is
+the metadata-only slice of #155; an authorized raw-output channel is separate work.
+`Process.stderr` retains its existing empty stream behavior.
+
+Each child has a 64 KiB duplex and an 8 KiB reader buffer. Newlines, partial
+lines, and invalid UTF-8 have no special meaning: every received byte contributes
+to `bytes`. There is no text decoder and therefore no encoding-error outcome.
+The reader retains constant memory and yields after each chunk. It discards raw
+content deliberately; the summary describes consumption, not message retention.
+
+After guest execution ends, the lifecycle owner drops the Store and applies one
+one-second deadline to the reader join. Individual reads do not reset the deadline.
+The stderr and RPC teardown deadlines run concurrently.
+Normal exit, guest failure, kill, and cooperative Host shutdown use this same
+drain path. EOF certifies consumption of all bytes accepted by the duplex. It
+does not certify guest writes cancelled before acceptance or delivery to a log
+collector. A kill can interrupt a guest write even when the subsequent drain
+reaches EOF.
+
+The owner emits one summary before publishing backend cleanup. Code 204 means
+EOF was observed and the reader joined. On deadline expiry, the owner aborts and
+joins the reader before reporting code 205. A completed read failure reports
+code 207. These two outcomes can still certify resource teardown, but neither
+certifies complete output consumption. An unexpected reader task failure reports
+code 208 and withholds cleanup certification. Dropping the lifecycle owner aborts
+the reader and reports code 206 without claiming that asynchronous cleanup
+finished. Existing `Process.wait` cleanup-loss behavior remains in effect.
+
+Every summary includes the Host-assigned `cell_id`, `bytes`, and `completed`.
+`cell_id` remains available when filters disable the child span. `completed` is
+true only for code 204. `bytes` counts consumed bytes, including delimiters and
+invalid UTF-8, and saturates at `u64::MAX` (then a lower bound). Incomplete summaries
+also include the configured `timeout_ms=1000`; this is not elapsed time or proof
+that cancellation waited for the deadline. The unread tail size is unknown;
+zero consumed bytes with `completed=false` does not mean the child wrote nothing.
+
+Successful summaries remain TRACE-only. Incomplete summaries use WARN. The Host
+subscriber and trace exporter apply their existing bounds and filters; neither
+provides durable delivery of these summaries.
+
+The deadline is cooperative, not a hard wall-clock limit on full teardown.
+Executor scheduling, abort/join processing, filesystem cleanup, and the existing
+synchronous log writer can add latency. The fixed-size reader yields between
+chunks so continuously ready output does not starve its deadline.
+
+Issue #155 remains open. Its original per-record output requirements are not
+implemented here: operators cannot read guest messages, guest levels and context
+are not preserved, and unstructured lines receive no record level. This byte-only
+path also provides no invalid-encoding counter or exact lost-byte count. Those
+requirements need a separately authorized guest-output contract. PID0 isolation
+remains separate under #755.
+
 ## Scope and remaining gaps
 
 The policy applies to the Host tracing subscriber, including enabled dependency
 events. It does not sanitize returned RPC errors, direct CLI error rendering,
-interactive shell output, or direct guest stderr. Child stderr ownership and final
-drain remain under #155. These outputs must not be mistaken for sanitized JSON
-Host event records.
+interactive shell output, or direct PID0 guest stderr. `src/kernel.rs` still
+passes process stderr directly to PID0. Full-daemon Host-log isolation remains
+under #755. These outputs must not be mistaken for sanitized JSON Host event
+records.
 
 Unconverted events intentionally lose free-text explanations. Source location and
 safe numeric fields remain available; future meaningful events require a reviewed
