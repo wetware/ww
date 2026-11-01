@@ -74,3 +74,25 @@ ww_fuel_decisions_total{policy="oneshot",decision="exhausted"} 0
 # TYPE ww_fuel_settled_units_total counter
 ww_fuel_settled_units_total{policy="scheduled"} 0
 ww_fuel_settled_units_total{policy="oneshot"} 0
+# HELP ww_telemetry_sampled_out_total Cell roots excluded by sampling.
+# TYPE ww_telemetry_sampled_out_total counter
+ww_telemetry_sampled_out_total 0
+# HELP ww_telemetry_admitted_total Spans admitted before subsequent queue or delivery loss.
+# TYPE ww_telemetry_admitted_total counter
+ww_telemetry_admitted_total 0
+# HELP ww_telemetry_exported_total Spans accepted by the collector; does not establish Tempo delivery.
+# TYPE ww_telemetry_exported_total counter
+ww_telemetry_exported_total 0
+# HELP ww_telemetry_request_bytes_total Attempted OTLP HTTP JSON body bytes, excluding network overhead.
+# TYPE ww_telemetry_request_bytes_total counter
+ww_telemetry_request_bytes_total 0
+# HELP ww_telemetry_active_spans Active sampled spans retained by the local exporter.
+# TYPE ww_telemetry_active_spans gauge
+ww_telemetry_active_spans 0
+# HELP ww_telemetry_dropped_total Lost spans, or event and field records for reason record.
+# TYPE ww_telemetry_dropped_total counter
+ww_telemetry_dropped_total{reason="queue"} 0
+ww_telemetry_dropped_total{reason="limit"} 0
+ww_telemetry_dropped_total{reason="record"} 0
+ww_telemetry_dropped_total{reason="export"} 0
+ww_telemetry_dropped_total{reason="shutdown"} 0
