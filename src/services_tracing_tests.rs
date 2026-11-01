@@ -214,7 +214,10 @@ fn exercise_cells(cancel: bool) {
                 .with_writer(json_writer),
         );
         tracing::subscriber::with_default(subscriber, || {
-            worker_loop(0, requests_rx, shutdown_rx, worker_counts, None).unwrap();
+            let registry = worker_liveness::WorkerRegistry::default();
+            let (_liveness, mut guards) = registry.register(1, shutdown_rx.clone()).unwrap();
+            let guard = guards.pop().unwrap();
+            worker_loop(0, requests_rx, shutdown_rx, worker_counts, None, &guard).unwrap();
             tracing::info!(probe = "after_worker", owner = "none");
         });
     });

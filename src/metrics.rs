@@ -17,7 +17,10 @@ use tokio::sync::watch;
 use crate::cell::engine::{WasmtimeCacheMetrics, WasmtimeCacheSnapshot, WasmtimeCacheState};
 use crate::cell::lifecycle::{WasmtimeLifecycleSnapshot, DURATION_BUCKET_SECONDS};
 use crate::cell::metrics::FuelMetrics;
-use crate::services::{ExecutorMetrics, ExecutorSnapshot};
+use crate::services::{
+    ExecutorMetrics, ExecutorSnapshot, WorkerState, WORKER_HEARTBEAT_INTERVAL,
+    WORKER_STALL_THRESHOLD,
+};
 
 /// Immutable build and artifact identity exposed by `GET /version`.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -110,6 +113,7 @@ fn render_metrics(state: &AdminState) -> String {
     render_wasmtime_cache_metrics(&mut out, &state.wasmtime_cache_metrics.snapshot());
     render_wasmtime_lifecycle_metrics(&mut out, state.wasmtime_cache_metrics.lifecycle_snapshot());
     render_executor_metrics(&mut out, state.executor_metrics.snapshot());
+    render_worker_liveness(&mut out, &state.executor_metrics);
     render_fuel_metrics(&mut out, &state.fuel_metrics);
     out
 }
@@ -251,6 +255,70 @@ fn render_executor_metrics(out: &mut String, snapshot: ExecutorSnapshot) {
             "ww_executor_cell_terminations_total{{outcome=\"{outcome}\"}} {value}"
         )
         .unwrap();
+    }
+}
+
+/// Worker indices are bounded by the configured pool size. Collection runs on
+/// the admin thread and never asks an executor worker to answer a scrape.
+fn render_worker_liveness(out: &mut String, metrics: &ExecutorMetrics) {
+    let workers = metrics.worker_liveness();
+    out.push_str("# HELP ww_executor_worker_heartbeat_interval_seconds Target interval between LocalSet progress publications; missed ticks are skipped.\n");
+    out.push_str("# TYPE ww_executor_worker_heartbeat_interval_seconds gauge\n");
+    writeln!(
+        out,
+        "ww_executor_worker_heartbeat_interval_seconds {}",
+        WORKER_HEARTBEAT_INTERVAL.as_secs_f64()
+    )
+    .unwrap();
+    out.push_str("# HELP ww_executor_worker_stall_threshold_seconds Progress age at which a worker with confirmed progress becomes stalled; stopped workers are excluded.\n");
+    out.push_str("# TYPE ww_executor_worker_stall_threshold_seconds gauge\n");
+    writeln!(
+        out,
+        "ww_executor_worker_stall_threshold_seconds {}",
+        WORKER_STALL_THRESHOLD.as_secs_f64()
+    )
+    .unwrap();
+    out.push_str("# HELP ww_executor_worker_state Worker lifecycle state; exactly one state is 1. Shutdown requested does not imply progress.\n");
+    out.push_str("# TYPE ww_executor_worker_state gauge\n");
+    for worker in &workers {
+        for (state, name) in [
+            (WorkerState::Starting, "starting"),
+            (WorkerState::Running, "running"),
+            (WorkerState::ShuttingDown, "shutting_down"),
+            (WorkerState::Stopped, "stopped"),
+        ] {
+            writeln!(
+                out,
+                "ww_executor_worker_state{{worker=\"{}\",state=\"{name}\"}} {}",
+                worker.worker_id,
+                u8::from(worker.state == state)
+            )
+            .unwrap();
+        }
+    }
+    out.push_str("# HELP ww_executor_worker_stalled Worker has no confirmed LocalSet progress for the stall threshold; clears on progress or stopped state, not shutdown request. Does not prove permanent deadlock.\n");
+    out.push_str("# TYPE ww_executor_worker_stalled gauge\n");
+    for worker in &workers {
+        writeln!(
+            out,
+            "ww_executor_worker_stalled{{worker=\"{}\"}} {}",
+            worker.worker_id,
+            u8::from(worker.stalled)
+        )
+        .unwrap();
+    }
+    out.push_str("# HELP ww_executor_worker_progress_age_seconds Monotonic elapsed time since confirmed LocalSet progress; absent before first publication, retained through shutdown.\n");
+    out.push_str("# TYPE ww_executor_worker_progress_age_seconds gauge\n");
+    for worker in &workers {
+        if let Some(age) = worker.progress_age {
+            writeln!(
+                out,
+                "ww_executor_worker_progress_age_seconds{{worker=\"{}\"}} {}",
+                worker.worker_id,
+                age.as_secs_f64()
+            )
+            .unwrap();
+        }
     }
 }
 
@@ -689,18 +757,18 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("# HELP "))
                 .count(),
-            13
+            18
         );
         assert_eq!(
             output
                 .lines()
                 .filter(|line| line.starts_with("# TYPE "))
                 .count(),
-            13
+            18
         );
         assert_eq!(
             output.lines().filter(|line| !line.starts_with('#')).count(),
-            50
+            52
         );
     }
 

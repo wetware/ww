@@ -364,8 +364,10 @@ locally through `OwnedChildLifecycle` do not submit a new pool admission.
 
 Admission failure describes the selected worker's channel. A full channel does
 not establish that every worker is full. Occupancy does not distinguish runnable
-work, guest I/O waits, or one-shot epoch suspension. These metrics do not detect
-blocked workers.
+work, guest I/O waits, or one-shot epoch suspension. Separate
+[worker liveness metrics](worker-liveness.md) detect missing event-loop progress
+with a 250 ms heartbeat and five-second threshold. They identify workers with
+bounded numeric labels and preserve the existing health/readiness contracts.
 
 Metric slot guards track queue and task ownership independently of the scheduler's
 existing `cell_counts`. Those counters can retain stale values after immediate
@@ -423,16 +425,22 @@ cancellation, and Store teardown can leave physical consumption unsettled.
 The runtime adds no termination settlement. Initial zero-budget rejection
 adds no consumption.
 
-The endpoint exports exactly 50 series: 35 Wasmtime samples, seven executor
-samples, six fuel-decision samples, and two settled-consumption samples.
-Metric names, HELP text, and label values are static. The renderer accepts
+The endpoint exports 52 fixed series: 35 Wasmtime samples, seven executor
+samples, six fuel-decision samples, two settled-consumption samples, and two
+worker-liveness policy samples. Each configured executor worker adds five
+lifecycle/stall samples and one age sample after its first confirmed progress.
+Metric names and HELP text are static. Worker indices are bounded by the
+configured worker count; other label values are fixed. The renderer accepts
 no dynamic label or HELP text that requires escaping. Cell identifiers, task names,
 RPC methods, paths, peer IDs, and CIDs do not become metric labels. Response size
-is bounded by fixed text and bounded numeric representations, regardless of Cell churn.
+is bounded by configured worker count and bounded numeric representations,
+regardless of Cell churn.
 
 Collection adds atomic updates at completed Wasmtime lifecycle boundaries,
 at executor admission and terminal boundaries,
-at applied fuel decisions, and when Stores publish pending settled fuel.
+at applied fuel decisions, and when Stores publish pending settled fuel. Worker
+liveness adds one clock read and atomic publication per heartbeat, with no
+additional instrumentation on Wasmtime Host returns.
 Settlements between publications update only Store-owned ordinary integers.
 Epoch notification alone does not record a fuel decision or consumption.
 The existing test-only

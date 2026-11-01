@@ -74,3 +74,21 @@ ww_fuel_decisions_total{policy="oneshot",decision="exhausted"} 0
 # TYPE ww_fuel_settled_units_total counter
 ww_fuel_settled_units_total{policy="scheduled"} 0
 ww_fuel_settled_units_total{policy="oneshot"} 0
+# HELP ww_executor_worker_heartbeat_interval_seconds Target interval between LocalSet progress publications; missed ticks are skipped.
+# TYPE ww_executor_worker_heartbeat_interval_seconds gauge
+ww_executor_worker_heartbeat_interval_seconds 0.25
+# HELP ww_executor_worker_stall_threshold_seconds Progress age at which a worker with confirmed progress becomes stalled; stopped workers are excluded.
+# TYPE ww_executor_worker_stall_threshold_seconds gauge
+ww_executor_worker_stall_threshold_seconds 5
+# HELP ww_executor_worker_state Worker lifecycle state; exactly one state is 1. Shutdown requested does not imply progress.
+# TYPE ww_executor_worker_state gauge
+ww_executor_worker_state{worker="0",state="starting"} 0
+ww_executor_worker_state{worker="0",state="running"} 1
+ww_executor_worker_state{worker="0",state="shutting_down"} 0
+ww_executor_worker_state{worker="0",state="stopped"} 0
+# HELP ww_executor_worker_stalled Worker has no confirmed LocalSet progress for the stall threshold; clears on progress or stopped state, not shutdown request. Does not prove permanent deadlock.
+# TYPE ww_executor_worker_stalled gauge
+ww_executor_worker_stalled{worker="0"} 0
+# HELP ww_executor_worker_progress_age_seconds Monotonic elapsed time since confirmed LocalSet progress; absent before first publication, retained through shutdown.
+# TYPE ww_executor_worker_progress_age_seconds gauge
+ww_executor_worker_progress_age_seconds{worker="0"} 0.01

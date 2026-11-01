@@ -1657,9 +1657,9 @@ mod rust_lifecycle {
         parse_host_metrics(&body)
     }
 
-    // The fixed HELP/TYPE text is below 3 KiB. Fifty sample lines, each below
-    // 100 bytes even with 20-digit u64 values, keep the full schema below 8 KiB.
-    const MAX_HOST_METRICS_BYTES: usize = 8 * 1024;
+    // These daemon tests configure one worker. Metadata, fixed aggregate
+    // samples and at most six worker samples must fit this bound.
+    const MAX_HOST_METRICS_BYTES: usize = 11 * 1024;
     const DURATION_HISTOGRAMS: [&str; 2] = [
         "ww_wasmtime_component_compile_duration_seconds",
         "ww_wasmtime_instantiation_duration_seconds",
@@ -1668,8 +1668,8 @@ mod rust_lifecycle {
         "0.0001", "0.001", "0.01", "0.1", "0.5", "1", "2", "5", "10", "+Inf",
     ];
 
-    /// Validate all 50 samples; return the 48 exact integers used by PID0 checks.
-    /// Duration sums are validated separately and never converted to counters.
+    /// Validate aggregate and worker samples; return the 48 exact integers
+    /// used by PID0 checks. Timing samples never become integer counters.
     fn parse_host_metrics(body: &str) -> std::collections::BTreeMap<String, u64> {
         assert!(
             body.len() < MAX_HOST_METRICS_BYTES,
@@ -1689,7 +1689,53 @@ mod rust_lifecycle {
                 "duplicate metric: {name}"
             );
         }
-        assert_eq!(raw.len(), 50, "Host must expose exactly 50 fixed samples");
+        for (name, expected) in [
+            ("ww_executor_worker_heartbeat_interval_seconds", 0.25),
+            ("ww_executor_worker_stall_threshold_seconds", 5.0),
+        ] {
+            let value: f64 = raw
+                .remove(name)
+                .expect("worker policy gauge")
+                .parse()
+                .unwrap();
+            assert_eq!(value, expected);
+        }
+        // Before pool construction there are no worker samples. Once the pool
+        // exists, its single configured worker has a complete fixed state set.
+        if let Some(stalled) = raw.remove("ww_executor_worker_stalled{worker=\"0\"}") {
+            assert!(matches!(stalled, "0" | "1"));
+            let mut active_states = 0;
+            let mut running = false;
+            let mut stopped = false;
+            for state in ["starting", "running", "shutting_down", "stopped"] {
+                let name = format!("ww_executor_worker_state{{worker=\"0\",state=\"{state}\"}}");
+                let value = raw
+                    .remove(name.as_str())
+                    .expect("complete worker state set");
+                assert!(matches!(value, "0" | "1"));
+                active_states += usize::from(value == "1");
+                running |= state == "running" && value == "1";
+                stopped |= state == "stopped" && value == "1";
+            }
+            assert_eq!(active_states, 1);
+            let age = raw.remove("ww_executor_worker_progress_age_seconds{worker=\"0\"}");
+            assert!(
+                !running || age.is_some(),
+                "running requires confirmed progress"
+            );
+            if let Some(age) = age {
+                let age: f64 = age.parse().expect("worker progress age");
+                assert!(age.is_finite() && age >= 0.0);
+                assert_eq!(stalled == "1", !stopped && age >= 5.0);
+            } else {
+                assert_eq!(stalled, "0");
+            }
+        }
+        assert_eq!(
+            raw.len(),
+            50,
+            "Host must expose exactly 50 aggregate samples"
+        );
 
         let mut integer_names: Vec<String> = [
             "ww_wasmtime_cache_hits_total",
@@ -1836,6 +1882,20 @@ mod rust_lifecycle {
             body.replace("_sum 0.005761916", "_sum invalid"),
             body.replace("_count 3", "_count 4"),
             body.replace("_bucket{le=\"0.01\"} 3", "_bucket{le=\"0.01\"} 0"),
+            body.replace(
+                "ww_executor_worker_heartbeat_interval_seconds 0.25",
+                "ww_executor_worker_heartbeat_interval_seconds 1",
+            ),
+            body.replace("worker=\"0\"", "worker=\"42\""),
+            body.replace("state=\"starting\"} 0", "state=\"starting\"} 1"),
+            body.replace(
+                "ww_executor_worker_stalled{worker=\"0\"} 0",
+                "ww_executor_worker_stalled{worker=\"0\"} 1",
+            ),
+            body.replace(
+                "ww_executor_worker_progress_age_seconds{worker=\"0\"} 0.01",
+                "ww_executor_worker_progress_age_seconds{worker=\"0\"} NaN",
+            ),
             format!("{body}#{}", "x".repeat(MAX_HOST_METRICS_BYTES)),
         ];
         for (case, invalid) in invalid.iter().enumerate() {
