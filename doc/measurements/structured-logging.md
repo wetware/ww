@@ -24,7 +24,10 @@ loop. Compilation and shutdown are excluded. Allocations were not measured.
 
 Both trees used the same test source, toolchain, profile, machine, and sink.
 The baseline is master `a85e4c4bf074a1d4f399de9daea92d5476bb9e2e` with only the
-measurement test added. Tests used the unoptimized Cargo test profile on an
+measurement test added. The final candidate is `2b05a33b`, including master
+`24a2ff06` (landed #786) and the outgoing RPC correlation repair. This comparison
+therefore includes the integrated upstream changes; it does not isolate only
+the logging patch. Tests used the unoptimized Cargo test profile on an
 Apple `Mac17,7` (`arm64`), Rust 1.96.0. Heavy builds and timed experiments held
 `/tmp/ww-fuel-coordination/build-benchmark.lock`. All 40 power samples reported
 AC power. The baseline run preceded the final run; the observations are not a
@@ -58,14 +61,14 @@ CPU medians, microseconds per Cell:
 
 | Format | Filter | Master | Final | Change |
 | --- | --- | ---: | ---: | ---: |
-| JSON | OFF | 508.36 | 504.93 | −0.7% |
-| JSON | default INFO | 517.84 | 519.04 | +0.2% |
-| JSON | TRACE | 614.81 | 634.42 | +3.2% |
-| compact | OFF | 505.16 | 506.00 | +0.2% |
-| compact | default INFO | 513.50 | 520.01 | +1.3% |
-| compact | TRACE | 574.58 | 604.32 | +5.2% |
+| JSON | OFF | 522.26 | 518.20 | -0.8% |
+| JSON | default INFO | 536.26 | 534.88 | -0.3% |
+| JSON | TRACE | 640.03 | 652.53 | +2.0% |
+| compact | OFF | 523.41 | 521.71 | -0.3% |
+| compact | default INFO | 535.06 | 535.46 | +0.1% |
+| compact | TRACE | 599.77 | 632.23 | +5.4% |
 
-Final wall medians were 518.16 µs/Cell for default JSON and 517.01 µs/Cell for
+Final wall medians were 529.18 µs/Cell for default JSON and 528.57 µs/Cell for
 default compact output. Default-level CPU ranges overlap the baseline ranges.
 These observations do not establish a material default-level CPU regression.
 They also do not establish equivalence outside this workload. TRACE increased
