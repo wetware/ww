@@ -310,6 +310,7 @@ fn open_read_only_path(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MaterializeError {
     Busy(cache::AdmissionError),
+    Cancelled,
     Invalid,
     Io,
     NoEntry,
@@ -321,6 +322,7 @@ impl From<MaterializeError> for p3_types::ErrorCode {
     fn from(error: MaterializeError) -> Self {
         match error {
             MaterializeError::Busy(_) => Self::Busy,
+            MaterializeError::Cancelled => Self::Interrupted,
             MaterializeError::Invalid => Self::Invalid,
             MaterializeError::Io => Self::Io,
             MaterializeError::NoEntry => Self::NoEntry,
@@ -520,6 +522,7 @@ async fn materialize_resolved_descriptor(
                 .map_err(|_| MaterializeError::Io)
         }
         ResolvedNode::CidDir { cid } => {
+            let cancellation = filesystem_scope.cancellation();
             let transaction = resources
                 .host()
                 .try_cleanup_transaction(logical, &[filesystem_scope])
@@ -549,29 +552,93 @@ async fn materialize_resolved_descriptor(
                 #[cfg(test)]
                 let cleanup_hook = tests::take_directory_cleanup_hook();
                 let build_scope = filesystem_scope.clone();
-                transaction
-                    .run_directory_build(filesystem_scope, move || {
-                        build_directory(
-                            staging_root,
-                            publish_path,
-                            entries,
-                            build_scope,
-                            #[cfg(test)]
-                            build_hook,
-                            #[cfg(test)]
-                            cleanup_hook,
-                        )
-                    })
-                    .await
-                    .map_err(|_| MaterializeError::Io)?
-                    .into_inner()?;
+                let build_cancellation = cancellation.clone();
+                submit_directory_build(&transaction, filesystem_scope, &cancellation, move || {
+                    build_directory(
+                        staging_root,
+                        publish_path,
+                        entries,
+                        build_scope,
+                        build_cancellation,
+                        #[cfg(test)]
+                        build_hook,
+                        #[cfg(test)]
+                        cleanup_hook,
+                    )
+                })
+                .await?;
             }
+            check_directory_cancellation(&cancellation)?;
+            #[cfg(any(test, feature = "test-support"))]
+            let descriptor_scope = filesystem_scope.clone();
             transaction
                 .run_blocking(cache::FilesystemOperation::DescriptorOpen, move || {
+                    check_directory_cancellation(&cancellation)?;
+                    #[cfg(any(test, feature = "test-support"))]
+                    descriptor_scope.test_event(
+                        cache::FilesystemOperation::DescriptorOpen,
+                        cache::FsTestStage::Started,
+                        None,
+                    );
                     open_read_only_path(&staging_dir, None)
                 })
                 .await
                 .map_err(|_| MaterializeError::Io)
+        }
+    }
+}
+
+async fn submit_directory_build(
+    transaction: &cache::ForegroundTransaction,
+    scope: &cache::FsScope,
+    cancellation: &cache::FsCancellation,
+    build: impl FnOnce() -> Result<(), MaterializeError> + Send + 'static,
+) -> Result<(), MaterializeError> {
+    check_directory_cancellation(cancellation)?;
+    transaction
+        .run_directory_build(scope, build)
+        .await
+        .map_err(|_| MaterializeError::Io)?
+        .into_inner()
+}
+
+fn check_directory_cancellation(
+    cancellation: &cache::FsCancellation,
+) -> Result<(), MaterializeError> {
+    if cancellation.is_cancelled() {
+        Err(MaterializeError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+// Explicit rollback also runs on unwind. Published content is disarmed before
+// any later work so a reused private pathname or another winner is never removed.
+struct DirectoryTemporary<'a> {
+    directory: Option<tempfile::TempDir>,
+    scope: &'a cache::FsScope,
+    #[cfg(test)]
+    cleanup_hook: Option<tests::DirectoryCleanupHook>,
+}
+
+impl DirectoryTemporary<'_> {
+    fn path(&self) -> &std::path::Path {
+        self.directory
+            .as_ref()
+            .expect("private directory published")
+            .path()
+    }
+}
+
+impl Drop for DirectoryTemporary<'_> {
+    fn drop(&mut self) {
+        if let Some(temporary) = self.directory.take() {
+            cleanup_temporary_directory(
+                self.scope,
+                temporary,
+                #[cfg(test)]
+                &mut self.cleanup_hook,
+            );
         }
     }
 }
@@ -581,69 +648,72 @@ fn build_directory(
     staging_dir: std::path::PathBuf,
     entries: Vec<crate::vfs::DirEntry>,
     filesystem_scope: cache::FsScope,
+    cancellation: cache::FsCancellation,
     #[cfg(test)] mut build_hook: Option<tests::DirectoryBuildHook>,
-    #[cfg(test)] mut cleanup_hook: Option<tests::DirectoryCleanupHook>,
+    #[cfg(test)] cleanup_hook: Option<tests::DirectoryCleanupHook>,
 ) -> Result<(), MaterializeError> {
+    check_directory_cancellation(&cancellation)?;
     std::fs::create_dir_all(&staging_root).map_err(|_| MaterializeError::Io)?;
+    check_directory_cancellation(&cancellation)?;
     let temporary = tempfile::Builder::new()
         .prefix(".cid-dir-")
         .tempdir_in(&staging_root)
         .map_err(|_| MaterializeError::Io)?;
-    let populate = (|| {
-        for entry in entries {
-            if !is_confined_relative_path(&entry.name)
-                || std::path::Path::new(&entry.name).components().count() != 1
-            {
-                tracing::warn!(name = %entry.name, "rejected unconfined CidTree entry");
-                return Err(MaterializeError::Invalid);
+    let mut temporary = DirectoryTemporary {
+        directory: Some(temporary),
+        scope: &filesystem_scope,
+        #[cfg(test)]
+        cleanup_hook,
+    };
+    for entry in entries {
+        check_directory_cancellation(&cancellation)?;
+        if !is_confined_relative_path(&entry.name)
+            || std::path::Path::new(&entry.name).components().count() != 1
+        {
+            tracing::warn!(name = %entry.name, "rejected unconfined CidTree entry");
+            return Err(MaterializeError::Invalid);
+        }
+        let entry_path = temporary.path().join(&entry.name);
+        match entry.entry_type {
+            crate::vfs::EntryType::Dir => {
+                std::fs::create_dir_all(entry_path).map_err(|_| MaterializeError::Io)?;
             }
-            let entry_path = temporary.path().join(&entry.name);
-            match entry.entry_type {
-                crate::vfs::EntryType::Dir => {
-                    std::fs::create_dir_all(entry_path).map_err(|_| MaterializeError::Io)?;
-                }
-                _ => {
-                    let file =
-                        std::fs::File::create(entry_path).map_err(|_| MaterializeError::Io)?;
-                    file.set_len(entry.size).map_err(|_| MaterializeError::Io)?;
-                }
+            _ => {
+                let file = std::fs::File::create(entry_path).map_err(|_| MaterializeError::Io)?;
+                check_directory_cancellation(&cancellation)?;
+                file.set_len(entry.size).map_err(|_| MaterializeError::Io)?;
             }
-            #[cfg(test)]
-            tests::directory_build_hook(
-                &mut build_hook,
-                temporary.path(),
-                tests::BuildStage::Entry,
-            )?;
-            #[cfg(any(test, feature = "test-support"))]
-            filesystem_scope.test_event(
-                cache::FilesystemOperation::DirectoryBuild,
-                cache::FsTestStage::DirectoryEntry,
-                Some(temporary.path().to_owned()),
-            );
         }
         #[cfg(test)]
-        tests::directory_build_hook(
-            &mut build_hook,
-            temporary.path(),
-            tests::BuildStage::BeforePublish,
-        )?;
+        tests::directory_build_hook(&mut build_hook, temporary.path(), tests::BuildStage::Entry)?;
         #[cfg(any(test, feature = "test-support"))]
         filesystem_scope.test_event(
             cache::FilesystemOperation::DirectoryBuild,
-            cache::FsTestStage::BeforePublish,
+            cache::FsTestStage::DirectoryEntry,
             Some(temporary.path().to_owned()),
         );
-        Ok(())
-    })();
-    if let Err(error) = populate {
-        cleanup_temporary_directory(
-            &filesystem_scope,
-            temporary,
-            #[cfg(test)]
-            &mut cleanup_hook,
-        );
-        return Err(error);
     }
+    #[cfg(test)]
+    tests::directory_build_hook(
+        &mut build_hook,
+        temporary.path(),
+        tests::BuildStage::BeforePublish,
+    )?;
+    #[cfg(any(test, feature = "test-support"))]
+    filesystem_scope.test_event(
+        cache::FilesystemOperation::DirectoryBuild,
+        cache::FsTestStage::BeforePublish,
+        Some(temporary.path().to_owned()),
+    );
+    if !cancellation.try_accept_commit() {
+        return Err(MaterializeError::Cancelled);
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    filesystem_scope.test_event(
+        cache::FilesystemOperation::DirectoryBuild,
+        cache::FsTestStage::CommitAccepted,
+        Some(temporary.path().to_owned()),
+    );
 
     use rustix::fs::{renameat_with, RenameFlags, CWD};
     match renameat_with(
@@ -654,7 +724,7 @@ fn build_directory(
         RenameFlags::NOREPLACE,
     ) {
         Ok(()) => {
-            let _former_path = temporary.keep();
+            let _former_path = temporary.directory.take().unwrap().keep();
             #[cfg(test)]
             tests::directory_build_hook(
                 &mut build_hook,
@@ -669,20 +739,9 @@ fn build_directory(
             );
         }
         Err(rustix::io::Errno::EXIST) if staging_dir.is_dir() => {
-            cleanup_temporary_directory(
-                &filesystem_scope,
-                temporary,
-                #[cfg(test)]
-                &mut cleanup_hook,
-            );
+            // The guard removes only this builder's private staging.
         }
         Err(_) => {
-            cleanup_temporary_directory(
-                &filesystem_scope,
-                temporary,
-                #[cfg(test)]
-                &mut cleanup_hook,
-            );
             return Err(MaterializeError::Io);
         }
     }
@@ -696,11 +755,13 @@ fn cleanup_temporary_directory(
 ) {
     let temporary_path = temporary.path().to_owned();
     #[cfg(test)]
-    if let Err(error) = tests::directory_cleanup_hook(cleanup_hook, &temporary_path) {
-        filesystem_scope.record_cleanup_failure(format!(
-            "failed to remove temporary CidTree directory {}: injected {error:?}",
-            temporary_path.display()
-        ));
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tests::directory_cleanup_hook(cleanup_hook, &temporary_path)
+    })) {
+        Ok(Ok(())) => {}
+        result => filesystem_scope.record_cleanup_failure(format!(
+            "temporary CidTree directory rollback hook failed or panicked: {result:?}"
+        )),
     }
     if let Err(error) = temporary.close() {
         filesystem_scope.record_cleanup_failure(format!(
@@ -1883,8 +1944,419 @@ mod tests {
         assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 2);
     }
 
+    // Regressions for the distinct admission/driver/blocking execution boundaries.
+    #[test]
+    fn directory_cancellation_before_execution_has_no_filesystem_effects() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for boundary in [
+                "never-polled",
+                "before-submit",
+                "driver-queued",
+                "blocking-queued",
+            ] {
+                let fs = TestFilesystem::new();
+                let parent = tempfile::tempdir().unwrap();
+                let root = parent.path().join("untouched");
+                let destination = root.join("published");
+                let transaction = fs
+                    .resources
+                    .host()
+                    .try_cleanup_transaction(fs.resources.try_logical_io().unwrap(), &[&fs.scope])
+                    .unwrap();
+                let entered = Arc::new(AtomicBool::new(false));
+                let witness = Arc::clone(&entered);
+                let scope = fs.scope.clone();
+                let cancellation = scope.cancellation();
+                let work_root = root.clone();
+                let (submitted_tx, submitted_rx) = tokio::sync::oneshot::channel();
+                let submitted_tx = std::sync::Mutex::new(Some(submitted_tx));
+                fs.scope.set_test_hook(Arc::new(move |event| {
+                    if event.stage == cache::FsTestStage::BlockingSubmitted {
+                        let _ = submitted_tx.lock().unwrap().take().unwrap().send(());
+                    }
+                }));
+                let (blocker_release_tx, blocker_release_rx) = std::sync::mpsc::channel();
+                let blocker = if boundary == "blocking-queued" {
+                    let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        blocked_tx.send(()).unwrap();
+                        blocker_release_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                    });
+                    blocked_rx.await.unwrap();
+                    Some(blocker)
+                } else {
+                    None
+                };
+                let build_cancellation = cancellation.clone();
+                let mut call = Box::pin(submit_directory_build(
+                    &transaction,
+                    &fs.scope,
+                    &cancellation,
+                    move || {
+                        witness.store(true, Ordering::SeqCst);
+                        build_directory(
+                            work_root,
+                            destination,
+                            directory_entries(),
+                            scope,
+                            build_cancellation,
+                            None,
+                            None,
+                        )
+                    },
+                ));
+                if matches!(boundary, "driver-queued" | "blocking-queued") {
+                    std::future::poll_fn(|cx| {
+                        assert!(call.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    if boundary == "blocking-queued" {
+                        // Driver has submitted the job, but the sole native worker is gated.
+                        submitted_rx.await.unwrap();
+                    }
+                    assert!(!entered.load(Ordering::SeqCst));
+                }
+                drop(fs._scope_owner);
+                if let Some(blocker) = blocker {
+                    blocker_release_tx.send(()).unwrap();
+                    blocker.await.unwrap();
+                }
+                if boundary == "never-polled" {
+                    drop(call);
+                } else {
+                    assert_eq!(call.await, Err(MaterializeError::Cancelled), "{boundary}");
+                }
+                assert_eq!(
+                    entered.load(Ordering::SeqCst),
+                    matches!(boundary, "driver-queued" | "blocking-queued"),
+                    "{boundary}"
+                );
+                assert!(!root.exists(), "{boundary} must cause no native effects");
+                drop(transaction);
+                fs.completion.wait().await.unwrap();
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn directory_rollback_error_and_panics_fail_completion_after_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for failure in ["rollback-error", "rollback-panic", "populate-panic"] {
+            let fs = TestFilesystem::new();
+            let staging = tempfile::tempdir().unwrap();
+            let root = staging.path().to_owned();
+            let final_path = root.join("published");
+            let later_cleanup = Arc::new(AtomicBool::new(false));
+            let later_witness = Arc::clone(&later_cleanup);
+            fs.scope
+                .own_cleanup(cache::FilesystemOperation::ProcessCleanup, move || {
+                    later_witness.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            let transaction = fs
+                .resources
+                .host()
+                .try_cleanup_transaction(fs.resources.try_logical_io().unwrap(), &[&fs.scope])
+                .unwrap();
+            let scope = fs.scope.clone();
+            let mut owner = Some(fs._scope_owner);
+            let parent = root.clone();
+            let result = transaction
+                .run_directory_build(&fs.scope, move || {
+                    build_directory(
+                        root,
+                        final_path,
+                        directory_entries(),
+                        scope.clone(),
+                        scope.cancellation(),
+                        Some(Box::new(move |_, stage| {
+                            if stage == BuildStage::Entry {
+                                drop(owner.take());
+                                assert_ne!(failure, "populate-panic", "injected population panic");
+                            }
+                            Ok(())
+                        })),
+                        Some(Box::new(move |_| {
+                            assert_ne!(failure, "rollback-panic", "injected rollback panic");
+                            if failure == "rollback-error" {
+                                // A real unlink/rmdir failure, not just a synthetic error result.
+                                std::fs::set_permissions(
+                                    &parent,
+                                    std::fs::Permissions::from_mode(0o555),
+                                )
+                                .unwrap();
+                            }
+                            Ok(())
+                        })),
+                    )
+                })
+                .await;
+            if failure == "populate-panic" {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(
+                    result.unwrap().into_inner(),
+                    Err(MaterializeError::Cancelled)
+                );
+            }
+            drop(transaction);
+            assert!(fs.completion.wait().await.is_err(), "{failure}");
+            assert!(later_cleanup.load(Ordering::SeqCst));
+            assert!(!staging.path().join("published").exists());
+            if failure == "rollback-error" {
+                std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 1);
+            } else {
+                assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_directory_commit_survives_close_and_skips_descriptor_open() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for winner_exists in [false, true] {
+            let staging = tempfile::tempdir().unwrap();
+            let tree = cached_directory_tree(staging.path(), &directory_entries());
+            let final_path = staging.path().join(format!("dir-{DIRECTORY_CID}"));
+            let destination = final_path.clone();
+            let TestTree {
+                tree,
+                filesystem: fs,
+            } = tree;
+            let owner = std::sync::Mutex::new(Some(fs._scope_owner));
+            let descriptor_opened = Arc::new(AtomicBool::new(false));
+            let descriptor_witness = Arc::clone(&descriptor_opened);
+            fs.scope.set_test_hook(Arc::new(move |event| {
+                if event.operation == cache::FilesystemOperation::DescriptorOpen {
+                    descriptor_witness.store(true, Ordering::SeqCst);
+                }
+                if event.stage == cache::FsTestStage::CommitAccepted {
+                    if winner_exists {
+                        std::fs::create_dir(&destination).unwrap();
+                        std::fs::write(destination.join("winner"), b"untouched").unwrap();
+                    }
+                    drop(owner.lock().unwrap().take());
+                }
+            }));
+            let result = materialize_cid_tree_descriptor(None, &tree, "", false).await;
+            assert!(
+                matches!(result, Err(MaterializeError::Cancelled)),
+                "closed root must skip the descriptor tail after accepted publication"
+            );
+            fs.completion.wait().await.unwrap();
+            assert!(!descriptor_opened.load(Ordering::SeqCst));
+            if winner_exists {
+                assert_eq!(
+                    std::fs::read(final_path.join("winner")).unwrap(),
+                    b"untouched"
+                );
+                assert_eq!(std::fs::read_dir(&final_path).unwrap().count(), 1);
+            } else {
+                assert_complete_directory(&final_path, false);
+            }
+            assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn queued_directory_descriptor_observes_close_before_native_entry() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let fs = TestFilesystem::with_limits(
+                cache::HostLimits::new(1, 2, 1).unwrap(),
+                cache::CellLimits::new(1).unwrap(),
+            );
+            let staging = tempfile::tempdir().unwrap();
+            std::fs::write(
+                staging.path().join(format!("{DIRECTORY_CID}.dirlist.json")),
+                serde_json::to_vec(&directory_entries()).unwrap(),
+            ).unwrap();
+            let cid = ipfs::cid_identity::parse_cid(DIRECTORY_CID).unwrap();
+            let tree = fs.tree(cid, ipfs::HttpClient::new("http://127.0.0.1:1".into()), staging.path().to_owned());
+            let final_path = staging.path().join(format!("dir-{DIRECTORY_CID}"));
+            let descriptor_entered = Arc::new(AtomicBool::new(false));
+            let entry_witness = Arc::clone(&descriptor_entered);
+            fs.scope.set_test_hook(Arc::new(move |event| {
+                if event.operation == cache::FilesystemOperation::DescriptorOpen
+                    && event.stage == cache::FsTestStage::Started {
+                    entry_witness.store(true, Ordering::SeqCst);
+                }
+            }));
+            let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let mut blocker = Some((blocked_tx, release_rx));
+            let worker_runtime = tokio::runtime::Handle::current();
+            let _hook = BuildHookGuard::install(move |_, stage| {
+                if stage == BuildStage::Published {
+                    let (blocked, release) = blocker.take().unwrap();
+                    // Queue before the directory closure returns, so the sole
+                    // native worker cannot enter the subsequent descriptor job.
+                    worker_runtime.spawn_blocking(move || {
+                        blocked.send(()).unwrap();
+                        release.recv_timeout(Duration::from_secs(10)).unwrap();
+                    });
+                }
+                Ok(())
+            });
+            let mut call = Box::pin(materialize_cid_tree_descriptor_in(
+                &fs.scope, &fs.resources, fs.resources.try_logical_io().unwrap(),
+                None, &tree, ResolvedNode::CidDir { cid },
+            ));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    _ = &mut call => panic!("descriptor must remain pending behind the native blocker"),
+                    entered = blocked_rx => entered.unwrap(),
+                }
+                loop {
+                    std::future::poll_fn(|cx| {
+                        assert!(call.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    }).await;
+                    let snapshot = fs.completion.try_snapshot().unwrap();
+                    let build = snapshot.directory_builds()[0].unwrap();
+                    if build.waiter() == cache::FsOperationWaiter::Returned {
+                        assert_eq!(build.backend(), cache::FsOperationBackend::Succeeded);
+                        assert_eq!(build.receipt(), cache::FsOperationReceipt::Outstanding);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            // In the same poll that returns DirectoryBuild, materialization
+            // passes the descriptor pre-submit check and queues its driver before
+            // yielding. This is a driver-queued witness, not a blocking-pool
+            // submission diagnostic. The root has remained open throughout.
+            assert!(!fs.scope.cancellation().is_cancelled());
+            assert_complete_directory(&final_path, false);
+            assert!(!descriptor_entered.load(Ordering::SeqCst));
+            drop(fs._scope_owner);
+            assert!(fs.resources.try_logical_io().is_err());
+            assert!(fs.resources.host().try_foreground().is_err());
+            let mut completion = Box::pin(fs.completion.wait());
+            std::future::poll_fn(|cx| {
+                assert!(completion.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            }).await;
+            release_tx.send(()).unwrap();
+            let result = call.await.unwrap();
+            assert!(!descriptor_entered.load(Ordering::SeqCst));
+            assert!(fs.resources.try_logical_io().is_err(), "completed result still owns the transaction");
+            assert!(fs.resources.host().try_foreground().is_err());
+            assert!(matches!(result.into_inner(), Err(MaterializeError::Cancelled)));
+            completion.await.unwrap();
+            assert!(fs.resources.try_logical_io().is_ok());
+            assert!(fs.resources.host().try_foreground().is_ok());
+            assert_complete_directory(&final_path, false);
+            assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 2);
+        });
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn cancelled_directory_waiter_retains_complete_publication_and_retry() {
+    async fn closed_root_stops_directory_entries_and_retains_rollback() {
+        let fs = TestFilesystem::with_limits(
+            cache::HostLimits::new(1, 2, 1).unwrap(),
+            cache::CellLimits::new(1).unwrap(),
+        );
+        let staging = tempfile::tempdir().unwrap();
+        let final_path = staging.path().join("published");
+        let transaction = fs
+            .resources
+            .host()
+            .try_cleanup_transaction(fs.resources.try_logical_io().unwrap(), &[&fs.scope])
+            .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (rollback_tx, rollback_rx) = tokio::sync::oneshot::channel();
+        let (rollback_release_tx, rollback_release_rx) = std::sync::mpsc::channel();
+        let mut entered_tx = Some(entered_tx);
+        let mut rollback_tx = Some(rollback_tx);
+        let scope = fs.scope.clone();
+        let root = staging.path().to_owned();
+        let destination = final_path.clone();
+        let waiter = tokio::spawn(async move {
+            transaction
+                .run_directory_build(&scope, {
+                    let scope = scope.clone();
+                    move || {
+                        build_directory(
+                            root,
+                            destination,
+                            directory_entries(),
+                            scope.clone(),
+                            scope.cancellation(),
+                            Some(Box::new(move |path, stage| {
+                                if stage == BuildStage::Entry {
+                                    if let Some(entered) = entered_tx.take() {
+                                        entered.send(path.to_owned()).unwrap();
+                                        release_rx
+                                            .recv_timeout(std::time::Duration::from_secs(10))
+                                            .unwrap();
+                                    }
+                                }
+                                Ok(())
+                            })),
+                            Some(Box::new(move |path| {
+                                rollback_tx.take().unwrap().send(path.to_owned()).unwrap();
+                                rollback_release_rx
+                                    .recv_timeout(std::time::Duration::from_secs(10))
+                                    .unwrap();
+                                Ok(())
+                            })),
+                        )
+                    }
+                })
+                .await
+                .unwrap()
+                .into_inner()
+        });
+        let temporary = entered_rx.await.unwrap();
+        assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 1);
+        drop(fs._scope_owner);
+        assert!(fs.resources.try_logical_io().is_err());
+        assert!(fs.completion.try_snapshot().unwrap().outstanding_work() > 0);
+        release_tx.send(()).unwrap();
+        let rollback = rollback_rx
+            .await
+            .expect("root close must roll back, not publish");
+        assert_eq!(rollback, temporary);
+        assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 1);
+        assert!(!final_path.exists());
+        assert!(fs.resources.try_logical_io().is_err());
+        assert!(fs.completion.try_snapshot().unwrap().outstanding_work() > 0);
+        rollback_release_tx.send(()).unwrap();
+        assert!(waiter.await.unwrap().is_err());
+        fs.completion.wait().await.unwrap();
+        assert!(!temporary.exists());
+        assert!(!final_path.exists());
+        assert!(fs.resources.try_logical_io().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_waiter_with_live_root_retains_complete_publication_and_retry() {
         let staging = tempfile::TempDir::new().unwrap();
         let tree = cached_directory_tree(staging.path(), &directory_entries());
         let final_path = staging.path().join(format!("dir-{DIRECTORY_CID}"));
@@ -1914,10 +2386,11 @@ mod tests {
             }
             Ok(())
         });
-        let waiter =
-            tokio::spawn(
-                async move { materialize_cid_tree_descriptor(None, &tree, "", false).await },
-            );
+        let tree = Arc::new(tree);
+        let waiter_tree = Arc::clone(&tree);
+        let waiter = tokio::spawn(async move {
+            materialize_cid_tree_descriptor(None, &waiter_tree, "", false).await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx)
             .await
             .unwrap()

@@ -1942,22 +1942,336 @@ mod tests {
         .expect("operation snapshot deadline")
     }
 
+    #[tokio::test]
+    async fn directory_root_cancellation_propagates_from_exit_trap_construction_and_finalizer() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+        for cause in [
+            "normal-exit",
+            "trap",
+            "construction-failure",
+            "finalizer-abandoned",
+        ] {
+            let resources = cache::CellResources::new(
+                test_filesystem_host(),
+                cache::CellLimits::new(2).unwrap(),
+            );
+            let filesystem = cell::FilesystemOwnership::try_new(Arc::clone(&resources)).unwrap();
+            let scope = filesystem.test_scope().clone();
+            let cancellation = scope.cancellation();
+            let completion = filesystem.completion();
+            let transaction = resources
+                .host()
+                .try_cleanup_transaction(resources.try_logical_io().unwrap(), &[&scope])
+                .unwrap();
+            let returned = Arc::new(AtomicBool::new(false));
+            let returned_witness = Arc::clone(&returned);
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let cleanup_witness = Arc::clone(&cleaned);
+            scope
+                .own_cleanup(cache::FilesystemOperation::ProcessCleanup, move || {
+                    assert!(returned_witness.load(Ordering::SeqCst));
+                    cleanup_witness.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let operation_scope = scope.clone();
+            let operation_cancellation = cancellation.clone();
+            let native_returned = Arc::clone(&returned);
+            // A retained native operation shares the precise owner injected into
+            // Builder. Construction failure cannot initiate a guest request; this
+            // fixture tests termination-to-root propagation with ownership live.
+            let native = tokio::spawn(async move {
+                transaction
+                    .run_directory_build(&operation_scope, move || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        let cancelled = operation_cancellation.is_cancelled();
+                        native_returned.store(true, Ordering::SeqCst);
+                        Ok::<_, ()>(cancelled)
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .unwrap()
+            });
+            entered_rx.await.unwrap();
+            assert!(!cancellation.is_cancelled());
+            let program = if cause == "construction-failure" {
+                Program::Bytes(vec![0])
+            } else {
+                let command = if cause == "trap" {
+                    "unreachable"
+                } else {
+                    "i32.const 0 call $return"
+                };
+                Program::Bytes(
+                    wat::parse_str(format!(
+                        r#"
+                    (component
+                      (core func $return (canon task.return (result (result))))
+                      (core module $command
+                        (import "" "return" (func $return (param i32)))
+                        (func (export "run") {command}))
+                      (core instance $instance (instantiate $command
+                        (with "" (instance (export "return" (func $return))))))
+                      (func $run async (result (result))
+                        (canon lift (core func $instance "run") async))
+                      (instance (export (interface "wasi:cli/run@0.3.0"))
+                        (export "run" (func $run))))
+                "#
+                    ))
+                    .unwrap(),
+                )
+            };
+            let (mut builder, _handles) =
+                Builder::ordinary(program, io::empty(), io::sink(), io::sink(), filesystem);
+            let (engine, _publisher) = cell::engine::runtime_engine().unwrap();
+            let mut finalizer = builder.take_filesystem_finalizer();
+            let prepared = builder.with_runtime_engine(engine).build().await;
+            if cause == "construction-failure" {
+                assert!(prepared.is_err());
+            } else {
+                let proc = prepared.unwrap();
+                assert!(!cancellation.is_cancelled());
+                if cause == "finalizer-abandoned" {
+                    drop(finalizer.take());
+                    assert!(
+                        cancellation.is_cancelled(),
+                        "finalizer alone closes the root"
+                    );
+                    drop(proc);
+                } else {
+                    let result = proc.run().await;
+                    assert_eq!(result.is_err(), cause == "trap");
+                }
+            }
+            assert!(
+                cancellation.is_cancelled(),
+                "{cause} must close the same root"
+            );
+            assert!(!returned.load(Ordering::SeqCst));
+            assert!(!cleaned.load(Ordering::SeqCst));
+            assert!(operation_snapshot(&completion).await.outstanding_work() > 0);
+            // Hold the other Cell slot to prove the admitted native operation
+            // still occupies its original L slot, independently of snapshots.
+            let spare = resources.try_logical_io().unwrap();
+            assert!(resources.try_logical_io().is_err());
+            let mut pending = Box::pin(completion.wait());
+            std::future::poll_fn(|cx| {
+                assert!(pending.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            release_tx.send(()).unwrap();
+            assert!(
+                native.await.unwrap(),
+                "native checkpoint must observe {cause}"
+            );
+            completion.wait().await.unwrap();
+            if let Some(finalizer) = finalizer {
+                finalizer.run().await.unwrap();
+            }
+            assert!(cleaned.load(Ordering::SeqCst));
+            assert!(resources.try_logical_io().is_ok());
+            drop(spare);
+        }
+    }
+
+    // Inject a real blocked syscall into the actual builder's test-only entry
+    // hook. This tests retained native ownership, not a claim that ordinary
+    // directory creation naturally blocks on this filesystem.
+    struct NativeReadGate {
+        reader: Arc<std::os::fd::OwnedFd>,
+        writer: std::os::fd::OwnedFd,
+        witness: Arc<NativeReadWitness>,
+    }
+
+    struct NativeReadWitness {
+        fd: libc::c_int,
+        thread: std::sync::atomic::AtomicUsize,
+        // 0 = preparing; 1 = exclusive raw-read interval; 2 = read returned.
+        phase: std::sync::atomic::AtomicU8,
+    }
+
+    impl NativeReadGate {
+        fn new() -> Self {
+            use std::os::fd::FromRawFd;
+            let mut fds = [-1; 2];
+            // SAFETY: pipe initializes the two writable fd slots on success.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            Self {
+                // SAFETY: each successfully created descriptor receives one owner.
+                reader: Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) }),
+                writer: unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) },
+                witness: Arc::new(NativeReadWitness {
+                    fd: fds[0],
+                    thread: std::sync::atomic::AtomicUsize::new(0),
+                    phase: std::sync::atomic::AtomicU8::new(0),
+                }),
+            }
+        }
+
+        fn release(&self) {
+            use std::os::fd::AsRawFd;
+            let byte = 7_u8;
+            // SAFETY: writer is live and byte points to one readable byte.
+            assert_eq!(
+                unsafe { libc::write(self.writer.as_raw_fd(), (&byte as *const u8).cast(), 1) },
+                1
+            );
+        }
+    }
+
+    impl NativeReadWitness {
+        fn read_one_byte(&self, reader: &std::os::fd::OwnedFd) {
+            use std::os::fd::AsRawFd;
+            use std::sync::atomic::Ordering;
+            #[cfg(target_os = "macos")]
+            // SAFETY: querying the current pthread's borrowed Mach thread identity.
+            let thread = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) } as usize;
+            #[cfg(target_os = "linux")]
+            // SAFETY: gettid has no pointer arguments.
+            let thread = unsafe { libc::syscall(libc::SYS_gettid) } as usize;
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let thread = unimplemented!("native read witness requires macOS or Linux");
+            let fd = reader.as_raw_fd();
+            assert_eq!(fd, self.fd);
+            let mut byte = 0_u8;
+            let buffer = (&mut byte as *mut u8).cast();
+            self.thread.store(thread, Ordering::SeqCst);
+            // Keep this interval exclusive: no locks, channels, allocation, or
+            // other potentially blocking operations between these phase writes.
+            self.phase.store(1, Ordering::SeqCst);
+            // SAFETY: reader stays owned through the call; buffer is one writable byte.
+            let read = unsafe { libc::read(fd, buffer, 1) };
+            self.phase.store(2, Ordering::SeqCst);
+            assert_eq!(read, 1, "read must return only after the controller writes");
+            assert_eq!(byte, 7);
+        }
+
+        fn is_blocked(&self) -> bool {
+            use std::sync::atomic::Ordering;
+            if self.phase.load(Ordering::SeqCst) != 1 {
+                return false;
+            }
+            let thread = self.thread.load(Ordering::SeqCst);
+            #[cfg(target_os = "macos")]
+            let blocked = {
+                let mut info = std::mem::MaybeUninit::<libc::thread_basic_info>::uninit();
+                let mut count = libc::THREAD_BASIC_INFO_COUNT;
+                // SAFETY: the exact worker is live while read is pending; the
+                // output has the ABI size requested by THREAD_BASIC_INFO_COUNT.
+                let status = unsafe {
+                    libc::thread_info(
+                        thread as libc::thread_inspect_t,
+                        libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+                        info.as_mut_ptr().cast(),
+                        &mut count,
+                    )
+                };
+                assert_eq!(status, libc::KERN_SUCCESS);
+                assert_eq!(count, libc::THREAD_BASIC_INFO_COUNT);
+                // SAFETY: successful thread_info initialized the requested output.
+                unsafe { info.assume_init() }.run_state == libc::TH_STATE_WAITING
+            };
+            #[cfg(target_os = "linux")]
+            let blocked = {
+                let syscall = std::fs::read_to_string(format!("/proc/self/task/{thread}/syscall"))
+                    .expect("read exact native worker syscall witness");
+                let mut fields = syscall.split_whitespace();
+                let number = fields
+                    .next()
+                    .and_then(|number| number.parse::<libc::c_long>().ok());
+                let fd = fields
+                    .next()
+                    .and_then(|fd| usize::from_str_radix(fd.trim_start_matches("0x"), 16).ok());
+                number == Some(libc::SYS_read) && fd == Some(self.fd as usize)
+            };
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let blocked = unimplemented!("native read witness requires macOS or Linux");
+            blocked && self.phase.load(Ordering::SeqCst) == 1
+        }
+
+        async fn wait_until_blocked(&self) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !self.is_blocked() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native worker never entered the controlled read syscall");
+        }
+    }
+
     #[test]
     fn native_p3_directory_cancellation_distinguishes_backend_and_cleanup_completion() {
+        native_p3_directory_cancellation(DirectoryCancellationCase::BeforeCommit);
+    }
+
+    #[test]
+    fn native_p3_directory_accepted_commit_survives_cancellation() {
+        native_p3_directory_cancellation(DirectoryCancellationCase::AcceptedCommit);
+    }
+
+    #[test]
+    fn native_p3_directory_executor_shutdown_cancels_before_commit() {
+        native_p3_directory_cancellation(DirectoryCancellationCase::ExecutorShutdown);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn native_p3_directory_blocked_syscall_retains_ownership_until_actual_return() {
+        native_p3_directory_cancellation(DirectoryCancellationCase::BlockedRead);
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum DirectoryCancellationCase {
+        BeforeCommit,
+        AcceptedCommit,
+        ExecutorShutdown,
+        BlockedRead,
+    }
+
+    fn native_p3_directory_cancellation(case: DirectoryCancellationCase) {
         use cache::{FsCleanupState, FsOperationBackend, FsOperationReceipt, FsOperationWaiter};
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let commit_accepted = case == DirectoryCancellationCase::AcceptedCommit;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let pool = crate::services::ExecutorPool::new(1, shutdown_rx, test_filesystem_host());
-        let runtime_engine = pool.runtime_engine();
+        let mut pool = Some(pool);
+        // The writer is owned outside the executor and drops on assertion unwind,
+        // unblocking a pending read with EOF even if this test fails.
+        let native_read =
+            (case == DirectoryCancellationCase::BlockedRead).then(NativeReadGate::new);
+        let read_witness = native_read.as_ref().map(|gate| Arc::clone(&gate.witness));
+        let read_hook = native_read
+            .as_ref()
+            .map(|gate| (Arc::clone(&gate.reader), Arc::clone(&gate.witness)));
+        let runtime_engine = pool.as_ref().unwrap().runtime_engine();
         let component = native_kernel_fixture_component(&runtime_engine);
         let (build_entered_tx, build_entered_rx) = tokio::sync::oneshot::channel();
         let build_entered_tx = Arc::new(std::sync::Mutex::new(Some(build_entered_tx)));
         let (build_release_tx, build_release_rx) = std::sync::mpsc::channel();
         let build_release_rx = Arc::new(std::sync::Mutex::new(Some(build_release_rx)));
+        let first_entry = AtomicBool::new(true);
         let hook: Arc<dyn Fn(cache::FsTestEvent) + Send + Sync> = Arc::new(move |event| {
             if event.operation == cache::FilesystemOperation::DirectoryBuild
-                && event.stage == cache::FsTestStage::BeforePublish
+                && event.stage
+                    == match case {
+                        DirectoryCancellationCase::AcceptedCommit => {
+                            cache::FsTestStage::CommitAccepted
+                        }
+                        DirectoryCancellationCase::BlockedRead => {
+                            cache::FsTestStage::DirectoryEntry
+                        }
+                        _ => cache::FsTestStage::BeforePublish,
+                    }
+                && first_entry.swap(false, Ordering::SeqCst)
             {
                 build_entered_tx
                     .lock()
@@ -1966,6 +2280,10 @@ mod tests {
                     .unwrap()
                     .send(event.path.unwrap())
                     .unwrap();
+                if let Some((reader, witness)) = &read_hook {
+                    witness.read_one_byte(reader);
+                    return;
+                }
                 build_release_rx
                     .lock()
                     .unwrap()
@@ -1981,11 +2299,14 @@ mod tests {
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let cleanup_finished = Arc::new(AtomicBool::new(false));
         let cleanup_witness = Arc::clone(&cleanup_finished);
+        let lifecycle_read_witness = read_witness.clone();
         assert!(pool
+            .as_ref()
+            .unwrap()
             .spawn(crate::services::SpawnRequest {
                 name: "native-directory-cancellation".into(),
                 factory: Box::new(move |_| {
-                    Box::pin(async move {
+                    let test = async move {
                         use std::future::Future;
                         use std::task::Poll;
 
@@ -1994,8 +2315,14 @@ mod tests {
                         if let Some(old_rpc) = lifecycle.rpc_task.take() {
                             old_rpc.shutdown();
                         }
-                        let filesystem = test_filesystem_ownership();
+                        let resources = cache::CellResources::new(
+                            test_filesystem_host(),
+                            cache::CellLimits::new(1).unwrap(),
+                        );
+                        let filesystem =
+                            cell::FilesystemOwnership::try_new(Arc::clone(&resources)).unwrap();
                         let scope = filesystem.test_scope().clone();
+                        let cancellation = scope.cancellation();
                         let (tree_staging, tree, cache) =
                             native_filesystem_fixture(&filesystem, None).await;
                         let nested = tree_staging
@@ -2008,13 +2335,26 @@ mod tests {
                             .own_cleanup(cache::FilesystemOperation::ProcessCleanup, move || {
                                 // This witness reads the native filesystem independently
                                 // of the new operation diagnostic.
-                                assert_eq!(cleanup_path.join("child").metadata()?.len(), 12);
-                                assert_eq!(std::fs::read_dir(&cleanup_path)?.count(), 2_049);
+                                if commit_accepted {
+                                    assert_eq!(cleanup_path.join("child").metadata()?.len(), 12);
+                                    assert_eq!(std::fs::read_dir(&cleanup_path)?.count(), 2_049);
+                                } else {
+                                    assert!(!cleanup_path.exists());
+                                }
+                                assert!(std::fs::read_dir(cleanup_path.parent().unwrap())?.all(
+                                    |entry| !entry
+                                        .unwrap()
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .starts_with(".cid-dir-")
+                                ));
                                 cleanup_entered_tx.send(()).unwrap();
                                 cleanup_release_rx
                                     .recv_timeout(Duration::from_secs(10))
                                     .unwrap();
-                                std::fs::remove_dir_all(cleanup_path)?;
+                                if commit_accepted {
+                                    std::fs::remove_dir_all(cleanup_path)?;
+                                }
                                 cleanup_witness.store(true, Ordering::SeqCst);
                                 Ok(())
                             })
@@ -2056,6 +2396,9 @@ mod tests {
                         let owner = tokio::task::spawn_local(lifecycle.run());
 
                         let temporary = build_entered_rx.await.unwrap();
+                        if let Some(witness) = &lifecycle_read_witness {
+                            witness.wait_until_blocked().await;
+                        }
                         let active = operation_snapshot(&completion).await;
                         let builds: Vec<_> = active.directory_builds().iter().flatten().collect();
                         assert_eq!(builds.len(), 1);
@@ -2067,7 +2410,11 @@ mod tests {
                         assert_eq!(active.omitted_directory_builds(), 0);
 
                         let mut wait = Box::pin(process.wait_request().send().promise);
-                        process.kill_request().send().promise.await.unwrap();
+                        if case == DirectoryCancellationCase::ExecutorShutdown {
+                            shutdown_tx.send(()).unwrap();
+                        } else {
+                            process.kill_request().send().promise.await.unwrap();
+                        }
                         // clear() follows drop(proc_run) in OwnedChildLifecycle.
                         // Bootstrap destruction therefore witnesses guest Store
                         // destruction without using the operation diagnostic.
@@ -2090,7 +2437,18 @@ mod tests {
                         assert_eq!(build.backend(), FsOperationBackend::Running);
                         assert_eq!(build.receipt(), FsOperationReceipt::Outstanding);
                         assert!(!cancelled.root_admission_open());
+                        assert!(cancellation.is_cancelled());
+                        if let Some(witness) = &lifecycle_read_witness {
+                            assert!(
+                                witness.is_blocked(),
+                                "root closed while native read remains blocked"
+                            );
+                        }
                         assert!(cancelled.outstanding_work() > 0);
+                        assert!(
+                            resources.try_logical_io().is_err(),
+                            "native work retains Cell L after cancellation"
+                        );
                         assert_eq!(cancelled.cleanup(), FsCleanupState::Pending);
                         std::future::poll_fn(|cx| {
                             assert!(matches!(wait.as_mut().poll(cx), Poll::Pending));
@@ -2100,6 +2458,13 @@ mod tests {
                         cancelled_tx.send((temporary, nested.clone())).unwrap();
 
                         cleanup_entered_rx.await.unwrap();
+                        if let Some(witness) = &lifecycle_read_witness {
+                            assert_eq!(
+                                witness.phase.load(Ordering::SeqCst),
+                                2,
+                                "native read returned before cleanup"
+                            );
+                        }
                         let cleaning = operation_snapshot(&completion).await;
                         let build = cleaning
                             .directory_builds()
@@ -2108,7 +2473,14 @@ mod tests {
                             .find(|build| build.id() == operation_id)
                             .unwrap();
                         assert_eq!(build.waiter(), FsOperationWaiter::Dropped);
-                        assert_eq!(build.backend(), FsOperationBackend::Succeeded);
+                        assert_eq!(
+                            build.backend(),
+                            if commit_accepted {
+                                FsOperationBackend::Succeeded
+                            } else {
+                                FsOperationBackend::Failed
+                            }
+                        );
                         assert_eq!(build.receipt(), FsOperationReceipt::Released);
                         assert_eq!(cleaning.outstanding_work(), 0);
                         assert_eq!(cleaning.cleanup(), FsCleanupState::Running);
@@ -2132,9 +2504,14 @@ mod tests {
                         assert_eq!(completed.cleanup(), FsCleanupState::Completed);
                         assert_eq!(completed.outstanding_work(), 0);
                         assert!(!completed.failure_recorded());
+                        assert!(resources.try_logical_io().is_ok());
                         assert!(!nested.exists());
                         drop(scope);
                         finished_tx.send(()).unwrap();
+                    };
+                    Box::pin(async move {
+                        tokio::task::spawn_local(rpc::local_tasks::track(test));
+                        std::future::pending::<()>().await;
                     })
                 }),
                 result_tx: None,
@@ -2145,18 +2522,52 @@ mod tests {
         assert!(temporary.join("child").is_file());
         assert!(!nested.exists());
         assert!(!cleanup_finished.load(Ordering::SeqCst));
-        build_release_tx.send(()).unwrap();
+        let shutdown_join = if case == DirectoryCancellationCase::ExecutorShutdown {
+            let pool = pool.take().unwrap();
+            let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                drop(pool);
+                joined_tx.send(()).unwrap();
+            });
+            Some((thread, joined_rx))
+        } else {
+            None
+        };
+        if let Some(gate) = &native_read {
+            assert!(gate.witness.is_blocked());
+            gate.release();
+        } else {
+            build_release_tx.send(()).unwrap();
+        }
         let published = cleanup_observed_rx
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
         assert_eq!(published, nested);
-        assert_eq!(published.join("child").metadata().unwrap().len(), 12);
-        assert_eq!(std::fs::read_dir(&published).unwrap().count(), 2_049);
+        assert!(
+            !temporary.exists(),
+            "private staging must settle before root cleanup"
+        );
+        if commit_accepted {
+            assert_eq!(published.join("child").metadata().unwrap().len(), 12);
+            assert_eq!(std::fs::read_dir(&published).unwrap().count(), 2_049);
+        } else {
+            assert!(!published.exists(), "cancelled build must not publish");
+        }
         assert!(!cleanup_finished.load(Ordering::SeqCst));
+        if let Some((_, joined)) = &shutdown_join {
+            assert!(
+                matches!(joined.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+                "executor shutdown must wait for root cleanup"
+            );
+        }
         cleanup_release_tx.send(()).unwrap();
         finished_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(cleanup_finished.load(Ordering::SeqCst));
         assert!(!published.exists());
+        if let Some((thread, joined)) = shutdown_join {
+            joined.recv_timeout(Duration::from_secs(10)).unwrap();
+            thread.join().unwrap();
+        }
         drop(pool);
     }
 

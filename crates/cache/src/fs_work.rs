@@ -37,8 +37,10 @@ pub enum FilesystemOperation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsTestStage {
     Started,
+    BlockingSubmitted,
     DirectoryEntry,
     BeforePublish,
+    CommitAccepted,
     Published,
     CleanupStarted,
     Completed,
@@ -642,6 +644,35 @@ pub struct FsScope {
     state: Arc<State>,
 }
 
+/// Read-only cancellation observation of one exact filesystem root.
+/// Holds no owner, work receipt, or resource capacity; root reuse cannot retarget it.
+#[derive(Clone)]
+pub struct FsCancellation {
+    state: Weak<State>,
+}
+
+impl FsCancellation {
+    /// Closure, released state, and poisoned state all fail closed.
+    pub fn is_cancelled(&self) -> bool {
+        !self.try_accept_commit()
+    }
+
+    /// Accept one non-interruptible publication phase if this root is still open.
+    ///
+    /// The accepting read under the lifecycle mutex orders against root closure.
+    /// A successful caller may finish its non-replacing rename even if the root
+    /// closes afterward. No lock or ownership is retained across the syscall.
+    pub fn try_accept_commit(&self) -> bool {
+        let Some(state) = self.state.upgrade() else {
+            return false;
+        };
+        state
+            .lifecycle
+            .lock()
+            .is_ok_and(|lifecycle| lifecycle.accepting)
+    }
+}
+
 pub struct FsOwner {
     state: Arc<State>,
 }
@@ -931,6 +962,12 @@ impl<T> Drop for FsResultEnvelope<T> {
 }
 
 impl FsScope {
+    pub fn cancellation(&self) -> FsCancellation {
+        FsCancellation {
+            state: Arc::downgrade(&self.state),
+        }
+    }
+
     pub(crate) fn belongs_to(&self, host: &Arc<HostResources>) -> bool {
         Arc::ptr_eq(&self.state.host, host)
     }
@@ -1103,9 +1140,12 @@ impl ForegroundTransaction {
             entered: false,
         };
         let result = self
-            .run_blocking(FilesystemOperation::DirectoryBuild, move || {
-                backend.run(operation)
-            })
+            .run_blocking_inner(
+                FilesystemOperation::DirectoryBuild,
+                move || backend.run(operation),
+                #[cfg(feature = "test-support")]
+                Some(scope.clone()),
+            )
             .await;
         waiter.returned();
         result
@@ -1175,6 +1215,25 @@ impl ForegroundTransaction {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        self.run_blocking_inner(
+            kind,
+            operation,
+            #[cfg(feature = "test-support")]
+            None,
+        )
+        .await
+    }
+
+    async fn run_blocking_inner<T, F>(
+        &self,
+        kind: FilesystemOperation,
+        operation: F,
+        #[cfg(feature = "test-support")] test_scope: Option<FsScope>,
+    ) -> Result<FsResultEnvelope<T>, FsWorkError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
         let transaction = self.continuation();
         let failure_owner = transaction.continuation();
         let driver = self.driver().clone();
@@ -1182,8 +1241,12 @@ impl ForegroundTransaction {
         driver.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 std::panic::catch_unwind(AssertUnwindSafe(operation))
-            })
-            .await;
+            });
+            #[cfg(feature = "test-support")]
+            if let Some(scope) = test_scope {
+                scope.test_event(kind, FsTestStage::BlockingSubmitted, None);
+            }
+            let result = result.await;
             match result {
                 Ok(Ok(value)) => {
                     let _ =
@@ -1335,6 +1398,88 @@ impl FsCompletion {
 mod tests {
     use super::*;
     use crate::{HostFsOwner, HostLimits};
+
+    #[tokio::test]
+    async fn cancellation_is_exact_root_and_retains_neither_receipt_nor_reused_slot() {
+        let (host_owner, host) = HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            HostLimits::new(1, 2, 2).unwrap(),
+        )
+        .unwrap();
+        let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+        let cancellation = scope.cancellation();
+        let original = scope.state.id;
+        let (other, other_owner, other_finalizer, _) = host.try_filesystem_scope().unwrap();
+        let other_cancellation = other.cancellation();
+        let receipt = scope.try_work().unwrap();
+        assert!(cancellation.try_accept_commit());
+        drop(owner);
+        assert!(
+            cancellation.is_cancelled(),
+            "live receipts must not mask root closure"
+        );
+        assert!(!cancellation.try_accept_commit());
+        assert!(!other_cancellation.is_cancelled());
+        assert_eq!(completion.try_snapshot().unwrap().outstanding_work(), 1);
+        drop(receipt);
+        finalizer.run().await.unwrap();
+        drop(scope);
+        // Holding both weak handles must not retain K or identify the next root.
+        let (replacement, replacement_owner, replacement_finalizer, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Ok(root) = host.try_filesystem_scope() {
+                        break root;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(replacement.state.id.slot, original.slot);
+        assert_ne!(replacement.state.id.generation, original.generation);
+        assert!(cancellation.state.upgrade().is_none());
+        assert!(cancellation.is_cancelled());
+        assert!(!replacement.cancellation().is_cancelled());
+        drop(replacement_owner);
+        replacement_finalizer.run().await.unwrap();
+        drop(other_owner);
+        other_finalizer.run().await.unwrap();
+        host_owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_observes_abandoned_and_running_finalizers() {
+        use std::task::Poll;
+        let (host_owner, host) = HostFsOwner::start(
+            tokio::runtime::Handle::current(),
+            HostLimits::new(1, 2, 2).unwrap(),
+        )
+        .unwrap();
+        for polled in [false, true] {
+            let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+            let cancellation = scope.cancellation();
+            let receipt = scope.try_work().unwrap();
+            if polled {
+                let mut running = Box::pin(finalizer.run());
+                std::future::poll_fn(|cx| {
+                    assert!(running.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(!cancellation.is_cancelled());
+                drop(running);
+            } else {
+                drop(finalizer);
+            }
+            assert!(cancellation.is_cancelled());
+            assert!(!cancellation.try_accept_commit());
+            drop(receipt);
+            completion.wait().await.unwrap();
+            drop(owner);
+        }
+        host_owner.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn directory_observation_exhaustion_and_stale_handles_do_not_change_work() {
@@ -1560,6 +1705,8 @@ mod tests {
         }))
         .is_err());
         assert_eq!(completion.try_snapshot(), Err(FsSnapshotError::Poisoned));
+        assert!(scope.cancellation().is_cancelled());
+        assert!(!scope.cancellation().try_accept_commit());
         // Diagnostic destructors must not turn poisoned state into a second panic.
         drop(OperationBackend {
             observation: Some(observation.clone()),
