@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **Ordinary-child stderr draining (#155).** Fixed-size byte reads replace
+  line buffering. Teardown drains through EOF under one cooperative one-second
+  deadline, then aborts and joins the reader if the deadline expires. One bounded
+  summary reports Host-assigned Cell identity, consumed bytes and the drain
+  outcome without including guest text. Resource cleanup remains distinct from
+  complete output consumption; unexpected reader loss withholds cleanup
+  certification. Guest message access and PID0 isolation remain separate work;
+  #155 remains open.
 - **Cell-owned directory build cancellation (#787, #785).** Closing a Cell's
   filesystem root stops unnecessary CID-directory entries and rolls back private
   staging. Commit acceptance is ordered with cancellation; already accepted
