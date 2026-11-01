@@ -28,6 +28,11 @@ use rpc::observability::EventCode;
 use tokio::sync::{mpsc, watch};
 use tracing::Instrument;
 
+mod worker_liveness;
+pub use worker_liveness::{
+    WorkerLivenessSnapshot, WorkerState, WORKER_HEARTBEAT_INTERVAL, WORKER_STALL_THRESHOLD,
+};
+
 #[cfg(test)]
 pub(crate) fn test_filesystem_resources() -> Arc<cache::HostResources> {
     static RESOURCES: std::sync::OnceLock<Arc<cache::HostResources>> = std::sync::OnceLock::new();
@@ -293,6 +298,7 @@ pub struct ExecutorMetrics {
 
 #[derive(Debug, Default)]
 struct ExecutorMetricsInner {
+    workers: worker_liveness::WorkerRegistry,
     occupied: AtomicUsize,
     accepted: AtomicU64,
     full: AtomicU64,
@@ -319,6 +325,12 @@ pub struct ExecutorSnapshot {
 }
 
 impl ExecutorMetrics {
+    /// Sample the current pool without asking its workers to respond.
+    /// Records remain after teardown and are replaced on the next pool start.
+    pub fn worker_liveness(&self) -> Vec<WorkerLivenessSnapshot> {
+        self.inner.workers.snapshot()
+    }
+
     pub fn snapshot(&self) -> ExecutorSnapshot {
         ExecutorSnapshot {
             occupied: self.inner.occupied.load(Ordering::Relaxed),
@@ -390,6 +402,7 @@ pub struct ExecutorPool {
     runtime_engine: cell::engine::RuntimeEngine,
     filesystem_resources: Arc<cache::HostResources>,
     metrics: ExecutorMetrics,
+    liveness: Arc<worker_liveness::PoolLiveness>,
 }
 
 impl ExecutorPool {
@@ -449,12 +462,25 @@ impl ExecutorPool {
                 .map_err(|e| anyhow::anyhow!("failed to create shared wasmtime engine: {e}"))?;
         let mut epoch_publisher = Some(epoch_publisher);
 
-        let mut senders = Vec::with_capacity(n);
-        let mut threads = Vec::with_capacity(n);
+        let senders = Vec::with_capacity(n);
+        let threads = Vec::with_capacity(n);
         let cell_counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
         let cell_counts = Arc::new(cell_counts);
 
-        for i in 0..n {
+        let (liveness, guards) = metrics.inner.workers.register(n, shutdown.clone())?;
+        // Own partial construction so a thread-spawn error closes admission and
+        // joins already-started workers. Unstarted guards become stopped too.
+        let mut pool = Self {
+            senders,
+            threads,
+            cell_counts: cell_counts.clone(),
+            next: AtomicUsize::new(0),
+            runtime_engine,
+            filesystem_resources,
+            metrics,
+            liveness,
+        };
+        for (i, guard) in guards.into_iter().enumerate() {
             let (tx, rx) = mpsc::channel(SPAWN_CHANNEL_DEPTH);
             let shutdown = shutdown.clone();
             let counts = cell_counts.clone();
@@ -465,10 +491,14 @@ impl ExecutorPool {
             });
             let handle = std::thread::Builder::new()
                 .name(format!("executor-{}", i))
-                .spawn(move || worker_loop(i, rx, shutdown, counts, worker_epoch_publisher))
+                .spawn(move || {
+                    // The guard drops after worker_loop's runtime and LocalSet.
+                    let guard = guard;
+                    worker_loop(i, rx, shutdown, counts, worker_epoch_publisher, &guard)
+                })
                 .with_context(|| format!("failed to spawn executor worker thread {i}"))?;
-            senders.push(tx);
-            threads.push(Some(handle));
+            pool.senders.push(tx);
+            pool.threads.push(Some(handle));
         }
 
         tracing::info!(
@@ -477,15 +507,7 @@ impl ExecutorPool {
             "executor pool started"
         );
 
-        Ok(Self {
-            senders,
-            threads,
-            cell_counts,
-            next: AtomicUsize::new(0),
-            runtime_engine,
-            filesystem_resources,
-            metrics,
-        })
+        Ok(pool)
     }
 
     /// Create a new executor pool, panicking on startup errors.
@@ -574,6 +596,7 @@ impl ExecutorPool {
     }
 
     pub async fn shutdown_and_join(mut self) {
+        self.liveness.request_shutdown();
         self.senders.clear();
         let mut threads = std::mem::take(&mut self.threads);
         if let Err(error) = tokio::task::spawn_blocking(move || {
@@ -594,6 +617,7 @@ impl ExecutorPool {
 
 impl Drop for ExecutorPool {
     fn drop(&mut self) {
+        self.liveness.request_shutdown();
         // Close all channels so workers exit their recv loops.
         self.senders.clear();
         // Join all worker threads.
@@ -659,6 +683,7 @@ fn worker_loop(
     shutdown: watch::Receiver<()>,
     cell_counts: Arc<Vec<AtomicUsize>>,
     epoch_publisher: Option<cell::engine::EpochPublisher>,
+    liveness: &worker_liveness::WorkerGuard,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -670,6 +695,7 @@ fn worker_loop(
     let _span = tracing::info_span!("executor", worker = id).entered();
 
     rt.block_on(local.run_until(async move {
+        liveness.start_heartbeat();
         // The sole publisher advances the shared Engine and then publishes the
         // paired sequence. Store callbacks only record the transition. A
         // fuel-flushed hook performs settlement and installs the next grant.
@@ -763,6 +789,7 @@ fn worker_loop(
                 _ = shutdown.changed() => break,
             }
         }
+        liveness.draining();
         // Stop admission, then release and join the root cell owners. Their
         // nested RPC workers and OwnedChildLifecycle tasks remain scheduled on
         // this LocalSet until managed disconnection and backend teardown finish.

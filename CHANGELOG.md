@@ -24,6 +24,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `respond_bytes_async` for output completion.
 
 ### Added
+- **Executor worker liveness (#390).** The Host metrics endpoint reports each
+  worker's lifecycle, confirmed progress age, and five-second stall threshold.
+  A 250 ms LocalSet heartbeat distinguishes blocked workers from Cells awaiting
+  P3 I/O or cooperative fuel suspension without changing health/readiness.
 - **Local Cell incident investigation (#755).** Opt-in sampled OTLP/HTTP export
   reuses the operational log redaction policy, supplies exact log-to-trace IDs,
   and bounds retained records, export queues, requests and shutdown. Fixed-label
