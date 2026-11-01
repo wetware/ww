@@ -519,4 +519,8 @@ impl ForegroundTransaction {
     pub(crate) fn owns_scope(&self, scope: &FsScope) -> bool {
         self.inner.work.iter().any(|token| token.belongs_to(scope))
     }
+
+    pub(crate) fn work_for(&self, scope: &FsScope) -> Option<&FsWorkToken> {
+        self.inner.work.iter().find(|token| token.belongs_to(scope))
+    }
 }
