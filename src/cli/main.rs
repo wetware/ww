@@ -1477,6 +1477,7 @@ system::export!({iface_name}Guest);
         let mut deployment_slot = None;
         let mut deployment_lifecycle_slot = None;
         let mut retained_startup_roots = Vec::new();
+        let mut telemetry_guard = None;
 
         let outcome: Result<i32> = async {
         let lifecycle = filesystem_resources
@@ -1485,7 +1486,7 @@ system::export!({iface_name}Guest);
         let deployment_scope = lifecycle.0.clone();
         deployment_lifecycle_slot = Some(lifecycle);
 
-        ww::config::init_tracing();
+        telemetry_guard = ww::config::init_tracing();
 
         let ipfs_client = ipfs::HttpClient::new(ipfs_url);
 
@@ -2108,6 +2109,7 @@ system::export!({iface_name}Guest);
             };
         let filesystem_shutdown = supervisor.shutdown_filesystem().await;
         supervisor.shutdown_services().await;
+        drop(telemetry_guard);
 
         let mut shutdown_errors = Vec::new();
         if let Some((finalization, proof)) = deployment_cleanup {

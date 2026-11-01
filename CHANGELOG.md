@@ -24,6 +24,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `respond_bytes_async` for output completion.
 
 ### Added
+- **Local Cell incident investigation (#755).** Opt-in sampled OTLP/HTTP export
+  reuses the operational log redaction policy, supplies exact log-to-trace IDs,
+  and bounds retained records, export queues, requests and shutdown. Fixed-label
+  metrics report telemetry loss. A pinned local Grafana stack and real P3
+  instantiation-timeout workload demonstrate metrics, logs and traces together.
 - **Structured operational event contracts (#778, #751).** JSON and compact
   Host logs share stable event codes, typed numeric correlation, bounded error
   source chains, and a default policy that redacts free text without rendering

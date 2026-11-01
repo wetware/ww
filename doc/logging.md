@@ -28,6 +28,7 @@ them. Every recognized event includes numeric `contract_version=1`.
 | 101 | host | stop | completed | stopped | INFO |
 | 102 | host | run | failed | service_failed | ERROR |
 | 103 | host | configure | fallback | invalid_format | WARN |
+| 111 | host | configure_telemetry | disabled | configuration_or_start_failed | WARN |
 | 104 | host | join | failed | join_failed | ERROR |
 | 105 | host | run | failed | worker_failed | ERROR |
 | 106 | host | run | failed | worker_panicked | ERROR |
@@ -199,6 +200,9 @@ Host event records.
 Unconverted events intentionally lose free-text explanations. Source location and
 safe numeric fields remain available; future meaningful events require a reviewed
 code and typed fields. An unknown event does not inherit another event's reason.
-No OTLP exporter, causal-link serialization, production log collector, or retention
-system is added. Workload volume and timing evidence belong in the qualification
-report; formatter structure alone does not establish production performance.
+The #778 logging slice added no OTLP exporter, causal-link serialization,
+production log collector, or retention system. The subsequent
+[local observability workflow](observability.md) adds bounded OTLP export,
+causal links, and a local collector stack. Workload volume and timing evidence
+belong in the qualification report; formatter structure alone does not establish
+production performance.

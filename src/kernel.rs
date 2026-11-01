@@ -396,7 +396,9 @@ impl Generation {
         if !generation_is_current(&guard, root.cid, &terminate_rx) {
             return Ok(Outcome::Terminated);
         }
-        crate::config::init_tracing();
+        // The Host retains its guard across generations. A standalone Kernel
+        // invocation retains the first-initialization guard until this run ends.
+        let _telemetry_guard = crate::config::init_tracing();
 
         anyhow::ensure!(
             prepared.effective_root() == root.cid,

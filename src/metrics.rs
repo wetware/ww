@@ -111,6 +111,7 @@ fn render_metrics(state: &AdminState) -> String {
     render_wasmtime_lifecycle_metrics(&mut out, state.wasmtime_cache_metrics.lifecycle_snapshot());
     render_executor_metrics(&mut out, state.executor_metrics.snapshot());
     render_fuel_metrics(&mut out, &state.fuel_metrics);
+    crate::telemetry::render_metrics(&mut out);
     out
 }
 
@@ -689,18 +690,18 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("# HELP "))
                 .count(),
-            13
+            19
         );
         assert_eq!(
             output
                 .lines()
                 .filter(|line| line.starts_with("# TYPE "))
                 .count(),
-            13
+            19
         );
         assert_eq!(
             output.lines().filter(|line| !line.starts_with('#')).count(),
-            50
+            60
         );
     }
 

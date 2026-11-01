@@ -248,6 +248,10 @@ impl Scrape {
                             "ww_executor_cell_terminations_total" => {
                                 ("outcome", &["completed", "cancelled", "panicked"])
                             }
+                            "ww_telemetry_dropped_total" => (
+                                "reason",
+                                &["queue", "limit", "record", "export", "shutdown"],
+                            ),
                             _ => panic!("unsupported metric labels: {identity}"),
                         };
                         assert!(values
@@ -286,6 +290,12 @@ impl Scrape {
             ("ww_executor_cell_terminations_total", "counter"),
             ("ww_fuel_decisions_total", "counter"),
             ("ww_fuel_settled_units_total", "counter"),
+            ("ww_telemetry_sampled_out_total", "counter"),
+            ("ww_telemetry_admitted_total", "counter"),
+            ("ww_telemetry_exported_total", "counter"),
+            ("ww_telemetry_request_bytes_total", "counter"),
+            ("ww_telemetry_active_spans", "gauge"),
+            ("ww_telemetry_dropped_total", "counter"),
         ]
         .into_iter()
         .map(|(name, kind)| (name.to_owned(), kind.to_owned()))
@@ -398,12 +408,13 @@ impl Scrape {
             assert!(
                 name.starts_with("ww_wasmtime_")
                     || name.starts_with("ww_executor_")
+                    || name.starts_with("ww_telemetry_")
                     || name.starts_with("ww_fuel_decisions_total{")
                     || name.starts_with("ww_fuel_settled_units_total{"),
                 "unsupported sample exposed: {name}"
             );
         }
-        assert_eq!(self.samples.len(), 48);
+        assert_eq!(self.samples.len(), 58);
         assert_eq!(self.duration_sums.len(), 2);
         assert!(self.body.len() < 8192, "unbounded metrics response");
     }

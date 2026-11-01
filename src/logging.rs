@@ -24,7 +24,7 @@ const MAX_RECORD_BYTES: usize = 16_384;
 const REDACTED: &str = "[redacted]";
 
 #[derive(Default)]
-struct Fields {
+pub(crate) struct Fields {
     values: Map<String, Value>,
     truncated: bool,
 }
@@ -44,7 +44,7 @@ impl Fields {
         }
     }
 
-    fn finish(mut self) -> Map<String, Value> {
+    pub(crate) fn finish(mut self) -> Map<String, Value> {
         if self.truncated {
             self.values
                 .insert("fields_truncated".into(), Value::Bool(true));
@@ -298,6 +298,14 @@ where
         let target = bounded_metadata(event.metadata().target());
         let mut record = json!({"timestamp": timestamp, "level": level, "target": target,
             "line": event.metadata().line(), "fields": fields});
+        if let Some(scope) = ctx.event_scope() {
+            if let Some(span) = scope.into_iter().next() {
+                if let Some(context) = span.extensions().get::<crate::telemetry::TraceContext>() {
+                    record["trace_id"] = context.trace_id.clone().into();
+                    record["span_id"] = context.span_id.clone().into();
+                }
+            }
+        }
         if let Some(span) = span {
             record["span"] = span;
         }
@@ -322,7 +330,7 @@ where
     }
 }
 
-fn bounded_metadata(value: &str) -> String {
+pub(crate) fn bounded_metadata(value: &str) -> String {
     value
         .chars()
         .filter(|c| !c.is_control())
