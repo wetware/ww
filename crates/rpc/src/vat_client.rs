@@ -99,21 +99,29 @@ impl system_capnp::vat_client::Server for VatClientImpl {
             let driver_peer = peer_id;
             let driver_protocol = stream_protocol.clone();
             let driver_service = protocol_name.clone();
+            let rpc_id = driver.rpc_id();
             tokio::task::spawn_local(async move {
                 match driver.await {
-                    Ok(Ok(())) => tracing::debug!(
+                    Ok(Ok(())) => tracing::trace!(
+                        rpc_id,
                         peer = %driver_peer,
                         protocol = %driver_protocol,
                         service = %driver_service,
                         "vat dial session ended cleanly"
                     ),
                     Ok(Err(e)) => tracing::warn!(
+                        event_code = crate::observability::EventCode::RpcFailed as u16,
+                        rpc_id,
+                        error = &e as &dyn std::error::Error,
                         peer = %driver_peer,
                         protocol = %driver_protocol,
                         service = %driver_service,
                         "vat dial session ended with error: {e}"
                     ),
                     Err(e) => tracing::warn!(
+                        event_code = crate::observability::EventCode::RpcFailed as u16,
+                        rpc_id,
+                        error = &e as &dyn std::error::Error,
                         peer = %driver_peer,
                         protocol = %driver_protocol,
                         service = %driver_service,

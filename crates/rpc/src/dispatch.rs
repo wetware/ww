@@ -41,6 +41,11 @@ pub type RequestSender = mpsc::Sender<CgiRequest>;
 pub struct RegistrationId(u64);
 
 impl RegistrationId {
+    /// Numeric process-local identity for operational correlation.
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+
     pub(crate) fn next() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
 

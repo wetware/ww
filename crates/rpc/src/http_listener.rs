@@ -149,8 +149,9 @@ impl RouteRegistration {
     fn remove_if_owned(&self) -> bool {
         let Ok(mut routes) = self.registry.write() else {
             tracing::error!(
+                event_code = crate::observability::EventCode::RpcCleanupFailed as u16,
                 prefix = %self.prefix,
-                registration_id = ?self.id,
+                registration_id = self.id.as_u64(),
                 "route registry lock poisoned during registration cleanup"
             );
             return false;
@@ -161,9 +162,9 @@ impl RouteRegistration {
             .is_some_and(|entry| entry.registration_id() == self.id);
         if owns_current_entry {
             routes.remove(&self.prefix);
-            tracing::info!(
-                prefix = %self.prefix,
-                registration_id = ?self.id,
+            tracing::trace!(
+                event_code = crate::observability::EventCode::HttpRouteUnregistered as u16,
+                registration_id = self.id.as_u64(),
                 "unregistered HTTP route"
             );
             true
@@ -226,9 +227,9 @@ impl system_capnp::http_listener::Server for HttpListenerImpl {
                 guard.clone(),
                 registration_scope.clone(),
             )?;
-            tracing::info!(
-                prefix = %prefix,
-                registration_id = ?registration.id,
+            tracing::trace!(
+                event_code = crate::observability::EventCode::HttpRouteRegistered as u16,
+                registration_id = registration.id.as_u64(),
                 issued_epoch = guard.issued_seq,
                 "registered HTTP route"
             );
@@ -460,8 +461,16 @@ fn kill_process_best_effort(process: &system_capnp::process::Client) {
     tokio::task::spawn_local(async move {
         match tokio::time::timeout(WAGI_KILL_TIMEOUT, process.kill_request().send().promise).await {
             Ok(Ok(_)) => {}
-            Ok(Err(err)) => tracing::warn!(error = %err, "process.kill failed during WAGI cleanup"),
-            Err(_) => tracing::warn!("process.kill timed out during WAGI cleanup"),
+            Ok(Err(err)) => tracing::warn!(
+                event_code = crate::observability::EventCode::RpcCleanupFailed as u16,
+                error = &err as &dyn std::error::Error,
+                "process.kill failed during WAGI cleanup"
+            ),
+            Err(_) => tracing::warn!(
+                event_code = crate::observability::EventCode::RpcCleanupTimedOut as u16,
+                timeout_ms = WAGI_KILL_TIMEOUT.as_millis(),
+                "process.kill timed out during WAGI cleanup"
+            ),
         }
     });
 }
@@ -505,7 +514,11 @@ async fn run_spawned_process(
     let wait_resp = process.wait_request().send().promise.await?;
     let exit_code = wait_resp.get()?.get_exit_code();
     if exit_code != 0 {
-        tracing::warn!(exit_code, "WAGI cell exited with non-zero code");
+        tracing::warn!(
+            event_code = crate::observability::EventCode::CellFailed as u16,
+            exit_code,
+            "WAGI cell exited with non-zero code"
+        );
     }
 
     Ok(response)

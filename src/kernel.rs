@@ -637,11 +637,19 @@ fn map_join_outcome(joined: Result<Result<()>, tokio::task::JoinError>) -> Outco
     match joined {
         Ok(Ok(())) => Outcome::Exited(0),
         Ok(Err(error)) => {
-            tracing::error!("Kernel Cell error: {error:#}");
+            tracing::error!(
+                event_code = rpc::observability::EventCode::CellFailed as u16,
+                error = error.as_ref() as &dyn std::error::Error,
+                "Kernel Cell error"
+            );
             Outcome::Exited(1)
         }
         Err(error) => {
-            tracing::error!("Kernel Cell task join error: {error}");
+            tracing::error!(
+                event_code = rpc::observability::EventCode::CellFailed as u16,
+                error = &error as &dyn std::error::Error,
+                "Kernel Cell task join error"
+            );
             Outcome::Exited(1)
         }
     }

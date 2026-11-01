@@ -1039,6 +1039,7 @@ impl Deployment {
             root: None,
         });
         info!(
+            event_code = rpc::observability::EventCode::DeploymentEpochAdvanced as u16,
             seq = self.epoch_seq,
             "Advancing deployment epoch; authority revoked"
         );
@@ -1270,6 +1271,7 @@ impl Deployment {
 
             if let Target::Invalid(invalid) = &target {
                 warn!(
+                    event_code = rpc::observability::EventCode::InvalidDeploymentHead as u16,
                     seq = self.epoch_seq,
                     selected = %hex::encode(&invalid.selected),
                     reason = %invalid.reason,
@@ -1430,9 +1432,11 @@ impl Deployment {
                     FailureClass::Transient => {
                         let delay = retry_delay(&mut retry);
                         warn!(
+                            event_code = rpc::observability::EventCode::DeploymentRetry as u16,
                             seq = self.epoch_seq,
                             retry_ms = delay.as_millis() as u64,
-                            "Transient deployment preparation failure; retry scheduled: {error:#}"
+                            error = error.as_ref() as &dyn std::error::Error,
+                            "Transient deployment preparation failure; retry scheduled"
                         );
                         let retry_timer = tokio::time::sleep(delay);
                         tokio::pin!(retry_timer);
@@ -1525,6 +1529,7 @@ impl Deployment {
                     }
                     self.release_retained().await;
                     info!(
+                        event_code = rpc::observability::EventCode::DeploymentRootActivated as u16,
                         seq = self.epoch_seq,
                         root = %self.cid_tree.root_cid(),
                         teardown_ms = started.elapsed().as_millis() as u64,
@@ -1753,7 +1758,11 @@ impl BootstrapState {
                         head: prepared.head_bytes(),
                         root: Some(prepared.effective),
                     });
-                    info!(seq = self.epoch_seq, root = %prepared.effective, "Boot deployment root activated");
+                    info!(
+                        event_code = rpc::observability::EventCode::DeploymentRootActivated as u16,
+                        seq = self.epoch_seq,
+                        "Boot deployment root activated"
+                    );
                     return Ok(Deployment {
                         installed_baseline: self.installed_baseline,
                         runtime_engine: self.runtime_engine,
@@ -1790,6 +1799,7 @@ impl BootstrapState {
             root: None,
         });
         info!(
+            event_code = rpc::observability::EventCode::DeploymentEpochAdvanced as u16,
             seq = self.epoch_seq,
             "Advancing deployment epoch during boot"
         );
