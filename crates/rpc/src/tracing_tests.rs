@@ -36,6 +36,7 @@ impl Visit for Fields {
 #[derive(Clone, Debug)]
 struct EventRecord {
     message: String,
+    fields: Fields,
     spans: Vec<SpanRecord>,
 }
 
@@ -149,6 +150,7 @@ impl Subscriber for Capture {
         event.record(&mut fields);
         let record = EventRecord {
             message: fields.0.remove("message").unwrap_or_default(),
+            fields,
             spans,
         };
         state.events.push(record.clone());
@@ -244,7 +246,7 @@ async fn tracing_interleaved_pumps_keep_task_context_through_cancellation() {
                     resumed_a.await.unwrap();
                     tracing::debug!("a.after");
                     first_pending(
-                        crate::stream_listener::pump_stream_to_stdin(network_in.compat(), stdin),
+                        crate::stream_listener::pump_stream_to_stdin(network_in.compat(), stdin, 1),
                         pending_a,
                     )
                     .await;
@@ -262,6 +264,7 @@ async fn tracing_interleaved_pumps_keep_task_context_through_cancellation() {
                         crate::stream_listener::pump_stdout_to_stream(
                             stdout,
                             network_out.compat_write(),
+                            2,
                         ),
                         pending_b,
                     )
@@ -316,7 +319,19 @@ async fn tracing_interleaved_pumps_keep_task_context_through_cancellation() {
     }
     capture.assert_path("pump_in: read chunk", &["task.a", "stream.pump_in"]);
     capture.assert_path("pump_out: write chunk", &["task.b", "stream.pump_out"]);
-    assert!(capture.state.lock().unwrap().entered.is_empty());
+    let state = capture.state.lock().unwrap();
+    for (message, connection_id) in [("pump_in: read chunk", "1"), ("pump_out: write chunk", "2")] {
+        let event = state
+            .events
+            .iter()
+            .find(|event| event.message == message)
+            .unwrap();
+        assert_eq!(
+            event.spans.last().unwrap().fields.0["connection_id"],
+            connection_id
+        );
+    }
+    assert!(state.entered.is_empty());
 }
 
 fn memory_swarm() -> libp2p::Swarm<libp2p_stream::Behaviour> {
@@ -334,6 +349,120 @@ fn memory_swarm() -> libp2p::Swarm<libp2p_stream::Behaviour> {
         libp2p::swarm::Config::with_tokio_executor()
             .with_idle_connection_timeout(Duration::from_secs(60)),
     )
+}
+
+#[tokio::test]
+async fn tracing_outgoing_vat_failures_keep_managed_rpc_identity() {
+    use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (capture, mut events) = Capture::new();
+    let _subscriber = tracing::subscriber::set_default(capture.clone());
+    let local = tokio::task::LocalSet::new();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        local.run_until(async {
+            let mut server = memory_swarm();
+            let server_peer = *server.local_peer_id();
+            let mut server_control = server.behaviour().new_control();
+            let mut incoming = server_control
+                .accept(crate::vat_protocol("trace-outgoing").unwrap())
+                .unwrap();
+            server.listen_on("/memory/0".parse().unwrap()).unwrap();
+            let address = loop {
+                if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } =
+                    server.select_next_some().await
+                {
+                    break address;
+                }
+            };
+            let mut client = memory_swarm();
+            let client_control = client.behaviour().new_control();
+            client.dial(address).unwrap();
+            let server_task =
+                tokio::task::spawn_local(async move { while server.next().await.is_some() {} });
+            while !matches!(
+                client.select_next_some().await,
+                libp2p::swarm::SwarmEvent::ConnectionEstablished { .. }
+            ) {}
+            let client_task =
+                tokio::task::spawn_local(async move { while client.next().await.is_some() {} });
+            let (_epoch, receiver) = watch::channel(Epoch {
+                seq: 1,
+                head: vec![],
+                root: None,
+            });
+            let vat: system_capnp::vat_client::Client =
+                capnp_rpc::new_client(crate::vat_client::VatClientImpl::new(
+                    client_control,
+                    EpochGuard {
+                        issued_seq: 1,
+                        receiver,
+                    },
+                ));
+
+            let mut connections = Vec::new();
+            for _ in 0..2 {
+                let mut request = vat.dial_request();
+                request.get().set_peer(&server_peer.to_bytes());
+                request.get().set_protocol("trace-outgoing");
+                let response = request.send().promise.await.unwrap();
+                let (_, mut stream) = incoming.next().await.unwrap();
+                // Observe actual driver progress before allowing either peer
+                // to fail. Both RPC workers remain live across suspension.
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                let state = capture.state.lock().unwrap();
+                let root = state
+                    .spans
+                    .iter()
+                    .rev()
+                    .find(|span| span.name == "rpc")
+                    .unwrap();
+                assert!(root.parent.is_none());
+                connections.push((stream, response, root.fields.0["rpc_id"].clone()));
+            }
+            assert_ne!(connections[0].2, connections[1].2);
+
+            let mut message = capnp::message::Builder::new_default();
+            let mut abort = message
+                .init_root::<capnp_rpc::rpc_capnp::message::Builder>()
+                .init_abort();
+            abort.set_type(capnp_rpc::rpc_capnp::exception::Type::Failed);
+            abort.set_reason("outgoing tracing fixture failure");
+            let mut bytes = Vec::new();
+            capnp::serialize::write_message(&mut bytes, &message).unwrap();
+            for (mut stream, _response, rpc_id) in connections {
+                stream.write_all(&bytes).await.unwrap();
+                stream.flush().await.unwrap();
+                let event = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let event = events.recv().await.unwrap();
+                        if event
+                            .message
+                            .starts_with("vat dial session ended with error:")
+                        {
+                            break event;
+                        }
+                    }
+                })
+                .await
+                .expect("outgoing failure warning");
+                assert_eq!(event.fields.0["event_code"], "400");
+                assert_eq!(event.fields.0["rpc_id"], rpc_id);
+                assert!(
+                    event.spans.is_empty(),
+                    "completion must not reparent the worker"
+                );
+            }
+            server_task.abort();
+            client_task.abort();
+            let _ = server_task.await;
+            let _ = client_task.await;
+        }),
+    )
+    .await
+    .expect("outgoing VAT fixture completed");
+    assert!(capture.state.lock().unwrap().entered.is_empty());
 }
 
 struct RejectSpawn;
@@ -451,7 +580,7 @@ async fn listener_handlers_keep_accept_context(filter_handlers: bool) {
                 ),
                 (
                     crate::stream_protocol("trace-stream").unwrap(),
-                    "Stream cell connection error: Failed: tracing fixture rejected spawn",
+                    "Stream cell connection error",
                     ["stream.accept", "stream.handle"],
                 ),
             ] {
@@ -472,12 +601,15 @@ async fn listener_handlers_keep_accept_context(filter_handlers: bool) {
                 );
                 assert_eq!(event.spans[0].fields.0["peer"], client_peer.to_string());
                 assert_eq!(event.spans[0].fields.0["protocol"], protocol.to_string());
+                let connection_id = &event.spans[0].fields.0["connection_id"];
+                assert_ne!(connection_id.parse::<u64>().unwrap(), 0);
                 let field = if expected[1] == "stream.handle" {
                     "protocol"
                 } else {
                     "service"
                 };
                 if !filter_handlers {
+                    assert_eq!(&event.spans[1].fields.0["connection_id"], connection_id);
                     assert_eq!(
                         event.spans[1].fields.0[field],
                         protocol.as_ref().rsplit('/').next().unwrap()
@@ -568,6 +700,10 @@ async fn tracing_rpc_workers_have_independent_roots_through_error_and_panic() {
                     "worker requires its own root: {event:?}"
                 );
                 assert_eq!(event.spans[0].name, "rpc");
+                assert_eq!(
+                    worker.rpc_id().to_string(),
+                    event.spans[0].fields.0["rpc_id"]
+                );
                 workers.push((
                     worker,
                     release,

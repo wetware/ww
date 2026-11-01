@@ -237,9 +237,10 @@ impl EngineFactory {
                     }
                     Err(error) => {
                         tracing::warn!(
+                            event_code = 301u16,
                             state = "fallback",
                             directory = %settings.directory.display(),
-                            error = %error,
+                            error = error.as_ref() as &dyn std::error::Error,
                             "Wasmtime persistent cache unavailable; compiling without it"
                         );
                         Self::without_cache(WasmtimeCacheState::Fallback)
@@ -248,6 +249,7 @@ impl EngineFactory {
             }
             Err(error) => {
                 tracing::warn!(
+                    event_code = 302u16,
                     state = "fallback",
                     error = %error,
                     "Wasmtime persistent cache configuration invalid; compiling without it"

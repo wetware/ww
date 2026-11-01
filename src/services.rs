@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use cell::sched::EPOCH_TICK_MS;
+use rpc::observability::EventCode;
 use tokio::sync::{mpsc, watch};
 use tracing::Instrument;
 
@@ -214,7 +215,11 @@ impl Host {
     pub async fn shutdown(mut self) {
         self.close_filesystem_admission();
         if let Err(error) = self.shutdown_filesystem().await {
-            tracing::error!(%error, "filesystem services failed to shut down");
+            tracing::error!(
+                event_code = EventCode::HostFailed as u16,
+                error = error.as_ref() as &dyn std::error::Error,
+                "filesystem services failed to shut down"
+            );
         }
         self.shutdown_services().await;
     }
@@ -223,15 +228,29 @@ impl Host {
 fn join_service_threads(threads: Vec<(String, JoinHandle<Result<()>>)>) {
     for (name, handle) in threads {
         match handle.join() {
-            Ok(Ok(())) => tracing::info!(name, "service stopped"),
-            Ok(Err(e)) => tracing::error!(name, error = %e, "service failed"),
+            Ok(Ok(())) => tracing::info!(
+                event_code = EventCode::HostStopped as u16,
+                name,
+                "service stopped"
+            ),
+            Ok(Err(e)) => tracing::error!(
+                event_code = EventCode::HostFailed as u16,
+                name,
+                error = e.as_ref() as &dyn std::error::Error,
+                "service failed"
+            ),
             Err(panic) => {
                 let msg = panic
                     .downcast_ref::<&str>()
                     .copied()
                     .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("<non-string panic>");
-                tracing::error!(name, panic = msg, "service panicked");
+                tracing::error!(
+                    event_code = EventCode::HostFailed as u16,
+                    name,
+                    panic = msg,
+                    "service panicked"
+                );
             }
         }
     }
@@ -452,7 +471,11 @@ impl ExecutorPool {
             threads.push(Some(handle));
         }
 
-        tracing::info!(workers = n, "executor pool started");
+        tracing::info!(
+            event_code = EventCode::HostStarted as u16,
+            workers = n,
+            "executor pool started"
+        );
 
         Ok(Self {
             senders,
@@ -560,7 +583,11 @@ impl ExecutorPool {
         })
         .await
         {
-            tracing::error!(%error, "executor join task failed");
+            tracing::error!(
+                event_code = EventCode::HostJoinFailed as u16,
+                error = &error as &dyn std::error::Error,
+                "executor join task failed"
+            );
         }
     }
 }
@@ -580,14 +607,22 @@ fn join_executor_thread(handle: &mut Option<JoinHandle<Result<()>>>) {
     if let Some(handle) = handle.take() {
         match handle.join() {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::error!(%error, "executor worker failed"),
+            Ok(Err(error)) => tracing::error!(
+                event_code = EventCode::HostWorkerFailed as u16,
+                error = error.as_ref() as &dyn std::error::Error,
+                "executor worker failed"
+            ),
             Err(panic) => {
                 let message = panic
                     .downcast_ref::<&str>()
                     .copied()
                     .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("<non-string panic>");
-                tracing::error!(panic = message, "executor worker panicked");
+                tracing::error!(
+                    event_code = EventCode::HostWorkerPanicked as u16,
+                    panic = message,
+                    "executor worker panicked"
+                );
             }
         }
     }
@@ -666,7 +701,9 @@ fn worker_loop(
                             worker_id: id,
                         };
                         // JSON reserves span.name; retain name for existing filters.
-                        let span = tracing::info_span!("cell", name = %cell_name, cell_name = %cell_name);
+                        static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+                        let owner_id = NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+                        let span = tracing::info_span!("cell", owner_id, name = %cell_name, cell_name = %cell_name);
                         let cancelled = rpc::local_tasks::shutdown_token();
                         let handle = tokio::task::spawn_local(async move {
                             let _guard = guard;
@@ -696,9 +733,11 @@ fn worker_loop(
                                 }
                                 Err(e) if e.is_panic() => {
                                     tracing::error!(
+                                        event_code = EventCode::CellFailed as u16,
+                                        owner_id,
                                         cell = %cell_name_log,
-                                        "cell panicked: {}",
-                                        e,
+                                        error = &e as &dyn std::error::Error,
+                                        "cell panicked",
                                     );
                                     if let Some(tx) = result_tx {
                                         let _ = tx.send(Err(anyhow::anyhow!("cell panicked")));
@@ -706,9 +745,11 @@ fn worker_loop(
                                 }
                                 Err(e) => {
                                     tracing::error!(
+                                        event_code = EventCode::CellFailed as u16,
+                                        owner_id,
                                         cell = %cell_name_log,
-                                        "cell task failed: {}",
-                                        e,
+                                        error = &e as &dyn std::error::Error,
+                                        "cell task failed",
                                     );
                                     if let Some(tx) = result_tx {
                                         let _ = tx.send(Err(e.into()));
@@ -926,7 +967,7 @@ impl Service for CompilationService {
                                 match job_rx.lock() {
                                     Ok(lock) => lock.recv(),
                                     Err(e) => {
-                                        tracing::error!(error = %e, worker = idx, "compile worker queue lock poisoned");
+                                        tracing::error!(event_code = EventCode::CompilerQueuePoisoned as u16, error = %e, worker = idx, "compile worker queue lock poisoned");
                                         break;
                                     }
                                 }
@@ -941,7 +982,7 @@ impl Service for CompilationService {
                             let result = cell::engine::compile_component(&job.engine, &job.bytecode)
                                 .map_err(|e| e.to_string());
                             if let Ok(ref _component) = result {
-                                tracing::info!(
+                                tracing::trace!(
                                     ?job.key.wasm_hash,
                                     engine_id = job.key.engine_id,
                                     elapsed_ms = start.elapsed().as_millis(),
@@ -963,7 +1004,7 @@ impl Service for CompilationService {
                 {
                     Ok(handle) => worker_handles.push(handle),
                     Err(e) => {
-                        tracing::error!(error = %e, worker = idx, "failed to spawn compile worker thread");
+                        tracing::error!(event_code = EventCode::CompilerStartFailed as u16, error = &e as &dyn std::error::Error, worker = idx, "failed to spawn compile worker thread");
                     }
                 }
             }
@@ -1048,7 +1089,7 @@ impl Service for CompilationService {
                         .copied()
                         .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
                         .unwrap_or("<non-string panic>");
-                    tracing::error!(panic = msg, "compile worker thread panicked");
+                    tracing::error!(event_code = EventCode::CompilerPanicked as u16, panic = msg, "compile worker thread panicked");
                 }
             }
 

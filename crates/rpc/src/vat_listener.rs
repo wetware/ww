@@ -21,6 +21,8 @@ use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use futures::StreamExt;
 use tracing::Instrument;
 
+use crate::observability::EventCode;
+
 use crate::{inbound_connection_budget, terminal_login_timeout, ConnectionBudget};
 use authority::system_capnp;
 
@@ -79,7 +81,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                     "failed to register vat service '{protocol_name}': {e}"
                 ))));
 
-        tracing::info!(
+        tracing::trace!(
             protocol = %stream_protocol,
             service = %protocol_name,
             "published vat service"
@@ -93,11 +95,13 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                 tokio::select! {
                     conn = incoming.next() => {
                         let Some((peer_id, stream)) = conn else {
-                            tracing::warn!(protocol = %stream_protocol, "vat accept loop ended unexpectedly");
+                            tracing::warn!(event_code = EventCode::RpcListenerStopped as u16, "vat accept loop ended unexpectedly");
                             break;
                         };
+                        let connection_id = crate::observability::next_connection_id();
                         let _accept_span = tracing::info_span!(
                             "vat.accept",
+                            connection_id,
                             peer = %peer_id,
                             protocol = %stream_protocol,
                             service = %protocol_name,
@@ -107,6 +111,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                             Ok(permit) => permit,
                             Err(error) => {
                                 tracing::warn!(
+                                    event_code = EventCode::RpcRejected as u16,
                                     capacity = error.capacity,
                                     active = budget.active(),
                                     "rejecting vat connection: service connection budget exhausted"
@@ -119,19 +124,23 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                         let protocol = protocol_name.clone();
                         let handle_span = tracing::info_span!(
                             "vat.handle",
+                            connection_id,
                             service = protocol.as_str(),
                         );
                         tokio::task::spawn_local(async move {
                             let _permit = permit;
                             if let Err(e) = handle_vat_connection_serve(cap, stream, &protocol).await {
-                                tracing::error!("vat service connection error: {e}");
+                                tracing::error!(
+                                    event_code = EventCode::RpcFailed as u16,
+                                    error = &e as &dyn std::error::Error,
+                                    "vat service connection error"
+                                );
                             }
                         }.instrument(handle_span.or_current()));
                     }
                     _ = epoch_rx.changed() => {
                         if epoch_rx.borrow().seq != issued_seq {
-                            tracing::warn!(
-                                protocol = %stream_protocol,
+                            tracing::trace!(
                                 "epoch became stale, closing vat accept loop"
                             );
                             break;
@@ -180,7 +189,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                     "failed to register authenticated vat service '{protocol_name}': {e}"
                 ))));
 
-        tracing::info!(
+        tracing::trace!(
             protocol = %stream_protocol,
             service = %protocol_name,
             "published authenticated vat service"
@@ -195,11 +204,13 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                 tokio::select! {
                     conn = incoming.next() => {
                         let Some((peer_id, stream)) = conn else {
-                            tracing::warn!(protocol = %stream_protocol, "authenticated vat accept loop ended unexpectedly");
+                            tracing::warn!(event_code = EventCode::RpcListenerStopped as u16, "authenticated vat accept loop ended unexpectedly");
                             break;
                         };
+                        let connection_id = crate::observability::next_connection_id();
                         let _accept_span = tracing::info_span!(
                             "vat.authenticated.accept",
+                            connection_id,
                             peer = %peer_id,
                             protocol = %stream_protocol,
                             service = %protocol_name,
@@ -208,6 +219,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                             Ok(permit) => permit,
                             Err(error) => {
                                 tracing::warn!(
+                                    event_code = EventCode::RpcRejected as u16,
                                     capacity = error.capacity,
                                     active = budget.active(),
                                     "rejecting authenticated vat connection: service connection budget exhausted"
@@ -232,6 +244,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                         let protocol = protocol_name.clone();
                         let handle_span = tracing::info_span!(
                             "vat.authenticated.handle",
+                            connection_id,
                             service = protocol.as_str(),
                         );
                         tokio::task::spawn_local(async move {
@@ -251,6 +264,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                                 }
                                 AuthenticatedConnectionOutcome::LoginTimedOut => {
                                     tracing::warn!(
+                                        event_code = EventCode::RpcLoginTimedOut as u16,
                                         "closing authenticated vat connection: login deadline expired"
                                     );
                                 }
@@ -259,8 +273,7 @@ impl system_capnp::vat_listener::Server for VatListenerImpl {
                     }
                     _ = epoch_rx.changed() => {
                         if epoch_rx.borrow().seq != issued_seq {
-                            tracing::warn!(
-                                protocol = %stream_protocol,
+                            tracing::trace!(
                                 "epoch became stale, closing authenticated vat accept loop"
                             );
                             break;

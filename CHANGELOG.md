@@ -30,6 +30,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   outstanding request is allowed; contention, timeout and owner termination are
   explicit. A local P3 reporter explains grant clamping without adding telemetry
   to the default fuel path.
+- **Structured operational event contracts (#778, #751).** JSON and compact
+  Host logs share stable event codes, typed numeric correlation, bounded error
+  source chains, and a default policy that redacts free text without rendering
+  it. Successful Cell and route lifecycle diagnostics use TRACE. Existing PID0
+  codes retain their values; unconverted messages retain source locations and
+  safe typed fields. Representative native P3 Cell probes measure log volume
+  and logging cost under the installed subscriber.
 - **Native P3 directory-build diagnostics (#780, #753).** Owner-local filesystem
   snapshots distinguish dropped waiters, running or completed native directory
   builds, retained transaction receipts, and cleanup phases. Eight records per

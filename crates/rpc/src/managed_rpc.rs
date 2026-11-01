@@ -18,6 +18,8 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::observability::EventCode;
+
 /// Maximum time to flush RPC shutdown after exported ownership is released.
 pub const DISCONNECT_GRACE: Duration = Duration::from_secs(1);
 
@@ -30,6 +32,7 @@ pub const DISCONNECT_GRACE: Duration = Duration::from_secs(1);
 /// shutdown. Retained imported clients do not own this handle.
 #[must_use = "dropping the RPC owner requests disconnection"]
 pub struct ManagedRpc {
+    rpc_id: u64,
     shutdown: CancellationToken,
     task: JoinHandle<capnp::Result<()>>,
 }
@@ -76,13 +79,23 @@ fn record_failure(
             // Recursively panicking payloads have no safe general destructor.
             // Keep the original failure and continue the terminalization path.
             std::mem::forget(secondary);
-            tracing::warn!(stage, "RPC panic payload destructor also panicked");
+            tracing::warn!(
+                event_code = EventCode::RpcCleanupFailed as u16,
+                stage,
+                "RPC panic payload destructor also panicked"
+            );
         }
         Err(error)
     });
     if let Err(error) = result {
         if let Some(cause) = first.as_ref() {
-            tracing::warn!(stage, %error, first_error = %cause, "secondary RPC terminalization failure");
+            tracing::warn!(
+                event_code = EventCode::RpcCleanupFailed as u16,
+                stage,
+                error = &error as &dyn std::error::Error,
+                first_error = cause as &dyn std::error::Error,
+                "secondary RPC terminalization failure"
+            );
         } else {
             *first = Some(error);
         }
@@ -102,8 +115,8 @@ impl ManagedRpc {
         let shutdown = crate::local_tasks::shutdown_token();
         let cancelled = shutdown.clone();
         static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
-        let span = tracing::info_span!(parent: None, "rpc",
-            rpc_id = NEXT_RPC_ID.fetch_add(1, Ordering::Relaxed));
+        let rpc_id = NEXT_RPC_ID.fetch_add(1, Ordering::Relaxed);
+        let span = tracing::info_span!(parent: None, "rpc", rpc_id);
         span.follows_from(tracing::Span::current());
         let worker = crate::local_tasks::track(async move {
             let rpc = AssertUnwindSafe(rpc).catch_unwind();
@@ -158,7 +171,16 @@ impl ManagedRpc {
             first_error.map_or(Ok(()), Err)
         });
         let task = tokio::task::spawn_local(worker.instrument(span));
-        Self { shutdown, task }
+        Self {
+            rpc_id,
+            shutdown,
+            task,
+        }
+    }
+
+    /// Process-local identity shared with the independent worker's root span.
+    pub(crate) fn rpc_id(&self) -> u64 {
+        self.rpc_id
     }
 
     /// Request shutdown once. Export release is asynchronous, not a child

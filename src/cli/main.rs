@@ -2073,14 +2073,14 @@ system::export!({iface_name}Guest);
                     tracing::error!(
                         event_code = ww::rpc::graft::KernelEventCode::TeardownTimeout as u16,
                         epoch,
-                        teardown_ms = timeout.as_millis() as u64,
+                        timeout_ms = timeout.as_millis() as u64,
                         "Kernel generation teardown timed out"
                     );
                     break 'generations 1;
                 }
             }
         };
-        tracing::info!(code = exit_code, "Kernel exited");
+        tracing::info!(event_code = ww::rpc::observability::EventCode::KernelExited as u16, code = exit_code, "Kernel exited");
 
         // Hold the CidTree alive until after guest exits; the outer epilogue
         // closes admission and drains workers/filesystem ownership in order.

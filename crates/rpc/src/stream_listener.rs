@@ -17,6 +17,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::observability::EventCode;
+
 use crate::{inbound_connection_budget, ConnectionBudget, ConnectionPermit};
 use authority::system_capnp;
 
@@ -76,7 +78,7 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
             .accept(stream_protocol.clone())
             .map_err(|e| capnp::Error::failed(format!("failed to register protocol cell: {e}"))));
 
-        tracing::info!(protocol = %stream_protocol, "Registered stream subprotocol cell");
+        tracing::trace!(protocol = %stream_protocol, "Registered stream subprotocol cell");
 
         // Accept loop: for each incoming connection, spawn a cell process.
         // Watches the epoch guard so we stop accepting when capabilities are revoked.
@@ -94,11 +96,13 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
                 tokio::select! {
                     conn = incoming.next() => {
                         let Some((peer_id, stream)) = conn else {
-                            tracing::warn!(protocol = %stream_protocol, "Stream subprotocol accept loop ended unexpectedly");
+                            tracing::warn!(event_code = EventCode::RpcListenerStopped as u16, "Stream subprotocol accept loop ended unexpectedly");
                             break;
                         };
+                        let connection_id = crate::observability::next_connection_id();
                         let _accept_span = tracing::info_span!(
                             "stream.accept",
+                            connection_id,
                             peer = %peer_id,
                             protocol = %stream_protocol,
                         ).entered();
@@ -112,6 +116,7 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
                             Ok(permit) => permit,
                             Err(error) => {
                                 tracing::warn!(
+                                    event_code = EventCode::RpcRejected as u16,
                                     capacity = error.capacity,
                                     active = budget.active(),
                                     "rejecting stream connection: service connection budget exhausted"
@@ -127,10 +132,12 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
                         let connection_cancellation = cancellation.child_token();
                         let handle_span = tracing::info_span!(
                             "stream.handle",
+                            connection_id,
                             protocol = protocol.as_str(),
                         );
                         supervisors.push(tokio::task::spawn_local(async move {
                             let supervisor = AcceptedConnectionSupervisor {
+                                connection_id,
                                 executor,
                                 membrane,
                                 stream,
@@ -141,19 +148,22 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
                                 permit,
                             };
                             if let Err(e) = supervisor.run().await {
-                                tracing::error!("Stream cell connection error: {e}");
+                                tracing::error!(
+                                    event_code = EventCode::RpcFailed as u16,
+                                    error = &e as &dyn std::error::Error,
+                                    "Stream cell connection error"
+                                );
                             }
                         }.instrument(handle_span.or_current())));
                     }
                     completed = supervisors.next(), if !supervisors.is_empty() => {
                         if let Some(Err(error)) = completed {
-                            tracing::error!(%error, "accepted stream supervisor task failed");
+                            tracing::error!(event_code = EventCode::RpcFailed as u16, error = &error as &dyn std::error::Error, "accepted stream supervisor task failed");
                         }
                     }
                     changed = epoch_rx.changed(), if epoch_watch_open => {
                         if epoch_rx.borrow().seq != issued_seq {
-                            tracing::warn!(
-                                protocol = %stream_protocol,
+                            tracing::trace!(
                                 "Epoch became stale, closing stream accept loop"
                             );
                             break;
@@ -168,7 +178,11 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
             cancellation.cancel();
             while let Some(result) = supervisors.next().await {
                 if let Err(error) = result {
-                    tracing::error!(%error, "accepted stream supervisor cleanup task failed");
+                    tracing::error!(
+                        event_code = EventCode::RpcCleanupFailed as u16,
+                        error = &error as &dyn std::error::Error,
+                        "accepted stream supervisor cleanup task failed"
+                    );
                 }
             }
         });
@@ -180,6 +194,7 @@ impl system_capnp::stream_listener::Server for StreamListenerImpl {
 /// Owns gateway connection state and one admission permit. Its Process reference
 /// shares execution ownership; backend lifecycle cleanup remains independent.
 struct AcceptedConnectionSupervisor<S> {
+    connection_id: u64,
     executor: system_capnp::executor::Client,
     membrane: system_capnp::membrane::Client,
     stream: S,
@@ -196,6 +211,7 @@ where
 {
     async fn run(self) -> Result<(), capnp::Error> {
         let Self {
+            connection_id,
             executor,
             membrane,
             stream,
@@ -206,6 +222,7 @@ where
             permit,
         } = self;
         let result = supervise_connection(
+            connection_id,
             executor,
             membrane,
             stream,
@@ -236,6 +253,7 @@ where
     S: AsyncRead + AsyncWrite + 'static,
 {
     AcceptedConnectionSupervisor {
+        connection_id: crate::observability::next_connection_id(),
         executor,
         membrane,
         stream,
@@ -322,10 +340,16 @@ async fn best_effort_kill(process: &system_capnp::process::Client, protocol: &st
     {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
-            tracing::warn!(%error, protocol, "process.kill failed during accepted stream teardown");
+            tracing::warn!(
+                event_code = EventCode::RpcCleanupFailed as u16,
+                error = &error as &dyn std::error::Error,
+                protocol,
+                "process.kill failed during accepted stream teardown"
+            );
         }
         Err(_) => {
             tracing::warn!(
+                event_code = EventCode::RpcCleanupTimedOut as u16,
                 protocol,
                 "process.kill timed out during accepted stream teardown"
             );
@@ -333,7 +357,9 @@ async fn best_effort_kill(process: &system_capnp::process::Client, protocol: &st
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn supervise_connection<S>(
+    connection_id: u64,
     executor: system_capnp::executor::Client,
     membrane: system_capnp::membrane::Client,
     stream: S,
@@ -398,7 +424,7 @@ where
                         arm_deadline(&mut deadline, completion_grace);
                     }
                     Err(error) => {
-                        tracing::warn!(%error, protocol, "process.wait failed during stream setup");
+                        tracing::warn!(event_code = EventCode::RpcFailed as u16, error = &error as &dyn std::error::Error, protocol, "process.wait failed during stream setup");
                         drop(setup.take());
                         drop(stream.take());
                         best_effort_kill(&process, protocol).await;
@@ -427,9 +453,9 @@ where
     let (reader, writer) = Box::pin(stream.take().expect("connection stream owned")).split();
     let mut inbound = child_result
         .is_none()
-        .then(|| pump_stream_to_stdin(reader, stdin).boxed_local());
+        .then(|| pump_stream_to_stdin(reader, stdin, connection_id).boxed_local());
     let mut stdin_close: Option<LocalBoxFuture<'static, Result<(), capnp::Error>>> = None;
-    let mut outbound = Some(pump_stdout_to_stream(stdout, writer).boxed_local());
+    let mut outbound = Some(pump_stdout_to_stream(stdout, writer, connection_id).boxed_local());
     let mut output_complete = false;
     let mut teardown_error = None;
 
@@ -456,7 +482,7 @@ where
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(%error, protocol, "process.wait failed");
+                        tracing::warn!(event_code = EventCode::RpcFailed as u16, error = &error as &dyn std::error::Error, protocol, "process.wait failed");
                         child_result = Some(Err(error));
                         break;
                     }
@@ -576,10 +602,11 @@ impl OutputPumpOutcome {
 }
 
 /// Read from the libp2p stream and write to the cell's stdin.
-#[tracing::instrument(name = "stream.pump_in", skip_all)]
+#[tracing::instrument(name = "stream.pump_in", skip_all, fields(connection_id = connection_id))]
 pub(crate) async fn pump_stream_to_stdin(
     mut reader: impl futures::io::AsyncRead + Unpin,
     stdin: system_capnp::byte_stream::Client,
+    connection_id: u64,
 ) -> InputPumpOutcome {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -605,10 +632,11 @@ pub(crate) async fn pump_stream_to_stdin(
 }
 
 /// Read from the cell's stdout and write to the libp2p stream.
-#[tracing::instrument(name = "stream.pump_out", skip_all)]
+#[tracing::instrument(name = "stream.pump_out", skip_all, fields(connection_id = connection_id))]
 pub(crate) async fn pump_stdout_to_stream(
     stdout: system_capnp::byte_stream::Client,
     mut writer: impl futures::io::AsyncWrite + Unpin,
+    connection_id: u64,
 ) -> OutputPumpOutcome {
     loop {
         let mut req = stdout.read_request();
