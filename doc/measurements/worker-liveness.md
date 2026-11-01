@@ -3,6 +3,12 @@
 Baseline: `792729859e1019feb9a01f0c64f7fdce0b92933e` (`origin/master` verified at
 work start). Policy and limits: [worker liveness](../worker-liveness.md).
 
+**Merge recommendation: NO-GO.** The prospective real-Cell comparison completed,
+but unstable identical-binary controls made performance acceptance inconclusive.
+The campaign passed 32 gated metrics; 24 remained inconclusive. No metric met
+the predeclared confirmed-regression rule. See the representative comparison
+below. The original adverse synthetic results remain part of the evidence.
+
 ## Correctness evidence
 
 | Case | Evidence |
@@ -153,12 +159,125 @@ The loop passes the record reference through `black_box` and performs an extra
 black-box atomic read. This measures publication code, not timer/wakeup cost;
 the real-pool CPU measurements above cover those costs.
 
-Independent review found no demonstrated material end-to-end regression that
-requires rollback. Performance acceptance remains limited to these synthetic
-measurements and functional service smoke. Representative service latency,
-production traffic, Linux performance, and scrape-contention overhead were not
-qualified. Do not report this evidence as a zero-overhead bound or production
-performance pass.
+At the end of those two campaigns, independent review found no demonstrated
+material end-to-end regression that required rollback. Those campaigns provided
+synthetic measurements and functional service smoke, without representative
+service performance acceptance. The additional comparison below does not erase
+their adverse results. No evidence establishes a zero-overhead bound or
+production performance pass.
+
+## Representative Cell-service comparison
+
+An independent review required a real-Cell comparison because the executor
+microbenchmarks used synthetic futures. The
+[prospective plan](worker-liveness-service-plan.md) fixed workloads, numerical
+limits, process order and variance rules before timing. No numerical limit or
+production code changed after results were observed.
+
+The harness admits real P3 commands through `ExecutorPool::spawn`, then runs
+`Builder::ordinary`, `Proc::run` and filesystem cleanup. It covers pool creation,
+Cell startup, short batches, sustained cooperative Cells, ordinary clock waits,
+and shutdown. Both binaries use the production worker-0 epoch publisher. The
+pending-I/O case establishes exact applied-fuel evidence, distinct worker
+identities and an unchanged pending snapshot. Completion-lateness measurements
+retain lower and upper bounds; acceptance uses the conservative upper bound.
+
+The candidate production commit was
+`2a56d53d266cdbf0895e90256eaa8e7d390b0250`; baseline was
+`792729859e1019feb9a01f0c64f7fdce0b92933e`. The harness source and its generated
+example entrypoint were byte-identical across builds. Build receipts bind the
+source, fixture, dependency lockfile, commits and binaries. The example wrapper
+avoids relinking the unused Host CLI; it changes no measured workload.
+
+Exactly twelve processes ran in three alternating four-process blocks. Each
+block contained two runs of each identical binary. All processes completed with
+their correctness assertions intact. The campaign took 290.11 seconds. All 273
+periodic power samples and the final power check reported AC. Executable hashes
+remained unchanged. No additional timing campaign ran.
+
+The machine was not idle: a game process consumed 62.1–180.6% of one CPU in the
+recorded samples, with a median of 101.0%. WindowServer also consumed CPU.
+No compiler or Cargo process appeared among the five busiest processes in the
+samples. `pmset` reported no recorded thermal or performance warning; that
+output does not prove the absence of throttling. Background activity is a
+possible source of variance, not an established causal explanation.
+
+The following changes compare geometric means within each block. Positive
+values indicate increased cost. Individual Cells were not treated as independent
+process replications.
+
+| Metric | Workers | Block 0 | Block 1 | Block 2 | Acceptance |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Short-batch elapsed cost per Cell | 1 | +0.33% | −6.25% | +0.43% | Inconclusive: controls unstable |
+| Short-batch elapsed cost per Cell | 4 | +0.86% | +2.50% | +0.40% | Inconclusive: controls unstable |
+| Cooperative elapsed cost per Cell | 1 | −0.09% | +1.48% | +0.69% | Pass |
+| Cooperative elapsed cost per Cell | 4 | −6.92% | +16.07% | −0.77% | Inconclusive: controls unstable, mixed limit crossings |
+| Cooperative CPU per Cell | 1 | +0.10% | +1.63% | +0.56% | Pass |
+| Cooperative CPU per Cell | 4 | −7.01% | +16.27% | −0.77% | Inconclusive: controls unstable, mixed limit crossings |
+
+All 24 inconclusive metrics had unstable identical-binary controls. Most did
+not exceed their candidate-versus-baseline allowance, but the prospective plan
+requires stable controls before declaring a pass. For example, the four-worker
+short-batch candidate controls differed by 12.86 microseconds per Cell in block 1,
+exceeding that block's 10-microsecond control allowance. Four-worker cooperative
+controls also varied more than the five-percent budget. Favorable aggregate
+medians cannot resolve these failures.
+
+Pool creation, shutdown and pending-I/O CPU/lateness gates passed. Across all
+metrics, 32 passed, 24 were inconclusive, and six were descriptive only. There
+was no confirmed regression under the frozen rule, which requires stable
+controls and an over-budget increase in all three blocks. This is not a
+performance pass. Merge remains NO-GO pending further user-directed performance
+qualification or an explicit decision about the unresolved cost.
+
+[Process summaries, decisions, build receipts and environment samples](worker-liveness-service-results.json)
+retain every block. [Compressed raw samples](worker-liveness-service-samples.json.gz)
+retain every timed Cell and process record. The original local result and full
+process-monitor logs remain in `.context/service-performance/`; their hashes are
+recorded in the public summary. Public process samples use executable basenames,
+and build paths are repository-relative. No timing samples were discarded.
+
+After the campaign, source review moved the build helper's overwrite guard
+inside its shared lock. The same correction was applied to the campaign driver,
+so concurrent invocations cannot bypass either guard. These corrections change
+no measured workload or numerical acceptance rule. The public summary retains
+the exact driver source matching the recorded campaign hash. Both corrected
+helpers were checked against existing artifacts and refused to overwrite them.
+
+For reproduction in a separate checkout, create the baseline worktree at the
+recorded baseline commit, then build both binaries before starting the driver:
+
+```sh
+git worktree add --detach .context/liveness-baseline 792729859e1019feb9a01f0c64f7fdce0b92933e
+python3 scripts/build_worker_liveness_measurement.py
+python3 scripts/qualify_worker_liveness.py \
+  --receipt .context/service-performance-build-receipt.json \
+  --baseline .context/service-performance-baseline \
+  --candidate .context/service-performance-candidate --entry example
+```
+
+The build helper refuses to overwrite recorded binaries or receipts. The driver
+refuses to repeat an existing campaign. Both use the shared build/benchmark lock.
+The checked-in plan applies to the recorded experiment; another campaign
+requires an explicit decision before timing. This in-process boundary does not
+qualify HTTP ingress, kernel RPC admission, Kubo, production traffic, Linux, or
+scrape-contention overhead.
+
+## Publication qualification
+
+The original candidate was published as draft PR #793 at `2a56d53d`. Its tree
+exactly matched the independently reviewed working-tree candidate. Fresh local
+validation repeated 1,136 library tests, three P3 liveness tests, ten HTTP tests,
+two PID0 parser tests, six native P3 artifact tests and the real PID0 smoke.
+Strict all-target Clippy, formatting and diff checks passed. Independent
+correctness and adversarial source reviews found no material defect. The
+adversarial pass reviewed test fixtures in summary mode. A separate reviewer
+checked the performance harness and driver before timing. Optional Claude
+review was unavailable because OAuth refresh failed.
+
+Qualification additions change tests, scripts and evidence only. The production
+worker-liveness source remains identical to the published implementation.
+GitHub CI status must be checked for the final PR head before any landing.
 
 ## Qualification limits
 
@@ -187,5 +306,8 @@ admin endpoint; no CLI wiring change was needed.
 | `tests/metrics_http.rs`, `tests/pid0_e2e.rs`, `tests/fixtures/host-metrics.prom` | HTTP stall/recovery coverage and complete metric schema checks. |
 | `src/services_tracing_tests.rs` | Supply the worker lifecycle guard to the existing direct-loop fixture. |
 | `tests/executor_overhead.rs` | Sustained workloads and idle CPU measurements on the real pool. |
+| `tests/worker_liveness_service_overhead.rs` | Opt-in real P3 Cell-service comparison. |
+| `scripts/build_worker_liveness_measurement.py`, `scripts/qualify_worker_liveness.py` | Paired builds, source receipts, bounded campaign, AC monitoring and frozen acceptance rules. |
 | `doc/worker-liveness.md`, `doc/deployment.md`, `CHANGELOG.md` | Operator semantics, limits and release note. |
 | `doc/measurements/worker-liveness.md`, `worker-liveness-results.json` | Qualification method, evidence and recorded measurements. |
+| `doc/measurements/worker-liveness-service-plan.md`, `worker-liveness-service-results.json`, `worker-liveness-service-samples.json.gz` | Prospective criteria, all process comparisons, environment samples and compressed raw data. |
