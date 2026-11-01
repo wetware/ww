@@ -9,6 +9,10 @@ Primary code references:
 - `crates/cell/src/proc.rs` — `FuelEstimator`, call hook, epoch callback
 - `src/services.rs` — `ExecutorPool` and epoch tick task
 
+For opt-in, bounded inspection of one Store's committed fuel decisions, see
+[the fuel inspector](fuel-inspector.md). Inspection uses owner-held state and
+keeps the independently observed Host epoch separate from Store authority.
+
 ## Problem
 
 Each executor worker thread runs many cells on a single `LocalSet`.
