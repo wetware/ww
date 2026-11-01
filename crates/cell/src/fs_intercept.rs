@@ -2173,6 +2173,108 @@ mod tests {
         }
     }
 
+    #[test]
+    fn queued_directory_descriptor_observes_close_before_native_entry() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let fs = TestFilesystem::with_limits(
+                cache::HostLimits::new(1, 2, 1).unwrap(),
+                cache::CellLimits::new(1).unwrap(),
+            );
+            let staging = tempfile::tempdir().unwrap();
+            std::fs::write(
+                staging.path().join(format!("{DIRECTORY_CID}.dirlist.json")),
+                serde_json::to_vec(&directory_entries()).unwrap(),
+            ).unwrap();
+            let cid = ipfs::cid_identity::parse_cid(DIRECTORY_CID).unwrap();
+            let tree = fs.tree(cid, ipfs::HttpClient::new("http://127.0.0.1:1".into()), staging.path().to_owned());
+            let final_path = staging.path().join(format!("dir-{DIRECTORY_CID}"));
+            let descriptor_entered = Arc::new(AtomicBool::new(false));
+            let entry_witness = Arc::clone(&descriptor_entered);
+            fs.scope.set_test_hook(Arc::new(move |event| {
+                if event.operation == cache::FilesystemOperation::DescriptorOpen
+                    && event.stage == cache::FsTestStage::Started {
+                    entry_witness.store(true, Ordering::SeqCst);
+                }
+            }));
+            let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let mut blocker = Some((blocked_tx, release_rx));
+            let worker_runtime = tokio::runtime::Handle::current();
+            let _hook = BuildHookGuard::install(move |_, stage| {
+                if stage == BuildStage::Published {
+                    let (blocked, release) = blocker.take().unwrap();
+                    // Queue before the directory closure returns, so the sole
+                    // native worker cannot enter the subsequent descriptor job.
+                    worker_runtime.spawn_blocking(move || {
+                        blocked.send(()).unwrap();
+                        release.recv_timeout(Duration::from_secs(10)).unwrap();
+                    });
+                }
+                Ok(())
+            });
+            let mut call = Box::pin(materialize_cid_tree_descriptor_in(
+                &fs.scope, &fs.resources, fs.resources.try_logical_io().unwrap(),
+                None, &tree, ResolvedNode::CidDir { cid },
+            ));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    _ = &mut call => panic!("descriptor must remain pending behind the native blocker"),
+                    entered = blocked_rx => entered.unwrap(),
+                }
+                loop {
+                    std::future::poll_fn(|cx| {
+                        assert!(call.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    }).await;
+                    let snapshot = fs.completion.try_snapshot().unwrap();
+                    let build = snapshot.directory_builds()[0].unwrap();
+                    if build.waiter() == cache::FsOperationWaiter::Returned {
+                        assert_eq!(build.backend(), cache::FsOperationBackend::Succeeded);
+                        assert_eq!(build.receipt(), cache::FsOperationReceipt::Outstanding);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            // In the same poll that returns DirectoryBuild, materialization
+            // passes the descriptor pre-submit check and queues its driver before
+            // yielding. This is a driver-queued witness, not a blocking-pool
+            // submission diagnostic. The root has remained open throughout.
+            assert!(!fs.scope.cancellation().is_cancelled());
+            assert_complete_directory(&final_path, false);
+            assert!(!descriptor_entered.load(Ordering::SeqCst));
+            drop(fs._scope_owner);
+            assert!(fs.resources.try_logical_io().is_err());
+            assert!(fs.resources.host().try_foreground().is_err());
+            let mut completion = Box::pin(fs.completion.wait());
+            std::future::poll_fn(|cx| {
+                assert!(completion.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            }).await;
+            release_tx.send(()).unwrap();
+            let result = call.await.unwrap();
+            assert!(!descriptor_entered.load(Ordering::SeqCst));
+            assert!(fs.resources.try_logical_io().is_err(), "completed result still owns the transaction");
+            assert!(fs.resources.host().try_foreground().is_err());
+            assert!(matches!(result.into_inner(), Err(MaterializeError::Cancelled)));
+            completion.await.unwrap();
+            assert!(fs.resources.try_logical_io().is_ok());
+            assert!(fs.resources.host().try_foreground().is_ok());
+            assert_complete_directory(&final_path, false);
+            assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 2);
+        });
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn closed_root_stops_directory_entries_and_retains_rollback() {
         let fs = TestFilesystem::with_limits(
