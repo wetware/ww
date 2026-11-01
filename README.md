@@ -175,5 +175,6 @@ an image. A published guest requires an application-specific composition path.
 - [RPC transport](doc/rpc-transport.md): transport plumbing and scheduling model
 - [Guest runtime](doc/guest-runtime.md): async runtime for WASM guests
 - [Runtime topology](doc/runtimes.md): host service threads and filesystem lifecycle
+- [Local observability](doc/observability.md): reproduce a Cell incident and follow metrics, logs, and traces in Grafana
 - [Replay protection](doc/replay-protection.md): epoch-bound authentication
 - [Examples](examples/): echo, counter, oracle, chess, discovery, and snap-hello-rs

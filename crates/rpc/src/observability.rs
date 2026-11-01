@@ -21,6 +21,7 @@ pub enum EventCode {
     CompilerStartFailed = 108,
     CompilerPanicked = 109,
     KernelExited = 110,
+    TelemetryDisabled = 111,
     CellExited = 200,
     CellFailed = 201,
     CellCleanupFailed = 202,
@@ -95,6 +96,13 @@ pub fn contract(code: u64) -> Option<Contract> {
             "timed_out",
             "teardown_deadline",
             "Kernel generation teardown timed out",
+        ),
+        111 => (
+            "host",
+            "configure_telemetry",
+            "disabled",
+            "configuration_or_start_failed",
+            "Local trace export disabled: invalid configuration or exporter startup failed",
         ),
         100 => (
             "host",

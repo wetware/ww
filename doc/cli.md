@@ -182,6 +182,9 @@ RPC listener and does not serve this path. Wetware does not fall back to Kubo's
 | `WW_OCI_IMAGE_ID` | operator | Optional immutable OCI image identity reported by `/version`. Deployment verification uses Kubernetes `pod.status.imageID` as the authority. |
 | `RUST_LOG` | user | Host-side tracing verbosity |
 | `WW_LOG_FORMAT` | user | Host log format: `auto` (default), `compact`, or `json` |
+| `WW_OTLP_ENDPOINT` | user | Opt-in local OTLP/HTTP trace endpoint; absent disables export |
+| `WW_TRACE_SAMPLE_RATIO` | user | Eligible Cell root sampling probability, `0` through `1`; enabled default `0.01` |
+| `WW_TRACE_MAX_SPANS_PER_SECOND` | user | Sampled span admission cap, `1` through `10000`; default `100` |
 | `NO_COLOR` | user | A nonempty value disables ANSI color in Host logs |
 
 ### Host logging
@@ -233,6 +236,13 @@ This policy covers Host tracing. Interactive shell rendering, progress output,
 and direct guest/PID0 stderr keep their existing behavior (child-output ownership:
 #155). Ordinary child stderr forwarded through tracing emits TRACE byte counts;
 the log record does not include the child output.
+
+Trace export accepts only an HTTP loopback IP endpoint with path `/v1/traces`.
+Credentials, query strings, DNS names, and redirects are not supported.
+Invalid configuration disables export and emits event `111`. Keep `cell` and
+`ww` INFO spans enabled in `RUST_LOG` to retain the Cell lifecycle boundaries.
+The [local observability recipe](observability.md) documents sampling, queue
+bounds, shutdown behavior, and the Grafana incident walkthrough.
 
 ## ww image check
 

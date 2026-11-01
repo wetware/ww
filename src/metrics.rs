@@ -115,6 +115,7 @@ fn render_metrics(state: &AdminState) -> String {
     render_executor_metrics(&mut out, state.executor_metrics.snapshot());
     render_worker_liveness(&mut out, &state.executor_metrics);
     render_fuel_metrics(&mut out, &state.fuel_metrics);
+    crate::telemetry::render_metrics(&mut out);
     out
 }
 
@@ -757,18 +758,18 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("# HELP "))
                 .count(),
-            18
+            24
         );
         assert_eq!(
             output
                 .lines()
                 .filter(|line| line.starts_with("# TYPE "))
                 .count(),
-            18
+            24
         );
         assert_eq!(
             output.lines().filter(|line| !line.starts_with('#')).count(),
-            52
+            62
         );
     }
 

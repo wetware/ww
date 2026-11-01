@@ -1,15 +1,29 @@
 # Executor worker liveness qualification
 
-Baseline: `792729859e1019feb9a01f0c64f7fdce0b92933e` (`origin/master` verified at
-work start). Policy and limits: [worker liveness](../worker-liveness.md).
+Historical baseline: `792729859e1019feb9a01f0c64f7fdce0b92933e`.
+The representative comparison measured candidate
+`2a56d53d266cdbf0895e90256eaa8e7d390b0250` against that baseline.
+Policy and limits: [worker liveness](../worker-liveness.md).
+
+**Evidence boundary:** All measurements below predate PR #791, merged into master
+at `0d3a364c7115a81168c9141536fdb983fe935464`. They do not qualify the
+worker-liveness head after integration with that master commit. The earlier
+synthetic campaigns retain their original working-tree source and binary hashes.
+No additional timing was performed for the integrated implementation. The frozen
+plan, raw measurements and recorded acceptance decisions remain unchanged.
 
 **Merge recommendation: NO-GO.** The prospective real-Cell comparison completed,
 but unstable identical-binary controls made performance acceptance inconclusive.
-The campaign passed 32 gated metrics; 24 remained inconclusive. No metric met
-the predeclared confirmed-regression rule. See the representative comparison
+The campaign passed 32 gated metrics; 24 remained inconclusive. No measured metric met
+the predeclared confirmed-regression rule. The integrated head has no combined
+performance qualification. See the representative comparison
 below. The original adverse synthetic results remain part of the evidence.
 
 ## Correctness evidence
+
+The evidence and test counts in the next two sections describe the original
+worker-liveness candidate before PR #791 integration. They do not replace
+correctness checks or GitHub CI for the integrated head.
 
 | Case | Evidence |
 | --- | --- |
@@ -62,6 +76,22 @@ code changed. The timeout's cause was not independently established.
 The 14 ignored library tests include opt-in measurements and artifact tests.
 The six native P3 artifact tests were subsequently enabled in their dedicated
 lane. This qualification does not claim every repository integration test ran.
+
+## Merged-master correctness checks
+
+After reconciling master `0d3a364c7115a81168c9141536fdb983fe935464`, the
+combined endpoint retains both telemetry and worker-liveness metrics: 24 families,
+62 fixed samples, plus five worker samples and an optional progress-age sample
+per configured worker. Conflict resolution changed metric counts and fixtures;
+worker heartbeat and lifecycle logic remained unchanged.
+
+Fresh local checks passed 1,146 workspace library tests (16 ignored), three real
+P3 liveness tests, ten HTTP tests, two PID0 parser tests, and the real
+PID0/TTY/status/metrics smoke test. Strict all-target Clippy and formatting passed.
+Independent integration review found no material defect in metric rendering,
+parser contracts, shutdown ordering or heartbeat interactions with telemetry.
+GitHub CI must still be checked against the final published head. These checks
+add no performance qualification.
 
 ## Reproduction
 
@@ -244,10 +274,18 @@ no measured workload or numerical acceptance rule. The public summary retains
 the exact driver source matching the recorded campaign hash. Both corrected
 helpers were checked against existing artifacts and refused to overwrite them.
 
-For reproduction in a separate checkout, create the baseline worktree at the
-recorded baseline commit, then build both binaries before starting the driver:
+Historical source reproduction requires a separate checkout at evidence commit
+`59af9d1f662d7db75c399195ab552a0290eaae8b`. That commit contains the measurement
+helpers and retains the production source measured at `2a56d53d`. Running the
+helpers from the integrated head would instead build the unmeasured telemetry
+integration. Do not treat that build as a reproduction of the recorded candidate.
+A new timing run still requires an explicit decision under the frozen plan.
+
+In that separate checkout, select the historical evidence commit, create the
+recorded baseline worktree, and build both binaries before starting the driver:
 
 ```sh
+git checkout --detach 59af9d1f662d7db75c399195ab552a0290eaae8b
 git worktree add --detach .context/liveness-baseline 792729859e1019feb9a01f0c64f7fdce0b92933e
 python3 scripts/build_worker_liveness_measurement.py
 python3 scripts/qualify_worker_liveness.py \
@@ -275,9 +313,13 @@ adversarial pass reviewed test fixtures in summary mode. A separate reviewer
 checked the performance harness and driver before timing. Optional Claude
 review was unavailable because OAuth refresh failed.
 
-Qualification additions change tests, scripts and evidence only. The production
-worker-liveness source remains identical to the published implementation.
-GitHub CI status must be checked for the final PR head before any landing.
+Before master reconciliation, the qualification additions changed tests, scripts
+and evidence only. The recorded campaign therefore remains bound to the original
+published production implementation. PR #791 adds telemetry collectors and
+runtime integration that the measured baseline and candidate did not contain.
+Correctness checks and GitHub CI must cover the final integrated PR head.
+Passing those checks cannot transfer the historical performance results to that
+head or resolve the campaign's inconclusive acceptance.
 
 ## Qualification limits
 
@@ -292,9 +334,11 @@ fuel-decision, or epoch-publication instrumentation was added.
 Tests establish worker responsiveness independently of waiting Cells. They do
 not prove fairness for each Cell, distinguish permanent deadlock from OS
 scheduling delays, or qualify production load and whole-process failure.
-No deployment, release promotion, OTLP integration, or PR #791 reconciliation
-was performed. The existing Host collector already connects the CLI to the
-admin endpoint; no CLI wiring change was needed.
+The recorded worker-liveness qualification performed no deployment, release
+promotion or OTLP integration. PR #791 reconciliation is a subsequent source
+integration; its combined behavior and cost were not measured by these campaigns.
+The original worker-liveness change used the existing Host collector connection
+between the CLI and admin endpoint; it required no separate CLI wiring.
 
 ## Changed files
 

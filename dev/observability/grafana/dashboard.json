@@ -1,0 +1,333 @@
+{
+  "uid": "wetware-lifecycle",
+  "title": "Wetware \u2014 Cell lifecycle investigation",
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "tags": [
+    "wetware",
+    "local"
+  ],
+  "editable": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Instantiation failures since process start",
+      "type": "stat",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 5
+      },
+      "description": "Actual returned instantiations; includes start functions. Dropped pending futures are excluded. A timeout is the incident symptom.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ww_wasmtime_instantiations_total{outcome=~\"error|timeout\"}",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Cell task slots",
+      "type": "stat",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 8,
+        "h": 5
+      },
+      "description": "Executor-admitted slots. A slot is not evidence of guest progress.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ww_executor_cell_slots",
+          "legendFormat": "queued or running"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Ended Cell tasks since process start",
+      "type": "stat",
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 8,
+        "h": 5
+      },
+      "description": "completed means the factory future returned, not guest success.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ww_executor_cell_terminations_total",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Compilation and instantiation p95 (5m window)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 7
+      },
+      "description": "Includes returned failures; low sample counts make quantiles approximate. Compilation includes persistent-cache loads.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(ww_wasmtime_instantiation_duration_seconds_bucket[5m])))",
+          "legendFormat": "instantiation"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(ww_wasmtime_component_compile_duration_seconds_bucket[5m])))",
+          "legendFormat": "compilation"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Applied fuel decisions (per second)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 7
+      },
+      "description": "Aggregate decision boundaries, not fuel hooks. No Cell identifier labels. No data means no matching samples; it does not establish a zero value or the cause of missing samples.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(ww_fuel_decisions_total[1m])",
+          "legendFormat": "{{policy}} / {{decision}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Returned lifecycle operations since process start",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 12,
+        "h": 6
+      },
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ww_wasmtime_instantiations_total",
+          "legendFormat": "instantiation {{outcome}}"
+        },
+        {
+          "refId": "B",
+          "expr": "ww_wasmtime_component_compile_total",
+          "legendFormat": "compile {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Telemetry losses since process start",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 12,
+        "h": 6
+      },
+      "description": "Runtime drops. A sampled log can point to a trace that export later dropped. Check collector and Alloy metrics in Explore for downstream delivery failures.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ww_telemetry_dropped_total",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Lifecycle incident logs \u2014 expand a record, then Open trace",
+      "type": "logs",
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"wetware\"} | json | fields_event_code=\"300\"",
+          "queryType": "range"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true
+      },
+      "description": "Event 300 is the existing classified instantiation timeout. trace_id is query-time data, never an indexed Loki label. Open trace follows the actual runtime trace ID."
+    }
+  ],
+  "links": []
+}

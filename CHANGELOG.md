@@ -28,6 +28,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   worker's lifecycle, confirmed progress age, and five-second stall threshold.
   A 250 ms LocalSet heartbeat distinguishes blocked workers from Cells awaiting
   P3 I/O or cooperative fuel suspension without changing health/readiness.
+- **Local Cell incident investigation (#755).** Opt-in sampled OTLP/HTTP export
+  reuses the operational log redaction policy, supplies exact log-to-trace IDs,
+  and bounds retained records, export queues, requests and shutdown. Fixed-label
+  metrics report telemetry loss. A pinned local Grafana stack and real P3
+  instantiation-timeout workload demonstrate metrics, logs and traces together.
 - **Owner-coherent fuel inspection (#781, #752, #756).** Trusted hosts can request
   bounded snapshots of a Cell's fuel policy, EWMA, grants, physical fuel, epochs,
   authority ledgers and committed decisions at Store ownership boundaries. One

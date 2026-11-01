@@ -300,7 +300,7 @@ localhost-only admin plane on `127.0.0.1:2026` is the process control surface:
 - `/version` reports source and current generation kernel provenance plus degraded
   cache state.
 - `/metrics` exposes live Wasmtime cache and lifecycle, ExecutorPool, applied fuel decisions,
-  and settled fuel consumption. See the collection
+  settled fuel consumption, worker liveness, and telemetry export/loss. See the collection
   policy below for measurements that are not yet available.
 
 Keep the admin listener on loopback unless an authenticated network boundary
@@ -425,9 +425,11 @@ cancellation, and Store teardown can leave physical consumption unsettled.
 The runtime adds no termination settlement. Initial zero-budget rejection
 adds no consumption.
 
-The endpoint exports 52 fixed series: 35 Wasmtime samples, seven executor
+The endpoint exports 62 fixed series: 35 Wasmtime samples, seven executor
 samples, six fuel-decision samples, two settled-consumption samples, and two
-worker-liveness policy samples. Each configured executor worker adds five
+worker-liveness policy samples, plus ten telemetry samples. The telemetry
+samples use fixed labels to report sampling, export, and loss; see
+[local observability](observability.md). Each configured executor worker adds five
 lifecycle/stall samples and one age sample after its first confirmed progress.
 Metric names and HELP text are static. Worker indices are bounded by the
 configured worker count; other label values are fixed. The renderer accepts
