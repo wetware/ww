@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cell-owned directory build cancellation (#787, #785).** Closing a Cell's
+  filesystem root stops unnecessary CID-directory entries and rolls back private
+  staging. Commit acceptance is ordered with cancellation; already accepted
+  publication preserves immutable winners. Native work, rollback and results
+  retain their receipts until safe completion, and rollback errors prevent false
+  cleanup certification. Post-publication descriptor work observes cancellation.
+
 ### Removed
 - Obsolete kernel-selector migration handling and tests for retired CLI flags
   and routing identifiers. `--kernel` now receives Clap's ordinary unknown-argument

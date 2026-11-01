@@ -98,13 +98,35 @@ flowchart TD
 
 Dropping the waiter does not cancel retained backend work. Dropping the async
 wrapper before its first poll submits no work and creates no record. Ordinary
-backend errors set `Failed` without changing existing root-failure semantics.
+backend errors, including cooperative cancellation, set `Failed` without
+changing existing root-failure semantics. `Failed` is a returned error, not
+evidence that rollback failed.
 Panic handling and root failure recording remain those of `run_blocking`.
 
-Guest cancellation currently does not cancel this selected native backend
-operation. [#785](https://github.com/wetware/ww/issues/785) owns the correctness
-decision and any cancellation changes. This diagnostic observes existing behavior;
-continued execution is not evidence that an independent Host owner needs it.
+Cell root closure now cancels unnecessary work in this selected slice (#787).
+`FsScope::cancellation()` returns a read-only weak observation of the exact root;
+it retains no work receipt, owner, or capacity and cannot target a reused root.
+Closure is visible even with receipts outstanding. A released or poisoned root
+fails closed.
+
+The builder checks before submission, on native entry, between entry operations
+(including file creation and sizing), and before commit acceptance. Cancellation
+before acceptance explicitly removes private staging; unwind also performs that
+rollback. Expected cancellation maps to WASI `interrupted` and does not poison
+cleanup. Rollback failure or panic prevents successful filesystem completion.
+
+Commit acceptance reads root admission under the same lifecycle mutex as root
+closure. If closure wins, publication is refused. If acceptance wins, the
+non-replacing rename may finish after closure; the mutex is released before the
+syscall. Published winners remain intact. The descriptor tail checks cancellation
+before submission and native entry, so it skips unnecessary post-publication
+work. Receipts still retain already-started native phases, mandatory rollback,
+and result disposal; the async wrapper is never aborted.
+
+This contract does not cancel the preceding listing fetch, shared pin producers,
+all delegated P3 filesystem operations, or an entire `open-at`. Dropping just the
+waiter while the root remains open still allows construction to complete.
+[#785](https://github.com/wetware/ww/issues/785) tracks the remaining scope.
 
 The pinned Wasmtime `FilesystemOperation` hook exposes admission and final
 opaque-owner release only. A stream session or retained result can outlive a
@@ -199,9 +221,11 @@ return `Busy`; consumers must preserve that uncertainty.
 
 The real compiled P3 test
 `native_p3_directory_cancellation_distinguishes_backend_and_cleanup_completion`
-gates directory publication, kills the Cell, verifies Store destruction, then
-holds cleanup separately. Native file contents and deletion independently
-witness publication and cleanup. Cache tests cover queued cancellation,
+gates before commit acceptance, kills the Cell, verifies Store destruction, then
+holds root cleanup separately. Private staging deletion and absence of publication
+independently witness rollback. Its accepted-commit companion gates after
+acceptance and verifies permitted publication despite closure. Cell tests hold
+rollback separately and check admission remains occupied until deletion finishes. Cache tests cover queued cancellation,
 failure, panic, concurrency, retention, bounds, generation reuse, and shutdown.
 
 ## Extension boundary
