@@ -203,27 +203,36 @@ WW_LOG_FORMAT=json RUST_LOG=ww=debug,rpc=info ww run 2>host.jsonl
 NO_COLOR=1 WW_LOG_FORMAT=compact ww run
 ```
 
-Each JSON line contains `timestamp`, `level`, `target`, and `fields`. Event
-messages appear in `fields.message`; native numeric and boolean fields retain
-their JSON types. When available, `span` contains the current span's name and
-fields. The formatter reserves `span.name` for the span name (`cell` for a Cell
-span); use `span.cell_name` for the Cell identity. The legacy `name` field remains
-available to span-field filters. Ancestor spans are not repeated in a `spans`
-list. Filtering can remove span context, and separately spawned tasks need
-explicit span propagation. Ordinary child tasks use numeric `span.cell_id`;
-managed RPC workers use numeric `span.rpc_id`. These IDs are local to one Host
-process. RPC spans describe connections, not the caller that opened them.
+Each JSON line contains `timestamp`, `level`, `target`, `line`, and `fields`.
+Recognized event codes select a literal `fields.message` and typed contract
+fields. Approved numeric and boolean fields retain their JSON types. Other values,
+including interpolated messages and arbitrary strings, are redacted.
+
+When available, `span` contains the current span's name and safe fields. The
+formatter reserves `span.name` for the span name (`cell` for a Cell span).
+ExecutorPool owners use numeric `span.owner_id`; ordinary children use
+`span.cell_id`; managed RPC workers use `span.rpc_id`. VAT and stream handlers use
+`span.connection_id`. These identity namespaces are distinct and local to one
+Host process. `cell_name`, `name`, protocol names, and service names remain
+available to existing span-field filters but are redacted in output.
+
+Ancestor spans are not repeated in a `spans` list. Filtering can remove span
+context, and separately spawned tasks need explicit span propagation. RPC spans
+describe connections, not the caller that opened them.
 See [async tracing ownership](runtimes.md#async-tracing-ownership) for propagation
 and filtering boundaries.
 
 Unknown, empty, or non-Unicode `WW_LOG_FORMAT` values fall back to `auto` and
 produce a warning, subject to `RUST_LOG`. The warning does not echo the value.
-Existing event error fields retain their recorded diagnostic representation;
-the formatter does not add or redact application fields. Call sites must avoid
-recording secrets or opaque capability payloads.
+Errors recorded as `dyn Error` retain bounded source relationships with redacted
+messages. Both output formats enforce the same field and record limits, including
+when TRACE is enabled. See the [operational logging contract](logging.md) for event
+codes, privacy policy, correlation fields, error chains, and migration rules.
 
 This policy covers Host tracing. Interactive shell rendering, progress output,
-and child stderr keep their existing behavior (child-output ownership: #155).
+and direct guest/PID0 stderr keep their existing behavior (child-output ownership:
+#155). Ordinary child stderr forwarded through tracing emits TRACE byte counts;
+the log record does not include the child output.
 
 ## ww image check
 

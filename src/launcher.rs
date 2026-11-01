@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
+use rpc::observability::EventCode;
 use tokio::io;
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
@@ -377,7 +378,10 @@ impl OwnedChildLifecycle {
         let exit_code = loop {
             // A request may predate this owner's first poll.
             if *self.kill_rx.borrow() {
-                tracing::info!("executor: child process killed");
+                tracing::trace!(
+                    event_code = EventCode::CellTerminationRequested as u16,
+                    "executor: child process killed"
+                );
                 break 137;
             }
             tokio::select! {
@@ -393,7 +397,7 @@ impl OwnedChildLifecycle {
                     break match result {
                         Ok(()) => 0,
                         Err(error) => {
-                            tracing::error!("executor: child process failed: {error}");
+                            tracing::error!(event_code = EventCode::CellFailed as u16, error = error.as_ref() as &dyn std::error::Error, "executor: child process failed");
                             1
                         }
                     };
@@ -418,14 +422,22 @@ impl OwnedChildLifecycle {
         let filesystem_completed = match filesystem_result {
             Ok(()) => true,
             Err(error) => {
-                tracing::error!(%error, "executor: child filesystem cleanup was not certified");
+                tracing::error!(
+                    event_code = EventCode::CellCleanupFailed as u16,
+                    error = &error as &dyn std::error::Error,
+                    "executor: child filesystem cleanup was not certified"
+                );
                 false
             }
         };
         // Release the delegated Membrane after child RPC and the stored guest
         // bootstrap are gone but before reporting exit to the parent.
         drop(self.membrane.take());
-        tracing::info!("executor: child process exited with code {exit_code}");
+        tracing::trace!(
+            event_code = EventCode::CellExited as u16,
+            exit_code,
+            "executor: child process exited"
+        );
         if filesystem_completed && rpc_terminalization_completed {
             if let Some(cleanup) = self.cleanup.take() {
                 cleanup.cleaned(exit_code);
@@ -462,9 +474,15 @@ impl OwnedChildLifecycle {
             rpc_terminalization_completed = result.is_ok();
             if !matches!(result, Ok(Ok(()))) {
                 RPC_EOF_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                let error: &dyn std::error::Error = match &result {
+                    Ok(Err(error)) => error,
+                    Err(error) => error,
+                    Ok(Ok(())) => unreachable!("failure branch"),
+                };
                 tracing::warn!(
-                    grace_ms = DISCONNECT_GRACE.as_millis() as u64,
-                    result = ?result,
+                    event_code = EventCode::RpcCleanupFailed as u16,
+                    timeout_ms = DISCONNECT_GRACE.as_millis() as u64,
+                    error,
                     "executor: child RPC disconnect failed or exceeded grace"
                 );
             }
@@ -630,7 +648,11 @@ impl system_capnp::executor::Server for ExecutorImpl {
             tokio::task::spawn_local(
                 rpc::local_tasks::track(async move {
                     if let Err(error) = filesystem_finalizer.run().await {
-                        tracing::error!(%error, "executor: child filesystem finalization failed");
+                        tracing::error!(
+                            event_code = EventCode::CellCleanupFailed as u16,
+                            error = &error as &dyn std::error::Error,
+                            "executor: child filesystem finalization failed"
+                        );
                     }
                 })
                 .instrument(child_span.clone()),
@@ -663,7 +685,8 @@ impl system_capnp::executor::Server for ExecutorImpl {
                 let reader = tokio::io::BufReader::new(host_stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::info!("{}", line);
+                    // Guest output is untrusted; ordinary logs never render its contents.
+                    tracing::trace!(bytes = line.len(), "guest stderr line redacted");
                 }
             });
 

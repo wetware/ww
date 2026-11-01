@@ -11,6 +11,7 @@ pub mod keys;
 pub mod local_tasks;
 pub mod managed_rpc;
 pub mod named_capability;
+pub mod observability;
 pub mod routing;
 pub mod stream_dialer;
 pub mod stream_listener;
@@ -803,7 +804,10 @@ impl system_capnp::process::Server for ProcessImpl {
         _results: system_capnp::process::KillResults,
     ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
         self.terminate.request();
-        tracing::info!("process.kill: termination requested");
+        tracing::trace!(
+            event_code = observability::EventCode::CellTerminationRequested as u16,
+            "Cell termination requested"
+        );
         Promise::ok(())
     }
 }

@@ -22,6 +22,9 @@ impl Capture {
     fn assert_stdout_reserved(&self) {
         assert!(self.stdout.contains(STDOUT_MARKER), "{}", self.stdout);
         for diagnostic in [
+            "Host service failed",
+            "Cell process failed",
+            "RPC connection failed",
             "native-event",
             "filter-event",
             "cell-event",
@@ -192,7 +195,7 @@ fn redirected_stderr_defaults_to_json() {
     let events = capture.json();
     assert!(events
         .iter()
-        .any(|event| event["fields"]["message"] == "native-event"));
+        .any(|event| event["fields"]["message"] == "Host service failed"));
 }
 
 #[test]
@@ -205,7 +208,7 @@ fn explicit_auto_uses_redirected_stderr() {
 fn terminal_stderr_uses_compact_ansi_even_when_stdout_is_redirected() {
     let capture = capture(true, &[]);
     assert!(
-        capture.stderr.contains("native-event"),
+        capture.stderr.contains("Host service failed"),
         "{}",
         capture.stderr
     );
@@ -223,7 +226,7 @@ fn json_override_on_terminal_has_no_ansi() {
 fn compact_override_on_pipe_has_no_ansi() {
     let capture = capture(false, &[("WW_LOG_FORMAT", "compact")]);
     assert!(
-        capture.stderr.contains("native-event"),
+        capture.stderr.contains("Host service failed"),
         "{}",
         capture.stderr
     );
@@ -236,7 +239,7 @@ fn compact_override_on_pipe_has_no_ansi() {
 fn nonempty_no_color_disables_terminal_ansi() {
     let capture = capture(true, &[("NO_COLOR", "1")]);
     assert!(
-        capture.stderr.contains("native-event"),
+        capture.stderr.contains("Host service failed"),
         "{}",
         capture.stderr
     );
@@ -256,7 +259,7 @@ fn json_preserves_typed_fields_and_multiline_errors_in_one_event() {
     let events = capture.json();
     let native: Vec<_> = events
         .iter()
-        .filter(|event| event["fields"]["message"] == "native-event")
+        .filter(|event| event["fields"]["message"] == "Host service failed")
         .collect();
     assert_eq!(native.len(), 1, "initialization must not duplicate events");
     let event = native[0];
@@ -267,8 +270,12 @@ fn json_preserves_typed_fields_and_multiline_errors_in_one_event() {
         .is_some_and(|timestamp| !timestamp.is_empty()));
     assert_eq!(event["fields"]["count"], 42);
     assert_eq!(event["fields"]["active"], true);
-    assert_eq!(event["fields"]["text"], "line one\nline two");
-    assert_eq!(event["fields"]["error"], "probe failed\nuseful detail");
+    assert_eq!(event["fields"]["text"], "[redacted]");
+    assert_eq!(event["fields"]["error"]["chain"][0]["category"], "io");
+    assert_eq!(
+        event["fields"]["error"]["chain"][0]["message"],
+        "[redacted]"
+    );
 }
 
 #[test]
@@ -277,15 +284,12 @@ fn json_keeps_only_current_span_with_correct_async_attribution() {
     let events = capture.json();
     let cells: Vec<_> = events
         .iter()
-        .filter(|event| event["fields"]["message"] == "cell-event")
+        .filter(|event| event["fields"]["event_code"] == 200)
         .collect();
     assert_eq!(cells.len(), 2);
     for event in cells {
         assert_eq!(event["span"]["name"], "cell");
-        assert_eq!(
-            event["span"]["cell_id"],
-            event["fields"]["expected_cell_id"]
-        );
+        assert_eq!(event["span"]["cell_id"], event["fields"]["count"]);
         assert!(
             event.get("spans").is_none(),
             "full span tree duplicated: {event}"
@@ -353,7 +357,7 @@ fn filtered_spans_do_not_add_context_to_enabled_events() {
     let events = capture.json();
     let cells: Vec<_> = events
         .iter()
-        .filter(|event| event["fields"]["message"] == "cell-event-warning")
+        .filter(|event| event["fields"]["event_code"] == 201)
         .collect();
     assert_eq!(cells.len(), 2);
     for event in cells {
@@ -404,7 +408,7 @@ fn invalid_format_falls_back_to_auto_without_echoing_value() {
     assert!(!capture.stderr.contains("forged-log"));
     assert!(events
         .iter()
-        .any(|event| event["fields"]["message"] == "native-event"));
+        .any(|event| event["fields"]["message"] == "Host service failed"));
 }
 
 #[test]
@@ -498,7 +502,7 @@ fn cli_startup_diagnostics_use_json_stderr_and_leave_stdout_empty() {
         events
             .iter()
             .filter(
-                |event| event["fields"]["message"] == "resolving identity..."
+                |event| event["fields"]["message"] == "unclassified event (text redacted)"
                     && event["level"] == "DEBUG"
             )
             .count(),
@@ -538,6 +542,182 @@ fn filtered_stream_handler_error_has_no_invented_context() {
     assert_stream_correlation(true);
 }
 
+#[test]
+fn concurrent_vat_listener_handlers_keep_redacted_numeric_identity() {
+    assert_vat_listener_correlation(false);
+}
+
+#[test]
+fn filtered_vat_listener_rejection_has_no_invented_identity() {
+    assert_vat_listener_correlation(true);
+}
+
+#[test]
+// Value: protects=stable private-name-free identity for real concurrent executor owners;
+// fails_when=owner_id is missing reused or changes after suspension;
+// why_new=existing worker tests only assert names and ancestry; seam=none.
+fn executor_owners_keep_distinct_numeric_identity_after_suspension() {
+    let capture = capture(
+        false,
+        &[("WW_LOG_TEST_PROBE", "owners"), ("RUST_LOG", "ww=info")],
+    );
+    assert!(!capture.stderr.contains("private-owner-name"));
+    let events = capture.json();
+    let mut ids = Vec::new();
+    for owner in [1u64, 2] {
+        let observed: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event["target"] == "ww::logging_probe" && event["fields"]["epoch"] == owner
+            })
+            .collect();
+        assert_eq!(observed.len(), 2, "{events:?}");
+        let id = observed[0]["span"]["owner_id"]
+            .as_u64()
+            .expect("numeric executor owner identity");
+        assert_ne!(id, 0);
+        for (stage, event) in observed.iter().enumerate() {
+            assert_eq!(event["span"]["name"], "cell");
+            assert_eq!(event["span"]["owner_id"], id);
+            assert_eq!(event["span"]["cell_name"], "[redacted]");
+            assert_eq!(event["fields"]["count"], stage);
+        }
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1]);
+    let unrelated: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["target"] == "ww::logging_probe" && event["fields"]["event_code"] == 101
+        })
+        .collect();
+    assert_eq!(unrelated.len(), 1);
+    assert!(unrelated[0].get("span").is_none());
+}
+
+#[test]
+// Value: protects=quiet successful child lifecycle and structured child failure events;
+// fails_when=exit/kill detail emits at INFO or failure loses its code/source;
+// why_new=existing child attribution tests do not inspect the final event contract; seam=none.
+fn real_child_exit_kill_and_failure_follow_the_logging_contract() {
+    for format in ["json", "compact"] {
+        for level in ["info", "trace"] {
+            let filter = format!("ww={level},rpc={level},cell={level}");
+            let capture = capture(
+                false,
+                &[
+                    ("WW_LOG_TEST_PROBE", "children"),
+                    ("WW_LOG_FORMAT", format),
+                    ("RUST_LOG", &filter),
+                ],
+            );
+            if format == "json" {
+                let events = capture.json();
+                let failures: Vec<_> = events
+                    .iter()
+                    .filter(|event| event["fields"]["event_code"] == 201)
+                    .collect();
+                assert_eq!(failures.len(), 1, "{events:?}");
+                assert_eq!(failures[0]["level"], "ERROR");
+                assert!(!failures[0]["fields"]["error"]["chain"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(failures[0]["fields"]["error"]["messages_redacted"], true);
+                let exits: Vec<_> = events
+                    .iter()
+                    .filter(|event| event["fields"]["event_code"] == 200)
+                    .collect();
+                let kills: Vec<_> = events
+                    .iter()
+                    .filter(|event| event["fields"]["event_code"] == 203)
+                    .collect();
+                if level == "info" {
+                    assert!(exits.is_empty() && kills.is_empty());
+                } else {
+                    assert_eq!(exits.len(), 3, "{events:?}");
+                    let statuses: Vec<_> = exits
+                        .iter()
+                        .map(|event| event["fields"]["exit_code"].as_i64().unwrap())
+                        .collect();
+                    assert_eq!(statuses, [0, 137, 1]);
+                    assert!(exits
+                        .iter()
+                        .chain(kills.iter())
+                        .all(|event| event["level"] == "TRACE"));
+                    assert!(!kills.is_empty());
+                    let ids: std::collections::BTreeSet<_> = exits
+                        .iter()
+                        .map(|event| event["span"]["cell_id"].as_u64().unwrap())
+                        .collect();
+                    assert_eq!(ids.len(), 3);
+                    assert_eq!(failures[0]["span"]["cell_id"], exits[2]["span"]["cell_id"]);
+                }
+            } else {
+                let has_code = |code| {
+                    capture.stderr.lines().any(|line| {
+                        line.split_whitespace()
+                            .any(|field| field == format!("event_code={code}"))
+                    })
+                };
+                assert!(has_code(201));
+                assert_eq!(has_code(200), level == "trace");
+                assert_eq!(has_code(203), level == "trace");
+                assert!(capture.stderr.contains("messages_redacted"));
+            }
+        }
+    }
+}
+
+fn assert_vat_listener_correlation(filtered: bool) {
+    let filter = if filtered {
+        "ww::logging_probe=info,rpc=warn"
+    } else {
+        "ww::logging_probe=info,rpc=debug"
+    };
+    let events = capture(
+        false,
+        &[("WW_LOG_TEST_PROBE", "vat_listener"), ("RUST_LOG", filter)],
+    )
+    .json();
+    let rejected: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["event_code"] == 402)
+        .collect();
+    assert_eq!(rejected.len(), 1, "{events:?}");
+    if filtered {
+        assert!(rejected[0].get("span").is_none(), "{}", rejected[0]);
+    } else {
+        let rejected_id = rejected[0]["span"]["connection_id"].as_u64().unwrap();
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|event| event["span"]["name"] == "vat.handle")
+            .collect();
+        assert_eq!(completed.len(), 2, "{events:?}");
+        let mut ids = Vec::new();
+        for event in completed {
+            let id = event["span"]["connection_id"]
+                .as_u64()
+                .expect("numeric VAT identity");
+            assert_ne!(id, 0);
+            assert_ne!(id, rejected_id);
+            assert_eq!(event["span"]["service"], "[redacted]");
+            assert!(events
+                .iter()
+                .any(|accept| accept["span"]["name"] == "vat.accept"
+                    && accept["span"]["connection_id"] == id));
+            ids.push(id);
+        }
+        assert_ne!(ids[0], ids[1], "concurrent VAT handlers share identity");
+    }
+    let unrelated: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["event_code"] == 101)
+        .collect();
+    assert_eq!(unrelated.len(), 2);
+    assert!(unrelated.iter().all(|event| event.get("span").is_none()));
+}
+
 fn assert_stream_correlation(filtered: bool) {
     // EnvFilter keeps named spans enabled when they affect dynamic filtering,
     // even with a named `off` directive. Selectively disabled handler spans are
@@ -545,7 +725,7 @@ fn assert_stream_correlation(filtered: bool) {
     let filter = if filtered {
         "ww::logging_probe=info,rpc=error"
     } else {
-        "ww::logging_probe=info,rpc=info"
+        "ww::logging_probe=info,rpc=debug"
     };
     let events = capture(
         false,
@@ -554,21 +734,31 @@ fn assert_stream_correlation(filtered: bool) {
     .json();
     let errors: Vec<_> = events
         .iter()
-        .filter(|event| {
-            event["fields"]["message"]
-                == "Stream cell connection error: Failed: controlled stream probe error"
-        })
+        .filter(|event| event["fields"]["event_code"] == 400)
         .collect();
-    assert_eq!(errors.len(), 1, "{events:?}");
+    assert_eq!(errors.len(), 2, "{events:?}");
     if filtered {
-        assert!(errors[0].get("span").is_none(), "{}", errors[0]);
+        assert!(errors.iter().all(|event| event.get("span").is_none()));
     } else {
-        assert_eq!(errors[0]["span"]["name"], "stream.handle");
-        assert_eq!(errors[0]["span"]["protocol"], "json-stream");
+        let mut ids = Vec::new();
+        for event in errors {
+            assert_eq!(event["span"]["name"], "stream.handle");
+            assert_eq!(event["span"]["protocol"], "[redacted]");
+            let id = event["span"]["connection_id"]
+                .as_u64()
+                .expect("numeric stream identity");
+            assert_ne!(id, 0);
+            assert!(events
+                .iter()
+                .any(|accept| accept["span"]["name"] == "stream.accept"
+                    && accept["span"]["connection_id"] == id));
+            ids.push(id);
+        }
+        assert_ne!(ids[0], ids[1], "concurrent stream handlers share identity");
     }
     let unrelated: Vec<_> = events
         .iter()
-        .filter(|event| event["fields"]["message"] == "stream-probe-unrelated")
+        .filter(|event| event["fields"]["event_code"] == 101)
         .collect();
     assert_eq!(unrelated.len(), 2, "{events:?}");
     for event in unrelated {
@@ -587,13 +777,13 @@ fn assert_rpc_correlation(filtered: bool) {
     let mut ids = Vec::new();
     for connection in [1, 2] {
         let mut id = None;
-        for stage in ["before", "after", "drop"] {
+        for stage in [0, 1, 2] {
             let matching: Vec<_> = events
                 .iter()
                 .filter(|event| {
-                    event["fields"]["message"] == "rpc-probe"
-                        && event["fields"]["connection"] == connection
-                        && event["fields"]["stage"] == stage
+                    event["fields"]["event_code"] == 400
+                        && event["fields"]["epoch"] == connection
+                        && event["fields"]["count"] == stage
                 })
                 .collect();
             assert_eq!(matching.len(), 1, "{events:?}");
@@ -618,7 +808,7 @@ fn assert_rpc_correlation(filtered: bool) {
     }
     let unrelated: Vec<_> = events
         .iter()
-        .filter(|event| event["fields"]["message"] == "rpc-probe-unrelated")
+        .filter(|event| event["fields"]["event_code"] == 100)
         .collect();
     assert_eq!(unrelated.len(), 2, "{events:?}");
     for event in unrelated {
@@ -642,7 +832,10 @@ fn logging_probe() {
     }
     println!("{STDOUT_MARKER}");
     let probe = std::env::var("WW_LOG_TEST_PROBE");
-    if matches!(probe.as_deref(), Ok("rpc" | "stream")) {
+    if matches!(
+        probe.as_deref(),
+        Ok("rpc" | "stream" | "vat_listener" | "owners" | "children")
+    ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -650,6 +843,12 @@ fn logging_probe() {
         runtime.block_on(tokio::task::LocalSet::new().run_until(async {
             if probe.as_deref() == Ok("rpc") {
                 rpc_correlation_probe().await;
+            } else if probe.as_deref() == Ok("vat_listener") {
+                vat_listener_correlation_probe().await;
+            } else if probe.as_deref() == Ok("owners") {
+                executor_owner_probe().await;
+            } else if probe.as_deref() == Ok("children") {
+                child_lifecycle_probe().await;
             } else {
                 stream_correlation_probe().await;
             }
@@ -657,7 +856,7 @@ fn logging_probe() {
         return;
     }
     let error = io::Error::other("probe failed\nuseful detail");
-    tracing::warn!(target: "ww::logging_probe", count = 42u64, active = true,
+    tracing::warn!(target: "ww::logging_probe", event_code = 102u64, count = 42u64, active = true,
         text = "line one\nline two", error = &error as &dyn std::error::Error, "native-event");
 
     macro_rules! internal_events {
@@ -688,8 +887,133 @@ fn logging_probe() {
 
 async fn emit_cell_event(cell_id: u64) {
     tokio::task::yield_now().await;
-    tracing::info!(target: "ww::logging_probe", expected_cell_id = cell_id, "cell-event");
-    tracing::warn!(target: "ww::logging_probe", expected_cell_id = cell_id, "cell-event-warning");
+    tracing::info!(target: "ww::logging_probe", event_code = 200u64, count = cell_id, "cell-event");
+    tracing::warn!(target: "ww::logging_probe", event_code = 201u64, count = cell_id, "cell-event-warning");
+}
+
+async fn executor_owner_probe() {
+    use std::sync::Arc;
+    use tokio::sync::{oneshot, watch};
+    use ww::services::{ExecutorPool, SpawnRequest};
+
+    let (filesystem, resources) = cache::HostFsOwner::start(
+        tokio::runtime::Handle::current(),
+        cache::HostLimits::new(64, 8, 8).unwrap(),
+    )
+    .unwrap();
+    let (_shutdown, shutdown_rx) = watch::channel(());
+    let pool = ExecutorPool::new(1, shutdown_rx, Arc::clone(&resources));
+    let mut suspended = Vec::new();
+    for owner in [1u64, 2] {
+        let (started, pending) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let (result_tx, result) = oneshot::channel();
+        assert!(pool.spawn(SpawnRequest {
+            name: format!("private-owner-name-{owner}"),
+            factory: Box::new(move |_| Box::pin(async move {
+                tracing::info!(target: "ww::logging_probe", epoch = owner, count = 0u64, "owner started");
+                started.send(()).unwrap();
+                released.await.unwrap();
+                tokio::task::yield_now().await;
+                tracing::info!(target: "ww::logging_probe", epoch = owner, count = 1u64, "owner resumed");
+            })),
+            result_tx: Some(result_tx),
+        }).is_ok());
+        pending.await.unwrap();
+        suspended.push((release, result));
+    }
+    // Both owners are suspended before this independent event is emitted.
+    tracing::info!(target: "ww::logging_probe", event_code = 101u64, "unrelated owner probe");
+    for (release, result) in suspended {
+        release.send(()).unwrap();
+        assert_eq!(result.await.unwrap().unwrap(), 0);
+    }
+    pool.shutdown_and_join().await;
+    filesystem.shutdown().await.unwrap();
+}
+
+async fn child_lifecycle_probe() {
+    struct EmptyMembrane;
+    impl authority::system_capnp::membrane::Server for EmptyMembrane {}
+
+    // Same successful native P3 command shape used by logging_volume; the
+    // existing spinning fixture supplies controlled termination and failure.
+    let successful = wat::parse_str(
+        r#"(component
+      (core func $return (canon task.return (result (result))))
+      (core module $command
+        (import "" "return" (func $return (param i32)))
+        (func (export "run") i32.const 0 call $return))
+      (core instance $instance (instantiate $command
+        (with "" (instance (export "return" (func $return))))))
+      (func $run async (result (result))
+        (canon lift (core func $instance "run") async))
+      (instance (export (interface "wasi:cli/run@0.3.0"))
+        (export "run" (func $run))))"#,
+    )
+    .unwrap();
+    let spinning = wat::parse_str(include_str!("fixtures/spinning-component.wat")).unwrap();
+    let (filesystem, resources) = cache::HostFsOwner::start(
+        tokio::runtime::Handle::current(),
+        cache::HostLimits::new(64, 8, 8).unwrap(),
+    )
+    .unwrap();
+    let (engine, _publisher) = cell::engine::runtime_engine().unwrap();
+    let runtime = ww::launcher::create_runtime_client(
+        false,
+        authority::EpochGuard::fixed(authority::Epoch::zero()),
+        engine,
+        None,
+        rpc::CachePolicy::Isolated,
+        resources,
+    );
+    for (bytes, kill, budget, expected) in [
+        (&successful, false, u64::MAX, 0),
+        (&spinning, true, u64::MAX, 137),
+        (&spinning, false, 0, 1),
+    ] {
+        let mut load = runtime.load_request();
+        load.get().set_wasm(bytes);
+        let executor = load
+            .send()
+            .promise
+            .await
+            .unwrap()
+            .get()
+            .unwrap()
+            .get_executor()
+            .unwrap();
+        let mut spawn = executor.spawn_request();
+        spawn
+            .get()
+            .set_membrane(capnp_rpc::new_client(EmptyMembrane));
+        let mut fuel = spawn.get().init_fuel_policy().init_oneshot();
+        fuel.set_total_budget(budget);
+        fuel.set_max_per_epoch(10_000);
+        fuel.set_min_per_epoch(0);
+        let process = spawn
+            .send()
+            .promise
+            .await
+            .unwrap()
+            .get()
+            .unwrap()
+            .get_process()
+            .unwrap();
+        if kill {
+            process.kill_request().send().promise.await.unwrap();
+        }
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            process.wait_request().send().promise,
+        )
+        .await
+        .expect("real child completion deadline")
+        .unwrap();
+        assert_eq!(response.get().unwrap().get_exit_code(), expected);
+    }
+    drop(runtime);
+    filesystem.shutdown().await.unwrap();
 }
 
 struct RpcProbe {
@@ -704,21 +1028,21 @@ impl authority::system_capnp::membrane::Server for RpcProbe {
         _: authority::system_capnp::membrane::GraftParams,
         _: authority::system_capnp::membrane::GraftResults,
     ) -> capnp::Result<()> {
-        tracing::info!(target: "ww::logging_probe", connection = self.connection,
-            stage = "before", "rpc-probe");
+        tracing::info!(target: "ww::logging_probe", event_code = 400u64, epoch = self.connection,
+            count = 0u64, "rpc-probe");
         self.started.borrow_mut().take().unwrap().send(()).unwrap();
         let release = self.release.borrow_mut().take().unwrap();
         release.await.unwrap();
-        tracing::info!(target: "ww::logging_probe", connection = self.connection,
-            stage = "after", "rpc-probe");
+        tracing::info!(target: "ww::logging_probe", event_code = 400u64, epoch = self.connection,
+            count = 1u64, "rpc-probe");
         Err(capnp::Error::failed("controlled RPC probe error".into()))
     }
 }
 
 impl Drop for RpcProbe {
     fn drop(&mut self) {
-        tracing::info!(target: "ww::logging_probe", connection = self.connection,
-            stage = "drop", "rpc-probe");
+        tracing::info!(target: "ww::logging_probe", event_code = 400u64, epoch = self.connection,
+            count = 2u64, "rpc-probe");
     }
 }
 
@@ -755,7 +1079,7 @@ async fn rpc_correlation_probe() {
         connections.push((release, response, client, server));
     }
     tokio::task::spawn_local(async {
-        tracing::info!(target: "ww::logging_probe", "rpc-probe-unrelated");
+        tracing::info!(target: "ww::logging_probe", event_code = 100u64, "rpc-probe-unrelated");
     })
     .await
     .unwrap();
@@ -770,7 +1094,7 @@ async fn rpc_correlation_probe() {
         server.await.unwrap().unwrap();
     }
     tokio::task::spawn_local(async {
-        tracing::info!(target: "ww::logging_probe", "rpc-probe-unrelated");
+        tracing::info!(target: "ww::logging_probe", event_code = 100u64, "rpc-probe-unrelated");
     })
     .await
     .unwrap();
@@ -847,44 +1171,142 @@ async fn stream_correlation_probe() {
         issued_seq: 1,
         receiver: receiver.clone(),
     };
-    let (started, pending) = oneshot::channel();
-    let (release, released) = oneshot::channel();
     let listener: system_capnp::stream_listener::Client = capnp_rpc::new_client(
         rpc::stream_listener::StreamListenerImpl::new(server_control, guard),
     );
-    let mut listen = listener.listen_request();
-    listen.get().set_protocol("json-stream");
-    listen
-        .get()
-        .set_membrane(authority::membrane_client(receiver, b"logging-probe"));
-    listen
-        .get()
-        .set_executor(capnp_rpc::new_client(StreamProbe {
-            started: std::cell::RefCell::new(Some(started)),
-            release: std::cell::RefCell::new(Some(released)),
-        }));
-    listen.send().promise.await.unwrap();
-    let mut connection = client_control
-        .open_stream(server_peer, rpc::stream_protocol("json-stream").unwrap())
+    let mut connections = Vec::new();
+    for protocol in ["json-stream-a", "json-stream-b"] {
+        let (started, pending) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let mut listen = listener.listen_request();
+        listen.get().set_protocol(protocol);
+        listen.get().set_membrane(authority::membrane_client(
+            receiver.clone(),
+            b"logging-probe",
+        ));
+        listen
+            .get()
+            .set_executor(capnp_rpc::new_client(StreamProbe {
+                started: std::cell::RefCell::new(Some(started)),
+                release: std::cell::RefCell::new(Some(released)),
+            }));
+        listen.send().promise.await.unwrap();
+        let connection = client_control
+            .open_stream(server_peer, rpc::stream_protocol(protocol).unwrap())
+            .await
+            .unwrap();
+        pending.await.unwrap();
+        connections.push((connection, release));
+    }
+    tokio::task::spawn_local(async {
+        tracing::info!(target: "ww::logging_probe", event_code = 101u64, "stream-probe-unrelated");
+    })
+    .await
+    .unwrap();
+    for (mut connection, release) in connections {
+        release.send(()).unwrap();
+        // EOF follows supervisor error/stream destruction. The error log runs
+        // in the same supervisor poll before this independent task can resume.
+        let mut output = Vec::new();
+        connection.read_to_end(&mut output).await.unwrap();
+        assert!(output.is_empty());
+    }
+    tokio::task::spawn_local(async {
+        tracing::info!(target: "ww::logging_probe", event_code = 101u64, "stream-probe-unrelated");
+    })
+    .await
+    .unwrap();
+    epoch
+        .send(Epoch {
+            seq: 2,
+            head: vec![],
+            root: None,
+        })
+        .unwrap();
+    server_task.abort();
+    client_task.abort();
+    let _ = server_task.await;
+    let _ = client_task.await;
+}
+
+async fn vat_listener_correlation_probe() {
+    use authority::{system_capnp, Epoch, EpochGuard};
+    use futures::{AsyncReadExt, StreamExt};
+    use tokio::sync::watch;
+
+    let mut server = memory_swarm();
+    let server_peer = *server.local_peer_id();
+    let server_control = server.behaviour().new_control();
+    server.listen_on("/memory/0".parse().unwrap()).unwrap();
+    let address = loop {
+        if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } =
+            server.select_next_some().await
+        {
+            break address;
+        }
+    };
+    let mut client = memory_swarm();
+    let mut client_control = client.behaviour().new_control();
+    client.dial(address).unwrap();
+    let server_task =
+        tokio::task::spawn_local(async move { while server.next().await.is_some() {} });
+    while !matches!(
+        client.select_next_some().await,
+        libp2p::swarm::SwarmEvent::ConnectionEstablished { .. }
+    ) {}
+    let client_task =
+        tokio::task::spawn_local(async move { while client.next().await.is_some() {} });
+    let (epoch, receiver) = watch::channel(Epoch {
+        seq: 1,
+        head: vec![],
+        root: None,
+    });
+    let guard = EpochGuard {
+        issued_seq: 1,
+        receiver: receiver.clone(),
+    };
+    let budget = rpc::ConnectionBudget::new(2).unwrap();
+    let listener: system_capnp::vat_listener::Client = capnp_rpc::new_client(
+        rpc::vat_listener::VatListenerImpl::new(server_control, guard).with_budget(budget.clone()),
+    );
+    let membrane = authority::membrane_client(receiver, b"logging-probe");
+    let mut raw = listener.serve_raw_request();
+    raw.get().set_protocol("json-vat");
+    raw.get().init_cap().set_as_capability(membrane.client.hook);
+    raw.send().promise.await.unwrap();
+    let mut connections = Vec::new();
+    for _ in 0..2 {
+        connections.push(
+            client_control
+                .open_stream(server_peer, rpc::vat_protocol("json-vat").unwrap())
+                .await
+                .unwrap(),
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while budget.active() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both VAT handlers admitted");
+    tracing::info!(target: "ww::logging_probe", event_code = 101u64, "vat-probe-unrelated");
+    let mut rejected = client_control
+        .open_stream(server_peer, rpc::vat_protocol("json-vat").unwrap())
         .await
         .unwrap();
-    pending.await.unwrap();
-    tokio::task::spawn_local(async {
-        tracing::info!(target: "ww::logging_probe", "stream-probe-unrelated");
+    let mut bytes = Vec::new();
+    rejected.read_to_end(&mut bytes).await.unwrap();
+    assert!(bytes.is_empty());
+    drop(connections);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while budget.active() != 0 {
+            tokio::task::yield_now().await;
+        }
     })
     .await
-    .unwrap();
-    release.send(()).unwrap();
-    // EOF follows supervisor error/stream destruction. The error log runs in
-    // the same supervisor poll, before this independent task can resume.
-    let mut output = Vec::new();
-    connection.read_to_end(&mut output).await.unwrap();
-    assert!(output.is_empty());
-    tokio::task::spawn_local(async {
-        tracing::info!(target: "ww::logging_probe", "stream-probe-unrelated");
-    })
-    .await
-    .unwrap();
+    .expect("both VAT handlers completed");
+    tracing::info!(target: "ww::logging_probe", event_code = 101u64, "vat-probe-unrelated");
     epoch
         .send(Epoch {
             seq: 2,

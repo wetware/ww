@@ -241,6 +241,8 @@ impl RunningNode {
             .env("HOME", &home)
             // Lifecycle assertions parse compact fields without ANSI escapes.
             .env("WW_LOG_FORMAT", "compact")
+            // Route lifecycle diagnostics are opt-in; ordinary runs keep them off.
+            .env("RUST_LOG", "ww=info,atom=info,cache=info,cell=info,ipfs=info,membrane=info,rpc=info,stem=info,rpc::http_listener=trace")
             .env("NO_COLOR", "1")
             .env("WW_KUBO_WAIT_MAX_SECS", "30")
             .env("WW_CWASM_DIR", home.join("cwasm"))
@@ -340,11 +342,11 @@ async fn assert_kernel_epoch(
     client: &reqwest::Client,
     admin_addr: SocketAddr,
     kubo_addr: SocketAddr,
-    node: &RunningNode,
+    _node: &RunningNode,
     seq: u64,
     kernel: &[u8],
 ) -> Value {
-    let root = activated_root(node, seq);
+    let root = activated_root(client, admin_addr, seq).await;
     let source = immutable_path_cid(client, kubo_addr, &root, "boot/kernel.wasm").await;
     let identity = version(client, admin_addr).await;
     assert_eq!(identity["kernel_epoch_seq"], seq);
@@ -1066,6 +1068,13 @@ fn log_position(logs: &str, first: &str, second: &str) -> usize {
         .unwrap_or_else(|| panic!("missing log evidence {first:?}/{second:?}\n{logs}"))
 }
 
+fn count_event_code(logs: &str, event_code: u16) -> usize {
+    let code = format!("event_code={event_code}");
+    logs.lines()
+        .filter(|line| line.split_whitespace().any(|field| field == code))
+        .count()
+}
+
 fn count_log_lines(logs: &str, needle: &str) -> usize {
     logs.lines().filter(|line| line.contains(needle)).count()
 }
@@ -1076,26 +1085,48 @@ fn count_log_lines_with(logs: &str, first: &str, second: &str) -> usize {
         .count()
 }
 
-// "registered HTTP route" is a substring of "unregistered HTTP route", so
-// route-lifecycle positions need explicit disambiguation.
-fn registered_route_positions(logs: &str, route: &str) -> Vec<usize> {
+// These fixtures register only /status and assert its HTTP behavior separately.
+// Logs correlate registrations by process-local identity without exposing paths.
+fn route_events(logs: &str, event_code: u16) -> Vec<(usize, u64)> {
+    let code = format!("event_code={event_code}");
     logs.lines()
         .enumerate()
-        .filter(|(_, line)| {
-            line.contains("registered HTTP route")
-                && !line.contains("unregistered HTTP route")
-                && line.contains(route)
+        .filter_map(|(position, line)| {
+            if !line.split_whitespace().any(|field| field == code) {
+                return None;
+            }
+            let id = line
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("registration_id="))
+                .expect("route event has a registration identity")
+                .parse()
+                .expect("registration identity is numeric");
+            Some((position, id))
         })
-        .map(|(index, _)| index)
         .collect()
 }
 
-fn unregistered_route_positions(logs: &str, route: &str) -> Vec<usize> {
-    logs.lines()
-        .enumerate()
-        .filter(|(_, line)| line.contains("unregistered HTTP route") && line.contains(route))
-        .map(|(index, _)| index)
-        .collect()
+async fn wait_for_route_removal(node: &mut RunningNode, registration_id: u64) {
+    let deadline = Instant::now() + INVALIDATION_TIMEOUT;
+    loop {
+        if route_events(&node.logs(), 501)
+            .iter()
+            .any(|(_, id)| *id == registration_id)
+        {
+            return;
+        }
+        assert!(
+            node.try_wait().is_none(),
+            "Host exited before route removal\n{}",
+            node.logs()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "route removal timed out\n{}",
+            node.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// An image with a missing or corrupt `bin/status.wasm`.
@@ -1340,20 +1371,13 @@ async fn directory_data(
     value["Data"].clone()
 }
 
-fn activated_root(node: &RunningNode, seq: u64) -> cid::Cid {
-    let logs = node.logs();
-    let sequence = format!("seq={seq}");
-    let line = logs
-        .lines()
-        .find(|line| {
-            (line.contains("deployment root activated")
-                || line.contains("Deployment root activated"))
-                && line.split_whitespace().any(|field| field == sequence)
-        })
-        .unwrap_or_else(|| panic!("missing activated epoch {seq}\n{logs}"));
-    line.split_whitespace()
-        .find_map(|field| field.strip_prefix("root="))
-        .expect("activation must report the exact effective root CID")
+async fn activated_root(client: &reqwest::Client, admin_addr: SocketAddr, seq: u64) -> cid::Cid {
+    // Image identity belongs to the existing on-demand typed state surface.
+    let identity = version(client, admin_addr).await;
+    assert_eq!(identity["kernel_epoch_seq"], seq, "{identity}");
+    identity["kernel_effective_root"]
+        .as_str()
+        .expect("running kernel reports its effective root")
         .parse()
         .expect("effective root CID")
 }
@@ -1518,7 +1542,7 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
         let ready_url = format!("http://{admin_addr}/readyz");
         wait_for_ready(&client, &ready_url, &mut node).await;
         assert_status_cell(&client, http_addr, &overlay_status_cid, &node).await;
-        let initial_root = activated_root(&node, 0);
+        let initial_root = activated_root(&client, admin_addr, 0).await;
         wait_for_log(&mut node, "kernel-X readiness!", "").await;
         assert_persistent_peer(&client, http_addr, peer_id).await;
         let initial_identity = assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &kernel).await;
@@ -1545,7 +1569,8 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
             if seq == 1 {
                 tokio::time::timeout(INVALIDATION_TIMEOUT, replacement_reached.recv()).await
                     .expect("valid replacement did not reach its preparation gate").expect("replacement gate closed");
-                wait_for_log(&mut node, "unregistered HTTP route", "/status").await;
+                let initial_registration = route_events(&node.logs(), 500)[0].1;
+                wait_for_route_removal(&mut node, initial_registration).await;
                 assert_unready_and_old_generation_dead(&client, admin_addr, http_addr, &mut node).await;
                 assert_eq!(count_log_lines(&node.logs(), "kernel-X readiness!"), 1, "cached kernel reused prior readiness");
                 assert_eq!(count_log_lines_with(&node.logs(), "Deployment root activated", "seq=1"), 0);
@@ -1561,7 +1586,7 @@ async fn frozen_cli_mounts_survive_real_stem_transition_obstruction_recovery_and
             wait_for_log(&mut node, "Deployment root activated", &format!("seq={seq}")).await;
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert_status_cell(&client, http_addr, &overlay_status_cid, &node).await;
-            let effective = activated_root(&node, seq);
+            let effective = activated_root(&client, admin_addr, seq).await;
             assert_ne!(effective, initial_root);
             for (path, expected) in [("etc/app/config.toml", frozen_config), ("bin/status.wasm", frozen_status), ("boot/kernel.wasm", frozen_kernel)] {
                 assert_eq!(immutable_path_cid(&client, kubo_addr, &effective, path).await, expected);
@@ -2015,7 +2040,7 @@ mod rust_lifecycle {
                 "status init failure must fail the host\n{logs}"
             );
             assert!(
-                logs.contains("event_code=1"),
+                count_event_code(&logs, 1) > 0,
                 "the host must classify the initial failure as authoritative\n{logs}"
             );
             assert!(
@@ -2114,12 +2139,12 @@ mod rust_lifecycle {
 
         let logs = node.logs();
         assert_eq!(
-            count_log_lines(&logs, "event_code=3"),
+            count_event_code(&logs, 3),
             1,
             "one head update must replace exactly one PID0 generation\n{logs}"
         );
-        let registered = registered_route_positions(&logs, "/status");
-        let unregistered = unregistered_route_positions(&logs, "/status");
+        let registered = route_events(&logs, 500);
+        let unregistered = route_events(&logs, 501);
         assert_eq!(
             registered.len(),
             2,
@@ -2129,6 +2154,14 @@ mod rust_lifecycle {
             unregistered.len(),
             1,
             "only the old generation's /status must unregister\n{logs}"
+        );
+        assert_eq!(
+            registered[0].1, unregistered[0].1,
+            "cleanup must remove the old registration"
+        );
+        assert_ne!(
+            registered[0].1, registered[1].1,
+            "replacement must receive a new registration identity"
         );
         assert!(
             registered[0] < unregistered[0] && unregistered[0] < registered[1],
@@ -2187,7 +2220,7 @@ mod rust_lifecycle {
         // Convergence contract: the final generation serves. A coherent
         // superseded intermediate generation may transiently activate, so one
         // or two replacements are legitimate outcomes.
-        let replacements = count_log_lines(&logs, "event_code=3");
+        let replacements = count_event_code(&logs, 3);
         assert!(
             (1..=2).contains(&replacements),
             "rapid updates must converge in one or two coherent replacements\n{logs}"
@@ -2196,8 +2229,8 @@ mod rust_lifecycle {
         // route registrations range from 2 (boot + final) up to one per
         // replacement plus boot. Every registration except the final one must
         // be torn down.
-        let registered = registered_route_positions(&logs, "/status");
-        let unregistered = unregistered_route_positions(&logs, "/status");
+        let registered = route_events(&logs, 500);
+        let unregistered = route_events(&logs, 501);
         assert!(
             (2..=1 + replacements).contains(&registered.len()),
             "boot and the final generation must each register /status\n{logs}"
@@ -2207,6 +2240,39 @@ mod rust_lifecycle {
             registered.len() - 1,
             "every superseded /status registration must be torn down exactly once\n{logs}"
         );
+        let retired: std::collections::BTreeSet<_> =
+            unregistered.iter().map(|(_, id)| *id).collect();
+        let expected: std::collections::BTreeSet<_> = registered[..registered.len() - 1]
+            .iter()
+            .map(|(_, id)| *id)
+            .collect();
+        assert_eq!(
+            retired, expected,
+            "cleanup must identify each superseded registration"
+        );
+        assert_eq!(
+            retired.len(),
+            unregistered.len(),
+            "no registration may be removed twice"
+        );
+        let all_registered: std::collections::BTreeSet<_> =
+            registered.iter().map(|(_, id)| *id).collect();
+        assert_eq!(
+            all_registered.len(),
+            registered.len(),
+            "registration identities must not be reused"
+        );
+        assert!(
+            !retired.contains(&registered.last().unwrap().1),
+            "final registration must remain installed"
+        );
+        for (removed_at, id) in &unregistered {
+            let (registered_at, _) = registered.iter().find(|(_, issued)| issued == id).unwrap();
+            assert!(
+                registered_at < removed_at,
+                "removal must follow its own registration"
+            );
+        }
         assert!(
             unregistered.iter().max() < registered.iter().max(),
             "the final generation's route must outlive every teardown\n{logs}"
@@ -2261,7 +2327,7 @@ mod rust_lifecycle {
             "failed replacement exited without any readiness observations\n{logs}"
         );
         assert!(
-            logs.contains("event_code=2"),
+            count_event_code(&logs, 2) > 0,
             "the host must classify the replacement failure as authoritative\n{logs}"
         );
         assert!(
@@ -2305,9 +2371,9 @@ mod rust_lifecycle {
             Some(0),
             "interactive replacement must end the invocation cleanly\n{logs}"
         );
-        assert_eq!(count_log_lines(&logs, "event_code=5"), 1, "{logs}");
-        assert_eq!(count_log_lines(&logs, "event_code=3"), 0, "{logs}");
-        assert_eq!(count_log_lines(&logs, "event_code=2"), 0, "{logs}");
+        assert_eq!(count_event_code(&logs, 5), 1, "{logs}");
+        assert_eq!(count_event_code(&logs, 3), 0, "{logs}");
+        assert_eq!(count_event_code(&logs, 2), 0, "{logs}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2395,7 +2461,7 @@ async fn bare_installed_boot_from_unrelated_cwd_does_not_import_cwd_or_private_s
     let mut node = RunningNode::spawn(home.path(), admin_addr, kubo_addr, &options);
     wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
     assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &kernel).await;
-    let root = activated_root(&node, 0);
+    let root = activated_root(&client, admin_addr, 0).await;
     let ipfs = ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"));
     for path in ["cwd-secret", ".ww", "identity", "bin"] {
         assert!(
@@ -2432,7 +2498,7 @@ async fn explicit_dot_boots_complete_source_without_installation() {
     wait_for_ready(&client, &format!("http://{admin_addr}/readyz"), &mut node).await;
     wait_for_log(&mut node, "kernel-A readiness!", "").await;
     assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 0, &selected).await;
-    let root = activated_root(&node, 0);
+    let root = activated_root(&client, admin_addr, 0).await;
     assert_eq!(
         ww::ipfs::HttpClient::new(format!("http://{kubo_addr}"))
             .cat(&format!("/ipfs/{root}/explicit-marker"))
@@ -2578,7 +2644,7 @@ async fn selected_block_failure_driver(status: StatusCode) {
             let ready_url = format!("http://{admin_addr}/readyz");
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert_status_cell(&client, http_addr, &cid_a, &node).await;
-            let initial_root = activated_root(&node, 0);
+            let initial_root = activated_root(&client, admin_addr, 0).await;
             let frozen_cid =
                 immutable_path_cid(&client, kubo_addr, &initial_root, "frozen-marker").await;
             assert_ne!(frozen_cid, hidden_cid, "hidden source must be overwritten in the initial root");
@@ -2629,7 +2695,7 @@ async fn selected_block_failure_driver(status: StatusCode) {
             assert_status_cell(&client, http_addr, &cid_b, &node).await;
             wait_for_log(&mut node, "kernel-B readiness!", "").await;
             assert_kernel_epoch(&client, admin_addr, kubo_addr, &node, 1, &kernel_b).await;
-            let final_root = activated_root(&node, 1);
+            let final_root = activated_root(&client, admin_addr, 1).await;
             assert_eq!(
                 immutable_path_cid(&client, kubo_addr, &final_root, "frozen-marker").await,
                 frozen_cid
@@ -2695,7 +2761,7 @@ async fn host_epoch_preparation_supersession_activates_only_latest_target() {
             let ready_url = format!("http://{admin_addr}/readyz");
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert_status_cell(&client, http_addr, &cid_a, &node).await;
-            let initial_root = activated_root(&node, 0);
+            let initial_root = activated_root(&client, admin_addr, 0).await;
             let frozen_cid =
                 immutable_path_cid(&client, kubo_addr, &initial_root, "frozen-marker").await;
             frozen_file.close().unwrap();
@@ -2714,7 +2780,7 @@ async fn host_epoch_preparation_supersession_activates_only_latest_target() {
             wait_for_log(&mut node, "Advancing deployment epoch", "seq=2").await;
             wait_for_ready(&client, &ready_url, &mut node).await;
             assert_status_cell(&client, http_addr, &cid_c, &node).await;
-            let final_root = activated_root(&node, 2);
+            let final_root = activated_root(&client, admin_addr, 2).await;
             assert_eq!(
                 immutable_path_cid(&client, kubo_addr, &final_root, "frozen-marker").await,
                 frozen_cid
@@ -2840,11 +2906,11 @@ async fn superseded_pending_generation_converges_to_the_newer_epoch() {
             assert_status_cell(&client, http_addr, &cid_c, &node).await;
             let logs = node.logs();
             assert!(
-                !logs.contains("event_code=2"),
+                count_event_code(&logs, 2) == 0,
                 "superseded generation emitted an authoritative failure\n{logs}"
             );
             assert!(
-                logs.contains("event_code=4")
+                count_event_code(&logs, 4) > 0
                     && logs.contains("Kernel result superseded by newer generation"),
                 "superseded generation did not exit through result classification\n{logs}"
             );

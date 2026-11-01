@@ -61,25 +61,23 @@ pub fn init_tracing() {
             _ => (!is_terminal, true),
         };
         let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-        let subscriber = tracing_subscriber::fmt()
+        let initialized = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .log_internal_errors(false)
             .with_writer(std::io::stderr)
-            .with_env_filter(filter);
-        let initialized = if json {
-            subscriber
-                .json()
-                .with_ansi(false)
-                .with_current_span(true)
-                .with_span_list(false)
-                .try_init()
-        } else {
-            subscriber
-                .compact()
-                .with_ansi(is_terminal && !no_color)
-                .try_init()
-        };
+            .with_env_filter(filter)
+            .fmt_fields(crate::logging::SafeFields)
+            .event_format(crate::logging::SafeEvent {
+                json,
+                ansi: !json && is_terminal && !no_color,
+            })
+            .try_init();
         // Do not emit additional diagnostics through a subscriber owned by a caller.
         if initialized.is_ok() && invalid_format {
-            tracing::warn!("invalid WW_LOG_FORMAT; expected auto, compact, or json; using auto");
+            tracing::warn!(
+                event_code = 103u64,
+                "invalid WW_LOG_FORMAT; expected auto, compact, or json; using auto"
+            );
         }
     }
 }

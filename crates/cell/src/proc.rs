@@ -2015,7 +2015,12 @@ impl Proc {
                     crate::lifecycle::Outcome::Timeout,
                     start.elapsed(),
                 );
-                tracing::error!("Guest component instantiation timed out");
+                tracing::error!(
+                    event_code = 300u16,
+                    timeout_ms = 5_000u64,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Guest component instantiation timed out"
+                );
                 return Err(anyhow!("guest component instantiation timed out"));
             }
         };

@@ -129,11 +129,11 @@ for the synchronous VAT/stream accept branches, but must not cross an await.
 
 | Boundary | Context |
 | --- | --- |
-| `services::worker_loop` → Cell factory | Existing `cell` span with `cell_name`, parented to the worker's `executor` span. The legacy `name` field remains available to filters. |
+| `services::worker_loop` → Cell factory | Existing `cell` span with numeric `owner_id`, parented to the worker's `executor` span. `cell_name` and legacy `name` remain available to filters but are redacted in output. |
 | `Generation::run` → PID0 process and filesystem finalizer | Explicitly retain the generation's current Cell span across the separate tasks. |
 | `ExecutorImpl::spawn` → ordinary child | New root `cell` span with numeric `cell_id`. Construction, process lifecycle, and filesystem finalization share this span. A `follows_from` link records the spawning context. |
 | `ManagedRpc::spawn` → private RPC worker | New root `rpc` span with numeric `rpc_id`. Dispatch, driver failure, and managed teardown share this span. A `follows_from` link records the opening context. |
-| VAT/stream accept → handler/supervisor | Handler span has the synchronous accept span as parent. If the handler span is disabled, explicitly retain the enabled current accept span. |
+| VAT/stream accept → handler/supervisor | Handler span has the synchronous accept span as parent. Both contain the same numeric `connection_id`. If the handler span is disabled, explicitly retain the enabled current accept span. |
 | Stream supervisor → input/output pump | Each inline pump future has its own task-aware span, nested under the supervisor. |
 
 RPC connections can outlive their opening call and carry capabilities used by
@@ -144,12 +144,15 @@ children likewise have their own identity, rather than the spawning Cell's
 identity. These changes do not change RPC authority, task ownership, cancellation,
 or scheduling.
 
-`cell_id` and `rpc_id` distinguish operations within one Host process. They are
-log/span fields, not Prometheus labels or cross-process trace IDs. The current
+`owner_id`, `cell_id`, `rpc_id`, and `connection_id` distinguish operations within
+one Host process. Each field uses a separate identity namespace. They are log/span
+fields, not Prometheus labels or cross-process trace IDs. The current
 JSON formatter includes only the current span; it does not serialize ancestry
 or `follows_from` links. Nested events can therefore identify a pump or RPC
 without repeating the enclosing Cell's fields. Filtering may remove context;
 an absent span must not be interpreted as a new or shared identity.
+The [operational logging contract](logging.md) specifies redaction and event codes
+without changing these task/span ownership boundaries.
 
 Other independently spawned work does not implicitly inherit caller context.
 Service/control loops, executor monitors, cache/filesystem producers, and
