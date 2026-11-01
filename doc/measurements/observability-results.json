@@ -1,0 +1,300 @@
+{
+  "baseline_commit": "f7881b75",
+  "environment": {
+    "os": "macOS 26.6.2",
+    "architecture": "arm64",
+    "rustc": "1.96.0",
+    "profile": "debug"
+  },
+  "incident": {
+    "trace_id": "28f68665d728f1062c518d8cc565c4e9",
+    "span_id": "c46aec67ea6a74e0",
+    "event_timestamp": "2026-11-01T14:42:08.982504Z",
+    "owner_id": 2,
+    "cell_span_duration_ns": 5006538792,
+    "elapsed_ms": 5002,
+    "timeout_ms": 5000,
+    "prometheus_zero_then_timeout_observed": true,
+    "loki_correlation_observed": true,
+    "tempo_timeout_event_observed": true,
+    "unavailable": "The recorded timeout does not establish why the epoch publisher stopped advancing."
+  },
+  "cost_campaigns": [
+    {
+      "mode": "baseline",
+      "repetition": 0,
+      "exit_code": 0,
+      "process_seconds": 0.08753404207527637,
+      "log_bytes": 630,
+      "samples": 30,
+      "median_wall_ns": 2116604.0,
+      "min_wall_ns": 1929167,
+      "max_wall_ns": 2469958,
+      "limits": "debug build; tiny real P3 command; process order alternates; descriptive local comparison, not throughput qualification"
+    },
+    {
+      "mode": "disabled",
+      "repetition": 0,
+      "exit_code": 0,
+      "process_seconds": 1.1954161250032485,
+      "log_bytes": 630,
+      "samples": 30,
+      "median_wall_ns": 2135416.5,
+      "min_wall_ns": 1940417,
+      "max_wall_ns": 2715000,
+      "limits": "debug build; tiny real P3 command; process order alternates; descriptive local comparison, not throughput qualification",
+      "telemetry": {
+        "ww_telemetry_sampled_out_total": 0.0,
+        "ww_telemetry_admitted_total": 0.0,
+        "ww_telemetry_exported_total": 0.0,
+        "ww_telemetry_request_bytes_total": 0.0,
+        "ww_telemetry_active_spans": 0.0,
+        "ww_telemetry_dropped_total{reason=\"queue\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"limit\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"record\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"export\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"shutdown\"}": 0.0
+      }
+    },
+    {
+      "mode": "enabled",
+      "repetition": 0,
+      "exit_code": 0,
+      "process_seconds": 0.09339333302341402,
+      "log_bytes": 630,
+      "samples": 30,
+      "median_wall_ns": 2255125.0,
+      "min_wall_ns": 2092208,
+      "max_wall_ns": 2795750,
+      "limits": "debug build; tiny real P3 command; process order alternates; descriptive local comparison, not throughput qualification",
+      "telemetry": {
+        "ww_telemetry_sampled_out_total": 0.0,
+        "ww_telemetry_admitted_total": 35.0,
+        "ww_telemetry_exported_total": 35.0,
+        "ww_telemetry_request_bytes_total": 24666.0,
+        "ww_telemetry_active_spans": 0.0,
+        "ww_telemetry_dropped_total{reason=\"queue\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"limit\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"record\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"export\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"shutdown\"}": 0.0
+      }
+    },
+    {
+      "mode": "enabled",
+      "repetition": 1,
+      "exit_code": 0,
+      "process_seconds": 0.09209879208356142,
+      "log_bytes": 630,
+      "samples": 30,
+      "median_wall_ns": 2264854.5,
+      "min_wall_ns": 2075667,
+      "max_wall_ns": 2612000,
+      "limits": "debug build; tiny real P3 command; process order alternates; descriptive local comparison, not throughput qualification",
+      "telemetry": {
+        "ww_telemetry_sampled_out_total": 0.0,
+        "ww_telemetry_admitted_total": 35.0,
+        "ww_telemetry_exported_total": 35.0,
+        "ww_telemetry_request_bytes_total": 24666.0,
+        "ww_telemetry_active_spans": 0.0,
+        "ww_telemetry_dropped_total{reason=\"queue\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"limit\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"record\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"export\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"shutdown\"}": 0.0
+      }
+    },
+    {
+      "mode": "disabled",
+      "repetition": 1,
+      "exit_code": 0,
+      "process_seconds": 0.08431833307258785,
+      "log_bytes": 630,
+      "samples": 30,
+      "median_wall_ns": 2061666.5,
+      "min_wall_ns": 1949709,
+      "max_wall_ns": 2797959,
+      "limits": "debug build; tiny real P3 command; process order alternates; descriptive local comparison, not throughput qualification",
+      "telemetry": {
+        "ww_telemetry_sampled_out_total": 0.0,
+        "ww_telemetry_admitted_total": 0.0,
+        "ww_telemetry_exported_total": 0.0,
+        "ww_telemetry_request_bytes_total": 0.0,
+        "ww_telemetry_active_spans": 0.0,
+        "ww_telemetry_dropped_total{reason=\"queue\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"limit\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"record\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"export\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"shutdown\"}": 0.0
+      }
+    },
+    {
+      "mode": "baseline",
+      "repetition": 1,
+      "exit_code": 0,
+      "process_seconds": 0.08686116710305214,
+      "log_bytes": 630,
+      "samples": 30,
+      "median_wall_ns": 2076499.5,
+      "min_wall_ns": 1973084,
+      "max_wall_ns": 2546000,
+      "limits": "debug build; tiny real P3 command; process order alternates; descriptive local comparison, not throughput qualification"
+    },
+    {
+      "mode": "baseline",
+      "repetition": 2,
+      "exit_code": 0,
+      "process_seconds": 0.08615858387202024,
+      "log_bytes": 630,
+      "samples": 30,
+      "median_wall_ns": 2034104.0,
+      "min_wall_ns": 1919417,
+      "max_wall_ns": 2540667,
+      "limits": "debug build; tiny real P3 command; process order alternates; descriptive local comparison, not throughput qualification"
+    },
+    {
+      "mode": "disabled",
+      "repetition": 2,
+      "exit_code": 0,
+      "process_seconds": 0.08390062511898577,
+      "log_bytes": 630,
+      "samples": 30,
+      "median_wall_ns": 2043562.5,
+      "min_wall_ns": 1910167,
+      "max_wall_ns": 2242667,
+      "limits": "debug build; tiny real P3 command; process order alternates; descriptive local comparison, not throughput qualification",
+      "telemetry": {
+        "ww_telemetry_sampled_out_total": 0.0,
+        "ww_telemetry_admitted_total": 0.0,
+        "ww_telemetry_exported_total": 0.0,
+        "ww_telemetry_request_bytes_total": 0.0,
+        "ww_telemetry_active_spans": 0.0,
+        "ww_telemetry_dropped_total{reason=\"queue\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"limit\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"record\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"export\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"shutdown\"}": 0.0
+      }
+    },
+    {
+      "mode": "enabled",
+      "repetition": 2,
+      "exit_code": 0,
+      "process_seconds": 0.08989762491546571,
+      "log_bytes": 630,
+      "samples": 30,
+      "median_wall_ns": 2158250.0,
+      "min_wall_ns": 2053375,
+      "max_wall_ns": 2468125,
+      "limits": "debug build; tiny real P3 command; process order alternates; descriptive local comparison, not throughput qualification",
+      "telemetry": {
+        "ww_telemetry_sampled_out_total": 0.0,
+        "ww_telemetry_admitted_total": 35.0,
+        "ww_telemetry_exported_total": 35.0,
+        "ww_telemetry_request_bytes_total": 24666.0,
+        "ww_telemetry_active_spans": 0.0,
+        "ww_telemetry_dropped_total{reason=\"queue\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"limit\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"record\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"export\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"shutdown\"}": 0.0
+      }
+    }
+  ],
+  "failures_after_drain_fix": [
+    {
+      "case": "collector-stops",
+      "cell_correctness_passed": true,
+      "process_seconds": 5.0504956669174135,
+      "drain_ns": 20211458,
+      "requests_received": 1,
+      "request_bytes": 704,
+      "metrics": {
+        "ww_telemetry_sampled_out_total": 0.0,
+        "ww_telemetry_admitted_total": 2.0,
+        "ww_telemetry_exported_total": 1.0,
+        "ww_telemetry_request_bytes_total": 1711.0,
+        "ww_telemetry_active_spans": 0.0,
+        "ww_telemetry_dropped_total{reason=\"queue\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"limit\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"record\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"export\"}": 1.0,
+        "ww_telemetry_dropped_total{reason=\"shutdown\"}": 0.0
+      }
+    },
+    {
+      "case": "slow-saturated",
+      "cell_correctness_passed": true,
+      "process_seconds": 3.678510459139943,
+      "drain_ns": 1503316000,
+      "requests_received": 2,
+      "request_bytes": 14328,
+      "metrics": {
+        "ww_telemetry_sampled_out_total": 0.0,
+        "ww_telemetry_admitted_total": 1000.0,
+        "ww_telemetry_exported_total": 0.0,
+        "ww_telemetry_request_bytes_total": 41592.0,
+        "ww_telemetry_active_spans": 0.0,
+        "ww_telemetry_dropped_total{reason=\"queue\"}": 679.0,
+        "ww_telemetry_dropped_total{reason=\"limit\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"record\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"export\"}": 97.0,
+        "ww_telemetry_dropped_total{reason=\"shutdown\"}": 224.0
+      }
+    }
+  ],
+  "scope": "Local evidence only. Cost comparison precedes Release/Acquire publication correction; failure and unit tests rerun after that correction.",
+  "failures_after_ordering_fix": [
+    {
+      "case": "collector-stops",
+      "cell_correctness_passed": true,
+      "process_seconds": 5.048452750081196,
+      "drain_ns": 19411333,
+      "requests_received": 1,
+      "request_bytes": 704,
+      "metrics": {
+        "ww_telemetry_sampled_out_total": 0.0,
+        "ww_telemetry_admitted_total": 2.0,
+        "ww_telemetry_exported_total": 1.0,
+        "ww_telemetry_request_bytes_total": 1711.0,
+        "ww_telemetry_active_spans": 0.0,
+        "ww_telemetry_dropped_total{reason=\"queue\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"limit\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"record\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"export\"}": 1.0,
+        "ww_telemetry_dropped_total{reason=\"shutdown\"}": 0.0
+      }
+    },
+    {
+      "case": "slow-saturated",
+      "cell_correctness_passed": true,
+      "process_seconds": 3.6613505422137678,
+      "drain_ns": 1502177042,
+      "requests_received": 2,
+      "request_bytes": 14328,
+      "metrics": {
+        "ww_telemetry_sampled_out_total": 0.0,
+        "ww_telemetry_admitted_total": 1000.0,
+        "ww_telemetry_exported_total": 0.0,
+        "ww_telemetry_request_bytes_total": 41592.0,
+        "ww_telemetry_active_spans": 0.0,
+        "ww_telemetry_dropped_total{reason=\"queue\"}": 679.0,
+        "ww_telemetry_dropped_total{reason=\"limit\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"record\"}": 0.0,
+        "ww_telemetry_dropped_total{reason=\"export\"}": 97.0,
+        "ww_telemetry_dropped_total{reason=\"shutdown\"}": 224.0
+      }
+    }
+  ],
+  "validation": {
+    "workspace_lib_passed": 1120,
+    "final_exporter_tests_passed": 9,
+    "final_exporter_tests_ignored": 1,
+    "live_ignored_collector_test": "passed separately",
+    "logging_metrics_integration": "passed",
+    "strict_workspace_all_targets_clippy": "passed",
+    "format": "passed",
+    "linux_host_reachability": "not tested",
+    "release_profile": "not tested"
+  }
+}

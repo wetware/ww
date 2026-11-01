@@ -1,0 +1,33 @@
+// One fixed stream. Cell IDs, trace IDs and event fields remain in the JSON body.
+loki.source.file "wetware" {
+  targets = [{__path__ = "/var/log/wetware/runtime.jsonl", service_name = "wetware", job = "wetware"}]
+  forward_to = [loki.process.wetware.receiver]
+}
+
+loki.process "wetware" {
+  stage.json {
+    expressions = {timestamp = "timestamp"}
+  }
+  stage.timestamp {
+    source = "timestamp"
+    format = "RFC3339Nano"
+  }
+  // The fixed filename is not useful as an indexed dimension.
+  stage.label_drop {
+    values = ["filename"]
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  max_streams = 1
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+    batch_size = "64KiB"
+    batch_wait = "1s"
+    remote_timeout = "1s"
+    min_backoff_period = "100ms"
+    max_backoff_period = "1s"
+    max_backoff_retries = 2
+  }
+}

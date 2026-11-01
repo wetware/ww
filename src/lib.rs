@@ -39,6 +39,8 @@ pub mod ns;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod packaging;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod telemetry;
+#[cfg(not(target_arch = "wasm32"))]
 pub use rpc;
 #[cfg(not(target_arch = "wasm32"))]
 pub use rpc::keys;

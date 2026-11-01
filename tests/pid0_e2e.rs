@@ -1657,8 +1657,8 @@ mod rust_lifecycle {
         parse_host_metrics(&body)
     }
 
-    // The fixed HELP/TYPE text is below 3 KiB. Fifty sample lines, each below
-    // 100 bytes even with 20-digit u64 values, keep the full schema below 8 KiB.
+    // Fixed HELP/TYPE text is below 4 KiB. The complete 60-sample schema
+    // remains below 8 KiB even with 20-digit sample values.
     const MAX_HOST_METRICS_BYTES: usize = 8 * 1024;
     const DURATION_HISTOGRAMS: [&str; 2] = [
         "ww_wasmtime_component_compile_duration_seconds",
@@ -1668,7 +1668,7 @@ mod rust_lifecycle {
         "0.0001", "0.001", "0.01", "0.1", "0.5", "1", "2", "5", "10", "+Inf",
     ];
 
-    /// Validate all 50 samples; return the 48 exact integers used by PID0 checks.
+    /// Validate all 60 samples; return the 58 exact integers used by PID0 checks.
     /// Duration sums are validated separately and never converted to counters.
     fn parse_host_metrics(body: &str) -> std::collections::BTreeMap<String, u64> {
         assert!(
@@ -1689,18 +1689,28 @@ mod rust_lifecycle {
                 "duplicate metric: {name}"
             );
         }
-        assert_eq!(raw.len(), 50, "Host must expose exactly 50 fixed samples");
+        assert_eq!(raw.len(), 60, "Host must expose exactly 60 fixed samples");
 
         let mut integer_names: Vec<String> = [
             "ww_wasmtime_cache_hits_total",
             "ww_wasmtime_cache_stores_total",
             "ww_wasmtime_component_compilations_total",
             "ww_executor_cell_slots",
+            "ww_telemetry_sampled_out_total",
+            "ww_telemetry_admitted_total",
+            "ww_telemetry_exported_total",
+            "ww_telemetry_request_bytes_total",
+            "ww_telemetry_active_spans",
         ]
         .into_iter()
         .map(str::to_owned)
         .collect();
         for (family, label, values) in [
+            (
+                "ww_telemetry_dropped_total",
+                "reason",
+                &["queue", "limit", "record", "export", "shutdown"][..],
+            ),
             (
                 "ww_wasmtime_cache_state",
                 "state",
@@ -1798,9 +1808,15 @@ mod rust_lifecycle {
                 "ww_wasmtime_cache_hits_total 1\n",
                 "ww_wasmtime_cache_hits_total 18446744073709551615\n",
             )
-            .replace("_sum 0.005761916", "_sum 5.761916e-3");
+            .replace("_sum 0.005761916", "_sum 5.761916e-3")
+            .replace(
+                "ww_telemetry_request_bytes_total 0\n",
+                "ww_telemetry_request_bytes_total 18446744073709551615\n",
+            );
         let samples = parse_host_metrics(&body);
+        assert_eq!(samples.len(), 58);
         assert_eq!(samples["ww_wasmtime_cache_hits_total"], u64::MAX);
+        assert_eq!(samples["ww_telemetry_request_bytes_total"], u64::MAX);
     }
 
     #[test]
@@ -1828,6 +1844,7 @@ mod rust_lifecycle {
             format!("{body}unexpected_metric 1\n"),
             body.replace("ww_wasmtime_cache_hits_total", "unexpected_metric"),
             body.replace("outcome=\"timeout\"", "outcome=\"unknown\""),
+            body.replace("reason=\"queue\"", "reason=\"unknown\""),
             body.replace("le=\"0.0001\"", "le=\"0.0002\""),
             body.replace("le=\"+Inf\"", "le=\"Inf\""),
             body.replace("_sum 0.005761916", "_sum NaN"),

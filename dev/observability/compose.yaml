@@ -1,0 +1,81 @@
+name: ww-observability
+
+x-local-service: &local-service
+  restart: "no"
+  logging:
+    driver: json-file
+    options:
+      max-size: 5m
+      max-file: "2"
+  stop_grace_period: 5s
+
+services:
+  prometheus:
+    <<: *local-service
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=24h
+      - --storage.tsdb.retention.size=128MB
+    ports: ["127.0.0.1:19090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes: ["./prometheus.yaml:/etc/prometheus/prometheus.yml:ro"]
+    tmpfs: ["/prometheus:size=256m,uid=65534,gid=65534"]
+    mem_limit: 512m
+
+  collector:
+    <<: *local-service
+    image: otel/opentelemetry-collector:0.136.0@sha256:98fd3b410ae8a939be9588f1580c4b7c3da6ebba49f5363df4259a827aabb779
+    command: ["--config=/etc/otelcol/config.yaml"]
+    ports: ["127.0.0.1:14318:4318"]
+    volumes: ["./collector.yaml:/etc/otelcol/config.yaml:ro"]
+    mem_limit: 192m
+
+  tempo:
+    <<: *local-service
+    image: grafana/tempo:2.9.0@sha256:65a5789759435f1ef696f1953258b9bbdb18eb571d5ce711ff812d2e128288a4
+    command: ["-config.file=/etc/tempo.yaml"]
+    ports: ["127.0.0.1:13200:3200"]
+    volumes: ["./tempo.yaml:/etc/tempo.yaml:ro"]
+    tmpfs: ["/var/tempo:size=256m,uid=10001,gid=10001"]
+    mem_limit: 512m
+
+  loki:
+    <<: *local-service
+    image: grafana/loki:3.5.5@sha256:31628519045e7f28692a7ae73b4a3fd293dccb425585ed5d16ceea3b5c9592e6
+    command: ["-config.file=/etc/loki/local.yaml"]
+    ports: ["127.0.0.1:13100:3100"]
+    volumes: ["./loki.yaml:/etc/loki/local.yaml:ro"]
+    tmpfs: ["/loki:size=256m,uid=10001,gid=10001"]
+    mem_limit: 512m
+
+  alloy:
+    <<: *local-service
+    image: grafana/alloy:v1.10.2@sha256:bcf27f18c4402869af112fb39e35e1db3804a404686f4caa20bdf77814219223
+    command: ["run", "--storage.path=/var/lib/alloy", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      - ../../.context/observability:/var/log/wetware:ro
+    tmpfs: ["/var/lib/alloy:size=16m"]
+    mem_limit: 192m
+
+  grafana:
+    <<: *local-service
+    image: grafana/grafana:12.2.0@sha256:74144189b38447facf737dfd0f3906e42e0776212bf575dc3334c3609183adf7
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Grafana 12.2 requires this for anonymous Viewers to open trace Explore.
+      GF_USERS_VIEWERS_CAN_EDIT: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+    ports: ["127.0.0.1:13000:3000"]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboard.json:/etc/grafana/dashboards/wetware.json:ro
+    tmpfs: ["/var/lib/grafana:size=64m,uid=472,gid=0"]
+    mem_limit: 384m

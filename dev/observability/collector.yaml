@@ -1,0 +1,39 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        max_request_body_size: 1048576
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 96
+    spike_limit_mib: 16
+  batch:
+    timeout: 1s
+    send_batch_size: 64
+    send_batch_max_size: 64
+exporters:
+  otlphttp/tempo:
+    endpoint: http://tempo:4318
+    timeout: 1s
+    retry_on_failure:
+      enabled: false
+    sending_queue:
+      enabled: true
+      num_consumers: 1
+      queue_size: 16
+service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/tempo]

@@ -208,7 +208,7 @@ impl Check {
     }
 
     async fn run(mut self) -> Result<()> {
-        ww::config::init_tracing();
+        let _telemetry_guard = ww::config::init_tracing();
         // Resolve local configuration before any backend effects.
         let authoritative = self.stem.is_some() || self.ipns_stem.is_some();
         let (baseline, mounts) = super::Commands::startup_mounts(
