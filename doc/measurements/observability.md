@@ -177,6 +177,6 @@ destination. Sampled traces can be incomplete after bounded loss.
 
 The next slice can reuse the landed native filesystem ownership diagnostics
 to explain delayed cleanup, with the same bounded export and explicit missing
-evidence. Integrate #781 only after its API and merge stabilize. Broader network,
-RPC, and IPFS instrumentation remains with #754; cancellation correctness remains
+evidence. Integrating the #781 API, now landed through #790, remains follow-up
+work. Broader network, RPC, and IPFS instrumentation remains with #754; cancellation correctness remains
 with #785. Production Grafana/VPS deployment remains outside this work.

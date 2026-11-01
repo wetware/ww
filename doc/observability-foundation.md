@@ -80,5 +80,6 @@ induced the condition, but that knowledge is not runtime-recorded causality.
 The integration adds selective local export, collector-health counters, and
 subscriber-generated trace correlation. It does not alter Store ownership,
 fuel authority, scheduling, filesystem cancellation, or `crates/cell/src/proc.rs`.
-The unmerged #781 inspector is not a dependency. Network/RPC/IPFS coverage
+The #781 inspector landed through #790 during publication. This workflow does
+not integrate that inspector. Network/RPC/IPFS coverage
 remains with #754, and further cancellation correctness remains with #785.
