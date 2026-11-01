@@ -244,7 +244,7 @@ impl Owner {
     pub(crate) fn new() -> (Self, FuelInspector) {
         static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
         let identity = NEXT_IDENTITY
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .expect("fuel inspection generation space exhausted");

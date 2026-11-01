@@ -24,6 +24,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `respond_bytes_async` for output completion.
 
 ### Added
+- **Owner-coherent fuel inspection (#781, #752, #756).** Trusted hosts can request
+  bounded snapshots of a Cell's fuel policy, EWMA, grants, physical fuel, epochs,
+  authority ledgers and committed decisions at Store ownership boundaries. One
+  outstanding request is allowed; contention, timeout and owner termination are
+  explicit. A local P3 reporter explains grant clamping without adding telemetry
+  to the default fuel path.
 - **Native P3 directory-build diagnostics (#780, #753).** Owner-local filesystem
   snapshots distinguish dropped waiters, running or completed native directory
   builds, retained transaction receipts, and cleanup phases. Eight records per
