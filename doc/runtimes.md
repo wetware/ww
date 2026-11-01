@@ -92,6 +92,15 @@ mandatory cleanup from progressing. Executor workers retain admitted
 transactions through native-resource installation or disposal; a returned
 value does not release its work receipt early.
 
+Cell-owned CID directory construction observes its exact filesystem root closing.
+It stops at native checkpoints and rolls back private staging. Commit acceptance
+is ordered with closure under the root lifecycle mutex; an accepted non-replacing
+rename finishes without holding that mutex. Already-started native work and
+mandatory rollback retain their transaction until return and result disposal.
+The descriptor tail skips work after observed cancellation. This does not cancel
+preceding listings, shared pin producers, or every P3 operation; see
+[filesystem snapshots](filesystem-snapshots.md#native-p3-directory-build-slice).
+
 Shutdown preserves that scheduling topology. The Host first closes new
 filesystem admission, asks deployment generations to stop, and asynchronously
 joins executor workers while the main runtime remains available. It then drops

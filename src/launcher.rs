@@ -1944,6 +1944,15 @@ mod tests {
 
     #[test]
     fn native_p3_directory_cancellation_distinguishes_backend_and_cleanup_completion() {
+        native_p3_directory_cancellation(false);
+    }
+
+    #[test]
+    fn native_p3_directory_accepted_commit_survives_cancellation() {
+        native_p3_directory_cancellation(true);
+    }
+
+    fn native_p3_directory_cancellation(commit_accepted: bool) {
         use cache::{FsCleanupState, FsOperationBackend, FsOperationReceipt, FsOperationWaiter};
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1957,7 +1966,12 @@ mod tests {
         let build_release_rx = Arc::new(std::sync::Mutex::new(Some(build_release_rx)));
         let hook: Arc<dyn Fn(cache::FsTestEvent) + Send + Sync> = Arc::new(move |event| {
             if event.operation == cache::FilesystemOperation::DirectoryBuild
-                && event.stage == cache::FsTestStage::BeforePublish
+                && event.stage
+                    == if commit_accepted {
+                        cache::FsTestStage::CommitAccepted
+                    } else {
+                        cache::FsTestStage::BeforePublish
+                    }
             {
                 build_entered_tx
                     .lock()
@@ -2008,13 +2022,26 @@ mod tests {
                             .own_cleanup(cache::FilesystemOperation::ProcessCleanup, move || {
                                 // This witness reads the native filesystem independently
                                 // of the new operation diagnostic.
-                                assert_eq!(cleanup_path.join("child").metadata()?.len(), 12);
-                                assert_eq!(std::fs::read_dir(&cleanup_path)?.count(), 2_049);
+                                if commit_accepted {
+                                    assert_eq!(cleanup_path.join("child").metadata()?.len(), 12);
+                                    assert_eq!(std::fs::read_dir(&cleanup_path)?.count(), 2_049);
+                                } else {
+                                    assert!(!cleanup_path.exists());
+                                }
+                                assert!(std::fs::read_dir(cleanup_path.parent().unwrap())?.all(
+                                    |entry| !entry
+                                        .unwrap()
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .starts_with(".cid-dir-")
+                                ));
                                 cleanup_entered_tx.send(()).unwrap();
                                 cleanup_release_rx
                                     .recv_timeout(Duration::from_secs(10))
                                     .unwrap();
-                                std::fs::remove_dir_all(cleanup_path)?;
+                                if commit_accepted {
+                                    std::fs::remove_dir_all(cleanup_path)?;
+                                }
                                 cleanup_witness.store(true, Ordering::SeqCst);
                                 Ok(())
                             })
@@ -2108,7 +2135,14 @@ mod tests {
                             .find(|build| build.id() == operation_id)
                             .unwrap();
                         assert_eq!(build.waiter(), FsOperationWaiter::Dropped);
-                        assert_eq!(build.backend(), FsOperationBackend::Succeeded);
+                        assert_eq!(
+                            build.backend(),
+                            if commit_accepted {
+                                FsOperationBackend::Succeeded
+                            } else {
+                                FsOperationBackend::Failed
+                            }
+                        );
                         assert_eq!(build.receipt(), FsOperationReceipt::Released);
                         assert_eq!(cleaning.outstanding_work(), 0);
                         assert_eq!(cleaning.cleanup(), FsCleanupState::Running);
@@ -2150,8 +2184,16 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
         assert_eq!(published, nested);
-        assert_eq!(published.join("child").metadata().unwrap().len(), 12);
-        assert_eq!(std::fs::read_dir(&published).unwrap().count(), 2_049);
+        assert!(
+            !temporary.exists(),
+            "private staging must settle before root cleanup"
+        );
+        if commit_accepted {
+            assert_eq!(published.join("child").metadata().unwrap().len(), 12);
+            assert_eq!(std::fs::read_dir(&published).unwrap().count(), 2_049);
+        } else {
+            assert!(!published.exists(), "cancelled build must not publish");
+        }
         assert!(!cleanup_finished.load(Ordering::SeqCst));
         cleanup_release_tx.send(()).unwrap();
         finished_rx.recv_timeout(Duration::from_secs(10)).unwrap();

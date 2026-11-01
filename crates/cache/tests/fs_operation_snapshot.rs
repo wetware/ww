@@ -62,6 +62,74 @@ fn operation(snapshot: &FsSnapshot, id: u64) -> FsDirectoryBuildSnapshot {
 }
 
 #[tokio::test]
+async fn late_root_close_retains_completed_unpolled_directory_result_until_disposal() {
+    struct NativeResult(Option<std::fs::File>, Arc<AtomicBool>);
+    impl Drop for NativeResult {
+        fn drop(&mut self) {
+            drop(self.0.take());
+            self.1.store(true, Ordering::SeqCst);
+        }
+    }
+    let (host_owner, host) = start_host(1, 1);
+    let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
+    let cancellation = scope.cancellation();
+    let staging = tempfile::tempdir().unwrap();
+    let path = staging.path().join("result");
+    let disposed = Arc::new(AtomicBool::new(false));
+    let native_result = NativeResult(
+        Some(std::fs::File::create(&path).unwrap()),
+        Arc::clone(&disposed),
+    );
+    let cleanup_witness = Arc::clone(&disposed);
+    let cleanup_path = path.clone();
+    scope
+        .own_cleanup(FilesystemOperation::ProcessCleanup, move || {
+            assert!(cleanup_witness.load(Ordering::SeqCst));
+            std::fs::remove_file(cleanup_path)
+        })
+        .unwrap();
+    let transaction = admit_transaction(&host, &scope);
+    let operation_scope = scope.clone();
+    let mut waiter = Box::pin(async move {
+        transaction
+            .run_directory_build(&operation_scope, move || Ok::<_, io::Error>(native_result))
+            .await
+    });
+    std::future::poll_fn(|cx| {
+        assert!(waiter.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    deadline(async {
+        while only_operation(&snapshot(&completion).await).backend()
+            != FsOperationBackend::Succeeded
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // The result waiter has not been polled since submission, even though its
+    // native backend finished. Root closure cannot dispose its native payload.
+    drop(owner);
+    assert!(cancellation.is_cancelled());
+    assert!(!disposed.load(Ordering::SeqCst));
+    assert!(path.exists());
+    assert!(host.try_foreground().is_err());
+    assert!(host.try_logical_io().is_err());
+    assert_eq!(
+        only_operation(&snapshot(&completion).await).receipt(),
+        FsOperationReceipt::Outstanding
+    );
+    drop(waiter);
+    deadline(finalizer.run()).await.unwrap();
+    assert!(disposed.load(Ordering::SeqCst));
+    assert!(!path.exists());
+    assert!(host.try_foreground().is_ok());
+    assert!(host.try_logical_io().is_ok());
+    deadline(host_owner.shutdown()).await.unwrap();
+}
+
+#[tokio::test]
 async fn backend_return_does_not_release_a_retained_result_receipt() {
     struct ResultResource(Arc<AtomicBool>);
     impl Drop for ResultResource {

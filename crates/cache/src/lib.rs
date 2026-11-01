@@ -10,8 +10,8 @@ pub use arc::{ArcInner, ArcStats};
 pub use bloom::AtomicBloom;
 pub use fs_driver::{HostFsOwner, HostFsStartError};
 pub use fs_work::{
-    CleanupPhase, CleanupRegistration, FilesystemOperation, FsCleanupState, FsCompletion,
-    FsDirectoryBuildSnapshot, FsFinalizer, FsOperationBackend, FsOperationReceipt,
+    CleanupPhase, CleanupRegistration, FilesystemOperation, FsCancellation, FsCleanupState,
+    FsCompletion, FsDirectoryBuildSnapshot, FsFinalizer, FsOperationBackend, FsOperationReceipt,
     FsOperationWaiter, FsOwner, FsResultEnvelope, FsRootId, FsScope, FsSnapshot, FsSnapshotError,
     FsWorkError, FsWorkToken, FS_DIRECTORY_BUILD_CAPACITY,
 };
