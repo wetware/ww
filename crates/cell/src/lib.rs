@@ -8,6 +8,7 @@ use async_trait::async_trait;
 
 pub mod engine;
 pub mod fs_intercept;
+pub mod fuel_inspector;
 pub mod image;
 pub mod lifecycle;
 pub mod loaders;

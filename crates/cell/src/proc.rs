@@ -703,6 +703,8 @@ pub struct ComponentRunStates {
     returning_from_epoch_callback: bool,
     /// Opt-in production callback observations used by integration tests.
     fuel_observer: Option<FuelObserver>,
+    /// Present only after explicit trusted-host diagnostic enrollment.
+    fuel_inspector: Option<Box<crate::fuel_inspector::Owner>>,
     /// Real-import markers paired with live `CallingHost` hook frames.
     ///
     /// P3 may have more than one outstanding host transition. A marker on each
@@ -1282,13 +1284,16 @@ pub fn validate_component(
 }
 
 fn install_host_return_fuel_hook(store: &mut Store<ComponentRunStates>) {
-    store.call_hook_async(FuelCallHook);
+    store.call_hook_async(FuelCallHook::<false>);
 }
 
-struct FuelCallHook;
+struct FuelCallHook<const INSPECT: bool>;
 
 #[async_trait::async_trait]
-impl CallHookHandler<ComponentRunStates> for FuelCallHook {
+impl<const INSPECT: bool> CallHookHandler<ComponentRunStates> for FuelCallHook<INSPECT>
+where
+    FuelCallHook<INSPECT>: FuelDecisionApplier,
+{
     async fn handle_call_event(
         &self,
         mut ctx: StoreContextMut<'_, ComponentRunStates>,
@@ -1327,6 +1332,9 @@ impl CallHookHandler<ComponentRunStates> for FuelCallHook {
             ctx.data_mut()
                 .fuel_estimator
                 .rearm_yield_boundary(remaining, interval);
+            if INSPECT {
+                service_fuel_inspection(&mut ctx);
+            }
             return Ok(());
         }
 
@@ -1335,15 +1343,31 @@ impl CallHookHandler<ComponentRunStates> for FuelCallHook {
         } else {
             FuelBoundary::Slice
         };
-        settle_and_apply_fuel_boundary(&mut ctx, remaining, boundary).await
+        settle_and_apply_fuel_boundary_with_inspector::<INSPECT>(&mut ctx, remaining, boundary)
+            .await
     }
 }
 
+#[cfg(test)]
 async fn settle_and_apply_fuel_boundary(
     ctx: &mut StoreContextMut<'_, ComponentRunStates>,
     remaining: u64,
     boundary: FuelBoundary,
 ) -> wasmtime::Result<()> {
+    settle_and_apply_fuel_boundary_with_inspector::<false>(ctx, remaining, boundary).await
+}
+
+async fn settle_and_apply_fuel_boundary_with_inspector<const INSPECT: bool>(
+    ctx: &mut StoreContextMut<'_, ComponentRunStates>,
+    remaining: u64,
+    boundary: FuelBoundary,
+) -> wasmtime::Result<()>
+where
+    FuelCallHook<INSPECT>: FuelDecisionApplier,
+{
+    if INSPECT {
+        record_inspected_settlement(ctx, remaining, boundary);
+    }
     let mut update = ctx
         .data_mut()
         .fuel_estimator
@@ -1375,7 +1399,7 @@ async fn settle_and_apply_fuel_boundary(
     if let Some(observer) = ctx.data().fuel_observer.as_ref() {
         observer.record_decision(update);
     }
-    apply_fuel_decision(ctx, update.decision).await?;
+    apply_fuel_decision_with_inspector::<INSPECT>(ctx, update.decision).await?;
     tracing::debug!(
         consumed = update.consumed,
         remaining,
@@ -1383,6 +1407,44 @@ async fn settle_and_apply_fuel_boundary(
         "fuel.boundary"
     );
     Ok(())
+}
+
+// Application futures are selected by type, not by a branch inside one
+// coroutine. A const-disabled await still reserves storage in Rust's coroutine
+// layout; this dispatch preserves the normal hook's per-call allocation size.
+trait FuelDecisionApplier {
+    fn apply<'a, 'store: 'a>(
+        ctx: &'a mut StoreContextMut<'store, ComponentRunStates>,
+        decision: FuelDecision,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send + 'a;
+}
+
+impl FuelDecisionApplier for FuelCallHook<false> {
+    fn apply<'a, 'store: 'a>(
+        ctx: &'a mut StoreContextMut<'store, ComponentRunStates>,
+        decision: FuelDecision,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send + 'a {
+        apply_fuel_decision(ctx, decision)
+    }
+}
+
+impl FuelDecisionApplier for FuelCallHook<true> {
+    fn apply<'a, 'store: 'a>(
+        ctx: &'a mut StoreContextMut<'store, ComponentRunStates>,
+        decision: FuelDecision,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send + 'a {
+        apply_inspected_fuel_decision(ctx, decision)
+    }
+}
+
+fn apply_fuel_decision_with_inspector<'a, 'store: 'a, const INSPECT: bool>(
+    ctx: &'a mut StoreContextMut<'store, ComponentRunStates>,
+    decision: FuelDecision,
+) -> impl Future<Output = wasmtime::Result<()>> + Send + 'a + use<'a, 'store, INSPECT>
+where
+    FuelCallHook<INSPECT>: FuelDecisionApplier,
+{
+    FuelCallHook::<INSPECT>::apply(ctx, decision)
 }
 
 async fn apply_fuel_decision(
@@ -1393,7 +1455,7 @@ async fn apply_fuel_decision(
     loop {
         match decision {
             FuelDecision::Grant(grant) => {
-                install_fuel_slice_in_context(ctx, grant)?;
+                install_fuel_slice_in_context_with_inspector::<false>(ctx, grant)?;
                 return Ok(());
             }
             FuelDecision::Exhausted => {
@@ -1438,7 +1500,55 @@ async fn apply_fuel_decision(
     }
 }
 
+async fn apply_inspected_fuel_decision(
+    ctx: &mut StoreContextMut<'_, ComponentRunStates>,
+    mut decision: FuelDecision,
+) -> wasmtime::Result<()> {
+    let mut suspended = false;
+    loop {
+        match decision {
+            FuelDecision::Grant(grant) => {
+                install_fuel_slice_in_context_with_inspector::<true>(ctx, grant)?;
+                return Ok(());
+            }
+            FuelDecision::Exhausted => {
+                ctx.data_mut().fuel_metrics.flush();
+                let state = ctx.data();
+                state
+                    .fuel_metrics
+                    .record_exhausted(state.fuel_estimator.policy());
+                ctx.data_mut()
+                    .fuel_inspector
+                    .as_mut()
+                    .expect("inspector attached")
+                    .state = crate::fuel_inspector::FuelState::Exhausted;
+                service_fuel_inspection(ctx);
+                return Err(wasmtime::Error::msg(
+                    "one-shot total fuel authority exhausted",
+                ));
+            }
+            FuelDecision::Suspend => {
+                ctx.data_mut().fuel_metrics.flush();
+                if ctx.data_mut().open_latest_epoch().is_none() {
+                    suspended = wait_for_inspected_epoch(ctx, suspended).await?;
+                    continue;
+                }
+                ctx.set_epoch_deadline(1);
+                decision = ctx.data().fuel_estimator.current_decision();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn install_fuel_slice_in_context(
+    ctx: &mut StoreContextMut<'_, ComponentRunStates>,
+    authority: u64,
+) -> wasmtime::Result<()> {
+    install_fuel_slice_in_context_with_inspector::<false>(ctx, authority)
+}
+
+fn install_fuel_slice_in_context_with_inspector<const INSPECT: bool>(
     ctx: &mut StoreContextMut<'_, ComponentRunStates>,
     authority: u64,
 ) -> wasmtime::Result<()> {
@@ -1448,6 +1558,10 @@ fn install_fuel_slice_in_context(
         .install_authority_grant(authority);
     ctx.fuel_async_yield_interval(Some(slice.yield_interval))?;
     ctx.set_fuel(slice.physical)?;
+    if INSPECT {
+        record_inspected_grant(ctx, slice);
+        service_fuel_inspection(ctx);
+    }
     let state = ctx.data();
     state
         .fuel_metrics
@@ -1455,7 +1569,15 @@ fn install_fuel_slice_in_context(
     Ok(())
 }
 
+#[cfg(test)]
 fn install_fuel_slice_in_store(
+    store: &mut Store<ComponentRunStates>,
+    authority: u64,
+) -> wasmtime::Result<()> {
+    install_fuel_slice_in_store_with_inspector::<false>(store, authority)
+}
+
+fn install_fuel_slice_in_store_with_inspector<const INSPECT: bool>(
     store: &mut Store<ComponentRunStates>,
     authority: u64,
 ) -> wasmtime::Result<()> {
@@ -1465,11 +1587,172 @@ fn install_fuel_slice_in_store(
         .install_authority_grant(authority);
     store.fuel_async_yield_interval(Some(slice.yield_interval))?;
     store.set_fuel(slice.physical)?;
+    if INSPECT {
+        let mut ctx = store.as_context_mut();
+        record_inspected_grant(&mut ctx, slice);
+        service_fuel_inspection(&mut ctx);
+    }
     let state = store.data();
     state
         .fuel_metrics
         .record_grant(state.fuel_estimator.policy());
     Ok(())
+}
+
+// These helpers are reachable only from the explicitly enabled specialization.
+// Capturing is read-only: it never settles, opens an epoch, or installs fuel.
+// Call only at a confirmed flushed boundary after successful application, or
+// while an actual epoch wait owns the Store. A failed installer has already
+// mutated estimator intentions and must never serve a snapshot from this helper.
+fn capture_fuel_snapshot(
+    ctx: &StoreContextMut<'_, ComponentRunStates>,
+) -> crate::fuel_inspector::FuelInspectionSnapshot {
+    use crate::fuel_inspector::FuelInspectionSnapshot;
+    let state = ctx.data();
+    let owner = state.fuel_inspector.as_ref().expect("inspector attached");
+    let est = &state.fuel_estimator;
+    FuelInspectionSnapshot {
+        identity: owner.identity,
+        captured_at: std::time::Instant::now(),
+        policy: est.policy().into(),
+        state: owner.state,
+        ewma_initialized: est.initialized,
+        avg_ratio: est.avg_ratio,
+        ratio_scale: RATIO_SCALE,
+        desired_quantum: est.quantum,
+        min_quantum: est.min_quantum,
+        max_quantum: est.max_quantum,
+        authority_grant: est.authority_grant,
+        physical_accounting_baseline: est.physical_installed,
+        physical_remaining: ctx.get_fuel().ok(),
+        yield_reserve: YIELD_RESERVE,
+        opened_epoch: state.opened_epoch,
+        pending_epoch: state.pending_epoch,
+        published_epoch: state.epoch_clock.current_epoch(),
+        total_remaining: est.total_remaining,
+        epoch_remaining: est.epoch_remaining,
+        epoch_limit: est.epoch_limit,
+        last_settlement: owner.last_settlement,
+        last_applied_grant: owner.last_applied_grant,
+    }
+}
+
+fn service_fuel_inspection(ctx: &mut StoreContextMut<'_, ComponentRunStates>) {
+    if let Some(request) = ctx
+        .data_mut()
+        .fuel_inspector
+        .as_mut()
+        .expect("inspector attached")
+        .try_request()
+    {
+        respond_to_fuel_inspection(ctx, request);
+    }
+}
+
+fn respond_to_fuel_inspection(
+    ctx: &StoreContextMut<'_, ComponentRunStates>,
+    request: crate::fuel_inspector::Request,
+) {
+    if !request.is_closed() && !request.is_expired() {
+        request.respond(capture_fuel_snapshot(ctx));
+    }
+}
+
+fn record_inspected_settlement(
+    ctx: &mut StoreContextMut<'_, ComponentRunStates>,
+    remaining: u64,
+    boundary: FuelBoundary,
+) {
+    use crate::fuel_inspector::{LastSettlement, SettlementBoundary};
+    let state = ctx.data_mut();
+    let est = &state.fuel_estimator;
+    state
+        .fuel_inspector
+        .as_mut()
+        .expect("inspector attached")
+        .last_settlement = Some(LastSettlement {
+        consumed: est.physical_installed.saturating_sub(remaining),
+        physical_before: est.physical_installed,
+        physical_remaining: remaining,
+        authority_before: est.authority_grant,
+        epoch: state.opened_epoch,
+        boundary: match boundary {
+            FuelBoundary::HostReturn => SettlementBoundary::HostReturn,
+            FuelBoundary::Slice => SettlementBoundary::Slice,
+        },
+    });
+}
+
+fn record_inspected_grant(ctx: &mut StoreContextMut<'_, ComponentRunStates>, slice: FuelSlice) {
+    use crate::fuel_inspector::{AppliedGrant, FuelState};
+    let state = ctx.data_mut();
+    let est = &state.fuel_estimator;
+    let owner = state.fuel_inspector.as_mut().expect("inspector attached");
+    owner.last_applied_grant = Some(AppliedGrant {
+        authority: slice.authority,
+        physical: slice.physical,
+        yield_interval: slice.yield_interval,
+        desired_quantum: est.quantum,
+        total_remaining: est.total_remaining,
+        epoch_remaining: est.epoch_remaining,
+        opened_epoch: state.opened_epoch,
+    });
+    owner.state = FuelState::Running;
+}
+
+async fn wait_for_inspected_epoch(
+    ctx: &mut StoreContextMut<'_, ComponentRunStates>,
+    mut suspended: bool,
+) -> wasmtime::Result<bool> {
+    // watch::changed is cancellation-safe. Recreating its future after serving
+    // a diagnostic request neither consumes a tick nor opens an allowance.
+    loop {
+        let request = {
+            let state = ctx.data_mut();
+            let policy = state.fuel_estimator.policy();
+            let owner = state.fuel_inspector.as_mut().expect("inspector attached");
+            let metrics = &state.fuel_metrics;
+            let mut changed = std::pin::pin!(state.epoch_clock.changed());
+            std::future::poll_fn(|cx| {
+                let has_budget = tokio::task::coop::has_budget_remaining();
+                match changed.as_mut().poll(cx) {
+                    Poll::Ready(result) => Poll::Ready(result.map(|_| None)),
+                    Poll::Pending => {
+                        if has_budget {
+                            if !suspended {
+                                metrics.record_suspend(policy);
+                                suspended = true;
+                            }
+                            owner.state = crate::fuel_inspector::FuelState::Suspended;
+                        }
+                        // A cooperative-budget yield is not evidence of an
+                        // epoch wait. Defer capture until the real wait polls.
+                        if !suspended {
+                            return Poll::Pending;
+                        }
+                        match owner.poll_request(cx) {
+                            Poll::Ready(Some(request)) => Poll::Ready(Ok(Some(request))),
+                            // Closed readers must not turn this wait into a loop.
+                            Poll::Ready(None) | Poll::Pending => Poll::Pending,
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| {
+                wasmtime::Error::msg("epoch clock closed while one-shot Cell was suspended")
+            })?
+        };
+        match request {
+            Some(request) => {
+                respond_to_fuel_inspection(ctx, request);
+                // Bound work per owner poll even under a repeatedly rearmed
+                // reader. This yield is restricted to the enabled wait path.
+                tokio::task::yield_now().await;
+            }
+            None => return Ok(suspended),
+        }
+    }
 }
 
 fn install_epoch_fuel_callback(store: &mut Store<ComponentRunStates>) {
@@ -1886,6 +2169,7 @@ impl Proc {
                 pending_epoch: None,
                 returning_from_epoch_callback: false,
                 fuel_observer,
+                fuel_inspector: None,
                 host_call_frames: HostCallFrames::default(),
                 kernel_ready_gate,
             })
@@ -1971,13 +2255,40 @@ impl Proc {
     }
 
     /// Instantiate the prepared guest and invoke `wasi:cli/run#run`.
-    pub async fn run(mut self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
+        if self.store.data().fuel_inspector.is_some() {
+            self.run_with_inspector::<true>().await
+        } else {
+            self.run_with_inspector::<false>().await
+        }
+    }
+
+    /// Enable bounded, read-only fuel inspection for this Store incarnation.
+    ///
+    /// The trusted embedder must retain this handle; it is never exposed to
+    /// guest code. Requests can time out while no safe fuel boundary occurs.
+    /// Enrollment is single-use and must precede `run`.
+    pub fn fuel_inspector(&mut self) -> Result<crate::fuel_inspector::FuelInspector> {
+        anyhow::ensure!(
+            self.store.data().fuel_inspector.is_none(),
+            "fuel inspector already attached"
+        );
+        let (owner, inspector) = crate::fuel_inspector::Owner::new();
+        self.store.data_mut().fuel_inspector = Some(Box::new(owner));
+        self.store.call_hook_async(FuelCallHook::<true>);
+        Ok(inspector)
+    }
+
+    async fn run_with_inspector<const INSPECT: bool>(mut self) -> Result<()>
+    where
+        FuelCallHook<INSPECT>: FuelDecisionApplier,
+    {
         match self.store.data().fuel_estimator.current_decision() {
             FuelDecision::Grant(grant) => {
                 // Physical fuel includes a runtime reserve that is not Cell
                 // authority. The normal fuel and epoch hooks were installed
                 // during preparation, before executable instantiation.
-                install_fuel_slice_in_store(&mut self.store, grant)?;
+                install_fuel_slice_in_store_with_inspector::<INSPECT>(&mut self.store, grant)?;
                 tracing::trace!(grant, "fuel.initial");
             }
             FuelDecision::Exhausted => {
@@ -1985,6 +2296,15 @@ impl Proc {
                 state
                     .fuel_metrics
                     .record_exhausted(state.fuel_estimator.policy());
+                if INSPECT {
+                    self.store
+                        .data_mut()
+                        .fuel_inspector
+                        .as_mut()
+                        .expect("inspector attached")
+                        .state = crate::fuel_inspector::FuelState::Exhausted;
+                    service_fuel_inspection(&mut self.store.as_context_mut());
+                }
                 return Err(anyhow!("one-shot total fuel authority exhausted"));
             }
             FuelDecision::Suspend => {
@@ -2037,7 +2357,12 @@ impl Proc {
             .has_unsettled_consumption(remaining)
         {
             let mut ctx = self.store.as_context_mut();
-            settle_and_apply_fuel_boundary(&mut ctx, remaining, FuelBoundary::Slice).await?;
+            settle_and_apply_fuel_boundary_with_inspector::<INSPECT>(
+                &mut ctx,
+                remaining,
+                FuelBoundary::Slice,
+            )
+            .await?;
         }
 
         let result = self
@@ -2406,6 +2731,7 @@ mod tests {
             pending_epoch: None,
             returning_from_epoch_callback: false,
             fuel_observer,
+            fuel_inspector: None,
             host_call_frames: HostCallFrames::default(),
             kernel_ready_gate: None,
         }
@@ -5084,21 +5410,21 @@ mod tests {
         install_fuel_slice_in_store(&mut store, 25_000).unwrap();
         store.set_fuel(YIELD_RESERVE + 15_000).unwrap();
         for _ in 0..3 {
-            FuelCallHook
+            FuelCallHook::<false>
                 .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
                 .await
                 .unwrap();
             assert_eq!(metrics.snapshot().scheduled_settled_units, 0);
         }
         store.set_fuel(YIELD_RESERVE).unwrap();
-        FuelCallHook
+        FuelCallHook::<false>
             .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
             .await
             .unwrap();
         // The committed settlement remains local until publication or Drop.
         assert_eq!(metrics.snapshot().scheduled_settled_units, 0);
         for _ in 0..3 {
-            FuelCallHook
+            FuelCallHook::<false>
                 .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
                 .await
                 .unwrap();
@@ -5655,4 +5981,5 @@ mod tests {
 
     include!("proc_fuel_metrics_tests.rs");
     include!("proc_fuel_publication_tests.rs");
+    include!("proc_fuel_inspector_tests.rs");
 }

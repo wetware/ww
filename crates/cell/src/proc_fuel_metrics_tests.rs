@@ -374,20 +374,20 @@ async fn fuel_metrics_hook_rearms_and_ignored_returns_do_not_grant() {
     // The first callback rearms an intermediate yield; the repeated callback
     // no longer meets the rearmed boundary. Neither installs new authority.
     for _ in 0..3 {
-        FuelCallHook
+        FuelCallHook::<false>
             .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
             .await
             .unwrap();
         assert_eq!(metrics.snapshot().scheduled.grant, 1);
     }
     store.set_fuel(YIELD_RESERVE).unwrap();
-    FuelCallHook
+    FuelCallHook::<false>
         .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
         .await
         .unwrap();
     assert_eq!(metrics.snapshot().scheduled.grant, 2);
     for _ in 0..3 {
-        FuelCallHook
+        FuelCallHook::<false>
             .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
             .await
             .unwrap();
@@ -403,12 +403,12 @@ async fn fuel_metrics_each_marked_host_return_installs_one_grant() {
     let mut store = fuel_metrics_store(&runtime, FuelEstimator::new(INITIAL_FUEL));
     install_fuel_slice_in_store(&mut store, INITIAL_FUEL).unwrap();
     for count in 1..=4 {
-        FuelCallHook
+        FuelCallHook::<false>
             .handle_call_event(store.as_context_mut(), CallHook::CallingHost)
             .await
             .unwrap();
         store.data_mut().mark_host_call();
-        FuelCallHook
+        FuelCallHook::<false>
             .handle_call_event(store.as_context_mut(), CallHook::ReturningFromHost)
             .await
             .unwrap();
