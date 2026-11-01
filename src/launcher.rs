@@ -413,7 +413,7 @@ impl OwnedChildLifecycle {
         let filesystem_completion = self.filesystem_completion.clone();
         // The tracing macro evaluates this bounded read only when enabled.
         // Guest exit can precede native completion; do not infer completion here.
-        tracing::debug!(
+        tracing::trace!(
             filesystem = ?filesystem_completion.try_snapshot(),
             "executor: child filesystem ownership after guest exit"
         );
@@ -430,6 +430,10 @@ impl OwnedChildLifecycle {
                 false
             }
         };
+        tracing::trace!(
+            succeeded = filesystem_completed,
+            "executor: child filesystem completion observed"
+        );
         // Release the delegated Membrane after child RPC and the stored guest
         // bootstrap are gone but before reporting exit to the parent.
         drop(self.membrane.take());
@@ -1944,6 +1948,238 @@ mod tests {
         release_tx.send(()).unwrap();
         assert_eq!(result_rx.blocking_recv().unwrap().unwrap(), 0);
         assert!(contents_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        drop(pool);
+    }
+
+    async fn operation_snapshot(completion: &cache::FsCompletion) -> cache::FsSnapshot {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match completion.try_snapshot() {
+                    Ok(snapshot) => break snapshot,
+                    Err(cache::FsSnapshotError::Busy) => tokio::task::yield_now().await,
+                    Err(error) => panic!("operation snapshot failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("operation snapshot deadline")
+    }
+
+    #[test]
+    fn native_p3_directory_cancellation_distinguishes_backend_and_cleanup_completion() {
+        use cache::{FsCleanupState, FsOperationBackend, FsOperationReceipt, FsOperationWaiter};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let pool = crate::services::ExecutorPool::new(1, shutdown_rx, test_filesystem_host());
+        let runtime_engine = pool.runtime_engine();
+        let component = native_kernel_fixture_component(&runtime_engine);
+        let (build_entered_tx, build_entered_rx) = tokio::sync::oneshot::channel();
+        let build_entered_tx = Arc::new(std::sync::Mutex::new(Some(build_entered_tx)));
+        let (build_release_tx, build_release_rx) = std::sync::mpsc::channel();
+        let build_release_rx = Arc::new(std::sync::Mutex::new(Some(build_release_rx)));
+        let hook: Arc<dyn Fn(cache::FsTestEvent) + Send + Sync> = Arc::new(move |event| {
+            if event.operation == cache::FilesystemOperation::DirectoryBuild
+                && event.stage == cache::FsTestStage::BeforePublish
+            {
+                build_entered_tx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(event.path.unwrap())
+                    .unwrap();
+                build_release_rx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+        });
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let (cleanup_observed_tx, cleanup_observed_rx) = std::sync::mpsc::channel();
+        let (cleanup_release_tx, cleanup_release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let cleanup_finished = Arc::new(AtomicBool::new(false));
+        let cleanup_witness = Arc::clone(&cleanup_finished);
+        assert!(pool
+            .spawn(crate::services::SpawnRequest {
+                name: "native-directory-cancellation".into(),
+                factory: Box::new(move |_| {
+                    Box::pin(async move {
+                        use std::future::Future;
+                        use std::task::Poll;
+
+                        let (mut lifecycle, process, dropped, _, observer) =
+                            lifecycle_loss_fixture();
+                        if let Some(old_rpc) = lifecycle.rpc_task.take() {
+                            old_rpc.shutdown();
+                        }
+                        let filesystem = test_filesystem_ownership();
+                        let scope = filesystem.test_scope().clone();
+                        let (tree_staging, tree, cache) =
+                            native_filesystem_fixture(&filesystem, None).await;
+                        let nested = tree_staging
+                            .path()
+                            .join(format!("dir-{}", native_fixture_cid(2)));
+                        let (cleanup_entered_tx, cleanup_entered_rx) =
+                            tokio::sync::oneshot::channel();
+                        let cleanup_path = nested.clone();
+                        scope
+                            .own_cleanup(cache::FilesystemOperation::ProcessCleanup, move || {
+                                // This witness reads the native filesystem independently
+                                // of the new operation diagnostic.
+                                assert_eq!(cleanup_path.join("child").metadata()?.len(), 12);
+                                assert_eq!(std::fs::read_dir(&cleanup_path)?.count(), 2_049);
+                                cleanup_entered_tx.send(()).unwrap();
+                                cleanup_release_rx
+                                    .recv_timeout(Duration::from_secs(10))
+                                    .unwrap();
+                                std::fs::remove_dir_all(cleanup_path)?;
+                                cleanup_witness.store(true, Ordering::SeqCst);
+                                Ok(())
+                            })
+                            .unwrap();
+                        let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(authority::Epoch {
+                            seq: 1,
+                            head: Vec::new(),
+                            root: None,
+                        });
+                        let readiness = Arc::new(authority::KernelReadyGate::new(epoch_rx));
+                        readiness.bind_generation(1);
+                        let (mut builder, mut handles) = Builder::kernel(
+                            Program::Precompiled(component),
+                            io::empty(),
+                            io::sink(),
+                            io::sink(),
+                            tree,
+                            readiness,
+                            filesystem,
+                        );
+                        builder = builder
+                            .with_runtime_engine(runtime_engine)
+                            .with_args(vec!["native-p3-fixture".into(), "directory".into()])
+                            .with_cache(cache)
+                            .with_filesystem_test_hook(hook);
+                        let completion = builder.filesystem_completion();
+                        let finalizer = builder.take_filesystem_finalizer().unwrap();
+                        let finalizer =
+                            tokio::task::spawn_local(rpc::local_tasks::track(finalizer.run()));
+                        lifecycle.proc = Some(builder.build().await.unwrap());
+                        lifecycle.filesystem_completion = completion.clone();
+                        let (reader, writer) = handles.take_host_split().unwrap();
+                        let (rpc, _) = graft::build_child_membrane_rpc(
+                            reader,
+                            writer,
+                            lifecycle.membrane.as_ref().unwrap().clone(),
+                        );
+                        lifecycle.rpc_task = Some(rpc);
+                        let owner = tokio::task::spawn_local(lifecycle.run());
+
+                        let temporary = build_entered_rx.await.unwrap();
+                        let active = operation_snapshot(&completion).await;
+                        let builds: Vec<_> = active.directory_builds().iter().flatten().collect();
+                        assert_eq!(builds.len(), 1);
+                        let operation_id = builds[0].id();
+                        assert_eq!(builds[0].waiter(), FsOperationWaiter::Waiting);
+                        assert_eq!(builds[0].backend(), FsOperationBackend::Running);
+                        assert_eq!(builds[0].receipt(), FsOperationReceipt::Outstanding);
+                        assert!(active.root_admission_open());
+                        assert_eq!(active.omitted_directory_builds(), 0);
+
+                        let mut wait = Box::pin(process.wait_request().send().promise);
+                        process.kill_request().send().promise.await.unwrap();
+                        // clear() follows drop(proc_run) in OwnedChildLifecycle.
+                        // Bootstrap destruction therefore witnesses guest Store
+                        // destruction without using the operation diagnostic.
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            while dropped.get() == 0 {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("launcher did not release the guest bootstrap");
+                        assert_eq!(dropped.get(), 1);
+                        let cancelled = operation_snapshot(&completion).await;
+                        let build = cancelled
+                            .directory_builds()
+                            .iter()
+                            .flatten()
+                            .find(|build| build.id() == operation_id)
+                            .unwrap();
+                        assert_eq!(build.waiter(), FsOperationWaiter::Dropped);
+                        assert_eq!(build.backend(), FsOperationBackend::Running);
+                        assert_eq!(build.receipt(), FsOperationReceipt::Outstanding);
+                        assert!(!cancelled.root_admission_open());
+                        assert!(cancelled.outstanding_work() > 0);
+                        assert_eq!(cancelled.cleanup(), FsCleanupState::Pending);
+                        std::future::poll_fn(|cx| {
+                            assert!(matches!(wait.as_mut().poll(cx), Poll::Pending));
+                            Poll::Ready(())
+                        })
+                        .await;
+                        cancelled_tx.send((temporary, nested.clone())).unwrap();
+
+                        cleanup_entered_rx.await.unwrap();
+                        let cleaning = operation_snapshot(&completion).await;
+                        let build = cleaning
+                            .directory_builds()
+                            .iter()
+                            .flatten()
+                            .find(|build| build.id() == operation_id)
+                            .unwrap();
+                        assert_eq!(build.waiter(), FsOperationWaiter::Dropped);
+                        assert_eq!(build.backend(), FsOperationBackend::Succeeded);
+                        assert_eq!(build.receipt(), FsOperationReceipt::Released);
+                        assert_eq!(cleaning.outstanding_work(), 0);
+                        assert_eq!(cleaning.cleanup(), FsCleanupState::Running);
+                        assert_eq!(observer.state(), rpc::CleanupState::Running);
+                        let mut filesystem_wait = Box::pin(completion.wait());
+                        std::future::poll_fn(|cx| {
+                            assert!(matches!(wait.as_mut().poll(cx), Poll::Pending));
+                            assert!(matches!(filesystem_wait.as_mut().poll(cx), Poll::Pending));
+                            Poll::Ready(())
+                        })
+                        .await;
+                        cleanup_observed_tx.send(nested.clone()).unwrap();
+
+                        assert_eq!(wait.await.unwrap().get().unwrap().get_exit_code(), 137);
+                        filesystem_wait.await.unwrap();
+                        owner.await.unwrap();
+                        finalizer.await.unwrap().unwrap();
+                        assert_eq!(observer.state(), rpc::CleanupState::Cleaned(137));
+                        assert_eq!(dropped.get(), 2);
+                        let completed = operation_snapshot(&completion).await;
+                        assert_eq!(completed.cleanup(), FsCleanupState::Completed);
+                        assert_eq!(completed.outstanding_work(), 0);
+                        assert!(!completed.failure_recorded());
+                        assert!(!nested.exists());
+                        drop(scope);
+                        finished_tx.send(()).unwrap();
+                    })
+                }),
+                result_tx: None,
+            })
+            .is_ok());
+
+        let (temporary, nested) = cancelled_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(temporary.join("child").is_file());
+        assert!(!nested.exists());
+        assert!(!cleanup_finished.load(Ordering::SeqCst));
+        build_release_tx.send(()).unwrap();
+        let published = cleanup_observed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(published, nested);
+        assert_eq!(published.join("child").metadata().unwrap().len(), 12);
+        assert_eq!(std::fs::read_dir(&published).unwrap().count(), 2_049);
+        assert!(!cleanup_finished.load(Ordering::SeqCst));
+        cleanup_release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(cleanup_finished.load(Ordering::SeqCst));
+        assert!(!published.exists());
         drop(pool);
     }
 
