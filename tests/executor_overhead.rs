@@ -87,7 +87,10 @@ fn executor_overhead_probe() {
             measure_completions(workers, Arc::clone(&resources)).await;
             measure_cancellation(workers, Arc::clone(&resources)).await;
         }
-        measure_full_queue(resources).await;
+        measure_full_queue(Arc::clone(&resources)).await;
+        for workers in [1, 4, 32] {
+            measure_idle_workers(workers, Arc::clone(&resources)).await;
+        }
         tokio::time::timeout(DEADLINE, owner.shutdown())
             .await
             .expect("filesystem shutdown deadline")
@@ -177,6 +180,23 @@ async fn measure_completions(workers: usize, resources: Arc<cache::HostResources
             tokio::time::timeout(DEADLINE, complete(&pool, work, operations, width))
                 .await
                 .expect("completion batch deadline");
+            sample(case, workers, iteration, operations, start.elapsed());
+        }
+    }
+    // Keep the real pool busy across several heartbeat periods per sample.
+    for (case, work) in [
+        ("cooperative_sustained", Work::Mixed),
+        ("immediate_sustained", Work::Immediate),
+    ] {
+        for iteration in WARMUPS..WARMUPS + 3 {
+            let start = Instant::now();
+            let mut operations = 0;
+            while start.elapsed() < Duration::from_secs(1) {
+                tokio::time::timeout(DEADLINE, complete(&pool, work, 1_024, BATCH_WIDTH))
+                    .await
+                    .expect("sustained batch deadline");
+                operations += 1_024;
+            }
             sample(case, workers, iteration, operations, start.elapsed());
         }
     }
@@ -297,4 +317,43 @@ async fn measure_full_queue(resources: Arc<cache::HostResources>) {
     tokio::time::timeout(DEADLINE, pool.shutdown_and_join())
         .await
         .expect("full queue pool shutdown deadline");
+}
+
+// Process CPU includes runtime wakeups and epoch publication. Compare unchanged
+// against the baseline; elapsed sleep alone does not measure heartbeat cost.
+#[cfg(unix)]
+fn process_cpu_seconds() -> f64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage initializes the provided rusage on successful return.
+    assert_eq!(
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+        0
+    );
+    let usage = unsafe { usage.assume_init() };
+    usage.ru_utime.tv_sec as f64
+        + usage.ru_utime.tv_usec as f64 / 1_000_000.0
+        + usage.ru_stime.tv_sec as f64
+        + usage.ru_stime.tv_usec as f64 / 1_000_000.0
+}
+
+async fn measure_idle_workers(workers: usize, resources: Arc<cache::HostResources>) {
+    let (_shutdown, rx) = watch::channel(());
+    let pool = ExecutorPool::new(workers, rx, resources);
+    // Warm up runtime construction before sampling CPU for an idle pool.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    #[cfg(unix)]
+    {
+        let cpu = process_cpu_seconds();
+        let start = Instant::now();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        println!(
+            "{}",
+            serde_json::json!({
+                "benchmark": "executor_idle", "label": label(), "workers": workers,
+                "elapsed_seconds": start.elapsed().as_secs_f64(),
+                "cpu_seconds": process_cpu_seconds() - cpu,
+            })
+        );
+    }
+    drop(pool);
 }
