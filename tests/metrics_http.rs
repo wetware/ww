@@ -93,6 +93,7 @@ struct Admin {
     url: String,
     shutdown: watch::Sender<()>,
     done: std::sync::mpsc::Receiver<anyhow::Result<()>>,
+    kernel_ready_gate: Arc<authority::KernelReadyGate>,
 }
 
 impl Admin {
@@ -109,6 +110,7 @@ impl Admin {
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/metrics", listener.local_addr().unwrap());
         let (_epoch_tx, epoch_rx) = watch::channel(authority::Epoch::zero());
+        let kernel_ready_gate = Arc::new(authority::KernelReadyGate::new(epoch_rx.clone()));
         let service = AdminService {
             listener,
             peer_id: "metrics-http-test".into(),
@@ -119,7 +121,7 @@ impl Admin {
                 kernel_identity: ww::kernel::IdentityState::pending(epoch_rx.clone()),
             },
             runtime_status: RuntimeStatus::starting(),
-            kernel_ready_gate: Arc::new(authority::KernelReadyGate::new(epoch_rx)),
+            kernel_ready_gate: kernel_ready_gate.clone(),
             route_registry: None,
             wasmtime_cache_metrics: wasmtime_cache_metrics(),
             executor_metrics,
@@ -134,6 +136,7 @@ impl Admin {
             url,
             shutdown,
             done,
+            kernel_ready_gate,
         }
     }
 }
@@ -155,6 +158,7 @@ struct Scrape {
     body: String,
     samples: BTreeMap<String, u64>,
     duration_sums: BTreeMap<String, f64>,
+    seconds: BTreeMap<String, f64>,
     http_elapsed: Duration,
 }
 
@@ -186,6 +190,7 @@ impl Scrape {
         );
         let mut samples = BTreeMap::new();
         let mut duration_sums = BTreeMap::new();
+        let mut seconds = BTreeMap::new();
         let mut types = BTreeMap::new();
         let mut helps = BTreeSet::new();
         for line in body.lines() {
@@ -199,7 +204,7 @@ impl Scrape {
                 assert!(types.insert(name.to_owned(), kind.to_owned()).is_none());
             } else {
                 // This parser validates the endpoint's fixed families and labels.
-                // Duration sums use seconds; all other samples are integers.
+                // Duration sums and worker timing gauges use seconds.
                 let (identity, value) = line.split_once(' ').expect("sample value");
                 let name = identity.split('{').next().unwrap();
                 assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
@@ -218,7 +223,24 @@ impl Scrape {
                         assert_eq!(identity, name, "unexpected duration labels");
                     }
                 } else if identity.contains('{') {
-                    if name == "ww_fuel_decisions_total" {
+                    if name.starts_with("ww_executor_worker_") {
+                        let labels = identity
+                            .strip_prefix(&format!("{name}{{worker=\""))
+                            .expect("worker is the first label");
+                        let (worker, suffix) = labels.split_once('"').unwrap();
+                        let index: usize = worker.parse().expect("numeric worker index");
+                        assert_eq!(worker, index.to_string());
+                        match name {
+                            "ww_executor_worker_state" => {
+                                assert!(["starting", "running", "shutting_down", "stopped"]
+                                    .iter()
+                                    .any(|state| suffix == format!(",state=\"{state}\"}}")))
+                            }
+                            "ww_executor_worker_stalled"
+                            | "ww_executor_worker_progress_age_seconds" => assert_eq!(suffix, "}"),
+                            _ => panic!("unsupported worker labels: {identity}"),
+                        }
+                    } else if name == "ww_fuel_decisions_total" {
                         assert!(
                             ["scheduled", "oneshot"].iter().any(|policy| {
                                 ["grant", "suspend", "exhausted"].iter().any(|decision| {
@@ -265,6 +287,12 @@ impl Scrape {
                     assert!(duration_sums.insert(identity.to_owned(), value).is_none());
                     continue;
                 }
+                if name.starts_with("ww_executor_worker_") && name.ends_with("_seconds") {
+                    let value: f64 = value.parse().expect("worker timing in seconds");
+                    assert!(value.is_finite() && value >= 0.0);
+                    assert!(seconds.insert(identity.to_owned(), value).is_none());
+                    continue;
+                }
                 let value: u64 = value.parse().expect("nonnegative integer sample");
                 assert!(
                     samples.insert(identity.to_owned(), value).is_none(),
@@ -288,6 +316,11 @@ impl Scrape {
             ("ww_executor_cell_slots", "gauge"),
             ("ww_executor_spawn_admissions_total", "counter"),
             ("ww_executor_cell_terminations_total", "counter"),
+            ("ww_executor_worker_heartbeat_interval_seconds", "gauge"),
+            ("ww_executor_worker_stall_threshold_seconds", "gauge"),
+            ("ww_executor_worker_state", "gauge"),
+            ("ww_executor_worker_stalled", "gauge"),
+            ("ww_executor_worker_progress_age_seconds", "gauge"),
             ("ww_fuel_decisions_total", "counter"),
             ("ww_fuel_settled_units_total", "counter"),
             ("ww_telemetry_sampled_out_total", "counter"),
@@ -305,6 +338,7 @@ impl Scrape {
             body,
             samples,
             duration_sums,
+            seconds,
             http_elapsed,
         }
     }
@@ -414,9 +448,26 @@ impl Scrape {
                 "unsupported sample exposed: {name}"
             );
         }
-        assert_eq!(self.samples.len(), 58);
+        let workers = self
+            .samples
+            .keys()
+            .filter(|name| name.starts_with("ww_executor_worker_stalled{"))
+            .count();
+        assert_eq!(self.samples.len(), 58 + 5 * workers);
         assert_eq!(self.duration_sums.len(), 2);
-        assert!(self.body.len() < 8192, "unbounded metrics response");
+        assert!((2..=2 + workers).contains(&self.seconds.len()));
+        assert_eq!(
+            self.seconds["ww_executor_worker_heartbeat_interval_seconds"],
+            0.25
+        );
+        assert_eq!(
+            self.seconds["ww_executor_worker_stall_threshold_seconds"],
+            5.0
+        );
+        assert!(
+            self.body.len() < 10_240 + 768 * workers,
+            "unbounded metrics response"
+        );
     }
 
     fn assert_live_families_contiguous(&self) {
@@ -812,6 +863,137 @@ async fn fuel_http_runtime_spawn_uses_pool_collector_across_child_and_pool_teard
                 .assert_fuel_unchanged(&terminal);
         })
         .await;
+}
+
+#[tokio::test]
+async fn worker_stall_is_observed_over_http_without_changing_probe_contracts() {
+    let metrics = ExecutorMetrics::default();
+    let admin = Admin::with_executor_metrics(metrics.clone());
+    admin.kernel_ready_gate.bind_generation(0);
+    admin.kernel_ready_gate.kernel_ready().unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let before_pool = scrape(&client, &admin).await;
+    before_pool.assert_unsupported_absent();
+    assert!(!before_pool
+        .samples
+        .keys()
+        .any(|name| name.starts_with("ww_executor_worker_")));
+
+    let (_shutdown, shutdown_rx) = watch::channel(());
+    let pool = ExecutorPool::try_new_with_metrics(
+        2,
+        shutdown_rx,
+        support::filesystem_resources(),
+        metrics.clone(),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metrics
+            .worker_liveness()
+            .iter()
+            .any(|worker| worker.progress_age.is_none())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both workers confirm initial progress");
+
+    let (entered_tx, entered) = oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let completed = submit(
+        &pool,
+        "private-liveness-blocked-cell",
+        Box::new(move |_| {
+            let thread = std::thread::current();
+            let worker: usize = thread
+                .name()
+                .unwrap()
+                .strip_prefix("executor-")
+                .unwrap()
+                .parse()
+                .unwrap();
+            entered_tx.send(worker).unwrap();
+            // Independent OS timeout and sender-drop cleanup bound a test failure.
+            // The entry acknowledgement establishes blocking order, not a sleep.
+            let _ = released.recv_timeout(Duration::from_secs(20));
+            Box::pin(async {})
+        }),
+    );
+    let blocked_worker = tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("worker entered blocking operation")
+        .unwrap();
+    let stalled_name = format!("ww_executor_worker_stalled{{worker=\"{blocked_worker}\"}}");
+    let age_name =
+        format!("ww_executor_worker_progress_age_seconds{{worker=\"{blocked_worker}\"}}");
+    let stalled = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let observed = scrape(&client, &admin).await;
+            if observed.samples[&stalled_name] == 1 {
+                break observed;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("independent admin observes worker stall");
+    stalled.assert_unsupported_absent();
+    stalled.assert_live_families_contiguous();
+    assert!(stalled.seconds[&age_name] >= 5.0);
+    assert_eq!(
+        stalled.samples[&format!(
+            "ww_executor_worker_stalled{{worker=\"{}\"}}",
+            1 - blocked_worker
+        )],
+        0
+    );
+    assert!(!stalled.body.contains("private-liveness"));
+    let base = admin.url.strip_suffix("/metrics").unwrap();
+    let healthy = client.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(healthy.status(), reqwest::StatusCode::OK);
+    assert_eq!(healthy.text().await.unwrap(), "ok\n");
+    let ready = client.get(format!("{base}/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        ready.json::<serde_json::Value>().await.unwrap()["ready"],
+        true
+    );
+
+    release.send(()).unwrap();
+    cell_result(completed).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let recovered = scrape(&client, &admin).await;
+            if recovered.samples[&stalled_name] == 0 {
+                assert!(recovered.seconds[&age_name] < 5.0);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a new publication clears the stall");
+    pool.shutdown_and_join().await;
+    let stopped = scrape(&client, &admin).await;
+    for worker in 0..2 {
+        assert_eq!(
+            stopped.samples
+                [&format!("ww_executor_worker_state{{worker=\"{worker}\",state=\"stopped\"}}")],
+            1
+        );
+        assert_eq!(
+            stopped.samples[&format!("ww_executor_worker_stalled{{worker=\"{worker}\"}}")],
+            0
+        );
+        assert!(stopped.seconds.contains_key(&format!(
+            "ww_executor_worker_progress_age_seconds{{worker=\"{worker}\"}}"
+        )));
+    }
 }
 
 #[tokio::test]
