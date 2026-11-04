@@ -24,7 +24,7 @@ P3_ROUTING := --allow-import wetware:routing/key@0.1.0
 P3_READINESS := --allow-import wetware:kernel-runtime/readiness@1.0.0
 
 .PHONY: all host std kernel status examples chess echo counter discovery oracle snap-hello-rs clean run-kernel
-.PHONY: publish-std try-publish-std publish test-deps test test-wasm test-p3-fixture test-guest-session-cancel guest-session-cancel-probe authority-probe routing-key-probe stream-lifecycle-probe
+.PHONY: publish-std try-publish-std publish test-deps test test-wasm test-p3-fixture test-guest-session-cancel guest-session-cancel-probe authority-probe gate2b-root-probe routing-key-probe stream-lifecycle-probe
 .PHONY: p3-chess p3-counter p3-discovery p3-echo p3-oracle p3-snap-hello-rs
 .PHONY: container-build container-run container-dev container-clean
 .PHONY: agent-skills
@@ -65,6 +65,9 @@ authority-probe:
 		$(P3_CLI_ENV) $(P3_CLI_TYPES) $(P3_STDIN) $(P3_STDOUT) $(P3_STDERR) \
 		$(P3_TERMINAL_IN) $(P3_TERMINAL_OUT) $(P3_FILESYSTEM) \
 		$(P3_MONOTONIC_CLOCK) $(P3_SYSTEM_CLOCK) $(P3_RANDOM) $(P3_TRANSPORT)
+
+gate2b-root-probe:
+	bash tests/fixtures/gate2b-root/build.sh
 
 stream-lifecycle-probe:
 	$(P3_BUILD) \
@@ -261,7 +264,7 @@ publish: host package-check
 # --- Test WASM components ----------------------------------------------------
 # Build every first-party component and verify its P3 command architecture.
 # Runtime integration tests consume these validated artifacts from CI.
-test-wasm: std examples authority-probe routing-key-probe stream-lifecycle-probe
+test-wasm: std examples authority-probe gate2b-root-probe routing-key-probe stream-lifecycle-probe
 	bash scripts/check_first_party_wasip3.sh
 
 # --- Run ---------------------------------------------------------------------

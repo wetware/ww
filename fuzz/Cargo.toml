@@ -19,7 +19,8 @@ serde = "=1.0.228"
 serde_json = "=1.0.150"
 
 [patch.crates-io]
-capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a" }
+capnp = { git = "https://github.com/wetware/capnproto-rust", rev = "25261268e254b2d45283233e7feebe79389a1509" }
+capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "25261268e254b2d45283233e7feebe79389a1509" }
 # Filesystem operation lifecycle hooks for bounded native WASI I/O.
 wasmtime = { git = "https://github.com/wetware/wasmtime", rev = "fe367749da9584f974b516f28c5c8055861d1512" }
 wasmtime-wasi = { git = "https://github.com/wetware/wasmtime", rev = "fe367749da9584f974b516f28c5c8055861d1512" }

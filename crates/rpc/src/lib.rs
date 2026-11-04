@@ -12,6 +12,7 @@ pub mod local_tasks;
 pub mod managed_rpc;
 pub mod named_capability;
 pub mod observability;
+pub mod outbound;
 pub mod routing;
 pub mod stream_dialer;
 pub mod stream_listener;
@@ -21,6 +22,9 @@ pub mod vat_listener;
 
 #[cfg(test)]
 mod tracing_tests;
+
+#[cfg(test)]
+mod vat_client_reproduction;
 
 pub use connection_budget::{
     inbound_connection_budget, parse_inbound_connection_limit, parse_terminal_login_timeout,

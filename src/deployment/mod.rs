@@ -437,6 +437,8 @@ impl<'a> KernelLauncher<'a> {
             },
         )?;
         let filesystem_completion = generation.filesystem_completion();
+        let effects_completion = generation.effects_completion();
+        let rpc_completion = generation.rpc_completion();
         let intended_seq = epoch.seq;
         let (result_tx, result_rx) = oneshot::channel();
         self.executor_pool
@@ -460,6 +462,8 @@ impl<'a> KernelLauncher<'a> {
             terminate_tx,
             result_rx,
             filesystem_completion,
+            effects_completion,
+            rpc_completion,
         })
     }
 }
@@ -470,6 +474,8 @@ struct RunningGeneration {
     terminate_tx: watch::Sender<()>,
     result_rx: oneshot::Receiver<Result<kernel::Outcome>>,
     filesystem_completion: cache::FsCompletion,
+    effects_completion: rpc::outbound::EffectsCompletion,
+    rpc_completion: rpc::CleanupObserver,
 }
 
 impl RunningGeneration {
@@ -480,10 +486,14 @@ impl RunningGeneration {
         if completed_result.is_none() {
             let _ = (&mut self.result_rx).await;
         }
-        self.filesystem_completion
-            .wait()
-            .await
-            .context("kernel generation filesystem cleanup failed")?;
+        let (filesystem, effects, rpc) = tokio::join!(
+            self.filesystem_completion.wait(),
+            self.effects_completion.wait(),
+            self.rpc_completion.wait(),
+        );
+        filesystem.context("kernel generation filesystem cleanup failed")?;
+        effects.context("kernel generation outbound cleanup failed")?;
+        rpc.map_err(|error| anyhow::anyhow!("kernel generation RPC cleanup failed: {error}"))?;
         Ok(GenerationStopped(()))
     }
 }
@@ -2744,6 +2754,8 @@ mod tests {
                 terminate_tx,
                 result_rx,
                 filesystem_completion: completed_filesystem_scope(),
+                effects_completion: completed_effects(),
+                rpc_completion: completed_root_rpc(),
             },
             result_tx,
             terminate_rx,
@@ -2834,6 +2846,18 @@ mod tests {
             .is_none());
         shutdown.send(()).unwrap();
         server.await.unwrap();
+    }
+
+    fn completed_root_rpc() -> rpc::CleanupObserver {
+        let (publication, completion) = rpc::cleanup_channel();
+        publication.cleaned(0);
+        completion
+    }
+
+    fn completed_effects() -> rpc::outbound::EffectsCompletion {
+        let (publisher, completion) = rpc::outbound::effects_completion();
+        drop(publisher);
+        completion
     }
 
     fn completed_filesystem_scope() -> cache::FsCompletion {
@@ -4596,6 +4620,8 @@ mod tests {
             terminate_tx,
             result_rx,
             filesystem_completion: completed_filesystem_scope(),
+            effects_completion: completed_effects(),
+            rpc_completion: completed_root_rpc(),
         };
         let head = Head {
             cid: ROOT.parse().unwrap(),
@@ -4635,6 +4661,115 @@ mod tests {
         })
         .await
         .expect("generation filesystem completion regression watchdog expired");
+    }
+
+    #[tokio::test]
+    async fn lost_generation_result_requires_independent_root_rpc_completion() {
+        use futures::FutureExt;
+        for joined in [false, true] {
+            let (terminate_tx, _) = watch::channel(());
+            let (result_tx, result_rx) = oneshot::channel();
+            drop(result_tx);
+            let (publication, rpc_completion) = rpc::cleanup_channel();
+            let mut running = RunningGeneration {
+                admission: None,
+                intended_seq: 1,
+                terminate_tx,
+                result_rx,
+                filesystem_completion: completed_filesystem_scope(),
+                effects_completion: completed_effects(),
+                rpc_completion,
+            };
+            // Let the real filesystem completion finish: it cannot certify RPC.
+            running.filesystem_completion.wait().await.unwrap();
+            let mut stopped = Box::pin(running.stopped(None));
+            assert!(stopped.as_mut().now_or_never().is_none());
+            if joined {
+                publication.cleaned(0);
+            } else {
+                drop(publication);
+            }
+            assert_eq!(stopped.await.is_ok(), joined);
+        }
+    }
+
+    /// Exercises the real retirement barrier with a real admitted outbound
+    /// attempt. Only native stream negotiation is synthetic and held by a
+    /// oneshot; the owner, receipt, worker, join monitor and failure are real.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lost_generation_result_waits_for_outbound_and_rejects_worker_loss() {
+        use futures::FutureExt;
+        for lose_worker in [false, true] {
+            let registry = rpc::outbound::OutboundRegistry::default();
+            let effects = registry.register().unwrap();
+            let completion = effects.completion();
+            let workers = tokio::task::LocalSet::new();
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            let dial = {
+                let _entered = workers.enter();
+                rpc::vat_dial::connect_owned::<
+                    futures::io::Cursor<Vec<u8>>,
+                    capnp::capability::Client,
+                    _,
+                >(&registry, Some(effects.origin()), async move {
+                    entered_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Err(capnp::Error::failed(
+                        "controlled native open refusal".into(),
+                    ))
+                })
+                .unwrap()
+            };
+            workers.run_until(entered_rx).await.unwrap();
+            effects.close();
+            assert!(completion.snapshot().closed);
+            assert_eq!(completion.snapshot().active, 1);
+            assert!(!completion.snapshot().failed);
+
+            let (terminate_tx, _) = watch::channel(());
+            let (result_tx, result_rx) = oneshot::channel();
+            drop(result_tx);
+            let mut running = RunningGeneration {
+                admission: None,
+                intended_seq: 1,
+                terminate_tx,
+                result_rx,
+                filesystem_completion: completed_filesystem_scope(),
+                effects_completion: completion.clone(),
+                rpc_completion: completed_root_rpc(),
+            };
+            running.filesystem_completion.wait().await.unwrap();
+            let mut stopped = Box::pin(running.stopped(None));
+            assert!(
+                stopped.as_mut().now_or_never().is_none(),
+                "lost generation must not retire while native work remains admitted"
+            );
+            if lose_worker {
+                // Destroy actual worker and monitor tasks, not a fabricated
+                // failed completion value. Unknown capacity remains occupied.
+                drop(workers);
+                assert!(completion.snapshot().failed);
+                assert_eq!(completion.snapshot().active, 1);
+                assert!(tokio::time::timeout(Duration::from_secs(2), stopped)
+                    .await
+                    .unwrap()
+                    .is_err());
+            } else {
+                release_tx.send(()).unwrap();
+                workers
+                    .run_until(async {
+                        tokio::time::timeout(Duration::from_secs(2), stopped)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert!(dial.await.is_err());
+                    })
+                    .await;
+                assert_eq!(completion.snapshot().active, 0);
+                assert!(!completion.snapshot().failed);
+            }
+        }
     }
 
     async fn assert_lost_generation_result_waits_for_filesystem_completion(
@@ -4714,6 +4849,8 @@ mod tests {
             terminate_tx,
             result_rx,
             filesystem_completion,
+            effects_completion: completed_effects(),
+            rpc_completion: completed_root_rpc(),
         };
         drop(result_tx);
         let completed_result = if preconsume_result {
@@ -4800,6 +4937,8 @@ mod tests {
             terminate_tx,
             result_rx,
             filesystem_completion,
+            effects_completion: completed_effects(),
+            rpc_completion: completed_root_rpc(),
         };
         drop(result_tx);
         let completed_result = Some((&mut running.result_rx).await);
@@ -4870,6 +5009,8 @@ mod tests {
             terminate_tx,
             result_rx,
             filesystem_completion: completed_filesystem_scope(),
+            effects_completion: completed_effects(),
+            rpc_completion: completed_root_rpc(),
         };
         let outcome = {
             let replacement = deployment.replace(
@@ -5083,6 +5224,8 @@ mod tests {
             terminate_tx,
             result_rx,
             filesystem_completion: completed_filesystem_scope(),
+            effects_completion: completed_effects(),
+            rpc_completion: completed_root_rpc(),
         };
         source_tx
             .send(SourceMessage::Error(anyhow::anyhow!("RPC unavailable")))

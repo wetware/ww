@@ -101,6 +101,7 @@ async fn exercise_children(child_span_enabled: bool, launcher_trace_enabled: boo
             let membrane = authority::membrane_client(receiver.clone(), b"child-tracing");
             let fuel = FuelObserver::default();
             let executor: system_capnp::executor::Client = capnp_rpc::new_client(ExecutorImpl {
+                outbound_registry: OutboundRegistry::default(),
                 bytecode,
                 component: Some(component),
                 runtime_engine,

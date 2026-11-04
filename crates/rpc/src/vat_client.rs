@@ -22,6 +22,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct VatClientImpl {
     stream_control: libp2p_stream::Control,
     guard: EpochGuard,
+    outbound: Option<crate::outbound::OutboundRegistry>,
 }
 
 impl VatClientImpl {
@@ -29,7 +30,13 @@ impl VatClientImpl {
         Self {
             stream_control,
             guard,
+            outbound: None,
         }
+    }
+
+    pub fn with_outbound_registry(mut self, registry: crate::outbound::OutboundRegistry) -> Self {
+        self.outbound = Some(registry);
+        self
     }
 }
 
@@ -42,6 +49,7 @@ impl system_capnp::vat_client::Server for VatClientImpl {
     ) -> Promise<(), capnp::Error> {
         pry!(self.guard.check());
 
+        let origin = params.hook.invocation_origin();
         let params = pry!(params.get());
         let peer_bytes = pry!(params.get_peer()).to_vec();
         let protocol = pry!(pry!(params.get_protocol())
@@ -53,82 +61,35 @@ impl system_capnp::vat_client::Server for VatClientImpl {
         let protocol_name = protocol.to_string();
         let stream_protocol = pry!(super::vat_protocol(&protocol_name));
 
-        let mut control = self.stream_control.clone();
-
+        // Preserve epoch and argument validation errors, then require a trusted
+        // invocation owner before starting any transport work.
+        if origin.is_none() {
+            return Promise::err(capnp::Error::failed("missing invocation origin".into()));
+        }
+        let registry = pry!(self
+            .outbound
+            .as_ref()
+            .ok_or_else(|| capnp::Error::failed("outbound ownership registry unavailable".into())));
+        let dial = pry!(super::vat_dial::connect_libp2p_owned_logged::<
+            capnp::capability::Client,
+        >(
+            registry,
+            origin,
+            self.stream_control.clone(),
+            peer_id,
+            stream_protocol.clone(),
+            Some(protocol_name),
+        ));
         Promise::from_future(async move {
-            tracing::debug!(
-                peer = %peer_id,
-                protocol = %stream_protocol,
-                service = %protocol_name,
-                "dialing vat service"
-            );
-
-            // Open stream with timeout to avoid hanging on unreachable peers.
-            let stream = tokio::time::timeout(
-                DIAL_TIMEOUT,
-                control.open_stream(peer_id, stream_protocol.clone()),
-            )
-            .await
-            .map_err(|_| {
-                capnp::Error::failed(format!(
-                    "timeout dialing {peer_id} on {stream_protocol} after {DIAL_TIMEOUT:?}"
-                ))
-            })?
-            .map_err(|e| {
-                capnp::Error::failed(format!(
-                    "failed to open stream to {peer_id} on {stream_protocol}: {e}"
-                ))
-            })?;
-
-            // Bootstrap Cap'n Proto RPC over the libp2p stream via the
-            // paved-path helper, which spawns the RpcSystem driver before
-            // returning. The driver flushes Bootstrap and receives the
-            // remote Return on its own.
-            //
-            // We don't await an explicit handshake check: `when_resolved()`
-            // on a bootstrap pipeline client doesn't fire reliably in
-            // capnp-rpc-rust 0.25 (see vat_dial docs).  The guest's first
-            // method call through the returned cap observes any remote
-            // failure via that call's own response timeout.
-            let super::vat_dial::VatDial { bootstrap, driver } =
-                super::vat_dial::connect::<_, capnp::capability::Client>(stream);
-
-            // The task below owns the managed driver and logs its outcome.
-            // Owner cancellation or detected transport failure explicitly
-            // disconnects before connection exports are abandoned.
-            let driver_peer = peer_id;
-            let driver_protocol = stream_protocol.clone();
-            let driver_service = protocol_name.clone();
-            let rpc_id = driver.rpc_id();
-            tokio::task::spawn_local(async move {
-                match driver.await {
-                    Ok(Ok(())) => tracing::trace!(
-                        rpc_id,
-                        peer = %driver_peer,
-                        protocol = %driver_protocol,
-                        service = %driver_service,
-                        "vat dial session ended cleanly"
-                    ),
-                    Ok(Err(e)) => tracing::warn!(
-                        event_code = crate::observability::EventCode::RpcFailed as u16,
-                        rpc_id,
-                        error = &e as &dyn std::error::Error,
-                        peer = %driver_peer,
-                        protocol = %driver_protocol,
-                        service = %driver_service,
-                        "vat dial session ended with error: {e}"
-                    ),
-                    Err(e) => tracing::warn!(
-                        event_code = crate::observability::EventCode::RpcFailed as u16,
-                        rpc_id,
-                        error = &e as &dyn std::error::Error,
-                        peer = %driver_peer,
-                        protocol = %driver_protocol,
-                        service = %driver_service,
-                        "vat dial driver task failed: {e}"
-                    ),
-                }
-            });
+            // This bounds the caller's wait. The supervised native attempt keeps
+            // its permit until the backend actually returns, even after timeout.
+            let bootstrap = tokio::time::timeout(DIAL_TIMEOUT, dial)
+                .await
+                .map_err(|_| {
+                    capnp::Error::failed(format!(
+                        "timeout dialing {peer_id} on {stream_protocol} after {DIAL_TIMEOUT:?}"
+                    ))
+                })??;
 
             // `bootstrap` is the remote peer's served capability directly
             // (the vat bootstrap slot carries the cap; no Synapse shim).
@@ -136,5 +97,26 @@ impl system_capnp::vat_client::Server for VatClientImpl {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn valid_unattributed_dial_rejects_before_transport_work() {
+        tokio::task::LocalSet::new().run_until(async {
+            let behaviour = libp2p_stream::Behaviour::new();
+            let client: system_capnp::vat_client::Client = capnp_rpc::new_client(
+                VatClientImpl::new(behaviour.new_control(), EpochGuard::fixed(authority::Epoch::zero()))
+            );
+            let mut request = client.dial_request();
+            request.get().set_peer(&PeerId::random().to_bytes());
+            request.get().set_protocol("ownership-test");
+            let result = tokio::time::timeout(Duration::from_millis(100), request.send().promise).await;
+            assert!(matches!(result, Ok(Err(error)) if error.extra.contains("missing invocation origin")),
+                "valid ownerless dial must reject before opening a transport");
+        }).await;
     }
 }

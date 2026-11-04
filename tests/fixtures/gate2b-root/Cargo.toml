@@ -1,0 +1,30 @@
+[package]
+name = "gate2b-root-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+default = ["gate2b-root"]
+gate2b-root = []
+
+[dependencies]
+capnp = "0.25.3"
+capnp-rpc = "0.25.0"
+serde = "1"
+serde_json = "1"
+system = { path = "../../../std/system" }
+wit-bindgen = { version = "=0.62.0", git = "https://github.com/wetware/wit-bindgen", rev = "025f95c294373c73e12eaee335577c81477d5a20" }
+
+[lib]
+crate-type = ["cdylib"]
+path = "../authority-probe/src/lib.rs"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rand = "0.9"
+
+[patch.crates-io]
+capnp = { git = "https://github.com/wetware/capnproto-rust", rev = "155c6f536de545810eb8e0436945bac3ad6df933" }
+capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "25261268e254b2d45283233e7feebe79389a1509" }

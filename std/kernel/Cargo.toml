@@ -18,4 +18,5 @@ crate-type = ["cdylib"]
 # capnp-rpc 0.25.1 + import-wrapper-reuse fix (wetware/ww#586). Keep the
 # kernel component on the same transport implementation as the host.
 [patch.crates-io]
-capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a" }
+capnp = { git = "https://github.com/wetware/capnproto-rust", rev = "155c6f536de545810eb8e0436945bac3ad6df933" }
+capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "25261268e254b2d45283233e7feebe79389a1509" }

@@ -30,6 +30,7 @@ use rpc::{
 };
 
 use rpc::managed_rpc::{ManagedRpc, DISCONNECT_GRACE};
+use rpc::outbound::{CellEffects, OutboundRegistry};
 
 static RPC_EOF_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static NEXT_CHILD_CELL_ID: AtomicU64 = AtomicU64::new(1);
@@ -41,6 +42,10 @@ use stderr::ChildStderr;
 #[cfg(test)]
 #[path = "launcher_tracing_tests.rs"]
 mod tracing_tests;
+
+#[cfg(test)]
+#[path = "launcher_outbound_tests.rs"]
+mod outbound_tests;
 
 /// Number of child RPC disconnects that failed or exceeded their grace.
 ///
@@ -83,6 +88,7 @@ pub struct RuntimeImpl {
     /// network, disk, pin/cache budget, and eviction work.
     pinset_cache: Option<Arc<cache::PinsetCache>>,
     filesystem_resources: Arc<cache::HostResources>,
+    outbound_registry: OutboundRegistry,
     /// Optional integration-test observation of production fuel callbacks.
     fuel_observer: Option<FuelObserver>,
 }
@@ -107,6 +113,7 @@ impl RuntimeImpl {
             pinset_cache: self.pinset_cache.clone(),
             filesystem_resources: Arc::clone(&self.filesystem_resources),
             fuel_observer: self.fuel_observer.clone(),
+            outbound_registry: self.outbound_registry.clone(),
         })
     }
 }
@@ -189,6 +196,33 @@ pub fn create_runtime_client_with_pinset(
     )
 }
 
+/// Construct a Runtime sharing the explicit outbound registry with native sinks.
+#[allow(clippy::too_many_arguments)]
+pub fn create_runtime_client_with_outbound_registry(
+    wasm_debug: bool,
+    guard: EpochGuard,
+    runtime_engine: cell::engine::RuntimeEngine,
+    compile_tx: Option<mpsc::Sender<CompileRequest>>,
+    cache_policy: CachePolicy,
+    pinset_cache: Option<Arc<cache::PinsetCache>>,
+    filesystem_resources: Arc<cache::HostResources>,
+    outbound_registry: OutboundRegistry,
+) -> system_capnp::runtime::Client {
+    create_runtime_client_with_options(
+        wasm_debug,
+        guard,
+        runtime_engine,
+        compile_tx,
+        cache_policy,
+        filesystem_resources,
+        RuntimeClientOptions {
+            pinset_cache,
+            outbound_registry,
+            ..RuntimeClientOptions::default()
+        },
+    )
+}
+
 /// Create a Runtime with opt-in observation of production fuel callbacks.
 #[doc(hidden)]
 pub fn create_runtime_client_with_fuel_observer(
@@ -218,6 +252,7 @@ pub fn create_runtime_client_with_fuel_observer(
 struct RuntimeClientOptions {
     pinset_cache: Option<Arc<cache::PinsetCache>>,
     fuel_observer: Option<FuelObserver>,
+    outbound_registry: OutboundRegistry,
 }
 
 fn create_runtime_client_with_options(
@@ -239,6 +274,7 @@ fn create_runtime_client_with_options(
         pinset_cache: options.pinset_cache,
         fuel_observer: options.fuel_observer,
         filesystem_resources,
+        outbound_registry: options.outbound_registry,
     };
     capnp_rpc::new_client(runtime)
 }
@@ -351,6 +387,7 @@ pub struct ExecutorImpl {
     pinset_cache: Option<Arc<cache::PinsetCache>>,
     fuel_observer: Option<FuelObserver>,
     filesystem_resources: Arc<cache::HostResources>,
+    outbound_registry: OutboundRegistry,
 }
 
 /// Owns every resource whose lifetime is exactly one running child.
@@ -358,6 +395,7 @@ pub struct ExecutorImpl {
 /// The task running this value owns the delegated authority through child exit.
 struct OwnedChildLifecycle {
     proc: Option<Proc>,
+    effects: CellEffects,
     filesystem_completion: cache::FsCompletion,
     rpc_task: Option<ManagedRpc>,
     stderr_task: Option<ChildStderr>,
@@ -374,11 +412,12 @@ impl OwnedChildLifecycle {
     }
 
     async fn run_until_shutdown(mut self, shutdown: tokio_util::sync::CancellationToken) {
-        let proc = self
-            .proc
-            .take()
-            .expect("owned child lifecycle starts with a process");
-        let mut proc_run = Box::pin(proc.run());
+        let mut proc_run = Box::pin(
+            self.proc
+                .as_mut()
+                .expect("owned child lifecycle starts with a process")
+                .run_borrowed(),
+        );
         let exit_code = loop {
             // A request may predate this owner's first poll.
             if *self.kill_rx.borrow() {
@@ -412,7 +451,9 @@ impl OwnedChildLifecycle {
         // Drop the Store and its guest transport before stopping the host RPC
         // system. This closes the peer side of the connection and cancels all
         // guest-owned RPC questions.
+        self.effects.close();
         drop(proc_run);
+        drop(self.proc.take());
         self.bootstrap_control.clear();
         let filesystem_completion = self.filesystem_completion.clone();
         // The tracing macro evaluates this bounded read only when enabled.
@@ -421,8 +462,19 @@ impl OwnedChildLifecycle {
             filesystem = ?filesystem_completion.try_snapshot(),
             "executor: child filesystem ownership after guest exit"
         );
-        let (filesystem_result, auxiliary_terminalization_completed) =
-            tokio::join!(filesystem_completion.wait(), self.stop_auxiliary_tasks());
+        let effects_completion = self.effects.completion();
+        let (filesystem_result, auxiliary_terminalization_completed, effects_result) = tokio::join!(
+            filesystem_completion.wait(),
+            self.stop_auxiliary_tasks(),
+            effects_completion.wait()
+        );
+        if let Err(error) = &effects_result {
+            tracing::error!(
+                event_code = EventCode::CellCleanupFailed as u16,
+                error = error as &dyn std::error::Error,
+                "executor: child outbound cleanup was not certified"
+            );
+        }
         let filesystem_completed = match filesystem_result {
             Ok(()) => true,
             Err(error) => {
@@ -446,7 +498,7 @@ impl OwnedChildLifecycle {
             exit_code,
             "executor: child process exited"
         );
-        if filesystem_completed && auxiliary_terminalization_completed {
+        if filesystem_completed && auxiliary_terminalization_completed && effects_result.is_ok() {
             if let Some(cleanup) = self.cleanup.take() {
                 cleanup.cleaned(exit_code);
             }
@@ -509,6 +561,7 @@ impl OwnedChildLifecycle {
 
 impl Drop for OwnedChildLifecycle {
     fn drop(&mut self) {
+        self.effects.close();
         self.bootstrap_control.clear();
         drop(self.proc.take());
         self.cancel_auxiliary_tasks();
@@ -605,6 +658,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
         let pinset_cache = self.pinset_cache.clone();
         let fuel_observer = self.fuel_observer.clone();
         let filesystem_resources = Arc::clone(&self.filesystem_resources);
+        let outbound_registry = self.outbound_registry.clone();
 
         // A spawned child has its own lifetime and identity. Unlike the named
         // ExecutorPool owner (`cell_name`), each child gets a process-local ID.
@@ -618,6 +672,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
         span.follows_from(tracing::Span::current());
         let child_span = span.clone();
         let future = async move {
+            let effects = outbound_registry.register()?;
             let cell_resources =
                 cache::CellResources::new(filesystem_resources, cache::CellLimits::default());
             let filesystem = cell::FilesystemOwnership::try_new(cell_resources)
@@ -689,8 +744,12 @@ impl system_capnp::executor::Server for ExecutorImpl {
                 .take_host_split()
                 .ok_or_else(|| capnp::Error::failed("host stream missing".into()))?;
 
-            let (rpc_task, guest_bootstrap) =
-                graft::build_child_membrane_rpc(reader, writer, child_membrane.clone());
+            let (rpc_task, guest_bootstrap) = graft::build_child_membrane_rpc_owned(
+                reader,
+                writer,
+                child_membrane.clone(),
+                effects.origin(),
+            );
 
             let stderr_task = ChildStderr::spawn(host_stderr, cell_id, child_span.clone());
 
@@ -713,6 +772,7 @@ impl system_capnp::executor::Server for ExecutorImpl {
             let lifecycle_task = tokio::task::spawn_local(
                 OwnedChildLifecycle {
                     proc: Some(proc),
+                    effects,
                     filesystem_completion,
                     rpc_task: Some(rpc_task),
                     stderr_task: Some(stderr_task),
@@ -774,7 +834,7 @@ mod tests {
         crate::services::test_filesystem_resources()
     }
 
-    fn test_filesystem_ownership() -> cell::FilesystemOwnership {
+    pub(super) fn test_filesystem_ownership() -> cell::FilesystemOwnership {
         let resources =
             cache::CellResources::new(test_filesystem_host(), cache::CellLimits::default());
         cell::FilesystemOwnership::try_new(resources).expect("test process filesystem ownership")
@@ -1238,7 +1298,7 @@ mod tests {
         completion
     }
 
-    fn lifecycle_loss_fixture() -> (
+    pub(super) fn lifecycle_loss_fixture() -> (
         OwnedChildLifecycle,
         system_capnp::process::Client,
         Rc<Cell<u32>>,
@@ -1296,6 +1356,7 @@ mod tests {
                 // These tests exercise loss of the owner before child polling,
                 // without allocating a Wasmtime Store.
                 proc: None,
+                effects: OutboundRegistry::default().register().unwrap(),
                 filesystem_completion: completed_filesystem_scope(),
                 rpc_task: Some(rpc_task),
                 stderr_task: Some(stderr_task),
@@ -1337,6 +1398,7 @@ mod tests {
 
         drop(OwnedChildLifecycle {
             proc: None,
+            effects: OutboundRegistry::default().register().unwrap(),
             filesystem_completion: completed_filesystem_scope(),
             rpc_task: None,
             stderr_task: None,
@@ -1443,6 +1505,34 @@ mod tests {
             .run_until(async {
                 let (mut lifecycle, process, dropped, tasks_dropped, observer) =
                     lifecycle_loss_fixture();
+                let registry = OutboundRegistry::default();
+                let effects = registry.register().unwrap();
+                let effects_completion = effects.completion();
+                let outbound_workers = tokio::task::LocalSet::new();
+                let (outbound_entered_tx, outbound_entered_rx) = oneshot::channel();
+                let (outbound_release_tx, outbound_release_rx) = oneshot::channel();
+                let dial = {
+                    let _entered = outbound_workers.enter();
+                    rpc::vat_dial::connect_owned::<
+                        futures::io::Cursor<Vec<u8>>,
+                        capnp::capability::Client,
+                        _,
+                    >(&registry, Some(effects.origin()), async move {
+                        outbound_entered_tx.send(()).unwrap();
+                        outbound_release_rx
+                            .await
+                            .expect("release completed outbound negotiation");
+                        Err(capnp::Error::failed(
+                            "controlled native open refusal".into(),
+                        ))
+                    })
+                    .unwrap()
+                };
+                outbound_workers
+                    .run_until(outbound_entered_rx)
+                    .await
+                    .unwrap();
+                lifecycle.effects = effects;
                 let (stderr_reader, mut stderr_writer) = io::duplex(stderr::PIPE_BYTES);
                 stderr_writer
                     .write_all(b"final fragment\xff")
@@ -1506,6 +1596,8 @@ mod tests {
                     "guest bootstrap released before RPC teardown"
                 );
                 assert_eq!(observer.state(), rpc::CleanupState::Running);
+                assert!(effects_completion.snapshot().closed);
+                assert_eq!(effects_completion.snapshot().active, 1);
                 let mut wait = Box::pin(process.wait_request().send().promise);
                 assert!(
                     wait.as_mut().now_or_never().is_none(),
@@ -1520,7 +1612,28 @@ mod tests {
                 assert_eq!(observer.state(), rpc::CleanupState::Running);
                 assert!(wait.as_mut().now_or_never().is_none());
                 drop(stderr_writer);
-                owner.await.expect("child teardown owner");
+                tokio::task::yield_now().await;
+                assert_eq!(observer.state(), rpc::CleanupState::Running);
+                assert!(
+                    wait.as_mut().now_or_never().is_none(),
+                    "outbound negotiation still prevents cleanup after RPC and stderr release"
+                );
+                outbound_release_tx.send(()).unwrap();
+                // Releasing the native gate does not run or join its worker.
+                // The dedicated LocalSet remains suspended until run_until.
+                assert_eq!(effects_completion.snapshot().active, 1);
+                assert!(wait.as_mut().now_or_never().is_none());
+                outbound_workers
+                    .run_until(async {
+                        owner.await.expect("child teardown owner");
+                        assert!(dial.await.is_err());
+                    })
+                    .await;
+                let effects = effects_completion.snapshot();
+                assert!(effects.closed);
+                assert_eq!(effects.active, 0, "outbound worker joined before cleanup");
+                assert!(!effects.failed);
+                assert_eq!(registry.total_active(), 0);
                 for task_dropped in tasks_dropped {
                     assert!(task_dropped.await.is_err());
                 }
@@ -1776,6 +1889,7 @@ mod tests {
                 let owner = tokio::task::spawn_local(
                     OwnedChildLifecycle {
                         proc: Some(proc),
+                        effects: OutboundRegistry::default().register().unwrap(),
                         filesystem_completion,
                         rpc_task: Some(rpc_task),
                         stderr_task: None,
