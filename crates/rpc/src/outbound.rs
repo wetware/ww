@@ -60,7 +60,7 @@ impl EffectBudget {
     fn acquire_one(&self) -> capnp::Result<()> {
         self.0
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < self.0.capacity).then(|| active + 1)
             })
             .map(|_| ())
@@ -223,7 +223,7 @@ struct OwnerSlot;
 impl OwnerSlot {
     fn acquire() -> capnp::Result<Self> {
         LIVE_PROCESS_OWNERS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_PROCESS_OWNERS).then(|| active + 1)
             })
             .map(|_| Self)

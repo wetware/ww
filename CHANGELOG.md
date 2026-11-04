@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **Cell-owned outbound RPC lifecycle (#792).** The initiating Cell owns
+  admitted negotiations and established RPC sessions, including calls through
+  delegated capabilities. Finite Cell and process admission orders submission
+  and delivery against closure. Cleanup waits for actual worker completion;
+  lost completion evidence reports failure and retains capacity.
 - **Ordinary-child stderr draining (#155).** Fixed-size byte reads replace
   line buffering. Teardown drains through EOF under one cooperative one-second
   deadline, then aborts and joins the reader if the deadline expires. One bounded
