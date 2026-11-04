@@ -1505,6 +1505,34 @@ mod tests {
             .run_until(async {
                 let (mut lifecycle, process, dropped, tasks_dropped, observer) =
                     lifecycle_loss_fixture();
+                let registry = OutboundRegistry::default();
+                let effects = registry.register().unwrap();
+                let effects_completion = effects.completion();
+                let outbound_workers = tokio::task::LocalSet::new();
+                let (outbound_entered_tx, outbound_entered_rx) = oneshot::channel();
+                let (outbound_release_tx, outbound_release_rx) = oneshot::channel();
+                let dial = {
+                    let _entered = outbound_workers.enter();
+                    rpc::vat_dial::connect_owned::<
+                        futures::io::Cursor<Vec<u8>>,
+                        capnp::capability::Client,
+                        _,
+                    >(&registry, Some(effects.origin()), async move {
+                        outbound_entered_tx.send(()).unwrap();
+                        outbound_release_rx
+                            .await
+                            .expect("release completed outbound negotiation");
+                        Err(capnp::Error::failed(
+                            "controlled native open refusal".into(),
+                        ))
+                    })
+                    .unwrap()
+                };
+                outbound_workers
+                    .run_until(outbound_entered_rx)
+                    .await
+                    .unwrap();
+                lifecycle.effects = effects;
                 let (stderr_reader, mut stderr_writer) = io::duplex(stderr::PIPE_BYTES);
                 stderr_writer
                     .write_all(b"final fragment\xff")
@@ -1568,6 +1596,8 @@ mod tests {
                     "guest bootstrap released before RPC teardown"
                 );
                 assert_eq!(observer.state(), rpc::CleanupState::Running);
+                assert!(effects_completion.snapshot().closed);
+                assert_eq!(effects_completion.snapshot().active, 1);
                 let mut wait = Box::pin(process.wait_request().send().promise);
                 assert!(
                     wait.as_mut().now_or_never().is_none(),
@@ -1582,7 +1612,28 @@ mod tests {
                 assert_eq!(observer.state(), rpc::CleanupState::Running);
                 assert!(wait.as_mut().now_or_never().is_none());
                 drop(stderr_writer);
-                owner.await.expect("child teardown owner");
+                tokio::task::yield_now().await;
+                assert_eq!(observer.state(), rpc::CleanupState::Running);
+                assert!(
+                    wait.as_mut().now_or_never().is_none(),
+                    "outbound negotiation still prevents cleanup after RPC and stderr release"
+                );
+                outbound_release_tx.send(()).unwrap();
+                // Releasing the native gate does not run or join its worker.
+                // The dedicated LocalSet remains suspended until run_until.
+                assert_eq!(effects_completion.snapshot().active, 1);
+                assert!(wait.as_mut().now_or_never().is_none());
+                outbound_workers
+                    .run_until(async {
+                        owner.await.expect("child teardown owner");
+                        assert!(dial.await.is_err());
+                    })
+                    .await;
+                let effects = effects_completion.snapshot();
+                assert!(effects.closed);
+                assert_eq!(effects.active, 0, "outbound worker joined before cleanup");
+                assert!(!effects.failed);
+                assert_eq!(registry.total_active(), 0);
                 for task_dropped in tasks_dropped {
                     assert!(task_dropped.await.is_err());
                 }
