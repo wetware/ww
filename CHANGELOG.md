@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Bound retained-materialization test startup and cleanup waits, observe early
+  materialization failures, and report unresolved worker shutdowns explicitly.
+  Production filesystem behavior is unchanged.
 - **Cell-owned outbound RPC lifecycle (#792).** The initiating Cell owns
   admitted negotiations and established RPC sessions, including calls through
   delegated capabilities. Finite Cell and process admission orders submission
