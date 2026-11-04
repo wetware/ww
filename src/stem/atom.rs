@@ -353,6 +353,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_abi_is_a_retryable_error() {
+        let cid: Cid = "bafkreibm6jg3ux5qugqkmfqt5uj5rxszb4sa4e3u7jj4c5ukv5s4xvcc7a"
+            .parse()
+            .unwrap();
+        let mut malformed = vec![0; 96];
+        malformed[63] = 64;
+        malformed[88..96].copy_from_slice(&u64::MAX.to_be_bytes());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for result in [
+                serde_json::json!("0x6"),
+                serde_json::json!(format!("0x{}", hex::encode(malformed))),
+                serde_json::json!("0x6"),
+                serde_json::json!(encode_head(8, &cid.to_bytes())),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                request(&mut stream).await;
+                respond(&mut stream, result).await;
+            }
+        });
+        let mut source = Source::new(Config::new(format!("http://{address}"), [0; 20], 6)).unwrap();
+
+        assert!(source.current().await.is_err());
+        assert_eq!(source.current().await.unwrap(), Update::Head(Head { cid }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn tip_below_confirmation_depth_is_not_authoritative() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
