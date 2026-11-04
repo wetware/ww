@@ -23,8 +23,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 [[package]]
 name = "capnp"
 version = "0.25.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d1c82ec25a9501d60e22eef4be1b2c271769b5a96e224d0875baef28529cf30"
+source = "git+https://github.com/wetware/capnproto-rust?rev=52cb94dcb1e7c24e863ada2eca5e454a842ed51a#52cb94dcb1e7c24e863ada2eca5e454a842ed51a"
 dependencies = [
  "embedded-io",
 ]
@@ -43,7 +42,7 @@ dependencies = [
 [[package]]
 name = "capnp-rpc"
 version = "0.25.1"
-source = "git+https://github.com/wetware/capnproto-rust?rev=b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a#b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a"
+source = "git+https://github.com/wetware/capnproto-rust?rev=25261268e254b2d45283233e7feebe79389a1509#25261268e254b2d45283233e7feebe79389a1509"
 dependencies = [
  "capnp",
  "capnp-futures",

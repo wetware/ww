@@ -247,6 +247,7 @@ pub struct RootMembraneBuilder {
     /// graft for that generation shares this receiver; unrelated graft calls
     /// therefore cannot invalidate pid0 registrations.
     registration_scope: Option<watch::Receiver<()>>,
+    outbound_registry: Option<crate::outbound::OutboundRegistry>,
 }
 
 impl RootMembraneBuilder {
@@ -269,6 +270,7 @@ impl RootMembraneBuilder {
             runtime_client,
             extras: NamedCapabilities::default(),
             registration_scope: None,
+            outbound_registry: None,
         }
     }
 
@@ -282,6 +284,12 @@ impl RootMembraneBuilder {
     ///
     pub fn with_extras(mut self, extras: NamedCapabilities) -> Self {
         self.extras = extras;
+        self
+    }
+
+    /// Share native effect admission with the Cell Runtime that owns ingress.
+    pub fn with_outbound_registry(mut self, registry: crate::outbound::OutboundRegistry) -> Self {
+        self.outbound_registry = Some(registry);
         self
     }
 
@@ -316,9 +324,12 @@ impl RootMembraneBuilder {
         let vat_listener: system_capnp::vat_listener::Client = capnp_rpc::new_client(
             super::vat_listener::VatListenerImpl::new(self.stream_control.clone(), guard.clone()),
         );
-        let vat_dialer: system_capnp::vat_client::Client = capnp_rpc::new_client(
-            super::vat_client::VatClientImpl::new(self.stream_control.clone(), guard.clone()),
-        );
+        let mut vat_dialer =
+            super::vat_client::VatClientImpl::new(self.stream_control.clone(), guard.clone());
+        if let Some(registry) = &self.outbound_registry {
+            vat_dialer = vat_dialer.with_outbound_registry(registry.clone());
+        }
+        let vat_dialer: system_capnp::vat_client::Client = capnp_rpc::new_client(vat_dialer);
         let http_listener: Option<system_capnp::http_listener::Client> =
             match (&self.route_registry, self.registration_scope.clone()) {
                 (Some(registry), Some(scope)) => Some(capnp_rpc::new_client(
@@ -424,13 +435,45 @@ where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
+    build_child_membrane_rpc_inner(reader, writer, membrane, None)
+}
+
+/// Bind one authenticated Cell generation to this ingress without altering its grant.
+pub fn build_child_membrane_rpc_owned<R, W>(
+    reader: R,
+    writer: W,
+    membrane: GuestMembrane,
+    origin: capnp::private::capability::InvocationOrigin,
+) -> (crate::managed_rpc::ManagedRpc, GuestExport)
+where
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
+{
+    build_child_membrane_rpc_inner(reader, writer, membrane, Some(origin))
+}
+
+fn build_child_membrane_rpc_inner<R, W>(
+    reader: R,
+    writer: W,
+    membrane: GuestMembrane,
+    origin: Option<capnp::private::capability::InvocationOrigin>,
+) -> (crate::managed_rpc::ManagedRpc, GuestExport)
+where
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
+{
     let rpc_network = VatNetwork::new(
         reader.compat(),
         writer.compat_write(),
         Side::Server,
         Default::default(),
     );
-    let mut rpc_system = RpcSystem::new(Box::new(rpc_network), Some(membrane.client));
+    let network: Box<dyn capnp_rpc::VatNetwork<Side>> = Box::new(rpc_network);
+    let network = match origin {
+        Some(origin) => crate::outbound::with_origin(network, origin),
+        None => network,
+    };
+    let mut rpc_system = RpcSystem::new(network, Some(membrane.client));
     let guest_export: GuestExport = rpc_system.bootstrap(Side::Client);
     (
         crate::managed_rpc::ManagedRpc::spawn(rpc_system),
@@ -507,6 +550,92 @@ where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
+    build_kernel_membrane_rpc_inner(
+        reader,
+        writer,
+        network_state,
+        swarm_cmd_tx,
+        epoch_rx,
+        readiness_gate,
+        signing_key,
+        stream_control,
+        route_registry,
+        runtime_client,
+        extras,
+        http_dial,
+        intended_seq,
+        registration_scope,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_kernel_membrane_rpc_owned<R, W>(
+    reader: R,
+    writer: W,
+    network_state: NetworkState,
+    swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
+    epoch_rx: watch::Receiver<Epoch>,
+    readiness_gate: Arc<authority::KernelReadyGate>,
+    signing_key: Option<Arc<SigningKey>>,
+    stream_control: libp2p_stream::Control,
+    route_registry: Option<crate::dispatch::RouteRegistry>,
+    runtime_client: system_capnp::runtime::Client,
+    extras: NamedCapabilities,
+    http_dial: Vec<String>,
+    intended_seq: u64,
+    registration_scope: watch::Receiver<()>,
+    outbound_registry: crate::outbound::OutboundRegistry,
+    origin: capnp::private::capability::InvocationOrigin,
+) -> crate::managed_rpc::ManagedRpc
+where
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
+{
+    build_kernel_membrane_rpc_inner(
+        reader,
+        writer,
+        network_state,
+        swarm_cmd_tx,
+        epoch_rx,
+        readiness_gate,
+        signing_key,
+        stream_control,
+        route_registry,
+        runtime_client,
+        extras,
+        http_dial,
+        intended_seq,
+        registration_scope,
+        Some((outbound_registry, origin)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_kernel_membrane_rpc_inner<R, W>(
+    reader: R,
+    writer: W,
+    network_state: NetworkState,
+    swarm_cmd_tx: mpsc::Sender<SwarmCommand>,
+    epoch_rx: watch::Receiver<Epoch>,
+    readiness_gate: Arc<authority::KernelReadyGate>,
+    signing_key: Option<Arc<SigningKey>>,
+    stream_control: libp2p_stream::Control,
+    route_registry: Option<crate::dispatch::RouteRegistry>,
+    runtime_client: system_capnp::runtime::Client,
+    extras: NamedCapabilities,
+    http_dial: Vec<String>,
+    intended_seq: u64,
+    registration_scope: watch::Receiver<()>,
+    outbound: Option<(
+        crate::outbound::OutboundRegistry,
+        capnp::private::capability::InvocationOrigin,
+    )>,
+) -> crate::managed_rpc::ManagedRpc
+where
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
+{
     let mut root_builder = RootMembraneBuilder::new(
         network_state,
         swarm_cmd_tx,
@@ -516,6 +645,9 @@ where
         runtime_client,
     )
     .with_registration_scope(registration_scope);
+    if let Some((registry, _)) = &outbound {
+        root_builder = root_builder.with_outbound_registry(registry.clone());
+    }
     if !extras.is_empty() {
         root_builder = root_builder.with_extras(extras);
     }
@@ -538,10 +670,12 @@ where
         Side::Server,
         Default::default(),
     );
-    crate::managed_rpc::ManagedRpc::spawn(RpcSystem::new(
-        Box::new(rpc_network),
-        Some(root_membrane.client),
-    ))
+    let network: Box<dyn capnp_rpc::VatNetwork<Side>> = Box::new(rpc_network);
+    let network = match outbound {
+        Some((_, origin)) => crate::outbound::with_origin(network, origin),
+        None => network,
+    };
+    crate::managed_rpc::ManagedRpc::spawn(RpcSystem::new(network, Some(root_membrane.client)))
 }
 
 // IPFS content access is tested in fs_intercept::tests and vfs::tests.

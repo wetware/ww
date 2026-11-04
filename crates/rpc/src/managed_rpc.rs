@@ -37,6 +37,16 @@ pub struct ManagedRpc {
     task: JoinHandle<capnp::Result<()>>,
 }
 
+/// Cancellation authority that retains neither the RPC worker nor its exports.
+#[derive(Clone)]
+pub struct ManagedRpcShutdown(CancellationToken);
+
+impl ManagedRpcShutdown {
+    pub fn shutdown(&self) {
+        self.0.cancel();
+    }
+}
+
 /// Build an RPC system whose local bootstrap can be released at disconnect.
 /// The raw driver remains private so every spawned owner has both release paths.
 pub struct ManagedRpcSystem<VatId: 'static> {
@@ -187,6 +197,10 @@ impl ManagedRpc {
     /// cleanup acknowledgement. Await this owner to join its bounded teardown.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+
+    pub fn shutdown_handle(&self) -> ManagedRpcShutdown {
+        ManagedRpcShutdown(self.shutdown.clone())
     }
 
     /// Outer success certifies terminalization, even if the inner RPC result

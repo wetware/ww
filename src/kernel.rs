@@ -313,22 +313,86 @@ pub struct Generation {
     stdio: Stdio,
     terminate_rx: watch::Receiver<()>,
     filesystem_ownership: cell::FilesystemOwnership,
+    effects_publication: rpc::outbound::EffectsPublisher,
+    effects_completion: rpc::outbound::EffectsCompletion,
+    rpc_publication: UnboundRootRpc,
+    rpc_completion: rpc::CleanupObserver,
     admission: LaunchAdmission,
 }
 
 struct GenerationCleanup {
+    effects: rpc::outbound::CellEffects,
     proc_abort: tokio::task::AbortHandle,
-    rpc: rpc::managed_rpc::ManagedRpc,
+    rpc: RootRpcOwner,
     readiness_gate: Arc<authority::KernelReadyGate>,
     identity: Option<IdentityGuard>,
 }
 
 impl Drop for GenerationCleanup {
     fn drop(&mut self) {
+        self.effects.close();
         self.identity.take();
         self.readiness_gate.clear();
         self.proc_abort.abort();
         self.rpc.shutdown();
+    }
+}
+
+/// Before binding, no root RPC exists and dropping this certifies an empty set.
+struct UnboundRootRpc(Option<rpc::CleanupPublisher>);
+
+impl Drop for UnboundRootRpc {
+    fn drop(&mut self) {
+        if let Some(publication) = self.0.take() {
+            publication.cleaned(0);
+        }
+    }
+}
+
+struct RootRpcOwner(rpc::managed_rpc::ManagedRpcShutdown);
+
+impl RootRpcOwner {
+    fn shutdown(&self) {
+        self.0.shutdown();
+    }
+}
+
+impl Drop for RootRpcOwner {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl UnboundRootRpc {
+    fn bind(mut self, driver: rpc::managed_rpc::ManagedRpc) -> RootRpcOwner {
+        let publication = self.0.take().expect("root RPC completion binds once");
+        let owner = RootRpcOwner(driver.shutdown_handle());
+        tokio::task::spawn_local(rpc::local_tasks::track(async move {
+            // Outer Ok proves terminalization even when the protocol failed.
+            // Losing this actual join task drops the publisher to Lost.
+            if driver.await.is_ok() {
+                publication.cleaned(0);
+            }
+        }));
+        owner
+    }
+}
+
+/// The worker closes native effect admission before dropping its borrowed Store.
+struct KernelExecution {
+    proc: cell::Proc,
+    effects_close: rpc::outbound::EffectsCloseHandle,
+}
+
+impl KernelExecution {
+    async fn run(mut self) -> Result<()> {
+        self.proc.run_borrowed().await
+    }
+}
+
+impl Drop for KernelExecution {
+    fn drop(&mut self) {
+        self.effects_close.close();
     }
 }
 
@@ -351,6 +415,8 @@ impl Generation {
             cache::CellLimits::default(),
         );
         let filesystem_ownership = cell::FilesystemOwnership::try_new(filesystem_resources)?;
+        let (effects_publication, effects_completion) = rpc::outbound::effects_completion();
+        let (rpc_publication, rpc_completion) = rpc::cleanup_channel();
         Ok(Self {
             prepared,
             root,
@@ -362,6 +428,10 @@ impl Generation {
             stdio,
             terminate_rx,
             filesystem_ownership,
+            effects_publication,
+            effects_completion,
+            rpc_publication: UnboundRootRpc(Some(rpc_publication)),
+            rpc_completion,
             admission,
         })
     }
@@ -370,6 +440,16 @@ impl Generation {
     /// cleanup have completed. Available before `run` is first polled.
     pub fn filesystem_completion(&self) -> cache::FsCompletion {
         self.filesystem_ownership.completion()
+    }
+
+    /// Completion of outbound effects, available before executor admission.
+    pub fn effects_completion(&self) -> rpc::outbound::EffectsCompletion {
+        self.effects_completion.clone()
+    }
+
+    /// Independent proof that the root RPC worker has actually joined.
+    pub fn rpc_completion(&self) -> rpc::CleanupObserver {
+        self.rpc_completion.clone()
     }
 
     /// Instantiate and run the kernel Cell, its privileged RPC system, and
@@ -386,8 +466,14 @@ impl Generation {
             stdio,
             mut terminate_rx,
             filesystem_ownership,
+            effects_publication,
+            effects_completion,
+            rpc_publication,
+            rpc_completion,
             admission,
         } = self;
+        let outbound_registry = rpc::outbound::OutboundRegistry::default();
+        let effects = outbound_registry.register_with_completion(effects_publication)?;
 
         anyhow::ensure!(
             identity_state.epoch_rx.same_channel(&guard.receiver),
@@ -493,7 +579,7 @@ impl Generation {
             return Ok(Outcome::Terminated);
         };
 
-        let runtime_client = crate::launcher::create_runtime_client_with_pinset(
+        let runtime_client = crate::launcher::create_runtime_client_with_outbound_registry(
             runtime_inputs.wasm_debug,
             guard.clone(),
             runtime_inputs.runtime_engine,
@@ -501,9 +587,10 @@ impl Generation {
             runtime_inputs.cache_policy,
             Some(runtime_inputs.pinset_cache),
             runtime_inputs.filesystem_resources,
+            outbound_registry.clone(),
         );
         let registration_scope = RegistrationScope::new();
-        let rpc_system = rpc::graft::build_kernel_membrane_rpc(
+        let rpc_system = rpc::graft::build_kernel_membrane_rpc_owned(
             reader,
             writer,
             bootstrap.network_state,
@@ -518,12 +605,19 @@ impl Generation {
             bootstrap.http_dial,
             guard.issued_seq,
             registration_scope.receiver(),
+            outbound_registry,
+            effects.origin(),
         );
 
-        let mut proc_task = tokio::spawn(async move { proc.run().await }.in_current_span());
+        let execution = KernelExecution {
+            proc,
+            effects_close: effects.close_handle(),
+        };
+        let mut proc_task = tokio::spawn(execution.run().in_current_span());
         let mut cleanup = GenerationCleanup {
+            effects,
             proc_abort: proc_task.abort_handle(),
-            rpc: rpc_system,
+            rpc: rpc_publication.bind(rpc_system),
             readiness_gate: readiness_gate.clone(),
             identity: Some(identity_guard),
         };
@@ -531,6 +625,7 @@ impl Generation {
             joined = &mut proc_task => map_join_outcome(joined),
             changed = terminate_rx.changed() => {
                 if changed.is_ok() {
+                    cleanup.effects.close();
                     proc_task.abort();
                     let _ = (&mut proc_task).await;
                     Outcome::Terminated
@@ -540,13 +635,26 @@ impl Generation {
             }
         };
 
+        cleanup.effects.close();
         cleanup.identity.take();
         readiness_gate.clear();
         drop(registration_scope);
-        let (filesystem_result, _rpc_result) = tokio::join!(
+        cleanup.rpc.shutdown();
+        let (filesystem_result, rpc_result, effects_result) = tokio::join!(
             filesystem_completion.wait(),
-            cleanup.rpc.shutdown_and_join(),
+            rpc_completion.wait(),
+            effects_completion.wait(),
         );
+        let _rpc_outcome =
+            rpc_result.map_err(|error| anyhow::anyhow!("kernel RPC worker was lost: {error}"))?;
+        effects_result.map_err(|error| {
+            tracing::error!(
+                event_code = rpc::observability::EventCode::CellCleanupFailed as u16,
+                error = &error as &dyn std::error::Error,
+                "kernel outbound cleanup was not certified"
+            );
+            anyhow::anyhow!("kernel outbound cleanup failed: {error}")
+        })?;
         filesystem_result.map_err(|error| {
             anyhow::anyhow!("kernel generation filesystem cleanup failed: {error}")
         })?;
@@ -669,6 +777,45 @@ mod tests {
     }
     impl authority::system_capnp::membrane::Server for KernelBootstrap {}
 
+    #[test]
+    fn root_rpc_completion_distinguishes_unstarted_from_lost_worker() {
+        let (publication, empty) = rpc::cleanup_channel();
+        drop(UnboundRootRpc(Some(publication)));
+        assert_eq!(empty.state(), rpc::CleanupState::Cleaned(0));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _runtime = runtime.enter();
+        let local = tokio::task::LocalSet::new();
+        let (publication, bound) = rpc::cleanup_channel();
+        let owner = {
+            use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty::VatNetwork};
+            use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+            let _local = local.enter();
+            let (stream, _peer) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(stream);
+            let rpc = rpc::managed_rpc::ManagedRpc::spawn(rpc::managed_rpc::ManagedRpcSystem::new(
+                Box::new(VatNetwork::new(
+                    reader.compat(),
+                    writer.compat_write(),
+                    Side::Server,
+                    Default::default(),
+                )),
+                None,
+            ));
+            UnboundRootRpc(Some(publication)).bind(rpc)
+        };
+        assert_eq!(bound.state(), rpc::CleanupState::Running);
+        drop(local);
+        assert_eq!(
+            bound.state(),
+            rpc::CleanupState::Lost(rpc::LostReason::OwnerDropped)
+        );
+        drop(owner);
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn generation_owner_loss_cancels_host_process_and_disconnects_rpc() {
         use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty::VatNetwork};
@@ -709,9 +856,13 @@ mod tests {
                 let retained: authority::system_capnp::membrane::Client =
                     rpc.bootstrap(Side::Client);
                 let proc = tokio::spawn(std::future::pending::<()>());
+                let (rpc_publication, rpc_completion) = rpc::cleanup_channel();
                 let owner = GenerationCleanup {
+                    effects: rpc::outbound::OutboundRegistry::default()
+                        .register()
+                        .unwrap(),
                     proc_abort: proc.abort_handle(),
-                    rpc: ManagedRpc::spawn(rpc),
+                    rpc: UnboundRootRpc(Some(rpc_publication)).bind(ManagedRpc::spawn(rpc)),
                     readiness_gate: ready.clone(),
                     identity: Some(identity),
                 };
@@ -726,6 +877,7 @@ mod tests {
                         .is_err()
                 );
                 assert!(retained.graft_request().send().promise.await.is_err());
+                assert_eq!(rpc_completion.wait().await, Ok(0));
             })
             .await;
     }
@@ -956,6 +1108,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_dropped_before_first_poll_certifies_empty_rpc_and_effects() {
+        let staging = tempfile::tempdir().unwrap();
+        let fixture = test_generation(staging.path().to_owned()).await;
+        let filesystem = fixture.generation.filesystem_completion();
+        let effects = fixture.generation.effects_completion();
+        let rpc = fixture.generation.rpc_completion();
+        drop(fixture.generation);
+        filesystem.wait().await.unwrap();
+        let effects = effects.wait().await.unwrap();
+        assert!(effects.closed);
+        assert_eq!(effects.active, 0);
+        assert_eq!(effects.committed, 0);
+        assert_eq!(rpc.wait().await, Ok(0));
+    }
+
+    #[tokio::test]
     async fn immediate_generation_exit_clears_identity_after_enqueue() {
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -969,12 +1137,16 @@ mod tests {
                     admit_tx,
                 } = test_generation(staging.path().to_owned()).await;
                 let completion = generation.filesystem_completion();
+                let effects = generation.effects_completion();
+                let rpc = generation.rpc_completion();
                 let worker = tokio::task::spawn_local(generation.run());
                 constructed_rx.await.unwrap();
                 assert!(identity.get().is_none());
                 admit_tx.send(()).unwrap();
                 assert_eq!(worker.await.unwrap().unwrap(), Outcome::Exited(0));
                 completion.wait().await.unwrap();
+                assert!(effects.wait().await.unwrap().closed);
+                assert_eq!(rpc.wait().await, Ok(0));
                 assert!(identity.get().is_none());
             })
             .await;

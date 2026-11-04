@@ -2255,7 +2255,13 @@ impl Proc {
     }
 
     /// Instantiate the prepared guest and invoke `wasi:cli/run#run`.
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
+        self.run_borrowed().await
+    }
+
+    /// Run while the caller retains the Store, so its lifecycle owner can close
+    /// native effect admission before releasing guest resources on every exit.
+    pub async fn run_borrowed(&mut self) -> Result<()> {
         if self.store.data().fuel_inspector.is_some() {
             self.run_with_inspector::<true>().await
         } else {
@@ -2279,7 +2285,7 @@ impl Proc {
         Ok(inspector)
     }
 
-    async fn run_with_inspector<const INSPECT: bool>(mut self) -> Result<()>
+    async fn run_with_inspector<const INSPECT: bool>(&mut self) -> Result<()>
     where
         FuelCallHook<INSPECT>: FuelDecisionApplier,
     {

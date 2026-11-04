@@ -391,37 +391,53 @@ async fn tracing_outgoing_vat_failures_keep_managed_rpc_identity() {
                 head: vec![],
                 root: None,
             });
-            let vat: system_capnp::vat_client::Client =
-                capnp_rpc::new_client(crate::vat_client::VatClientImpl::new(
+            let registry = crate::outbound::OutboundRegistry::default();
+            let owner = registry.register().unwrap();
+            let vat: system_capnp::vat_client::Client = capnp_rpc::new_client(
+                crate::vat_client::VatClientImpl::new(
                     client_control,
                     EpochGuard {
                         issued_seq: 1,
                         receiver,
                     },
-                ));
+                )
+                .with_outbound_registry(registry.clone()),
+            );
 
             let mut connections = Vec::new();
-            for _ in 0..2 {
+            for opening_index in 0..2 {
+                let opening = tracing::info_span!(parent: None, "vat.open", opening_index);
+                let opening_id = opening.id().expect("opening span enabled");
                 let mut request = vat.dial_request();
+                request.hook.set_invocation_origin(owner.origin()).unwrap();
                 request.get().set_peer(&server_peer.to_bytes());
                 request.get().set_protocol("trace-outgoing");
-                let response = request.send().promise.await.unwrap();
+                let response = async { request.send().promise.await.unwrap() }
+                    .instrument(opening)
+                    .await;
                 let (_, mut stream) = incoming.next().await.unwrap();
                 // Observe actual driver progress before allowing either peer
                 // to fail. Both RPC workers remain live across suspension.
                 let mut byte = [0];
                 stream.read_exact(&mut byte).await.unwrap();
                 let state = capture.state.lock().unwrap();
-                let root = state
+                let root_index = state
                     .spans
                     .iter()
-                    .rev()
-                    .find(|span| span.name == "rpc")
+                    .rposition(|span| span.name == "rpc")
                     .unwrap();
+                let root = &state.spans[root_index];
                 assert!(root.parent.is_none());
+                assert!(
+                    state
+                        .follows
+                        .contains(&(Id::from_u64(root_index as u64 + 1), opening_id)),
+                    "owned session RPC must retain the opening call's causal link"
+                );
                 connections.push((stream, response, root.fields.0["rpc_id"].clone()));
             }
             assert_ne!(connections[0].2, connections[1].2);
+            capture.assert_path("dialing vat service", &["vat.open"]);
 
             let mut message = capnp::message::Builder::new_default();
             let mut abort = message
@@ -449,11 +465,23 @@ async fn tracing_outgoing_vat_failures_keep_managed_rpc_identity() {
                 .expect("outgoing failure warning");
                 assert_eq!(event.fields.0["event_code"], "400");
                 assert_eq!(event.fields.0["rpc_id"], rpc_id);
+                assert_eq!(event.fields.0["peer"], server_peer.to_string());
+                assert_eq!(
+                    event.fields.0["protocol"],
+                    crate::vat_protocol("trace-outgoing").unwrap().to_string()
+                );
+                assert_eq!(event.fields.0["service"], "trace-outgoing");
                 assert!(
                     event.spans.is_empty(),
                     "completion must not reparent the worker"
                 );
             }
+            let completed = owner.close_and_join().await.unwrap();
+            assert_eq!(
+                (completed.committed, completed.joined, completed.rpc_errors),
+                (2, 2, 2)
+            );
+            assert_eq!(registry.total_active(), 0);
             server_task.abort();
             client_task.abort();
             let _ = server_task.await;

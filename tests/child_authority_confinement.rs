@@ -29,7 +29,7 @@ use ww::system_capnp;
 
 use ticked_executor::TickedExecutor;
 
-const CAPNP_FORK_REVISION: &str = "b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a";
+const CAPNP_FORK_REVISION: &str = "25261268e254b2d45283233e7feebe79389a1509";
 const USE_PREBUILT_AUTHORITY_PROBE_ENV: &str = "WW_USE_PREBUILT_AUTHORITY_PROBE";
 const KNOWN_CID: &str = "bafkreibm6jg3ux5quy7flfgn5gmxk5ubm6yur3apcu3to3d6tmjzptm2ye";
 

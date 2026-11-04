@@ -171,6 +171,307 @@ where
     }
 }
 
+/// The caller's wait for a Cell-owned dial. Dropping it cancels admission to a
+/// session until commit; an already committed session belongs to the Cell.
+/// Buffered success is rejected if scope closure wins the final delivery check.
+pub struct OwnedDial<C> {
+    response: tokio::sync::oneshot::Receiver<capnp::Result<C>>,
+    cancelled: tokio_util::sync::CancellationToken,
+    closure: crate::outbound::EffectsCloseHandle,
+}
+
+impl<C> std::future::Future for OwnedDial<C> {
+    type Output = capnp::Result<C>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let result = std::task::ready!(std::pin::Pin::new(&mut self.response).poll(cx))
+            .unwrap_or_else(|_| Err(capnp::Error::failed("outbound dial worker lost".into())));
+        // Session ownership commits in the worker. Caller delivery is a second
+        // decision: a buffered success must not survive closure-winning delivery.
+        // The gate check ends before dropping C or invoking caller code.
+        let result = match result {
+            Ok(client) if self.closure.is_closed() => {
+                drop(client);
+                Err(capnp::Error::failed(
+                    "outbound Cell closed before result delivery".into(),
+                ))
+            }
+            result => result,
+        };
+        std::task::Poll::Ready(result)
+    }
+}
+
+impl<C> Drop for OwnedDial<C> {
+    fn drop(&mut self) {
+        self.cancelled.cancel();
+    }
+}
+
+/// Admit before suspension, then supervise the native operation independently
+/// of its caller. Once polled, `open` is retained until its actual result: a
+/// dropped libp2p wait has no backend cancellation acknowledgement. The returned
+/// wait can time out without releasing the attempt's accounting prematurely.
+/// Submission authorization and Cell closure share a gate. Authorization commits
+/// to supervised drain; it does not acknowledge native enqueue or emission.
+/// Authorized work may first poll or emit after closure, but cannot escape its
+/// receipt or certify cleanup before its terminal result and worker join.
+///
+/// The supplied future must submit no native work before its first poll.
+/// Dropping the unpolled future must leave no native obligation. Once polled,
+/// the future must return only after the native operation is terminal.
+/// Use `connect_libp2p_owned` for libp2p; its channel errors need classification.
+pub fn connect_owned<S, C, F>(
+    registry: &crate::outbound::OutboundRegistry,
+    origin: Option<capnp::private::capability::InvocationOrigin>,
+    open: F,
+) -> capnp::Result<OwnedDial<C>>
+where
+    S: AsyncRead + AsyncWrite + 'static,
+    C: FromClientHook + 'static,
+    F: std::future::Future<Output = capnp::Result<S>> + 'static,
+{
+    connect_owned_classified(
+        registry,
+        origin,
+        async move {
+            open.await.map_err(|error| OpenFailure {
+                error,
+                terminal: true,
+            })
+        },
+        DialMetadata::default(),
+    )
+}
+
+#[derive(Default)]
+struct DialMetadata {
+    peer: Option<libp2p::PeerId>,
+    protocol: Option<libp2p::StreamProtocol>,
+    service: Option<String>,
+}
+
+/// A pinned-source completion classification. A channel disappearing does not
+/// acknowledge destruction of a handler-side upgrade. Keep those permits
+/// quarantined even when the outer task has joined.
+struct OpenFailure {
+    error: capnp::Error,
+    terminal: bool,
+}
+
+fn classify_open_error(error: libp2p_stream::OpenStreamError) -> OpenFailure {
+    use futures::channel::{mpsc, oneshot};
+    use libp2p_stream::OpenStreamError;
+    let terminal = match &error {
+        OpenStreamError::UnsupportedProtocol(_) => true,
+        OpenStreamError::Io(error) => !error.get_ref().is_some_and(|source| {
+            source.is::<oneshot::Canceled>() || source.is::<mpsc::SendError>()
+        }),
+        _ => false,
+    };
+    OpenFailure {
+        error: capnp::Error::failed(format!("failed to open stream: {error}")),
+        terminal,
+    }
+}
+
+/// Retain a pinned libp2p-stream 0.5.0-alpha request through its actual result.
+/// Requires default V1 substream negotiation, never V1Lazy. Public libp2p does
+/// not expose whether a submitted request is queued or actively negotiating.
+/// Cancellation suppresses RPC commit; it cannot stop an admitted upgrade.
+/// A result-channel loss quarantines capacity instead of certifying cleanup.
+/// Known completion releases the local negotiation obligation after late-stream
+/// disposal and worker join. It does not acknowledge muxer reclamation or remote
+/// rollback. Re-audit error provenance when upgrading libp2p-stream.
+pub fn connect_libp2p_owned<C>(
+    registry: &crate::outbound::OutboundRegistry,
+    origin: Option<capnp::private::capability::InvocationOrigin>,
+    control: libp2p_stream::Control,
+    peer: libp2p::PeerId,
+    protocol: libp2p::StreamProtocol,
+) -> capnp::Result<OwnedDial<C>>
+where
+    C: FromClientHook + 'static,
+{
+    connect_libp2p_owned_logged(registry, origin, control, peer, protocol, None)
+}
+
+pub(crate) fn connect_libp2p_owned_logged<C>(
+    registry: &crate::outbound::OutboundRegistry,
+    origin: Option<capnp::private::capability::InvocationOrigin>,
+    mut control: libp2p_stream::Control,
+    peer: libp2p::PeerId,
+    protocol: libp2p::StreamProtocol,
+    service: Option<String>,
+) -> capnp::Result<OwnedDial<C>>
+where
+    C: FromClientHook + 'static,
+{
+    let metadata = DialMetadata {
+        peer: Some(peer),
+        protocol: Some(protocol.clone()),
+        service,
+    };
+    connect_owned_classified(
+        registry,
+        origin,
+        async move {
+            control
+                .open_stream(peer, protocol)
+                .await
+                .map_err(classify_open_error)
+        },
+        metadata,
+    )
+}
+
+fn connect_owned_classified<S, C, F>(
+    registry: &crate::outbound::OutboundRegistry,
+    origin: Option<capnp::private::capability::InvocationOrigin>,
+    open: F,
+    metadata: DialMetadata,
+) -> capnp::Result<OwnedDial<C>>
+where
+    S: AsyncRead + AsyncWrite + 'static,
+    C: FromClientHook + 'static,
+    F: std::future::Future<Output = Result<S, OpenFailure>> + 'static,
+{
+    use crate::outbound::EffectOutcome;
+    let admission = registry.admit(origin)?;
+    // The retained worker runs independently of the opening call. Preserve
+    // causal correlation without making that call the session's parent.
+    let opening = tracing::Span::current();
+    let scope = admission.scope.clone();
+    let submission = admission.submission();
+    let closure = scope.close_handle();
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    let worker_cancelled = cancelled.clone();
+    let (response, receiver) = tokio::sync::oneshot::channel();
+    let worker = tokio::task::spawn_local(async move {
+        if worker_cancelled.is_cancelled() || response.is_closed() || !submission.authorize() {
+            let _ = response.send(Err(capnp::Error::failed(
+                "outbound dial cancelled before start".into(),
+            )));
+            return EffectOutcome::default();
+        }
+        tracing::debug!(
+            parent: &opening,
+            peer = metadata.peer.as_ref().map(tracing::field::display),
+            protocol = metadata.protocol.as_ref().map(tracing::field::display),
+            service = metadata.service.as_deref(),
+            "dialing vat service"
+        );
+        let stream = match open.await {
+            Ok(stream) => stream,
+            Err(failure) => {
+                let _ = response.send(Err(failure.error));
+                return EffectOutcome {
+                    lost: !failure.terminal,
+                    ..Default::default()
+                };
+            }
+        };
+        if scope.is_closed() || worker_cancelled.is_cancelled() || response.is_closed() {
+            drop(stream);
+            let _ = response.send(Err(capnp::Error::failed(
+                "outbound dial cancelled before commit".into(),
+            )));
+            return EffectOutcome::default();
+        }
+        // The actual connection continues to classify incoming calls as remote
+        // ingress. A Cell owns its lifetime, not that remote principal's calls.
+        // Construction can invoke arbitrary FromClientHook implementations.
+        // Prepare outside the close gate, then atomically adopt or join it.
+        let VatDial {
+            bootstrap,
+            mut driver,
+        } = opening.in_scope(|| connect::<_, C>(stream));
+        // ManagedRpc retained the follows_from link. Session completion must
+        // stay outside the opening call's span and does not need its handle.
+        drop(opening);
+        let committed = !worker_cancelled.is_cancelled() && !response.is_closed() && scope.commit();
+        let rpc_id = driver.rpc_id();
+        // The worker owns the driver before making its capability visible.
+        if committed {
+            let _ = response.send(Ok(bootstrap));
+        } else {
+            drop(bootstrap);
+            let _ = response.send(Err(capnp::Error::failed(
+                "outbound dial closed before commit".into(),
+            )));
+            driver.shutdown();
+        }
+        let joined = tokio::select! {
+            biased;
+            _ = scope.closed.cancelled() => driver.shutdown_and_join().await,
+            result = &mut driver => result,
+        };
+        match joined {
+            Ok(result) => {
+                let rpc_error = result.is_err();
+                if let Err(error) = result {
+                    tracing::warn!(
+                        event_code = crate::observability::EventCode::RpcFailed as u16,
+                        rpc_id,
+                        peer = metadata.peer.as_ref().map(tracing::field::display),
+                        protocol = metadata.protocol.as_ref().map(tracing::field::display),
+                        service = metadata.service.as_deref(),
+                        error = &error as &dyn std::error::Error,
+                        "vat dial session ended with error: {error}"
+                    );
+                } else {
+                    tracing::trace!(
+                        rpc_id,
+                        peer = metadata.peer.as_ref().map(tracing::field::display),
+                        protocol = metadata.protocol.as_ref().map(tracing::field::display),
+                        service = metadata.service.as_deref(),
+                        "vat dial session ended cleanly"
+                    );
+                }
+                EffectOutcome {
+                    session_joined: committed,
+                    rpc_error,
+                    lost: false,
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event_code = crate::observability::EventCode::RpcFailed as u16,
+                    rpc_id,
+                    peer = metadata.peer.as_ref().map(tracing::field::display),
+                    protocol = metadata.protocol.as_ref().map(tracing::field::display),
+                    service = metadata.service.as_deref(),
+                    error = &error as &dyn std::error::Error,
+                    "vat dial driver task failed: {error}"
+                );
+                EffectOutcome {
+                    lost: true,
+                    ..Default::default()
+                }
+            }
+        }
+    });
+    // Keep accounting in a separate join monitor. A worker returning is not yet
+    // its join acknowledgement, and losing either worker cannot certify cleanup.
+    tokio::task::spawn_local(crate::local_tasks::track(async move {
+        let outcome = worker.await.unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "outbound attempt worker lost");
+            EffectOutcome {
+                lost: true,
+                ..Default::default()
+            }
+        });
+        admission.finish(outcome);
+    }));
+    Ok(OwnedDial {
+        response: receiver,
+        cancelled,
+        closure,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +485,39 @@ mod tests {
     use capnp_rpc::RpcSystem;
     use tokio::io;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_scope_rejects_buffered_dial_result() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let registry = crate::outbound::OutboundRegistry::default();
+                let owner = registry.register().unwrap();
+                let stream = make_membrane_server(vec![1, 2, 3]);
+                let dial = connect_owned::<_, system_capnp::membrane::Client, _>(
+                    &registry,
+                    Some(owner.origin()),
+                    async { Ok(stream.compat_write()) },
+                )
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while owner.completion().snapshot().committed != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let done = tokio::time::timeout(Duration::from_secs(2), owner.close_and_join())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!((done.active, done.committed, done.joined), (0, 1, 1));
+                assert!(
+                    dial.await.is_err(),
+                    "closure before caller delivery must reject buffered success"
+                );
+            })
+            .await;
+    }
 
     struct TestMembrane {
         peer_id: Vec<u8>,
@@ -219,6 +553,44 @@ mod tests {
         });
 
         client_stream
+    }
+
+    #[test]
+    fn channel_loss_is_not_a_native_terminal_acknowledgement() {
+        use libp2p_stream::OpenStreamError;
+        use std::io;
+        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
+        drop(sender);
+        let cancelled = futures::executor::block_on(receiver).unwrap_err();
+        assert!(
+            !classify_open_error(OpenStreamError::Io(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                cancelled,
+            )))
+            .terminal
+        );
+        let (mut sender, receiver) = futures::channel::mpsc::channel::<()>(0);
+        drop(receiver);
+        let failed = sender.try_send(()).unwrap_err().into_send_error();
+        assert!(
+            !classify_open_error(OpenStreamError::Io(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                failed,
+            )))
+            .terminal
+        );
+        assert!(
+            classify_open_error(OpenStreamError::Io(io::Error::from(
+                io::ErrorKind::TimedOut,
+            )))
+            .terminal
+        );
+        assert!(
+            classify_open_error(OpenStreamError::UnsupportedProtocol(
+                libp2p::StreamProtocol::new("/not-supported"),
+            ))
+            .terminal
+        );
     }
 
     /// Regression test for the original `ww shell` 30s handshake bug

@@ -756,6 +756,13 @@ struct MembraneRequest {
 }
 
 impl RequestHook for MembraneRequest {
+    fn set_invocation_origin(
+        &mut self,
+        context: capnp::private::capability::InvocationOrigin,
+    ) -> capnp::Result<()> {
+        self.inner.set_invocation_origin(context)
+    }
+
     fn get(&mut self) -> any_pointer::Builder<'_> {
         // Stage params in our own buffer so `send` can transform their cap
         // table: same-lineage membraned caps that round-trip back in are
@@ -1087,6 +1094,13 @@ impl BrokenRequest {
 }
 
 impl RequestHook for BrokenRequest {
+    fn set_invocation_origin(
+        &mut self,
+        _origin: capnp::private::capability::InvocationOrigin,
+    ) -> capnp::Result<()> {
+        Err(self.error.clone())
+    }
+
     fn get(&mut self) -> any_pointer::Builder<'_> {
         let mut result: any_pointer::Builder = self.message.get_root().unwrap();
         result.imbue_mut(&mut self.cap_table);

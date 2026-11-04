@@ -16,6 +16,7 @@ command_artifacts=(
   examples/oracle/bin/oracle.wasm
   examples/snap-hello-rs/bin/snap-hello-rs.wasm
   target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
+  target/gate2b-root/wasm32-wasip3/release/gate2b_root_probe.wasm
   target/stream-lifecycle-probe/wasm32-wasip3/release/stream_lifecycle_probe.wasm
 )
 

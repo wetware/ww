@@ -126,6 +126,7 @@ jobs:
         cargo fmt --manifest-path std/kernel/Cargo.toml -- --check
         cargo fmt --manifest-path tests/fixtures/native-p3/Cargo.toml -- --check
         cargo fmt --manifest-path tests/fixtures/stream-lifecycle-probe/Cargo.toml -- --check
+        cargo fmt --manifest-path tests/fixtures/gate2b-root/Cargo.toml -- --check
 
     - name: Check IPFS release publish scripts
       run: |
@@ -355,6 +356,7 @@ jobs:
           examples/*/bin/
           target/native-p3-fixture/wasm32-wasip3/release/native_p3_fixture.wasm
           target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
+          target/gate2b-root/wasm32-wasip3/release/gate2b_root_probe.wasm
           target/routing-key-probe/wasm32-wasip3/release/routing_key_probe.wasm
           target/stream-lifecycle-probe/wasm32-wasip3/release/stream_lifecycle_probe.wasm
         retention-days: 1
@@ -428,6 +430,7 @@ jobs:
         test -s examples/discovery/bin/discovery.wasm
         test -s target/native-p3-fixture/wasm32-wasip3/release/native_p3_fixture.wasm
         test -s target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
+        test -s target/gate2b-root/wasm32-wasip3/release/gate2b_root_probe.wasm
         test -s target/stream-lifecycle-probe/wasm32-wasip3/release/stream_lifecycle_probe.wasm
 
     - name: Run host workspace tests
@@ -438,6 +441,14 @@ jobs:
         WW_USE_PREBUILT_AUTHORITY_PROBE: "1"
         # Reuse compiled WASM across fresh engines within this job.
         WW_CWASM_DIR: ${{ runner.temp }}/ww-cwasm
+
+    - name: Validate process-wide outbound limits
+      # Each ignored quota test owns the entire process budget while it runs.
+      # Keep these in separate processes from ordinary concurrent tests.
+      run: |
+        cargo test -p rpc --lib outbound::tests::process_owner_limit_spans_threads_and_recovers_after_idempotent_close --locked -- --ignored --exact
+        cargo test -p rpc --lib outbound::tests::default_budget_bounds_work_across_registry_recreation --locked -- --ignored --exact
+        cargo test -p rpc --lib outbound::tests::explicit_host_budgets_cannot_bypass_process_limit --locked -- --ignored --exact
 
     - name: Validate actual packaged installation and startup
       run: |

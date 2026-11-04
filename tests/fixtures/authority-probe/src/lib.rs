@@ -21,6 +21,15 @@ mod wasi {
     });
 }
 
+#[cfg(all(target_arch = "wasm32", feature = "gate2b-root"))]
+mod gate2b_root_runtime {
+    wit_bindgen::generate!({
+        path: "../../../std/kernel/wit",
+        world: "pid0",
+        generate_all,
+    });
+}
+
 type Membrane = system_capnp::membrane::Client;
 
 fn random_u64() -> u64 {
@@ -255,6 +264,219 @@ async fn run_reentrant_callback() -> Result<(), capnp::Error> {
     let listener: system_capnp::vat_listener::Client = capnp_rpc::new_client(ReentrantListener);
     system::serve(listener.client, |_membrane: Membrane| async move {
         std::future::pending().await
+    })
+    .await
+}
+
+// Gate 2B deliberately keeps the application alive after its dial calls return.
+// The exported grant is the same imported capability; no host substitute or
+// guest forwarding VatClient is used for delegation to the second Cell.
+#[derive(Default)]
+struct Gate2bState {
+    exports: Vec<NamedCap>,
+    sessions: Vec<system_capnp::process::Client>,
+    grant: Option<system_capnp::vat_client::Client>,
+    exit: bool,
+    waiter: Option<std::task::Waker>,
+}
+
+struct Gate2bExports(Rc<std::cell::RefCell<Gate2bState>>);
+
+impl system_capnp::membrane::Server for Gate2bExports {
+    async fn graft(
+        self: capnp::capability::Rc<Self>,
+        _: system_capnp::membrane::GraftParams,
+        mut results: system_capnp::membrane::GraftResults,
+    ) -> capnp::Result<()> {
+        let state = self.0.borrow();
+        let mut extras = results.get().init_extras(state.exports.len() as u32);
+        for (index, cap) in state.exports.iter().enumerate() {
+            let mut entry = extras.reborrow().get(index as u32);
+            entry.set_name(&cap.name);
+            entry.init_cap().set_as_capability(cap.cap.clone().hook);
+        }
+        Ok(())
+    }
+}
+
+struct Gate2bCommands(Rc<std::cell::RefCell<Gate2bState>>);
+
+impl system_capnp::vat_client::Server for Gate2bCommands {
+    async fn dial(
+        self: capnp::capability::Rc<Self>,
+        params: system_capnp::vat_client::DialParams,
+        _: system_capnp::vat_client::DialResults,
+    ) -> capnp::Result<()> {
+        let params = params.get()?;
+        match params
+            .get_protocol()?
+            .to_str()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?
+        {
+            "touch" => {
+                let index = params.get_peer()?.first().copied().unwrap_or(0) as usize;
+                let session = self
+                    .0
+                    .borrow()
+                    .sessions
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| capnp::Error::failed("session not ready".into()))?;
+                session.stdin_request().send().promise.await?;
+            }
+            "deny" => {
+                let grant = self
+                    .0
+                    .borrow()
+                    .grant
+                    .clone()
+                    .ok_or_else(|| capnp::Error::failed("grant not ready".into()))?;
+                grant
+                    .client
+                    .new_call::<capnp::any_pointer::Owned, capnp::any_pointer::Owned>(
+                        <system_capnp::vat_client::Client as capnp::traits::HasTypeId>::TYPE_ID,
+                        u16::MAX,
+                        None,
+                    )
+                    .send()
+                    .promise
+                    .await?;
+                return Err(capnp::Error::failed(
+                    "forbidden method unexpectedly succeeded".into(),
+                ));
+            }
+            "exit" => {
+                let mut state = self.0.borrow_mut();
+                state.exit = true;
+                if let Some(waiter) = state.waiter.take() {
+                    waiter.wake();
+                }
+            }
+            "trap" => {
+                #[cfg(target_arch = "wasm32")]
+                core::arch::wasm32::unreachable();
+                #[cfg(not(target_arch = "wasm32"))]
+                panic!("Gate2B requested guest trap");
+            }
+            _ => return Err(capnp::Error::failed("unknown Gate2B command".into())),
+        }
+        Ok(())
+    }
+}
+
+async fn run_gate2b_sessions() -> Result<(), capnp::Error> {
+    let state = Rc::new(std::cell::RefCell::new(Gate2bState::default()));
+    let bootstrap: Membrane = capnp_rpc::new_client(Gate2bExports(state.clone()));
+    let command: system_capnp::vat_client::Client =
+        capnp_rpc::new_client(Gate2bCommands(state.clone()));
+    state.borrow_mut().exports.push(NamedCap {
+        name: "command".into(),
+        cap: command.client,
+    });
+    system::serve(bootstrap.client, |membrane: Membrane| async move {
+        let caps = read_extras(&membrane).await?;
+        let grant: system_capnp::vat_client::Client = find_cap(&caps, "grant")?;
+        let peer = std::env::var("WW_GATE2B_PEER")
+            .unwrap()
+            .split(',')
+            .map(|byte| byte.parse::<u8>().unwrap())
+            .collect::<Vec<_>>();
+        state.borrow_mut().grant = Some(grant.clone());
+        state.borrow_mut().exports.push(NamedCap {
+            name: "grant".into(),
+            cap: grant.client,
+        });
+        for name in ["grant", "independent"] {
+            let Some(cap) = caps.iter().find(|cap| cap.name == name) else {
+                continue;
+            };
+            let dialer = system_capnp::vat_client::Client::new(cap.cap.clone().hook);
+            let mut dial = dialer.dial_request();
+            dial.get().set_peer(&peer);
+            dial.get().set_protocol("gate2b-sessions");
+            let response = dial.send().promise.await?;
+            let session: system_capnp::process::Client =
+                response.get()?.get_cap().get_as_capability()?;
+            session.stdin_request().send().promise.await?;
+            let mut state = state.borrow_mut();
+            let index = state.sessions.len();
+            state.sessions.push(session.clone());
+            state.exports.push(NamedCap {
+                name: format!("session-{index}"),
+                cap: session.client,
+            });
+        }
+        emit(json!({"mode":"gate2b-sessions", "ready":true}));
+        std::future::poll_fn(|cx| {
+            let mut state = state.borrow_mut();
+            if state.exit {
+                std::task::Poll::Ready(())
+            } else {
+                state.waiter = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        Ok(())
+    })
+    .await
+}
+
+#[cfg(feature = "gate2b-root")]
+struct Gate2bRootPeer(Rc<std::cell::RefCell<Option<Vec<u8>>>>);
+
+#[cfg(feature = "gate2b-root")]
+impl routing_capnp::provider_sink::Server for Gate2bRootPeer {
+    async fn provider(
+        self: capnp::capability::Rc<Self>,
+        params: routing_capnp::provider_sink::ProviderParams,
+        _: routing_capnp::provider_sink::ProviderResults,
+    ) -> capnp::Result<()> {
+        *self.0.borrow_mut() = Some(params.get()?.get_info()?.get_peer_id()?.to_vec());
+        Ok(())
+    }
+
+    async fn done(
+        self: capnp::capability::Rc<Self>,
+        _: routing_capnp::provider_sink::DoneParams,
+        _: routing_capnp::provider_sink::DoneResults,
+    ) -> capnp::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "gate2b-root")]
+async fn run_gate2b_root_sessions() -> capnp::Result<()> {
+    system::run(|membrane: Membrane| async move {
+        let response = membrane.graft_request().send().promise.await?;
+        let graft = response.get()?;
+        let finder = graft.get_routing()?.get_finder()?;
+        let vat = graft.get_network()?.get_vat().get_dialer()?;
+        #[cfg(target_arch = "wasm32")]
+        gate2b_root_runtime::wetware::kernel_runtime::readiness::kernel_ready()
+            .map_err(|error| capnp::Error::failed(format!("root readiness: {error:?}")))?;
+        let peer = Rc::new(std::cell::RefCell::new(None));
+        let sink: routing_capnp::provider_sink::Client =
+            capnp_rpc::new_client(Gate2bRootPeer(peer.clone()));
+        let mut find = finder.find_providers_request();
+        find.get().set_key(PROVIDER_KEY);
+        find.get().set_count(1);
+        find.get().set_sink(sink);
+        find.send().promise.await?;
+        let peer = peer
+            .borrow()
+            .clone()
+            .ok_or_else(|| capnp::Error::failed("root test provider missing".into()))?;
+        let mut dial = vat.dial_request();
+        dial.get().set_peer(&peer);
+        dial.get().set_protocol("gate2b-sessions");
+        let response = dial.send().promise.await?;
+        let session: system_capnp::process::Client =
+            response.get()?.get_cap().get_as_capability()?;
+        session.stdin_request().send().promise.await?;
+        std::future::pending::<()>().await;
+        drop(session);
+        Ok(())
     })
     .await
 }
@@ -1204,6 +1426,7 @@ struct AuthorityProbe;
 impl Guest for AuthorityProbe {
     async fn run() -> Result<(), ()> {
         let result = match std::env::args().nth(1).as_deref() {
+            Some("enumerate") => run_enumerate().await,
             Some("invoke") => run_invoke().await,
             Some("arbitrary-name") => run_arbitrary_name().await,
             Some("alias-redelivery") => run_alias_redelivery().await,
@@ -1222,9 +1445,19 @@ impl Guest for AuthorityProbe {
             Some("scratch-observe") => run_scratch_observe().await,
             Some("scratch-parent") => run_scratch_parent().await,
             Some("reentrant-callback") => run_reentrant_callback().await,
+            Some("gate2b-sessions") => run_gate2b_sessions().await,
             Some("no-graft") => run_no_graft().await,
             Some("stateful-graft") => run_stateful_graft().await,
-            _ => run_enumerate().await,
+            _ => {
+                #[cfg(feature = "gate2b-root")]
+                {
+                    run_gate2b_root_sessions().await
+                }
+                #[cfg(not(feature = "gate2b-root"))]
+                {
+                    run_enumerate().await
+                }
+            }
         };
         result.map_err(|error| {
             eprintln!("authority probe RPC failed: {error}");

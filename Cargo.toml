@@ -143,10 +143,11 @@ strip = true
 [profile.release.package.ww]
 opt-level = 2
 
-# Exact capnp-rpc import-wrapper and terminalization patches.
+# Exact Cap'n Proto invocation hooks, import-wrapper, and terminalization patches.
 # Provenance and removal gates: doc/dependencies/capnp-rpc.md.
 [patch.crates-io]
-capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "b3befb30fa1cb17b3b49f278d1a6f02b2ef2860a" }
+capnp = { git = "https://github.com/wetware/capnproto-rust", rev = "25261268e254b2d45283233e7feebe79389a1509" }
+capnp-rpc = { git = "https://github.com/wetware/capnproto-rust", rev = "25261268e254b2d45283233e7feebe79389a1509" }
 # Filesystem operation lifecycle hooks for bounded native WASI I/O.
 # Provenance and removal gates: doc/dependencies/wasmtime.md.
 wasmtime = { git = "https://github.com/wetware/wasmtime", rev = "fe367749da9584f974b516f28c5c8055861d1512" }
