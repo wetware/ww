@@ -5,7 +5,7 @@ use tracing::Instrument;
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
 #[derive(Clone, Default)]
-struct Output(Arc<Mutex<Vec<u8>>>);
+pub(super) struct Output(pub(super) Arc<Mutex<Vec<u8>>>);
 
 #[derive(Clone, Default)]
 struct CausalLinks(Arc<Mutex<Vec<(tracing::span::Id, tracing::span::Id)>>>);
@@ -167,6 +167,7 @@ async fn exercise_children(child_span_enabled: bool, launcher_trace_enabled: boo
     let mut stopped = Vec::new();
     let mut filesystem_snapshots = Vec::new();
     let mut filesystem_completions = Vec::new();
+    let mut stderr_completions = Vec::new();
     for event in events {
         let message = event["fields"]["message"].as_str().unwrap_or_default();
         if message == "unrelated-child-probe" {
@@ -175,6 +176,8 @@ async fn exercise_children(child_span_enabled: bool, launcher_trace_enabled: boo
         let filesystem_snapshot =
             message == "executor: child filesystem ownership after guest exit";
         let filesystem_completion = message == "executor: child filesystem completion observed";
+        let stderr_completion =
+            event["fields"]["event_code"] == EventCode::CellStderrDrained as u16;
         if filesystem_snapshot || filesystem_completion {
             assert!(
                 launcher_trace_enabled,
@@ -185,6 +188,7 @@ async fn exercise_children(child_span_enabled: bool, launcher_trace_enabled: boo
         if message == "fuel.initial"
             || filesystem_snapshot
             || filesystem_completion
+            || stderr_completion
             || message.starts_with("executor: child process exited")
         {
             let id = if child_span_enabled {
@@ -221,12 +225,27 @@ async fn exercise_children(child_span_enabled: bool, launcher_trace_enabled: boo
                 assert_eq!(filesystem_snapshots.len(), filesystem_completions.len() + 1);
                 assert_eq!(filesystem_snapshots.last(), Some(&id));
                 filesystem_completions.push(id);
+            } else if stderr_completion {
+                assert!(
+                    launcher_trace_enabled,
+                    "stderr diagnostic below trace: {event}"
+                );
+                assert_eq!(event["level"], "TRACE");
+                assert_eq!(event["fields"]["completed"], true);
+                assert_eq!(event["fields"]["bytes"], 0);
+                let explicit_id = event["fields"]["cell_id"].as_u64().unwrap();
+                if child_span_enabled {
+                    assert_eq!(explicit_id, id);
+                }
+                stderr_completions.push(id);
             } else {
                 if launcher_trace_enabled {
                     assert_eq!(filesystem_snapshots.len(), stopped.len() + 1);
                     assert_eq!(filesystem_snapshots.last(), Some(&id));
                     assert_eq!(filesystem_completions.len(), stopped.len() + 1);
                     assert_eq!(filesystem_completions.last(), Some(&id));
+                    assert_eq!(stderr_completions.len(), stopped.len() + 1);
+                    assert_eq!(stderr_completions.last(), Some(&id));
                 }
                 stopped.push(id);
             }
@@ -237,10 +256,12 @@ async fn exercise_children(child_span_enabled: bool, launcher_trace_enabled: boo
         assert_eq!(stopped, started);
         assert_eq!(filesystem_snapshots, started);
         assert_eq!(filesystem_completions, started);
+        assert_eq!(stderr_completions, started);
     } else {
         assert!(stopped.is_empty());
         assert!(filesystem_snapshots.is_empty());
         assert!(filesystem_completions.is_empty());
+        assert!(stderr_completions.is_empty());
     }
     if child_span_enabled {
         assert_ne!(started[0], started[1]);

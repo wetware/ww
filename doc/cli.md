@@ -233,9 +233,12 @@ when TRACE is enabled. See the [operational logging contract](logging.md) for ev
 codes, privacy policy, correlation fields, error chains, and migration rules.
 
 This policy covers Host tracing. Interactive shell rendering, progress output,
-and direct guest/PID0 stderr keep their existing behavior (child-output ownership:
-#155). Ordinary child stderr forwarded through tracing emits TRACE byte counts;
-the log record does not include the child output.
+and direct PID0 stderr keep their existing behavior; PID0 isolation remains #755.
+Ordinary child stderr produces one metadata-only summary: TRACE after EOF and
+reader join, or WARN for an incomplete drain. Summaries include the Host-assigned
+`cell_id` even when the child span is filtered, and never include guest output.
+See [ordinary child stderr](logging.md#ordinary-child-stderr) for completion and
+cleanup semantics. Issue #155 remains open for per-record guest-output requirements.
 
 Trace export accepts only an HTTP loopback IP endpoint with path `/v1/traces`.
 Credentials, query strings, DNS names, and redirects are not supported.

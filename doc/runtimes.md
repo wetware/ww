@@ -167,8 +167,11 @@ Other independently spawned work does not implicitly inherit caller context.
 Service/control loops, executor monitors, cache/filesystem producers, and
 libp2p tasks retain their existing service or operation context, where present.
 The Swarm service's ambient span labels its owning thread, not Tokio worker
-threads. Child stderr identity and final drain remain under #155; this change
-does not attach the child lifecycle span to the stderr reader.
+threads. The ordinary-child stderr reader explicitly carries the child lifecycle
+span. Its metadata-only drain summary also records the Host-assigned `cell_id`,
+even when the span is filtered. See [ordinary child stderr](logging.md#ordinary-child-stderr)
+for the bounded drain and cleanup semantics. Per-record guest-output requirements
+remain open under #155; PID0 stderr isolation remains separate under #755.
 
 ## SwarmService is the exception
 
