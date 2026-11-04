@@ -1483,6 +1483,21 @@ mod tests {
 
     #[tokio::test]
     async fn directory_observation_exhaustion_and_stale_handles_do_not_change_work() {
+        async fn snapshot(completion: &FsCompletion) -> FsSnapshot {
+            // The reaper can hold the lifecycle lock while checking readiness.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match completion.try_snapshot() {
+                        Ok(snapshot) => return snapshot,
+                        Err(FsSnapshotError::Busy) => tokio::task::yield_now().await,
+                        Err(error) => panic!("unexpected snapshot error: {error:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("directory lifecycle test exceeded its deadline")
+        }
+
         let (host_owner, host) = HostFsOwner::start(
             tokio::runtime::Handle::current(),
             HostLimits::new(1, 2, 1).unwrap(),
@@ -1499,7 +1514,7 @@ mod tests {
         });
         drop(OperationWaiter(Some(old.clone())));
         drop(work);
-        let retired = completion.try_snapshot().unwrap();
+        let retired = snapshot(&completion).await;
         let retired = retired.directory_builds()[0].unwrap();
         assert_eq!(retired.backend(), FsOperationBackend::NotExecuted);
         assert_eq!(retired.receipt(), FsOperationReceipt::Released);
@@ -1514,11 +1529,11 @@ mod tests {
             });
             drop(work);
         }
-        let current = completion.try_snapshot().unwrap();
+        let current = snapshot(&completion).await;
         assert_ne!(current.directory_builds()[0].unwrap().id(), old.id);
         old.update(|record| record.backend = FsOperationBackend::Failed);
         assert_eq!(
-            completion.try_snapshot().unwrap().directory_builds(),
+            snapshot(&completion).await.directory_builds(),
             current.directory_builds()
         );
 
@@ -1534,13 +1549,7 @@ mod tests {
                 .into_inner(),
             Ok(42)
         );
-        assert_eq!(
-            completion
-                .try_snapshot()
-                .unwrap()
-                .omitted_directory_builds(),
-            1
-        );
+        assert_eq!(snapshot(&completion).await.omitted_directory_builds(), 1);
         scope
             .state
             .lifecycle
@@ -1556,10 +1565,7 @@ mod tests {
             Ok(43)
         );
         assert_eq!(
-            completion
-                .try_snapshot()
-                .unwrap()
-                .omitted_directory_builds(),
+            snapshot(&completion).await.omitted_directory_builds(),
             u64::MAX
         );
         drop(transaction);
