@@ -106,14 +106,27 @@ pub fn decode_log_to_observed(log_value: &Value) -> Result<HeadUpdatedObserved> 
     })
 }
 
-/// Decode head() return data (eth_call result): (uint64, bytes) ABI via alloy sol-types.
+/// Decode the canonical `(uint64, bytes)` parameter sequence returned by Solidity head().
 pub fn decode_head_return(data: &[u8]) -> Result<CurrentHead> {
     type HeadReturn = (
         alloy::sol_types::sol_data::Uint<64>,
         alloy::sol_types::sol_data::Bytes,
     );
-    let (seq, cid) =
-        HeadReturn::abi_decode_sequence(data, false).context("decode head() return")?;
+    // Alloy 0.8.26 adds the encoded length to its cursor before checking bounds.
+    // Pin the tail location so this length guard covers the word Alloy will read.
+    if data.len() < 96 {
+        anyhow::bail!("head() return too short");
+    }
+    let mut cid_offset_word = [0_u8; 32];
+    cid_offset_word[31] = 64;
+    if data[32..64] != cid_offset_word {
+        anyhow::bail!("head() cid offset is not canonical");
+    }
+    let cid_len = alloy::primitives::U256::from_be_slice(&data[64..96]);
+    if cid_len > alloy::primitives::U256::from(data.len() - 96) {
+        anyhow::bail!("head() cid length exceeds return data");
+    }
+    let (seq, cid) = HeadReturn::abi_decode_sequence(data, true).context("decode head() return")?;
     Ok(CurrentHead {
         seq,
         cid: cid.to_vec(),
@@ -274,6 +287,93 @@ mod tests {
         // cid_len at offset 64+28..64+32 = 9999 (way past end)
         data[92..96].copy_from_slice(&9999u32.to_be_bytes());
         assert!(decode_head_return(&data).is_err());
+    }
+
+    #[test]
+    fn decode_head_return_rejects_high_word_bits() {
+        let data =
+            HeadReturn::abi_encode_sequence(&(8, alloy::primitives::Bytes::from(vec![0x42; 36])));
+        for word in [0, 32, 64] {
+            let mut malformed = data.clone();
+            malformed[word] = 1;
+            assert!(
+                decode_head_return(&malformed).is_err(),
+                "accepted high bits at {word}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_head_return_extreme_lengths_return_error() {
+        for offset in [64_usize, 0, 32, 65, 96, 128] {
+            for delta in [0, 1, 31, 32, 33] {
+                let mut data = vec![0; 96.max(offset + 32)];
+                data[56..64].copy_from_slice(&(offset as u64).to_be_bytes());
+                data[offset + 24..offset + 32]
+                    .copy_from_slice(&((usize::MAX - delta) as u64).to_be_bytes());
+                assert!(
+                    decode_head_return(&data).is_err(),
+                    "accepted length usize::MAX - {delta} at offset {offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_head_return_rejects_truncation() {
+        let data =
+            HeadReturn::abi_encode_sequence(&(8, alloy::primitives::Bytes::from(vec![0x42; 36])));
+        for end in 0..data.len() {
+            assert!(
+                decode_head_return(&data[..end]).is_err(),
+                "accepted {end} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_head_return_rejects_noncanonical_layout() {
+        let data =
+            HeadReturn::abi_encode_sequence(&(8, alloy::primitives::Bytes::from(vec![0x42; 36])));
+        let mut nonzero_padding = data.clone();
+        *nonzero_padding.last_mut().unwrap() = 1;
+        let mut trailing_byte = data.clone();
+        trailing_byte.push(0);
+        let mut trailing_word = data.clone();
+        trailing_word.extend([0; 32]);
+        let mut gap = data.clone();
+        gap.splice(64..64, [0; 32]);
+        gap[63] = 96;
+        let mut unaligned = data.clone();
+        unaligned.insert(64, 0);
+        unaligned[63] = 65;
+        let mut overlap = data;
+        overlap[63] = 0;
+        for malformed in [
+            nonzero_padding,
+            trailing_byte,
+            trailing_word,
+            gap,
+            unaligned,
+            overlap,
+        ] {
+            assert!(decode_head_return(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn decode_head_return_preserves_boundary_values() {
+        for len in [0, 1, 31, 32, 33, 64] {
+            let cid = vec![0x42; len];
+            let data = HeadReturn::abi_encode_sequence(&(
+                u64::MAX,
+                alloy::primitives::Bytes::from(cid.clone()),
+            ));
+            assert_eq!(
+                decode_head_return(&data).unwrap(),
+                CurrentHead { seq: u64::MAX, cid }
+            );
+        }
     }
 
     #[test]
