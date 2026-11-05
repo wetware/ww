@@ -1,4 +1,9 @@
-//! Bounded, immutable inline IPLD maps. Version 1 encodes `[1, {entries...}]`.
+//! A bounded, immutable, inline IPLD Map, initially used for release metadata.
+//!
+//! The entire Map encodes into one canonical DAG-CBOR block. Version 1 encodes
+//! `[1, {entries...}]`. Nested maps and lists use ordinary Rust [`BTreeMap`]
+//! and [`Vec`] values. Updates clone the bounded representation; there is no
+//! structural sharing or lazy traversal.
 //!
 //! Keys are exact UTF-8 bytes: no normalization or locale comparison. The
 //! envelope does not count toward collection or depth limits. Depth is the
@@ -6,8 +11,18 @@
 //! DAG-CBOR orders string keys by encoded length, then encoded bytes.
 //!
 //! Logical operations never contact storage. Persistence is explicit and
-//! separate from retention: neither persistence nor dropping a Map pins a DAG.
+//! separate from retention. Persisting a Map does not acquire retention, and
+//! dropping a Map neither acquires nor releases pins.
 //! This inline format does not promise CID equality with future tree formats.
+//!
+//! [`Value`] defines a versioned inline storage profile, not a universal
+//! Wetware value model. This module is not the definitive persistent-collection
+//! API explored in [#698](https://github.com/wetware/ww/issues/698).
+//! Persistent Maps, bit-partitioned vector tries, and other IPLD-backed
+//! collections may need different value types, representations, APIs, and
+//! lifetime contracts. That work must evaluate reuse or evolution of this
+//! inline implementation before introducing an independent Map. The current
+//! profile does not select those future designs.
 
 use std::collections::BTreeMap;
 

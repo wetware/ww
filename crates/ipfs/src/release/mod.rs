@@ -1,7 +1,32 @@
 //! Durable release retention and publication ordering, independent of deployment caches.
 //!
-//! See `doc/release-publication.md` for the storage and adapter contracts. A CID
-//! is content identity, never authentication. No production publisher is provided.
+//! [`Owner`] serializes a channel's candidate, retained, published, and retired
+//! transitions through one locked journal. It validates bounded artifact stages
+//! before retention, records intent before backend effects, and records durable
+//! retention acknowledgements before permitting publication. Publication intent
+//! is durable before the [`Publisher`] adapter is called. Uncertain retention
+//! and publication acknowledgements require reconciliation with their adapters.
+//!
+//! These responsibilities are distinct:
+//!
+//! - Content identity: a CID identifies bytes; it neither retains nor
+//!   authenticates them.
+//! - Retention: a durable backend acknowledgement establishes the required
+//!   storage obligation under the [`Retention`] contract.
+//! - Publication: authenticated, conditional selection makes a retained release
+//!   discoverable. The [`Publisher`] contract requires authentication,
+//!   expected-current checks, idempotent reconciliation, and stale-effect fencing.
+//!
+//! The journal records local decisions and adapter evidence. It does not
+//! independently establish remote publication truth or audit retained storage.
+//! Retirement changes local metadata without unpinning; pruning is refused
+//! because exclusive or coordinated pin ownership has not been established.
+//!
+//! See `doc/release-publication.md` for storage, durability, and adapter contracts.
+//! No production publisher is provided; authenticated integration belongs to
+//! [#738](https://github.com/wetware/ww/issues/738). The inline Map and release
+//! owner do not define the general persistent-collection APIs or Cell lifetime
+//! contracts explored in [#698](https://github.com/wetware/ww/issues/698).
 
 mod graph;
 mod journal;

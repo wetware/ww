@@ -1,6 +1,23 @@
-//! Bounded private state snapshots. Mirrors the repository's private-state
-//! write protocol (temp -> file sync -> rename -> directory sync), adding an
-//! owner lock. Temp files are never recovery authority.
+//! Durable local recovery state for the release-publication owner.
+//!
+//! An exclusive OS file lock remains held for the journal's lifetime. Within
+//! the provisioned private directory, snapshots are bounded JSON encodings of
+//! the owner's state. Reading requires an exact canonical re-encoding; the
+//! owner separately validates state invariants and the retention domain.
+//!
+//! Writes follow the repository's private-state protocol: write `state.next`,
+//! sync the file, atomically rename it to `state.json`, then sync the directory.
+//! Recovery reads only `state.json`. A temporary file can contain an incomplete
+//! write or an uncommitted replacement, even if it decodes successfully. It
+//! cannot establish which snapshot the owner committed and is never recovery
+//! authority. An initialization marker makes a missing initialized journal
+//! an error rather than an empty history.
+//!
+//! Durability depends on the documented local-filesystem and provisioning
+//! contract. File and directory syncs do not constitute power-loss test evidence.
+//! This module does not validate artifact graphs, retain blocks, or establish
+//! remote publication success. It persists local decisions and evidence for
+//! the owner's recovery protocol.
 
 use super::State;
 use anyhow::{ensure, Context, Result};

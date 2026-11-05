@@ -1,8 +1,25 @@
-//! Validate one bounded CAR stage before any storage side effect.
+//! Validate bounded content-addressed artifact graphs before CAR import.
 //!
-//! A stage may stop traversal only at roots already acknowledged by its release
-//! owner. Kubo presence alone is not retention. These checks establish closure
-//! of supplied bytes; the subsequent CAR acknowledgement establishes retention.
+//! Each stage must satisfy CID integrity, supported hash/codec, reachability,
+//! complete stage closure, and resource-limit checks. The validator checks
+//! supplied bytes against SHA-256 CIDs, follows raw, DAG-PB, and supported
+//! DAG-CBOR blocks, and rejects missing descendants or unreachable supplied
+//! blocks. CAR bytes, block bytes, supplied records, and traversed links are
+//! bounded.
+//!
+//! Traversal may terminate at previously acknowledged retained roots supplied
+//! by the release owner. Arbitrary Kubo-resident blocks are not sufficient:
+//! content presence alone does not establish retention. Validation establishes
+//! stage closure relative to those retained roots; a subsequent backend
+//! acknowledgement establishes retention under the backend contract.
+//!
+//! DAG-CBOR traversal uses `crate::map::links(bytes)`, which accepts the current
+//! bounded inline profile as a Map envelope or a standalone profile value.
+//! This is the supported format/codec boundary, not a requirement that future
+//! persistent collections use the same Map envelope. Collection formats and
+//! traversal contracts remain part of [#698](https://github.com/wetware/ww/issues/698).
+//!
+//! This module does not import, pin, journal, or publish anything.
 
 use std::collections::{BTreeMap, BTreeSet};
 

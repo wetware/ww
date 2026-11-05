@@ -1,6 +1,7 @@
 # Release-publication foundation (#737)
 
-The host library in `ipfs::map` represents bounded immutable values.
+The host library in `ipfs::map` provides a bounded immutable inline IPLD Map,
+initially used for release metadata.
 `ipfs::release::Owner` journals release retention and publication transitions.
 Neither module changes the running Host, deployment cache, release scripts,
 CI publication holds, or production configuration.
@@ -38,14 +39,30 @@ Canonical wire ordering follows encoded-key length then encoded-key bytes,
 not ordinary string order. See the [DAG-CBOR specification](https://ipld.io/specs/codecs/dag-cbor/spec/).
 
 `Map::get`, `iter`, `insert`, and `remove` operate on validated inline values.
-Updates return new Maps. Iteration uses UTF-8 lexical order and returns at most
-4,096 entries. `from_entries` bounds ingestion even for an unbounded iterator.
+Updates clone the bounded representation and return new Maps. Nested maps and
+lists use ordinary Rust `BTreeMap` and `Vec` values, without structural sharing.
+The entire Map encodes into one block. Iteration uses UTF-8 lexical order and
+returns at most 4,096 entries. `from_entries` bounds ingestion even for an
+unbounded iterator.
 `encode` and `cid` are fallible. `persist` and `load` use an explicit async
 `Blockstore`; `load` bounds acquisition and verifies the returned bytes.
 The supplied store must honor its byte limit before allocating content.
 Logical operations and Map destruction have no storage, pin, or cleanup effect.
 CID equality is specific to this format; it is not promised across future
 inline/tree representations. There is no guest WIT API or lazy traversal.
+
+### Relationship to future persistent collections
+
+`Value` is a versioned inline storage profile, not a universal Wetware value
+model. This Map is not the definitive persistent-collection API explored in
+[#698](https://github.com/wetware/ww/issues/698). Persistent Maps, bit-partitioned
+vector tries, and other IPLD-backed collections may require different value
+types, representations, APIs, and lifetime contracts.
+
+That architecture will be revisited under #698 after the release/upgrade MVP.
+The future work must evaluate reuse or evolution of this inline implementation
+before introducing an independent Map. This foundation selects neither a
+general value model nor a future collection API.
 
 ## One release owner
 
@@ -102,6 +119,12 @@ rejects noncanonical link/CID fields. DAG-CBOR supports Map envelopes or
 standalone bounded profile values. Unknown Map versions are rejected by
 `Map::decode`; graph traversal does not interpret a standalone list as a
 release descriptor. Descriptor/schema validation remains #738 work.
+
+The graph validator delegates DAG-CBOR link extraction to `crate::map::links`.
+This defines the currently supported format/codec boundary. It does not require
+future persistent collections under #698 to use the current Map envelope or
+`Value` representation. Any new format needs explicit traversal and retention
+contracts; this foundation does not select those formats.
 
 | Owner/import limit | Value |
 | --- | ---: |
