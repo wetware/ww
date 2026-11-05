@@ -3047,6 +3047,25 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn retained_materialization_outlives_cell_runtime_until_rollback_and_completion() {
         use futures::FutureExt as _;
+        use std::panic::AssertUnwindSafe;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        const DEADLINE: Duration = Duration::from_secs(10);
+
+        async fn join_cell(
+            thread: &mut Option<std::thread::JoinHandle<()>>,
+        ) -> Result<std::thread::Result<()>, tokio::time::error::Elapsed> {
+            if let Some(worker) = thread.as_ref() {
+                timeout(DEADLINE, async {
+                    while !worker.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await?;
+            }
+            Ok(thread.take().map_or(Ok(()), |worker| worker.join()))
+        }
 
         let fs = TestFilesystem::with_limits(
             cache::HostLimits::new(1, 2, 4).unwrap(),
@@ -3056,45 +3075,95 @@ mod tests {
             .parse()
             .unwrap();
         let pinner = GatedColdPinner::new(false, true, true);
-        let cache = Arc::new(fs.isolated_cache(pinner.clone()).await);
-        let staging = cache.staging_dir().to_path_buf();
-        let task_resources = Arc::clone(&fs.resources);
-        let task_scope = fs.scope.clone();
-        let task_cache = Arc::clone(&cache);
-        let fetch_started = pinner.fetch_started.notified();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let cell_thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.spawn(async move {
-                let _ = materialize_ipfs_descriptor(
-                    &task_resources,
-                    &task_scope,
-                    Some(&task_cache),
-                    &IpfsCidPath {
-                        cid,
-                        subpath: String::new(),
-                    },
-                    false,
-                )
-                .await;
-            });
-            runtime.block_on(async { shutdown_rx.await.unwrap() });
-            drop(runtime);
-        });
-
-        fetch_started.await;
-        shutdown_tx.send(()).unwrap();
-        tokio::task::spawn_blocking(move || cell_thread.join().unwrap())
+        let mut cache = None;
+        let mut cell_thread = None;
+        let mut shutdown = None;
+        // Defer assertion panics until the gates are released and owned workers
+        // are joined, including when startup fails before fetch_started.
+        let outcome = AssertUnwindSafe(async {
+            cache = Some(Arc::new(
+                timeout(DEADLINE, fs.isolated_cache(pinner.clone()))
+                    .await
+                    .expect("isolated cache setup timed out"),
+            ));
+            // Setup can deliver its result before failure_owner releases L and
+            // F. Probe both: dropping the setup transaction releases L before F.
+            let admission = timeout(DEADLINE, async {
+                loop {
+                    match fs.resources.try_logical_io().and_then(|logical| {
+                        fs.resources.host().try_foreground().map(|producer| (logical, producer))
+                    }) {
+                        Ok(admission) => break admission,
+                        Err(error)
+                            if matches!(error.kind(), cache::AdmissionKind::CellLogical
+                                | cache::AdmissionKind::ForegroundProducer) =>
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => panic!("unexpected setup admission failure: {error:?}"),
+                    }
+                }
+            })
             .await
-            .unwrap();
-        assert!(matches!(
-            fs.resources.try_logical_io(),
-            Err(ref error) if error.kind() == cache::AdmissionKind::CellLogical
-        ));
+            .expect("setup admission did not recover");
+            drop(admission);
 
+            let task_resources = Arc::clone(&fs.resources);
+            let task_scope = fs.scope.clone();
+            let task_cache = Arc::clone(cache.as_ref().unwrap());
+            let fetch_started = pinner.fetch_started.notified();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            shutdown = Some(shutdown_tx);
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            cell_thread = Some(std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.spawn(async move {
+                    let result = materialize_ipfs_descriptor(
+                        &task_resources,
+                        &task_scope,
+                        Some(&task_cache),
+                        &IpfsCidPath {
+                            cid,
+                            subpath: String::new(),
+                        },
+                        false,
+                    )
+                    .await;
+                    let _ = result_tx.send(result.map(drop));
+                });
+                runtime.block_on(async { let _ = shutdown_rx.await; });
+                drop(runtime);
+            }));
+
+            timeout(DEADLINE, async {
+                tokio::select! {
+                    result = result_rx => panic!("materialization ended before fetch-start: {result:?}"),
+                    () = fetch_started => {}
+                }
+            })
+            .await
+            .expect("materialization did not reach fetch-start");
+            shutdown.take().unwrap().send(()).unwrap();
+            join_cell(&mut cell_thread)
+                .await
+                .expect("Cell runtime shutdown timed out")
+                .unwrap();
+            assert!(matches!(
+                fs.resources.try_logical_io(),
+                Err(ref error) if error.kind() == cache::AdmissionKind::CellLogical
+            ));
+        })
+        .catch_unwind()
+        .await;
+
+        // Signal shutdown on failure as well. notify_one retains a permit when
+        // the worker has not yet reached a gate.
+        if let Some(shutdown) = shutdown.take() {
+            let _ = shutdown.send(());
+        }
         let TestFilesystem {
             resources: _,
             scope: _,
@@ -3104,22 +3173,44 @@ mod tests {
             _host_owner: host_owner,
         } = fs;
         drop(owner);
-        let finalizer_task = tokio::spawn(finalizer.run());
+        let completion_pending = completion.wait().now_or_never().is_none();
+        pinner.release_pin.notify_one();
+        pinner.release_fetch.notify_one();
+        let joined = join_cell(&mut cell_thread).await;
+        // A stuck OS thread cannot be cancelled. After releasing the gates and
+        // requesting shutdown, a second timeout must not silently detach it.
+        if joined.is_err() {
+            eprintln!("Cell runtime shutdown timed out; worker not joined; aborting test process");
+            std::process::abort();
+        }
+        let finalized = timeout(DEADLINE, finalizer.run()).await;
+        let completed = timeout(DEADLINE, completion.wait()).await;
+        let fetch_finished = pinner.finished.load(std::sync::atomic::Ordering::SeqCst);
+        let staging_removed = cache
+            .as_ref()
+            .is_some_and(|cache| !cache.staging_dir().exists());
+        drop(cache);
+        let host_shutdown = timeout(DEADLINE, host_owner.shutdown()).await;
+        if host_shutdown.is_err() {
+            eprintln!("filesystem shutdown timed out; cleanup not joined; aborting test process");
+            std::process::abort();
+        }
+        joined.unwrap().unwrap();
+        host_shutdown.unwrap().unwrap();
+        finalized.expect("filesystem finalizer timed out").unwrap();
+        completed.expect("filesystem completion timed out").unwrap();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
         assert!(
-            completion.wait().now_or_never().is_none(),
+            completion_pending,
             "origin completion must remain pending while retained materialization is active"
         );
-
-        pinner.release_fetch.notify_one();
-        finalizer_task.await.unwrap().unwrap();
-        completion.wait().await.unwrap();
-        assert!(pinner.finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(fetch_finished);
         assert!(
-            !staging.exists(),
+            staging_removed,
             "failed retained materialization and root cleanup must remove partial staging"
         );
-        drop(cache);
-        drop(host_owner);
     }
 
     #[tokio::test]
