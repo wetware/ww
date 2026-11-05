@@ -1399,6 +1399,21 @@ mod tests {
     use super::*;
     use crate::{HostFsOwner, HostLimits};
 
+    async fn snapshot(completion: &FsCompletion) -> FsSnapshot {
+        // The reaper can hold the lifecycle lock while checking readiness.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match completion.try_snapshot() {
+                    Ok(snapshot) => return snapshot,
+                    Err(FsSnapshotError::Busy) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected snapshot error: {error:?}"),
+                }
+            }
+        })
+        .await
+        .expect("filesystem snapshot remained busy past its deadline")
+    }
+
     #[tokio::test]
     async fn cancellation_is_exact_root_and_retains_neither_receipt_nor_reused_slot() {
         let (host_owner, host) = HostFsOwner::start(
@@ -1420,7 +1435,7 @@ mod tests {
         );
         assert!(!cancellation.try_accept_commit());
         assert!(!other_cancellation.is_cancelled());
-        assert_eq!(completion.try_snapshot().unwrap().outstanding_work(), 1);
+        assert_eq!(snapshot(&completion).await.outstanding_work(), 1);
         drop(receipt);
         finalizer.run().await.unwrap();
         drop(scope);
@@ -1483,21 +1498,6 @@ mod tests {
 
     #[tokio::test]
     async fn directory_observation_exhaustion_and_stale_handles_do_not_change_work() {
-        async fn snapshot(completion: &FsCompletion) -> FsSnapshot {
-            // The reaper can hold the lifecycle lock while checking readiness.
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    match completion.try_snapshot() {
-                        Ok(snapshot) => return snapshot,
-                        Err(FsSnapshotError::Busy) => tokio::task::yield_now().await,
-                        Err(error) => panic!("unexpected snapshot error: {error:?}"),
-                    }
-                }
-            })
-            .await
-            .expect("directory lifecycle test exceeded its deadline")
-        }
-
         let (host_owner, host) = HostFsOwner::start(
             tokio::runtime::Handle::current(),
             HostLimits::new(1, 2, 1).unwrap(),
@@ -1600,9 +1600,8 @@ mod tests {
                 witness.store(true, Ordering::SeqCst);
                 Ok::<_, ()>(())
             }));
-            assert!(completion
-                .try_snapshot()
-                .unwrap()
+            assert!(snapshot(&completion)
+                .await
                 .directory_builds()
                 .iter()
                 .all(Option::is_none));
@@ -1628,7 +1627,7 @@ mod tests {
             drop(waiter);
             drop(transaction);
             drop(owner);
-            let queued = completion.try_snapshot().unwrap();
+            let queued = snapshot(&completion).await;
             let build = queued.directory_builds()[0].unwrap();
             assert_eq!(build.backend(), FsOperationBackend::Queued);
             assert_eq!(build.waiter(), FsOperationWaiter::Dropped);
@@ -1640,7 +1639,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let completed = completion.try_snapshot().unwrap();
+            let completed = snapshot(&completion).await;
             assert_eq!(
                 completed.directory_builds()[0].unwrap().backend(),
                 FsOperationBackend::Succeeded
@@ -1665,12 +1664,16 @@ mod tests {
         let (scope, owner, finalizer, completion) = host.try_filesystem_scope().unwrap();
         let work = scope.try_work().unwrap();
         let observation = work.observe_directory_build().unwrap();
+        let mut waiting = Box::pin(snapshot(&completion));
         {
             let _guard = scope.state.lifecycle.lock().unwrap();
             for _ in 0..128 {
                 assert_eq!(completion.try_snapshot(), Err(FsSnapshotError::Busy));
             }
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
         }
+        assert_eq!(waiting.await.outstanding_work(), 1);
         drop(OperationBackend {
             observation: Some(observation.clone()),
             entered: false,
