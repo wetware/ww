@@ -116,6 +116,45 @@ grep -Fq 'docker load -i tested-image.tar' <<<"$release_job" || fail 'GHCR must 
 grep -Fq "            - 'scripts/**'" "$WORKFLOW" || fail 'installer-only changes must trigger release validation'
 grep -Fq 'linux/musl-x86_64' "$WORKFLOW" || fail 'IPFS must include fifth Host target'
 
+# Release secrets belong only to the guarded signing step. These assertions
+# inspect source boundaries; environment protection settings require operator
+# verification before activation.
+signing_step="$(awk '
+  /^    - name: Sign exact release checksum manifest$/ { capture = 1; print; next }
+  capture && /^    - / { exit }
+  capture { print }
+' "$WORKFLOW")"
+[[ -n "$signing_step" ]] || fail 'release manifest signing step missing'
+for condition in "github.repository == 'wetware/ww'" "github.ref == 'refs/heads/master'" \
+  "github.event_name == 'push'" "github.event_name == 'workflow_dispatch'" \
+  "needs.test.result == 'success'" "needs.validate-release.result == 'success'" \
+  "needs.release_image.result == 'success'"; do
+  grep -Fq "$condition" <<<"$signing_step" || fail "signing admission lost: $condition"
+done
+# shellcheck disable=SC2016
+grep -Fq 'WW_RELEASE_SIGNING_KEY: ${{ secrets.WW_RELEASE_SIGNING_KEY }}' <<<"$signing_step" \
+  || fail 'signing key must be a step-scoped secret'
+[[ "$(grep -Fc 'secrets.WW_RELEASE_SIGNING_KEY' "$WORKFLOW")" == 1 ]] \
+  || fail 'signing key must not be exposed to other steps'
+! grep -Fq 'secrets.WW_RELEASE_SIGNING_KEY' <<<"$non_publish_workflow" \
+  || fail 'build or PR jobs received a release signing key'
+grep -Fq '    environment: release-signing' "$WORKFLOW" \
+  || fail 'signing requires a protected environment boundary'
+grep -Fq 'set +x' <<<"$signing_step" || fail 'signing must disable tracing'
+grep -Fq 'umask 077' <<<"$signing_step" || fail 'private key file permissions missing'
+grep -Fq 'unset WW_RELEASE_SIGNING_KEY WW_RELEASE_TRUSTED_KEYS' <<<"$signing_step" \
+  || fail 'signing subprocesses must not inherit the key secret'
+# shellcheck disable=SC2016
+grep -Fq 'mktemp -d "$RUNNER_TEMP/ww-signing.XXXXXXXX"' <<<"$signing_step" \
+  || fail 'private key must remain outside build and release artifacts'
+transport_step="$(awk '
+  /^    - name: Publish to IPFS via VPS$/ { capture = 1; next }
+  capture && /^    - / { exit }
+  capture { print }
+' "$WORKFLOW")"
+grep -Fq "if: steps.release-signature.outcome == 'success'" <<<"$transport_step" \
+  || fail 'publisher transport must require successful manifest authentication'
+
 # Freeze the existing job-level admission controls during the maintenance hold.
 # This covers ordinary Rust/metrics CI, release validation, GHCR and Pages.
 # YAML/action validation is separate; this check follows the workflow's layout.

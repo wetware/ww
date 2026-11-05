@@ -1,11 +1,20 @@
 # Installation and recovery
 
-Run the current shell installer with a running Kubo node:
+Provision the release public keyring independently before running the installer.
+See [release authentication](release-authentication.md) for the trust format,
+key rotation, and the production activation hold. The installer requires
+OpenSSL 3.x or 4.x and a running Kubo node:
 
 ```sh
 sh scripts/install.sh                    # resolves releases.wetware.run
-sh scripts/install.sh --version <CID>    # immutable release
+sh scripts/install.sh --version <CID>    # immutable signed release
+sh scripts/install.sh --trusted-release-keys /trusted/path/release-keys
 ```
+
+The installer authenticates the exact checksum manifest with Ed25519 before
+trusting any checksum. Missing signatures and unsigned historic releases fail
+closed. The default trust path is `/etc/wetware/release-keys`; fetched release
+content cannot supply this trust anchor.
 
 The installer downloads the Host, `fhs/boot/kernel.wasm`, and
 `fhs/bin/status.wasm` to a temporary directory. It requires an exact SHA-256

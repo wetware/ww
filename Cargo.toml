@@ -105,6 +105,7 @@ blake3 = { workspace = true }
 cid = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
+sha2 = "0.10"
 axum = "0.8"
 dirs = { workspace = true }
 indicatif = "0.17"

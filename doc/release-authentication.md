@@ -1,0 +1,214 @@
+# Authenticated release manifests
+
+Status: implementation prepared for #412; production activation is **NO-GO**.
+No release key has been provisioned by this change. IPFS publication remains
+under the unconditional workflow hold. This document grants no operational authority.
+
+## Trust and wire format
+
+The release signing key is an Ed25519 key dedicated to release manifests.
+It must be independent of the Kubo `ww-release` IPNS key and Host/RPC identities.
+An IPNS publisher, gateway, or release-tree author cannot authorize a new binary
+without this release key. IPNS and CIDs locate content; they do not establish
+release authority.
+
+`CHECKSUMS.txt.sig` contains exactly 64 raw signature bytes. The signer uses pure
+Ed25519 over the exact published `CHECKSUMS.txt` bytes. It does not prehash the
+manifest, encode the signature as text, or normalize newlines. There is no
+unsigned fallback, including with `--version CID`.
+
+`CHECKSUMS.txt` is at most 1 MiB. Its first line is exactly `# sha256` followed
+by LF. Each remaining line contains 64 lowercase hexadecimal SHA-256 digits,
+two spaces, a relative artifact path, and LF. At least one entry is required.
+Paths contain only ASCII letters, digits, `.`, `_`, `-`, and `/`. Empty, `.` and
+`..` components and duplicate paths are invalid. CRLF, blank lines, unknown
+headers, mixed algorithms, and BLAKE3 entries are invalid. Signature verification
+precedes checksum parsing. A missing required artifact entry is an error.
+
+The independent public keyring contains one or two LF-terminated lines. Each
+line is canonical standard base64 of a 44-byte Ed25519 SubjectPublicKeyInfo DER
+value: prefix `302a300506032b6570032100`, then the 32-byte public key. Duplicate
+keys, extra lines, invalid encodings, and small-order keys are rejected.
+The second key exists only for a bounded operator-managed rotation.
+
+The installer reads `/etc/wetware/release-keys` by default. An operator can use
+`--trusted-release-keys /absolute/path` for a separately provisioned keyring.
+The installer never fetches a keyring from IPFS and never trusts a public key
+because it accompanies a signature. Do not point this option at downloaded
+release content. A missing local keyring fails closed.
+
+Trust bootstrap requires an independently obtained installer and keyring.
+Fetching the installer itself from an attacker-controlled release tree defeats
+this boundary. A trusted source checkout or authenticated distribution channel
+must supply the installer. The installer requires OpenSSL 3.x or 4.x with
+Ed25519 support. Unsupported OpenSSL/LibreSSL fails closed. On macOS, place a
+trusted OpenSSL installation on `PATH`; the OS-provided tool might be LibreSSL.
+
+## Consumers and producers
+
+`scripts/install.sh` authenticates the manifest, then verifies the selected Host,
+kernel, and status bytes with SHA-256. All three payloads must pass before the
+installer executes the candidate or changes installed state. Existing ownership,
+component validation, and recovery checks still apply.
+
+`ww perform upgrade` remains disabled before network access or file changes.
+`ww oci import` now refuses before download, stdout export, or container loading.
+The legacy OCI archive is absent from current packages and had no authentication.
+`ww perform install --payload` handles explicitly supplied local packages; it
+is not a release downloader. Its caller must trust the executed Host and local
+payload. Container registry distribution and deployment-head authority are
+separate from this IPFS release contract.
+
+`ww::release_auth::TrustedKeys` accepts separately supplied keyring bytes.
+`authenticate` returns an `AuthenticatedManifest` only after strict Ed25519
+verification and manifest parsing. `verify_artifact` explicitly uses SHA-256.
+#739 must obtain trust independently and use this verification before consuming
+or replacing a Host. This change does not implement replacement or rollback.
+
+`scripts/assemble_release.sh` still produces an unsigned staging tree for build
+and package validation. A staging tree is not an authorized release.
+`scripts/sign_release.sh MANIFEST SIGNATURE PRIVATE_KEY TRUSTED_KEYS` signs the
+exact staged manifest and verifies the result against independent trusted keys.
+It rejects an existing signature destination and a private key inside the release
+tree. The local publisher signs before `ipfs add`. The remote publisher verifies
+against its independently provisioned keyring before its first remote operation.
+The remote verifier comes from the reviewed checkout, never the release tree.
+
+The workflow references the proposed `release-signing` protected environment.
+Only the signing step receives `WW_RELEASE_SIGNING_KEY`. Repository, master ref,
+event type, and successful prerequisite jobs gate that step. Only master pushes
+and master workflow dispatches qualify. The signer also rejects PRs, forks, tags,
+and other branches. These checks complement environment protections; they do
+not establish that production protections have been configured.
+
+Private key material exists only in an owner-accessible temporary directory
+outside the artifact tree. The step disables tracing, uses `umask 077`, clears
+the secret environment variable, and removes the directory on exit. The private
+key is never copied to the VPS, Kubo, a release archive, or a build/test job.
+Trusted master code and the signing runner can access the key during signing.
+A compromised signing runner or authorized signing code remains in the threat
+model's trusted computing base. Abrupt runner termination might bypass cleanup;
+use ephemeral runners and restrict access to runner storage.
+
+## Provisioning runbook — requires separate approval
+
+1. Approve the release-key custodian, independent public-key distribution channel,
+   protected environment, and cutover release. Keep the publication hold in place.
+2. Generate a fresh key on the approved signing machine, outside the checkout and
+   every artifact directory. Do not reuse an IPNS or Host key:
+
+   ```sh
+   umask 077
+   openssl genpkey -algorithm ED25519 -out release-signing.pem
+   openssl pkey -in release-signing.pem -pubout -outform DER -out release-public.der
+   openssl base64 -A -in release-public.der > release-keys
+   printf '\n' >> release-keys
+   openssl dgst -sha256 release-public.der
+   ```
+
+3. Confirm the DER fingerprint through the approved independent channel. Use
+   OpenSSL-generated keys, not arbitrary encoded points. Preserve a protected
+   recovery copy according to the approved custody policy. Never send the private
+   key to a release consumer, publisher host, issue, PR, chat, or build artifact.
+4. Provision the public keyring on consumers and the publisher host as
+   `/etc/wetware/release-keys`, owned by an administrator and not writable by
+   untrusted users. For a user-managed installation, provision a protected local
+   path and pass `--trusted-release-keys` explicitly. Releases cannot rotate keys.
+5. After separate CI approval, configure environment secret
+   `WW_RELEASE_SIGNING_KEY` with the private PEM and environment variable
+   `WW_RELEASE_TRUSTED_KEYS` with the public keyring. A final LF is optional in
+   the CI variable; the workflow adds one if absent. Restrict `release-signing`
+   to protected master and required reviewers. Do not duplicate the private
+   secret into repository-wide build or PR contexts.
+6. Validate a signed candidate by immutable CID without changing discovery.
+   Verify all intended platforms and both fresh installation and recovery.
+   Independently compare the published manifest and signature with the signed
+   files. Record the source revision, CID, signer fingerprint, and test receipts.
+7. Obtain separate approval for publication/cutover. This patch does not remove
+   the IPFS hold, fence historical writers, or configure environment protections.
+   Apply [the existing publication fence](legacy-publication-hold.md), and use
+   #737/#738's publication owner when that integration is ready. Do not activate
+   a competing owner or journal from this work.
+
+For authorized local publication, set `WW_RELEASE_SIGNING_KEY_FILE` to the
+private PEM outside the release directory. `WW_RELEASE_TRUSTED_KEYS` selects the
+independent public keyring, defaulting to `/etc/wetware/release-keys`.
+These settings do not authorize publication by themselves.
+
+## Rotation, compromise, and unsigned releases
+
+Normal rotation has three explicit states: old key only, old plus new keys,
+then new key only. Distribute the new public key through the independent channel
+before signing releases with the new private key. Set an operator-approved
+cutover date and final old-key removal date. Keep at most two keys throughout.
+The wire format permits overlap; it does not enforce calendar deadlines.
+An operator who misses key distribution receives a verification error.
+
+After the cutover, remove the old key from consumer keyrings, CI trust, and the
+publisher keyring. Remove access to the old private key. A consumer that retains
+an old key still accepts old-key signatures. Compromise requires immediate
+independent removal and recovery; there is no online revocation service.
+Do not let an old-key signature authorize a replacement trust anchor.
+
+Use a producer-first cutover: prepare signed release content, provision trust,
+qualify new consumers against its CID, then separately approve discovery and
+consumer distribution. Existing SHA-256-only installers ignore the additional
+signature file and remain vulnerable; retire them through the trusted installer
+distribution channel. New installers reject unsigned historic releases even
+when explicitly pinned. Rebuild or separately audit and re-authorize historic
+bytes if recovery requires them. Do not add a temporary skip-verification flag.
+Until the first signed release and trust distribution are ready, distributing
+this new installer as the default would strand users. That cutover is NO-GO.
+
+## #738 integration contract
+
+#412 signs manifest bytes; #738 owns descriptor schema, retention, discovery,
+and freshness. There must be one release trust root and one publication owner.
+The compatible binding order is:
+
+1. Finalize and retain the descriptor and its artifact graph through #737/#798.
+2. Write `RELEASE-DESCRIPTOR` containing the exact canonical descriptor CID and
+   one LF. Add its SHA-256 record to `CHECKSUMS.txt` before signing. Alternatively,
+   add a SHA-256 record for exact descriptor bytes. #738 must choose and freeze
+   its representation, supported CID profile, and parser.
+3. Sign the final manifest through #412. Keep the manifest and signature outside
+   the descriptor's hashed content. The descriptor must not contain their hashes
+   or the enclosing release-root CID. This dependency direction has no hash cycle.
+4. The consumer authenticates the manifest, verifies the binding file's exact
+   bytes, validates the CID/schema, and fetches/verifies the descriptor. A CID
+   alone never authorizes selection. #738 must retain real traversable IPLD links;
+   a CID string in this binding file does not retain the artifact graph.
+
+This is an available format seam, not implemented descriptor publication.
+The generic authenticated manifest verifier can verify this binding file today.
+The installer does not interpret descriptors. #738 must test tampered binding
+bytes, mismatched descriptor/platform data, and missing binding records.
+
+## Limits and assumptions
+
+Authentication does not establish freshness, channel identity, source provenance,
+or reproducibility. A malicious publisher can replay a previously signed release
+or deny service. #738 owns consumer freshness and intentional rollback policy;
+reuse existing signed-IPNS watermark machinery where applicable. `VERSION`,
+`REVISION`, examples, and installer files are not implicitly authenticated by
+payload-only checksum entries. Do not derive authority from those files.
+
+The local OS, installer code, OpenSSL, hashing commands, trust file, and signing
+machine are trusted. Concurrent hostile local mutation is outside this boundary.
+Manifest size is checked after download; IPFS transport can consume disk/time
+before rejection. Artifact transport likewise retains its existing resource limits.
+No claim is made about compromised signing keys, CI administrators, or runners.
+
+OpenSSL performs shell Ed25519 verification. A shared small-order corpus closes
+OpenSSL's weak-point acceptance, including signature R points. Rust additionally
+rejects non-decodable public points while parsing the whole keyring. Provisioning
+uses generated, independently checked keys; malformed non-curve local keyring
+entries can cause stricter Rust refusal than OpenSSL during overlap. They do not
+let an untrusted publisher authenticate without another valid trusted key.
+
+The actual production environment protections, key custody, cross-platform native
+installation, and discovery cutover require operator qualification. Local test
+receipts and independent-review results accompany the proposed PR separately.
+
+References: [OpenSSL Ed25519 verification](https://docs.openssl.org/3.0/man1/openssl-pkeyutl/#ed25519-and-ed448-algorithms),
+[`ed25519-dalek` strict verification](https://docs.rs/ed25519-dalek/2.2.0/ed25519_dalek/struct.VerifyingKey.html#method.verify_strict).
