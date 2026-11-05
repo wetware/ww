@@ -33,7 +33,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   certification. Guest message access and PID0 isolation remain separate work;
   #155 remains open.
 - Retry contended snapshots within a five-second deadline in the `ww-cache`
-  directory-observation test. Production snapshot behavior is unchanged.
+  directory-observation, cancellation, and queued-work tests. Production snapshot
+  behavior is unchanged.
 - **Cell-owned directory build cancellation (#787, #785).** Closing a Cell's
   filesystem root stops unnecessary CID-directory entries and rolls back private
   staging. Commit acceptance is ordered with cancellation; already accepted
@@ -51,6 +52,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `respond_bytes_async` for output completion.
 
 ### Added
+- **Durable release foundation (#737).** A bounded immutable host IPLD Map
+  uses canonical DAG-CBOR and explicit blockstore persistence. A separate
+  release owner journals staged retention and conditional publication intent,
+  serializes attempts, reconciles uncertain acknowledgements, and refuses
+  destructive pin cleanup. Authentication and production publication remain
+  gated on #738; no production publisher is enabled.
 - **Executor worker liveness (#390).** The Host metrics endpoint reports each
   worker's lifecycle, confirmed progress age, and five-second stall threshold.
   A 250 ms LocalSet heartbeat distinguishes blocked workers from Cells awaiting
