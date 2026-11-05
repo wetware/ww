@@ -472,15 +472,10 @@ The daemon signs and publishes the configured default namespace when it starts.
 
 ### ww perform upgrade
 
-Self-update the `ww` binary via IPNS.
-
-```
-ww perform upgrade [--ipfs-url URL]
-```
-
-Resolves `/ipns/releases.wetware.run/Cargo.toml` for the latest
-version, fetches the platform binary, and atomically replaces the
-running executable.
+Native self-upgrade is disabled. The command refuses before network access or
+filesystem changes. Use the authenticated [installer](installation.md) for the
+complete Host and FHS package. Host replacement, restart checks, and rollback
+remain part of #739.
 
 ### ww perform uninstall
 
@@ -532,17 +527,7 @@ Writes a config file to `~/.ww/etc/ns/<name>`.
 
 ## ww oci import
 
-Pull the container image from IPFS into Docker/podman.
-
-```
-ww oci import [--cid CID] [--stdout] [--ipfs-url URL]
-```
-
-Resolves the OCI tar from `/ipns/releases.wetware.run/oci/image.tar`
-and pipes it to `docker load` or `podman load`.
-
-```sh
-ww oci import                     # auto-detect and load
-ww oci import --cid QmHash...    # specific CID
-ww oci import --stdout | podman load
-```
+OCI release import is disabled. Current releases do not package `oci/image.tar`.
+The command refuses before download, stdout export, or container runtime loading,
+including when `--cid` or `--stdout` is supplied. Legacy unsigned OCI archives
+cannot bypass release authentication.

@@ -97,6 +97,13 @@ if [ ! -d "$REMOTE_RELEASE_TREE" ]; then
   exit 1
 fi
 
+# Use the operator-installed verifier and keyring, never scripts/keys from the
+# release tree. CI transfers this verifier from the reviewed source checkout.
+verifier="${WW_RELEASE_VERIFIER:-$(dirname "$0")/install.sh}"
+sh "$verifier" --verify-manifest "$REMOTE_RELEASE_TREE/CHECKSUMS.txt" \
+  --signature "$REMOTE_RELEASE_TREE/CHECKSUMS.txt.sig" \
+  --trusted-release-keys "${WW_RELEASE_TRUSTED_KEYS:-/etc/wetware/release-keys}"
+
 # Reject incomplete or changed mandatory payloads before the first remote call.
 [ -s "$REMOTE_RELEASE_TREE/CHECKSUMS.txt" ] || { echo 'ERROR: missing release checksums' >&2; exit 1; }
 for payload in fhs/boot/kernel.wasm fhs/bin/status.wasm \
@@ -109,7 +116,7 @@ for payload in fhs/boot/kernel.wasm fhs/bin/status.wasm \
   awk -v path="$payload" '$2 == path && length($1) == 64 { found++ } END { exit found != 1 }' \
     "$REMOTE_RELEASE_TREE/CHECKSUMS.txt" || { echo "ERROR: missing checksum for $payload" >&2; exit 1; }
 done
-(cd "$REMOTE_RELEASE_TREE" && sha256sum --check --strict CHECKSUMS.txt)
+(cd "$REMOTE_RELEASE_TREE" && sed '1d' CHECKSUMS.txt | sha256sum --check --strict -)
 trap cleanup EXIT
 
 log "collecting repo stat before publish (best effort)"

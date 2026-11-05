@@ -420,15 +420,7 @@ enum PerformAction {
 
 #[derive(Subcommand)]
 enum OciAction {
-    /// Pull the wetware container image from IPFS and load it into Docker/podman.
-    ///
-    /// Resolves the OCI tar from /ipns/releases.wetware.run/oci/image.tar
-    /// and pipes it to `docker load` or `podman load`.
-    ///
-    /// Examples:
-    ///   ww oci import
-    ///   ww oci import --cid QmHash...
-    ///   ww oci import --stdout | podman load
+    /// Disabled until authenticated OCI release artifacts are available.
     Import {
         /// Use a specific CID instead of resolving IPNS.
         #[arg(long)]
@@ -2318,96 +2310,10 @@ system::export!({iface_name}Guest);
         Ok(())
     }
 
-    /// Pull a container image from IPFS and load it into Docker/podman.
-    async fn oci_import(cid: Option<String>, to_stdout: bool, ipfs_url: String) -> Result<()> {
-        let ipfs_client = ipfs::HttpClient::new(ipfs_url);
-
-        // Resolve the image tar path.
-        let ipfs_path = if let Some(ref cid) = cid {
-            format!("/ipfs/{}/oci/image.tar", cid.trim_start_matches("/ipfs/"))
-        } else {
-            // Resolve IPNS to get latest release.
-            eprintln!("Resolving /ipns/releases.wetware.run ...");
-            let resolved = ipfs_client
-                .name_resolve("/ipns/releases.wetware.run")
-                .await
-                .context(
-                    "IPNS resolution failed.\n\
-                     \n\
-                     Make sure Kubo is running (`ipfs daemon`) and connected to the DHT.\n\
-                     Alternatively, specify a CID directly: ww oci import --cid <CID>",
-                )?;
-            format!("{}/oci/image.tar", resolved.trim_end_matches('/'))
-        };
-
-        eprintln!("Fetching {ipfs_path} ...");
-        let tar_bytes = ipfs_client
-            .cat(&ipfs_path)
-            .await
-            .context("Failed to fetch OCI image tar from IPFS")?;
-
-        if to_stdout {
-            // Write raw tar to stdout for manual piping.
-            use std::io::Write;
-            let mut out = std::io::stdout().lock();
-            out.write_all(&tar_bytes)
-                .context("Failed to write image tar to stdout")?;
-            out.flush()?;
-            return Ok(());
-        }
-
-        // Detect container runtime.
-        let runtime = Self::detect_container_runtime()?;
-        eprintln!("Loading image via {runtime} ...");
-
-        let mut child = std::process::Command::new(&runtime)
-            .arg("load")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("Failed to start `{runtime} load`"))?;
-
-        {
-            use std::io::Write;
-            let stdin = child.stdin.as_mut().context("Failed to open stdin pipe")?;
-            stdin
-                .write_all(&tar_bytes)
-                .context("Failed to write image data to container runtime")?;
-        }
-
-        let status = child
-            .wait()
-            .context("Failed to wait on container runtime")?;
-        if !status.success() {
-            bail!("`{runtime} load` exited with status {status}");
-        }
-
-        println!("Loaded wetware/ww:latest from IPFS");
-        Ok(())
-    }
-
-    /// Detect whether Docker or podman is available.
-    fn detect_container_runtime() -> Result<String> {
-        for runtime in &["docker", "podman"] {
-            if std::process::Command::new(runtime)
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            {
-                return Ok(runtime.to_string());
-            }
-        }
-        bail!(
-            "Neither docker nor podman found in PATH.\n\
-             \n\
-             Install one of:\n\
-             - Docker: https://docs.docker.com/get-docker/\n\
-             - Podman: https://podman.io/getting-started/installation"
-        )
+    /// Refuse legacy OCI imports before network access, export, or runtime loading.
+    #[allow(clippy::unused_async)]
+    async fn oci_import(_cid: Option<String>, _to_stdout: bool, _ipfs_url: String) -> Result<()> {
+        bail!("OCI release import is disabled until authenticated OCI artifacts are available. Current releases do not package oci/image.tar.")
     }
 
     /// Refuse before network access or filesystem changes.
@@ -2504,6 +2410,23 @@ fn built_wasm_artifact(stdout: &[u8], manifest: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_release_consumers_refuse_before_network_access() {
+        let endpoint = "not a valid URL".to_owned();
+        let upgrade = Commands::perform_upgrade(endpoint.clone())
+            .await
+            .unwrap_err();
+        assert!(upgrade.to_string().contains("self-upgrade is disabled"));
+        for cid in [None, Some("untrusted-release".to_owned())] {
+            for to_stdout in [false, true] {
+                let error = Commands::oci_import(cid.clone(), to_stdout, endpoint.clone())
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("OCI release import is disabled"));
+            }
+        }
+    }
 
     #[test]
     fn build_selects_only_the_current_projects_reported_wasm() {

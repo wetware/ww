@@ -55,6 +55,10 @@ WW_FHS_VALIDATOR="${CARGO_TARGET_DIR:-target}/debug/examples/stage_fhs" \
 # Require those exact bytes in the release candidate.
 cmp "$binary" "$stage/bin/ww/$platform/$architecture/ww"
 
+bash scripts/sign_release.sh "$stage/CHECKSUMS.txt" "$stage/CHECKSUMS.txt.sig" \
+  "${WW_RELEASE_SIGNING_KEY_FILE:?set WW_RELEASE_SIGNING_KEY_FILE outside the release tree}" \
+  "${WW_RELEASE_TRUSTED_KEYS:-/etc/wetware/release-keys}"
+
 cid="$(ipfs add --pin=false -rQ --cid-version=1 "$stage")"
 [[ "$cid" =~ ^[A-Za-z0-9]+$ ]] || die "invalid imported release CID"
 if [[ -z "${SKIP_PIN:-}" ]]; then

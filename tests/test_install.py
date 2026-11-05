@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from kubo_fixture import isolated_kubo
+from release_auth_fixture import generate_key, sign_manifest
 
 REPO = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
@@ -35,6 +36,7 @@ class Installation(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.home = self.root / 'home'
         self.home.mkdir()
+        self.private, self.trusted_keys = generate_key(self.root / 'release-keys')
         self.release = self.root / 'release'
         (self.release / HOST_PATH).parent.mkdir(parents=True)
         shutil.copy2(BINARY, self.release / HOST_PATH)
@@ -70,10 +72,12 @@ esac
     def checksums(self):
         (self.release / 'CHECKSUMS.txt').write_text('# sha256\n' + ''.join(
             f'{digest(self.release / name)}  {name}\n' for name in PAYLOADS))
+        sign_manifest(self.private, self.release / 'CHECKSUMS.txt')
 
     def install(self, success=True):
         result = subprocess.run(['sh', str(REPO / 'scripts/install.sh'),
-                                 '--version', 'test-release'], env=self.env,
+                                 '--version', 'test-release',
+                                 '--trusted-release-keys', str(self.trusted_keys)], env=self.env,
                                 text=True, capture_output=True, timeout=120)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -113,7 +117,7 @@ esac
         self.assertNotIn('ww-install.', service)
 
     def test_missing_payloads_and_checksums_do_not_replace(self):
-        for name in PAYLOADS + ['CHECKSUMS.txt']:
+        for name in PAYLOADS + ['CHECKSUMS.txt', 'CHECKSUMS.txt.sig']:
             with self.subTest(name=name):
                 original = (self.release / name).read_bytes()
                 mode = (self.release / name).stat().st_mode
@@ -150,6 +154,7 @@ esac
                         '\n'.join(original.splitlines()[:-1]) + '\n',
                         original + original.splitlines()[1] + '\n'):
             (self.release / 'CHECKSUMS.txt').write_text(content)
+            sign_manifest(self.private, self.release / 'CHECKSUMS.txt')
             self.install(False)
             self.assertEqual(self.snapshot(), {})
 

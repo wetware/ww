@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **Authenticated IPFS release manifests (#412).** Sign exact checksum manifest
+  bytes with Ed25519 and verify them against independently provisioned release
+  keys before executing fetched payloads. Reject unsigned releases and preserve
+  explicit SHA-256 identity. Native upgrade remains disabled; legacy OCI import
+  now refuses unauthenticated archives. Production signing remains on hold.
 - **Atom head reads reject malformed ABI return data.** Bound the encoded CID
   length before Alloy decoding to avoid arithmetic overflow in checked builds.
   Validate ABI words, offsets, padding, and trailing data while preserving

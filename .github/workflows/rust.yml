@@ -137,9 +137,10 @@ jobs:
         bash tests/test_deploy_context.sh
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
+        python3 tests/test_release_auth.py
         bash -n scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
+          shellcheck scripts/install.sh scripts/sign_release.sh scripts/publish_local_release.sh scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
         fi
 
   fuzz-corpus:
@@ -260,6 +261,12 @@ jobs:
     name: Build ww binary
     needs: lockfiles
     runs-on: ubuntu-latest
+    env:
+      # Bound Host linker resource use; keep these settings equal in test-host.
+      # Debug assertions and overflow checks remain enabled.
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
     - uses: actions/checkout@v5
       with:
@@ -275,7 +282,7 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         # `key` is job-specific; share dependency artifacts with the test job.
-        shared-key: build-test
+        shared-key: build-test-no-debuginfo
 
     - name: Build host workspace test binaries
       run: cargo build --workspace --tests --locked
@@ -365,6 +372,11 @@ jobs:
     name: Test host
     needs: [build, build-wasm]
     runs-on: ubuntu-latest
+    env:
+      # Match the producer's profiles and avoid concurrent full-debug links.
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
     - uses: actions/checkout@v5
       with:
@@ -415,7 +427,7 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
       with:
-        shared-key: build-test
+        shared-key: build-test-no-debuginfo
 
     - name: Download validated P3 components
       uses: actions/download-artifact@v8
@@ -433,6 +445,12 @@ jobs:
         test -s target/gate2b-root/wasm32-wasip3/release/gate2b_root_probe.wasm
         test -s target/stream-lifecycle-probe/wasm32-wasip3/release/stream_lifecycle_probe.wasm
 
+    - name: Report resources before Host tests
+      run: |
+        df -h . "$RUNNER_TEMP"
+        free -h
+        du -sh target
+
     - name: Run host workspace tests
       run: cargo test --workspace --locked -- --test-threads=2
       env:
@@ -441,6 +459,13 @@ jobs:
         WW_USE_PREBUILT_AUTHORITY_PROBE: "1"
         # Reuse compiled WASM across fresh engines within this job.
         WW_CWASM_DIR: ${{ runner.temp }}/ww-cwasm
+
+    - name: Report resources after Host tests
+      if: ${{ always() }}
+      run: |
+        df -h . "$RUNNER_TEMP"
+        free -h
+        if [ -d target ]; then du -sh target; fi
 
     - name: Validate process-wide outbound limits
       # Each ignored quota test owns the entire process budget while it runs.
@@ -803,6 +828,7 @@ jobs:
     if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment: release-signing
 
     steps:
     - uses: actions/checkout@v5
@@ -814,7 +840,35 @@ jobs:
       with:
         name: validated-release
 
+    # Requires a separately approved protected environment and key provisioning.
+    # No release private key is available to build, test, or PR jobs.
+    - name: Sign exact release checksum manifest
+      id: release-signature
+      if: >-
+        github.repository == 'wetware/ww' && github.ref == 'refs/heads/master'
+        && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        && needs.test.result == 'success' && needs.validate-release.result == 'success'
+        && needs.release_image.result == 'success'
+      env:
+        WW_RELEASE_SIGNING_KEY: ${{ secrets.WW_RELEASE_SIGNING_KEY }}
+        WW_RELEASE_TRUSTED_KEYS: ${{ vars.WW_RELEASE_TRUSTED_KEYS }}
+      run: |
+        set +x
+        set -euo pipefail
+        umask 077
+        SIGNING_DIR=$(mktemp -d "$RUNNER_TEMP/ww-signing.XXXXXXXX")
+        trap 'rm -rf "$SIGNING_DIR"' EXIT
+        printf '%s\n' "$WW_RELEASE_SIGNING_KEY" > "$SIGNING_DIR/private.pem"
+        printf '%s' "$WW_RELEASE_TRUSTED_KEYS" > "$SIGNING_DIR/trusted-keys"
+        if [ "$(tail -c 1 "$SIGNING_DIR/trusted-keys" | od -An -tu1 | tr -d ' ')" != 10 ]; then
+          printf '\n' >> "$SIGNING_DIR/trusted-keys"
+        fi
+        unset WW_RELEASE_SIGNING_KEY WW_RELEASE_TRUSTED_KEYS
+        bash scripts/sign_release.sh release-tree/CHECKSUMS.txt release-tree/CHECKSUMS.txt.sig \
+          "$SIGNING_DIR/private.pem" "$SIGNING_DIR/trusted-keys"
+
     - name: Publish to IPFS via VPS
+      if: steps.release-signature.outcome == 'success'
       env:
         SSH_CMD: ssh -i ~/.ssh/deploy_key -o ServerAliveInterval=30 -o ServerAliveCountMax=10
       run: |
@@ -929,6 +983,7 @@ jobs:
         # publish failures masquerade as success — see issue uncovered in #421).
         set -o pipefail
         published=false
+        rsync -a -e "$SSH_CMD" scripts/install.sh ${{ secrets.VPS_SSH }}:/tmp/ww-release-verifier.sh
         rsync -a -e "$SSH_CMD" scripts/ipfs_publish_release.sh ${{ secrets.VPS_SSH }}:/tmp/ww-ipfs-publish-release.sh
         for attempt in 1 2 3; do
           echo "Publish attempt $attempt..."
@@ -943,7 +998,7 @@ jobs:
             if timeout 12m $SSH_CMD ${{ secrets.VPS_SSH }} "
               set -e
               chmod +x /tmp/ww-ipfs-publish-release.sh
-              POD='$POD' WW_RELEASE_EXPECTED_CURRENT='$CURRENT_RELEASE' WW_RELEASE_PIN_RETAIN=10 /tmp/ww-ipfs-publish-release.sh
+              WW_RELEASE_VERIFIER=/tmp/ww-release-verifier.sh POD='$POD' WW_RELEASE_EXPECTED_CURRENT='$CURRENT_RELEASE' WW_RELEASE_PIN_RETAIN=10 /tmp/ww-ipfs-publish-release.sh
             " | tee /tmp/ipfs-publish-output.txt; then
               published=true
               break

@@ -79,9 +79,14 @@ for payload in fhs/boot/kernel.wasm fhs/bin/status.wasm \
   mkdir -p "$TEST_DIR/release/$(dirname "$payload")"
   printf 'fixture\n' > "$TEST_DIR/release/$payload"
 done
-(cd "$TEST_DIR/release" && find fhs bin -type f | sort | xargs shasum -a 256) > "$TEST_DIR/release/CHECKSUMS.txt"
+(cd "$TEST_DIR/release" && printf '# sha256\n'; find fhs bin -type f | sort | xargs shasum -a 256) > "$TEST_DIR/release/CHECKSUMS.txt"
+
+  python3 "$ROOT_DIR/tests/release_auth_fixture.py" "$TEST_DIR/keys" "$TEST_DIR/release/CHECKSUMS.txt"
 
   case "${FAKE_PAYLOAD_DAMAGE:-}" in
+    unsigned) rm "$TEST_DIR/release/CHECKSUMS.txt.sig" ;;
+    bad-signature) printf malformed > "$TEST_DIR/release/CHECKSUMS.txt.sig" ;;
+    wrong-key) python3 "$ROOT_DIR/tests/release_auth_fixture.py" "$TEST_DIR/attacker-keys" "$TEST_DIR/release/CHECKSUMS.txt" ;;
     missing) rm "$TEST_DIR/release/fhs/boot/kernel.wasm" ;;
     empty) : > "$TEST_DIR/release/fhs/bin/status.wasm" ;;
     symlink) mv "$TEST_DIR/release/fhs/boot/kernel.wasm" "$TEST_DIR/kernel.wasm"; ln -s "$TEST_DIR/kernel.wasm" "$TEST_DIR/release/fhs/boot/kernel.wasm" ;;
@@ -95,6 +100,7 @@ done
     REMOTE_RELEASE_TREE="$TEST_DIR/release" \
     POD_RELEASE_TREE=/tmp/ww-release-tree-test \
     WW_RELEASE_EXPECTED_CURRENT="$expected" \
+    WW_RELEASE_TRUSTED_KEYS="$TEST_DIR/keys/trusted-keys" \
     FAKE_CURRENT_RELEASE="$current" \
     FAKE_CANDIDATE_CID="$candidate" \
     FAKE_CALL_LOG="$TEST_DIR/calls" \
@@ -104,14 +110,16 @@ done
 
 # Idempotent retry: the pointer already targets the candidate. Do not publish
 # again, but finish pin-state bookkeeping so a prior partial run can recover.
-run_publish /ipfs/bcandidate /ipfs/bexpected bcandidate "$TEST_DIR/idempotent.out"
+run_publish /ipfs/bcandidate /ipfs/bexpected bcandidate "$TEST_DIR/idempotent.out" \
+  || { cat "$TEST_DIR/idempotent.out" >&2; fail "idempotent publish failed"; }
 grep -Fq "IPNS_UPDATED=false" "$TEST_DIR/idempotent.out" \
   || fail "idempotent retry must report that IPNS was not updated"
 [ ! -s "$TEST_DIR/calls" ] \
   || fail "idempotent retry must not invoke ipfs name publish"
 
 # Normal compare-and-set success: the observed pointer still matches.
-run_publish /ipfs/bexpected /ipfs/bexpected bcandidate "$TEST_DIR/publish.out"
+run_publish /ipfs/bexpected /ipfs/bexpected bcandidate "$TEST_DIR/publish.out" \
+  || { cat "$TEST_DIR/publish.out" >&2; fail "valid publish failed"; }
 grep -Fq "IPNS_UPDATED=true" "$TEST_DIR/publish.out" \
   || fail "matching compare-and-set must report an IPNS update"
 [ "$(grep -Fc publish "$TEST_DIR/calls")" -eq 1 ] \
@@ -127,7 +135,7 @@ grep -Fq "expected /ipfs/bexpected, found /ipfs/bother" "$TEST_DIR/mismatch.out"
 [ ! -s "$TEST_DIR/calls" ] \
   || fail "compare-and-set mismatch must not invoke ipfs name publish"
 
-for damage in missing empty corrupt unchecked symlink; do
+for damage in unsigned bad-signature wrong-key missing empty corrupt unchecked symlink; do
   if FAKE_PAYLOAD_DAMAGE="$damage" run_publish /ipfs/bexpected /ipfs/bexpected bcandidate "$TEST_DIR/$damage.out"; then
     fail "$damage mandatory payload must fail"
   fi
