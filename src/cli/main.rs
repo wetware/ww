@@ -2183,42 +2183,56 @@ system::export!({iface_name}Guest);
         Ok(())
     }
 
-    fn restart_user_daemon(home: &std::path::Path) -> Option<bool> {
+    fn restart_user_daemon(
+        home: &std::path::Path,
+        lock: &ww::installation_state::MutationLock,
+    ) -> Result<Option<bool>> {
         let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
         let systemd_path = home.join(".config/systemd/user/ww.service");
 
         if cfg!(target_os = "macos") && plist_path.exists() {
-            let _ = std::process::Command::new("launchctl")
+            let mut command = std::process::Command::new("launchctl");
+            lock.inherit_to(&mut command)?;
+            let _ = command
                 .args(["unload", &plist_path.display().to_string()])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
-            let ok = std::process::Command::new("launchctl")
+            let mut command = std::process::Command::new("launchctl");
+            lock.inherit_to(&mut command)?;
+            let ok = command
                 .args(["load", &plist_path.display().to_string()])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
-            Some(ok)
+            Ok(Some(ok))
         } else if cfg!(target_os = "linux") && systemd_path.exists() {
-            let _ = std::process::Command::new("systemctl")
-                .args(["--user", "daemon-reload"])
-                .status();
-            let ok = std::process::Command::new("systemctl")
+            let mut command = std::process::Command::new("systemctl");
+            lock.inherit_to(&mut command)?;
+            let _ = command.args(["--user", "daemon-reload"]).status();
+            let mut command = std::process::Command::new("systemctl");
+            lock.inherit_to(&mut command)?;
+            let ok = command
                 .args(["--user", "restart", "ww"])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
-            Some(ok)
+            Ok(Some(ok))
         } else {
-            None
+            Ok(None)
         }
     }
 
-    fn remove_user_daemon(home: &std::path::Path) -> Result<bool> {
+    fn remove_user_daemon(
+        home: &std::path::Path,
+        lock: &ww::installation_state::MutationLock,
+    ) -> Result<bool> {
         if cfg!(target_os = "macos") {
             let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
             if plist_path.exists() {
-                let _ = std::process::Command::new("launchctl")
+                let mut command = std::process::Command::new("launchctl");
+                lock.inherit_to(&mut command)?;
+                let _ = command
                     .args(["unload", &plist_path.display().to_string()])
                     .status();
                 std::fs::remove_file(&plist_path)
@@ -2231,12 +2245,12 @@ system::export!({iface_name}Guest);
         if cfg!(target_os = "linux") {
             let unit_path = home.join(".config/systemd/user/ww.service");
             if unit_path.exists() {
-                let _ = std::process::Command::new("systemctl")
-                    .args(["--user", "stop", "ww"])
-                    .status();
-                let _ = std::process::Command::new("systemctl")
-                    .args(["--user", "disable", "ww"])
-                    .status();
+                let mut command = std::process::Command::new("systemctl");
+                lock.inherit_to(&mut command)?;
+                let _ = command.args(["--user", "stop", "ww"]).status();
+                let mut command = std::process::Command::new("systemctl");
+                lock.inherit_to(&mut command)?;
+                let _ = command.args(["--user", "disable", "ww"]).status();
                 std::fs::remove_file(&unit_path)
                     .with_context(|| format!("remove {}", unit_path.display()))?;
                 return Ok(true);
@@ -2250,12 +2264,13 @@ system::export!({iface_name}Guest);
     /// Revalidate installed payload and refresh managed files through the installer.
     #[allow(clippy::unused_async)]
     async fn perform_update() -> Result<()> {
-        if !installation::install(None, None, false).await? {
+        let home = dirs::home_dir().context("cannot determine HOME")?;
+        let lock = ww::installation_state::MutationLock::acquire(&home)?;
+        if !installation::install_locked(&lock, None, None, false).await? {
             println!("Daemon restart (nothing changed)");
             return Ok(());
         }
-        let home = dirs::home_dir().context("cannot determine HOME")?;
-        match Self::restart_user_daemon(&home) {
+        match Self::restart_user_daemon(&home, &lock)? {
             Some(true) => Ok(()),
             _ => bail!(
                 "installation updated; start the daemon with the activation command printed above"
@@ -2267,10 +2282,12 @@ system::export!({iface_name}Guest);
     #[allow(clippy::unused_async)]
     async fn perform_uninstall() -> Result<()> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
+        let lock = ww::installation_state::MutationLock::acquire(&home)?;
+        lock.reject_pending()?;
         let ww_dir = home.join(".ww");
 
         // Step 1: Stop and remove daemon.
-        match Self::remove_user_daemon(&home)? {
+        match Self::remove_user_daemon(&home, &lock)? {
             true => println!("  Daemon ...................... REMOVED"),
             false => println!("  Daemon ...................... NOT FOUND (already removed)"),
         }

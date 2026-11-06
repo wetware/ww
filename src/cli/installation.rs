@@ -1,19 +1,10 @@
 //! Fixed-path installation ownership. Private state never enters the FHS.
 use anyhow::{ensure, Context, Result};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use ww::installation_state::{MutationLock, Receipt as Ownership};
 
 // Exactly five artifacts: executable, kernel, status, default namespace, service.
 // During replacement, either recorded digest is recoverable by rerunning install.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Ownership {
-    version: u8,
-    hashes: [String; 5],
-    previous: Option<[String; 5]>,
-    complete: bool,
-}
-
 fn incompatible(path: &Path) -> anyhow::Error {
     anyhow::anyhow!(
         "Existing custom installation is incompatible at {}. Back up your configuration and reinstall using the current installer.",
@@ -98,17 +89,7 @@ fn persist_identity(path: &Path, key: &ed25519_dalek::SigningKey) -> Result<()> 
 }
 
 fn ownership(ww_dir: &Path) -> Result<Option<Ownership>> {
-    read_regular(&ww_dir.join("installation.json"))?
-        .map(|bytes| {
-            let state: Ownership = serde_json::from_slice(&bytes)
-                .context("invalid installation ownership metadata; back up and reinstall")?;
-            ensure!(
-                state.version == 1,
-                "unsupported installation ownership metadata; use the current installer"
-            );
-            Ok(state)
-        })
-        .transpose()
+    Ownership::read(ww_dir)
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -180,6 +161,19 @@ pub(super) async fn install(
     check: bool,
 ) -> Result<bool> {
     let home = dirs::home_dir().context("cannot determine HOME")?;
+    let lock = MutationLock::acquire(&home)?;
+    install_locked(&lock, payload, executable, check).await
+}
+
+/// The update caller keeps this guard through its existing restart operation.
+pub(super) async fn install_locked(
+    lock: &MutationLock,
+    payload: Option<PathBuf>,
+    executable: Option<PathBuf>,
+    check: bool,
+) -> Result<bool> {
+    lock.reject_pending()?;
+    let home = lock.home().to_owned();
     directory(&home)?;
     ensure!(home.is_absolute(), "HOME must be an absolute path");
     service_overrides(&home)?;

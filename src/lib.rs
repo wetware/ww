@@ -23,6 +23,8 @@ pub mod host;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod image;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod installation_state;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod ipns;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod kernel;
@@ -42,6 +44,8 @@ pub mod packaging;
 pub mod release;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod telemetry;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod upgrade;
 #[cfg(not(target_arch = "wasm32"))]
 pub use rpc;
 #[cfg(not(target_arch = "wasm32"))]

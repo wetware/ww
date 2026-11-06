@@ -71,12 +71,26 @@ installer and immutable release CID to recover. Preserve the original identity;
 the installer refuses to replace a missing identity in a recorded installation.
 There is no automatic rollback or crash-consistent multi-file transaction.
 Stop the existing service before replacing its package, then activate it after
-successful installation. Do not run multiple installers concurrently.
+successful installation. Installation mutations take the shared
+`~/.ww-installation.lock`; competing operations refuse instead of changing files.
+The lock remains outside `~/.ww` so software removal cannot unlink an active lock.
+The first native preflight can leave this empty lock file even when installation
+is refused. Keep the lock file in place. An interrupted native Host transaction also blocks
+legacy installation and removal until its recorded recovery completes.
 
 `ww perform update` revalidates the owned installed payload and refreshes the
 managed installation. Explicit installed payloads take precedence over embedded
 installation seeds. `ww perform upgrade` fails before changing files and directs
 the operator to the current installer.
+
+The internal [native upgrade engine](native-upgrades.md) does not yet provide a
+production command. Authenticated artifact selection and native operational
+admission remain required before enabling Host replacement.
+
+`scripts/uninstall.sh` requires Python 3 with `fcntl` to acquire the same lock on
+Linux and macOS. Missing Python or failed lock acquisition leaves the installation
+intact. The script retains its existing whole-directory removal behavior;
+the separate #740 command migration will change that policy.
 
 ## Build and container contract
 
