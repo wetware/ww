@@ -52,12 +52,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `respond_bytes_async` for output completion.
 
 ### Added
+- **Authenticated release descriptors and dedicated publisher (#738).** Bind
+  canonical IPLD descriptors to the existing Ed25519 manifest authority, preserve
+  actual platform build provenance, and verify Host/FHS compatibility and bytes.
+  `ww-release-publisher` retains bounded complete graphs before the existing
+  owner commits local release order, then announces through eventually consistent
+  IPNS. Consumers preserve independent transport and release freshness floors,
+  including across key rotation. Legacy official publisher scripts fail closed;
+  production publication remains on hold pending the infra#37 integration.
 - **Durable release foundation (#737).** A bounded immutable host IPLD Map
   uses canonical DAG-CBOR and explicit blockstore persistence. A separate
-  release owner journals staged retention and conditional publication intent,
+  release owner journals staged retention and publication intent,
   serializes attempts, reconciles uncertain acknowledgements, and refuses
-  destructive pin cleanup. Authentication and production publication remain
-  gated on #738; no production publisher is enabled.
+  destructive pin cleanup. #738 defines local commitment and authenticated
+  integration; no production publisher is enabled.
 - **Executor worker liveness (#390).** The Host metrics endpoint reports each
   worker's lifecycle, confirmed progress age, and five-second stall threshold.
   A 250 ms LocalSet heartbeat distinguishes blocked workers from Cells awaiting
