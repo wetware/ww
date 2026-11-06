@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -98,6 +99,22 @@ esac
         return {str(p.relative_to(self.home)): p.read_bytes()
                 for p in self.home.rglob('*') if p.is_file() and not p.is_symlink()}
 
+    def assert_native_refusal_preserved(self, before):
+        # Native preflight creates the persistent coordination inode before it
+        # inspects installation state. Account for only that exact new file;
+        # retain the full snapshot assertion for every other HOME file.
+        after = self.snapshot()
+        lock_name = '.ww-installation.lock'
+        expected = dict(before)
+        if lock_name not in before and os.path.lexists(self.home / lock_name):
+            metadata = (self.home / lock_name).lstat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_uid, os.geteuid())
+            self.assertEqual(metadata.st_nlink, 1)
+            expected[lock_name] = b''
+        self.assertEqual(after, expected)
+
     def test_fresh_precreated_bin_and_rerun(self):
         (self.home / '.ww/bin').mkdir(parents=True)
         self.install()
@@ -144,7 +161,7 @@ esac
                     self.checksums()
                     before = self.snapshot()
                     self.install(False)
-                    self.assertEqual(self.snapshot(), before)
+                    self.assert_native_refusal_preserved(before)
                     (self.release / name).write_bytes(original)
                     self.checksums()
 
@@ -163,7 +180,7 @@ esac
         (self.home / '.ww/identity').write_text('malformed identity')
         before = self.snapshot()
         self.install(False)
-        self.assertEqual(self.snapshot(), before)
+        self.assert_native_refusal_preserved(before)
 
     def test_unknown_kernel_collision_preserved(self):
         destination = self.home / '.ww/fhs/boot/kernel.wasm'
@@ -171,7 +188,7 @@ esac
         destination.write_text('operator kernel')
         before = self.snapshot()
         self.install(False)
-        self.assertEqual(self.snapshot(), before)
+        self.assert_native_refusal_preserved(before)
 
     def test_managed_payload_can_change(self):
         self.install()

@@ -25,7 +25,44 @@ case "$REPLY" in
     ;;
 esac
 
-rm -rf "$WW_HOME"
+# Hold the same kernel lock as native installation/upgrade until rm exits.
+# Python is required here because macOS does not ship a flock command. Isolated
+# mode excludes user Python startup configuration; failures leave .ww intact.
+python3 -I -S - "$HOME" <<'PY'
+import fcntl
+import os
+import stat
+import sys
+
+try:
+    home = sys.argv[1]
+    if not os.path.isabs(home) or not stat.S_ISDIR(os.lstat(home).st_mode):
+        raise ValueError("installation HOME must be an absolute directory without symlink traversal")
+    fd = os.open(os.path.join(home, ".ww-installation.lock"),
+                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    metadata = os.fstat(fd)
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022):
+        raise ValueError("installation lock must be a private regular file owned by this user")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise ValueError("installation mutation already in progress; retry after it completes") from None
+    directory = os.path.join(home, ".ww")
+    if not stat.S_ISDIR(os.lstat(directory).st_mode):
+        raise ValueError("installation directory is not a directory")
+    try:
+        os.lstat(os.path.join(directory, "host-upgrade.json"))
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("pending Host upgrade; recover the recorded transaction before uninstalling")
+    # The deleting process owns the lock, even if its parent shell is killed.
+    os.set_inheritable(fd, True)
+    os.execv("/bin/rm", ["rm", "-rf", "--", directory])
+except (OSError, ValueError) as error:
+    sys.exit(f"Uninstall refused: {error}")
+PY
 echo "Removed ${WW_HOME}"
 
 echo ""
