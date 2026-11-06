@@ -9,7 +9,8 @@ This runbook grants no authority to change production, credentials, or CI runs.
 Workflow executions using this definition cannot schedule the legacy IPFS job,
 including master pushes and manual dispatch. Rust tests, formatting, Clippy,
 metrics tests, release builds, release validation, and GHCR publication retain
-their existing conditions. The legacy publisher scripts remain available.
+their existing conditions. The legacy official publisher scripts fail closed in this checkout.
+The held job now targets the restricted infra worker and dedicated Rust publisher.
 
 The condition does **not** fence queued or running executions using older
 workflow definitions, historical reruns, dispatch to refs without the hold,
@@ -63,9 +64,10 @@ Keep evidence private and omit secrets and private keys.
    restart with that authority. Record the old IPNS value, sequence, and
    observation time after quiescence. Already signed records can propagate
    later; an unchanged cached IPNS resolution is not proof of no pending write.
-6. **Check alternate entry points.** `scripts/ipfs_publish_release.sh` can run
-   directly. `make publish` calls `scripts/publish_local_release.sh` and can
-   advance `ww-release` when its Kubo endpoint has that key. `make publish-std`
+6. **Check alternate entry points.** Historical copies of `scripts/ipfs_publish_release.sh` can run
+   directly. Historical `make publish` and `scripts/publish_local_release.sh` can
+   advance `ww-release` when their Kubo endpoint has that key. The current
+   official scripts refuse publication before external calls. `make publish-std`
    can publish through an explicitly supplied `IPNS_KEY`. Other clients with
    Kubo API access or copies of the signing key can also publish. Fence those
    authorities, including historical CI, before declaring retirement.

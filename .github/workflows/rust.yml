@@ -8,9 +8,8 @@ on:
   workflow_dispatch: {}
 
 # Serialize release-producing runs per ref so image + IPNS publication from
-# different commits cannot interleave. Retain every pending run; the IPNS
-# ancestry guard below independently prevents an older run from rolling back
-# a newer published master revision.
+# different commits cannot interleave. Retain every pending run. The durable
+# infrastructure Owner orders official releases; IPNS is eventual discovery.
 concurrency:
   group: ww-release-${{ github.ref }}
   cancel-in-progress: false
@@ -138,10 +137,21 @@ jobs:
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
         python3 tests/test_release_auth.py
+        python3 tests/test_release_sequence.py
+        python3 tests/test_release_metadata.py
         bash -n scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
         if command -v shellcheck >/dev/null 2>&1; then
           shellcheck scripts/install.sh scripts/sign_release.sh scripts/publish_local_release.sh scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
         fi
+
+    - uses: actions/setup-go@v5
+      with:
+        go-version-file: tests/publication-negative-control/go.mod
+        cache-dependency-path: tests/publication-negative-control/go.sum
+
+    - name: Reproduce delayed older Boxo writes
+      working-directory: tests/publication-negative-control
+      run: go test -count=1 .
 
   fuzz-corpus:
     name: Fuzz corpus regressions
@@ -350,6 +360,7 @@ jobs:
     - name: Stage and validate canonical FHS
       run: |
         make package-check
+        cargo build --locked --bin ww-release-publisher
         bash tests/test_release_package.sh target/debug/examples/stage_fhs target/fhs
 
     - uses: actions/upload-artifact@v7
@@ -360,6 +371,7 @@ jobs:
           std/status/bin/status.wasm
           target/fhs/
           target/debug/examples/stage_fhs
+          target/debug/ww-release-publisher
           examples/*/bin/
           target/native-p3-fixture/wasm32-wasip3/release/native_p3_fixture.wasm
           target/authority-probe/wasm32-wasip3/release/authority_probe.wasm
@@ -517,6 +529,20 @@ jobs:
           exit 1
         fi
         cat proof.stdout
+
+    - name: Qualify release publisher against infrastructure Kubo
+      run: |
+        set -euo pipefail
+        directory="$RUNNER_TEMP/release-kubo043"
+        mkdir -p "$directory"
+        curl --fail --location --retry 5 \
+          https://github.com/ipfs/kubo/releases/download/v0.43.1/kubo_v0.43.1_linux-amd64.tar.gz \
+          --output "$directory/kubo.tar.gz"
+        echo "3f2bf974ab2a3ec6d997fac7d8cb46f59983a7cddd0b55ef998e6ce379155fb2  $directory/kubo.tar.gz" | sha256sum --check --strict
+        tar -xzf "$directory/kubo.tar.gz" -C "$directory"
+        chmod +x target/debug/ww-release-publisher
+        python3 tests/test_release_publisher.py --binary target/debug/ww-release-publisher \
+          --ipfs "$directory/kubo/ipfs" --fhs target/fhs
 
   test-stdlib:
     name: Test standalone standard library
@@ -694,14 +720,14 @@ jobs:
 
     - name: Build (native)
       if: ${{ !matrix.use_cross }}
-      run: cargo build --release --locked --target ${{ matrix.target }}
+      run: cargo build --release --locked --bin ww --target ${{ matrix.target }}
 
     - name: Build (cross)
       if: ${{ matrix.use_cross }}
       # cross runs its own unlocked metadata before forwarding build flags.
       run: |
         cargo metadata --locked --format-version 1 --manifest-path Cargo.toml > /dev/null
-        cross build --release --locked --target ${{ matrix.target }}
+        cross build --release --locked --bin ww --target ${{ matrix.target }}
 
     - name: Package binary
       run: |
@@ -713,6 +739,9 @@ jobs:
         cp target/${{ matrix.target }}/release/ww ${{ matrix.bin_path }}/ww
         cp -R target/fhs ${{ matrix.bin_path }}/fhs
         printf '%s\n' "${{ github.sha }}" > ${{ matrix.bin_path }}/REVISION
+        python3 -c 'import json,sys; print(json.dumps(dict(repository="https://github.com/wetware/ww", revision=sys.argv[1], builder=sys.argv[2])))' \
+          "${{ github.sha }}" "github-actions:${{ github.run_id }}:${{ github.run_attempt }}:${{ matrix.target }}" \
+          > ${{ matrix.bin_path }}/PROVENANCE.json
         (cd ${{ matrix.bin_path }} && shasum -a 256 ww > SHA256SUMS)
 
     - name: Verify static linking
@@ -743,6 +772,9 @@ jobs:
       run: |
         chmod +x artifacts/wasm-artifacts/target/debug/examples/stage_fhs
         bash scripts/assemble_release.sh artifacts release-tree "${{ github.sha }}"
+        cp artifacts/wasm-artifacts/target/debug/ww-release-publisher ./ww-release-publisher
+        chmod +x ./ww-release-publisher
+        bash tests/test_release_descriptor_package.sh ./ww-release-publisher artifacts release-tree
         chmod +x artifacts/ww-linux-musl-x86_64/ww
         WW_TEST_BINARY=artifacts/ww-linux-musl-x86_64/ww WW_TEST_FHS=release-tree/fhs python3 tests/test_host_install.py
         python3 tests/test_install.py --binary artifacts/ww-linux-musl-x86_64/ww --fhs release-tree/fhs
@@ -771,6 +803,10 @@ jobs:
         name: validated-release
         path: |
           release-tree/
+          artifacts/ww-*/REVISION
+          artifacts/ww-*/SHA256SUMS
+          artifacts/ww-*/PROVENANCE.json
+          ww-release-publisher
           tested-image.tar
         retention-days: 1
 
@@ -840,6 +876,25 @@ jobs:
       with:
         name: validated-release
 
+    - uses: ./.github/actions/setup-kubo
+
+    - name: Prepare authenticated release descriptor
+      env:
+        WW_RELEASE_CHANNEL: ${{ vars.WW_RELEASE_IPNS_NAME }}
+        WW_RELEASE_RUN_NUMBER: ${{ github.run_number }}
+        WW_RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
+      run: |
+        set -euo pipefail
+        chmod +x ./ww-release-publisher
+        # Admit only the current master tip before the trusted signer is used.
+        test "$(git rev-parse origin/master)" = "${{ github.sha }}"
+        test "$(scripts/check_release_ancestry.sh "${{ github.sha }}" '')" = publish
+        sequence=$(python3 scripts/release_sequence.py "$WW_RELEASE_RUN_NUMBER" "$WW_RELEASE_RUN_ATTEMPT")
+        python3 scripts/release_metadata.py --artifacts artifacts --tree release-tree \
+          --channel "$WW_RELEASE_CHANNEL" --sequence "$sequence" \
+          --builder "github-actions:${{ github.run_id }}:${{ github.run_attempt }}" > metadata.json
+        ./ww-release-publisher prepare --tree release-tree --spool release-spool --metadata metadata.json
+
     # Requires a separately approved protected environment and key provisioning.
     # No release private key is available to build, test, or PR jobs.
     - name: Sign exact release checksum manifest
@@ -870,198 +925,58 @@ jobs:
     - name: Publish to IPFS via VPS
       if: steps.release-signature.outcome == 'success'
       env:
-        SSH_CMD: ssh -i ~/.ssh/deploy_key -o ServerAliveInterval=30 -o ServerAliveCountMax=10
+        WW_RELEASE_TRUSTED_KEYS: ${{ vars.WW_RELEASE_TRUSTED_KEYS }}
+        WW_RELEASE_SSH_TARGET: ${{ vars.WW_RELEASE_SSH_TARGET }}
+        WW_RELEASE_SSH_KEY: ${{ secrets.WW_RELEASE_SSH_KEY }}
+        WW_RELEASE_SSH_HOST_KEY: ${{ vars.WW_RELEASE_SSH_HOST_KEY }}
       run: |
-        # Set up SSH
-        mkdir -p ~/.ssh
-        echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
-        chmod 600 ~/.ssh/deploy_key
-        echo "${{ secrets.DEPLOY_SSH_HOST_KEY }}" > ~/.ssh/known_hosts
-
-        # Select a non-terminating Ready pod. Kubernetes can retain an evicted
-        # pod record beside its healthy replacement, and a terminating pod can
-        # remain Running/Ready briefly; a bare label selector may pick either.
-        select_ready_ipfs_pod() {
-          $SSH_CMD ${{ secrets.VPS_SSH }} "kubectl --request-timeout=30s get pod -l app=ipfs-daemon --field-selector=status.phase=Running -o json | jq -r '.items | map(select(.metadata.deletionTimestamp | not) | select(any(.status.conditions[]?; .type == \"Ready\" and .status == \"True\"))) | .[0].metadata.name // empty'"
+        set +x
+        set -euo pipefail
+        umask 077
+        work=$(mktemp -d "$RUNNER_TEMP/ww-publication.XXXXXXXX")
+        export IPFS_PATH="$work/ipfs"
+        cleanup() {
+          if [ -n "${kubo_pid:-}" ]; then kill "$kubo_pid" 2>/dev/null || true; fi
+          rm -rf "$work"
         }
-
-        if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
-          echo "ERROR: failed to discover a non-terminating Ready IPFS daemon pod"
-          exit 1
+        trap cleanup EXIT
+        printf '%s' "$WW_RELEASE_TRUSTED_KEYS" > "$work/trusted-keys"
+        if [ "$(tail -c 1 "$work/trusted-keys" | od -An -tu1 | tr -d ' ')" != 10 ]; then
+          printf '\n' >> "$work/trusted-keys"
         fi
-        echo "IPFS pod: $POD"
-
-        # Resolve the currently published release and read its Git provenance.
-        # A missing REVISION is allowed only for the one-time migration from
-        # legacy release trees; resolution/listing/read failures fail closed.
-        read_current_release_state() {
-          local attempt backoff links release revision
-          for attempt in 1 2 3; do
-            if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
-              echo "Release freshness attempt $attempt could not find a Ready IPFS daemon pod" >&2
-            elif ! release=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs name resolve /ipns/\$(kubectl exec $POD -- ipfs key list -l | awk '\$2 == \"ww-release\" { print \$1; exit }')"); then
-              echo "Release freshness attempt $attempt could not resolve ww-release IPNS" >&2
-            elif [[ ! "$release" =~ ^/ipfs/[A-Za-z0-9]+$ ]]; then
-              echo "Release freshness attempt $attempt returned an invalid path: $release" >&2
-            elif ! links=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs ls '$release'"); then
-              echo "Release freshness attempt $attempt could not list $release" >&2
-            elif grep -Eq '[[:space:]]REVISION$' <<<"$links"; then
-              if revision=$($SSH_CMD ${{ secrets.VPS_SSH }} "kubectl exec $POD -- ipfs cat '$release/REVISION'"); then
-                revision="$(printf '%s' "$revision" | tr -d '\r\n')"
-                printf '%s|%s\n' "$release" "$revision"
-                return 0
-              fi
-              echo "Release freshness attempt $attempt could not read $release/REVISION" >&2
-            else
-              echo "Current release $release predates Git provenance; allowing one migration publish" >&2
-              printf '%s|\n' "$release"
-              return 0
-            fi
-
-            if [ "$attempt" -lt 3 ]; then
-              backoff=$((attempt * 20))
-              echo "Release freshness attempt $attempt failed; retrying in ${backoff}s..." >&2
-              sleep "$backoff"
-            fi
-          done
-          return 1
-        }
-
-        if ! CURRENT_STATE="$(read_current_release_state)"; then
-          echo "ERROR: could not establish current IPNS release provenance"
-          exit 1
-        fi
-        CURRENT_RELEASE="${CURRENT_STATE%%|*}"
-        CURRENT_REVISION="${CURRENT_STATE#*|}"
-
-        if ! FRESHNESS_ACTION="$(scripts/check_release_ancestry.sh "${{ github.sha }}" "$CURRENT_REVISION")"; then
-          echo "ERROR: refusing to move IPNS to a stale, divergent, or non-master revision"
-          exit 1
-        fi
-        case "$FRESHNESS_ACTION" in
-          publish) ;;
-          skip)
-            echo "IPNS already publishes Git revision ${{ github.sha }}; nothing to do"
-            {
-              echo "PUBLISH_ACTION=skipped"
-              echo "CID=${CURRENT_RELEASE#/ipfs/}"
-              echo "RELEASE_REVISION=${{ github.sha }}"
-            } >> "$GITHUB_ENV"
-            exit 0
-            ;;
-          *)
-            echo "ERROR: release ancestry check returned an unknown action: $FRESHNESS_ACTION"
-            exit 1
-            ;;
-        esac
-
-        # This is the exact tree validated before either publication job.
-        STAGE="$PWD/release-tree"
-        test "$(cat "$STAGE/REVISION")" = "${{ github.sha }}"
-        (cd "$STAGE" && sha256sum --check --strict CHECKSUMS.txt)
-        for payload in fhs/boot/kernel.wasm fhs/bin/status.wasm; do
-          test -s "$STAGE/$payload"
+        printf '%s\n' "$WW_RELEASE_SSH_KEY" > "$work/key"
+        printf '%s\n' "$WW_RELEASE_SSH_HOST_KEY" > "$work/known_hosts"
+        unset WW_RELEASE_TRUSTED_KEYS WW_RELEASE_SSH_KEY
+        ./ww-release-publisher finalize --tree release-tree --spool release-spool \
+          --trusted-keys "$work/trusted-keys" > "$work/candidate.json"
+        ipfs init
+        ipfs daemon > "$work/kubo.log" 2>&1 &
+        kubo_pid=$!
+        for attempt in $(seq 1 30); do
+          if ipfs id >/dev/null 2>&1; then break; fi
+          echo "Waiting for disposable Kubo (attempt $attempt)"
+          sleep 1
         done
-        for platform in linux/x86_64 linux/aarch64 macos/aarch64 macos/x86_64 linux/musl-x86_64; do
-          test -s "$STAGE/bin/ww/$platform/ww"
-        done
-
-        # Rsync release tree to VPS
-        rsync -a --delete -e "$SSH_CMD" "$STAGE/" ${{ secrets.VPS_SSH }}:/tmp/ww-release-tree/
-
-        # kubectl cp into pod, ipfs add with implicit pinning disabled,
-        # explicitly pin the new root, publish IPNS, then prune only stale
-        # release roots that are already present in the CI-managed state file.
-        # It also pushes provide records to the DHT so installers resolving
-        # from elsewhere can actually fetch the new content (otherwise IPNS
-        # may resolve before provides propagate, and `ipfs cat` from a remote
-        # node stalls).
-        #
-        # `set -e` inside the SSH script propagates kubectl-exec failures,
-        # and `set -o pipefail` here propagates the SSH exit status through
-        # the `tee` pipe (without it, tee always exits 0 and silent
-        # publish failures masquerade as success — see issue uncovered in #421).
-        set -o pipefail
-        published=false
-        rsync -a -e "$SSH_CMD" scripts/install.sh ${{ secrets.VPS_SSH }}:/tmp/ww-release-verifier.sh
-        rsync -a -e "$SSH_CMD" scripts/ipfs_publish_release.sh ${{ secrets.VPS_SSH }}:/tmp/ww-ipfs-publish-release.sh
+        # CI seeds immutable content only. The infrastructure worker independently
+        # authenticates and retains the complete graph before local commitment.
+        ./ww-release-publisher seed --spool release-spool --trusted-keys "$work/trusted-keys" \
+          --kubo-api http://127.0.0.1:5001
+        candidate=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["root"])' "$work/candidate.json")
+        request_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["request_id"])' "$work/candidate.json")
+        ipfs routing provide "$candidate"
+        [[ "$WW_RELEASE_SSH_TARGET" =~ ^[a-zA-Z0-9_.@:-]+$ && "$WW_RELEASE_SSH_TARGET" != -* ]]
+        acknowledged=false
         for attempt in 1 2 3; do
-          echo "Publish attempt $attempt..."
-          # Re-select immediately before publish: staging can take long enough
-          # for a healthy daemon pod to be replaced between attempts.
-          if ! POD="$(select_ready_ipfs_pod)" || [ -z "$POD" ]; then
-            echo "Publish attempt $attempt could not find a non-terminating Ready IPFS daemon pod"
-          else
-            echo "Publishing through IPFS pod: $POD"
-            # SSH_CMD intentionally expands to the command and its fixed options.
-            # shellcheck disable=SC2086
-            if timeout 12m $SSH_CMD ${{ secrets.VPS_SSH }} "
-              set -e
-              chmod +x /tmp/ww-ipfs-publish-release.sh
-              WW_RELEASE_VERIFIER=/tmp/ww-release-verifier.sh POD='$POD' WW_RELEASE_EXPECTED_CURRENT='$CURRENT_RELEASE' WW_RELEASE_PIN_RETAIN=10 /tmp/ww-ipfs-publish-release.sh
-            " | tee /tmp/ipfs-publish-output.txt; then
-              published=true
+          if ssh -i "$work/key" -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$work/known_hosts" \
+            "$WW_RELEASE_SSH_TARGET" "publish-v1 $request_id $candidate" > "$work/result.json"; then
+            if python3 -c 'import json,sys; f=open(sys.argv[1]); raw=f.read(16385); assert len(raw)<=16384; r=json.loads(raw); assert r.get("request_id")==sys.argv[2] and r.get("descriptor")==sys.argv[3] and r.get("local_committed") is True and r.get("delivery_acknowledged") is True' \
+              "$work/result.json" "$request_id" "$candidate"; then
+              acknowledged=true
               break
             fi
           fi
-
-          if [ "$attempt" -lt 3 ]; then
-            backoff=$((attempt * 20))
-            echo "Publish attempt $attempt failed; retrying in ${backoff}s..."
-            sleep "$backoff"
-          fi
+          echo "Publication acknowledgement uncertain (attempt $attempt); retrying the same candidate"
+          sleep 5
         done
-        if [ "$published" != "true" ]; then
-          echo "ERROR: publish failed after 3 attempts"
-          exit 1
-        fi
-
-        # Extract CID from output
-        extract_publish_field() {
-          grep "^$1=" /tmp/ipfs-publish-output.txt | tail -n 1 | cut -d= -f2-
-        }
-
-        CID=$(extract_publish_field CID)
-        if [ -z "$CID" ]; then
-          echo "ERROR: publish produced empty CID — IPNS was NOT updated"
-          exit 1
-        fi
-        echo "Release CID: $CID"
-        {
-          echo "PUBLISH_ACTION=published"
-          echo "CID=$CID"
-          echo "RELEASE_REVISION=${{ github.sha }}"
-          echo "IPNS_UPDATED=$(extract_publish_field IPNS_UPDATED)"
-          echo "RETAINED_COUNT=$(extract_publish_field RETAINED_COUNT)"
-          echo "UNPINNED_COUNT=$(extract_publish_field UNPINNED_COUNT)"
-          echo "UNPINNED_CIDS=$(extract_publish_field UNPINNED_CIDS)"
-          echo "FAILED_UNPIN_CIDS=$(extract_publish_field FAILED_UNPIN_CIDS)"
-          echo "REPO_STAT_BEFORE=$(extract_publish_field REPO_STAT_BEFORE)"
-          echo "REPO_STAT_AFTER=$(extract_publish_field REPO_STAT_AFTER)"
-        } >> "$GITHUB_ENV"
-
-    - name: Record CID
-      run: |
-        if [ "${{ env.PUBLISH_ACTION }}" = "skipped" ]; then
-          {
-            echo "## IPFS Publish"
-            echo "- Action: skipped; this Git revision is already current"
-            echo "- Git revision: \`${{ env.RELEASE_REVISION }}\`"
-            echo "- CID: \`${{ env.CID }}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit 0
-        fi
-        {
-          echo "## IPFS Publish"
-          echo "- Action: published"
-          echo "- Git revision: \`${{ env.RELEASE_REVISION }}\`"
-          echo "- CID: \`${{ env.CID }}\`"
-          echo "- IPNS: \`/ipns/${{ secrets.IPNS_KEY_ID }}\`"
-          echo "- IPNS pointer updated: \`${{ env.IPNS_UPDATED }}\`"
-          echo "- Retained release CIDs: \`${{ env.RETAINED_COUNT }}\`"
-          echo "- Stale release CIDs unpinned: \`${{ env.UNPINNED_COUNT }}\`"
-          echo "- Unpinned CIDs: \`${{ env.UNPINNED_CIDS }}\`"
-          echo "- Failed managed unpins: \`${{ env.FAILED_UNPIN_CIDS }}\`"
-          echo "- Repo size before: \`${{ env.REPO_STAT_BEFORE }}\`"
-          echo "- Repo size after: \`${{ env.REPO_STAT_AFTER }}\`"
-        } >> "$GITHUB_STEP_SUMMARY"
+        test "$acknowledged" = true

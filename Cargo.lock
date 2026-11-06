@@ -8389,6 +8389,7 @@ dependencies = [
  "hex",
  "indicatif",
  "ipfs",
+ "ipld-dagpb",
  "libc",
  "libp2p",
  "libp2p-stream",

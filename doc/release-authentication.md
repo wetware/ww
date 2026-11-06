@@ -160,36 +160,50 @@ bytes if recovery requires them. Do not add a temporary skip-verification flag.
 Until the first signed release and trust distribution are ready, distributing
 this new installer as the default would strand users. That cutover is NO-GO.
 
-## #738 integration contract
+## #738 descriptor binding
 
-#412 signs manifest bytes; #738 owns descriptor schema, retention, discovery,
-and freshness. There must be one release trust root and one publication owner.
-The compatible binding order is:
+The descriptor uses the existing #412 signer. It adds no signing authority.
+The frozen binding order is:
 
-1. Finalize and retain the descriptor and its artifact graph through #737/#798.
-2. Write `RELEASE-DESCRIPTOR` containing the exact canonical descriptor CID and
-   one LF. Add its SHA-256 record to `CHECKSUMS.txt` before signing. Alternatively,
-   add a SHA-256 record for exact descriptor bytes. #738 must choose and freeze
-   its representation, supported CID profile, and parser.
-3. Sign the final manifest through #412. Keep the manifest and signature outside
-   the descriptor's hashed content. The descriptor must not contain their hashes
-   or the enclosing release-root CID. This dependency direction has no hash cycle.
-4. The consumer authenticates the manifest, verifies the binding file's exact
-   bytes, validates the CID/schema, and fetches/verifies the descriptor. A CID
-   alone never authorizes selection. #738 must retain real traversable IPLD links;
-   a CID string in this binding file does not retain the artifact graph.
+1. Construct immutable artifact graphs and the canonical version-1 descriptor.
+   The descriptor contains actual IPLD links and excludes its enclosing root,
+   manifest, and signature.
+2. Write `RELEASE-DESCRIPTOR` as canonical descriptor CID text plus exactly one
+   LF. Add the binding's ordinary SHA-256 entry to `CHECKSUMS.txt`.
+3. Sign the exact manifest bytes with the existing Ed25519 procedure.
+4. Finalize the legacy-compatible UnixFS transport root. It reaches all payloads,
+   manifest, signature, binding, and a direct `release-descriptor` IPLD link.
+5. Begin the owner candidate for that final root. Retain complete bounded child
+   stages and then the final root. Authenticate before authoritative local
+   commitment. Announce through IPNS after that commitment.
 
-This is an available format seam, not implemented descriptor publication.
-The generic authenticated manifest verifier can verify this binding file today.
-The installer does not interpret descriptors. #738 must test tampered binding
-bytes, mismatched descriptor/platform data, and missing binding records.
+`AuthenticatedRelease` verifies the signature, binding bytes, descriptor CID,
+schema, and manifest artifact bindings. Selection checks platform and Host/PID0
+compatibility. Artifact verification checks exact reconstructed bytes before use.
+The shell installer keeps its existing signed-manifest path during migration;
+it does not interpret descriptors or persist consumer freshness state.
+
+The Rust consumer records raw signed IPNS evidence and the signed release proof
+in one locked durable watermark. IPNS sequence and release sequence are separate
+monotonic floors. Historical immutable selection never rewinds that watermark.
+The watermark includes the public keyring used at acceptance. Reopening uses
+that historical keyring only to verify the persisted floor. Each new discovery
+must authenticate with the current independently provisioned keyring. A consumer
+offline during key overlap can therefore preserve its floor after the old key
+is removed, then accept a higher release signed by the new key. Historical keys
+never authorize a new discovery. This relies on the documented private-state
+integrity boundary; hostile filesystem writes and rollback are excluded.
+A fresh consumer cannot prove latest release discovery through IPNS alone.
+See [release-publication.md](release-publication.md) for local commitment,
+uncertain delivery, recovery, and the approved divergence from #737's CAS claim.
 
 ## Limits and assumptions
 
-Authentication does not establish freshness, channel identity, source provenance,
-or reproducibility. A malicious publisher can replay a previously signed release
-or deny service. #738 owns consumer freshness and intentional rollback policy;
-reuse existing signed-IPNS watermark machinery where applicable. `VERSION`,
+Manifest authentication alone does not establish freshness or reproducibility.
+The authenticated descriptor additionally binds channel identity and asserted
+source provenance. Producer provenance is an authorized assertion, not a
+reproducible-build proof. A malicious publisher can replay a previously signed release
+or deny service. Rust descriptor consumers enforce the freshness policy above. `VERSION`,
 `REVISION`, examples, and installer files are not implicitly authenticated by
 payload-only checksum entries. Do not derive authority from those files.
 

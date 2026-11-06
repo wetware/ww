@@ -43,10 +43,14 @@ impl Publisher for FixturePublisher {
     fn domain(&self) -> &str {
         "fixture"
     }
-    async fn publish(&self, intent: &PublicationIntent) -> Result<PublicationOutcome> {
+    async fn prepare(&self, intent: &PublicationIntent) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(intent)?)
+    }
+    async fn publish(&self, intent: &PublicationIntent, announcement: &[u8]) -> Result<()> {
+        assert_eq!(announcement, serde_json::to_vec(intent)?);
         let mut current = self.current.lock().unwrap();
         if *current == Some(intent.next.clone()) {
-            return Ok(PublicationOutcome::Applied);
+            return Ok(());
         }
         ensure!(
             *current == intent.previous,
@@ -59,7 +63,7 @@ impl Publisher for FixturePublisher {
                 .swap(false, std::sync::atomic::Ordering::SeqCst),
             "lost publication acknowledgement"
         );
-        Ok(PublicationOutcome::Applied)
+        Ok(())
     }
 }
 
@@ -190,7 +194,10 @@ async fn cancellation_keeps_pending_retention_and_publication_intents() {
         fn domain(&self) -> &str {
             "fixture"
         }
-        async fn publish(&self, _: &PublicationIntent) -> Result<PublicationOutcome> {
+        async fn prepare(&self, intent: &PublicationIntent) -> Result<Vec<u8>> {
+            Ok(serde_json::to_vec(intent)?)
+        }
+        async fn publish(&self, _: &PublicationIntent, _: &[u8]) -> Result<()> {
             std::future::pending().await
         }
     }
@@ -228,15 +235,18 @@ async fn cancellation_keeps_pending_retention_and_publication_intents() {
 }
 
 #[tokio::test]
-async fn rejected_publication_requires_adapter_fence_and_does_not_advance() {
+async fn authentication_refusal_has_no_commit_or_delivery() {
     struct Reject;
     #[async_trait]
     impl Publisher for Reject {
         fn domain(&self) -> &str {
             "fixture"
         }
-        async fn publish(&self, _: &PublicationIntent) -> Result<PublicationOutcome> {
-            Ok(PublicationOutcome::Rejected)
+        async fn prepare(&self, _: &PublicationIntent) -> Result<Vec<u8>> {
+            anyhow::bail!("unauthenticated release")
+        }
+        async fn publish(&self, _: &PublicationIntent, _: &[u8]) -> Result<()> {
+            panic!("unauthenticated release delivered")
         }
     }
     let dir = tempfile::tempdir().unwrap();
@@ -244,11 +254,8 @@ async fn rejected_publication_requires_adapter_fence_and_does_not_advance() {
     let id = retained(&mut owner, &Backend::default(), b"rejected").await;
     assert!(owner.publish(id, &Reject).await.is_err());
     assert_eq!(owner.current().unwrap(), None);
-    assert_eq!(owner.releases().unwrap()[0].state, ReleaseState::Retired);
-    assert!(owner
-        .publish(id, &FixturePublisher::default())
-        .await
-        .is_err());
+    assert_eq!(owner.releases().unwrap()[0].state, ReleaseState::Retained);
+    owner.retire(id).unwrap();
     owner.begin(block(b"next").0, None).unwrap();
 }
 
@@ -308,7 +315,7 @@ async fn domains_are_checked_before_any_effect() {
 fn corrupt_missing_noncanonical_and_oversized_journals_fail_closed() {
     for content in [
         b"{bad".as_slice(),
-        br#"{"version":2,"domain":"fixture","current":null,"releases":[]}"#,
+        br#"{"version":3,"domain":"fixture","current":null,"releases":[]}"#,
         br#"{"version":1,"domain":"fixture","current":null,"releases":[]} "#,
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -434,8 +441,12 @@ fn crash_child() {
             owner.publish(id, &publisher).await.unwrap();
         }
         if transition == 6 {
+            owner.publish(id, &publisher).await.unwrap();
+            let next = owner
+                .begin(block(b"abandoned").0, owner.current().unwrap())
+                .unwrap();
             owner.journal.fault = Some((point, true));
-            owner.retire(id).unwrap();
+            owner.retire(next).unwrap();
         }
         panic!("crash hook did not exit");
     });
@@ -471,11 +482,11 @@ fn process_crash_at_every_durable_transition_boundary() {
                     .unwrap();
                 assert!(release.stages.contains(&current.root));
                 assert_eq!(release.state, ReleaseState::Published);
-                assert!(!release.publishing);
+                assert!(release.announcement.is_some());
             }
             for release in owner.releases().unwrap() {
                 if release.publishing {
-                    assert_eq!(release.state, ReleaseState::Retained);
+                    assert_eq!(release.state, ReleaseState::Published);
                 }
             }
         }
@@ -542,7 +553,7 @@ async fn stage_limit_is_global_persistent_and_checked_before_import() {
 }
 
 #[tokio::test]
-async fn delayed_publication_after_cancellation_cannot_overwrite_newer_publication() {
+async fn delayed_older_delivery_can_regress_discovery_but_not_local_authority() {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -572,7 +583,11 @@ async fn delayed_publication_after_cancellation_cannot_overwrite_newer_publicati
         fn domain(&self) -> &str {
             "fixture"
         }
-        async fn publish(&self, intent: &PublicationIntent) -> Result<PublicationOutcome> {
+        async fn prepare(&self, intent: &PublicationIntent) -> Result<Vec<u8>> {
+            Ok(serde_json::to_vec(intent)?)
+        }
+        async fn publish(&self, intent: &PublicationIntent, announcement: &[u8]) -> Result<()> {
+            assert_eq!(announcement, serde_json::to_vec(intent)?);
             if self.delay_once.swap(false, Ordering::SeqCst) {
                 let current = self.current.clone();
                 let release = self.release.clone();
@@ -581,13 +596,15 @@ async fn delayed_publication_after_cancellation_cannot_overwrite_newer_publicati
                 // Models a remote request that outlives the dropped waiter.
                 tokio::spawn(async move {
                     release.notified().await;
-                    assert!(compare_and_publish(&current, &intent).is_err());
+                    // A receiver already admitted this request before the
+                    // newer write; its delayed storage write is not fenced.
+                    *current.lock().unwrap() = Some(intent.next);
                     settled.notify_one();
                 });
                 std::future::pending::<()>().await;
             }
             compare_and_publish(&self.current, intent)?;
-            Ok(PublicationOutcome::Applied)
+            Ok(())
         }
     }
     let publisher = DelayedPublisher {
@@ -615,8 +632,18 @@ async fn delayed_publication_after_cancellation_cannot_overwrite_newer_publicati
     tokio::time::timeout(Duration::from_secs(1), publisher.settled.notified())
         .await
         .unwrap();
-    assert_eq!(*publisher.current.lock().unwrap(), owner.current().unwrap());
+    assert_eq!(
+        publisher
+            .current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .generation,
+        first
+    );
     assert_eq!(owner.current().unwrap().unwrap().generation, second);
+    assert!(owner.publish(first, &publisher).await.is_err());
 }
 
 #[tokio::test]
@@ -627,7 +654,11 @@ async fn publication_adapter_observes_durable_retention_and_intent_before_effect
         fn domain(&self) -> &str {
             "fixture"
         }
-        async fn publish(&self, intent: &PublicationIntent) -> Result<PublicationOutcome> {
+        async fn prepare(&self, intent: &PublicationIntent) -> Result<Vec<u8>> {
+            Ok(serde_json::to_vec(intent)?)
+        }
+        async fn publish(&self, intent: &PublicationIntent, announcement: &[u8]) -> Result<()> {
+            assert_eq!(announcement, serde_json::to_vec(intent)?);
             let bytes = std::fs::read(self.0.join("state.json"))?;
             let state: State = serde_json::from_slice(&bytes)?;
             state.validate()?;
@@ -636,12 +667,12 @@ async fn publication_adapter_observes_durable_retention_and_intent_before_effect
                 .iter()
                 .find(|r| r.publication == intent.next)
                 .unwrap();
-            assert_eq!(release.state, ReleaseState::Retained);
+            assert_eq!(release.state, ReleaseState::Published);
             assert!(release.publishing);
             assert!(release.pending_stage.is_none());
             assert!(release.stages.contains(&intent.next.root));
-            assert_eq!(state.current, intent.previous);
-            Ok(PublicationOutcome::Applied)
+            assert_eq!(state.current, Some(intent.next.clone()));
+            Ok(())
         }
     }
     let dir = tempfile::tempdir().unwrap();
@@ -651,4 +682,25 @@ async fn publication_adapter_observes_durable_retention_and_intent_before_effect
         .publish(id, &InspectPublisher(dir.path().to_owned()))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn local_commit_survives_uncertain_delivery_and_can_be_superseded() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Backend::default();
+    let publisher = FixturePublisher::default();
+    let mut owner = Owner::open(dir.path(), "fixture").unwrap();
+    let first = retained(&mut owner, &backend, b"local-first").await;
+    publisher
+        .lose_ack
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(owner.publish(first, &publisher).await.is_err());
+    assert_eq!(owner.current().unwrap().unwrap().generation, first);
+    drop(owner);
+    let mut owner = Owner::open(dir.path(), "fixture").unwrap();
+    assert_eq!(owner.current().unwrap().unwrap().generation, first);
+    let next = retained(&mut owner, &backend, b"local-next").await;
+    owner.publish(next, &publisher).await.unwrap();
+    assert!(owner.publish(first, &publisher).await.is_err());
+    assert_eq!(owner.current().unwrap().unwrap().generation, next);
 }

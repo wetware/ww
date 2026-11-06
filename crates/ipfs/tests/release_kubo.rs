@@ -14,9 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Result};
 use async_trait::async_trait;
 use cid::Cid;
-use ipfs::release::{
-    KuboRetention, Owner, Publication, PublicationIntent, PublicationOutcome, Publisher, Retention,
-};
+use ipfs::release::{KuboRetention, Owner, Publication, PublicationIntent, Publisher, Retention};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -182,17 +180,21 @@ impl Publisher for FixturePublisher {
     fn domain(&self) -> &str {
         DOMAIN
     }
-    async fn publish(&self, intent: &PublicationIntent) -> Result<PublicationOutcome> {
+    async fn prepare(&self, intent: &PublicationIntent) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(intent)?)
+    }
+    async fn publish(&self, intent: &PublicationIntent, announcement: &[u8]) -> Result<()> {
+        assert_eq!(announcement, serde_json::to_vec(intent)?);
         let mut current = self.0.lock().unwrap();
         if *current == Some(intent.next.clone()) {
-            return Ok(PublicationOutcome::Applied);
+            return Ok(());
         }
         ensure!(
             *current == intent.previous,
             "fixture conditional publication conflict"
         );
         *current = Some(intent.next.clone());
-        Ok(PublicationOutcome::Applied)
+        Ok(())
     }
 }
 

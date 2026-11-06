@@ -1,32 +1,19 @@
 //! Durable release retention and publication ordering, independent of deployment caches.
 //!
-//! [`Owner`] serializes a channel's candidate, retained, published, and retired
-//! transitions through one locked journal. It validates bounded artifact stages
-//! before retention, records intent before backend effects, and records durable
-//! retention acknowledgements before permitting publication. Publication intent
-//! is durable before the [`Publisher`] adapter is called. Uncertain retention
-//! and publication acknowledgements require reconciliation with their adapters.
+//! [`Owner`] is the authoritative local release ordering journal for one channel.
+//! Complete retention precedes local commitment. The same atomic journal commit
+//! selects the current release and saves its immutable announcement request.
+//! Only then may [`Publisher`] deliver that request to eventual discovery.
 //!
-//! These responsibilities are distinct:
+//! Delivery acknowledgement is evidence of transport acceptance, not remote CAS,
+//! delayed-write fencing, or proof that any consumer discovers the latest release.
+//! Errors and cancellation cannot undo a local commit. A newer local commit may
+//! supersede an uncertain delivery; an older remote write may still arrive later.
+//! Consumers need authenticated release freshness watermarks. A new consumer
+//! cannot prove latest discovery through IPNS alone.
 //!
-//! - Content identity: a CID identifies bytes; it neither retains nor
-//!   authenticates them.
-//! - Retention: a durable backend acknowledgement establishes the required
-//!   storage obligation under the [`Retention`] contract.
-//! - Publication: authenticated, conditional selection makes a retained release
-//!   discoverable. The [`Publisher`] contract requires authentication,
-//!   expected-current checks, idempotent reconciliation, and stale-effect fencing.
-//!
-//! The journal records local decisions and adapter evidence. It does not
-//! independently establish remote publication truth or audit retained storage.
-//! Retirement changes local metadata without unpinning; pruning is refused
-//! because exclusive or coordinated pin ownership has not been established.
-//!
-//! See `doc/release-publication.md` for storage, durability, and adapter contracts.
-//! No production publisher is provided; authenticated integration belongs to
-//! [#738](https://github.com/wetware/ww/issues/738). The inline Map and release
-//! owner do not define the general persistent-collection APIs or Cell lifetime
-//! contracts explored in [#698](https://github.com/wetware/ww/issues/698).
+//! Retirement never unpins. The journal does not audit retained backend storage.
+//! See `doc/release-publication.md` for the approved divergence from #737.
 
 mod graph;
 mod journal;
@@ -56,27 +43,24 @@ pub struct PublicationIntent {
     pub next: Publication,
 }
 
-/// An error or cancellation means the publication result is unknown.
-pub enum PublicationOutcome {
-    Applied,
-    /// Terminal refusal: the adapter must fence all retries and delayed calls
-    /// for this intent before returning this outcome.
-    Rejected,
-}
-
-/// Integration boundary for #738. Implementations must authenticate exact root
-/// selection, enforce ancestry/rollback policy, and atomically compare previous
-/// publication with the remote current publication. The complete intent is an
-/// idempotency key. A successful retry cannot regress a newer remote value.
+/// Authenticated discovery adapter. `prepare` must validate the exact release,
+/// its channel, ordering, and compatibility before returning a bounded immutable
+/// request. It MUST NOT announce anything. The owner journals that request and
+/// commits local authority before calling `publish`.
 ///
-/// Errors/cancellation can leave effects in flight. Retrying the SAME intent
-/// must reconcile them. `Rejected` must also fence delayed effects. An ordinary
-/// IPNS PUT does not satisfy this contract. Only test fixtures implement it here.
+/// `publish` may deliver the request more than once. Success acknowledges delivery
+/// only. Errors/cancellation leave delivery uncertain, including after a newer
+/// local release commits. No remote comparison, CAS, or delayed-effect fence is
+/// assumed. The owner never invokes an obsolete request after supersession.
 #[async_trait]
 pub trait Publisher: Send + Sync {
     fn domain(&self) -> &str;
-    async fn publish(&self, intent: &PublicationIntent) -> Result<PublicationOutcome>;
+    async fn prepare(&self, intent: &PublicationIntent) -> Result<Vec<u8>>;
+    async fn publish(&self, intent: &PublicationIntent, announcement: &[u8]) -> Result<()>;
 }
+
+/// Bounded immutable delivery request stored in the existing owner journal.
+pub const MAX_ANNOUNCEMENT_BYTES: usize = 16 * 1024;
 
 /// Retention must atomically exclude GC from import through complete recursive
 /// graph validation, pinning, and durable pin acknowledgement. Empty blocks
@@ -140,8 +124,11 @@ pub struct Release {
     pub stages: Vec<Cid>,
     /// A validated import whose acknowledgement is not durably recorded yet.
     pub pending_stage: Option<Cid>,
-    /// Durable intent exists; retirement is forbidden until the adapter settles it.
+    /// Delivery has not been acknowledged. May remain true after retirement;
+    /// a superseded request can still be in flight remotely.
     pub publishing: bool,
+    /// Immutable authenticated request selected at the local commit point.
+    pub announcement: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -174,7 +161,7 @@ impl Owner {
             Some(state) => state,
             None => {
                 let state = State {
-                    version: 1,
+                    version: 2,
                     domain: domain.to_owned(),
                     current: None,
                     releases: Vec::new(),
@@ -264,6 +251,7 @@ impl Owner {
             stages: Vec::new(),
             pending_stage: None,
             publishing: false,
+            announcement: None,
         });
         self.commit(next)?;
         Ok(generation)
@@ -371,9 +359,10 @@ impl Owner {
         self.commit(next)
     }
 
-    /// Persist intent before calling the authenticated adapter. On uncertain
-    /// results, retry this method with the same adapter and generation.
-    pub async fn publish<P: Publisher + ?Sized>(
+    /// Commit local release authority after complete retention and authentication.
+    /// A successful return means the exact request and current release survived
+    /// file sync, atomic rename, and directory sync. No remote write occurs here.
+    pub async fn commit_publication<P: Publisher + ?Sized>(
         &mut self,
         generation: u64,
         publisher: &P,
@@ -403,45 +392,64 @@ impl Owner {
             previous: release.previous.clone(),
             next: release.publication.clone(),
         };
-        if !release.publishing {
-            let mut next = self.state.clone();
-            next.releases[index].publishing = true;
-            self.commit(next)?;
-        }
-        let outcome = publisher.publish(&intent).await?;
+        let announcement = publisher.prepare(&intent).await?;
+        ensure!(
+            !announcement.is_empty() && announcement.len() <= MAX_ANNOUNCEMENT_BYTES,
+            "invalid announcement size"
+        );
         let mut next = self.state.clone();
-        next.releases[index].publishing = false;
-        match outcome {
-            PublicationOutcome::Applied => {
-                for release in &mut next.releases {
-                    if release.state == ReleaseState::Published {
-                        release.state = ReleaseState::Retired;
-                    }
-                }
-                next.releases[index].state = ReleaseState::Published;
-                next.current = Some(intent.next);
-                self.commit(next)
-            }
-            PublicationOutcome::Rejected => {
-                next.releases[index].state = ReleaseState::Retired;
-                self.commit(next)?;
-                anyhow::bail!("publication adapter rejected and fenced intent")
+        for release in &mut next.releases {
+            if release.state == ReleaseState::Published {
+                release.state = ReleaseState::Retired;
             }
         }
+        next.releases[index].announcement = Some(announcement);
+        next.releases[index].publishing = true;
+        next.releases[index].state = ReleaseState::Published;
+        next.current = Some(intent.next);
+        self.commit(next)
     }
 
-    /// Retire an inactive candidate. A current publication or uncertain
-    /// publication cannot be retired. Unknown retention effects retain pins.
+    /// Commit if needed, then deliver the current immutable request. Every call
+    /// can reannounce current state, including after an earlier acknowledgement.
+    /// Transport acknowledgement never proves eventual discoverability.
+    pub async fn publish<P: Publisher + ?Sized>(
+        &mut self,
+        generation: u64,
+        publisher: &P,
+    ) -> Result<()> {
+        self.commit_publication(generation, publisher).await?;
+        let index = self.index(generation)?;
+        let release = &self.state.releases[index];
+        let intent = PublicationIntent {
+            previous: release.previous.clone(),
+            next: release.publication.clone(),
+        };
+        publisher
+            .publish(
+                &intent,
+                release
+                    .announcement
+                    .as_deref()
+                    .context("missing committed announcement")?,
+            )
+            .await?;
+        if self.state.releases[index].publishing {
+            let mut next = self.state.clone();
+            next.releases[index].publishing = false;
+            self.commit(next)?;
+        }
+        Ok(())
+    }
+
+    /// Retire an inactive candidate. Current local authority cannot be retired.
+    /// Superseded announcements may remain uncertain. All pins remain retained.
     pub fn retire(&mut self, generation: u64) -> Result<()> {
         let index = self.index(generation)?;
         let release = &self.state.releases[index];
         ensure!(
             release.state != ReleaseState::Published,
             "cannot retire current publication"
-        );
-        ensure!(
-            !release.publishing,
-            "uncertain publication must be reconciled first"
         );
         if release.state == ReleaseState::Retired {
             return Ok(());
@@ -474,7 +482,7 @@ impl State {
             .sum()
     }
     fn validate(&self) -> Result<()> {
-        ensure!(self.version == 1, "unknown release journal version");
+        ensure!(self.version == 2, "unknown release journal version");
         validate_domain(&self.domain)?;
         ensure!(
             self.releases.len() <= MAX_RELEASES && self.stage_count() <= MAX_STAGES,
@@ -529,8 +537,25 @@ impl State {
                 );
             }
             ensure!(
-                !release.publishing || release.state == ReleaseState::Retained,
-                "publication intent outside retained state"
+                !release.publishing || release.announcement.is_some(),
+                "delivery pending without committed announcement"
+            );
+            if let Some(announcement) = &release.announcement {
+                ensure!(
+                    !announcement.is_empty() && announcement.len() <= MAX_ANNOUNCEMENT_BYTES,
+                    "invalid announcement size"
+                );
+                ensure!(
+                    matches!(
+                        release.state,
+                        ReleaseState::Published | ReleaseState::Retired
+                    ) && stages.contains(&release.publication.root),
+                    "announcement without retained local commitment"
+                );
+            }
+            ensure!(
+                release.state != ReleaseState::Published || release.announcement.is_some(),
+                "current publication has no announcement"
             );
             if matches!(
                 release.state,

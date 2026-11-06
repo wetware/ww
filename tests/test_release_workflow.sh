@@ -66,31 +66,12 @@ grep -Fq 'needs: [changes, test, validate-release, release_image]' "$WORKFLOW" \
   || fail "IPFS publication must wait for the image build, not a deployment"
 grep -Fq 'name: Publish to IPFS' "$WORKFLOW" \
   || fail "workflow must retain IPFS publication"
-grep -Fq 'get pod -l app=ipfs-daemon --field-selector=status.phase=Running -o json | jq -r' "$WORKFLOW" \
-  || fail "IPFS publisher must consider only Running daemon pods"
-grep -Fq 'select(.metadata.deletionTimestamp | not)' "$WORKFLOW" \
-  || fail "IPFS publisher must exclude terminating daemon pods"
-grep -Fq 'any(.status.conditions[]?; .type == \"Ready\" and .status == \"True\")' "$WORKFLOW" \
-  || fail "IPFS publisher must select a Ready daemon pod"
-retry_loop="$({
-  awk '
-    /for attempt in 1 2 3; do/ { in_loop = 1 }
-    in_loop { print }
-    in_loop && /^        done$/ { exit }
-  ' "$WORKFLOW"
-})"
-pod_selection="POD=\"\$(select_ready_ipfs_pod)\""
-grep -Fq "$pod_selection" <<<"$retry_loop" \
-  || fail "IPFS publisher must reselect a Ready daemon pod for each retry"
-publish_retry_selection="$({
-  awk '
-    /Re-select immediately before publish/ { capture = 1 }
-    capture { print }
-    capture && /else/ { exit }
-  ' "$WORKFLOW"
-})"
-grep -Fq "$pod_selection" <<<"$publish_retry_selection" \
-  || fail "IPFS publisher must reselect a Ready daemon pod before each publish retry"
+# shellcheck disable=SC2016
+grep -Fq 'publish-v1 $request_id $candidate' "$WORKFLOW" \
+  || fail "IPFS publisher must use the restricted worker command"
+if grep -Eq '\b(kubectl|rsync)\b' "$WORKFLOW"; then
+  fail "legacy cluster publication transport remains"
+fi
 if grep -Fq 'fetch_previous_binaries' "$WORKFLOW"; then
   fail "std-only releases must consume the current run's Host binaries"
 fi
@@ -114,7 +95,7 @@ grep -Fq 'bash tests/test_container_boot.sh ww-validated:release' "$WORKFLOW" ||
 grep -Fq 'bash tests/test_container_boot.sh ww-validated:source' "$WORKFLOW" || fail 'source boot gate missing'
 grep -Fq 'docker load -i tested-image.tar' <<<"$release_job" || fail 'GHCR must publish the tested image'
 grep -Fq "            - 'scripts/**'" "$WORKFLOW" || fail 'installer-only changes must trigger release validation'
-grep -Fq 'linux/musl-x86_64' "$WORKFLOW" || fail 'IPFS must include fifth Host target'
+grep -Fq 'test_release_descriptor_package.sh' "$WORKFLOW" || fail 'descriptor package validation missing'
 
 # Release secrets belong only to the guarded signing step. These assertions
 # inspect source boundaries; environment protection settings require operator
