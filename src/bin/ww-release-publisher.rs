@@ -8,11 +8,17 @@ use std::{
 
 use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
-use ww::{
-    release_auth::TrustedKeys,
-    release_package::{self, Package},
-    release_publisher::{self, Config, KuboApi, Request},
-};
+use ww::release::auth::TrustedKeys;
+
+// Compile infrastructure publication only into this executable. Shared
+// authentication/descriptors stay in ww::release for runtime consumers.
+#[path = "../release/package.rs"]
+mod package;
+#[path = "../release/publisher.rs"]
+mod publisher;
+
+use package::Package;
+use publisher::{Config, KuboApi, Request};
 
 #[derive(Parser)]
 #[command(about = "Prepare and publish authenticated Wetware releases", version)]
@@ -23,6 +29,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Encode workflow and attempt counters as an ordered release sequence.
+    Sequence { run_number: i64, run_attempt: i64 },
+    /// Build release metadata from the five original Host producer receipts.
+    Metadata {
+        #[arg(long)]
+        artifacts: PathBuf,
+        #[arg(long)]
+        tree: PathBuf,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        sequence: u64,
+        #[arg(long)]
+        builder: String,
+    },
     /// Build the descriptor and signed-manifest binding before offline signing.
     Prepare {
         #[arg(long)]
@@ -74,7 +95,7 @@ enum Command {
 }
 
 fn keys(path: &Path) -> Result<TrustedKeys> {
-    TrustedKeys::from_bytes(&release_publisher::read_bounded(path, 122)?)
+    TrustedKeys::from_bytes(&publisher::read_bounded(path, 122)?)
 }
 
 fn emit(value: &impl serde::Serialize) -> Result<()> {
@@ -103,12 +124,12 @@ fn package_result(package: &Package, trust: &TrustedKeys) -> Result<serde_json::
 async fn publish(config_path: &Path, endpoint: &str, package: Option<&Path>) -> Result<()> {
     let mut bytes = Vec::new();
     std::io::stdin()
-        .take(release_publisher::MAX_REQUEST_BYTES as u64 + 1)
+        .take(publisher::MAX_REQUEST_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     let request = Request::parse(&bytes)?;
     let operation = async {
         let config = Config::load(config_path)?;
-        release_publisher::publish_request(request.clone(), &config, endpoint, package).await
+        publisher::publish_request(request.clone(), &config, endpoint, package).await
     }
     .await;
     match operation {
@@ -140,14 +161,26 @@ async fn publish(config_path: &Path, endpoint: &str, package: Option<&Path>) -> 
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Some(Command::Sequence {
+            run_number,
+            run_attempt,
+        }) => emit(&package::release_sequence(run_number, run_attempt)?),
+        Some(Command::Metadata {
+            artifacts,
+            tree,
+            channel,
+            sequence,
+            builder,
+        }) => emit(&package::metadata(
+            &artifacts, &tree, channel, sequence, builder,
+        )?),
         Some(Command::Prepare {
             tree,
             spool,
             metadata,
         }) => {
-            let metadata =
-                serde_json::from_slice(&release_publisher::read_bounded(&metadata, 64 * 1024)?)?;
-            let descriptor = release_package::prepare(&tree, &spool, metadata)?;
+            let metadata = serde_json::from_slice(&publisher::read_bounded(&metadata, 64 * 1024)?)?;
+            let descriptor = package::prepare(&tree, &spool, metadata)?;
             emit(
                 &serde_json::json!({"descriptor": descriptor.cid()?.to_string(), "sequence": descriptor.sequence}),
             )
@@ -158,7 +191,7 @@ async fn main() -> Result<()> {
             trusted_keys,
         }) => {
             let trust = keys(&trusted_keys)?;
-            let package = release_package::finalize(&tree, &spool, &trust)?;
+            let package = package::finalize(&tree, &spool, &trust)?;
             emit(&package_result(&package, &trust)?)
         }
         Some(Command::Verify {
@@ -204,7 +237,7 @@ async fn main() -> Result<()> {
                 endpoint.starts_with("/unix/"),
                 "installed publisher requires a Kubo Unix socket"
             );
-            publish(Path::new(release_publisher::CONFIG_PATH), &endpoint, None).await
+            publish(Path::new(publisher::CONFIG_PATH), &endpoint, None).await
         }
     }
 }

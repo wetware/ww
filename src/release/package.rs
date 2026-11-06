@@ -4,13 +4,6 @@
 //! existing `ipfs::release::Owner` journal. File chunks and retention stages are
 //! bounded independently of the complete release size.
 
-use crate::{
-    release_auth::TrustedKeys,
-    release_descriptor::{
-        Artifact, AuthenticatedRelease, DeploymentArtifact, Descriptor, HostArtifact, Provenance,
-        BINDING_PATH, COMPATIBILITY_PROFILE, DESCRIPTOR_LINK_NAME,
-    },
-};
 use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 use cid::Cid;
@@ -23,6 +16,13 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
+};
+use ww::release::{
+    auth::TrustedKeys,
+    descriptor::{
+        Artifact, AuthenticatedRelease, DeploymentArtifact, Descriptor, HostArtifact, Provenance,
+        BINDING_PATH, COMPATIBILITY_PROFILE, DESCRIPTOR_LINK_NAME,
+    },
 };
 
 const CHUNK_BYTES: usize = 1024 * 1024;
@@ -46,6 +46,104 @@ pub struct Metadata {
     pub version: String,
     pub source: Provenance,
     pub hosts: BTreeMap<String, Provenance>,
+}
+
+/// Encode workflow and rerun order without allowing a rerun to overtake a later run.
+pub fn release_sequence(run_number: i64, run_attempt: i64) -> Result<u64> {
+    ensure!(
+        (1..(1 << 47)).contains(&run_number) && (1..(1 << 16)).contains(&run_attempt),
+        "release workflow counter exceeds the signed sequence profile"
+    );
+    Ok(((run_number as u64) << 16) | run_attempt as u64)
+}
+
+/// Bind each staged Host to its original producer receipts before preparation.
+pub fn metadata(
+    artifacts: &Path,
+    tree: &Path,
+    channel: String,
+    sequence: u64,
+    builder: String,
+) -> Result<Metadata> {
+    let valid_revision = |revision: &str| {
+        revision.len() == 40
+            && revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let revision = fs::read_to_string(tree.join("REVISION"))?.trim().to_owned();
+    ensure!(
+        valid_revision(&revision) && sequence > 0,
+        "invalid release revision or sequence"
+    );
+    let mut hosts = BTreeMap::new();
+    for (platform, target) in [
+        ("linux-x86_64", "x86_64-unknown-linux-gnu"),
+        ("linux-aarch64", "aarch64-unknown-linux-gnu"),
+        ("macos-aarch64", "aarch64-apple-darwin"),
+        ("macos-x86_64", "x86_64-apple-darwin"),
+        ("linux-musl-x86_64", "x86_64-unknown-linux-musl"),
+    ] {
+        let directory = artifacts.join(format!("ww-{platform}"));
+        for name in ["REVISION", "SHA256SUMS", "PROVENANCE.json"] {
+            let path = directory.join(name);
+            ensure!(
+                fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()),
+                "invalid producer receipt: {}",
+                path.display()
+            );
+        }
+        let actual_revision = fs::read_to_string(directory.join("REVISION"))?
+            .trim()
+            .to_owned();
+        ensure!(
+            valid_revision(&actual_revision),
+            "invalid Host build revision"
+        );
+        let binary = tree.join(ww::release::descriptor::platform_path(target)?);
+        ensure!(
+            fs::symlink_metadata(&binary).is_ok_and(|metadata| metadata.is_file()),
+            "invalid staged Host: {}",
+            binary.display()
+        );
+        let mut host = File::open(binary)?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let len = host.read(&mut buffer)?;
+            if len == 0 {
+                break;
+            }
+            hash.update(&buffer[..len]);
+        }
+        ensure!(
+            fs::read_to_string(directory.join("SHA256SUMS"))?
+                == format!("{}  ww\n", hex::encode(hash.finalize())),
+            "Host checksum receipt mismatch"
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("PROVENANCE.json"))?)?;
+        let receipt: Provenance =
+            serde_json::from_value(receipt).context("Host provenance receipt mismatch")?;
+        ensure!(
+            receipt.repository == ww::release::descriptor::SOURCE_REPOSITORY
+                && receipt.revision == actual_revision
+                && !receipt.builder.is_empty(),
+            "Host provenance receipt mismatch"
+        );
+        hosts.insert(target.into(), receipt);
+    }
+    Ok(Metadata {
+        channel,
+        sequence,
+        version: fs::read_to_string(tree.join("VERSION"))?.trim().to_owned(),
+        source: Provenance {
+            repository: ww::release::descriptor::SOURCE_REPOSITORY.into(),
+            revision,
+            builder,
+        },
+        hosts,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -86,9 +184,9 @@ pub fn prepare(tree: &Path, spool: &Path, metadata: Metadata) -> Result<Descript
             == format!("{}\n", metadata.source.revision).as_bytes(),
         "REVISION differs from release source"
     );
-    let kernel = crate::packaging::read_payload(&tree.join("fhs/boot/kernel.wasm"))?;
-    let status = crate::packaging::read_payload(&tree.join("fhs/bin/status.wasm"))?;
-    crate::packaging::verify_fhs(&tree.join("fhs"), &kernel, &status)?;
+    let kernel = ww::packaging::read_payload(&tree.join("fhs/boot/kernel.wasm"))?;
+    let status = ww::packaging::read_payload(&tree.join("fhs/bin/status.wasm"))?;
+    ww::packaging::verify_fhs(&tree.join("fhs"), &kernel, &status)?;
     let mut builder = Builder::new(spool)?;
     ensure!(
         !spool.canonicalize()?.starts_with(tree.canonicalize()?),
@@ -97,7 +195,7 @@ pub fn prepare(tree: &Path, spool: &Path, metadata: Metadata) -> Result<Descript
     builder.scan(tree, "", 0, true)?;
     let mut hosts = Vec::new();
     for (target, provenance) in metadata.hosts {
-        let path = crate::release_descriptor::platform_path(&target)?;
+        let path = ww::release::descriptor::platform_path(&target)?;
         hosts.push(HostArtifact {
             target,
             artifact: builder
@@ -146,7 +244,7 @@ pub fn prepare(tree: &Path, spool: &Path, metadata: Metadata) -> Result<Descript
         manifest.push_str(&format!("{}  {path}\n", hex::encode(file.sha256)));
     }
     ensure!(
-        manifest.len() <= crate::release_auth::MAX_MANIFEST_BYTES,
+        manifest.len() <= ww::release::auth::MAX_MANIFEST_BYTES,
         "release manifest exceeds limit"
     );
     fs::write(tree.join("CHECKSUMS.txt"), manifest)?;
@@ -157,7 +255,7 @@ pub fn prepare(tree: &Path, spool: &Path, metadata: Metadata) -> Result<Descript
 pub fn finalize(tree: &Path, spool: &Path, keys: &TrustedKeys) -> Result<Package> {
     let descriptor_bytes = read_bounded(&tree.join(DESCRIPTOR_FILE), ipfs::map::MAX_BLOCK_BYTES)?;
     let binding = read_bounded(&tree.join(BINDING_PATH), 256)?;
-    let descriptor_cid = crate::release_descriptor::binding_cid(&binding)?;
+    let descriptor_cid = ww::release::descriptor::binding_cid(&binding)?;
     Descriptor::decode(descriptor_cid, &descriptor_bytes)?;
     let mut builder = Builder::new(spool)?;
     ensure!(
@@ -270,7 +368,7 @@ impl Package {
     /// Verify authority, descriptor links, reconstructed payload hashes/sizes,
     /// and exact artifact paths before beginning any publication operation.
     pub fn authenticate(&self, keys: &TrustedKeys) -> Result<AuthenticatedRelease> {
-        let manifest = self.file_bytes("CHECKSUMS.txt", crate::release_auth::MAX_MANIFEST_BYTES)?;
+        let manifest = self.file_bytes("CHECKSUMS.txt", ww::release::auth::MAX_MANIFEST_BYTES)?;
         let signature = self.file_bytes("CHECKSUMS.txt.sig", 64)?;
         let binding = self.file_bytes(BINDING_PATH, 256)?;
         let descriptor_cid = self.resolve(DESCRIPTOR_LINK_NAME)?;
@@ -978,4 +1076,5 @@ fn file_metadata(mut bytes: &[u8]) -> Result<(u64, Vec<u64>)> {
 }
 
 #[cfg(test)]
+#[path = "package/tests.rs"]
 mod tests;

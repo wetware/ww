@@ -65,6 +65,70 @@ The future work must evaluate reuse or evolution of this inline implementation
 before introducing an independent Map. This foundation selects neither a
 general value model nor a future collection API.
 
+## Module and executable boundaries
+
+Release source lives under `src/release/`:
+
+```text
+mod.rs
+  auth.rs                   shared authentication (tests inline)
+  descriptor.rs             shared descriptor and consumer watermark
+    descriptor/tests.rs
+  package.rs                infrastructure graph construction/acquisition
+    package/tests.rs
+  publisher.rs              infrastructure Kubo publication adapter
+    publisher/tests.rs
+```
+
+The library exports `ww::release::{auth, descriptor}`. These APIs remain available
+to installer and Host-upgrade consumers. The current normal `ww` executable has
+no callers of these release APIs. Native replacement interfaces belong to #739
+and remain unchanged by this release-module cleanup.
+There are no aliases for the former root-level `release_*` modules.
+
+`src/bin/ww-release-publisher.rs` includes `package.rs` and `publisher.rs` as
+private binary modules through two explicit source paths. The library does not
+declare those modules, so building only `ww` does not compile their source.
+`make host` and the Host CI matrix explicitly select `--bin ww`. A package-wide
+`cargo build` still builds both executables.
+Their unit tests run in the dedicated binary's test harness; workspace tests
+include that harness. `crates/ipfs/src/release/` remains the retention owner.
+The normal Host's deployment-IPNS publisher remains in `src/ipns.rs`.
+
+| Target | Release source needed |
+| --- | --- |
+| Normal `ww` executable | No release API calls. Its shared library still compiles auth and descriptor. |
+| `ww-release-publisher` | Shared auth and descriptor; private package and publisher; IPFS retention owner. |
+| Library release tests | Auth and descriptor tests. |
+| Publisher binary tests | Package and publisher tests, using shared auth and descriptor. |
+
+Fresh native debug builds verified the source boundary through rustc dep-info.
+The normal executable contained no named auth, descriptor, package, or publisher
+symbols; the dedicated executable contained all four groups. This is evidence
+for the inspected build, not a claim about every linker/profile configuration.
+The move does not promise a binary-size change: dead stripping already removed
+unused release functions from the normal executable before the move.
+
+Both executables still share one Cargo package and its dependency graph.
+The shared `ipfs` crate still compiles `ipfs::release::Owner` and its graph/journal
+modules. The inspected normal executable retained no named `ipfs::release`
+symbols. Excluding that source from compilation would require another feature
+or crate boundary and is outside this structural cleanup.
+The dedicated publisher intentionally uses production FHS validation through
+`ww::packaging` and Cell/Wasmtime. This change introduces no features or crate
+split. A separate package or feature boundary is only warranted in a bounded
+follow-up if measured build cost or packaging requirements justify separating
+Cargo dependencies. That follow-up must preserve shared authentication and
+descriptors and the existing production FHS validator.
+
+Focused checks:
+
+```sh
+cargo test --locked --lib release::
+cargo test --locked --bin ww-release-publisher
+cargo build --locked --bin ww --bin ww-release-publisher
+```
+
 ## One release owner
 
 `Owner::open(existing_directory, domain)` holds an exclusive OS file lock for
@@ -95,7 +159,8 @@ infrastructure. IPNS is eventually consistent discovery. Neither a successful
 PUT nor a local lock fences delayed remote writes.
 
 The dedicated Rust executable is `ww-release-publisher` in `wetware/ww`.
-GitHub Actions builds, validates, signs, and initiates publication. The restricted
+GitHub Actions owns build, validation, signing, and publication initiation.
+The held workflow refuses transport until infra integration is qualified. The restricted
 `wetware/infra` worker executes the publisher with infrastructure-owned storage
 and Kubo. The normal `ww` Host consumes releases. Its deployment-IPNS publisher
 and service lifecycle do not publish official releases.
@@ -222,7 +287,7 @@ invalidate that contract. The journal is not a storage repair service.
 
 ## Authentication and release graph
 
-`release_descriptor::Descriptor` uses canonical versioned IPLD Map bytes.
+`release::descriptor::Descriptor` uses canonical versioned IPLD Map bytes.
 The descriptor contains real links to the FHS and native artifacts, platform
 and ABI identity, file sizes and SHA-256 digests, actual source/build provenance,
 and the Host/PID0 compatibility profile. Runtime file digests differ from UnixFS
@@ -247,7 +312,7 @@ compatibility without updating channel freshness state.
 The existing shell installer continues to authenticate its manifest and payloads.
 It does not interpret descriptors or persist freshness watermarks. Legacy readers
 therefore retain their existing replay limitation during migration. #739 owns
-Host replacement; #740 owns CLI migration. Neither is implemented here.
+Host replacement; #740 owns CLI migration. Neither is changed here.
 
 ## Retirement and ownership
 
@@ -296,3 +361,9 @@ and invalid trust. Bootstrap and swarm listeners are disabled. This does not
 qualify the Linux infrastructure cgroup, public-network reachability, convergence,
 or cross-platform native execution. No production Kubo, production IPNS identity,
 release key, or publisher is used.
+
+Repository ownership and the installed executable ABI are specified in
+[release-publisher-infra-contract.md](release-publisher-infra-contract.md).
+VPS configuration, installation, worker result framing, journal mounts, renewal,
+and operational recovery belong to infra. The Python direct-Kubo test is portable
+protocol qualification; it does not configure or launch an infrastructure worker.

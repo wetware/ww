@@ -66,9 +66,18 @@ grep -Fq 'needs: [changes, test, validate-release, release_image]' "$WORKFLOW" \
   || fail "IPFS publication must wait for the image build, not a deployment"
 grep -Fq 'name: Publish to IPFS' "$WORKFLOW" \
   || fail "workflow must retain IPFS publication"
-# shellcheck disable=SC2016
-grep -Fq 'publish-v1 $request_id $candidate' "$WORKFLOW" \
-  || fail "IPFS publisher must use the restricted worker command"
+grep -Fq 'Refuse unintegrated infrastructure publication' "$WORKFLOW" \
+  || fail 'IPFS publisher must refuse until infra integration is reviewed'
+handoff_step="$(awk '
+  /^    - name: Refuse unintegrated infrastructure publication$/ { capture = 1; next }
+  capture && /^    - / { exit }
+  capture { print }
+' "$WORKFLOW")"
+grep -Eq '^        exit 1$' <<<"$handoff_step" \
+  || fail 'unintegrated publication must fail closed'
+if grep -Eq '\b(ssh|scp|rsync|kubectl)\b|WW_RELEASE_SSH_' "$WORKFLOW"; then
+  fail 'unintegrated infrastructure transport remains in the workflow'
+fi
 if grep -Eq '\b(kubectl|rsync)\b' "$WORKFLOW"; then
   fail "legacy cluster publication transport remains"
 fi
@@ -129,12 +138,12 @@ grep -Fq 'unset WW_RELEASE_SIGNING_KEY WW_RELEASE_TRUSTED_KEYS' <<<"$signing_ste
 grep -Fq 'mktemp -d "$RUNNER_TEMP/ww-signing.XXXXXXXX"' <<<"$signing_step" \
   || fail 'private key must remain outside build and release artifacts'
 transport_step="$(awk '
-  /^    - name: Publish to IPFS via VPS$/ { capture = 1; next }
+  /^    - name: Finalize authenticated release package$/ { capture = 1; next }
   capture && /^    - / { exit }
   capture { print }
 ' "$WORKFLOW")"
 grep -Fq "if: steps.release-signature.outcome == 'success'" <<<"$transport_step" \
-  || fail 'publisher transport must require successful manifest authentication'
+  || fail 'package finalization must require successful manifest authentication'
 
 # Freeze the existing job-level admission controls during the maintenance hold.
 # This covers ordinary Rust/metrics CI, release validation, GHCR and Pages.

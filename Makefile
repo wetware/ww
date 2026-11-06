@@ -36,7 +36,7 @@ all: try-publish-std examples
 # --- Host --------------------------------------------------------------------
 
 host: fhs
-	cargo build --release --locked
+	cargo build --release --locked --bin ww
 
 test-deps:
 	git submodule update --init contracts/stem/lib/forge-std
@@ -248,18 +248,11 @@ publish-std: fhs
 	@rm -rf $(STD_TREE)
 	@echo "CID written to target/std-namespace.cid"
 
-# --- Publish release tree to IPFS --------------------------------------------
-# Publish only the validated local Host and canonical FHS. This never copies
-# the working tree or installation/private state into the release.
-# RELEASE_ARTIFACTS must contain all five Host targets and canonical WASM.
-# Name updates require WW_RELEASE_EXPECTED_CURRENT=/ipfs/<cid>; SKIP_PIN=1
-# imports a content-addressed package without changing the release name.
-SKIP_PIN ?=
-
-publish: host package-check
-	python3 tests/test_install.py --binary target/release/ww --fhs $(FHS_DIR)
-	bash tests/test_installed_boot.sh target/release/ww $(FHS_DIR)
-	SKIP_PIN="$(SKIP_PIN)" bash scripts/publish_local_release.sh target/release/ww $(FHS_DIR)
+# --- Official release publication -------------------------------------------
+# Retain a fail-closed diagnostic for the historical make entry point.
+publish:
+	@echo 'Official publication requires ww-release-publisher through the restricted infra worker. Production publication remains on hold.' >&2
+	@exit 1
 
 # --- Test WASM components ----------------------------------------------------
 # Build every first-party component and verify its P3 command architecture.

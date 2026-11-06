@@ -137,11 +137,9 @@ jobs:
         bash tests/test_deploy_verify.sh
         bash tests/test_release_workflow.sh
         python3 tests/test_release_auth.py
-        python3 tests/test_release_sequence.py
-        python3 tests/test_release_metadata.py
         bash -n scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
         if command -v shellcheck >/dev/null 2>&1; then
-          shellcheck scripts/install.sh scripts/sign_release.sh scripts/publish_local_release.sh scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh scripts/ipfs_publish_release.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
+          shellcheck scripts/install.sh scripts/sign_release.sh scripts/build_wasip3_component.sh scripts/check_first_party_wasip3.sh scripts/check_native_p3_fixture.sh scripts/check_release_ancestry.sh scripts/deploy_verify.sh tests/test_ipfs_release_publish.sh tests/test_ipfs_release_publish_runtime.sh tests/test_native_p3_fixture.sh tests/test_release_ancestry.sh tests/test_deploy_context.sh tests/test_deploy_verify.sh tests/test_release_workflow.sh scripts/assemble_release.sh tests/test_container_boot.sh tests/test_release_package.sh
         fi
 
     - uses: actions/setup-go@v5
@@ -876,8 +874,6 @@ jobs:
       with:
         name: validated-release
 
-    - uses: ./.github/actions/setup-kubo
-
     - name: Prepare authenticated release descriptor
       env:
         WW_RELEASE_CHANNEL: ${{ vars.WW_RELEASE_IPNS_NAME }}
@@ -889,8 +885,8 @@ jobs:
         # Admit only the current master tip before the trusted signer is used.
         test "$(git rev-parse origin/master)" = "${{ github.sha }}"
         test "$(scripts/check_release_ancestry.sh "${{ github.sha }}" '')" = publish
-        sequence=$(python3 scripts/release_sequence.py "$WW_RELEASE_RUN_NUMBER" "$WW_RELEASE_RUN_ATTEMPT")
-        python3 scripts/release_metadata.py --artifacts artifacts --tree release-tree \
+        sequence=$(./ww-release-publisher sequence "$WW_RELEASE_RUN_NUMBER" "$WW_RELEASE_RUN_ATTEMPT")
+        ./ww-release-publisher metadata --artifacts artifacts --tree release-tree \
           --channel "$WW_RELEASE_CHANNEL" --sequence "$sequence" \
           --builder "github-actions:${{ github.run_id }}:${{ github.run_attempt }}" > metadata.json
         ./ww-release-publisher prepare --tree release-tree --spool release-spool --metadata metadata.json
@@ -922,61 +918,24 @@ jobs:
         bash scripts/sign_release.sh release-tree/CHECKSUMS.txt release-tree/CHECKSUMS.txt.sig \
           "$SIGNING_DIR/private.pem" "$SIGNING_DIR/trusted-keys"
 
-    - name: Publish to IPFS via VPS
+    - name: Finalize authenticated release package
       if: steps.release-signature.outcome == 'success'
       env:
         WW_RELEASE_TRUSTED_KEYS: ${{ vars.WW_RELEASE_TRUSTED_KEYS }}
-        WW_RELEASE_SSH_TARGET: ${{ vars.WW_RELEASE_SSH_TARGET }}
-        WW_RELEASE_SSH_KEY: ${{ secrets.WW_RELEASE_SSH_KEY }}
-        WW_RELEASE_SSH_HOST_KEY: ${{ vars.WW_RELEASE_SSH_HOST_KEY }}
       run: |
-        set +x
         set -euo pipefail
         umask 077
-        work=$(mktemp -d "$RUNNER_TEMP/ww-publication.XXXXXXXX")
-        export IPFS_PATH="$work/ipfs"
-        cleanup() {
-          if [ -n "${kubo_pid:-}" ]; then kill "$kubo_pid" 2>/dev/null || true; fi
-          rm -rf "$work"
-        }
-        trap cleanup EXIT
-        printf '%s' "$WW_RELEASE_TRUSTED_KEYS" > "$work/trusted-keys"
-        if [ "$(tail -c 1 "$work/trusted-keys" | od -An -tu1 | tr -d ' ')" != 10 ]; then
-          printf '\n' >> "$work/trusted-keys"
+        trust=$(mktemp "$RUNNER_TEMP/ww-public-trust.XXXXXXXX")
+        trap 'rm -f "$trust"' EXIT
+        printf '%s' "$WW_RELEASE_TRUSTED_KEYS" > "$trust"
+        if [ "$(tail -c 1 "$trust" | od -An -tu1 | tr -d ' ')" != 10 ]; then
+          printf '\n' >> "$trust"
         fi
-        printf '%s\n' "$WW_RELEASE_SSH_KEY" > "$work/key"
-        printf '%s\n' "$WW_RELEASE_SSH_HOST_KEY" > "$work/known_hosts"
-        unset WW_RELEASE_TRUSTED_KEYS WW_RELEASE_SSH_KEY
         ./ww-release-publisher finalize --tree release-tree --spool release-spool \
-          --trusted-keys "$work/trusted-keys" > "$work/candidate.json"
-        ipfs init
-        ipfs daemon > "$work/kubo.log" 2>&1 &
-        kubo_pid=$!
-        for attempt in $(seq 1 30); do
-          if ipfs id >/dev/null 2>&1; then break; fi
-          echo "Waiting for disposable Kubo (attempt $attempt)"
-          sleep 1
-        done
-        # CI seeds immutable content only. The infrastructure worker independently
-        # authenticates and retains the complete graph before local commitment.
-        ./ww-release-publisher seed --spool release-spool --trusted-keys "$work/trusted-keys" \
-          --kubo-api http://127.0.0.1:5001
-        candidate=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["root"])' "$work/candidate.json")
-        request_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["request_id"])' "$work/candidate.json")
-        ipfs routing provide "$candidate"
-        [[ "$WW_RELEASE_SSH_TARGET" =~ ^[a-zA-Z0-9_.@:-]+$ && "$WW_RELEASE_SSH_TARGET" != -* ]]
-        acknowledged=false
-        for attempt in 1 2 3; do
-          if ssh -i "$work/key" -o BatchMode=yes -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$work/known_hosts" \
-            "$WW_RELEASE_SSH_TARGET" "publish-v1 $request_id $candidate" > "$work/result.json"; then
-            if python3 -c 'import json,sys; f=open(sys.argv[1]); raw=f.read(16385); assert len(raw)<=16384; r=json.loads(raw); assert r.get("request_id")==sys.argv[2] and r.get("descriptor")==sys.argv[3] and r.get("local_committed") is True and r.get("delivery_acknowledged") is True' \
-              "$work/result.json" "$request_id" "$candidate"; then
-              acknowledged=true
-              break
-            fi
-          fi
-          echo "Publication acknowledgement uncertain (attempt $attempt); retrying the same candidate"
-          sleep 5
-        done
-        test "$acknowledged" = true
+          --trusted-keys "$trust" > candidate.json
+
+    - name: Refuse unintegrated infrastructure publication
+      if: steps.release-signature.outcome == 'success'
+      run: |
+        echo 'Publication remains on hold. Integrate the reviewed infra#37 worker and transport before activation.' >&2
+        exit 1

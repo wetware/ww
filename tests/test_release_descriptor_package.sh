@@ -17,7 +17,7 @@ while value:
 print('k' + result)
 PY
 )
-python3 "$root/scripts/release_metadata.py" --artifacts "$artifacts" --tree "$work/tree" \
+"$publisher" metadata --artifacts "$artifacts" --tree "$work/tree" \
   --channel "$channel" --sequence 1 --builder qualification-fixture > "$work/metadata.json"
 "$publisher" prepare --tree "$work/tree" --spool "$work/spool" --metadata "$work/metadata.json"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/release_auth_fixture.py" "$work/keys" "$work/tree/CHECKSUMS.txt"

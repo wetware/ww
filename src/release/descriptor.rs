@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ipns::{canonical_name, parse_name, SignedRecord, MAX_RECORD_SIZE};
-use crate::release_auth::{TrustedKeys, MAX_MANIFEST_BYTES};
+use crate::release::auth::{TrustedKeys, MAX_MANIFEST_BYTES};
 
 pub const COMPATIBILITY_PROFILE: &str = "wetware-host-pid0-p3-v1";
 pub const BINDING_PATH: &str = "RELEASE-DESCRIPTOR";

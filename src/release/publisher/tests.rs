@@ -40,7 +40,7 @@ fn committed_request_is_bound_to_channel_generation_and_root() {
     let name = libp2p::identity::Keypair::generate_ed25519()
         .public()
         .to_peer_id();
-    let channel = crate::ipns::canonical_name(name);
+    let channel = ww::ipns::canonical_name(name);
     let intent = PublicationIntent {
         previous: None,
         next: Publication {
@@ -91,7 +91,7 @@ async fn kubo_unix_transport_checks_identity_before_announcing() {
     let name = libp2p::identity::Keypair::generate_ed25519()
         .public()
         .to_peer_id();
-    let channel = crate::ipns::canonical_name(name);
+    let channel = ww::ipns::canonical_name(name);
     let candidate = root(b"one");
     let expected_name = name.to_string();
     let server = tokio::spawn(async move {
@@ -187,7 +187,7 @@ async fn wrong_key_identity_prevents_announcement() {
     assert!(api
         .announce(
             "ww-release",
-            &crate::ipns::canonical_name(expected),
+            &ww::ipns::canonical_name(expected),
             root(b"one")
         )
         .await
@@ -240,7 +240,7 @@ async fn lost_acknowledgement_retries_same_root_without_a_sequence_override() {
         Duration::from_secs(2),
     )
     .unwrap();
-    let channel = crate::ipns::canonical_name(name);
+    let channel = ww::ipns::canonical_name(name);
     assert!(api
         .announce("ww-release", &channel, candidate)
         .await
@@ -289,11 +289,7 @@ async fn invalid_or_oversized_acknowledgements_remain_uncertain() {
         )
         .unwrap();
         assert!(api
-            .announce(
-                "ww-release",
-                &crate::ipns::canonical_name(name),
-                root(b"one")
-            )
+            .announce("ww-release", &ww::ipns::canonical_name(name), root(b"one"))
             .await
             .is_err());
         server.await.unwrap();
@@ -301,11 +297,11 @@ async fn invalid_or_oversized_acknowledgements_remain_uncertain() {
 }
 
 fn authenticated(name: libp2p::PeerId, sequence: u64) -> AuthenticatedRelease {
-    use crate::release_descriptor::{
-        Artifact, DeploymentArtifact, Descriptor, HostArtifact, Provenance, COMPATIBILITY_PROFILE,
-    };
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
+    use ww::release::descriptor::{
+        Artifact, DeploymentArtifact, Descriptor, HostArtifact, Provenance, COMPATIBILITY_PROFILE,
+    };
     let file = |path: &str| Artifact {
         path: path.into(),
         root: Cid::new_v1(0x55, *root(path.as_bytes()).hash()),
@@ -318,7 +314,7 @@ fn authenticated(name: libp2p::PeerId, sequence: u64) -> AuthenticatedRelease {
         builder: "test".into(),
     };
     let descriptor = Descriptor {
-        channel: crate::ipns::canonical_name(name),
+        channel: ww::ipns::canonical_name(name),
         sequence,
         version: "test".into(),
         source: provenance.clone(),
@@ -383,7 +379,7 @@ async fn signed_stale_release_is_rejected_before_any_kubo_operation() {
     let config = Config {
         version: 1,
         domain: "release-test".into(),
-        channel: crate::ipns::canonical_name(name),
+        channel: ww::ipns::canonical_name(name),
         key: "ww-release".into(),
         journal: "/unused".into(),
         trusted_keys: "/unused-keys".into(),

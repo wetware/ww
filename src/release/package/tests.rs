@@ -1,5 +1,89 @@
 use super::*;
 
+#[test]
+fn release_sequence_orders_attempts_without_overtaking_a_later_run() {
+    assert!(release_sequence(5, 1).unwrap() < release_sequence(5, 2).unwrap());
+    assert!(release_sequence(5, 65535).unwrap() < release_sequence(6, 1).unwrap());
+    assert_eq!(release_sequence(1, 1).unwrap(), 65537);
+}
+
+#[test]
+fn release_sequence_counter_exhaustion_fails_closed() {
+    for (run, attempt) in [(0, 1), (-1, 1), (1, 0), (1, 65536), (1 << 47, 1)] {
+        assert!(release_sequence(run, attempt).is_err(), "{run}, {attempt}");
+    }
+    assert_eq!(
+        release_sequence((1 << 47) - 1, 65535).unwrap(),
+        (1 << 63) - 1
+    );
+}
+
+#[test]
+fn release_metadata_preserves_actual_producer_and_rejects_missing_receipt() {
+    let work = tempfile::tempdir().unwrap();
+    let tree = work.path().join("tree");
+    let artifacts = work.path().join("artifacts");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("VERSION"), "1.0\n").unwrap();
+    fs::write(tree.join("REVISION"), format!("{}\n", "b".repeat(40))).unwrap();
+    let mut last_receipt = PathBuf::new();
+    for (platform, path) in [
+        ("linux-x86_64", "linux/x86_64"),
+        ("linux-aarch64", "linux/aarch64"),
+        ("macos-aarch64", "macos/aarch64"),
+        ("macos-x86_64", "macos/x86_64"),
+        ("linux-musl-x86_64", "linux/musl-x86_64"),
+    ] {
+        let artifact = artifacts.join(format!("ww-{platform}"));
+        fs::create_dir_all(&artifact).unwrap();
+        let binary = tree.join("bin/ww").join(path).join("ww");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"native Host").unwrap();
+        fs::write(artifact.join("REVISION"), format!("{}\n", "a".repeat(40))).unwrap();
+        fs::write(
+            artifact.join("SHA256SUMS"),
+            format!("{}  ww\n", hex::encode(Sha256::digest(b"native Host"))),
+        )
+        .unwrap();
+        last_receipt = artifact.join("PROVENANCE.json");
+        fs::write(
+            &last_receipt,
+            serde_json::to_vec(&serde_json::json!({
+                "repository": "https://github.com/wetware/ww",
+                "revision": "a".repeat(40),
+                "builder": "original-build",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let result = metadata(
+        &artifacts,
+        &tree,
+        "fixture".into(),
+        1,
+        "packaging-build".into(),
+    )
+    .unwrap();
+    assert_eq!(result.source.builder, "packaging-build");
+    assert_eq!(result.source.revision, "b".repeat(40));
+    assert_eq!(result.hosts.len(), 5);
+    assert!(result
+        .hosts
+        .values()
+        .all(|host| { host.builder == "original-build" && host.revision == "a".repeat(40) }));
+    fs::remove_file(last_receipt).unwrap();
+    let error = metadata(
+        &artifacts,
+        &tree,
+        "fixture".into(),
+        1,
+        "packaging-build".into(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("invalid producer receipt"));
+}
+
 #[tokio::test]
 async fn streamed_file_exceeds_one_stage_without_exceeding_stage_memory_bound() {
     let temp = tempfile::tempdir().unwrap();
@@ -107,14 +191,14 @@ fn fixture(root: &Path) -> (PathBuf, PathBuf, SigningKey, Descriptor) {
         "x86_64-unknown-linux-musl",
     ];
     for (index, target) in targets.iter().enumerate() {
-        let path = tree.join(crate::release_descriptor::platform_path(target).unwrap());
+        let path = tree.join(ww::release::descriptor::platform_path(target).unwrap());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, format!("fixture host {index}")).unwrap();
     }
     let mut builder = Builder::new(&spool).unwrap();
     builder.scan(&tree, "", 0, true).unwrap();
     let descriptor = Descriptor {
-        channel: crate::ipns::canonical_name(
+        channel: ww::ipns::canonical_name(
             libp2p::identity::Keypair::ed25519_from_bytes([42; 32])
                 .unwrap()
                 .public()
@@ -127,7 +211,7 @@ fn fixture(root: &Path) -> (PathBuf, PathBuf, SigningKey, Descriptor) {
             .iter()
             .enumerate()
             .map(|(index, target)| {
-                let path = crate::release_descriptor::platform_path(target).unwrap();
+                let path = ww::release::descriptor::platform_path(target).unwrap();
                 HostArtifact {
                     target: (*target).into(),
                     artifact: builder.files[path].artifact(path),

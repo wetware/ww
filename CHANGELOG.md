@@ -58,8 +58,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ww-release-publisher` retains bounded complete graphs before the existing
   owner commits local release order, then announces through eventually consistent
   IPNS. Consumers preserve independent transport and release freshness floors,
-  including across key rotation. Legacy official publisher scripts fail closed;
-  production publication remains on hold pending the infra#37 integration.
+  including across key rotation. Shared APIs use `ww::release`; packaging and
+  publication compile only in the dedicated executable. Legacy official publisher
+  scripts are removed; `make publish` refuses. Production publication remains on
+  hold pending the infra#37 integration.
 - **Durable release foundation (#737).** A bounded immutable host IPLD Map
   uses canonical DAG-CBOR and explicit blockstore persistence. A separate
   release owner journals staged retention and publication intent,

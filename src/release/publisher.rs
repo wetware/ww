@@ -18,9 +18,8 @@ use ipfs::release::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    release_auth::TrustedKeys, release_descriptor::AuthenticatedRelease, release_package::Package,
-};
+use crate::package::Package;
+use ww::release::{auth::TrustedKeys, descriptor::AuthenticatedRelease};
 
 pub const MAX_REQUEST_BYTES: usize = 512;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
@@ -118,7 +117,7 @@ impl Config {
             "unsupported publisher configuration version"
         );
         ensure!(
-            self.channel == crate::ipns::canonical_name(crate::ipns::parse_name(&self.channel)?),
+            self.channel == ww::ipns::canonical_name(ww::ipns::parse_name(&self.channel)?),
             "publisher channel must use canonical Base36 IPNS identity"
         );
         ensure!(
@@ -272,7 +271,7 @@ impl KuboApi {
             "configured publication key is missing or ambiguous"
         );
         ensure!(
-            crate::ipns::parse_name(&matches[0].id)? == crate::ipns::parse_name(channel)?,
+            ww::ipns::parse_name(&matches[0].id)? == ww::ipns::parse_name(channel)?,
             "configured Kubo key does not match release channel"
         );
         Ok(())
@@ -306,7 +305,7 @@ impl KuboApi {
             .context("invalid Kubo publication acknowledgement")?;
         ensure!(
             published.value == value
-                && crate::ipns::parse_name(&published.name)? == crate::ipns::parse_name(channel)?,
+                && ww::ipns::parse_name(&published.name)? == ww::ipns::parse_name(channel)?,
             "Kubo acknowledged another publication"
         );
         Ok(())
@@ -592,4 +591,5 @@ pub async fn publish_request(
 }
 
 #[cfg(test)]
+#[path = "publisher/tests.rs"]
 mod tests;

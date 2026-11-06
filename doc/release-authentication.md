@@ -59,7 +59,7 @@ is not a release downloader. Its caller must trust the executed Host and local
 payload. Container registry distribution and deployment-head authority are
 separate from this IPFS release contract.
 
-`ww::release_auth::TrustedKeys` accepts separately supplied keyring bytes.
+`ww::release::auth::TrustedKeys` accepts separately supplied keyring bytes.
 `authenticate` returns an `AuthenticatedManifest` only after strict Ed25519
 verification and manifest parsing. `verify_artifact` explicitly uses SHA-256.
 #739 must obtain trust independently and use this verification before consuming
@@ -70,9 +70,10 @@ and package validation. A staging tree is not an authorized release.
 `scripts/sign_release.sh MANIFEST SIGNATURE PRIVATE_KEY TRUSTED_KEYS` signs the
 exact staged manifest and verifies the result against independent trusted keys.
 It rejects an existing signature destination and a private key inside the release
-tree. The local publisher signs before `ipfs add`. The remote publisher verifies
-against its independently provisioned keyring before its first remote operation.
-The remote verifier comes from the reviewed checkout, never the release tree.
+tree. `ww-release-publisher prepare` constructs the binding before signing.
+`finalize` authenticates the signed tree before producing the transport root.
+The worker verifies against its independently provisioned keyring before local
+commitment; the verifier comes from the installed executable, never the release tree.
 
 The workflow references the proposed `release-signing` protected environment.
 Only the signing step receives `WW_RELEASE_SIGNING_KEY`. Repository, master ref,
@@ -130,10 +131,11 @@ use ephemeral runners and restrict access to runner storage.
    #737/#738's publication owner when that integration is ready. Do not activate
    a competing owner or journal from this work.
 
-For authorized local publication, set `WW_RELEASE_SIGNING_KEY_FILE` to the
-private PEM outside the release directory. `WW_RELEASE_TRUSTED_KEYS` selects the
-independent public keyring, defaulting to `/etc/wetware/release-keys`.
-These settings do not authorize publication by themselves.
+For offline qualification, run `ww-release-publisher prepare`, then
+`scripts/sign_release.sh MANIFEST SIGNATURE PRIVATE_KEY TRUSTED_KEYS`, followed
+by `ww-release-publisher finalize`. Keep the private PEM outside the release
+directory and use independently supplied public trust. These commands do not
+announce a release or authorize production publication.
 
 ## Rotation, compromise, and unsigned releases
 
