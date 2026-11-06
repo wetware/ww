@@ -41,6 +41,8 @@ pub(super) async fn daemon_install(
     quiet: bool,
 ) -> Result<bool> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
+    let lock = ww::installation_state::MutationLock::acquire(&home)?;
+    lock.reject_pending()?;
     let ww_dir = home.join(".ww");
     // Service startup has a different working directory. Freeze explicitly
     // selected local sources while the install invocation still owns its CWD.
@@ -141,6 +143,8 @@ pub(super) fn render_service(
 /// Remove the platform service file.
 pub(super) async fn daemon_uninstall() -> Result<()> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
+    let lock = ww::installation_state::MutationLock::acquire(&home)?;
+    lock.reject_pending()?;
 
     if cfg!(target_os = "macos") {
         let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");

@@ -474,8 +474,9 @@ The daemon signs and publishes the configured default namespace when it starts.
 
 Native self-upgrade is disabled. The command refuses before network access or
 filesystem changes. Use the authenticated [installer](installation.md) for the
-complete Host and FHS package. Host replacement, restart checks, and rollback
-remain part of #739.
+complete Host and FHS package. The internal [native Host replacement engine](native-upgrades.md)
+supports recovery and rollback policy, but authenticated selection and native
+operational admission remain required before enabling a production command.
 
 ### ww perform uninstall
 

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Recoverable native Host transaction engine (#739).** Stage and verify exact
+  executable bytes, retain the previous artifact, journal replacement and
+  recovery, and preserve installation ownership. Installation and service-file
+  mutations share an exclusive lock, including the legacy shell uninstaller
+  (now requiring Python 3). The production upgrade command remains disabled
+  pending authenticated selection, compatibility, and native restart admission.
+
 ### Fixed
 - **Authenticated IPFS release manifests (#412).** Sign exact checksum manifest
   bytes with Ed25519 and verify them against independently provisioned release
