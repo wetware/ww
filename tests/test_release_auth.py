@@ -17,6 +17,7 @@ PLATFORMS = [('Linux', 'x86_64', 'linux/x86_64'),
              ('Linux', 'aarch64', 'linux/aarch64'),
              ('Darwin', 'x86_64', 'macos/x86_64'),
              ('Darwin', 'arm64', 'macos/aarch64')]
+RECOVERY_CID = 'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3rne56m7z37lnw3e4ni4ua3wi'
 
 
 class ReleaseAuthentication(unittest.TestCase):
@@ -35,9 +36,11 @@ class ReleaseAuthentication(unittest.TestCase):
         (self.home / 'sentinel').write_text('existing installation state')
         self.calls = self.root / 'executions'
         self.transport = self.root / 'transport-calls'
+        self.probes = self.root / 'platform-probes'
         self.stubs = self.root / 'bin'
         self.stubs.mkdir()
-        self.script('uname', '''case "$1" in
+        self.script('uname', '''printf '%s\n' "$*" >> "$TEST_PLATFORM_PROBES"
+case "$1" in
 -s) echo "$TEST_OS" ;;
 -m) echo "$TEST_ARCH" ;;
 *) exit 90 ;;
@@ -47,19 +50,23 @@ esac
 case "$1" in
 id) exit 0 ;;
 cat)
-  case "$2" in /ipfs/test-release/*) ;; *) exit 91 ;; esac
-  path=${2#/ipfs/test-release/}
+  prefix=/ipfs/${TEST_CID:-test-release}/
+  case "$2" in "$prefix"*) ;; *) exit 91 ;; esac
+  path=${2#"$prefix"}
   if [ "${FAIL_FETCH:-}" = "$path" ]; then printf truncated; exit 1; fi
   cat "$TEST_RELEASE/$path" ;;
 *) exit 92 ;;
 esac
 ''')
+        # The frozen legacy installer still invokes perform. This executable
+        # fixture models both consumers; the production CLI has no alias.
         binary = b'''#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$TEST_EXECUTIONS"
 case "$*" in
+'upgrade --recover-only '*) exit "${TEST_RECOVERY_EXIT:-0}" ;;
 *--check*) exit 0 ;;
-'perform install '*) mkdir -p "$HOME/.ww/bin"; cp "$0" "$HOME/.ww/bin/ww" ;;
+'install '*|'perform install '*) mkdir -p "$HOME/.ww/bin"; cp "$0" "$HOME/.ww/bin/ww" ;;
 esac
 '''
         for _, _, path in PLATFORMS:
@@ -74,7 +81,8 @@ esac
                     if not key.startswith(('WW_', 'IPFS_', 'GITHUB_'))}
         self.env.update(HOME=str(self.home), PATH=str(self.stubs) + os.pathsep + os.environ['PATH'],
                         TEST_OS='Linux', TEST_ARCH='x86_64', TEST_RELEASE=str(self.release),
-                        TEST_EXECUTIONS=str(self.calls), TEST_TRANSPORT=str(self.transport))
+                        TEST_EXECUTIONS=str(self.calls), TEST_TRANSPORT=str(self.transport),
+                        TEST_CID=RECOVERY_CID, TEST_PLATFORM_PROBES=str(self.probes))
         self.write_manifest()
 
     def script(self, name, body):
@@ -102,12 +110,27 @@ esac
         if verify:
             args += ['--verify-manifest', str(self.manifest), '--signature', str(self.signature)]
         else:
-            args += ['--version', 'test-release']
+            args += ['--version', 'test-release'] if legacy else ['--release', RECOVERY_CID]
         before = {str(path.relative_to(self.home)): path.read_bytes()
                   for path in self.home.rglob('*') if path.is_file()}
-        result = subprocess.run(args, env=self.env, capture_output=True, text=True, timeout=30)
+        previous_calls = len(self.calls.read_text().splitlines()) if self.calls.exists() else 0
+        env = dict(self.env, TEST_CID='test-release') if legacy else self.env
+        result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=30)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            if not verify and not legacy:
+                calls = self.calls.read_text().splitlines()[previous_calls:]
+                self.assertEqual(len(calls), 3, calls)
+                self.assertTrue(calls[0].startswith('install --check --payload '), calls)
+                self.assertTrue(calls[1].startswith('install --payload '), calls)
+                self.assertTrue(all(call.endswith(f' --bootstrap-release {RECOVERY_CID}')
+                                    for call in calls[:2]), calls)
+                for call in calls[:2]:
+                    self.assertIn(' --manifest ', call)
+                    self.assertIn(' --signature ', call)
+                    self.assertIn(f' --trusted-release-keys {keys or self.keys} ', call)
+                self.assertEqual(calls[2], '--version')
+                self.assertFalse(any('--executable' in call for call in calls), calls)
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse(self.calls.exists(), 'unauthenticated candidate executed')
@@ -125,6 +148,138 @@ esac
                 self.run_installer(success=True)
                 self.assertEqual(len(self.calls.read_text().splitlines()), 3)
                 self.calls.unlink()
+
+    def refuse_before_transport(self, flags):
+        before = {str(path.relative_to(self.home)): path.read_bytes()
+                  for path in self.home.rglob('*') if path.is_file()}
+        result = subprocess.run(['sh', str(INSTALLER), *flags,
+                                 '--trusted-release-keys', str(self.keys)],
+                                env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.transport.exists(), 'refusal contacted IPFS')
+        self.assertFalse(self.probes.exists(), 'refusal probed the platform')
+        self.assertFalse(self.calls.exists(), 'refusal executed a candidate')
+        after = {str(path.relative_to(self.home)): path.read_bytes()
+                 for path in self.home.rglob('*') if path.is_file()}
+        self.assertEqual(after, before)
+        return result
+
+    def test_release_selection_is_required_before_transport(self):
+        result = self.refuse_before_transport([])
+        self.assertIn('--release', result.stderr)
+
+    def test_release_rejects_paths_and_malformed_cids_before_transport(self):
+        for value in ('test-release', '/ipfs/' + RECOVERY_CID, '/ipns/untrusted',
+                      RECOVERY_CID + '/other', RECOVERY_CID + '?query', ' ', '--recover'):
+            with self.subTest(value=value):
+                self.refuse_before_transport(['--release', value])
+
+    def test_retired_version_option_has_no_alias(self):
+        self.refuse_before_transport(['--version', 'test-release'])
+
+    def test_recovery_requires_pending_journal_before_transport(self):
+        for flags in (['--recover'], ['--recover', '--release', 'test-release']):
+            with self.subTest(flags=flags):
+                result = self.refuse_before_transport(flags)
+                self.assertIn('pending Host upgrade', result.stderr)
+
+    def prepare_recovery(self, pointer=None):
+        root = self.home / '.ww'
+        root.mkdir(exist_ok=True)
+        (root / 'host-upgrade.json').write_bytes(b'pending generation sentinel')
+        if pointer is not None:
+            (root / 'installed-release.json').write_bytes(pointer)
+
+    def test_recovery_requires_canonical_local_locator_or_explicit_release(self):
+        self.prepare_recovery()
+        cases = [None, b'', b'{}', b'{"version":2,"release":"' + RECOVERY_CID.encode() + b'"}',
+                 b'{"version":1,"release":"' + RECOVERY_CID.encode() + b'"}\n',
+                 b'{"release":"' + RECOVERY_CID.encode() + b'","version":1}',
+                 b'{"version":1,"release":"/ipns/untrusted"}',
+                 b'{"version":1,"release":"' + RECOVERY_CID.encode() + b'","extra":true}',
+                 b'X' * 1025, b'{"version":1,"release":"' + RECOVERY_CID.encode() + b'"}\x00']
+        pointer = self.home / '.ww/installed-release.json'
+        for contents in cases:
+            with self.subTest(contents=contents):
+                if contents is not None:
+                    pointer.write_bytes(contents)
+                result = self.refuse_before_transport(['--recover'])
+                self.assertIn('--release', result.stderr)
+        pointer.unlink()
+        pointer.symlink_to(self.manifest)
+        self.refuse_before_transport(['--recover'])
+
+    def test_recovery_rejects_symlinked_journal_before_transport(self):
+        self.prepare_recovery()
+        journal = self.home / '.ww/host-upgrade.json'
+        journal.unlink()
+        journal.symlink_to(self.manifest)
+        self.refuse_before_transport(['--recover', '--release', RECOVERY_CID])
+
+    def run_recovery(self, flags=(), expected_exit=0):
+        self.env['TEST_CID'] = RECOVERY_CID
+        before = {str(path.relative_to(self.home)): path.read_bytes()
+                  for path in self.home.rglob('*') if path.is_file()}
+        result = subprocess.run(['sh', str(INSTALLER), '--recover', *flags,
+                                 '--trusted-release-keys', str(self.keys)],
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
+        after = {str(path.relative_to(self.home)): path.read_bytes()
+                 for path in self.home.rglob('*') if path.is_file()}
+        self.assertEqual(after, before)
+        self.assertFalse((self.home / '.ww/bin').exists(), 'recovery invoked install')
+        return result
+
+    def test_recovery_handoff_fetches_only_authenticated_host_all_platforms(self):
+        self.prepare_recovery(b'{"version":1,"release":"' + RECOVERY_CID.encode() + b'"}')
+        for os_name, arch, path in PLATFORMS:
+            with self.subTest(os=os_name, arch=arch):
+                self.env.update(TEST_OS=os_name, TEST_ARCH=arch)
+                self.run_recovery()
+                self.assertEqual(self.calls.read_text().splitlines(), [
+                    f'upgrade --recover-only --release {RECOVERY_CID} '
+                    f'--ipfs-url http://localhost:5001 --trusted-release-keys {self.keys}'])
+                self.assertEqual(self.transport.read_text().splitlines(), [
+                    'id', f'cat /ipfs/{RECOVERY_CID}/CHECKSUMS.txt',
+                    f'cat /ipfs/{RECOVERY_CID}/CHECKSUMS.txt.sig',
+                    f'cat /ipfs/{RECOVERY_CID}/bin/ww/{path}/ww'])
+                self.calls.unlink()
+                self.transport.unlink()
+
+    def test_recovery_explicit_release_propagates_native_refusal_and_endpoint(self):
+        self.prepare_recovery(b'invalid pointer bypassed by explicit selection')
+        self.env['TEST_RECOVERY_EXIT'] = '43'
+        self.run_recovery(['--release', RECOVERY_CID, '--ipfs-url', 'http://127.0.0.1:41001'],
+                          expected_exit=43)
+        self.assertIn('--ipfs-url http://127.0.0.1:41001', self.calls.read_text())
+        self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+
+    def test_recovery_explicit_release_uses_ipfs_api_without_local_pointer(self):
+        self.prepare_recovery()
+        self.env['IPFS_API'] = 'http://127.0.0.1:41002'
+        self.run_recovery(['--release', RECOVERY_CID])
+        self.assertIn('--ipfs-url http://127.0.0.1:41002', self.calls.read_text())
+
+    def test_recovery_authentication_failure_does_not_execute(self):
+        self.prepare_recovery()
+        self.signature.write_bytes(b'\x01' * 64)
+        self.run_recovery(['--release', RECOVERY_CID], expected_exit=1)
+        self.assertFalse(self.calls.exists())
+
+    def test_recovery_conflicts_with_manifest_verification(self):
+        result = self.refuse_before_transport(['--recover', '--verify-manifest', str(self.manifest),
+                                              '--signature', str(self.signature)])
+        self.assertIn('cannot combine', result.stderr)
+
+    def test_inherited_temporary_directory_is_never_removed(self):
+        directory = self.root / 'unrelated-state'
+        directory.mkdir()
+        sentinel = directory / 'sentinel'
+        sentinel.write_bytes(b'private unrelated state')
+        self.env['WW_TMPDIR'] = str(directory)
+        self.refuse_before_transport(['--recover'])
+        self.assertTrue(directory.exists(), 'cleanup removed inherited WW_TMPDIR')
+        self.assertEqual(sentinel.read_bytes(), b'private unrelated state')
 
     def test_legacy_consumer_accepts_signed_tree(self):
         # Frozen pre-authentication installer ignores the new detached signature.

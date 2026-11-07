@@ -15,7 +15,7 @@ release authority.
 `CHECKSUMS.txt.sig` contains exactly 64 raw signature bytes. The signer uses pure
 Ed25519 over the exact published `CHECKSUMS.txt` bytes. It does not prehash the
 manifest, encode the signature as text, or normalize newlines. There is no
-unsigned fallback, including with `--version CID`.
+unsigned fallback, including with `--release CID`.
 
 `CHECKSUMS.txt` is at most 1 MiB. Its first line is exactly `# sha256` followed
 by LF. Each remaining line contains 64 lowercase hexadecimal SHA-256 digits,
@@ -51,13 +51,24 @@ kernel, and status bytes with SHA-256. All three payloads must pass before the
 installer executes the candidate or changes installed state. Existing ownership,
 component validation, and recovery checks still apply.
 
-`ww perform upgrade` remains disabled before network access or file changes.
-`ww oci import` now refuses before download, stdout export, or container loading.
+With `--recover`, the shell stages only the signed Host. The native recovery
+entry point independently authenticates the typed release and checks that its
+own executable matches a recorded transaction generation before recovery.
+The shell relies on local Kubo for initial requested-CID binding; its signature
+checks alone authenticate publisher bytes, not the requested transport graph.
+
+`ww upgrade` authenticates descriptor selection and delegates to #739. Native
+replacement still refuses until compatibility and startup-admission gates pass;
+see [native upgrades](native-upgrades.md). `ww image update` authenticates the
+selected FHS and never replaces the native Host or restarts services.
+
+`ww oci import` refuses before download, stdout export, or container loading.
 The legacy OCI archive is absent from current packages and had no authentication.
-`ww perform install --payload` handles explicitly supplied local packages; it
-is not a release downloader. Its caller must trust the executed Host and local
-payload. Container registry distribution and deployment-head authority are
-separate from this IPFS release contract.
+The hidden shell bootstrap handoff requires the staged manifest, signature, and
+independent keyring. The native installer authenticates all three payloads again
+before component validation. No unsigned fresh-install path is exposed. Exact
+recorded-artifact repair does not authorize a different release. Container
+registry distribution and deployment-head authority remain separate.
 
 `ww::release::auth::TrustedKeys` accepts separately supplied keyring bytes.
 `authenticate` returns an `AuthenticatedManifest` only after strict Ed25519
@@ -181,8 +192,9 @@ The frozen binding order is:
 `AuthenticatedRelease` verifies the signature, binding bytes, descriptor CID,
 schema, and manifest artifact bindings. Selection checks platform and Host/PID0
 compatibility. Artifact verification checks exact reconstructed bytes before use.
-The shell installer keeps its existing signed-manifest path during migration;
-it does not interpret descriptors or persist consumer freshness state.
+The shell installer keeps its signed-manifest staging path during migration;
+it does not interpret descriptors or persist consumer freshness state. Automatic
+discovery is disabled. Recovery delegates typed verification to the staged Host.
 
 The Rust consumer records raw signed IPNS evidence and the signed release proof
 in one locked durable watermark. IPNS sequence and release sequence are separate

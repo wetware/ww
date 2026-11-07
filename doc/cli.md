@@ -95,7 +95,7 @@ See [local snapshots](local-snapshots.md) for exclusions, limits, and failure be
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port <PORT>` | `2025` | libp2p swarm listen port |
+| `--listen <MULTIADDR>` | TCP and QUIC on IPv4 and IPv6, port `2025` | libp2p swarm listen address; repeatable. Also reads comma-separated `WW_LISTEN`. Every requested address must bind successfully. |
 | `--identity <PATH>` | `~/.ww/identity` | Ed25519 identity file path. Also reads `WW_IDENTITY` env. |
 | `--insecure-ephemeral` | off | Allow ephemeral identity fallback if identity file is missing (insecure; for quick trial runs). |
 | `--http-listen <ADDR>` | none | Enable WAGI HTTP server (e.g. `127.0.0.1:2080`) |
@@ -147,7 +147,7 @@ ww run . --stem 0x1234...abcd --rpc-url http://rpc.example.com:8545
 ww run --ipns-stem k51qzi5uqu5... --ipns-routing-url http://localhost:8080
 ```
 
-Embedded payloads seed installation only.
+Installation consumes authenticated release payloads.
 Files under `/bin` do not execute merely because they are present.
 
 The IPNS Stem accepts canonical Base36 names, legacy base58 Peer IDs, and
@@ -156,7 +156,7 @@ signed record changes and revokes the deployment at signed EOL when no valid
 replacement exists.
 
 Kubo 0.33 does not expose Routing V1 on the Gateway by default. Configure and
-restart Kubo before using an IPNS Stem or the installed default publisher:
+restart Kubo before using an IPNS Stem or an explicitly configured Host-owned publisher:
 
 ```sh
 ipfs config --json Gateway.ExposeRoutingAPI true
@@ -171,6 +171,7 @@ RPC listener and does not serve this path. Wetware does not fall back to Kubo's
 | Variable | Set by | Description |
 |----------|--------|-------------|
 | `WW_IDENTITY` | user | Default identity file path |
+| `WW_LISTEN` | user | Comma-separated libp2p listen multiaddresses; also accepted through repeatable `--listen` |
 | `WW_FHS_ROOT` | user | Installed FHS baseline directory; accepts an absolute path or `~/path` |
 | `WW_TTY` | host | Set to `1` when stdin is a terminal (triggers interactive shell mode) |
 | `WW_CELL_MODE` | host | Cell transport mode: `vat`, `raw`, `http`, or absent (kernel) |
@@ -413,11 +414,12 @@ Generate a new Ed25519 identity.
 ww keygen [--output PATH]
 ```
 
-Prints the base58btc secret key to stdout, peer ID to stderr.
+Without `--output`, prints the base58btc secret key to stdout and peer ID to
+stderr. `--output` creates a private key file and refuses an existing path.
 
 ```sh
-ww keygen > ~/.ww/identity
-ww keygen --output ~/.ww/identity   # equivalent
+ww keygen                          # secret on stdout
+ww keygen --output ~/.ww/identity   # create only; never replace an existing key
 ```
 
 ## ww doctor
@@ -433,80 +435,92 @@ includes Rust nightly, `rust-src`, WASI SDK, `wasm-component-ld`, LLD, and
 `wasm-tools`. The command also checks optional Kubo and Ollama installations.
 Exit 0 if all required checks pass.
 
-## ww perform
+## ww install
 
-Effectful operations that mutate state beyond the current directory.
-
-### ww perform install
-
-Bootstrap `~/.ww` and the daemon.
-
-Validates the payload and managed-file ownership before replacing files.
-Reruns preserve existing identity and refresh only owned managed files.
-
-1. Creates `~/.ww` directory structure
-2. Generates `~/.ww/identity` if missing
-3. Derives the host Peer ID and default Base36 IPNS name from that identity
-4. Installs the validated kernel and status components under `~/.ww/fhs`
-5. Refreshes the default namespace when payloads change or its bootstrap is absent
-6. Registers the background daemon (launchd/systemd) and prints its activation command
-
-The command does not create a Kubo `"ww"` signing key. Kubo never receives the
-Wetware identity. Installation does not start the service. See
-[installation and recovery](installation.md) for activation and ownership rules.
-
-### ww perform update
-
-Revalidate the installed payload and refresh the managed installation.
+Install the Host, baseline FHS, and identity without service registration or
+name publication. Existing installations permit only the same recorded artifact.
+Different native bytes require `upgrade`; different FHS bytes require `image update`.
 
 ```sh
-ww perform update
+ww install [--release CID] [--check] [--json]
 ```
 
-The command preserves `~/.ww/identity` and reuses the default namespace unless
-its bootstrap is absent.
-Installed payloads take precedence over embedded installation seeds. Generated
-services retain the selected Kubo API and Routing V1 URLs. If files changed, the
-command attempts to restart the service; otherwise it leaves the service running.
-The daemon signs and publishes the configured default namespace when it starts.
+Without `--release`, an existing installation permits exact-artifact repair.
+Fresh installation requires an authenticated release or signed bootstrap handoff;
+automatic channel discovery awaits provisioning. `--trusted-release-keys` supplies
+the independent keyring. See [installation](installation.md).
 
-### ww perform upgrade
+## ww image update
 
-Native self-upgrade is disabled. The command refuses before network access or
-filesystem changes. Use the authenticated [installer](installation.md) for the
-complete Host and FHS package. The internal [native Host replacement engine](native-upgrades.md)
-supports recovery and rollback policy, but authenticated selection and native
-operational admission remain required before enabling a production command.
+Update the installed default FHS; active deployments and namespace configuration
+are unchanged. The command never replaces the Host or calls a service manager.
 
-### ww perform uninstall
+```sh
+ww image update --release CID [--check] [--json]
+```
 
-Remove the daemon and optionally `~/.ww`.
+Run the installed Host. The command verifies signed metadata, exact payload
+bytes, and production static compatibility. It retains complete before/after
+baselines for recovery and reports activation as false. Existing namespace
+configuration can shadow changed paths and retains its publication policy.
+Repeat `ww image update` after interruption to recover the recorded transaction
+before requesting a different release. Automatic release discovery awaits
+trusted channel provisioning.
+
+## ww upgrade
+
+Request explicit authenticated native Host replacement through #739:
+
+```sh
+ww upgrade --release CID [--check] [--json]
+ww upgrade --rollback [--json]
+```
+
+The command authenticates installed and selected native identities. It preserves
+FHS, namespace, identity, service configuration, and deployment authority.
+`--release` explicitly permits an authenticated historic selection; it does not
+lower freshness state. Recovery precedes new selection.
+
+Native replacement is still gated: the native adapter cannot yet certify
+candidate compatibility or live startup admission. Exact authenticated no-ops
+can succeed. Rollback preflight (`--rollback --check`) remains unavailable.
+Missing installed-release provenance causes refusal. Neither the
+installer nor any flag bypasses these gates. See [native upgrades](native-upgrades.md).
+
+## ww uninstall
+
+```sh
+ww uninstall [--check] [--json]
+```
+
+Remove owned software and daemon registration. Preserve identity, keys,
+namespaces, application data, logs, signed state, and recovery evidence.
+Unknown or altered owned software causes refusal before removal. There is no
+purge flag or recursive deletion of `~/.ww`.
 
 ## ww daemon
 
-Manage the background daemon.
+`daemon install` shares `run` options and positional mounts:
 
-### ww daemon install
-
-Register wetware as a user-level background service (launchd on
-macOS, systemd on Linux).
-
-```
-ww daemon install [--identity PATH] [--listen MULTIADDR ...] [--images PATH...] [--ipns-routing-url URL]
+```sh
+ww daemon install --identity /absolute/key --listen /ip4/127.0.0.1/tcp/2025 \
+  --http-listen 127.0.0.1:2080 --ipfs-url http://localhost:5001 ./image
+ww daemon uninstall [--check] [--json]
 ```
 
-`--ipns-routing-url` defaults to `http://localhost:8080` and reads
-`IPFS_ROUTING_API`. Generated launchd and systemd definitions preserve the
-selected value.
+Registration requires existing identity and startup paths. It freezes local
+paths and persists selected options without importing images, generating keys,
+or updating FHS. Fresh registration is disabled and stopped; identical owned
+registration preserves enabled/running state. A different existing definition
+requires explicit removal first. `--check` and `--json` are also supported by
+`daemon install`. Use native platform tools for start, stop, restart, and login
+activation; see [service activation](installation.md#separate-software-and-service-operations).
 
-`IPFS_API` supplies the install-time Kubo endpoint. The generated service records
-it as `--ipfs-url`, so startup does not depend on inheriting that variable.
-Without `--images`, the service uses the installed FHS baseline and reads
-`~/.ww/etc/ns` through a separate host-only configuration argument.
+Removal checks stop/unload and disable results, verifies stopped state, retains
+an exact configuration backup, then removes registration. Failure preserves
+registration or reports the remaining state. Software and private state remain.
 
-### ww daemon uninstall
-
-Remove the platform service file.
+The removed `perform` hierarchy has no compatibility aliases.
 
 ## ww ns
 
@@ -524,7 +538,10 @@ Add or update a namespace.
 ww ns add <NAME> [--ipns KEY]
 ```
 
-Writes a config file to `~/.ww/etc/ns/<name>`.
+Writes a config file to `~/.ww/etc/ns/<name>`. Selection changes on the next
+Host invocation. Configuring `ww` with the Host's own IPNS name and a bootstrap
+CID enables publication of that target at startup; the edit does not publish or
+restart the current Host.
 
 ## ww oci import
 

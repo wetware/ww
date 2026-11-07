@@ -29,31 +29,32 @@ Run `ww --version` to see if the binary is installed.
 
 Tell them how to get started:
 
-**macOS (build from source):**
-```
-git clone https://github.com/wetware/ww.git && cd ww
-make all
-./target/release/ww perform install
+**Linux or macOS (authenticated release):**
+Provision the release keyring independently. Set `RELEASE_CID` to the selected
+signed release and use an independently obtained installer:
+
+```sh
+sh scripts/install.sh --release "$RELEASE_CID"
 ```
 
-**Linux (pre-built binary):**
-```
-curl -LO https://github.com/wetware/ww/releases/latest/download/ww-linux-x86_64
-chmod +x ww-linux-x86_64
-sudo mv ww-linux-x86_64 /usr/local/bin/ww
-ww perform install
-```
+The installer requires Kubo and OpenSSL 3.x or 4.x. It validates the Host and
+kernel/status FHS, preserves existing identity, and creates no daemon or namespace.
+Automatic channel selection remains gated. Source builds can run with explicit
+FHS and identity; they do not bypass authenticated installation.
+See `doc/installation.md` for prerequisites and current release activation gates.
 
-Both paths require Kubo. Installation validates the kernel/status FHS, preserves
-existing identity, and registers the background daemon. It prints the service
-activation command without starting it. See `doc/installation.md` for setup.
+Register a service only when requested, using `ww daemon install` and the same
+startup options as `ww run`. Fresh registration is disabled. Activation uses
+native systemd or launchd commands and requires separate operator intent.
 
 ### If installed
 
 Check if setup is complete: `ww doctor`
 
-Look at the "Install state" section. If the identity or daemon is missing,
-run `ww perform install` to fix it.
+Look at the "Install state" section. Missing daemon registration is valid for a
+foreground installation. `ww install` repairs only the exact recorded package;
+it cannot upgrade the Host or FHS. A missing recorded identity requires restoring
+the original identity from backup. Do not regenerate identity during repair.
 
 If everything is OK, hand off to the quickstart.
 

@@ -1,9 +1,10 @@
 # Native Host replacement engine
 
-`ww perform upgrade` remains disabled. The `ww::upgrade` library contains the
-Host-specific transaction engine for #739. No production caller can construct
-its `PreverifiedCandidate` input yet. The existing installer is a separate
-multi-artifact operation; the upgrade engine never calls that installer.
+`ww upgrade` connects authenticated release selection to the #739 transaction
+engine. `PreverifiedCandidate::from_release` accepts only an authenticated
+release and selects the current platform. Native replacement remains gated by
+`NativeService` compatibility and restart admission. The installer is separate
+and refuses different existing native bytes.
 
 ## Admission boundaries
 
@@ -14,16 +15,22 @@ digest, and executable size. Staging recomputes the selected digest and size
 from the supplied bytes. Supported digest algorithms are SHA-256 and BLAKE3;
 the engine never infers an algorithm from digest length.
 
-Candidate bytes arrive separately from authenticated selection. The current
-constructor exists only in unit tests. A future #738 integration must validate
-descriptor binding, platform/ABI, CID graph/reconstruction, release-key policy,
-freshness, and deliberately authorized historical selection before constructing
-the input. A URL, CID, checksum, or parsed local journal is not a trust root.
+Candidate bytes arrive separately from authenticated selection. The CLI checks
+manifest signature, descriptor binding, platform compatibility profile,
+transport-root link, and exact reconstructed digest/size. Artifact download is
+bounded and uses signed artifact CIDs. Independent release keys remain the trust
+root. Explicit `--release CID` permits historical selection without lowering
+freshness state; automatic channel selection awaits trusted channel provisioning.
 
-`installation.json` remains version 1. Its BLAKE3 hashes establish local ownership
-of five files; they do not authenticate a release. Upgrades refuse incomplete or
-unknown receipts. Recover an incomplete installation through its existing
-installer using the original package before starting a Host transaction.
+A new `install --release` records an untrusted CID locator in
+`installed-release.json`. Upgrade reauthenticates that release and verifies the
+installed executable; the locator itself supplies no authentication. Legacy or
+local-payload installs without provenance refuse native replacement.
+
+`installation.json` accepts legacy version 1 and scoped version 2. BLAKE3
+ownership hashes do not authenticate a release. The native engine changes only
+the executable slot and preserves FHS and legacy namespace/service provenance.
+Incomplete and unknown receipts cause refusal.
 
 ## Transaction ownership
 
@@ -68,6 +75,19 @@ recovery aborted staging, restored the previous artifact, or completed a commit.
 The same invocation does not then select a different release. `operator_rollback` uses only the
 previous recorded artifact and retained bytes. Rollback uses the same replacement
 owner and does not lower release freshness or rewind deployment heads.
+
+The authenticated shell recovery path uses `Engine::require_pending_recovery`
+before native network selection, then `Engine::recover_authenticated`. The latter
+requires an independently authenticated selection that matches the full recorded
+previous or candidate generation. The CLI also verifies its own executable bytes.
+This recovery-only path cannot start a new transaction. See the shell invocation
+and endpoint requirements in [installation and recovery](installation.md).
+
+`upgrade --json` reports a structured outcome, selected and observed artifact
+identities, native artifact paths changed, activation, and recovery action.
+Observed identity describes bytes on disk; it does not certify running readiness.
+Changed paths exclude journal and retained-copy metadata. Unknown failure state
+uses null values for activation and changed paths.
 
 Records currently depend on the operator's private local filesystem custody.
 Production integration must define retained signed-evidence validation with
@@ -115,14 +135,15 @@ evidence. They qualify transaction policy separately from native service-manager
 restart behavior. Native observation tests do not establish successful live
 restart, cold-start timing, power-loss durability, or production trust provisioning.
 
-Before enabling a production upgrade command, integrate and qualify:
+Before permitting native replacement through the CLI, integrate and qualify:
 
-1. #738 authenticated current/historical selection and retained signed evidence.
+1. Trusted automatic channel selection, retained signed evidence, and atomic
+   installed-release provenance changes during native commit/recovery.
 2. Candidate/effective-deployment compatibility using the prepared FHS machinery.
 3. Captured startup evidence and admission enforced before restarted Host effects.
 4. Exact running native identity and serving readiness on systemd and launchd.
 5. Recovery from real service restart failure and measured bounded cold startup.
 
-The broader command migration remains #740. This engine does not implement
-`ww image update`, change the `perform` hierarchy, regenerate service defaults,
-publish IPNS values, or authorize production upgrades.
+The CLI separates `install`, `image update`, `upgrade`, `uninstall`, and daemon
+registration/removal. The native engine never updates FHS or service defaults,
+publishes IPNS values, or authorizes a production rollout.

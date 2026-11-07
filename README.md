@@ -20,9 +20,10 @@ model running inside the cell.
 ## Try it in 60 seconds
 
 ```sh
-curl -sSL https://wetware.run/install | sh
-# Run the platform service activation command printed by the installer.
-curl http://localhost:2080/status
+curl -fsSL https://wetware.run/install | sh -s -- --release "$RELEASE_CID"
+# Start in the foreground; query /status from another terminal.
+ww run --http-listen 127.0.0.1:2080
+# In another terminal: curl http://localhost:2080/status
 ```
 
 ```json
@@ -35,7 +36,7 @@ curl http://localhost:2080/status
 }
 ```
 
-The second command hit a WebAssembly cell running inside the daemon. The
+The status request reaches a WebAssembly cell running inside the Host. The
 default Rust kernel installs this composition directly. The cell receives a
 narrow `Membrane` containing only `peerId` and `Stat`.
 
@@ -52,15 +53,19 @@ narrow `Membrane` containing only `peerId` and `Stat`.
 ### Install
 
 ```bash
-curl -sSL https://wetware.run/install | sh
+curl -fsSL https://wetware.run/install | sh -s -- --release "$RELEASE_CID"
 ```
 
-The installer verifies and installs the Host plus `fhs/boot/kernel.wasm` and
-`fhs/bin/status.wasm`. It creates identity only when absent and prints the
-platform service activation command. Installation does not start the service.
-See [installation and recovery](doc/installation.md) for manual activation,
-managed-file ownership, and incomplete-install recovery. `ww perform upgrade`
-is disabled; use the current installer for Host replacement.
+Set `RELEASE_CID` to the selected signed release and provision the independent
+release keyring first. The installer authenticates and installs the Host,
+baseline FHS, and identity. Automatic channel selection is not yet integrated.
+Installation does not register a daemon or configure name publication. Register
+separately with `ww daemon install`; use native platform tools for activation.
+`ww image update` changes only the baseline and never restarts the Host.
+`ww uninstall` preserves user state. `ww upgrade` uses authenticated native
+selection, but replacement remains gated on native operational admission.
+See [installation and recovery](doc/installation.md) for ownership, migration,
+service activation, and outstanding upgrade integration gates.
 
 Or build from source:
 

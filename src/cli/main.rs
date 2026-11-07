@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use std::io::Write as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use authority::Epoch;
@@ -16,6 +15,7 @@ mod image_cmd;
 mod installation;
 mod ns_cmd;
 mod p3_toolchain;
+mod upgrade_cmd;
 
 use ww::cell::image;
 use ww::host;
@@ -63,10 +63,128 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(clap::Args, Clone, Debug)]
+struct RunArgs {
+    /// Ordered source[:/guest/target] mounts above the installed FHS and Stem.
+    #[arg(value_name = "MOUNT")]
+    mounts: Vec<String>,
+
+    /// Installed FHS directory, frozen below Stem, namespaces, and CLI mounts.
+    /// Defaults to $HOME/.ww/fhs. Must be an absolute path or ~/path.
+    #[arg(long, env = "WW_FHS_ROOT", value_name = "PATH")]
+    fhs_root: Option<PathBuf>,
+
+    /// Host-only roots whose `etc/ns` directories configure namespace layers.
+    #[arg(long, value_name = "PATH", hide = true)]
+    namespace_root: Vec<PathBuf>,
+
+    /// libp2p listen multiaddr. Repeatable; comma-separated via WW_LISTEN.
+    /// Defaults to TCP and QUIC on both IPv4 and IPv6 at port 2025.
+    /// Every requested address must bind successfully — bind failures are
+    /// hard errors. Pass an explicit subset to opt out of e.g. IPv6 or QUIC.
+    #[arg(
+        long = "listen",
+        value_name = "MULTIADDR",
+        env = "WW_LISTEN",
+        value_delimiter = ','
+    )]
+    listen: Vec<Multiaddr>,
+
+    /// Enable WASM debug info for guest processes
+    #[arg(long)]
+    wasm_debug: bool,
+
+    /// Path to an Ed25519 identity file (host-side only; not a guest mount).
+    /// Works well with direnv: `export WW_IDENTITY=~/.ww/identity` in .envrc.
+    #[arg(long, env = "WW_IDENTITY", value_name = "PATH")]
+    identity: Option<String>,
+
+    /// Allow ephemeral identity (insecure). By default, `ww run` requires
+    /// a persistent identity file so auth-dependent shell/network flows can
+    /// rely on stable signing keys across restarts.
+    #[arg(long)]
+    insecure_ephemeral: bool,
+
+    /// Atom contract address (hex, 0x-prefixed). Enables authoritative
+    /// deployment following and authority revocation on head changes.
+    #[arg(long, conflicts_with = "ipns_stem")]
+    stem: Option<String>,
+
+    /// IPNS name to follow as the authoritative deployment Stem.
+    #[arg(long, value_name = "IPNS_NAME", conflicts_with = "stem")]
+    ipns_stem: Option<String>,
+
+    /// HTTP Routing V1 Gateway listener used for raw IPNS records.
+    /// Kubo 0.33 requires Gateway.ExposeRoutingAPI=true.
+    #[arg(
+        long,
+        default_value = "http://localhost:8080",
+        env = "IPFS_ROUTING_API"
+    )]
+    ipns_routing_url: String,
+
+    /// HTTP JSON-RPC URL for finalized-depth Atom polling.
+    #[arg(long, default_value = "http://127.0.0.1:8545")]
+    rpc_url: String,
+
+    /// WebSocket JSON-RPC URL for advisory pre-finality Atom events.
+    #[arg(long, default_value = "ws://127.0.0.1:8545")]
+    ws_url: String,
+
+    /// Chain depth used when reading authoritative Atom.head() state.
+    #[arg(long, default_value = "6")]
+    confirmation_depth: u64,
+
+    /// Number of executor worker threads for cell scheduling.
+    /// Each worker runs its own single-threaded tokio runtime.
+    /// 0 = auto-detect (one per CPU core). NOTE: auto-detect reads the
+    /// node's core count, NOT the cgroup CPU quota, so under a k8s CPU
+    /// limit it over-subscribes during the compile-heavy boot window
+    /// (measured self-contention). Pin this to match the CPU budget on
+    /// constrained hosts; WW_EXECUTOR_THREADS sets it from the environment
+    /// (parity with WW_COMPILE_WORKERS) so the deploy manifest can carry it
+    /// next to the CPU limit.
+    #[arg(long, default_value = "0", env = "WW_EXECUTOR_THREADS")]
+    executor_threads: usize,
+
+    /// Enable the WAGI HTTP server on the given address.
+    /// Example: --http-listen 127.0.0.1:8080
+    #[arg(long, value_name = "ADDR")]
+    http_listen: Option<String>,
+
+    /// Allow cells to make outbound HTTP requests to the given host.
+    /// Repeatable. Without this flag, no http-client capability is granted.
+    /// Supports exact hosts, subdomain globs (*.example.com), or '*' for all.
+    #[arg(long, value_name = "HOST")]
+    http_dial: Vec<String>,
+
+    /// Runtime cache policy for `Runtime.load()`.
+    /// "shared" (default): same WASM bytes → same Executor server.
+    /// "isolated": always create a fresh Executor server.
+    #[arg(long, default_value = "shared", env = "WW_RUNTIME_CACHE_POLICY")]
+    runtime_cache_policy: String,
+
+    /// Local HTTP admin endpoint. Serves GET /healthz, GET /readyz,
+    /// GET /version, GET /metrics, GET /host/id, and GET /host/addrs.
+    /// Defaults to localhost only; pass `--with-http-admin off` to
+    /// disable it.
+    #[arg(
+        long,
+        value_name = "ADDR",
+        default_value = "127.0.0.1:2026",
+        env = "WW_HTTP_ADMIN"
+    )]
+    with_http_admin: String,
+
+    /// IPFS HTTP API endpoint
+    #[arg(long, default_value = "http://localhost:5001", env = "IPFS_API")]
+    ipfs_url: String,
+}
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Statically validate composed images without executing guest code.
+    /// Validate composed images or update the installed baseline FHS.
     Image {
         #[command(subcommand)]
         action: image_cmd::ImageAction,
@@ -104,122 +222,7 @@ enum Commands {
     ///   ww run ./images/app ./config:/etc/myapp
     ///   ww run ./kernel.wasm:/boot/kernel.wasm
     ///   ww run /ipfs/<directory-cid>
-    Run {
-        /// Ordered source[:/guest/target] mounts above the installed FHS and Stem.
-        #[arg(value_name = "MOUNT")]
-        mounts: Vec<String>,
-
-        /// Installed FHS directory, frozen below Stem, namespaces, and CLI mounts.
-        /// Defaults to $HOME/.ww/fhs. Must be an absolute path or ~/path.
-        #[arg(long, env = "WW_FHS_ROOT", value_name = "PATH")]
-        fhs_root: Option<PathBuf>,
-
-        /// Host-only roots whose `etc/ns` directories configure namespace layers.
-        #[arg(long, value_name = "PATH", hide = true)]
-        namespace_root: Vec<PathBuf>,
-
-        /// libp2p listen multiaddr. Repeatable; comma-separated via WW_LISTEN.
-        /// Defaults to TCP and QUIC on both IPv4 and IPv6 at port 2025.
-        /// Every requested address must bind successfully — bind failures are
-        /// hard errors. Pass an explicit subset to opt out of e.g. IPv6 or QUIC.
-        #[arg(
-            long = "listen",
-            value_name = "MULTIADDR",
-            env = "WW_LISTEN",
-            value_delimiter = ','
-        )]
-        listen: Vec<Multiaddr>,
-
-        /// Enable WASM debug info for guest processes
-        #[arg(long)]
-        wasm_debug: bool,
-
-        /// Path to an Ed25519 identity file (host-side only; not a guest mount).
-        /// Works well with direnv: `export WW_IDENTITY=~/.ww/identity` in .envrc.
-        #[arg(long, env = "WW_IDENTITY", value_name = "PATH")]
-        identity: Option<String>,
-
-        /// Allow ephemeral identity (insecure). By default, `ww run` requires
-        /// a persistent identity file so auth-dependent shell/network flows can
-        /// rely on stable signing keys across restarts.
-        #[arg(long)]
-        insecure_ephemeral: bool,
-
-        /// Atom contract address (hex, 0x-prefixed). Enables authoritative
-        /// deployment following and authority revocation on head changes.
-        #[arg(long, conflicts_with = "ipns_stem")]
-        stem: Option<String>,
-
-        /// IPNS name to follow as the authoritative deployment Stem.
-        #[arg(long, value_name = "IPNS_NAME", conflicts_with = "stem")]
-        ipns_stem: Option<String>,
-
-        /// HTTP Routing V1 Gateway listener used for raw IPNS records.
-        /// Kubo 0.33 requires Gateway.ExposeRoutingAPI=true.
-        #[arg(
-            long,
-            default_value = "http://localhost:8080",
-            env = "IPFS_ROUTING_API"
-        )]
-        ipns_routing_url: String,
-
-        /// HTTP JSON-RPC URL for finalized-depth Atom polling.
-        #[arg(long, default_value = "http://127.0.0.1:8545")]
-        rpc_url: String,
-
-        /// WebSocket JSON-RPC URL for advisory pre-finality Atom events.
-        #[arg(long, default_value = "ws://127.0.0.1:8545")]
-        ws_url: String,
-
-        /// Chain depth used when reading authoritative Atom.head() state.
-        #[arg(long, default_value = "6")]
-        confirmation_depth: u64,
-
-        /// Number of executor worker threads for cell scheduling.
-        /// Each worker runs its own single-threaded tokio runtime.
-        /// 0 = auto-detect (one per CPU core). NOTE: auto-detect reads the
-        /// node's core count, NOT the cgroup CPU quota, so under a k8s CPU
-        /// limit it over-subscribes during the compile-heavy boot window
-        /// (measured self-contention). Pin this to match the CPU budget on
-        /// constrained hosts; WW_EXECUTOR_THREADS sets it from the environment
-        /// (parity with WW_COMPILE_WORKERS) so the deploy manifest can carry it
-        /// next to the CPU limit.
-        #[arg(long, default_value = "0", env = "WW_EXECUTOR_THREADS")]
-        executor_threads: usize,
-
-        /// Enable the WAGI HTTP server on the given address.
-        /// Example: --http-listen 127.0.0.1:8080
-        #[arg(long, value_name = "ADDR")]
-        http_listen: Option<String>,
-
-        /// Allow cells to make outbound HTTP requests to the given host.
-        /// Repeatable. Without this flag, no http-client capability is granted.
-        /// Supports exact hosts, subdomain globs (*.example.com), or '*' for all.
-        #[arg(long, value_name = "HOST")]
-        http_dial: Vec<String>,
-
-        /// Runtime cache policy for `Runtime.load()`.
-        /// "shared" (default): same WASM bytes → same Executor server.
-        /// "isolated": always create a fresh Executor server.
-        #[arg(long, default_value = "shared", env = "WW_RUNTIME_CACHE_POLICY")]
-        runtime_cache_policy: String,
-
-        /// Local HTTP admin endpoint. Serves GET /healthz, GET /readyz,
-        /// GET /version, GET /metrics, GET /host/id, and GET /host/addrs.
-        /// Defaults to localhost only; pass `--with-http-admin off` to
-        /// disable it.
-        #[arg(
-            long,
-            value_name = "ADDR",
-            default_value = "127.0.0.1:2026",
-            env = "WW_HTTP_ADMIN"
-        )]
-        with_http_admin: String,
-
-        /// IPFS HTTP API endpoint
-        #[arg(long, default_value = "http://localhost:5001", env = "IPFS_API")]
-        ipfs_url: String,
-    },
+    Run(RunArgs),
 
     /// Probe a running node's localhost admin endpoint.
     ///
@@ -294,10 +297,18 @@ enum Commands {
         ipfs_url: String,
     },
 
-    /// Effectful operations that mutate state beyond the current directory.
-    Perform {
-        #[command(subcommand)]
-        action: PerformAction,
+    /// Install the native Host, baseline FHS, and identity without daemon registration.
+    Install(installation::InstallArgs),
+
+    /// Replace only the native Host through the authenticated upgrade transaction.
+    Upgrade(upgrade_cmd::UpgradeArgs),
+
+    /// Remove owned software and daemon registration; preserve identity and user state.
+    Uninstall {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Check the development environment for required and optional tools.
@@ -328,93 +339,21 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum DaemonAction {
-    /// Register wetware as a user-level background service.
-    ///
-    /// Generates a key if missing, creates a platform service file
-    /// (launchd on macOS, systemd on Linux) from flags/defaults,
-    /// and prints the activation command.
+    /// Register an existing installation as a disabled user service. Does not start it.
     Install {
-        /// Path to an Ed25519 identity file. Defaults to ~/.ww/identity;
-        /// generated automatically if the file does not exist.
-        #[arg(long, value_name = "PATH")]
-        identity: Option<PathBuf>,
-
-        /// libp2p listen multiaddr. Repeatable; comma-separated via WW_LISTEN.
-        /// Overrides the default TCP+QUIC v4/v6 set on port 2025.
-        #[arg(
-            long = "listen",
-            value_name = "MULTIADDR",
-            env = "WW_LISTEN",
-            value_delimiter = ','
-        )]
-        listen: Vec<Multiaddr>,
-
-        /// Mounts to run: source[:/guest/target]. Local paths require ./, /, or ~/.
-        #[arg(long, value_name = "PATH")]
-        images: Vec<String>,
-
-        /// HTTP Routing V1 Gateway listener for host-owned IPNS publication.
-        #[arg(
-            long,
-            default_value = "http://localhost:8080",
-            env = "IPFS_ROUTING_API"
-        )]
-        ipns_routing_url: String,
-    },
-
-    /// Remove the platform service file.
-    ///
-    /// Removes the launchd plist (macOS) or systemd unit (Linux) and
-    /// prints the deactivation command. Does not touch ~/.ww/identity.
-    Uninstall,
-}
-
-#[derive(Subcommand)]
-enum PerformAction {
-    /// Bootstrap the ~/.ww user layer and daemon.
-    ///
-    /// Idempotent: re-running skips completed steps, retries failed ones.
-    ///
-    /// Steps:
-    ///   1. Create ~/.ww directory structure
-    ///   2. Generate Ed25519 identity at ~/.ww/identity (if missing)
-    ///   3. Register background daemon (launchd/systemd)
-    ///   4. Print summary with next steps
-    Install {
-        /// Canonical FHS directory containing boot/kernel.wasm and bin/status.wasm.
-        #[arg(long)]
-        payload: Option<PathBuf>,
-        /// Final executable path (defaults to ~/.ww/bin/ww).
-        #[arg(long)]
-        executable: Option<PathBuf>,
-        /// Validate payload and destination ownership without writing files.
+        #[command(flatten)]
+        run: Box<RunArgs>,
         #[arg(long)]
         check: bool,
+        #[arg(long)]
+        json: bool,
     },
-
-    /// Remove the wetware daemon and optionally ~/.ww.
-    ///
-    /// Steps:
-    ///   1. Stop and remove background daemon
-    ///   2. Optionally remove ~/.ww (prompts for confirmation)
-    Uninstall,
-
-    /// Refresh WASM images and the daemon to match this binary.
-    ///
-    /// Safe to run repeatedly. Does not touch identity or directory structure.
-    ///
-    /// Steps:
-    ///   1. Sync WASM images (CID compare, overwrite if changed)
-    ///   2. Republish standard library (if images changed and Kubo running)
-    ///   3. Regenerate daemon service file
-    ///   4. Restart daemon
-    Update,
-
-    /// Disabled until verified Host upgrades are implemented. Use the installer.
-    Upgrade {
-        /// IPFS HTTP API endpoint.
-        #[arg(long, default_value = "http://localhost:5001", env = "IPFS_API")]
-        ipfs_url: String,
+    /// Stop, disable, and remove owned registration; retain a configuration backup.
+    Uninstall {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -712,11 +651,25 @@ fn atom_advisory_candidates(
 
 impl Commands {
     async fn run(self) -> Result<()> {
-        match self {
+        let json_failure = match &self {
+            Commands::Install(args) if args.json => Some("install"),
+            Commands::Image {
+                action: image_cmd::ImageAction::Update(args),
+            } if args.json => Some("image update"),
+            Commands::Uninstall { json: true, .. } => Some("uninstall"),
+            Commands::Daemon {
+                action: DaemonAction::Install { json: true, .. },
+            } => Some("daemon install"),
+            Commands::Daemon {
+                action: DaemonAction::Uninstall { json: true, .. },
+            } => Some("daemon uninstall"),
+            _ => None,
+        };
+        let result = match self {
             Commands::Image { action } => action.run().await,
             Commands::Init { name } => Self::init(name).await,
             Commands::Build { path } => Self::build(path).await,
-            Commands::Run {
+            Commands::Run(RunArgs {
                 mounts: mount_args,
                 mut namespace_root,
                 fhs_root,
@@ -736,7 +689,7 @@ impl Commands {
                 runtime_cache_policy,
                 with_http_admin,
                 ipfs_url,
-            } => {
+            }) => {
                 let (installed_baseline, mounts) = Self::startup_mounts(
                     &mount_args,
                     fhs_root,
@@ -799,30 +752,18 @@ impl Commands {
                 .await
             }
             Commands::Daemon { action } => match action {
-                DaemonAction::Install {
-                    identity,
-                    listen,
-                    images,
-                    ipns_routing_url,
-                } => Self::daemon_install(identity, listen, images, ipns_routing_url, false)
-                    .await
-                    .map(|_| ()),
-                DaemonAction::Uninstall => Self::daemon_uninstall().await,
+                DaemonAction::Install { run, check, json } => {
+                    daemon_cmd::daemon_install(*run, check, json).await
+                }
+                DaemonAction::Uninstall { check, json } => {
+                    daemon_cmd::daemon_uninstall(check, json).await
+                }
             },
-            Commands::Push { path, ipfs_url } => Self::push(path, ipfs_url).await,
+            Commands::Install(args) => installation::install(args).await,
+            Commands::Uninstall { check, json } => installation::uninstall(check, json).await,
+            Commands::Upgrade(args) => upgrade_cmd::run(args).await,
             Commands::Keygen { output } => Self::keygen(output).await,
-            Commands::Perform { action } => match action {
-                PerformAction::Install {
-                    payload,
-                    executable,
-                    check,
-                } => installation::install(payload, executable, check)
-                    .await
-                    .map(|_| ()),
-                PerformAction::Uninstall => Self::perform_uninstall().await,
-                PerformAction::Update => Self::perform_update().await,
-                PerformAction::Upgrade { ipfs_url } => Self::perform_upgrade(ipfs_url).await,
-            },
+            Commands::Push { path, ipfs_url } => Self::push(path, ipfs_url).await,
             Commands::Doctor => Self::doctor().await,
             Commands::Oci { action } => match action {
                 OciAction::Import {
@@ -841,7 +782,25 @@ impl Commands {
                 NsAction::Remove { name } => Self::ns_remove(name).await,
                 NsAction::Resolve { name } => Self::ns_resolve(name).await,
             },
+        };
+        if let (Some(operation), Err(error)) = (json_failure, &result) {
+            let root = dirs::home_dir().map(|home| home.join(".ww"));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": 1, "operation": operation, "status": "failed",
+                    "error": format!("{error:#}"), "activation": null,
+                    "changed_paths": null,
+                    "recovery": {
+                        "pending_host": root.as_ref().is_some_and(|p| p.join("host-upgrade.json").exists()),
+                        "pending_fhs": root.as_ref().is_some_and(|p| p.join("image-update.json").exists()),
+                        "installation_complete": root.as_ref().and_then(|p| ww::installation_state::Receipt::read(p).ok().flatten()).map(|r| r.complete),
+                        "service_record": root.map(|p| p.join("daemon.json")),
+                    },
+                })
+            );
         }
+        result
     }
 
     async fn admin_get(admin: &str, path: &str, timeout_secs: u64) -> Result<(u16, String)> {
@@ -1391,7 +1350,7 @@ system::export!({iface_name}Guest);
         let peer_id = kp.public().to_peer_id();
 
         if let Some(path) = output {
-            ww::keys::save(&sk, &path)?;
+            installation::persist_identity(&path, &sk)?;
             eprintln!("Secret written to: {}", path.display());
         } else {
             println!("{encoded}");
@@ -1399,25 +1358,6 @@ system::export!({iface_name}Guest);
 
         eprintln!("Peer ID:        {peer_id}");
         Ok(())
-    }
-
-    /// Register wetware as a user-level background service.
-    ///
-    /// When `quiet` is true, suppresses status output (used by `perform install`
-    /// which prints its own summary).
-    async fn daemon_install(
-        identity: Option<PathBuf>,
-        listen: Vec<Multiaddr>,
-        images: Vec<String>,
-        ipns_routing_url: String,
-        quiet: bool,
-    ) -> Result<bool> {
-        daemon_cmd::daemon_install(identity, listen, images, ipns_routing_url, quiet).await
-    }
-
-    /// Remove the platform service file.
-    async fn daemon_uninstall() -> Result<()> {
-        daemon_cmd::daemon_uninstall().await
     }
 
     /// Run a wetware environment from parsed mounts.
@@ -1450,6 +1390,7 @@ system::export!({iface_name}Guest);
             .transpose()
             .context("parse --ipns-stem")?;
         let authoritative_source = stem_contract.is_some() || ipns_stem_name.is_some();
+        let baseline_guard = installation::startup_guard(installed_baseline.as_ref())?;
         let ns_configs = Self::startup_namespaces(
             &mounts,
             &namespace_roots,
@@ -1710,6 +1651,7 @@ system::export!({iface_name}Guest);
         };
         drop(mount_resolution);
         drop(mount_transaction);
+        drop(baseline_guard);
         let mut frozen_mounts = resolved_mounts.mounts;
         let installed_baseline = has_baseline.then(|| frozen_mounts.remove(0));
         let retained_source_roots = resolved_mounts.retained_roots;
@@ -2183,160 +2125,10 @@ system::export!({iface_name}Guest);
         Ok(())
     }
 
-    fn restart_user_daemon(
-        home: &std::path::Path,
-        lock: &ww::installation_state::MutationLock,
-    ) -> Result<Option<bool>> {
-        let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
-        let systemd_path = home.join(".config/systemd/user/ww.service");
-
-        if cfg!(target_os = "macos") && plist_path.exists() {
-            let mut command = std::process::Command::new("launchctl");
-            lock.inherit_to(&mut command)?;
-            let _ = command
-                .args(["unload", &plist_path.display().to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            let mut command = std::process::Command::new("launchctl");
-            lock.inherit_to(&mut command)?;
-            let ok = command
-                .args(["load", &plist_path.display().to_string()])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            Ok(Some(ok))
-        } else if cfg!(target_os = "linux") && systemd_path.exists() {
-            let mut command = std::process::Command::new("systemctl");
-            lock.inherit_to(&mut command)?;
-            let _ = command.args(["--user", "daemon-reload"]).status();
-            let mut command = std::process::Command::new("systemctl");
-            lock.inherit_to(&mut command)?;
-            let ok = command
-                .args(["--user", "restart", "ww"])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            Ok(Some(ok))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn remove_user_daemon(
-        home: &std::path::Path,
-        lock: &ww::installation_state::MutationLock,
-    ) -> Result<bool> {
-        if cfg!(target_os = "macos") {
-            let plist_path = home.join("Library/LaunchAgents/io.wetware.ww.plist");
-            if plist_path.exists() {
-                let mut command = std::process::Command::new("launchctl");
-                lock.inherit_to(&mut command)?;
-                let _ = command
-                    .args(["unload", &plist_path.display().to_string()])
-                    .status();
-                std::fs::remove_file(&plist_path)
-                    .with_context(|| format!("remove {}", plist_path.display()))?;
-                return Ok(true);
-            }
-            return Ok(false);
-        }
-
-        if cfg!(target_os = "linux") {
-            let unit_path = home.join(".config/systemd/user/ww.service");
-            if unit_path.exists() {
-                let mut command = std::process::Command::new("systemctl");
-                lock.inherit_to(&mut command)?;
-                let _ = command.args(["--user", "stop", "ww"]).status();
-                let mut command = std::process::Command::new("systemctl");
-                lock.inherit_to(&mut command)?;
-                let _ = command.args(["--user", "disable", "ww"]).status();
-                std::fs::remove_file(&unit_path)
-                    .with_context(|| format!("remove {}", unit_path.display()))?;
-                return Ok(true);
-            }
-            return Ok(false);
-        }
-
-        bail!("unsupported platform; only macOS and Linux are supported")
-    }
-
-    /// Revalidate installed payload and refresh managed files through the installer.
-    #[allow(clippy::unused_async)]
-    async fn perform_update() -> Result<()> {
-        let home = dirs::home_dir().context("cannot determine HOME")?;
-        let lock = ww::installation_state::MutationLock::acquire(&home)?;
-        if !installation::install_locked(&lock, None, None, false).await? {
-            println!("Daemon restart (nothing changed)");
-            return Ok(());
-        }
-        match Self::restart_user_daemon(&home, &lock)? {
-            Some(true) => Ok(()),
-            _ => bail!(
-                "installation updated; start the daemon with the activation command printed above"
-            ),
-        }
-    }
-
-    /// Remove the wetware daemon and optionally ~/.ww.
-    #[allow(clippy::unused_async)]
-    async fn perform_uninstall() -> Result<()> {
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let lock = ww::installation_state::MutationLock::acquire(&home)?;
-        lock.reject_pending()?;
-        let ww_dir = home.join(".ww");
-
-        // Step 1: Stop and remove daemon.
-        match Self::remove_user_daemon(&home, &lock)? {
-            true => println!("  Daemon ...................... REMOVED"),
-            false => println!("  Daemon ...................... NOT FOUND (already removed)"),
-        }
-
-        // Step 2: Optionally remove ~/.ww.
-        let mut ww_dir_removed = false;
-        if ww_dir.exists() {
-            print!("  Remove ~/.ww? This deletes your identity and all data. [y/N] ");
-            std::io::stdout().flush().ok();
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
-            if input.trim().eq_ignore_ascii_case("y") {
-                std::fs::remove_dir_all(&ww_dir)
-                    .with_context(|| format!("remove {}", ww_dir.display()))?;
-                println!("  ~/.ww ....................... REMOVED");
-                ww_dir_removed = true;
-            } else {
-                println!("  ~/.ww ....................... KEPT");
-            }
-        }
-
-        println!();
-        println!("Wetware uninstalled.");
-
-        // Only mention the binary if it lives outside ~/.ww (or ~/.ww was kept).
-        if let Ok(exe) = std::env::current_exe() {
-            let exe = exe.canonicalize().unwrap_or(exe);
-            let inside_ww_dir = exe.starts_with(&ww_dir);
-            if !inside_ww_dir || !ww_dir_removed {
-                println!(
-                    "  Binary at {} not removed (delete manually if desired).",
-                    exe.display()
-                );
-            }
-        }
-
-        Ok(())
-    }
-
     /// Refuse legacy OCI imports before network access, export, or runtime loading.
     #[allow(clippy::unused_async)]
     async fn oci_import(_cid: Option<String>, _to_stdout: bool, _ipfs_url: String) -> Result<()> {
         bail!("OCI release import is disabled until authenticated OCI artifacts are available. Current releases do not package oci/image.tar.")
-    }
-
-    /// Refuse before network access or filesystem changes.
-    #[allow(clippy::unused_async)]
-    async fn perform_upgrade(_ipfs_url: String) -> Result<()> {
-        bail!("Native self-upgrade is disabled until verified Host upgrades are available. Use the current installer to install the complete Host and FHS package.")
     }
 
     /// List configured namespaces from ~/.ww/etc/ns/.
@@ -2431,10 +2223,6 @@ mod tests {
     #[tokio::test]
     async fn legacy_release_consumers_refuse_before_network_access() {
         let endpoint = "not a valid URL".to_owned();
-        let upgrade = Commands::perform_upgrade(endpoint.clone())
-            .await
-            .unwrap_err();
-        assert!(upgrade.to_string().contains("self-upgrade is disabled"));
         for cid in [None, Some("untrusted-release".to_owned())] {
             for to_stdout in [false, true] {
                 let error = Commands::oci_import(cid.clone(), to_stdout, endpoint.clone())
@@ -2551,7 +2339,7 @@ mod tests {
     #[test]
     fn run_has_no_implicit_current_directory_mount() {
         let cli = Cli::try_parse_from(["ww", "run"]).unwrap();
-        let Commands::Run { mounts, .. } = cli.command else {
+        let Commands::Run(RunArgs { mounts, .. }) = cli.command else {
             panic!("expected run command");
         };
         assert!(mounts.is_empty());
@@ -2707,9 +2495,9 @@ mod tests {
             .expect("parse run command")
             .command
         {
-            Commands::Run {
+            Commands::Run(RunArgs {
                 with_http_admin, ..
-            } => with_http_admin,
+            }) => with_http_admin,
             _ => panic!("expected run command"),
         }
     }
@@ -2753,9 +2541,9 @@ mod tests {
         ])
         .unwrap()
         .command;
-        let Commands::Run {
+        let Commands::Run(RunArgs {
             mounts, fhs_root, ..
-        } = command
+        }) = command
         else {
             panic!("expected run");
         };
@@ -2881,151 +2669,6 @@ mod tests {
         assert!(format!("{error:#}").contains("state=disabled"));
     }
 
-    // ── Daemon service-file writer tests ──────────────────────────────
-    //
-    // These guard the `--http-listen` flag emission, which is the
-    // single point of failure for the engagement starter kit demo:
-    // if either the launchd plist or the systemd unit drops the flag,
-    // the daemon comes up with no WAGI HTTP server and `curl /status`
-    // gets connection refused. The `tests/status_cell_e2e.rs` integration
-    // path bypasses these writers entirely (it spawns the cell via
-    // Runtime/Executor in-process), so a regression in either writer
-    // would slip past silently without these unit tests.
-
-    fn config_with_http_listen(addr: &str) -> daemon_cmd::DaemonServiceConfig {
-        daemon_cmd::DaemonServiceConfig {
-            listen: vec!["/ip4/0.0.0.0/tcp/2025".to_string()],
-            identity: PathBuf::from("/tmp/identity"),
-            namespace_roots: vec![PathBuf::from("/tmp/host-state")],
-            images: Vec::new(),
-            http_listen: Some(addr.to_string()),
-            ipfs_url: "http://localhost:5001".to_string(),
-            ipns_routing_url: "http://localhost:8080".to_string(),
-        }
-    }
-
-    fn config_no_http_listen() -> daemon_cmd::DaemonServiceConfig {
-        daemon_cmd::DaemonServiceConfig {
-            listen: vec!["/ip4/0.0.0.0/tcp/2025".to_string()],
-            identity: PathBuf::from("/tmp/identity"),
-            namespace_roots: Vec::new(),
-            images: Vec::new(),
-            http_listen: None,
-            ipfs_url: "http://localhost:5001".to_string(),
-            ipns_routing_url: "http://localhost:8080".to_string(),
-        }
-    }
-
-    #[test]
-    fn test_launchd_plist_emits_http_listen_when_set() {
-        let home = tempfile::TempDir::new().unwrap();
-        let config = config_with_http_listen("127.0.0.1:2080");
-        let ww_bin = std::path::Path::new("/usr/local/bin/ww");
-
-        let changed =
-            daemon_cmd::write_launchd_plist(ww_bin, &config, home.path(), "/tmp/identity", true)
-                .expect("write plist should succeed");
-        assert!(changed, "a missing plist should count as changed");
-
-        let changed =
-            daemon_cmd::write_launchd_plist(ww_bin, &config, home.path(), "/tmp/identity", true)
-                .expect("rewrite identical plist should succeed");
-        assert!(!changed, "an identical plist should not count as changed");
-
-        let plist =
-            std::fs::read_to_string(home.path().join("Library/LaunchAgents/io.wetware.ww.plist"))
-                .expect("plist should exist");
-
-        assert!(
-            plist.contains("<string>--http-listen</string>"),
-            "plist should emit --http-listen flag, got:\n{plist}"
-        );
-        assert!(
-            plist.contains("<string>127.0.0.1:2080</string>"),
-            "plist should emit the configured listen address, got:\n{plist}"
-        );
-        assert!(
-            plist.contains("<string>--namespace-root</string>")
-                && plist.contains("<string>/tmp/host-state</string>"),
-            "plist should read namespace configuration through a host-only root, got:\n{plist}"
-        );
-        assert!(
-            plist.contains("<string>--ipns-routing-url</string>")
-                && plist.contains("<string>http://localhost:8080</string>"),
-            "plist should preserve the Routing V1 listener, got:\n{plist}"
-        );
-    }
-
-    #[test]
-    fn test_launchd_plist_omits_http_listen_when_none() {
-        let home = tempfile::TempDir::new().unwrap();
-        let config = config_no_http_listen();
-        let ww_bin = std::path::Path::new("/usr/local/bin/ww");
-
-        daemon_cmd::write_launchd_plist(ww_bin, &config, home.path(), "/tmp/identity", true)
-            .expect("write plist should succeed");
-
-        let plist =
-            std::fs::read_to_string(home.path().join("Library/LaunchAgents/io.wetware.ww.plist"))
-                .expect("plist should exist");
-
-        assert!(
-            !plist.contains("--http-listen"),
-            "plist should NOT emit --http-listen when config.http_listen is None, got:\n{plist}"
-        );
-    }
-
-    #[test]
-    fn test_systemd_unit_emits_http_listen_when_set() {
-        let home = tempfile::TempDir::new().unwrap();
-        let config = config_with_http_listen("127.0.0.1:2080");
-        let ww_bin = std::path::Path::new("/usr/local/bin/ww");
-
-        let changed =
-            daemon_cmd::write_systemd_unit(ww_bin, &config, home.path(), "/tmp/identity", true)
-                .expect("write unit should succeed");
-        assert!(changed, "a missing unit should count as changed");
-
-        let changed =
-            daemon_cmd::write_systemd_unit(ww_bin, &config, home.path(), "/tmp/identity", true)
-                .expect("rewrite identical unit should succeed");
-        assert!(!changed, "an identical unit should not count as changed");
-
-        let unit = std::fs::read_to_string(home.path().join(".config/systemd/user/ww.service"))
-            .expect("unit should exist");
-
-        assert!(
-            unit.contains("--http-listen 127.0.0.1:2080"),
-            "systemd unit should emit --http-listen flag with addr, got:\n{unit}"
-        );
-        assert!(
-            unit.contains("--namespace-root /tmp/host-state"),
-            "systemd unit should read namespace configuration through a host-only root, got:\n{unit}"
-        );
-        assert!(
-            unit.contains("--ipns-routing-url http://localhost:8080"),
-            "systemd unit should preserve the Routing V1 listener, got:\n{unit}"
-        );
-    }
-
-    #[test]
-    fn test_systemd_unit_omits_http_listen_when_none() {
-        let home = tempfile::TempDir::new().unwrap();
-        let config = config_no_http_listen();
-        let ww_bin = std::path::Path::new("/usr/local/bin/ww");
-
-        daemon_cmd::write_systemd_unit(ww_bin, &config, home.path(), "/tmp/identity", true)
-            .expect("write unit should succeed");
-
-        let unit = std::fs::read_to_string(home.path().join(".config/systemd/user/ww.service"))
-            .expect("unit should exist");
-
-        assert!(
-            !unit.contains("--http-listen"),
-            "systemd unit should NOT emit --http-listen when config.http_listen is None, got:\n{unit}"
-        );
-    }
-
     #[test]
     fn default_fhs_refuses_unowned_legacy_status() {
         let home = tempfile::tempdir().unwrap();
@@ -3033,7 +2676,7 @@ mod tests {
         let path = ww_dir.join("std/status/bin/status.wasm");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"custom legacy status").unwrap();
-        assert!(daemon_cmd::refresh_default_fhs(&ww_dir).is_err());
+        assert!(installation::installed_fhs(&ww_dir).is_err());
         assert!(!ww_dir.join("fhs").exists());
         assert_eq!(std::fs::read(path).unwrap(), b"custom legacy status");
     }

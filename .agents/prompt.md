@@ -29,14 +29,16 @@ ww run . --stem 0xAddr --rpc-url http://... --ws-url ws://...
 | `ww build [PATH]` | Compile a native `wasm32-wasip3` component into `bin/` |
 | `ww run [MOUNT...]` | Boot a node; mounts are `source[:target]` |
 | `ww image check [MOUNT...]` | Check static PID0 compatibility without guest execution; imports content and retains Kubo pins |
-| `ww push [PATH]` | Snapshot FHS tree to IPFS, optionally update on-chain HEAD |
+| `ww push [PATH]` | Snapshot an FHS tree to IPFS; does not promote a deployment head |
 | `ww keygen` | Generate Ed25519 identity (prints to stdout) |
 | `ww doctor` | Check dev environment (Rust, wasm target, Kubo) |
-| `ww perform install` | Bootstrap ~/.ww and the daemon |
-| `ww perform upgrade` | Self-update binary via IPNS |
-| `ww daemon install` | Register background daemon (launchd/systemd) |
+| `ww install --release CID` | Install signed Host, baseline FHS, and identity; no daemon or publication |
+| `ww image update --release CID` | Update the managed FHS without restarting the Host |
+| `ww upgrade --release CID` | Authenticate native selection through the upgrade engine; operational admission remains gated |
+| `ww uninstall` | Remove managed software and service registration; preserve user state |
+| `ww daemon install/uninstall` | Register a disabled service, or stop/disable/remove owned registration |
 | `ww ns add NAME --ipns KEY` | Add a namespace (IPFS mount layer) |
-| `ww oci import` | Pull container image from IPFS into Docker/podman |
+| `ww oci import` | Refuses until authenticated OCI distribution is integrated |
 
 ## Cell modes
 

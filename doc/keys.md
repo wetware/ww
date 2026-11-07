@@ -47,9 +47,9 @@ Rationale:
   image root is `~/.ww/fhs`, so the identity file does not enter the imported
   image DAG. An explicit image path can still expose any key inside that path.
 
-The save path creates new private directories with mode `0700` on Unix. It
-writes a mode-`0600` temporary file, syncs the file, renames it atomically, and
-syncs the parent directory. The same helper stores durable raw IPNS records.
+`ww keygen --output` writes a mode-`0600` temporary file, syncs it, installs
+it without replacing an existing path, and syncs the parent directory.
+Durable raw IPNS records use a separate atomic replacement helper.
 An interrupted write therefore does not truncate the canonical identity file.
 
 ### Default IPNS identity
@@ -63,7 +63,9 @@ Ed25519 private key
 ```
 
 Identity rotation changes both the Peer ID and the default IPNS name.
-`ww perform update` rewrites `~/.ww/etc/ns/ww` with the derived canonical name.
+Installation and software updates never rewrite `~/.ww/etc/ns/ww`. Fresh
+installation does not create that namespace. Publication requires an explicit
+namespace configuration with the Host's own name and bootstrap target.
 The running daemon signs records locally and sends only raw signed records to
 Kubo HTTP Routing V1. Wetware no longer creates or uses a Kubo `"ww"` signing
 key for default publication.
@@ -100,9 +102,8 @@ For daemon/service mode, pass identity through the same host flags/env:
 # Print a new secret to stdout (metadata on stderr)
 ww keygen
 
-# Save to a file
+# Save to an absent file; an existing file is never replaced
 ww keygen --output ~/.ww/identity
-ww keygen > ~/.ww/identity          # equivalent
 
 # Run with a persistent identity
 ww run --identity ~/.ww/identity ./images/my-app

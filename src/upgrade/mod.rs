@@ -1,9 +1,8 @@
 //! Explicit, recoverable native Host replacement.
 //!
-//! The production command stays disabled. Only the authenticated release
-//! selector may eventually construct [`PreverifiedCandidate`]; the constructor
-//! presently exists only in this module's tests. A checksum or local receipt is
-//! not upgrade authorization.
+//! Only an authenticated release can construct [`PreverifiedCandidate`].
+//! A checksum or local receipt is not upgrade authorization. Native operational
+//! compatibility and live restart admission remain separately enforced gates.
 
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,7 +15,8 @@ use service::{EnabledState, RestartAdmission, RunningState, ServiceControl, Serv
 use storage::{checkpoint, Paths};
 
 pub mod service;
-mod storage;
+#[doc(hidden)]
+pub mod storage;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -54,9 +54,9 @@ impl ArtifactIdentity {
 
 /// An authenticated selection, independent of downloaded bytes.
 ///
-/// No public constructor or Deserialize implementation exists. Integrating #738
-/// must add the single conversion from its authenticated platform selection;
-/// it must not expose a constructor from URLs, checksums, or arbitrary metadata.
+/// The only public constructor consumes an authenticated release and performs
+/// platform/compatibility selection. There is no metadata-only constructor or
+/// Deserialize implementation.
 #[derive(Clone, Debug)]
 pub struct PreverifiedCandidate {
     artifact: ArtifactIdentity,
@@ -66,6 +66,38 @@ pub struct PreverifiedCandidate {
     platform: String,
 }
 
+impl PreverifiedCandidate {
+    /// Exact authenticated native identity, without exposing a trusted constructor.
+    pub fn artifact(&self) -> &ArtifactIdentity {
+        &self.artifact
+    }
+
+    /// Bind #738's authenticated platform selection to #739's transaction input.
+    /// This does not certify downloaded bytes or operational compatibility;
+    /// staging and the service adapter perform those checks independently.
+    pub fn from_release(
+        release: &crate::release::descriptor::AuthenticatedRelease,
+        target: &str,
+    ) -> Result<Self> {
+        let selection =
+            release.select(target, crate::release::descriptor::COMPATIBILITY_PROFILE)?;
+        let host = selection.host();
+        let candidate = Self {
+            artifact: ArtifactIdentity {
+                algorithm: DigestAlgorithm::Sha256,
+                digest: hex::encode(host.artifact.sha256),
+                size: host.artifact.size,
+            },
+            release: release.descriptor_cid().to_string(),
+            version: release.descriptor().version.clone(),
+            revision: host.provenance.revision.clone(),
+            platform: host.target.clone(),
+        };
+        candidate.artifact.validate()?;
+        Ok(candidate)
+    }
+}
+
 /// Both selections are authenticated. The legacy receipt authenticates neither.
 pub struct UpgradeRequest<R: Read> {
     pub installed: PreverifiedCandidate,
@@ -73,7 +105,8 @@ pub struct UpgradeRequest<R: Read> {
     pub bytes: R,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Outcome {
     AlreadyInstalled,
     /// `live_ready` is false for absent/stopped services.
@@ -90,7 +123,8 @@ pub enum Outcome {
     NoPendingTransaction,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RecoveryAction {
     AbortedBeforeReplacement,
     RestoredPrevious,
@@ -205,6 +239,7 @@ pub struct Engine {
 impl Engine {
     pub fn open(home: &Path) -> Result<Self> {
         let lock = MutationLock::acquire(home)?;
+        lock.reject_pending_image()?;
         let paths = Paths::open(home)?;
         Ok(Self { _lock: lock, paths })
     }
@@ -278,6 +313,50 @@ impl Engine {
     ) -> Result<Outcome> {
         let result = self.recover_until(service, deadline(timeout)?);
         self.with_recovery_context(result)
+    }
+
+    /// Check recorded recovery ownership before a bootstrap transport fetches
+    /// an executable. This engine retains the mutation lock throughout selection.
+    pub fn require_pending_recovery(&self) -> Result<()> {
+        ensure!(
+            self.pending_recovery()?.is_some(),
+            "no pending Host transaction; recovery-only operation cannot select a new release"
+        );
+        Ok(())
+    }
+
+    /// Recover only through an independently authenticated recorded generation.
+    /// The caller must verify that its running recovery executable has the exact
+    /// selected bytes. A local journal supplies scope, never release authority.
+    pub fn recover_authenticated(
+        &mut self,
+        service: &mut impl ServiceControl,
+        timeout: Duration,
+        executable: PreverifiedCandidate,
+    ) -> Result<Outcome> {
+        let journal = self.pending_recovery()?.context(
+            "no pending Host transaction; recovery-only operation cannot select a new release",
+        )?;
+        let executable = ArtifactRecord::from(executable);
+        executable.validate()?;
+        ensure!(
+            executable == journal.previous || executable == journal.candidate,
+            "authenticated recovery executable is not a recorded Host generation; preserve the pending transaction and select its exact release"
+        );
+        self.recover(service, timeout)
+    }
+
+    fn pending_recovery(&self) -> Result<Option<Journal>> {
+        let Some(bytes) = storage::read_record(&self.paths.journal)? else {
+            return Ok(None);
+        };
+        let journal: Journal = serde_json::from_slice(&bytes).context(
+            "invalid Host transaction journal; preserve recovery files for manual inspection",
+        )?;
+        self.validate_journal(&journal)?;
+        self.validate_receipt_bindings(&journal)?;
+        self.expect_receipt(&journal, true)?;
+        Ok(Some(journal))
     }
 
     fn start(
@@ -487,15 +566,9 @@ impl Engine {
         service: &mut impl ServiceControl,
         deadline: Instant,
     ) -> Result<Outcome> {
-        let Some(bytes) = storage::read_record(&self.paths.journal)? else {
+        let Some(mut journal) = self.pending_recovery()? else {
             return Ok(Outcome::NoPendingTransaction);
         };
-        let mut journal: Journal = serde_json::from_slice(&bytes).context(
-            "invalid Host transaction journal; preserve recovery files for manual inspection",
-        )?;
-        self.validate_journal(&journal)?;
-        self.validate_receipt_bindings(&journal)?;
-        self.expect_receipt(&journal, true)?;
         if journal.phase == Phase::Committed {
             storage::verify(&self.paths.executable, &journal.candidate.artifact)?;
             ensure!(
@@ -619,7 +692,7 @@ impl Engine {
         }
         let original = Receipt::decode(&journal.receipt_before)?;
         ensure!(
-            original.version == 1 && original.complete,
+            original.complete,
             "journal contains an incomplete or unknown installation receipt"
         );
         if let Some(bytes) = &journal.receipt_after {

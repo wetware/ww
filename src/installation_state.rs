@@ -98,7 +98,18 @@ impl MutationLock {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
             Err(error) => return Err(error).context("inspect pending Host upgrade"),
         }
+        self.reject_pending_image()?;
         Ok(())
+    }
+
+    pub fn reject_pending_image(&self) -> Result<()> {
+        match std::fs::symlink_metadata(self.home.join(".ww/image-update.json")) {
+            Ok(_) => anyhow::bail!(
+                "pending FHS update; run ww image update to recover the recorded baseline"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("inspect pending FHS update"),
+        }
     }
 }
 
@@ -111,6 +122,33 @@ pub struct Receipt {
     pub hashes: [String; 5],
     pub previous: Option<[String; 5]>,
     pub complete: bool,
+}
+
+/// Version 2 separates owned software from preserved legacy provenance.
+/// The in-memory slots remain compatible with the native upgrade engine.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedReceipt {
+    version: u8,
+    executable: String,
+    fhs: FhsDigests,
+    legacy: LegacyDigests,
+    previous: Option<[String; 5]>,
+    complete: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FhsDigests {
+    kernel: String,
+    status: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyDigests {
+    namespace: String,
+    service: String,
 }
 
 impl Receipt {
@@ -141,8 +179,26 @@ impl Receipt {
             bytes.len() <= 65536,
             "installation ownership metadata exceeds 64 KiB"
         );
-        let state: Self = serde_json::from_slice(bytes)
-            .context("invalid installation ownership metadata; back up and reinstall")?;
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).context("invalid installation ownership metadata")?;
+        if value["version"] == 2 {
+            let state: ScopedReceipt = serde_json::from_value(value)
+                .context("invalid scoped installation ownership metadata")?;
+            return Ok(Self {
+                version: 2,
+                hashes: [
+                    state.executable,
+                    state.fhs.kernel,
+                    state.fhs.status,
+                    state.legacy.namespace,
+                    state.legacy.service,
+                ],
+                previous: state.previous,
+                complete: state.complete,
+            });
+        }
+        let state: Self = serde_json::from_value(value)
+            .context("invalid installation ownership metadata; preserve the original receipt")?;
         ensure!(
             state.version == 1,
             "unsupported installation ownership metadata; use the current installer"
@@ -172,6 +228,22 @@ impl Receipt {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.version == 2 {
+            return Ok(serde_json::to_vec_pretty(&ScopedReceipt {
+                version: 2,
+                executable: self.hashes[0].clone(),
+                fhs: FhsDigests {
+                    kernel: self.hashes[1].clone(),
+                    status: self.hashes[2].clone(),
+                },
+                legacy: LegacyDigests {
+                    namespace: self.hashes[3].clone(),
+                    service: self.hashes[4].clone(),
+                },
+                previous: self.previous.clone(),
+                complete: self.complete,
+            })?);
+        }
         Ok(serde_json::to_vec_pretty(self)?)
     }
 }
@@ -270,7 +342,7 @@ mod tests {
         std::fs::write(&path, pending.encode().unwrap()).unwrap();
         assert!(Receipt::load(home.path()).is_err());
         assert!(!Receipt::read(home.path()).unwrap().unwrap().complete);
-        pending.version = 2;
+        pending.version = 3;
         std::fs::write(&path, pending.encode().unwrap()).unwrap();
         assert!(Receipt::read(home.path()).is_err());
     }

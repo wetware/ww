@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Boot the installed Host using generated service argv and an offline Kubo."""
+"""Boot the installed Host explicitly with an offline Kubo; register no service."""
 import hashlib
 import json
 import os
 from pathlib import Path
-import plistlib
-import shlex
 import shutil
 import socket
 import subprocess
@@ -15,6 +13,7 @@ import time
 import urllib.parse
 import urllib.request
 from kubo_fixture import isolated_kubo
+from release_auth_fixture import bootstrap_arguments
 
 
 def port():
@@ -61,31 +60,26 @@ def main():
                if not k.startswith(('WW_', 'IPFS_'))}
         env.update(HOME=str(home), IPFS_PATH=str(root / 'ipfs'), NO_COLOR='1')
         with isolated_kubo() as kubo:
-            # Install against a nondefault endpoint; boot must get it from service argv.
+            # Explicit runtime endpoints remain separate from offline installation.
             assert urllib.parse.urlparse(kubo['IPFS_API']).port != 5001, kubo
             api = urllib.parse.urlparse(kubo['IPFS_API'])
             kubo_api = f'/ip4/{api.hostname}/tcp/{api.port}'
             env.update(kubo)
-            subprocess.run([str(binary), 'perform', 'install', '--payload', str(fhs)],
+            bootstrap = bootstrap_arguments(root / 'bootstrap', binary, fhs)
+            subprocess.run([str(binary), 'install', *bootstrap],
                            env=env, check=True, timeout=120)
             installed = home / '.ww/bin/ww'
             assert hashlib.sha256(installed.read_bytes()).digest() == hashlib.sha256(binary.read_bytes()).digest()
             identity = (home / '.ww/identity').read_bytes()
             services = list(home.rglob('*.plist')) + list(home.rglob('*.service'))
-            assert len(services) == 1, services
-            if services[0].suffix == '.plist':
-                argv = plistlib.loads(services[0].read_bytes())['ProgramArguments']
-            else:
-                command = next(line[len('ExecStart='):] for line in services[0].read_text().splitlines()
-                               if line.startswith('ExecStart='))
-                argv = shlex.split(command)
-            assert argv[0] == str(installed), argv
-            assert str(home / '.ww/fhs') not in argv, argv
-            assert argv.count('--ipfs-url') == 1, f'generated service must carry --ipfs-url: {argv}'
-            assert argv[argv.index('--ipfs-url') + 1] == kubo['IPFS_API'], argv
-            print(f'PASS: generated {services[0].suffix} endpoint {kubo["IPFS_API"]}', flush=True)
-            # Change listeners for isolation; preserve the generated dependency endpoints.
-            # Keep executable, identity, namespace and dependency arguments exact.
+            assert services == [], services
+            assert not (home / '.ww/etc/ns/ww').exists()
+            argv = [str(installed), 'run', '--identity', str(home / '.ww/identity'),
+                    '--namespace-root', str(home / '.ww'),
+                    '--ipfs-url', kubo['IPFS_API'],
+                    '--ipns-routing-url', kubo['IPFS_ROUTING_API'],
+                    '--listen', '/ip4/127.0.0.1/tcp/0', '--http-listen', '127.0.0.1:0']
+            # Start explicitly with isolated listeners and dependency endpoints.
             # The unrelated CWD and private state must never become image layers.
             cwd = root / 'unrelated-cwd'
             cwd.mkdir()
@@ -102,7 +96,7 @@ def main():
             peer_id = None
             default_kernel_cid = None
             override_kernel_cid = None
-            for mode in ('generated', 'bare', 'local-target', 'immutable-target', 'explicit-root'):
+            for mode in ('configured', 'bare', 'local-target', 'immutable-target', 'explicit-root'):
 
                 admin, http = port(), port()
                 command = list(argv)

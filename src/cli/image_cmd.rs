@@ -12,6 +12,8 @@ use ww::{cell::image, ipfs, stem::Source as _};
 pub enum ImageAction {
     /// Check static PID0 compatibility. Imports content and retains shared Kubo pins.
     Check(Check),
+    /// Update the installed default FHS; active deployments and namespaces are unchanged.
+    Update(super::installation::UpdateArgs),
 }
 
 #[derive(Args)]
@@ -104,6 +106,7 @@ impl ImageAction {
     pub async fn run(self) -> Result<()> {
         match self {
             Self::Check(check) => check.run().await,
+            Self::Update(update) => super::installation::image_update(update).await,
         }
     }
 }
@@ -218,6 +221,7 @@ impl Check {
             authoritative,
         )
         .context("source configuration")?;
+        let _baseline_guard = super::installation::startup_guard(baseline.as_ref())?;
         let namespaces = super::Commands::startup_namespaces(
             &mounts,
             &self.namespace_root,
