@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Separate software and daemon CLI lifecycles (#740).** Use `ww install`,
+  `ww image update`, `ww upgrade`, and `ww uninstall`; `perform` has no aliases.
+  Installation creates Host/FHS/identity without a daemon or publication.
+  FHS updates retain complete recovery generations and never restart the Host.
+  Daemon registration uses shared `run` options and starts disabled; removal
+  stops/disables the service and saves its definition. Software removal preserves
+  user state. Signed shell bootstrap uses `--release`; `--recover` authenticates
+  an exact recorded Host generation and enters the native recovery owner.
+  Native replacement, automatic channel freshness, and production activation
+  retain their integration gates. The shell uninstaller delegates to `ww`
+  without a separate Python dependency or data-purge path.
 - **Recoverable native Host transaction engine (#739).** Stage and verify exact
   executable bytes, retain the previous artifact, journal replacement and
   recovery, and preserve installation ownership. Installation and service-file
