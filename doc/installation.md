@@ -15,9 +15,14 @@ trusting any checksum. Missing signatures and unsigned historic releases fail
 closed. The default trust path is `/etc/wetware/release-keys`; fetched release
 content cannot supply this trust anchor.
 Automatic channel selection refuses until trusted channel freshness is integrated.
-The shell bootstrap relies on local Kubo for the requested transport CID. The
-native `--release` selector additionally verifies the descriptor link and transport
-root independently. Manifest authentication alone does not establish that binding.
+The shell independently hashes the raw release root and verifies that its direct
+`CHECKSUMS.txt` link identifies the authenticated manifest. Signed payload hashes
+then bind the staged executable to the requested root before its first execution.
+Kubo supplies bytes; its path-resolution results do not grant execution authority.
+Shell bootstrap accepts the current package producer format: canonical lowercase
+base32 CIDv1 DAG-PB SHA-256 roots with a single raw-block manifest. CIDv0 roots,
+chunked manifests, and other unsupported layouts fail closed. The native
+`--release` selector additionally verifies the typed descriptor and compatibility.
 
 The installer downloads the Host, `fhs/boot/kernel.wasm`, and
 `fhs/bin/status.wasm` to a temporary directory. It requires an exact SHA-256
@@ -156,8 +161,9 @@ sh scripts/install.sh --recover --release <RECORDED_RELEASE_CID>
 
 Recovery requires an existing `host-upgrade.json`. The default locator is the
 untrusted `installed-release.json`; supply the exact recorded release explicitly
-when that locator is unavailable. The shell authenticates and stages only the
-Host, then invokes the native recovery-only entry point. The native entry point
+when that locator is unavailable. The shell binds the authenticated manifest to
+the requested root and verifies the Host bytes before invoking the native
+recovery-only entry point. The native entry point
 holds the installation lock, reauthenticates the typed release, verifies its own
 executable bytes, and matches the recorded generation before calling `Engine::recover`.
 It never falls through to fresh installation or new-release selection.

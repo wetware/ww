@@ -11,10 +11,10 @@ import stat
 import subprocess
 import tempfile
 import unittest
-from release_auth_fixture import bootstrap_arguments, generate_key, sign_manifest
+from release_auth_fixture import (bootstrap_arguments, cid_text, generate_key,
+                                  manifest_root, sign_manifest)
 
 REPO = Path(__file__).resolve().parents[1]
-RELEASE_CID = 'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3rne56m7z37lnw3e4ni4ua3wi'
 parser = argparse.ArgumentParser()
 parser.add_argument('--binary', type=Path, required=True)
 parser.add_argument('--fhs', type=Path, required=True)
@@ -51,6 +51,9 @@ class Installation(unittest.TestCase):
 set -eu
 case "$1" in
   id) exit 0 ;;
+  block)
+    [ "$2" = get ] && [ "$3" = "$TEST_RELEASE_CID" ] || exit 91
+    cat "$TEST_ROOT_BLOCK" ;;
   cat)
     prefix=/ipfs/$TEST_RELEASE_CID/
     case "$2" in "$prefix"*) ;; *) exit 91 ;; esac
@@ -67,7 +70,8 @@ esac
             stub.chmod(0o755)
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(('WW_', 'IPFS_'))}
-        self.env.update(HOME=str(self.home), TEST_RELEASE=str(self.release), TEST_RELEASE_CID=RELEASE_CID,
+        self.env.update(HOME=str(self.home), TEST_RELEASE=str(self.release), TEST_RELEASE_CID=self.release_cid,
+                        TEST_ROOT_BLOCK=str(self.root / 'root.block'),
                         PATH=str(self.stubs) + os.pathsep + os.environ['PATH'],
                         NO_COLOR='1', WW_CWASM_DIR=str(self.root / 'cwasm'),
                         IPFS_API='http://127.0.0.1:1', IPFS_ROUTING_API='http://127.0.0.1:1')
@@ -81,10 +85,18 @@ esac
         (self.release / 'CHECKSUMS.txt').write_text('# sha256\n' + ''.join(
             f'{digest(path)}  {name}\n' for name, path in records))
         sign_manifest(self.private, self.release / 'CHECKSUMS.txt')
+        self.bind_manifest()
+
+    def bind_manifest(self):
+        block = manifest_root((self.release / 'CHECKSUMS.txt').read_bytes())
+        (self.root / 'root.block').write_bytes(block)
+        self.release_cid = cid_text(block)
+        if hasattr(self, 'env'):
+            self.env['TEST_RELEASE_CID'] = self.release_cid
 
     def install(self, success=True):
         result = subprocess.run(['sh', str(REPO / 'scripts/install.sh'),
-                                 '--release', RELEASE_CID,
+                                 '--release', self.release_cid,
                                  '--trusted-release-keys', str(self.trusted_keys)], env=self.env,
                                 text=True, capture_output=True, timeout=120)
         if success:
@@ -100,7 +112,7 @@ esac
                            capture_output=True, check=True, timeout=15)
             locator = json.loads((self.home / '.ww/installed-release.json').read_text())
             self.assertEqual(locator['version'], 1)
-            self.assertEqual(locator['release'], RELEASE_CID)
+            self.assertEqual(locator['release'], self.release_cid)
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -179,6 +191,7 @@ esac
                         original + original.splitlines()[1] + '\n'):
             (self.release / 'CHECKSUMS.txt').write_text(content)
             sign_manifest(self.private, self.release / 'CHECKSUMS.txt')
+            self.bind_manifest()
             self.install(False)
             self.assertEqual(self.snapshot(), {})
 

@@ -226,6 +226,119 @@ verify_manifest() {
   ' "$manifest" || die "Malformed SHA-256 release manifest"
 }
 
+# The public package builder stores the <=1 MiB manifest as one raw block.
+# Bind that block to the requested root independently of Kubo before executing
+# any downloaded Host. This is a flat directory membership check, not a general
+# IPLD decoder or a substitute for native typed-descriptor verification.
+verify_release_binding() {
+  if ! ipfs block get "$RELEASE_CID" > "$WW_TMPDIR/release-root"; then
+    die "Could not fetch release root block"
+  fi
+  [ "$(wc -c < "$WW_TMPDIR/release-root")" -le 2097152 ] \
+    || die "Release root exceeds 2 MiB"
+  # Encode the fixed CIDv1 / DAG-PB / SHA-256 profile locally. Comparing the
+  # entire canonical string also rejects other codecs and nonzero base32 padding.
+  printf '\001\160\022\040' > "$WW_TMPDIR/root-cid"
+  openssl dgst -sha256 -binary "$WW_TMPDIR/release-root" >> "$WW_TMPDIR/root-cid" \
+    || die "Could not hash release root"
+  od -An -v -tu1 "$WW_TMPDIR/root-cid" > "$WW_TMPDIR/root-cid-bytes" \
+    || die "Could not read release root CID"
+  actual_cid=$(awk '
+    BEGIN { alphabet="abcdefghijklmnopqrstuvwxyz234567"; printf "b" }
+    { for (i=1; i<=NF; i++) {
+        bits+=8; value=value*256+$i
+        while (bits>=5) {
+          bits-=5; scale=2^bits
+          printf "%s", substr(alphabet, int(value/scale)+1, 1)
+          value%=scale
+        }
+      }
+    }
+    END { if (bits) printf "%s", substr(alphabet, value*2^(5-bits)+1, 1) }
+  ' "$WW_TMPDIR/root-cid-bytes") || die "Could not encode release root CID"
+  [ "$actual_cid" = "$RELEASE_CID" ] || die "Release root CID mismatch"
+  openssl dgst -sha256 -binary "$WW_TMPDIR/CHECKSUMS.txt" > "$WW_TMPDIR/manifest-digest" \
+    || die "Could not hash release manifest"
+  manifest_digest=$(od -An -v -tx1 "$WW_TMPDIR/manifest-digest" | tr -d ' \n')
+  od -An -v -tu1 "$WW_TMPDIR/release-root" > "$WW_TMPDIR/root-bytes" \
+    || die "Could not read release root"
+  # Accept only the producer profile: sorted unique ASCII names, canonical
+  # length varints, exact Hash/Name/Tsize fields, and plain-directory Data.
+  # Other links remain opaque; only CHECKSUMS.txt grants payload authority.
+  awk -v digest="$manifest_digest" -v size="$(wc -c < "$WW_TMPDIR/CHECKSUMS.txt")" '
+    function fail() { exit 1 }
+    function number(end,    value,scale,b,count) {
+      value=0; scale=1
+      for (count=1; count<=4; count++) {
+        if (pos>end) fail()
+        b=bytes[pos++]; value+=(b%128)*scale
+        if (value>2097152) fail()
+        if (b<128) { if (count>1 && b==0) fail(); return value }
+        scale*=128
+      }
+      fail()
+    }
+    function field(tag,end,    field_length) {
+      if (pos>end || bytes[pos++]!=tag) fail()
+      field_length=number(end)
+      if (field_length>end-pos+1) fail()
+      return pos+field_length-1
+    }
+    # Validate u64 Tsize without rounding large values in awk. Only a small
+    # raw manifest size is interpreted; unrelated artifact sizes stay opaque.
+    function tsize(end,    count,b,value,scale) {
+      value=0; scale=1
+      for (count=1; count<=10; count++) {
+        if (pos>end) fail()
+        b=bytes[pos++]
+        if (count==10 && b>1) fail()
+        if (count<=4) { value+=(b%128)*scale; scale*=128 }
+        if (b<128) {
+          if (count>1 && b==0) fail()
+          return count<=4 ? value : -1
+        }
+      }
+      fail()
+    }
+    { for (i=1; i<=NF; i++) bytes[++total]=$i }
+    END {
+      pos=1
+      while (pos<=total) {
+        if (bytes[pos]==10) {
+          if (data++) fail()
+          data_end=field(10,total)
+          if (data_end!=pos+1 || bytes[pos]!=8 || bytes[pos+1]!=1) fail()
+          pos+=2
+          if (links && pos<=total) fail()
+        } else {
+          if (++links>1024) fail()
+          end=field(18,total)
+          hash_end=field(10,end); hash=""
+          if (hash_end-pos+1!=36 || bytes[pos]!=1 || bytes[pos+2]!=18 || bytes[pos+3]!=32 ||
+              (bytes[pos+1]!=85 && bytes[pos+1]!=112 && bytes[pos+1]!=113)) fail()
+          while (pos<=hash_end) hash=hash sprintf("%02x",bytes[pos++])
+          name_end=field(18,end); name=""
+          while (pos<=name_end) {
+            if (bytes[pos]<32 || bytes[pos]>126) fail()
+            name=name sprintf("%c",bytes[pos++])
+          }
+          if (name=="" || name=="." || name==".." || name~/[^A-Za-z0-9._-]/ ||
+              ("x" name)<=("x" previous)) fail()
+          previous=name
+          if (pos>end || bytes[pos++]!=24) fail()
+          link_size=tsize(end)
+          if (pos!=end+1) fail()
+          if (name=="CHECKSUMS.txt") {
+            if (hash!="01551220" digest || link_size!=size) fail()
+            matched=1
+          }
+        }
+      }
+      if (data!=1 || !matched) fail()
+    }
+  ' "$WW_TMPDIR/root-bytes" || die "Invalid release root or manifest binding"
+}
+
 if "$RECOVER"; then
   [ -z "$VERIFY_MANIFEST" ] && [ -z "$VERIFY_SIGNATURE" ] \
     || die "cannot combine --recover with manifest verification"
@@ -262,9 +375,9 @@ fi
 [ -n "$RELEASE_CID" ] \
   || die "Automatic release selection is unavailable until trusted channel freshness is provisioned. Specify --release CID."
 printf '%s\n' "$RELEASE_CID" | awk '
-  /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{58})$/ { valid=1 }
+  /^bafybei[a-z2-7]{52}$/ { valid=1 }
   END { exit !(NR == 1 && valid) }
-' || die "--release requires one immutable CID, without a path or query."
+' || die "--release requires one canonical CIDv1 DAG-PB SHA-256 release root, without a path or query."
 
 # --- Detect platform ---
 OS="$(uname -s)"
@@ -318,6 +431,7 @@ if ! ipfs cat "${IPFS_BASE}/CHECKSUMS.txt.sig" > "${WW_TMPDIR}/CHECKSUMS.txt.sig
   die "Could not fetch required CHECKSUMS.txt.sig"
 fi
 verify_manifest "${WW_TMPDIR}/CHECKSUMS.txt" "${WW_TMPDIR}/CHECKSUMS.txt.sig"
+verify_release_binding
 
 fetch_verified() {
   package_path="$1"

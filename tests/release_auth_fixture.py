@@ -8,6 +8,33 @@ import platform
 import subprocess
 
 
+def varint(value):
+    encoded = bytearray()
+    while value >= 128:
+        encoded.append((value & 127) | 128)
+        value >>= 7
+    return bytes(encoded) + bytes([value])
+
+
+def cid_bytes(data, codec=0x55):
+    return bytes([1, codec, 0x12, 32]) + hashlib.sha256(data).digest()
+
+
+def cid_text(data, codec=0x70):
+    return 'b' + base64.b32encode(cid_bytes(data, codec)).decode().lower().rstrip('=')
+
+
+def pb_field(tag, data):
+    return bytes([tag]) + varint(len(data)) + data
+
+
+def manifest_root(manifest):
+    """Minimal producer-profile directory, with a raw signed-manifest link."""
+    link = (pb_field(10, cid_bytes(manifest)) + pb_field(18, b'CHECKSUMS.txt')
+            + b'\x18' + varint(len(manifest)))
+    return pb_field(18, link) + pb_field(10, b'\x08\x01')
+
+
 def generate_key(directory):
     directory = Path(directory)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)

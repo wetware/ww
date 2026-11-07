@@ -26,6 +26,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pending authenticated selection, compatibility, and native restart admission.
 
 ### Fixed
+- **Bind shell bootstrap and recovery to the requested release (#805).** Verify
+  the raw release root CID and its direct signed-manifest link before executing
+  any downloaded Host. A different validly signed release cannot satisfy this
+  check. Unsupported root or manifest layouts fail closed.
 - **Authenticated IPFS release manifests (#412).** Sign exact checksum manifest
   bytes with Ed25519 and verify them against independently provisioned release
   keys before executing fetched payloads. Reject unsigned releases and preserve

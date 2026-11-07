@@ -150,7 +150,8 @@ release sequences, and equal-release-sequence descriptor changes. Expiry does no
 erase either floor. Explicit historical selection authenticates and checks
 compatibility without updating channel freshness state.
 
-The existing shell installer continues to authenticate its manifest and payloads.
+The shell installer independently verifies that the requested transport root
+links the authenticated manifest before executing checksum-authorized payloads.
 It does not interpret descriptors or persist freshness watermarks. Legacy readers
 therefore retain their existing replay limitation during migration. #739 owns
 Host replacement; #740 owns CLI migration. Neither is changed here.

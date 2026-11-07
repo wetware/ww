@@ -8,7 +8,8 @@ import subprocess
 import tempfile
 import unittest
 
-from release_auth_fixture import generate_key, sign_manifest
+from release_auth_fixture import (cid_bytes, cid_text, generate_key, manifest_root,
+                                  pb_field, sign_manifest, varint)
 
 REPO = Path(__file__).resolve().parents[1]
 INSTALLER = REPO / 'scripts/install.sh'
@@ -17,7 +18,6 @@ PLATFORMS = [('Linux', 'x86_64', 'linux/x86_64'),
              ('Linux', 'aarch64', 'linux/aarch64'),
              ('Darwin', 'x86_64', 'macos/x86_64'),
              ('Darwin', 'arm64', 'macos/aarch64')]
-RECOVERY_CID = 'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3rne56m7z37lnw3e4ni4ua3wi'
 
 
 class ReleaseAuthentication(unittest.TestCase):
@@ -49,6 +49,10 @@ esac
         self.script('ipfs', '''printf '%s\n' "$*" >> "$TEST_TRANSPORT"
 case "$1" in
 id) exit 0 ;;
+block)
+  [ "$2" = get ] && [ "$3" = "$TEST_CID" ] || exit 91
+  [ "${FAIL_FETCH:-}" != root ] || exit 1
+  cat "$TEST_ROOT_BLOCK" ;;
 cat)
   prefix=/ipfs/${TEST_CID:-test-release}/
   case "$2" in "$prefix"*) ;; *) exit 91 ;; esac
@@ -82,7 +86,7 @@ esac
         self.env.update(HOME=str(self.home), PATH=str(self.stubs) + os.pathsep + os.environ['PATH'],
                         TEST_OS='Linux', TEST_ARCH='x86_64', TEST_RELEASE=str(self.release),
                         TEST_EXECUTIONS=str(self.calls), TEST_TRANSPORT=str(self.transport),
-                        TEST_CID=RECOVERY_CID, TEST_PLATFORM_PROBES=str(self.probes))
+                        TEST_PLATFORM_PROBES=str(self.probes), TEST_ROOT_BLOCK=str(self.root / 'root.block'))
         self.write_manifest()
 
     def script(self, name, body):
@@ -101,6 +105,12 @@ esac
 
     def sign(self, private=None):
         sign_manifest(private or self.private, self.manifest)
+        self.set_root(manifest_root(self.manifest.read_bytes()))
+
+    def set_root(self, data):
+        (self.root / 'root.block').write_bytes(data)
+        self.release_cid = cid_text(data)
+        self.env['TEST_CID'] = self.release_cid
 
     def run_installer(self, verify=False, success=False, keys=None, legacy=False):
         installer = REPO / 'tests/fixtures/release-auth/legacy-install.sh' if legacy else INSTALLER
@@ -110,7 +120,7 @@ esac
         if verify:
             args += ['--verify-manifest', str(self.manifest), '--signature', str(self.signature)]
         else:
-            args += ['--version', 'test-release'] if legacy else ['--release', RECOVERY_CID]
+            args += ['--version', 'test-release'] if legacy else ['--release', self.release_cid]
         before = {str(path.relative_to(self.home)): path.read_bytes()
                   for path in self.home.rglob('*') if path.is_file()}
         previous_calls = len(self.calls.read_text().splitlines()) if self.calls.exists() else 0
@@ -123,7 +133,7 @@ esac
                 self.assertEqual(len(calls), 3, calls)
                 self.assertTrue(calls[0].startswith('install --check --payload '), calls)
                 self.assertTrue(calls[1].startswith('install --payload '), calls)
-                self.assertTrue(all(call.endswith(f' --bootstrap-release {RECOVERY_CID}')
+                self.assertTrue(all(call.endswith(f' --bootstrap-release {self.release_cid}')
                                     for call in calls[:2]), calls)
                 for call in calls[:2]:
                     self.assertIn(' --manifest ', call)
@@ -149,6 +159,163 @@ esac
                 self.assertEqual(len(self.calls.read_text().splitlines()), 3)
                 self.calls.unlink()
 
+    def substituted_release(self, original_root):
+        # A and B are different releases signed by the SAME trusted publisher.
+        # Authentication of either manifest succeeds independently.
+        self.run_installer(verify=True, success=True)
+        requested = self.release_cid
+        root_a = (self.root / 'root.block').read_bytes()
+        for _, _, path in PLATFORMS:
+            binary = self.release / 'bin/ww' / path / 'ww'
+            binary.write_bytes(binary.read_bytes() + b'\n# distinct valid release B\n')
+        self.write_manifest()
+        self.run_installer(verify=True, success=True)
+        self.assertNotEqual(requested, self.release_cid)
+        self.release_cid = self.env['TEST_CID'] = requested
+        if original_root:
+            (self.root / 'root.block').write_bytes(root_a)
+        for mode in ('install', 'explicit-recovery', 'locator-recovery'):
+            with self.subTest(mode=mode):
+                if mode == 'install':
+                    result = self.run_installer()
+                else:
+                    self.prepare_recovery(b'{"version":1,"release":"'
+                                          + requested.encode() + b'"}')
+                    flags = ['--release', requested] if mode == 'explicit-recovery' else []
+                    result = self.run_recovery(flags, expected_exit=1)
+                    self.assertFalse(self.calls.exists(), 'substituted candidate executed')
+                self.assertIn('manifest binding' if original_root else 'root CID mismatch',
+                              result.stderr)
+                self.assertNotIn('/bin/ww/', self.transport.read_text(),
+                                 'binding failure reached candidate download')
+
+    def test_other_valid_release_root_never_executes(self):
+        self.substituted_release(original_root=False)
+
+    def test_other_valid_manifest_under_requested_root_never_executes(self):
+        self.substituted_release(original_root=True)
+
+    def test_root_bytes_must_match_requested_cid_before_candidate_fetch(self):
+        root = self.root / 'root.block'
+        root.write_bytes(root.read_bytes() + b'\x00')
+        result = self.run_installer()
+        self.assertIn('root CID mismatch', result.stderr)
+        self.assertNotIn('/bin/ww/', self.transport.read_text())
+        self.prepare_recovery()
+        result = self.run_recovery(['--release', self.release_cid], expected_exit=1)
+        self.assertIn('root CID mismatch', result.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_unsupported_root_cid_profiles_and_noncanonical_padding(self):
+        for cid in (cid_text(b'raw root', 0x55), cid_text(b'cbor root', 0x71),
+                    'Qm' + 'a' * 44, self.release_cid.upper()):
+            with self.subTest(cid=cid):
+                self.refuse_before_transport(['--release', cid])
+        alphabet = 'abcdefghijklmnopqrstuvwxyz234567'
+        # A 36-byte CID has two unused low bits in its last base32 digit.
+        index = alphabet.index(self.release_cid[-1])
+        self.assertEqual(index % 4, 0)
+        self.release_cid = self.env['TEST_CID'] = self.release_cid[:-1] + alphabet[index + 1]
+        result = self.run_installer()
+        self.assertIn('root CID mismatch', result.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_malformed_root_membership_never_executes(self):
+        manifest = self.manifest.read_bytes()
+        raw_hash = cid_bytes(manifest)
+        data = pb_field(10, b'\x08\x01')
+
+        def link(name=b'CHECKSUMS.txt', cid=raw_hash, size=None):
+            return (pb_field(10, cid) + pb_field(18, name)
+                    + b'\x18' + varint(len(manifest) if size is None else size))
+
+        valid_link = link()
+        wrapped_link = pb_field(18, valid_link)
+        cases = {
+            'empty': b'',
+            'missing-manifest': pb_field(18, link(b'OTHER')) + data,
+            'wrong-manifest-digest': pb_field(18, link(cid=cid_bytes(b'other'))) + data,
+            'unixfs-manifest-wrapper': pb_field(18, link(cid=cid_bytes(manifest, 0x70))) + data,
+            'wrong-cid-version': pb_field(18, link(cid=b'\x02' + raw_hash[1:])) + data,
+            'wrong-multihash': pb_field(18, link(cid=raw_hash[:2] + b'\x13' + raw_hash[3:])) + data,
+            'truncated-cid': pb_field(18, link(cid=raw_hash[:-1])) + data,
+            'wrong-manifest-size': pb_field(18, link(size=len(manifest) + 1)) + data,
+            'duplicate-link': wrapped_link * 2 + data,
+            'empty-name': pb_field(18, link(b'')) + data,
+            'dot-name': pb_field(18, link(b'.')) + wrapped_link + data,
+            'path-name': pb_field(18, link(b'../CHECKSUMS.txt')) + data,
+            'nul-name': pb_field(18, link(b'CHECKSUMS.txt\x00')) + data,
+            'non-ascii-name': pb_field(18, link(b'\xff')) + wrapped_link + data,
+            'unsorted-links': pb_field(18, link(b'Z')) + wrapped_link + data,
+            'missing-directory-data': wrapped_link,
+            'wrong-directory-data': wrapped_link + pb_field(10, b'\x08\x02'),
+            'duplicate-directory-data': wrapped_link + data * 2,
+            'interleaved-data': wrapped_link + data + pb_field(18, link(b'Z')),
+            'unknown-node-field': wrapped_link + data + b'\x18\x00',
+            'unknown-link-field': pb_field(18, valid_link + b'\x20\x00') + data,
+            'duplicate-hash': pb_field(18, pb_field(10, raw_hash) + valid_link) + data,
+            'duplicate-name': pb_field(18, valid_link + pb_field(18, b'OTHER')) + data,
+            'missing-size': pb_field(18, valid_link[:-len(varint(len(manifest))) - 1]) + data,
+            'overlong-size': pb_field(18, link(b'0', size=0)[:-1] + b'\x80\x00') + wrapped_link + data,
+            'overflow-size': pb_field(18, link(b'0', size=0)[:-1] + b'\xff' * 9 + b'\x02') + wrapped_link + data,
+            'nonminimal-length': b'\x12' + bytes([len(valid_link) | 128, 0]) + valid_link + data,
+            'overflow-length': b'\x12' + b'\xff' * 10 + b'\x00' + valid_link + data,
+            'truncated-link': wrapped_link[:-1],
+            'trailing-byte': wrapped_link + data + b'\x00',
+            'nested-decoy-link': pb_field(10, wrapped_link) + data,
+            'too-many-links': b''.join(pb_field(18, link(f'{i:04d}'.encode()))
+                                     for i in range(1024)) + wrapped_link + data,
+            'oversized-root': b'\x00' * (2097152 + 1),
+        }
+        self.prepare_recovery()
+        for name, block in cases.items():
+            with self.subTest(case=name):
+                # The requested CID is genuine for each malformed root. Root
+                # hashing alone must not make an ambiguous membership valid.
+                self.set_root(block)
+                result = self.run_installer()
+                self.assertIn('Release root exceeds' if name == 'oversized-root'
+                              else 'manifest binding', result.stderr)
+                self.run_recovery(['--release', self.release_cid], expected_exit=1)
+                self.assertFalse(self.calls.exists())
+                self.assertNotIn('/bin/ww/', self.transport.read_text())
+
+    def test_directory_orders_and_opaque_u64_artifact_sizes(self):
+        root = manifest_root(self.manifest.read_bytes())
+        # Native consumers also accept Data before all Links.
+        self.set_root(root[-4:] + root[:-4])
+        self.run_installer(success=True)
+        self.calls.unlink()
+        # The parser must not round or reject canonical unrelated u64 sizes.
+        link = (pb_field(10, cid_bytes(b'other')) + pb_field(18, b'Z')
+                + b'\x18' + varint(2**64 - 1))
+        self.set_root(root[:-4] + pb_field(18, link) + root[-4:])
+        self.run_installer(success=True)
+
+    def test_maximum_manifest_remains_a_raw_block(self):
+        manifest = self.manifest.read_bytes()
+        # Fill with unique short entries, then one entry to reach the bound.
+        records = []
+        remaining = 1048576 - len(manifest)
+        index = 0
+        while remaining > 200:
+            record = b'0' * 64 + f'  unused/{index}\n'.encode()
+            records.append(record)
+            remaining -= len(record)
+            index += 1
+        records.append(b'0' * 64 + b'  ' + b'z' * (remaining - 67) + b'\n')
+        self.manifest.write_bytes(manifest + b''.join(records))
+        self.assertEqual(self.manifest.stat().st_size, 1048576)
+        self.sign()
+        self.run_installer(success=True)
+
+    def test_recovery_modified_executable_never_executes(self):
+        self.prepare_recovery()
+        (self.release / 'bin/ww/linux/x86_64/ww').write_bytes(b'tampered Host')
+        result = self.run_recovery(['--release', self.release_cid], expected_exit=1)
+        self.assertIn('Checksum mismatch', result.stderr)
+        self.assertFalse(self.calls.exists())
+
     def refuse_before_transport(self, flags):
         before = {str(path.relative_to(self.home)): path.read_bytes()
                   for path in self.home.rglob('*') if path.is_file()}
@@ -169,8 +336,8 @@ esac
         self.assertIn('--release', result.stderr)
 
     def test_release_rejects_paths_and_malformed_cids_before_transport(self):
-        for value in ('test-release', '/ipfs/' + RECOVERY_CID, '/ipns/untrusted',
-                      RECOVERY_CID + '/other', RECOVERY_CID + '?query', ' ', '--recover'):
+        for value in ('test-release', '/ipfs/' + self.release_cid, '/ipns/untrusted',
+                      self.release_cid + '/other', self.release_cid + '?query', ' ', '--recover'):
             with self.subTest(value=value):
                 self.refuse_before_transport(['--release', value])
 
@@ -192,12 +359,12 @@ esac
 
     def test_recovery_requires_canonical_local_locator_or_explicit_release(self):
         self.prepare_recovery()
-        cases = [None, b'', b'{}', b'{"version":2,"release":"' + RECOVERY_CID.encode() + b'"}',
-                 b'{"version":1,"release":"' + RECOVERY_CID.encode() + b'"}\n',
-                 b'{"release":"' + RECOVERY_CID.encode() + b'","version":1}',
+        cases = [None, b'', b'{}', b'{"version":2,"release":"' + self.release_cid.encode() + b'"}',
+                 b'{"version":1,"release":"' + self.release_cid.encode() + b'"}\n',
+                 b'{"release":"' + self.release_cid.encode() + b'","version":1}',
                  b'{"version":1,"release":"/ipns/untrusted"}',
-                 b'{"version":1,"release":"' + RECOVERY_CID.encode() + b'","extra":true}',
-                 b'X' * 1025, b'{"version":1,"release":"' + RECOVERY_CID.encode() + b'"}\x00']
+                 b'{"version":1,"release":"' + self.release_cid.encode() + b'","extra":true}',
+                 b'X' * 1025, b'{"version":1,"release":"' + self.release_cid.encode() + b'"}\x00']
         pointer = self.home / '.ww/installed-release.json'
         for contents in cases:
             with self.subTest(contents=contents):
@@ -214,10 +381,10 @@ esac
         journal = self.home / '.ww/host-upgrade.json'
         journal.unlink()
         journal.symlink_to(self.manifest)
-        self.refuse_before_transport(['--recover', '--release', RECOVERY_CID])
+        self.refuse_before_transport(['--recover', '--release', self.release_cid])
 
     def run_recovery(self, flags=(), expected_exit=0):
-        self.env['TEST_CID'] = RECOVERY_CID
+        self.env['TEST_CID'] = self.release_cid
         before = {str(path.relative_to(self.home)): path.read_bytes()
                   for path in self.home.rglob('*') if path.is_file()}
         result = subprocess.run(['sh', str(INSTALLER), '--recover', *flags,
@@ -231,25 +398,26 @@ esac
         return result
 
     def test_recovery_handoff_fetches_only_authenticated_host_all_platforms(self):
-        self.prepare_recovery(b'{"version":1,"release":"' + RECOVERY_CID.encode() + b'"}')
+        self.prepare_recovery(b'{"version":1,"release":"' + self.release_cid.encode() + b'"}')
         for os_name, arch, path in PLATFORMS:
             with self.subTest(os=os_name, arch=arch):
                 self.env.update(TEST_OS=os_name, TEST_ARCH=arch)
                 self.run_recovery()
                 self.assertEqual(self.calls.read_text().splitlines(), [
-                    f'upgrade --recover-only --release {RECOVERY_CID} '
+                    f'upgrade --recover-only --release {self.release_cid} '
                     f'--ipfs-url http://localhost:5001 --trusted-release-keys {self.keys}'])
                 self.assertEqual(self.transport.read_text().splitlines(), [
-                    'id', f'cat /ipfs/{RECOVERY_CID}/CHECKSUMS.txt',
-                    f'cat /ipfs/{RECOVERY_CID}/CHECKSUMS.txt.sig',
-                    f'cat /ipfs/{RECOVERY_CID}/bin/ww/{path}/ww'])
+                    'id', f'cat /ipfs/{self.release_cid}/CHECKSUMS.txt',
+                    f'cat /ipfs/{self.release_cid}/CHECKSUMS.txt.sig',
+                    f'block get {self.release_cid}',
+                    f'cat /ipfs/{self.release_cid}/bin/ww/{path}/ww'])
                 self.calls.unlink()
                 self.transport.unlink()
 
     def test_recovery_explicit_release_propagates_native_refusal_and_endpoint(self):
         self.prepare_recovery(b'invalid pointer bypassed by explicit selection')
         self.env['TEST_RECOVERY_EXIT'] = '43'
-        self.run_recovery(['--release', RECOVERY_CID, '--ipfs-url', 'http://127.0.0.1:41001'],
+        self.run_recovery(['--release', self.release_cid, '--ipfs-url', 'http://127.0.0.1:41001'],
                           expected_exit=43)
         self.assertIn('--ipfs-url http://127.0.0.1:41001', self.calls.read_text())
         self.assertEqual(len(self.calls.read_text().splitlines()), 1)
@@ -257,13 +425,13 @@ esac
     def test_recovery_explicit_release_uses_ipfs_api_without_local_pointer(self):
         self.prepare_recovery()
         self.env['IPFS_API'] = 'http://127.0.0.1:41002'
-        self.run_recovery(['--release', RECOVERY_CID])
+        self.run_recovery(['--release', self.release_cid])
         self.assertIn('--ipfs-url http://127.0.0.1:41002', self.calls.read_text())
 
     def test_recovery_authentication_failure_does_not_execute(self):
         self.prepare_recovery()
         self.signature.write_bytes(b'\x01' * 64)
-        self.run_recovery(['--release', RECOVERY_CID], expected_exit=1)
+        self.run_recovery(['--release', self.release_cid], expected_exit=1)
         self.assertFalse(self.calls.exists())
 
     def test_recovery_conflicts_with_manifest_verification(self):
@@ -431,7 +599,7 @@ esac
         self.run_installer(verify=True)
 
     def test_failed_transport_never_executes(self):
-        for path in ('CHECKSUMS.txt', 'CHECKSUMS.txt.sig', 'fhs/bin/status.wasm'):
+        for path in ('CHECKSUMS.txt', 'CHECKSUMS.txt.sig', 'root', 'fhs/bin/status.wasm'):
             with self.subTest(path=path):
                 self.env['FAIL_FETCH'] = path
                 self.run_installer()
